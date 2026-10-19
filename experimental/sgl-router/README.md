@@ -1,435 +1,356 @@
 # sgl-router
 
-Slim, KV-aware, OpenAI-compatible router for SGLang workers.
+Slim, KV-aware router for SGLang workers.
 
-Serves a single model and routes across its workers. Exposes
-`/v1/tokenize`, `/v1/detokenize`, `/v1/models`, `/v1/chat/completions`
-(buffered and SSE), plus `/healthz` / `/readyz` and `/metrics`. Worker
-pools come from either a static URL list or Kubernetes EndpointSlice
-discovery. Both edges speak cleartext HTTP/2 where the peer does — see
-[HTTP/2](#http2).
+A router serves one model and spreads its requests across that model's SGLang
+engines. It picks an engine per request from live engine load, global KV-cache prefix
+matches, or session affinity, supports prefill/decode (P/D) disaggregation, bucketed deployments, and
+discovers engines from a static URL list or Kubernetes EndpointSlices.
 
-## Building
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Key interfaces](#key-interfaces)
+- [Routing policies](#routing-policies)
+- [Deployment examples](#deployment-examples)
+- [Add a new policy](#add-a-new-policy)
+- [Other features](#other-features)
+
+Related docs: [ARCHITECTURE.md](ARCHITECTURE.md) (routing design and bucket
+configuration), [REFERENCE.md](REFERENCE.md) (detailed feature behavior),
+[monitoring/README.md](monitoring/README.md) (metrics and
+Grafana), [BENCHMARKS.md](BENCHMARKS.md),
+[sgl-kv-indexer/README.md](sgl-kv-indexer/README.md) (external KV indexer).
+
+## Architecture
+
+A deployment is a **router** in front of **buckets of SGLang engines**. A bucket
+is a logical group defined in the router configuration. It holds either one
+**plain** engine group, where each engine does prefill and decode, or separate
+**prefill and decode (P/D)** groups. Buckets can be length tiers (for example
+short and long context); without a bucket file there is one plain bucket and one
+P/D bucket containing every discovered engine.
+
+![Router deployment with short-context and long-context P/D engine buckets](./assets/architecture-deployment.png)
+
+Engines publish load reports and KV events. The router uses them, plus its own
+in-flight counts and session bindings, to pick engines. An optional
+[external KV indexer](sgl-kv-indexer/README.md) can replace the router's local
+radix tree as the source of prefix matches. In P/D, the router sends the request
+to both the chosen prefill and decode engines, and prefill transfers KV directly
+to decode.
+
+For each request, the router renders and tokenizes it, tries the buckets that fit
+its length (ordered by SLO preference, capacity, then `rank`), lets the group's
+policy pick an engine that passes admission, and dispatches it, retrying on
+another engine if it fails before any response. Output handling (OpenAI
+responses, tool and reasoning parsing) also happens in the router.
+
+**Scalability.** Routers are stateless: nothing is persisted or shared between
+replicas. Each one rebuilds its routing state (engine load, KV prefix tree,
+in-flight counts) from the engines' own reports, so you scale a large deployment
+by running more router replicas behind a load balancer. A new replica can copy
+the KV tree from a warm sibling at startup
+([peer bootstrap](#kv-cache-signals)). Session bindings stay in each
+replica's memory, so with `session_aware` and several replicas, route a session's
+requests to the same replica (for example, a load balancer sticky on the session
+header).
+
+## Quick start
+
+Build:
 
 ```bash
 cd experimental/sgl-router
 cargo build --release
 ```
 
-## Running
-
-The router is configured entirely through CLI flags (run
-`sgl-router --help` for the full list). It serves exactly one model, so
-`--model-id` is required, along with exactly one discovery backend.
-`--tokenizer-path` is optional: give it a local `tokenizer.json` path or a
-HuggingFace repo id, and when omitted the router downloads the tokenizer
-for `--model-id` from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`).
-
-Static worker list:
+Run in front of two engines with cache-aware routing:
 
 ```bash
-sgl-router \
+./target/release/sgl-router \
   --host 0.0.0.0 --port 30000 \
   --model-id qwen3 \
-  --tokenizer-path /models/qwen3/tokenizer.json \
-  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000
-```
-
-Kubernetes EndpointSlice discovery:
-
-```bash
-sgl-router \
-  --host 0.0.0.0 --port 30000 \
-  --model-id qwen3 \
-  --tokenizer-path /models/qwen3/tokenizer.json \
-  --service-discovery \
-  --service-discovery-namespace prod \
-  --selector app=engines-qwen3
-```
-
-Omit `--service-discovery-namespace` to watch all namespaces (requires
-cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
-with `--prefill-selector` and `--decode-selector`.
-
-To run two engine versions side by side in PD mode (e.g. during a rollout),
-pass `--pd-version-group-label <key>`. A prefill worker is then paired only with
-decode workers that have the same value for that EndpointSlice label (inherited
-from the Service, so use one Service per role and version), so KV never crosses
-versions. Unlabeled workers form their own group.
-
-```bash
-sgl-router --model-id qwen3 --service-discovery \
-  --prefill-selector app=engines-qwen3,role=prefill \
-  --decode-selector app=engines-qwen3,role=decode \
-  --pd-version-group-label sglang.ai/version-group
-```
-
-External KV indexer as the cache-aware signal source:
-
-```bash
-sgl-router \
-  --model-id qwen3 \
-  --tokenizer-path /models/qwen3/tokenizer.json \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
-  --policy cache_aware \
-  --cache-prefix-provider indexer \
-  --kv-indexer-endpoint http://10.0.0.10:50051 \
-  --kv-indexer-query-timeout-ms 100 \
-  --kv-indexer-query-max-inflight 32
-```
-
-The Indexer replaces the Router-local radix tree as the native Cache-Aware
-signal. Query timeouts and local concurrency are bounded by the two Indexer
-options, which default to 100 ms and 32 respectively.
-
-### Peer bootstrap (Kubernetes)
-
-A replica that starts mid-fleet subscribes to each worker's KV topic
-mid-stream, so everything already resident in the engines' caches is invisible
-to it and it routes cache-blind until traffic re-stores those blocks —
-degrading the engines' locality for the whole fleet, once per replica on every
-rolling update. With a peer selector set, a booting replica instead pulls a
-tree snapshot from a warm sibling over `/internal/kv_snapshot` and splices it
-under its own live delta stream, and `/readyz` stays 503 until that bootstrap
-settles. Off unless `--kv-peer-selector` is set; requires `--policy
-cache_aware` with the Router-local radix tree (not an external Indexer) and
-`--service-discovery`, which the CLI enforces.
-
-```bash
-sgl-router \
-  --model-id qwen3 --policy cache_aware \
-  --service-discovery --service-discovery-namespace prod \
-  --selector app=engines-qwen3 \
-  --kv-peer-selector kubernetes.io/service-name=sgl-router
-```
-
-- `--kv-peer-selector` is matched against **EndpointSlice labels** — the
-  router Service's labels plus `kubernetes.io/service-name`, never the pods'
-  labels, so `kubernetes.io/service-name=<router-service>` is the unambiguous
-  choice. A pod-template label matches nothing and every replica boots cold.
-- `--kv-bootstrap-timeout-ms` (default 600000) bounds the whole bootstrap;
-  readiness waits on it, so startup/readiness probes must tolerate a replica
-  staying unready this long.
-- `--kv-bootstrap-fetch-timeout-cap-ms` (default 300000) caps one snapshot
-  fetch within that budget.
-- `--kv-bootstrap-seed-required` (off by default) keeps holding `/readyz` when
-  siblings were present but their tree could not be pulled, bounded at
-  max(3× the bootstrap timeout, 60s) — it delays a failed seed's replica (and
-  with it a rolling update) rather than shipping it cache-blind; it cannot
-  stall a rollout indefinitely.
-
-The deployment needs two things beyond the flags: the router's ServiceAccount
-must hold `get`/`list`/`watch` on `endpointslices` in the watched namespace
-(the worker-discovery Role already grants this), and the pod spec should wire
-`POD_NAME`, `POD_NAMESPACE` and `POD_IP` from the downward API so a replica
-can exclude itself from its own peer list. A rolling update should surge
-(`maxUnavailable: 0`) so new replicas always have warm siblings to copy from.
-`tests/e2e/k8s_integration/manifests/kv-bootstrap.yaml` is a worked example of
-all of it, and the `sgl_router_kv_bootstrap_*` series in
-[monitoring/README.md](monitoring/README.md) make the whole path observable.
-
-### Reorg routing
-
-Use `--chat-routing reorg` to select the new bucket engine. The existing `--policy`
-and cache/session flags configure its policies; no separate file is required.
-
-```bash
-sgl-router --model-id qwen3 --worker-urls http://localhost:30001 \
   --chat-routing reorg --policy cache_aware
 ```
 
-Reorg supports `power_of_two` (its default), `cache_aware`, and `session_aware`.
-Discovery supplies the plain or PD workers; decode uses power-of-two. Cache
-settings, external indexers, session headers/timeouts, and `--filter overloaded`
-with `--max-in-flight` retain their existing flags. Unsupported legacy options
-fail at startup. Legacy `--bucket-config` files cannot define complete reorg PD
-buckets and are not accepted on this path.
-
-Omitting `--chat-routing` keeps the existing policies and defaults.
-
-### Optional tokenizer for load-only routing
-
-`--no-tokenizer` skips tokenizer loading for load-only policies such as
-`power_of_two` and `session_aware`, on either routing path. Workers tokenize the
-original messages, and `/v1/tokenize` and `/v1/detokenize` are unavailable.
-Cache-aware routing, prefix-cache terms or filters, and `--bucket-config` still
-require a tokenizer.
-
-### DP-rank routing
-
-An engine launched with `--dp-size` or `--attn-dp-size` runs several DP ranks,
-each with its own KV cache, behind one endpoint. With `--dp-aware`, the router
-also picks the rank inside the selected worker. It sends that rank as
-`X-Data-Parallel-Rank`, which the engine honors, and overwrites any value the
-client sent. The router picks the first of these that applies:
-
-1. A hash of the sticky routing key or session id, so a conversation keeps
-   its rank and router replicas agree.
-2. The rank with the deepest cached prefix in the local KV tree.
-3. The rank with the fewest requests this router has in flight on it.
-
-In PD mode, decode is ranked by load only. The bootstrap room satisfies
-`room % prefill_dp_size == prefill_rank`, which is how a decode engine finds
-the prefill rank.
-
-### Engines with `--api-key`
-
-The router reads each worker's `/server_info` and `/model_info` to learn its
-model, KV-event publisher, HTTP/2 support and DP size. An engine launched with
-`--api-key` rejects those requests without the key, so pass the same key as
-`--worker-api-key`. Chat requests and `/flush_cache` forward the caller's
-`Authorization` header instead, so callers still need the engine key.
-
-### Fleet-wide sampling contract
-
-`--override-sampling-params` fixes the sampling configuration for every client
-of this router, independently of what the engine's own defaults happen to be:
+Send a request:
 
 ```bash
-sgl-router \
-  --model-id qwen3 \
-  --tokenizer-path /models/qwen3/tokenizer.json \
-  --worker-urls http://10.0.0.1:30000 \
-  --override-sampling-params '{"temperature": 1, "top_p": 0.95, "n": 1}' \
-  --sampling-param-conflict reject
+curl http://localhost:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "qwen3", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-It takes one JSON object keyed by the request-body field names
-(`temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`,
-`frequency_penalty`, `presence_penalty`, `n`). A configured value is injected
-whenever the request omits that field, so the engine's defaults cannot drift
-from what the operator declared. `temperature`, `top_p`, `top_k`, `min_p` and
-`repetition_penalty` are the five the engine resolves from the model's own
-`generation_config`, which is what makes them drift when a deployed image
-changes; the rest have fixed API defaults.
+`--model-id` is required. `--tokenizer-path` takes a local `tokenizer.json` or a
+HuggingFace repo id; when omitted, the tokenizer for `--model-id` is downloaded
+from HuggingFace (honoring `HF_TOKEN` / `HF_HOME`). `sgl-router --help` lists
+every flag.
 
-An explicit `null` counts as omitting the field, not as a client-supplied
-value: the OpenAI API types these parameters as nullable with a documented
-default, so `null` asks for the default — and on a governed fleet the
-configured value is what the default is.
+## Key interfaces
 
-For a request that does send a value, `--sampling-param-conflict` decides:
-`reject` (the default) 400s a differing value before admission, while `allow`
-forwards the client's value untouched — the router never silently rewrites what
-a client sent. A `reject` response carries
-`x-router-error-code: sampling_contract_violation` and is counted in
-`sgl_router_sampling_contract_rejections_total{param}`, so a rollout's blast
-radius is visible per parameter rather than folded into `bad_request`.
+### HTTP endpoints
 
-`reject` also 400s a value it cannot read as a number, on a governed parameter
-only. The engine coerces more than JSON numbers — a bool and a numeric string
-both become numbers — by rules that are undocumented and need not match across
-a fleet, so a value the router cannot read is one it cannot prove conforms, and
-waving it through would make the pin bypassable. The common coercions are
-matched exactly (`false` is 0, `"0.5"` and `"1_0"` are 0.5 and 10), so this
-refuses only genuine garbage. `allow` is unaffected: it promises nothing, so
-such a value keeps flowing to the engine, which owns the request schema.
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/chat/completions`, `POST /v1/completions` | OpenAI API, served [over `/generate`](#openai-over-generate) |
+| `POST`/`PUT /generate` | SGLang [native generate](#native-generate), buffered or SSE |
+| `POST /v1/messages`, `/v1/messages/count_tokens` | [Anthropic Messages](#anthropic-messages) |
+| `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
+| `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
+| `GET /v1/models` | The served model |
+| `POST /flush_cache` | Fan out a cache flush to every worker |
+| `GET /healthz`, `/readyz` | Liveness and readiness |
+| `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
-A value may also be an inclusive band, `{"min": LO, "max": HI}`, for a
-parameter that stays tunable inside a range. A band names no value to inject,
-so it constrains only the requests that name the parameter; one that omits it
-gets the model's own `generation_config` default, which the router cannot see.
-Because a band can only ever reject, combining one with `allow` is a startup
-error.
+Both edges speak cleartext HTTP/2 where the peer does; see
+[operations](#operations). With `--grpc-port`, the router also serves the
+engine's [native gRPC](#native-grpc) API.
 
-Values are range-checked at startup, so a misconfiguration fails the launch
-instead of 400ing every request at the engine. Repeating a key in the flag is
-also a startup error, rather than silently enforcing whichever copy came last.
+### Key flags
 
-| parameter | accepted | notes |
-| --- | --- | --- |
-| `temperature` | `[0, 2]` | |
-| `top_p` | `(0, 1]` | |
-| `top_k` | `>= 1`, or exactly `-1` | `-1` is the engine's "whole vocabulary" spelling and its default. Being non-contiguous it cannot bound a band. Note `top_k: 1` is greedy decoding, not "disabled". |
-| `min_p` | `[0, 1]` | not an OpenAI parameter; the engine's domain |
-| `repetition_penalty` | `(0, 2]` | not an OpenAI parameter; the engine's domain |
-| `frequency_penalty` | `[-2, 2]` | |
-| `presence_penalty` | `[-2, 2]` | |
-| `n` | `[1, 128]` | |
+| Area | Flags |
+| --- | --- |
+| Model | `--model-id`, `--tokenizer-path`, `--no-tokenizer` |
+| Engines | `--worker-urls`, or `--service-discovery` with `--selector` (plain) or `--prefill-selector` + `--decode-selector` (P/D) |
+| Routing | `--chat-routing reorg`, `--policy`, `--bucket-config`, `--affinity-*`, `--session-id-header` |
+| Admission | `--max-inflight-requests`, `--max-waiting-requests`, `--max-pending-prefill-tokens`, `--max-running-usage`, `--max-kv-usage` |
+| Reliability | `--retry-max-attempts`, `--request-timeout-secs`, `--stale-request-timeout-secs` |
+| KV signals | `--cache-prefix-provider`, `--kv-indexer-endpoint`, `--kv-peer-selector` |
 
-The OpenAI domains are deliberately narrower than what the engine itself
-accepts (`SamplingParams.verify` would take `temperature: 5`): these values are
-injected into request bodies, and a fleet contract outside the range every
-OpenAI client library validates against is far more likely a typo than an
-intent.
+Omitting `--chat-routing` keeps the legacy routing path (default
+`--policy round_robin`). This README and [ARCHITECTURE.md](ARCHITECTURE.md)
+describe `--chat-routing reorg`.
 
-Cost: a request that named every configured field forwards its original bytes
-untouched. One that omits a field has the scalars spliced directly into the
-body bytes — no parse, no re-serialize — which on a 16 MiB body is ~0.24 ms
-against ~5.7 ms for a `serde_json` round-trip. Only `input_ids` and PD
-bootstrap injection still parse and re-serialize, because those may have to
-overwrite a key the client sent.
+## Routing policies
 
-### Relationship to the engine's own `--preferred-sampling-params`
+Each engine group runs one policy, chosen by `--policy` (default `power_of_two`
+under reorg) or per group in a bucket file:
 
-The engine has an inject-when-absent flag of its own,
-`--preferred-sampling-params`, merged in
-`python/sglang/srt/managers/tokenizer_manager.py` as
-`{**preferred, **obj.sampling_params}`. On `/v1/chat/completions` it is
-currently a no-op: `ChatCompletionRequest.to_sampling_params`
-(`python/sglang/srt/entrypoints/openai/protocol.py`) resolves every sampling
-key eagerly through `generation_config` and then its own defaults, so the
-right-hand side of that merge is always fully populated and always wins.
-(`/v1/responses`, in the same file, already omits `None` entries for exactly
-this reason.) If that is fixed engine-side, `--preferred-sampling-params`
-covers the inject-when-absent half for a single engine.
+- **`power_of_two`**: samples two engines and takes the less loaded. Prefill and
+  plain engines compare estimated prefill queue time, waiting uncached tokens,
+  waiting, running, then in-flight requests; decode engines compare waiting and
+  running requests, then KV usage. Decode groups always default to it.
+- **`cache_aware`**: prefers the engine holding the longest cached prefix of the
+  prompt (at least `--cache-affinity-min-matched-tokens`, default 1024, and
+  optionally `--cache-affinity-min-match-ratio` of the prompt). Plain and
+  prefill groups only. Needs a tokenizer.
+- **`session_aware`**: keeps requests with the same session header
+  (`--session-id-header`, default `x-session-id`) on the engine they are bound
+  to. Any stage, including decode via a bucket file.
 
-What stays the router's to own either way is the enforcement half: the
-`reject` immutability contract with its 400 before admission — costing no
-queue slot and no engine round-trip — the `sampling_contract_violation` code
-and per-parameter counter, bands, and one contract applied at a shared ingress
-across engines whose own flags the router operator may not control.
+Both affinity policies fall back to `power_of_two` among the remaining engines
+when there is no preferred engine or it fails admission. With
+`--affinity-mode prefer` (default) the preferred engine wins whenever it is
+admitted. With `--affinity-mode balanced` the router also samples an
+alternative and switches only when the preferred engine's load exceeds both
+`alternative * --affinity-load-factor` (default 2) and
+`alternative + --affinity-load-gap`, measured by `--affinity-balanced-by`
+(`prefill-tokens` by default, or `running-requests`).
 
-## Chat rendering
+Admission flags set per-engine caps; an engine at a cap is skipped:
 
-The router renders chat requests with dynamo-render (`dynamo-renderer`): the model's
-HF Jinja template from `tokenizer_config.json` or a sibling
-`chat_template.jinja`, or dynamo-render's built-in DeepSeek encoder (V4 family, V3.2)
-for template-less models. Cache-aware routing hashes the rendered tokens so its
-prefix queries match the blocks the engine caches. Models the engine encodes in
-code but dynamo-render cannot tokenize here (Inkling) route via raw prompt
-text, as does any model whose template fails to load or render.
+| Flag | Rejects an engine at |
+|---|---|
+| `--max-inflight-requests N` | `N` requests this router has in flight to it (`--max-in-flight` is an alias) |
+| `--max-waiting-requests N` | `N` engine-reported waiting requests |
+| `--max-pending-prefill-tokens N` | `N` engine-reported waiting uncached tokens |
+| `--max-running-usage F` | share `F` of its reported running-request capacity |
+| `--max-kv-usage F` | share `F` of its reported KV capacity |
 
-Some chats additionally forward the rendered tokens to the engine as
-`input_ids`, retaining the original messages, so the engine skips
-re-tokenizing. How many depends on the model's renderer. DeepSeek-V4's native
-encoder is fixture-verified against SGLang's request normalization, so it
-forwards every chat except multimodal ones and those with caller-provided
-`input_ids`. Renderers without that verification (HF Jinja templates, Kimi-K3)
-forward only plain text chat requests (string `content`, no tools, no template
-kwargs or reasoning controls or historical `reasoning_content`, no assistant
-continuation, no consecutive users or non-leading system turns) and warn
-`UNVERIFIED` at startup; every other request shape is rendered for routing
-only. DeepSeek-V4.1 forwards nothing — its renderer is not verified against
-current SGLang — while routing tokenization keeps working.
+Engine-reported caps lag by one load report, so a burst can pass them;
+`--max-inflight-requests` counts dispatches as they happen.
 
-Use matching model files on the router and workers, and set
-the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
-`SGLANG_DSV4_REASONING_EFFORT`, and `SGLANG_DSV41_REASONING_EFFORT` on both.
-The router reads these render defaults from its own configuration and environment;
-it does not discover the workers' settings. Point `--tokenizer-path` at the workers'
-model snapshot so the V4 effort profile is read from the same
-`encoding/encoding_dsv4.py`.
+For the full selection rules see ARCHITECTURE.md:
+[load-aware routing](ARCHITECTURE.md#13-example-load-aware-routing),
+[cache- and session-aware routing](ARCHITECTURE.md#14-example-cache-aware-and-session-aware-routing),
+and [configuration examples](ARCHITECTURE.md#2-configuration-examples).
 
-Set `--disable-input-ids-forwarding` for this router's model when worker-side
-rendering has not been verified to match. This disables router-generated IDs
-for every routing policy; cache-aware routing still renders and tokenizes
-locally, and the original messages reach the workers for engine processing.
-Caller-supplied `input_ids` remain caller-owned and pass through unchanged.
+## Deployment examples
 
-Forwarding logs its assumptions at startup. In particular, disable it when the
-router's render defaults differ from the workers', for worker template overrides
-not reflected in the router's model files, for worker parser overrides such as
-`--tool-call-parser deepseekv32` that select a native encoder over a shipped
-template, or conversation templates with stop strings (the engine's `input_ids`
-path skips those template stops). Disabling forwarding preserves engine behavior
-but does not establish parity for local routing hashes.
+Static workers, plain engines:
 
-Also set `--disable-input-ids-forwarding` for array-only templates: Dynamo may wrap
-string content into arrays differently from the worker. The pinned Dynamo renderer does not expose
-its conversion flag, so the router cannot automatically block these templates.
-Detailed content-format parity coverage follows in #39133.
+```bash
+sgl-router --model-id qwen3 --chat-routing reorg --policy cache_aware \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000
+```
 
-The Dynamo crates are pinned exactly and `Cargo.lock` is committed; CI builds
-with `--locked`, so rendered bytes cannot change without a reviewed diff.
+Kubernetes discovery, plain engines (omit the namespace to watch all
+namespaces, which needs cluster-wide RBAC):
 
-Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
-flags make it cheaper:
+```bash
+sgl-router --model-id qwen3 --chat-routing reorg --policy cache_aware \
+  --service-discovery --service-discovery-namespace prod \
+  --selector app=engines-qwen3
+```
 
-- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
-  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
-- `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
-  boundaries, so a multi-turn chat encodes only the turns added since the
-  previous request. Boundaries are unconditional, non-normalized, non-stripping
-  special tokens with no overlapping added-token spellings. Unsafe candidates
-  are excluded; if none remain, encoding proceeds without the cache.
+Kubernetes discovery, P/D engines with session affinity:
 
-On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
-a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
-case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
-backend and cache state. `/metrics` exposes only
-`sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
-how much tokenization work the cache reuses.
+```bash
+sgl-router --model-id qwen3 --chat-routing reorg --policy session_aware \
+  --service-discovery --service-discovery-namespace prod \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --max-kv-usage 0.9
+```
 
-## DeepSeek V4
+Length-tiered buckets from a file (schema and a full example in
+[ARCHITECTURE.md](ARCHITECTURE.md#example-c-pd-buckets-from-a-file)):
 
-Native V4 rendering follows SGLang's serving path (`serving_chat.py`), not
-Dynamo's OpenAI defaults: all declared tools are rendered with SGLang's schema
-defaults, reasoning effort comes from `reasoning` / `reasoning_effort`, and the
-official/preview effort profile is detected from the checkpoint's
-`encoding/encoding_dsv4.py` or overridden by `dsv4_reasoning_effort_profile` in
-`config.json`, as in SGLang. Reference prompts live in `tests/fixtures/deepseek/`
-and are regenerated by `tests/scripts/generate_deepseek_parity.py`.
+```bash
+sgl-router --model-id qwen3 --chat-routing reorg --policy cache_aware \
+  --service-discovery --service-discovery-namespace prod \
+  --prefill-selector app=engines-qwen3,role=prefill \
+  --decode-selector app=engines-qwen3,role=decode \
+  --bucket-config buckets.json
+```
 
-V4.1 Flash uses Dynamo's separate V4.1 encoder with SGLang's numeric reasoning
-budgets, tool payloads, and `<｜System｜>` markers — for routing tokenization
-only, since V4.1 never forwards `input_ids`. Developer messages and media are
-left to the worker (the pinned encoder renders them differently), and a
-non-default `SGLANG_DSV41_REASONING_EFFORT` still matters for cache-aware
-routing-hash parity.
+## Add a new policy
 
-## Kimi-K3
+Reorg policies live in [`src/policies_reorg/`](src/policies_reorg/). Contributions
+are welcome; read [ARCHITECTURE.md](ARCHITECTURE.md) first for how buckets,
+admission and fallback fit together.
 
-Kimi-K3 renders through dynamo-render's native XTML formatter with SGLang's
-request semantics (reasoning controls, tools, `response_format`, continuations)
-and the checkpoint's chunked tiktoken encoding. `--tokenizer-path` accepts a
-local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
-and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
-An explicit null `thinking_effort` with thinking enabled is not representable
-in the pinned formatter and falls back to engine-side rendering.
+1. **Implement the `Policy` trait** in `src/policies_reorg/<name>.rs`. The trait
+   is in [`src/policies_reorg/mod.rs`](src/policies_reorg/mod.rs):
 
-## HTTP/2
+   ```rust
+   pub trait Policy: Send + Sync + Debug {
+       fn pick<'a>(&'a self, engines: &'a [Arc<Worker>], request: &'a PickRequest<'a>)
+           -> BoxFuture<'a, Result<Pick, PickError>>;
+       fn supports(&self, _stage: Stage) -> bool { true }
+       fn needs_request_tokens(&self) -> bool { false }
+       fn fallback(&self) -> Option<&dyn Policy> { None }
+   }
+   ```
 
-There is nothing to configure. The router negotiates per connection inbound and
-resolves the protocol per worker outbound; every combination below is reached
-automatically, and HTTP/1.1 remains a supported peer on both edges.
+   - `pick` must return one of the supplied `engines` and check admission on it
+     (`self.admission.check(&engine, &metrics)`), returning
+     `PickError::AdmissionRejected` on rejection.
+   - The policy holds its own shared-state handles (load table, KV source,
+     session store), passed in at construction, and reads them inside `pick`.
+   - Override `supports` to restrict stages (plain, prefill, decode),
+     `needs_request_tokens` if it reads `request.token_ids` or `request.prefix`,
+     and `fallback` if it delegates to another policy.
+   - [`power_of_two.rs`](src/policies_reorg/power_of_two.rs) is a complete
+     ~80-line example; [`session_aware.rs`](src/policies_reorg/session_aware.rs)
+     shows affinity with a fallback.
+2. **Declare the module** in `src/policies_reorg/mod.rs`.
+3. **Add a `PolicyKind` variant** in [`src/config/types.rs`](src/config/types.rs)
+   with its `--policy` name. `PolicyKind` is shared with the legacy path, so add
+   an arm returning an error to `build_kind` in
+   [`src/policies/factory.rs`](src/policies/factory.rs) (the compiler lists every
+   exhaustive match to update).
+4. **Wire it into** [`src/policies_reorg/factory.rs`](src/policies_reorg/factory.rs):
+   add it to the allowlist in `validate()` and construct it in the `match kind`
+   of `Groups::build`.
+5. **Test it** in `tests/component/policies_reorg_<name>.rs`, registered in
+   `tests/component/main.rs`, following `policies_reorg_power_of_two.rs`. For
+   end-to-end routing, add a case under `tests/proxy/chat_routing/reorg/`.
+6. **Document it**: a subsection in [ARCHITECTURE.md](ARCHITECTURE.md) next to
+   section 1.4, and a bullet in [Routing policies](#routing-policies) above.
 
-**Inbound.** The listener accepts cleartext HTTP/2 (h2c, prior knowledge) and
-HTTP/1.1 on the same `--port`, chosen per connection. A mesh sidecar or
-load balancer that prefers h2c multiplexes over one connection instead of
-opening one per request; an HTTP/1.1 client is unaffected.
+## Other features
 
-**Outbound.** At registration the router reads each worker's `/server_info` and
-forwards over cleartext h2c only when that worker reports `--enable-http2` (the
-engine's Granian server, which serves h2c and HTTP/1.1 together) **and** the
-worker URL is cleartext. Everything else uses the default client, which speaks
-HTTP/1.1 in cleartext and negotiates ALPN `h2, http/1.1` over TLS:
+Each item links to its full description in [REFERENCE.md](REFERENCE.md).
 
-| `/server_info` | worker URL | router forwards over |
-|---|---|---|
-| `enable_http2: true` | `http://` | cleartext h2c |
-| `enable_http2: true` | `https://` | HTTP/2 over TLS, by ALPN |
-| `enable_http2: false`, or absent | any | HTTP/1.1 (cleartext) or ALPN (TLS) |
+### Native `/generate`
 
-The choice is per worker, not fleet-wide, so a mixed fleet works and one
-worker's state never changes another's. The flag comes from the `/server_info`
-launch record, which has reported it all along, so no engine change is needed.
-A worker whose `/server_info` does not answer has no readable protocol and
-forwards over HTTP/1.1 for as long as it stays registered — a throughput cost,
-never a correctness one. Admin fan-out (`/flush_cache`) always uses the default
-client, because it addresses every worker at once rather than a selected one.
+Same body and response as the engine's `/generate`, buffered or SSE. With a
+tokenizer loaded, `text` is forwarded as `input_ids` so routing sees the
+engine's exact tokens (`--disable-input-ids-forwarding` turns this off). See
+[native `/generate`](REFERENCE.md#native-generate).
 
-Two things worth knowing when debugging. h2c is prior-knowledge only — there is
-no negotiation and no fallback — which is why the router requires the engine's
-own `enable_http2` report before using it. And a worker's protocol is fixed
-for as long as that worker stays registered: it is read once, at registration,
-and never re-read. Under the K8s backend a restarting engine flips its
-EndpointSlice to `ready=false`, which is a `Removed` → `Added` cycle and so a
-fresh reading; under `--worker-urls` the fan-out happens once at startup and
-nothing re-registers. So a worker registered over h2c that later stops serving
-it (a proxy interposed on its port, say) is not detected until it
-is re-registered; its circuit breaker will open in the meantime.
+### OpenAI over /generate
 
-## Upgrading from `cache_aware_zmq`
+For `/v1/chat/completions` and `/v1/completions`, the router runs SGLang's
+OpenAI layer itself: it sends the request to `/generate` and builds the OpenAI
+response. Requests it cannot reproduce exactly (for example media or strict
+tools) go to the engine's own route unchanged. See
+[OpenAI over /generate](REFERENCE.md#openai-over-generate) for the exact
+conditions, and [chat rendering](REFERENCE.md#chat-rendering) plus the
+per-model sections ([DeepSeek V4 and V4.1](REFERENCE.md#deepseek-v4-and-v41),
+[GLM-5.3](REFERENCE.md#glm-53), [Qwen3.8](REFERENCE.md#qwen38),
+[Kimi-K3](REFERENCE.md#kimi-k3)) for which chats forward `input_ids`.
 
-The `cache_aware_zmq` policy has been removed. Configurations using it should
-select `--policy cache_aware` and choose a native cache-prefix source: the
-Router-local radix tree (the default), or the external Indexer shown above.
+### Anthropic Messages
 
-The legacy `--cache-threshold`, `--balance-abs-threshold`, and
-`--balance-rel-threshold` flags have also been removed. They do not have
-one-to-one replacements; remove them and review the current `sgl-router
---help` output when tuning Cache-Aware routing.
+`/v1/messages` is converted to a chat completion and back.
+`/v1/messages/count_tokens` is answered by the router from the chat template.
+See [Anthropic Messages](REFERENCE.md#anthropic-messages).
+
+### Embeddings, classify and rerank
+
+Engine request and response bodies, routed on load. Not available on P/D fleets.
+See [embeddings](REFERENCE.md#embeddings), [classify](REFERENCE.md#classify)
+and [rerank](REFERENCE.md#rerank).
+
+### Native gRPC
+
+`--grpc-port` serves the engine's `sglang.runtime.v1.SglangService`. Each RPC is
+routed like its HTTP route and forwarded to the same RPC on the engine's own
+native gRPC port, so engines must run with `--grpc-port` too. See
+[native gRPC](REFERENCE.md#native-grpc).
+
+### Bucket file
+
+`--bucket-config` defines buckets whose groups set `worker_services`
+(`namespace/name`) or `worker_ids`, plus `policy`, `admission` and `affinity`;
+unset fields inherit the CLI flags. See
+[ARCHITECTURE.md](ARCHITECTURE.md#2-configuration-examples) and
+[bucket file membership](REFERENCE.md#bucket-file-membership).
+
+### KV cache signals
+
+- **External KV indexer**: `--cache-prefix-provider indexer
+  --kv-indexer-endpoint <url>`; see [sgl-kv-indexer](sgl-kv-indexer/README.md)
+  and [external KV indexer](REFERENCE.md#external-kv-indexer).
+- **KV-event gap replay**: add `"replay_endpoint"` to the engine's
+  `--kv-events-config` so the router can re-fetch dropped KV events; see
+  [gap replay](REFERENCE.md#kv-event-gap-replay).
+- **Pending prefixes**: `--cache-pending-prefix-ttl-ms` keeps bursts that share
+  a cold prefix on one worker until its KV events arrive; see
+  [pending prefixes](REFERENCE.md#pending-prefixes).
+- **Peer bootstrap (Kubernetes)**: `--kv-peer-selector
+  kubernetes.io/service-name=<router-service>` makes a new replica copy the KV
+  tree from a sibling before `/readyz` passes; see
+  [peer bootstrap](REFERENCE.md#peer-bootstrap-kubernetes).
+- **LoRA cache identity**: with workers that publish `BlockStored.lora_name`,
+  prefix matches are kept per adapter; see
+  [LoRA cache identity](REFERENCE.md#lora-cache-identity).
+
+### Operations
+
+- **No tokenizer**: `--no-tokenizer` for load-only policies (`power_of_two`,
+  `session_aware`); see [optional tokenizer](REFERENCE.md#optional-tokenizer-for-load-only-routing).
+- **Retries**: `--retry-max-attempts N` resends a request that failed before
+  any response to another worker; see [retries](REFERENCE.md#retries).
+- **Circuit breaker**: a worker leaves routing after `--cb-threshold`
+  consecutive failures; `--disable-circuit-breaker` turns this off; see
+  [circuit breaker](REFERENCE.md#circuit-breaker).
+- **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
+  engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
+  or cached prefix decides; see [DP-rank routing](REFERENCE.md#dp-rank-routing).
+- **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
+  decode only within the same engine version; see
+  [PD version groups](REFERENCE.md#pd-version-groups).
+- **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
+  see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
+- **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
+  parameters fleet-wide; `--sampling-param-conflict reject|allow` decides what
+  happens to requests that differ. See
+  [fleet-wide sampling contract](REFERENCE.md#fleet-wide-sampling-contract)
+  for parameter domains and null handling.
+- **Chat rendering**: use the same model files and chat-template settings on
+  router and workers, or set `--disable-input-ids-forwarding`.
+  `--tokenizer-backend fast` and `--tokenizer-l1-cache-mb N` speed up
+  tokenization.
+- **HTTP/2**: no configuration. h2c is used inbound when the client speaks it,
+  and outbound to workers that report `enable_http2`; see
+  [HTTP/2](REFERENCE.md#http2).
+- **Upgrading**: the `cache_aware_zmq` policy and the legacy cache and balance
+  threshold flags were removed; see
+  [upgrading](REFERENCE.md#upgrading-from-cache_aware_zmq).
 
 ## License
 

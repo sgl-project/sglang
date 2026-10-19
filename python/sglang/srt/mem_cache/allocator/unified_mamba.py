@@ -17,7 +17,7 @@ mamba-state end pools of one `UnifiedKVPool`."""
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Hashable, List, Optional, Sequence
 
 import torch
 from torch.profiler import record_function
@@ -349,6 +349,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
+    def prewarm_compaction(self) -> None:
+        """Prewarm the page-move path of every member that compacts."""
+        for allocator in self._move_gate_targets():
+            allocator.prewarm_compaction()
+
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
 
@@ -443,3 +448,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             ):
                 return 0
             return fa.flush_opportunistic() + ma.flush_opportunistic()
+
+    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
+        self.full_attn_allocator.set_hicache_transfer_done_event(transfer_key, event)
+        self.mamba_allocator.set_hicache_transfer_done_event(transfer_key, event)

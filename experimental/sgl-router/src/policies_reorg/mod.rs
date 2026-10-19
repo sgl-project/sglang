@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Side-by-side implementation of POLICY_DESIGN.md. Chat routing can opt into
+//! Routing policies described in ARCHITECTURE.md. Chat routing can opt into
 //! this interface through AppContext; `policies` remains the default.
 
 pub mod admission;
+mod affinity;
 pub mod cache_aware;
 pub mod factory;
 pub mod power_of_two;
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::discovery::{ModelId, WorkerId};
+use crate::state::kv_events::CacheNamespace;
 use crate::workers::Worker;
 
 pub use crate::discovery::WorkerMode as Stage;
@@ -26,10 +28,14 @@ pub struct PickRequest<'a> {
     pub model: &'a ModelId,
     pub stage: Stage,
     pub bucket: &'a str,
+    /// The longest prompt, for bucket fit and prefix matching.
     pub input_tokens: u64,
+    /// Every prompt in a batch, for load comparisons.
+    pub total_input_tokens: u64,
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
+    pub cache_namespace: &'a CacheNamespace,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
 }
@@ -41,9 +47,11 @@ impl<'a> PickRequest<'a> {
             stage,
             bucket: "",
             input_tokens,
+            total_input_tokens: input_tokens,
             expected_peak_tokens: None,
             prefix: None,
             token_ids: None,
+            cache_namespace: CacheNamespace::NONE,
             session_key: None,
             routing_key: None,
         }
@@ -102,7 +110,7 @@ pub trait Policy: Send + Sync + Debug {
         false
     }
 
-    /// Runs on a miss within the same candidates; never on an admission rejection.
+    /// Runs on a miss, rejected affinity, or a balanced-mode comparison.
     fn fallback(&self) -> Option<&dyn Policy> {
         None
     }

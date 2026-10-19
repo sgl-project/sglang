@@ -67,7 +67,7 @@ fn insert_params_mamba<'k>(
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
-        chunked: false,
+        inserted_len: 0,
         priority: 0,
         session_id: None,
         track_adopted_ranges: false,
@@ -157,6 +157,14 @@ fn set_full_host(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_, slot: i64) 
 
 fn lru_order(lru: &UnifiedLRUList) -> Vec<NodeIdx_> {
     lru.iter().collect()
+}
+
+#[test]
+#[should_panic(expected = "get_or_fill_uuid is unsupported for Mamba")]
+fn get_or_fill_uuid_rejects_mamba() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let [node] = chain::<1>(&mut tc);
+    mamba_component().get_or_fill_uuid(&mut tc, node, /* host = */ false);
 }
 
 #[test]
@@ -2394,7 +2402,7 @@ fn branching_from_a_host_full_hit_is_reusable_after_insert() {
     let result = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
     assert_eq!(result.best_match_node_id, a);
     assert_eq!(result.last_device_node_id, a);
-    assert_eq!(result.device_indices.numel(), 3);
+    assert_eq!(result.device_prefix_len, 3);
     assert_eq!(result.host_hit_length, 0);
     assert_eq!(result.full_kv_hit_length, 7);
     assert_eq!(result.mamba_branching_seqlen, Some(6));
@@ -2406,7 +2414,7 @@ fn branching_from_a_host_full_hit_is_reusable_after_insert() {
     ));
     assert!(!insert_result.mamba_exist);
     let second = tc.match_prefix(&match_params(&vec![1, 2, 3, 4, 5, 6, 7]));
-    assert_eq!(second.device_indices.numel(), 6);
+    assert_eq!(second.device_prefix_len, 6);
     assert_eq!(second.mamba_branching_seqlen, None);
 }
 

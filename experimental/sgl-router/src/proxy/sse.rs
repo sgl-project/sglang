@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
+//! Streaming passthrough: an SSE body for HTTP, a chunk stream for gRPC.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,11 +27,34 @@ pub enum StreamEndReason {
     PumpPanicked,
 }
 
+/// A stream the router ended itself; it reads as before, and a gRPC caller
+/// maps `reason` to the router's error contract.
+#[derive(Debug)]
+pub struct RouterStreamError {
+    pub reason: StreamEndReason,
+    message: String,
+}
+
+impl RouterStreamError {
+    fn io(reason: StreamEndReason, message: impl Into<String>) -> std::io::Error {
+        let message = message.into();
+        std::io::Error::other(Self { reason, message })
+    }
+}
+
+impl std::fmt::Display for RouterStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RouterStreamError {}
+
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
     pub reason: StreamEndReason,
-    /// An SSE error event (`data: {"error"...}`) rode the stream.
+    /// An SSE error event (`data: {"error"...}`) or native error abort rode the stream.
     pub saw_error_event: bool,
 }
 
@@ -39,9 +62,14 @@ pub struct StreamEnd {
 /// SSE-legal framing variants (no space after `data:`, whitespace after `{`),
 /// so the match is anchored to the spec rather than one serializer's bytes.
 fn is_error_event_line(line: &[u8]) -> bool {
-    line.strip_prefix(b"data:")
-        .map(|p| p.trim_ascii_start())
-        .and_then(|p| p.strip_prefix(b"{"))
+    line.strip_prefix(b"data:").is_some_and(is_error_payload)
+}
+
+/// A JSON payload whose first key is `error`: an SSE event's data or a gRPC chunk.
+pub(crate) fn is_error_payload(payload: &[u8]) -> bool {
+    payload
+        .trim_ascii_start()
+        .strip_prefix(b"{")
         .map(|p| p.trim_ascii_start())
         .is_some_and(|p| p.starts_with(b"\"error\""))
 }
@@ -49,11 +77,20 @@ fn is_error_event_line(line: &[u8]) -> bool {
 /// Line-start bytes that suffice to decide `is_error_event_line`.
 const LINE_PROBE: usize = 32;
 
+/// Native `/generate` streams an error as an abort with a status code,
+/// which a user abort leaves null; neither key can occur unescaped in a JSON string.
+const NATIVE_ABORT: &[u8] = br#""type":"abort""#;
+const NATIVE_STATUS: &[u8] = br#""status_code":"#;
+
 /// Finds error events emitted after an SSE response commits a 200.
 /// Line-anchored, so lookalike text inside event payloads cannot match.
 #[derive(Default)]
-struct ErrorEventScanner {
+pub struct ErrorEventScanner {
     line_start: Vec<u8>,
+    /// The current line's last bytes, so a native key split across chunks matches.
+    line_tail: Vec<u8>,
+    native_abort: bool,
+    native_status: bool,
 }
 
 impl ErrorEventScanner {
@@ -61,20 +98,58 @@ impl ErrorEventScanner {
         let mut hit = false;
         for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
             if i > 0 {
-                hit |= is_error_event_line(&self.line_start);
+                let native = self.native_abort && self.native_status;
+                hit |= is_error_event_line(&self.line_start)
+                    || (native && self.line_start.starts_with(b"data:"));
                 self.line_start.clear();
+                self.line_tail.clear();
+                (self.native_abort, self.native_status) = (false, false);
             }
             let room = LINE_PROBE - self.line_start.len();
             self.line_start
                 .extend_from_slice(&segment[..segment.len().min(room)]);
+            self.scan_native(segment);
         }
         hit
+    }
+
+    /// Look for the native error keys in `segment` and where it joins the line so far.
+    fn scan_native(&mut self, segment: &[u8]) {
+        let head = &segment[..segment.len().min(NATIVE_STATUS.len())];
+        let boundary = [self.line_tail.as_slice(), head].concat();
+        for hay in [boundary.as_slice(), segment] {
+            let quotes = hay.iter().enumerate().filter(|&(_, &b)| b == b'"');
+            for rest in quotes.map(|(i, _)| &hay[i..]) {
+                self.native_abort |= rest.starts_with(NATIVE_ABORT);
+                let status = rest.strip_prefix(NATIVE_STATUS).and_then(<[u8]>::first);
+                self.native_status |= status.is_some_and(u8::is_ascii_digit);
+            }
+        }
+        let keep = segment.len().min(NATIVE_STATUS.len());
+        self.line_tail
+            .extend_from_slice(&segment[segment.len() - keep..]);
+        let excess = self.line_tail.len().saturating_sub(NATIVE_STATUS.len());
+        self.line_tail.drain(..excess);
     }
 }
 
 /// Whether a buffered SSE body carries an error event.
 pub fn has_error_event(body: &[u8]) -> bool {
     ErrorEventScanner::default().feed(body)
+}
+
+/// An upstream item the pump forwards unchanged.
+pub trait PumpItem: Send + 'static {
+    /// Whether this item carries an error event; `scanner` keeps line state across items.
+    fn is_error_event(&self, _scanner: &mut ErrorEventScanner) -> bool {
+        false
+    }
+}
+
+impl PumpItem for Bytes {
+    fn is_error_event(&self, scanner: &mut ErrorEventScanner) -> bool {
+        scanner.feed(self)
+    }
 }
 
 /// Bounds on a streaming response beyond what the upstream stream itself provides.
@@ -88,7 +163,22 @@ pub struct StreamLimits {
     pub abort: Option<CancellationToken>,
 }
 
-/// Bridge a byte stream into an axum Body that streams chunks unchanged.
+/// Bridge a byte stream into an axum Body that streams chunks unchanged; see [`pump`].
+pub fn bytes_stream_to_body<S, E>(
+    stream: S,
+    guards: Option<Box<dyn Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
+    on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    limits: StreamLimits,
+) -> Body
+where
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Body::from_stream(pump(stream, guards, on_complete, on_first_byte, limits))
+}
+
+/// Forward upstream items unchanged.
 ///
 /// One tokio task pumps upstream chunks through a bounded 64-slot channel so a
 /// slow client backpressures the upstream read. The pump stops as soon as the
@@ -102,18 +192,20 @@ pub struct StreamLimits {
 ///
 /// `guards` is held until the pump finishes; `on_first_byte` runs on the first
 /// `Ok` chunk; `on_complete` runs exactly once with the final [`StreamEnd`].
-pub fn bytes_stream_to_body<S, E>(
+/// An upstream error is wrapped, not stringified, so a gRPC caller can recover its `Status`.
+pub fn pump<T, S, E>(
     mut stream: S,
     guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     mut on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
     limits: StreamLimits,
-) -> Body
+) -> impl futures::Stream<Item = Result<T, std::io::Error>> + Send + 'static
 where
-    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
-    E: std::fmt::Display + Send + Sync + 'static,
+    T: PumpItem,
+    S: futures::Stream<Item = Result<T, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<T>(64);
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut end = StreamEnd {
@@ -141,24 +233,24 @@ where
                 }
                 _ = expired => {
                     end.reason = StreamEndReason::Expired;
-                    Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"))
+                    Err(RouterStreamError::io(end.reason, "SSE stream exceeded stale_request_timeout"))
                 }
                 _ = aborted => {
                     end.reason = StreamEndReason::Aborted;
-                    Err(std::io::Error::other("SSE stream aborted by the router"))
+                    Err(RouterStreamError::io(end.reason, "SSE stream aborted by the router"))
                 }
                 result = async {
                     loop {
-                        let bytes = match tokio::time::timeout(idle, stream.next()).await {
+                        let item = match tokio::time::timeout(idle, stream.next()).await {
                             Ok(None) => return (StreamEndReason::Completed, Ok(())),
-                            Ok(Some(Ok(bytes))) => bytes,
+                            Ok(Some(Ok(item))) => item,
                             Ok(Some(Err(e))) => return (
                                 StreamEndReason::UpstreamError,
-                                Err(std::io::Error::other(e.to_string())),
+                                Err(std::io::Error::other(e)),
                             ),
                             Err(_) => return (
                                 StreamEndReason::IdleTimeout,
-                                Err(std::io::Error::other("SSE upstream idle timeout")),
+                                Err(RouterStreamError::io(StreamEndReason::IdleTimeout, "SSE upstream idle timeout")),
                             ),
                         };
                         started.store(true, Ordering::Relaxed);
@@ -166,9 +258,9 @@ where
                             hook();
                         }
                         if !end.saw_error_event {
-                            end.saw_error_event = scanner.feed(&bytes);
+                            end.saw_error_event = item.is_error_event(&mut scanner);
                         }
-                        if tx.send(bytes).await.is_err() {
+                        if tx.send(item).await.is_err() {
                             // Receiver gone; the `tx.closed()` arm reports the disconnect.
                             std::future::pending::<()>().await;
                         }
@@ -188,9 +280,10 @@ where
                     .copied()
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic payload>");
-                Err(std::io::Error::other(format!(
-                    "SSE pump panicked: {message}"
-                )))
+                Err(RouterStreamError::io(
+                    end.reason,
+                    format!("SSE pump panicked: {message}"),
+                ))
             }
         };
         if let Some(hook) = on_complete {
@@ -203,10 +296,13 @@ where
         futures::future::ready(match result {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(Err(error)),
-            Err(_) => Some(Err(std::io::Error::other("SSE pump cancelled"))),
+            Err(_) => Some(Err(RouterStreamError::io(
+                StreamEndReason::PumpPanicked,
+                "SSE pump cancelled",
+            ))),
         })
     });
-    Body::from_stream(ReceiverStream::new(rx).map(Ok).chain(terminal))
+    ReceiverStream::new(rx).map(Ok).chain(terminal)
 }
 
 async fn cancelled(token: Option<CancellationToken>) {
@@ -615,6 +711,23 @@ mod tests {
     }
 
     #[test]
+    fn error_event_scanner_detects_native_error_abort() {
+        let event = |reason: &str| {
+            format!("data: {{\"text\":\"\",\"meta_info\":{{\"finish_reason\":{reason}}}}}\n\n")
+        };
+        let error = event(r#"{"type":"abort","message":"boom","status_code":500}"#);
+        assert!(has_error_event(error.as_bytes()));
+        // A user abort (`/abort_request`) carries no status code; lookalike text is escaped.
+        let user = event(r#"{"type":"abort","message":"Aborted","status_code":null}"#);
+        assert!(!has_error_event(user.as_bytes()));
+        let text = r#"data: {"text":"\"type\":\"abort\",\"status_code\":500"}"#;
+        assert!(!has_error_event(format!("{text}\n\n").as_bytes()));
+        let mut scanner = ErrorEventScanner::default();
+        let bytes = error.as_bytes().chunks(1);
+        assert!(bytes.fold(false, |hit, byte| scanner.feed(byte) || hit));
+    }
+
+    #[test]
     fn error_event_scanner_detects_error_split_across_chunks() {
         let mut scanner = ErrorEventScanner::default();
         assert!(!scanner.feed(b"data: {\"err"));
@@ -651,6 +764,7 @@ mod tests {
         let big = vec![b'x'; 1 << 20];
         assert!(!scanner.feed(&big));
         assert_eq!(scanner.line_start.len(), LINE_PROBE);
+        assert_eq!(scanner.line_tail.len(), NATIVE_STATUS.len());
     }
 
     fn body_with_completion(

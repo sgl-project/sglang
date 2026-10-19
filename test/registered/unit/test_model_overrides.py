@@ -184,6 +184,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "attn_cp_size",
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
+                    "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
@@ -197,6 +198,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
+                    "enable_decoder_swa_bounded_replay",
                     "dsa_topk_backend",
                     "enable_dsa_fused_indexer",
                     "prefill_attention_backend",
@@ -213,10 +215,18 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "watermark_context_window",
+                    "watermark_default_enabled",
+                    "watermark_enforce_all",
+                    "watermark_key",
+                    "watermark_key_b",
+                    "watermark_max_probability",
+                    "watermark_mixing_probability",
                     "prefill_decode_interval",
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "mm_enable_dp_encoder",
                 }
             ),
         )
@@ -241,7 +251,11 @@ class TestBoundaryReductionDefaults(CustomTestCase):
             for architecture, default in (
                 ("Qwen3ForCausalLM", "ar"),
                 ("Qwen3Model", "ar"),
+                ("KimiK3ForConditionalGeneration", "ar"),
+                ("KimiK3LinearForCausalLM", "ar"),
                 ("MossVLForConditionalGeneration", "ar"),
+                ("Qwen4ExpForConditionalGeneration", "ar"),
+                ("Qwen4ExpForCausalLMMTP", "ar"),
                 ("BailingMoELinearForCausalLM", "rsv"),
                 ("BailingMoeV2_5ForCausalLM", "rsv"),
                 ("LongcatFlashForCausalLM", "rsv"),
@@ -1166,6 +1180,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 speculative_algorithm=None,
                 moe_runner_backend="auto",
+                moe_a2a_backend="none",
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
@@ -1178,6 +1193,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(
                 _mimo_v2_overrides(_args(), _hf("fp8")),
                 {"attention_backend": "fa4", "moe_runner_backend": "flashinfer_trtllm"},
+            )
+            # An all-to-all backend chooses its own runner (deepep_v2 accepts
+            # only deep_gemm), so the FP8 pin must not fire.
+            self.assertEqual(
+                _mimo_v2_overrides(_args(moe_a2a_backend="deepep_v2"), _hf("fp8")),
+                {"attention_backend": "fa4"},
             )
             # An explicit user choice is never overwritten.
             self.assertEqual(
@@ -1271,6 +1292,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=model_config,
             ),
             hf_config,
@@ -1339,6 +1363,78 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "attention_backend": "trtllm_mha",
                 },
             )
+
+    def test_nemotron_h_eplb_picks_routed_runner_on_sm100(self):
+        """flashinfer_trtllm cannot take the EPLB remap; with redundant experts it
+        fails its routing shape check at startup."""
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        for quantization in ("modelopt_fp4", "nvfp4_online"):
+            with self.subTest(quantization):
+                server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+                server_args.enable_eplb = True
+                server_args.ep_num_redundant_experts = 32
+                if quantization == "nvfp4_online":
+                    server_args.quantization = quantization
+                    server_args._model_config.quantization = quantization
+
+                with (
+                    override_platform(is_sm100=True),
+                    override_platform(is_blackwell=True),
+                ):
+                    overrides = _nemotron_h_overrides(server_args, hf_config)
+
+                self.assertEqual(
+                    overrides["moe_runner_backend"], "flashinfer_trtllm_routed"
+                )
+
+    def test_nemotron_h_expert_remap_validation(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _validate_expert_remap,
+        )
+
+        def puzzle(*n_routed_experts):
+            return SimpleNamespace(
+                block_configs=[
+                    {"block_type": "moe", "n_routed_experts": n}
+                    for n in n_routed_experts
+                ]
+                + [{"block_type": "mamba"}]
+            )
+
+        def args(moe_runner_backend, moe_a2a_backend="none"):
+            return SimpleNamespace(
+                enable_eplb=True,
+                moe_runner_backend=moe_runner_backend,
+                moe_a2a_backend=moe_a2a_backend,
+            )
+
+        dense = ("NemotronHForCausalLM", SimpleNamespace())
+        rejected = {
+            "flashinfer_trtllm": (args("flashinfer_trtllm"), *dense),
+            "cutedsl_without_a2a": (args("flashinfer_cutedsl"), *dense),
+            "puzzle_mixed_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 128),
+            ),
+        }
+        accepted = {
+            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "puzzle_equal_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 64),
+            ),
+        }
+        for name, (cfg, model_arch, hf_config) in rejected.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                _validate_expert_remap(cfg, hf_config, model_arch)
+        for name, (cfg, model_arch, hf_config) in accepted.items():
+            with self.subTest(name):
+                _validate_expert_remap(cfg, hf_config, model_arch)
 
     def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -1506,6 +1602,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             moe_runner_backend="auto",
             moe_a2a_backend="none",
             attention_backend=None,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
             _model_config=model_config,
         )
 
@@ -2221,6 +2320,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=mc,
             )
             defaults.update(kw)
@@ -2305,6 +2407,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {"speculative_moe_runner_backend": "triton"},
+        )
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend=None,
+                        moe_runner_backend="flashinfer_megamoe",
+                    )
+                )
+            ),
+            {"speculative_moe_runner_backend": "flashinfer_trtllm"},
         )
         # user-set draft backend survives
         self.assertEqual(
@@ -2723,7 +2836,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _deepseek_spec_moe_resolution(
                         _view(
-                            speculative_moe_runner_backend="triton",
+                            speculative_moe_runner_backend="flashinfer_trtllm",
                             speculative_moe_a2a_backend="none",
                         )
                     ),
@@ -3234,7 +3347,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=1,
                 # `use_mla_backend` reads the model configuration; a non-MLA
                 # one keeps these assertions about the page constraints.
-                _model_config=SimpleNamespace(attention_arch=None),
+                _model_config=SimpleNamespace(
+                    attention_arch=None, hf_config=SimpleNamespace(architectures=[])
+                ),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -3511,6 +3626,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 enable_prefill_cp=False,
                 dcp_size=1,
+                attn_cp_size=1,
+                moe_dense_tp_size=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -3585,18 +3702,35 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 "attn_cp_size": 8,
                             },
                         )
-                        # interleave CP with attention DP must assert
-                        with self.assertRaises(AssertionError):
-                            _deepseek_family_overrides(
+                        # Interleave keeps attention DP and the configured dense TP.
+                        for attn_dp_size, dense_tp_size, cp_size, expected_cp in (
+                            (1, None, 1, 8),
+                            (2, 8, 1, 4),
+                            (2, 1, 1, 4),
+                            # An explicit CP2 leaves two attention-TP ranks
+                            # within each DP group; it must not become CP4.
+                            (2, 8, 2, 2),
+                        ):
+                            result = _deepseek_family_overrides(
                                 _args(
                                     enable_prefill_cp=True,
                                     cp_strategy="interleave",
                                     tp_size=8,
                                     dp_size=1,
-                                    attn_dp_size=2,
+                                    attn_dp_size=attn_dp_size,
+                                    attn_cp_size=cp_size,
+                                    moe_dense_tp_size=dense_tp_size,
+                                    ep_size=1,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
                                 ),
                                 None,
                             )
+                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
+                            self.assertEqual(result["attn_cp_size"], expected_cp)
+                            self.assertNotIn("moe_dense_tp_size", result)
+                            self.assertNotIn("ep_size", result)
+                            self.assertNotIn("moe_a2a_backend", result)
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(

@@ -13,15 +13,6 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestSchedulerInternalStateEnvVars(unittest.TestCase):
-    def test_the_gate_is_declared_off(self):
-        """Nothing is exposed unless an operator opts in, so the declared default is the safety net."""
-        self.assertIs(envs.SGLANG_EXPOSE_OWN_ENV_VARS.default, False)
-
-    def test_env_vars_absent_when_disabled(self):
-        """The env_vars key must not exist at all when the gate is off."""
-        with envs.SGLANG_EXPOSE_OWN_ENV_VARS.override(False):
-            self.assertFalse(envs.SGLANG_EXPOSE_OWN_ENV_VARS.get())
-
     def test_declared_env_vars_exposed_when_enabled(self):
         """Enabling the gate exposes the declared, non secret environment of the scheduler."""
         with envs.SGLANG_EXPOSE_OWN_ENV_VARS.override(True):

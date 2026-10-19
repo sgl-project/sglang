@@ -300,7 +300,14 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             component = target_cls(**params)
 
         if weights is not None:
-            component.load_state_dict(weights, strict=False)
+            # Extra checkpoint keys are tolerated, but a weight the module expects and
+            # the checkpoint lacks would stay randomly initialized and corrupt outputs.
+            missing = component.load_state_dict(weights, strict=False).missing_keys
+            if missing:
+                raise RuntimeError(
+                    f"{cfg['target']} checkpoint is missing {len(missing)} weights, "
+                    f"e.g. {missing[:5]}"
+                )
 
         component.to(device=device, dtype=dtype)
         return component.eval()

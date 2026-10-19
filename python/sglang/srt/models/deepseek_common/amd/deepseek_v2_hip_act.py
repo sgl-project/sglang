@@ -10,6 +10,7 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
     silu_and_mul_clamp_fp8_grid_supported,
     silu_and_mul_clamp_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
 
@@ -33,7 +34,9 @@ def resolve_fused_clamp_route(mlp, half_width: int) -> None:
             quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_native()
             or quant_method.mxfp8_dense_backend.is_gfx95_mxfp8_aiter()
         )
-        and silu_and_mul_clamp_fp8_grid_supported(half_width)
+        and silu_and_mul_clamp_fp8_grid_supported(
+            half_width, multi_block=envs.SGLANG_HIP_SHARED_ACT_MXFP8.get()
+        )
     )
     # the native and aiter MXFP8 routes take fp8 + ue8m0 straight from the epilogue
     mlp._hip_act_native_consumer = bool(
