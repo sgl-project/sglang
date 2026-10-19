@@ -1,19 +1,14 @@
 """
 Correctness tests for DSA Indexer K/S Buffer Access with Fused Triton Kernels.
 
-This test verifies that the optimized Triton implementations (GetK, GetS, GetKAndS)
-produce identical results to the torch_fast baseline implementations.
-
-Test coverage:
-- GetK.triton() vs GetK.torch_fast()
-- GetS.triton() vs GetS.torch_fast()
-- GetKAndS.triton() vs separate GetK.torch_fast() + GetS.torch_fast()
+This test verifies that GetKAndS.triton() produces identical results to a
+torch gather of the K and S regions of the paged buffer.
 """
 
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsa.index_buf_accessor import GetK, GetKAndS, GetS
+from sglang.kernels.ops.attention.dsa.index_buf_accessor import GetKAndS
 
 
 class MockDSATokenToKVPool:
@@ -26,7 +21,7 @@ class MockDSATokenToKVPool:
         quant_block_size: int = 128,
         device: str = "cuda",
     ):
-        self.page_size = page_size
+        self.index_page_size = page_size
         self.index_head_dim = index_head_dim
         self.quant_block_size = quant_block_size
         self.device = device
@@ -61,190 +56,30 @@ def create_test_buffer(
     return buf
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestGetK:
-    """Test cases for GetK.triton() correctness."""
-
-    @pytest.mark.parametrize("num_pages", [1, 2, 4, 8, 16])
-    @pytest.mark.parametrize("seq_len", [64, 128, 256, 512, 1024])
-    @pytest.mark.parametrize("page_size", [64])
-    @pytest.mark.parametrize("index_head_dim", [128])
-    def test_getk_correctness(self, num_pages, seq_len, page_size, index_head_dim):
-        """Test GetK.triton() produces same output as GetK.torch_fast()."""
-        device = torch.device("cuda")
-
-        # Ensure seq_len doesn't exceed available pages
-        max_seq_len = num_pages * page_size
-        seq_len = min(seq_len, max_seq_len)
-
-        # Create mock pool
-        pool = MockDSATokenToKVPool(
-            page_size=page_size, index_head_dim=index_head_dim, device=device
-        )
-
-        # Create test buffer
-        buf = create_test_buffer(
-            num_pages=num_pages,
-            page_size=page_size,
-            index_head_dim=index_head_dim,
-            device=device,
-        )
-
-        # Create page indices
-        num_pages_needed = (seq_len + page_size - 1) // page_size
-        page_indices = torch.randint(
-            0, num_pages, (num_pages_needed,), dtype=torch.int32, device=device
-        )
-
-        # Run both implementations
-        output_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        output_triton = GetK.triton(pool, buf, seq_len, page_indices)
-
-        # Verify shapes
-        assert output_torch.shape == (seq_len, index_head_dim)
-        assert output_triton.shape == (seq_len, index_head_dim)
-        assert output_torch.dtype == torch.uint8
-        assert output_triton.dtype == torch.uint8
-
-        # Compare results (should be exact match)
-        torch.testing.assert_close(
-            output_triton, output_torch, rtol=0, atol=0, msg="GetK outputs differ"
-        )
-
-    def test_getk_sequential_pages(self):
-        """Test GetK with sequential page indices."""
-        device = torch.device("cuda")
-        page_size = 64
-        index_head_dim = 128
-        num_pages = 10
-        seq_len = 320  # 5 pages
-
-        pool = MockDSATokenToKVPool(
-            page_size=page_size, index_head_dim=index_head_dim, device=device
-        )
-        buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
-
-        # Sequential page indices [0, 1, 2, 3, 4]
-        page_indices = torch.arange(5, dtype=torch.int32, device=device)
-
-        output_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        output_triton = GetK.triton(pool, buf, seq_len, page_indices)
-
-        torch.testing.assert_close(output_triton, output_torch, rtol=0, atol=0)
-
-    def test_getk_repeated_pages(self):
-        """Test GetK with repeated page indices."""
-        device = torch.device("cuda")
-        page_size = 64
-        index_head_dim = 128
-        num_pages = 5
-        seq_len = 192  # 3 pages
-
-        pool = MockDSATokenToKVPool(
-            page_size=page_size, index_head_dim=index_head_dim, device=device
-        )
-        buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
-
-        # Repeated page indices [2, 2, 2]
-        page_indices = torch.full((3,), 2, dtype=torch.int32, device=device)
-
-        output_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        output_triton = GetK.triton(pool, buf, seq_len, page_indices)
-
-        torch.testing.assert_close(output_triton, output_torch, rtol=0, atol=0)
+def torch_get_k(pool, buf, seq_len: int, page_indices: torch.Tensor):
+    """Gather (seq_len, index_head_dim) uint8 K bytes from the paged buffer."""
+    num_k_bytes_per_page = pool.index_page_size * pool.index_head_dim
+    flat_indices = (page_indices * buf.shape[1])[:, None] + torch.arange(
+        num_k_bytes_per_page, dtype=torch.int32, device=buf.device
+    )[None, :]
+    flat_indices = flat_indices.flatten()[: seq_len * pool.index_head_dim]
+    return buf.flatten()[flat_indices].view(-1, pool.index_head_dim)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestGetS:
-    """Test cases for GetS.triton() correctness."""
-
-    @pytest.mark.parametrize("num_pages", [1, 2, 4, 8, 16])
-    @pytest.mark.parametrize("seq_len", [64, 128, 256, 512, 1024])
-    @pytest.mark.parametrize("page_size", [64])
-    @pytest.mark.parametrize("index_head_dim", [128])
-    def test_gets_correctness(self, num_pages, seq_len, page_size, index_head_dim):
-        """Test GetS.triton() produces same output as GetS.torch_fast()."""
-        device = torch.device("cuda")
-
-        # Ensure seq_len doesn't exceed available pages
-        max_seq_len = num_pages * page_size
-        seq_len = min(seq_len, max_seq_len)
-
-        # Create mock pool
-        pool = MockDSATokenToKVPool(
-            page_size=page_size, index_head_dim=index_head_dim, device=device
-        )
-
-        # Create test buffer
-        buf = create_test_buffer(
-            num_pages=num_pages,
-            page_size=page_size,
-            index_head_dim=index_head_dim,
-            device=device,
-        )
-
-        # Create page indices
-        num_pages_needed = (seq_len + page_size - 1) // page_size
-        page_indices = torch.randint(
-            0, num_pages, (num_pages_needed,), dtype=torch.int32, device=device
-        )
-
-        # Run both implementations
-        output_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
-        output_triton = GetS.triton(pool, buf, seq_len, page_indices)
-
-        # Verify shapes
-        assert output_torch.shape == (seq_len, 4)
-        assert output_triton.shape == (seq_len, 4)
-        assert output_torch.dtype == torch.uint8
-        assert output_triton.dtype == torch.uint8
-
-        # Compare results (should be exact match)
-        torch.testing.assert_close(
-            output_triton, output_torch, rtol=0, atol=0, msg="GetS outputs differ"
-        )
-
-    def test_gets_sequential_pages(self):
-        """Test GetS with sequential page indices."""
-        device = torch.device("cuda")
-        page_size = 64
-        index_head_dim = 128
-        num_pages = 10
-        seq_len = 320  # 5 pages
-
-        pool = MockDSATokenToKVPool(
-            page_size=page_size, index_head_dim=index_head_dim, device=device
-        )
-        buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
-
-        # Sequential page indices [0, 1, 2, 3, 4]
-        page_indices = torch.arange(5, dtype=torch.int32, device=device)
-
-        output_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
-        output_triton = GetS.triton(pool, buf, seq_len, page_indices)
-
-        torch.testing.assert_close(output_triton, output_torch, rtol=0, atol=0)
-
-    def test_gets_repeated_pages(self):
-        """Test GetS with repeated page indices."""
-        device = torch.device("cuda")
-        page_size = 64
-        index_head_dim = 128
-        num_pages = 5
-        seq_len = 192  # 3 pages
-
-        pool = MockDSATokenToKVPool(
-            page_size=page_size, index_head_dim=index_head_dim, device=device
-        )
-        buf = create_test_buffer(num_pages, page_size, index_head_dim, device)
-
-        # Repeated page indices [2, 2, 2]
-        page_indices = torch.full((3,), 2, dtype=torch.int32, device=device)
-
-        output_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
-        output_triton = GetS.triton(pool, buf, seq_len, page_indices)
-
-        torch.testing.assert_close(output_triton, output_torch, rtol=0, atol=0)
+def torch_get_s(pool, buf, seq_len: int, page_indices: torch.Tensor):
+    """Gather (seq_len, 4) uint8 fp32-scale bytes from the paged buffer."""
+    s_offset_in_page = pool.index_page_size * pool.index_head_dim
+    num_s_bytes_per_page = buf.shape[1] - s_offset_in_page
+    num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
+    flat_indices = (
+        (page_indices * buf.shape[1])[:, None]
+        + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device=buf.device)[
+            None, :
+        ]
+        + s_offset_in_page
+    )
+    flat_indices = flat_indices.flatten()[: seq_len * num_s_bytes_per_token]
+    return buf.flatten()[flat_indices].view(-1, 4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -258,7 +93,7 @@ class TestGetKAndS:
     def test_get_k_and_s_correctness(
         self, num_pages, seq_len, page_size, index_head_dim
     ):
-        """Test GetKAndS.triton() produces same output as separate torch_fast calls."""
+        """Test GetKAndS.triton() produces same output as the torch gathers."""
         device = torch.device("cuda")
 
         # Ensure seq_len doesn't exceed available pages
@@ -286,9 +121,9 @@ class TestGetKAndS:
         )
         page_indices_ = page_indices.unsqueeze(0)
 
-        # Run baseline: separate torch_fast calls
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
+        # Run baseline: separate torch gathers
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
 
         # Run fused Triton implementation
         k_triton, s_triton = GetKAndS.triton(
@@ -336,8 +171,8 @@ class TestGetKAndS:
         page_indices_ = page_indices.unsqueeze(0)
 
         # Baseline
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
 
         # Fused
         k_triton, s_triton = GetKAndS.triton(
@@ -366,8 +201,8 @@ class TestGetKAndS:
         page_indices_ = page_indices.unsqueeze(0)
 
         # Baseline
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
 
         # Fused
         k_triton, s_triton = GetKAndS.triton(
@@ -396,8 +231,8 @@ class TestGetKAndS:
         page_indices_ = page_indices.unsqueeze(0)
 
         # Baseline
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
 
         # Fused
         k_triton, s_triton = GetKAndS.triton(
@@ -429,22 +264,13 @@ class TestEdgeCases:
         page_indices = torch.tensor([0], dtype=torch.int32, device=device)
         page_indices_ = page_indices.unsqueeze(0)
 
-        # Test GetK
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        k_triton = GetK.triton(pool, buf, seq_len, page_indices)
-        torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
-
-        # Test GetS
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
-        s_triton = GetS.triton(pool, buf, seq_len, page_indices)
-        torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
-
-        # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(
             pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
         )
-        torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
-        torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
+        torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
+        torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
     def test_exact_page_boundary(self):
         """Test when seq_len exactly matches page boundaries."""
@@ -462,22 +288,13 @@ class TestEdgeCases:
         page_indices = torch.arange(3, dtype=torch.int32, device=device)
         page_indices_ = page_indices.unsqueeze(0)
 
-        # Test GetK
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        k_triton = GetK.triton(pool, buf, seq_len, page_indices)
-        torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
-
-        # Test GetS
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
-        s_triton = GetS.triton(pool, buf, seq_len, page_indices)
-        torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
-
-        # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(
             pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
         )
-        torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
-        torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
+        torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
+        torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
     def test_large_seq_len(self):
         """Test with large sequence length."""
@@ -499,22 +316,13 @@ class TestEdgeCases:
         )
         page_indices_ = page_indices.unsqueeze(0)
 
-        # Test GetK
-        k_torch = GetK.torch_fast(pool, buf, seq_len, page_indices)
-        k_triton = GetK.triton(pool, buf, seq_len, page_indices)
-        torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
-
-        # Test GetS
-        s_torch = GetS.torch_fast(pool, buf, seq_len, page_indices)
-        s_triton = GetS.triton(pool, buf, seq_len, page_indices)
-        torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
-
-        # Test GetKAndS
-        k_triton2, s_triton2 = GetKAndS.triton(
+        k_torch = torch_get_k(pool, buf, seq_len, page_indices)
+        s_torch = torch_get_s(pool, buf, seq_len, page_indices)
+        k_triton, s_triton = GetKAndS.triton(
             pool, buf, page_indices_, seq_len_tensor, seq_len, seq_len
         )
-        torch.testing.assert_close(k_triton2, k_torch, rtol=0, atol=0)
-        torch.testing.assert_close(s_triton2, s_torch, rtol=0, atol=0)
+        torch.testing.assert_close(k_triton, k_torch, rtol=0, atol=0)
+        torch.testing.assert_close(s_triton, s_torch, rtol=0, atol=0)
 
 
 def print_test_summary():
@@ -522,10 +330,7 @@ def print_test_summary():
     print("\n" + "=" * 80)
     print("DSA Indexer K/S Buffer Accessor Correctness Tests")
     print("=" * 80)
-    print("Testing Triton implementations against torch_fast baseline:")
-    print("  - GetK.triton() vs GetK.torch_fast()")
-    print("  - GetS.triton() vs GetS.torch_fast()")
-    print("  - GetKAndS.triton() vs separate GetK/GetS torch_fast() calls")
+    print("Testing GetKAndS.triton() against separate torch K/S gathers")
     print("=" * 80)
     print()
 
@@ -540,24 +345,6 @@ if __name__ == "__main__":
 
     # Run a few sample tests
     print("Running sample correctness tests...\n")
-
-    # Test GetK
-    print("Testing GetK...")
-    test_getk = TestGetK()
-    test_getk.test_getk_correctness(
-        num_pages=4, seq_len=256, page_size=64, index_head_dim=128
-    )
-    test_getk.test_getk_sequential_pages()
-    print("✓ GetK tests passed\n")
-
-    # Test GetS
-    print("Testing GetS...")
-    test_gets = TestGetS()
-    test_gets.test_gets_correctness(
-        num_pages=4, seq_len=256, page_size=64, index_head_dim=128
-    )
-    test_gets.test_gets_sequential_pages()
-    print("✓ GetS tests passed\n")
 
     # Test GetKAndS
     print("Testing GetKAndS SeqLen=256...")

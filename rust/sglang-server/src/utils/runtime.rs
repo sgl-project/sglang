@@ -453,6 +453,8 @@ mod tests {
             )],
             prompt_tokens: vec![3],
             tok_lens: vec![output_ids.len() as u32],
+            cached_tokens: vec![0],
+            reasoning_tokens: vec![0],
             ..Default::default()
         };
         let header = rmp_serde::to_vec(&header).unwrap();
