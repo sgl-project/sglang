@@ -245,7 +245,7 @@ def all_gather_matmul(x, weight, group, *, backend: str = "auto"):
     import cutlass
     import cutlass.cute as cute
 
-    from sglang.kernels.ops.gemm.cutlass_all_gather_gemm import (
+    from sglang.kernels.ops.communication.cutlass_all_gather_gemm import (
         PersistentDenseGemmKernel,
         ReleaseFlagSet,
     )
@@ -334,7 +334,7 @@ def matmul_reduce_scatter(x, weight, group):
     import cutlass
     import cutlass.cute as cute
 
-    from sglang.kernels.ops.gemm.cutlass_gemm_reduce_scatter import (
+    from sglang.kernels.ops.communication.cutlass_gemm_reduce_scatter import (
         Sm100PersistentDenseGemmReduceScatterLDMCKernel,
     )
 

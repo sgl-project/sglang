@@ -216,7 +216,9 @@ def column_parallel_g_matmul(
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
         if getattr(linear, "_sp_use_cutlass", False):
-            from sglang.kernels.ops.gemm.sp_collective_gemm import all_gather_matmul
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                all_gather_matmul,
+            )
 
             return all_gather_matmul(
                 input_parallel.contiguous(),
@@ -252,7 +254,9 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
         if getattr(linear, "_sp_use_cutlass", False):
-            from sglang.kernels.ops.gemm.sp_collective_gemm import matmul_reduce_scatter
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                matmul_reduce_scatter,
+            )
 
             return matmul_reduce_scatter(
                 x, linear.weight, get_parallel().tp_group.device_group
