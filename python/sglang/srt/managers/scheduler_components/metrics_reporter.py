@@ -83,6 +83,19 @@ class _CacheHitRateWindow:
         return self.hit_tokens / self.total_tokens if self.total_tokens > 0 else 0.0
 
 
+def _prefill_cache_hit_rate(
+    effective_hit_tokens: int, total_tokens: int
+) -> Optional[float]:
+    """Prefix-cache hit rate for one prefill report.
+
+    Returns None when the report carried no prefill tokens: there is nothing to
+    measure, and publishing 0.0 would read as a total cache miss.
+    """
+    if total_tokens <= 0:
+        return None
+    return effective_hit_tokens / total_tokens
+
+
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     """Sync-free sum of seq_lens for decode metrics."""
     if batch.seq_lens_cpu is not None:
@@ -808,14 +821,21 @@ class SchedulerMetricsReporter:
                 prefill_stats.log_hit_tokens - prefill_stats.reprocessed_log_hit_tokens
             )
             total_tokens = effective_input_tokens + effective_hit_tokens
-            cache_hit_rate = (
-                effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
-            )
             self.recent_cache_hit_rate = self.cache_hit_rate_window.add(
                 effective_hit_tokens,
                 total_tokens,
                 now,
             )
+            # A report with no prefill tokens carries no cache information, so it
+            # must not publish a 0.0: overwriting the gauge there makes
+            # avg_over_time()/Grafana read a healthy ~96% cache as broken. Leave
+            # the last known rate in place instead (mirrors the decode-path guard
+            # in report_decode_stats).
+            cache_hit_rate = _prefill_cache_hit_rate(
+                effective_hit_tokens, total_tokens
+            )
+            if cache_hit_rate is not None:
+                self.stats.cache_hit_rate = cache_hit_rate
             self.metrics_collector.increment_effective_prefill_tokens(
                 input_tokens=effective_input_tokens,
                 device_hit_tokens=prefill_stats.log_device_hit_tokens,
@@ -839,7 +859,6 @@ class SchedulerMetricsReporter:
                 self.scheduler.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-            self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
             self.stats.gen_throughput = self._current_gen_throughput(now)
