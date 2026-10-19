@@ -583,6 +583,10 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
@@ -591,6 +595,20 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     on the current stream instead of synchronizing like a pageable copy."""
     pin = is_pin_memory_available(device)
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+
+
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
@@ -3281,6 +3299,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
@@ -4436,7 +4455,9 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-def freeze_gc(context: str):
+def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
+    if gc_threshold is not None:
+        gc.set_threshold(*gc_threshold)
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
