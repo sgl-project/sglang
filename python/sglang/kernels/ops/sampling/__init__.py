@@ -12,7 +12,6 @@ from sglang.kernels.spec import (
     CUDA_ONLY,
     CapabilityRequirement,
     DeviceType,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
 )
@@ -64,10 +63,6 @@ register_kernel(
         backend=KernelBackend.AOT,
         target="sgl_kernel.sampling:top_k_renorm_probs",
         capabilities=frozenset((CapabilityRequirement.CUDA,)),
-        format_signature=FormatSignature(
-            description="renormalize probs by top-k thresholding; returns tensor"
-        ),
-        description="Top-k probability renormalization (sgl_kernel wheel).",
     )
 )
 register_kernel(
@@ -76,10 +71,6 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.renorm_triton:top_k_renorm_probs_triton",
         capabilities=frozenset((CapabilityRequirement.HIP,)),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="threshold-based top-k probability renormalization",
-        ),
     )
 )
 register_kernel(
@@ -94,10 +85,6 @@ register_kernel(
                 CapabilityRequirement(device=DeviceType.CPU),
             )
         ),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="portable threshold-based top-k probability renormalization",
-        ),
     )
 )
 register_kernel(
@@ -106,10 +93,6 @@ register_kernel(
         backend=KernelBackend.AOT,
         target="sgl_kernel.sampling:top_p_renorm_probs",
         capabilities=frozenset((CapabilityRequirement.CUDA,)),
-        format_signature=FormatSignature(
-            description="renormalize probs by top-p thresholding; returns tensor"
-        ),
-        description="Top-p probability renormalization (sgl_kernel wheel).",
     )
 )
 register_kernel(
@@ -118,10 +101,6 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.sampling.renorm_triton:top_p_renorm_probs_triton",
         capabilities=frozenset((CapabilityRequirement.HIP,)),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="threshold-based nucleus probability renormalization",
-        ),
     )
 )
 register_kernel(
@@ -135,10 +114,6 @@ register_kernel(
                 CapabilityRequirement.NPU,
                 CapabilityRequirement(device=DeviceType.CPU),
             )
-        ),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32",),
-            description="portable nucleus probability renormalization",
         ),
     )
 )
