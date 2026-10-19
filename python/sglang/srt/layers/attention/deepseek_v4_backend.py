@@ -3314,8 +3314,14 @@ class DeepseekV4AttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
             is_in_breakable_cuda_graph,
         )
+        from sglang.srt.models.deepseek_v4_replay_tail import in_replay_tail_graph
 
-        return self.low_ratio_prefill_graph and is_in_breakable_cuda_graph()
+        # Decoder tail graphs run the low-ratio sources as an eager break.
+        return (
+            self.low_ratio_prefill_graph
+            and is_in_breakable_cuda_graph()
+            and not in_replay_tail_graph()
+        )
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:
         # Projection layout and fused-write support are fixed together at load time.
@@ -4567,7 +4573,7 @@ class DeepseekV4AttnBackend(
             return BuildDsparkSwaRingIndices.execute(
                 seq_lens_casual=seq_lens_casual,
                 req_pool_indices_repeated=req_pool_indices_repeated,
-                valid_from=pool.swa_req_ring_valid_from,
+                valid_from=pool.swa_valid_from,
                 ring_size=pool.swa_req_ring_size,
                 block_size=block_size,
                 swa_window=SWA_WINDOW,
@@ -4578,6 +4584,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices_repeated=req_pool_indices_repeated,
             block_size=block_size,
             swa_window=SWA_WINDOW,
+            valid_from=pool.swa_valid_from,
         )
 
         swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(
