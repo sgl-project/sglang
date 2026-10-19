@@ -16,8 +16,6 @@ host_pool`. They verify:
 
 import logging
 import os
-import random
-import time
 import unittest
 from typing import Dict
 
@@ -35,11 +33,6 @@ from sglang.test.ascend.test_ascend_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
-)
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_pd_server,
-    popen_with_error_check,
 )
 
 register_npu_ci(est_time=400, suite="base-b-test-17-npu-a3")
@@ -87,11 +80,15 @@ class TestPDDecodeRetractionBackup(PDDisaggregationServerBase):
     decode_base_gpu_id = 0
     extra_prefill_env = {
         "ASCEND_RT_VISIBLE_DEVICES": os.getenv("PD_PREFILL_DEV", "1"),
-        "ASCEND_MF_STORE_URL": os.getenv("ASCEND_MF_STORE_URL", "tcp://127.0.0.1:24667"),
+        "ASCEND_MF_STORE_URL": os.getenv(
+            "ASCEND_MF_STORE_URL", "tcp://127.0.0.1:24667"
+        ),
     }
     extra_decode_env = {
         "ASCEND_RT_VISIBLE_DEVICES": os.getenv("PD_DECODE_DEV", "8"),
-        "ASCEND_MF_STORE_URL": os.getenv("ASCEND_MF_STORE_URL", "tcp://127.0.0.1:24667"),
+        "ASCEND_MF_STORE_URL": os.getenv(
+            "ASCEND_MF_STORE_URL", "tcp://127.0.0.1:24667"
+        ),
     }
 
     @classmethod
@@ -99,7 +96,9 @@ class TestPDDecodeRetractionBackup(PDDisaggregationServerBase):
         super().setUpClass()
         # The repo constant points at the CI model cache. It can be overridden via
         # env for local runs where the cache path is not populated.
-        cls.model = os.getenv("SGLANG_TEST_WEIGHTS_PATH") or LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+        cls.model = (
+            os.getenv("SGLANG_TEST_WEIGHTS_PATH") or LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+        )
         cls.tokenizer = get_tokenizer(cls.model)
         cls.launch_all()
 
@@ -141,7 +140,9 @@ class TestPDDecodeRetractionBackup(PDDisaggregationServerBase):
         # the reserved prefill KV is retracted to the host pool and re-fetched, so the
         # completion can legitimately end with either `stop` (EOS) or `length`
         # (max_new_tokens reached). Both are valid proof the PD pipeline is alive.
-        self.assertIn(response["meta_info"]["finish_reason"]["type"], ("stop", "length"))
+        self.assertIn(
+            response["meta_info"]["finish_reason"]["type"], ("stop", "length")
+        )
 
     def test_decode_side_npu_host_pool_config_resolved(self):
         """The decode server must resolve the NPU host-pool wiring.
