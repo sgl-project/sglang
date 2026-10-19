@@ -87,36 +87,117 @@ latency, throughput, and prefix-cache metrics.
 
 ### Closed-loop workloads
 
-`OFFLINE` can optionally coordinate virtual time with an external workload
-driver. Leave `SGLANG_SIMULATOR_COORDINATOR` unset to retain the existing
-`OFFLINE` and `BLOCKING` behavior. Coordination is incompatible with `BLOCKING`.
+In a closed-loop workload, request completion or a tool timer determines the next
+request. The **workload driver** owns these dependencies, its dataset parser,
+concurrency, warmup, and stopping conditions. The **simulator** owns model request
+scheduling, cache state, and predicted execution time. No dataset schema or agent
+framework is required by the server.
 
-In the server terminal, use the existing launch command below with:
+Clients can use either existing execution mode:
+
+| | `BLOCKING`: real time | `OFFLINE` with coordinator: fast-forward |
+|---|---|---|
+| Client | An ordinary HTTP workload driver. | A driver using the coordinator protocol. |
+| Timing | Predicted batch latency is spent sleeping; client timers use real time. | Client and server advance virtual time together. |
+| Metrics | Client measurements include HTTP, tokenization, and scheduling overhead. | The driver uses simulator timestamps. |
+
+Both paths use the same scheduler, cache, and latency predictor. The model output
+is synthetic: the driver must supply response history and workload dependencies
+when replaying a trace. These runs do not evaluate generated answers or agents
+choosing tools from model output. Results depend on the predictor data;
+the bundled replay table is an example, not a hardware performance calibration.
+
+#### Real-time HTTP clients
+
+Start a small example server from the repository root:
+
+```bash
+export SGLANG_USE_CPU_ENGINE=1
+export CUDA_VISIBLE_DEVICES=""
+export SGLANG_SIMULATOR_OUTPUT_MODE=BLOCKING
+unset SGLANG_SIMULATOR_COORDINATOR
+
+python3 -m sglang_simulator.simulation.sglang.launch_server \
+  --model-path tools/sglang-simulator/test/assets/qwen3-8b \
+  --tokenizer-path tools/sglang-simulator/examples/assets/tokenizer \
+  --chat-template chatml \
+  --sim-config-path tools/sglang-simulator/examples/sim_configs/replay.json \
+  --max-total-tokens 8192 \
+  --disable-overlap-schedule \
+  --skip-server-warmup \
+  --port 30000
+```
+
+Point an HTTP driver at `http://127.0.0.1:30000`. It can use `/generate` or the
+OpenAI-compatible API and issue dependent requests after responses and tool
+waits. No coordinator integration is needed. Requests can run concurrently, but
+a five-second tool wait takes five real seconds. For actual traces, replace the
+example model configuration and tokenizer and set cache capacity for the workload.
+Compare client wall-time metrics separately from simulator logical-time metrics.
+
+#### Fast-forward clients
+
+Restart the server with the same launch command and these environment settings:
 
 ```bash
 export SGLANG_SIMULATOR_OUTPUT_MODE=OFFLINE
 export SGLANG_SIMULATOR_COORDINATOR=tcp://127.0.0.1:30001
 ```
 
-Then run the two-request example from the repository root:
+Run the two-request example:
 
 ```bash
 python3 tools/sglang-simulator/examples/closed_loop.py --tool-delay 5
 ```
 
-The five-second tool delay advances virtual time without sleeping for five
-seconds. The example uses the existing `/generate` endpoint. OpenAI HTTP/SSE
-requests can use the same protocol by including the request `rid` in the body.
-One server handles one coordinated run; restart it for a fresh run and cache.
+The tool delay advances virtual time without sleeping. For parallel branches
+and a join, restart the server and run
+`python3 tools/sglang-simulator/examples/fork_join.py --tool-delay 5`.
+Both examples use `/generate`; see [the example guide](examples/README.md) to
+adapt the event loop to another dataset. OpenAI HTTP/SSE requests use the same
+protocol by including `rid` in the body. One server handles one run; restarting
+gives the next run a clean clock and cache.
 
-A driver sends `Ready` after processing all work at the current time, listing
-its ordered `Submit`/`Cancel` operations and earliest timer. The simulator waits
-for all listed payloads, then replies with `Grant` at the next visible event.
-Normal completion requires both the HTTP result and its matching Grant terminal.
-Use unique, equal-length request IDs within a run. HTTP connections must not wait
-for earlier responses before sending the rest of a round; the example uses a
-dedicated aiohttp pool with no connection admission limit. Workload credits, not
-the physical pool, control simulated concurrency.
+Plain `OFFLINE` cannot account for a client's future requests or tool waits.
+Use `BLOCKING` for clients without coordinator support. Coordination itself
+requires `OFFLINE`.
+
+#### Driver contract
+
+The protocol uses conservative event synchronization: the server advances only
+when the driver has accounted for all work at the current virtual time. The
+transport is JSON over a loopback ZeroMQ REQ/REP connection, separate from HTTP.
+[`AsyncCoordinatorClient`](src/sglang_simulator/simulation/client.py) implements
+the exchange; it does not execute workloads.
+
+Protocol version 1 has two messages:
+
+| Message | Fields |
+|---|---|
+| `Ready` | Stable `run_id`, sequential `round` starting at 0, ordered `operations` (`{"type":"submit","rid":"..."}` or `{"type":"cancel","rid":"..."}`), optional `next_wakeup_ns`, and `finished`. A cancel may include `reason`. |
+| `Grant` | Matching `run_id` and `round`, `now_ns`, `terminals` (`rid`, `kind`, `at_ns`, optional `reason`), and `status` (`CONTINUE`, `FINISHED`, or `ERROR` with `error`). Terminal kinds are `COMPLETED`, `CANCELLED`, and `ERROR`. |
+
+Both carry `protocol_version: 1`; only one `Ready` may be outstanding. All times
+are integer nanoseconds relative to the run. The earliest pending client timer
+is `next_wakeup_ns`; omit it when no timer is pending. Each round follows these rules:
+
+1. Process current completions and timers, including work their callbacks create.
+   Start HTTP requests concurrently with `Ready`; its submits form the input
+   barrier, so the server waits for every active submitted payload before advancing.
+2. Read `Grant` and consume HTTP results for its completed requests before
+   releasing dependent work. A timer-only grant needs no HTTP result; other
+   requests may remain pending across rounds. Do not wait for all pending HTTP
+   requests before sending the next `Ready`, or release dependencies on HTTP
+   arrival alone.
+3. When stopping, submit required cancels and set `finished`. Continue consuming
+   terminals and sending finished rounds until `FINISHED` confirms native cleanup.
+
+Use unique, equal-length request IDs within a run: SGLang's native cancellation
+matches ID prefixes. The HTTP pool must admit every request in a round without
+waiting for earlier responses; the examples use a dedicated unlimited aiohttp
+pool and control workload concurrency explicitly. Protocol watchdogs use real
+time to detect failures. They do not advance simulated time, and a timed-out
+exchange must not be retried on the same run.
 
 The initial scope is one local driver and scheduler, text generation with
 ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
@@ -127,14 +208,22 @@ contribute to virtual CPU overhead. Unmodeled frontend/CPU costs are zero.
 Predicted batch durations must be positive at nanosecond resolution; a zero-cost
 fallback is rejected rather than allowing an endless workload at one timestamp.
 
-Startup generation warmup is skipped. Workload/cache warmup belongs to the
-driver and must be excluded from its measurement window while retaining cache
-state. Administrative resets and profiling requests are rejected. The two-request
-example demonstrates the driver protocol; AgentX phase scheduling and metric
-aggregation belong to the separate AgentX adapter.
+Startup generation warmup is skipped. The driver may perform workload/cache
+warmup, then start its measurement window without resetting cache state. Warmup
+requests and time must be excluded from benchmark results.
+Administrative resets and profiling requests are rejected. Harness-specific
+phase scheduling and metric aggregation remain in that harness's adapter.
 
-Coordinated streaming chat (`/v1/chat/completions`, `n=1`) emits an additional
-SSE event before each native content output:
+#### Output and metrics
+
+For fixed-length trace replay, request the desired output length with
+`ignore_eos: true`. Prompt lengths depend on the supplied tokenizer and chat
+template; use actual server token and cache counts for metrics. Trace-declared
+lengths and synthetic output text do not establish cache reuse by themselves.
+
+Coordinated `/generate` responses include a timing snapshot under
+`meta_info.sglang_simulator`. Streaming chat (`/v1/chat/completions`, `n=1`)
+emits the same snapshot as an additional SSE event before each native content output:
 
 ```text
 event: sglang_simulator
@@ -153,10 +242,14 @@ Snapshots use constant space per request and preserve first/last times when
 streaming chunks are coalesced or emitted less frequently. They do not contain
 per-token timestamps, so they support TTFT, completion latency and mean TPOT,
 not per-token ITL percentiles. The initial empty role chunk can precede the first
-snapshot. Normal success requires a terminal snapshot, matching final usage and
-`[DONE]`; cancellation before a token commit retains the native abort response.
+snapshot. For streaming chat metrics, request `stream_options: {"include_usage": true}`
+and validate the terminal snapshot against final usage before consuming `[DONE]`.
+Non-streaming `/generate` returns its snapshot and counts in the JSON response.
+Cancellation before a token commit retains the native abort response.
 
-Focused tests are `test_simulation_coordinator.py`,
+The ordinary HTTP path is covered by `test_simulation_blocking_agentic.py`;
+`test_simulation_blocking_pacing.py` checks cache-load response timing.
+Focused coordinator tests are `test_simulation_coordinator.py`,
 `test_simulation_timing_metadata.py`, `test_simulation_coordinated_bridge.py`, and
 `test_simulation_coordinated_serving.py`. Run test files in separate processes,
 as simulator hooks cache configuration at import time.
