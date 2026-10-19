@@ -60,6 +60,11 @@ class MoeRunner:
         self.runner_backend = runner_backend
         self.config = config
         self.lora_enabled = lora_enabled
+        config.runner_backend = runner_backend
+        if get_moe_a2a_backend().is_deepep() and runner_backend.is_marlin():
+            from sglang.srt.layers.moe.moe_runner.marlin import validate_deepep_marlin
+
+            validate_deepep_marlin(config, lora_enabled=lora_enabled)
 
         if config.silu_mul_keep_fp32 and not runner_backend.is_deep_gemm():
             raise ValueError(
@@ -271,6 +276,8 @@ class MoeRunner:
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
+        if get_moe_a2a_backend().is_deepep() and self.runner_backend.is_marlin():
+            raise ValueError("Marlin + DeepEP does not support down-GEMM overlap.")
         self.down_gemm_overlap_args = down_gemm_overlap_args
         self.meta_overlap_args = meta_overlap_args
 

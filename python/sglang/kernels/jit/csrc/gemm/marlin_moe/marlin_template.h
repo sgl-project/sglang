@@ -498,7 +498,7 @@ __global__ void Marlin(
       if (mul_topk_weights) {
         idx = idx < prob_m_top_k ? idx : 0;
         scalar_t topk_weight_tmp = Dtype::float2num(topk_weights_ptr[idx]);
-        if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
+        if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn && !kHasBias) {
           sh_block_topk_weights[threadIdx.x] = __hmul2(global_scale, Dtype::num2num2(topk_weight_tmp));
         } else {
           sh_block_topk_weights[threadIdx.x] = Dtype::num2num2(topk_weight_tmp);
@@ -1545,7 +1545,9 @@ __global__ void Marlin(
       }
 
       if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-        if (!mul_topk_weights) {
+        // With bias, apply the weight scale before adding the bias. Folding
+        // it into the routing weight would also scale the bias at the store.
+        if (!mul_topk_weights || kHasBias) {
           res = __hmul2(res, global_scale);
         }
       }

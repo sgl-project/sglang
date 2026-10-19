@@ -196,6 +196,11 @@ def create_moe_dispatcher(
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+            **(
+                {"runner_backend": moe_runner_config.runner_backend}
+                if a2a_backend.is_deepep()
+                else {}
+            ),
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
