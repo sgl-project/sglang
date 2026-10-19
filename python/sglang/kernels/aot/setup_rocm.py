@@ -116,7 +116,7 @@ hipcc_flags = [
     "-O3",
     "-Xcompiler",
     "-fPIC",
-    "-std=c++17",
+    "-std=c++20",
     "-DENABLE_BF16",
     "-DENABLE_FP8",
 ]
