@@ -17,7 +17,7 @@ import test_cuda_graph_persistence as decode_e2e
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # 1-gpu-large-foundry installs Foundry (scripts/ci/cuda/ci_install_foundry.sh); skips elsewhere.
-register_cuda_ci(est_time=300, stage="nightly", runner_config="1-gpu-large-foundry")
+register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large-foundry")
 
 
 class TestFoundryGraphPersistencePrefill(decode_e2e.TestFoundryGraphPersistence):

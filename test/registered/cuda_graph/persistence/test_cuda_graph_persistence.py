@@ -9,7 +9,8 @@ restore its graphs quickly, and actually run Foundry.
 Qwen3.5-2B (hybrid gated DeltaNet) runs decode graphs only: its full-backend
 prefill capture fails in SGLang (the GDN out-of-graph metadata is decode-only).
 test_cuda_graph_persistence_prefill.py covers full-backend prefill plus decode
-graphs with Qwen3-1.7B.
+graphs with Qwen3-1.7B; test_cuda_graph_persistence_spec.py the EAGLE3
+decode-type graph kinds with Llama-3.1-8B-Instruct.
 
 Needs the optional dependency `foundry` (sglang[foundry]) in the serving
 environment; skipped otherwise.
@@ -39,7 +40,7 @@ from sglang.test.test_utils import (
 )
 
 # 1-gpu-large-foundry installs Foundry (scripts/ci/cuda/ci_install_foundry.sh); skips elsewhere.
-register_cuda_ci(est_time=300, stage="nightly", runner_config="1-gpu-large-foundry")
+register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large-foundry")
 
 # Upper bound on LOAD's graph restore (decode + prefill lines summed). Measured on
 # H200 with foundry 056b154: 0.032 s (prefill 4 graphs 0.012 s, decode 8 graphs 0.020 s);
@@ -64,7 +65,11 @@ _PROMPTS = [
 _SAMPLING = {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True}
 
 _ACTIVE = re.compile(r"\[Foundry\] cuda graph persistence active: pid=(\d+) mode=(\w+)")
-_DECODE_LOADED = re.compile(r"\[Foundry\] Loaded (\d+) SGLang graphs in ([0-9.]+)s")
+# "Loaded N SGLang graphs" (target decode) or "Loaded N SGLang <kind> graphs" (the
+# speculative-decoding kinds target_verify / draft_decode / draft_extend).
+_DECODE_LOADED = re.compile(
+    r"\[Foundry\] Loaded (\d+) SGLang (?!prefill )(?:(\w+) )?graphs in ([0-9.]+)s"
+)
 _PREFILL_LOADED = re.compile(
     r"\[Foundry\] Loaded (\d+) SGLang prefill graphs in ([0-9.]+)s"
 )
@@ -110,6 +115,12 @@ class TestFoundryGraphPersistence(CustomTestCase):
     prefill_bs = []
     # None = SGLang's default (fa3 on Hopper).
     attention_backend = None
+    # Decode-type graph kinds SAVE archives and LOAD restores: [None] = the target
+    # decode graphs (archive files graph_*_FULL_t*); speculative decoding replaces
+    # them by target_verify / draft_decode / draft_extend (graph_*_DECODE-<kind>_t*).
+    decode_kinds = [None]
+    # Appended to the server args of every engine (subclasses: speculative decoding).
+    extra_server_args = []
     process = None
     tmp = None
 
@@ -143,6 +154,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
         ]
         if cls.attention_backend is not None:
             cls.server_args += ["--attention-backend", cls.attention_backend]
+        cls.server_args += cls.extra_server_args
         # Native first: it also fills the JIT caches, which SAVE must not compile
         # inside its capture window.
         cls.runs = {"native": cls._run_engine("native", mode=None, bench=True)}
@@ -234,11 +246,19 @@ class TestFoundryGraphPersistence(CustomTestCase):
             "median_itl_ms": metrics["median_itl_ms"],
         }
 
+    def _archived_decode_graphs(self, kind):
+        pattern = (
+            "graph_*_FULL_t*.json" if kind is None else f"graph_*_DECODE-{kind}_t*.json"
+        )
+        return glob.glob(os.path.join(self.workspace, "rank_0", pattern))
+
     def test_save_writes_archive(self):
         rank_dir = os.path.join(self.workspace, "rank_0")
-        decode = glob.glob(os.path.join(rank_dir, "graph_*_FULL_t*.json"))
         prefill = glob.glob(os.path.join(rank_dir, "graph_*_PREFILL_t*.json"))
-        self.assertEqual(len(decode), len(self.decode_bs), sorted(decode))
+        for kind in self.decode_kinds:
+            with self.subTest(kind=kind):
+                decode = self._archived_decode_graphs(kind)
+                self.assertEqual(len(decode), len(self.decode_bs), sorted(decode))
         if self.prefill_bs:
             self.assertGreaterEqual(len(prefill), len(self.prefill_bs), sorted(prefill))
         else:
@@ -252,12 +272,15 @@ class TestFoundryGraphPersistence(CustomTestCase):
 
     def test_load_restores_and_replays_every_graph(self):
         log = self.runs["load"]["log"]
-        decode = [int(n) for n, _ in _DECODE_LOADED.findall(log)]
+        decode = {kind or None: int(n) for n, kind, _ in _DECODE_LOADED.findall(log)}
         prefill = [int(n) for n, _ in _PREFILL_LOADED.findall(log)]
         archived_prefill = len(
             glob.glob(os.path.join(self.workspace, "rank_0", "graph_*_PREFILL_t*.json"))
         )
-        self.assertEqual(decode, [len(self.decode_bs)])
+        # One Loaded line per decode-type kind, each with every archived graph.
+        self.assertEqual(
+            decode, {kind: len(self.decode_bs) for kind in self.decode_kinds}
+        )
         if not self.prefill_bs:
             self.assertEqual(prefill, [])
             return
@@ -269,7 +292,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
 
     def test_load_restore_time(self):
         log = self.runs["load"]["log"]
-        times = [float(t) for _, t in _DECODE_LOADED.findall(log)]
+        times = [float(t) for _, _, t in _DECODE_LOADED.findall(log)]
         times += [float(t) for _, t in _PREFILL_LOADED.findall(log)]
         self.assertTrue(times, "no [Foundry] Loaded line in the LOAD log")
         self.assertLess(sum(times), _RESTORE_BOUND_S, times)

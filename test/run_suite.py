@@ -100,6 +100,7 @@ PER_COMMIT_SUITES = {
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
         "extra-a-test-1-gpu-large",
+        "extra-a-test-1-gpu-large-foundry",
         "extra-a-test-2-gpu-large",
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
