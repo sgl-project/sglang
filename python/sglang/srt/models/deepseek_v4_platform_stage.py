@@ -639,6 +639,28 @@ def forward_layer_fused_boundary(
     )
 
 
+def fused_boundary_attn_input(layer, state):
+    """Layer's attention input on every row through the same boundary launch as
+    forward_hc_pre_from_prev_fused_boundary, for writing the tail source layer's KV
+    before the rows narrow; returns the state with the previous post applied."""
+    from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
+
+    if isinstance(state.streams, HcPending):
+        pending_post = tuple(state.streams)
+    else:
+        pending_post = (None, state.streams, None, None)
+    residual, x, coefficients = make_amd_hc_boundary(
+        layer,
+        *pending_post,
+        state.pre,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+    )
+    x, _ = layer._input_norm(x, allow_aiter_quant=False, coefficients=coefficients)
+    return HcState(residual, state.pre), x
+
+
 def forward_hc_pre_from_prev_fused_boundary(
     layer,
     positions: torch.Tensor,

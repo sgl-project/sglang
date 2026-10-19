@@ -884,6 +884,7 @@ class DeepseekV4HipRadixBackend(
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
     _forward_low_ratio_sources_cp = DeepseekV4AttnBackend._forward_low_ratio_sources_cp
+    write_tail_source_kv = DeepseekV4AttnBackend.write_tail_source_kv
     low_ratio_prefill_graph = DeepseekV4AttnBackend.low_ratio_prefill_graph
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
@@ -972,10 +973,9 @@ class DeepseekV4HipRadixBackend(
                 raise NotImplementedError(
                     "decoder SWA bounded replay is not wired for unified_kv_triton"
                 )
-        # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
+        # the model switches onto it at the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
-        # Read by the shared forward_low_ratio_sources; the ROCm tail starts after
-        # the source layer, so nothing sets it.
+        # Set by write_tail_source_kv until exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -2293,13 +2293,20 @@ class DeepseekV4HipRadixBackend(
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
-        return value. Each request's candidate mask is cut to its tail rows."""
+        return value. Unless the source layer runs inside the tail, each request's
+        candidate mask is cut to its tail rows and its top-k carried over."""
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (self.forward_metadata, self.candidate_masks)
         tail = tail_metadata.late_layer_tail
         tail_lens_cpu = tail.extend_seq_lens_cpu
-        if isinstance(self.candidate_masks, list) and self.candidate_masks:
+        # after write_tail_source_kv the source layer publishes both on the tail rows
+        source_in_tail = self.tail_source_kv_layer_id is not None
+        if (
+            not source_in_tail
+            and isinstance(self.candidate_masks, list)
+            and self.candidate_masks
+        ):
             # the last tail_len rows of each request's candidate publication
             self.candidate_masks = [
                 (
@@ -2318,7 +2325,7 @@ class DeepseekV4HipRadixBackend(
         # the consumers after the switch read the tail buffers, so carry the last source's rows over
         full_core = saved[0].core_attn_metadata
         tail_core = tail_metadata.core_attn_metadata
-        for ratio in tail_core.low_ratios:
+        for ratio in () if source_in_tail else tail_core.low_ratios:
             for full_buf, tail_buf in (
                 (
                     full_core.sparse_page_indices(ratio),
@@ -2347,6 +2354,7 @@ class DeepseekV4HipRadixBackend(
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
         self.forward_metadata, self.candidate_masks = saved
+        self.tail_source_kv_layer_id = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
             window.activate(
