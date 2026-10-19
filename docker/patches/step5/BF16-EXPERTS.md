@@ -2,7 +2,7 @@
 
 Step5 now honors the checkpoint's expert exclusions in `quantization_config.ignored_layers` instead of quantizing them to FP8 during loading. The current checkpoint excludes expert layers 88–90; selection follows metadata, not fixed layer numbers. Both expert matrices must have matching precision. Unexpected BF16-to-FP8 conversion fails with an actionable error.
 
-`SGLANG_STEP5_QUANTIZE_BF16_MOE=1` explicitly restores load-time FP8 quantization. Its default is `0`. The same policy covers the expert layers a ModelOpt NVFP4 export left in BF16 (`quantization_config.exclude_modules`).
+`SGLANG_STEP5_QUANTIZE_BF16_MOE=1` explicitly restores load-time FP8 quantization. Its default is `0`. It only decides how checkpoint-BF16 experts are served: a BF16 weight update into an FP8 expert is always block-quantized (128x128) with its scales, whatever its value. The same policy covers the expert layers a ModelOpt NVFP4 export left in BF16 (`quantization_config.exclude_modules`).
 
 ## MegaMoE with TRTLLM BF16 experts
 

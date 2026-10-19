@@ -1804,7 +1804,12 @@ class Step5ForCausalLM(nn.Module):
                     and param.dtype == torch.float8_e4m3fn
                 )
                 if quantize_bf16:
-                    if not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get():
+                    # Only a checkpoint needs the opt-in; BF16 updates into FP8 experts
+                    # are always requantized.
+                    if (
+                        checkpoint_load
+                        and not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get()
+                    ):
                         raise ValueError(
                             f"Refusing implicit BF16-to-FP8 expert quantization: {original_name}. "
                             "Declare the BF16 experts in quantization_config.ignored_layers "

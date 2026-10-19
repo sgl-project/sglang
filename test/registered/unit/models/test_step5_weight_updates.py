@@ -11,6 +11,7 @@ from unittest.mock import patch
 import torch
 from safetensors.torch import save_file
 
+from sglang.srt.environ import envs
 from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
 from sglang.srt.models.step5_mtp import Step5MTP
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,6 +26,8 @@ _PACKED = "model.layers.3.moe."
 
 class _RecordingParam:
     """A parameter that records what its weight loader was handed."""
+
+    device = torch.device("cpu")
 
     def __init__(self, dtype: torch.dtype, calls: list):
         self.dtype = dtype
@@ -55,6 +58,11 @@ class _FakeStep5:
         self.nvfp4_expert_layers = frozenset()
         self.nvfp4_expert_layouts = {}
         self.model = SimpleNamespace(layers=[])
+        self.experts = SimpleNamespace(
+            quant_method=SimpleNamespace(weight_block_size=[2, 2]),
+            num_local_experts=_NUM_EXPERTS,
+            _map_global_expert_id_to_local_expert_id=lambda expert_id: expert_id,
+        )
         self.checkpoint_path = None
         self._checkpoint_loaded = False
         self._checkpoint_duplicate_names = frozenset()
@@ -62,6 +70,10 @@ class _FakeStep5:
 
     def named_parameters(self):
         return list(self.params.items())
+
+    def get_submodule(self, name):
+        assert name == _EXPERTS.rstrip(".")
+        return self.experts
 
     def _checkpoint_duplicate_owners(self, expected, model_path):
         return Step5ForCausalLM._checkpoint_duplicate_owners(expected, model_path)
@@ -137,6 +149,26 @@ class TestStep5CheckpointLoad(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "missing 2 weights"):
             model.load_weights(partial)
 
+    def test_refuses_undeclared_bf16_experts_without_the_opt_in(self):
+        """Without SGLANG_STEP5_QUANTIZE_BF16_MOE, a BF16 checkpoint tensor for an FP8
+        expert is refused instead of quantized."""
+        model = _FakeStep5()
+        checkpoint = [
+            (
+                name,
+                weight.to(torch.bfloat16)
+                if name.endswith("gate_proj.weight")
+                else weight,
+            )
+            for name, weight in _checkpoint()
+        ]
+
+        with (
+            envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.override(False),
+            self.assertRaisesRegex(ValueError, "Refusing implicit BF16-to-FP8"),
+        ):
+            model.load_weights(checkpoint)
+
     def test_refuses_per_expert_names(self):
         model = _FakeStep5()
         per_expert = _EXPERTS + "1.gate_proj.weight"
@@ -170,6 +202,35 @@ class TestStep5WeightUpdates(CustomTestCase):
             if p is model.params[_EXPERTS + "w13_weight"]
         )
         self.assertTrue(torch.equal(loaded.float(), weight.float()))
+
+    def test_requantize_bf16_experts_without_the_opt_in(self):
+        """A BF16 update into an FP8 expert is block-quantized with its scales written,
+        whether or not checkpoint-BF16 experts are served as FP8."""
+        bf16 = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+        for opt_in in (False, True):
+            model = _loaded()
+            with (
+                self.subTest(opt_in=opt_in),
+                envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.override(opt_in),
+            ):
+                model.load_weights([(_EXPERTS + "2.gate_proj.weight", bf16)])
+
+                [(_, fp8, _, _)] = [
+                    c
+                    for c in model.calls
+                    if c[0] is model.params[_EXPERTS + "w13_weight"]
+                ]
+                [(_, scale, shard, expert)] = [
+                    c
+                    for c in model.calls
+                    if c[0] is model.params[_EXPERTS + "w13_weight_scale_inv"]
+                ]
+                self.assertEqual(fp8.dtype, torch.float8_e4m3fn)
+                self.assertEqual((shard, expert), ("w1", 2))
+                dequantized = fp8.float() * scale.repeat_interleave(
+                    2, 0
+                ).repeat_interleave(2, 1)
+                torch.testing.assert_close(dequantized, bf16.float(), rtol=0.07, atol=0)
 
     def test_may_send_any_subset_and_skip_the_disk_index(self):
         model = _loaded()
