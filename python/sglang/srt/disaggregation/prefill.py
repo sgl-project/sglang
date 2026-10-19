@@ -1606,6 +1606,9 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _request_row_payload():
+                return np.array([req.kv.req_pool_idx], dtype=np.int32)
+
             state_types = (
                 self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
             )
@@ -1620,6 +1623,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
