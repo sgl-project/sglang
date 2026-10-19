@@ -684,6 +684,9 @@ def init_mori_epv2_op(
         cfg_kwargs.update(async_ll=True, async_ll_transport=async_ll_transport)
     cfg = EpDispatchCombineConfig(
         **cfg_kwargs,
+        # Only the hip backend has the AsyncLL kernels; gfx950 defaults to flydsl,
+        # which rejects async_ll=True.
+        **({"kernel_backend": "hip"} if async_ll else {}),
         dispatch_block_num=launch_config.dispatch_block_num,
         combine_block_num=launch_config.combine_block_num,
         warp_num_per_block=launch_config.dispatch_warp_num_per_block,
