@@ -27,7 +27,8 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       int64_t draft_token_num,
       int64_t match_type,
       int64_t external_sam_budget,
-      int64_t external_corpus_max_tokens) {
+      int64_t external_corpus_max_tokens,
+      int64_t prompt_sam_budget) {
     ngram::Param param;
     param.enable = true;
     param.enable_router_mode = false;
@@ -38,6 +39,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     param.match_type = (match_type == 0) ? "BFS" : "PROB";
     param.external_sam_budget = static_cast<size_t>(external_sam_budget);
     param.external_corpus_max_tokens = static_cast<size_t>(external_corpus_max_tokens);
+    param.prompt_sam_budget = static_cast<size_t>(prompt_sam_budget);
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
@@ -96,6 +98,12 @@ struct NgramCorpusObj : public tvm::ffi::Object {
       start = end + 1;
     }
     ngram_->setCorpusFilter(state_id, std::move(ids));
+  }
+
+  void set_prompt_sam(int64_t state_id, const tvm::ffi::TensorView tokens_tv) {
+    auto* data = static_cast<const int32_t*>(tokens_tv.data_ptr());
+    std::vector<int32_t> tokens(data, data + tokens_tv.size(0));
+    ngram_->setPromptSam(state_id, tokens);
   }
 
   void start_external_corpus_load() {
@@ -168,11 +176,12 @@ struct NgramCorpusObj : public tvm::ffi::Object {
 void register_ngram_corpus() {
   namespace refl = tvm::ffi::reflection;
   refl::ObjectDef<NgramCorpusObj>()
-      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
+      .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("set_corpus_filter", &NgramCorpusObj::set_corpus_filter)
+      .def("set_prompt_sam", &NgramCorpusObj::set_prompt_sam)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
       .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)

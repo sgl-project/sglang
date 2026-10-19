@@ -938,6 +938,59 @@ class TestNgramCorpusRequestCorpusIds(CustomTestCase):
         self.assertIn([3, 20, 21], paths)
 
 
+class TestNgramCorpusPromptSam(CustomTestCase):
+    """Verify the per-request prompt SAM (prompt_sam_budget > 0)."""
+
+    def _paths(self, corpus, rid, prompt, query=(1, 2, 3)):
+        ids, masks = corpus.batch_get(
+            [rid], [list(query)], [len(query)], None, [prompt]
+        )
+        return corpus.leaf_paths_from_mask(ids.tolist(), masks.reshape(6, 6).tolist())
+
+    def test_drafts_from_own_prompt(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, prompt_sam_budget=4)
+        paths = self._paths(corpus, "r", [7, 1, 2, 3, 10, 11, 8])
+        self.assertIn([3, 10, 11, 8], paths)
+
+    def test_disabled_by_default(self):
+        corpus = _make_corpus("BFS", draft_token_num=6)
+        paths = self._paths(corpus, "r", [7, 1, 2, 3, 10, 11, 8])
+        self.assertNotIn([3, 10, 11, 8], paths)
+
+    def test_prompt_is_private_to_its_request(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, prompt_sam_budget=4)
+        self._paths(corpus, "a", [1, 2, 3, 10, 11])
+        paths_b = self._paths(corpus, "b", [1, 2, 3, 20, 21])
+        self.assertIn([3, 20, 21], paths_b)
+        self.assertNotIn([3, 10, 11], paths_b)
+
+    def test_erase_frees_prompt_sam(self):
+        corpus = _make_corpus("BFS", draft_token_num=6, prompt_sam_budget=4)
+        self._paths(corpus, "r", [1, 2, 3, 10, 11])
+        corpus.erase_match_state(["r"])
+        ids, masks = corpus.batch_get(["r"], [[1, 2, 3]], [3])
+        paths = corpus.leaf_paths_from_mask(ids.tolist(), masks.reshape(6, 6).tolist())
+        self.assertNotIn([3, 10, 11], paths)
+
+    def test_only_last_max_tokens_are_indexed(self):
+        corpus = _make_corpus(
+            "BFS", draft_token_num=6, prompt_sam_budget=4, prompt_sam_max_tokens=4
+        )
+        # [1, 2, 3, 10, 11] falls outside the last 4 tokens.
+        paths = self._paths(corpus, "r", [1, 2, 3, 10, 11, 40, 41, 42, 43])
+        self.assertNotIn([3, 10, 11], paths)
+
+    def test_combines_with_external_corpus(self):
+        corpus = _make_corpus(
+            "BFS", draft_token_num=6, external_sam_budget=2, prompt_sam_budget=2
+        )
+        loaded = corpus.load_external_corpus_named("ext", [[1, 2, 3, 20, 21]])
+        corpus.commit_external_corpus_load("ext", loaded)
+        paths = self._paths(corpus, "r", [1, 2, 3, 10, 11])
+        self.assertIn([3, 10, 11], paths)
+        self.assertIn([3, 20, 21], paths)
+
+
 class TestMultiSamHttpMock(CustomTestCase):
     """Test HTTP endpoints for multi-SAM management with a mocked backend."""
 

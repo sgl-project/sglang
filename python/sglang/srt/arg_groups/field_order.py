@@ -304,6 +304,8 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_ngram_external_corpus_path",
     "speculative_ngram_external_sam_budget",
     "speculative_ngram_external_corpus_max_tokens",
+    "speculative_ngram_prompt_sam_budget",
+    "speculative_ngram_prompt_sam_max_tokens",
     "ep_size",
     "moe_a2a_backend",
     "enable_w4a4_mxfp4_megamoe",

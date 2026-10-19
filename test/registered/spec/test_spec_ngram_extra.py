@@ -160,5 +160,54 @@ class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
                 )
 
 
+# Copy-heavy prompts for the prompt SAM: the answer reuses most of the prompt.
+_PROMPT_SAM_CODE = [
+    """def merge_intervals(intervals):
+    intervals.sort(key=lambda x: x[0])
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged""",
+    """def word_count(path):
+    counts = {}
+    with open(path) as f:
+        for line in f:
+            for word in line.split():
+                word = word.lower().strip(".,!?")
+                counts[word] = counts.get(word, 0) + 1
+    return sorted(counts.items(), key=lambda kv: -kv[1])""",
+]
+
+
+@unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
+class TestNgramPromptSam(NgramServerBase):
+    attention_backend = "flashinfer"
+    extra_args = ["--speculative-ngram-prompt-sam-budget", "8"]
+
+    def test_copy_task_drafts_from_prompt(self):
+        """A request whose answer copies its prompt drafts from the prompt."""
+        accept_lens = []
+        for code in _PROMPT_SAM_CODE:
+            requests.post(self.base_url + "/flush_cache", timeout=30)
+            resp = requests.post(
+                self.base_url + "/generate",
+                json={
+                    "text": "Add type hints to the following Python code. Keep "
+                    "everything else exactly the same and output only the code."
+                    f"\n\n{code}\n\nCode with type hints:\n",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 256},
+                },
+                timeout=120,
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            accept_lens.append(resp.json()["meta_info"]["spec_accept_length"])
+        avg = sum(accept_lens) / len(accept_lens)
+        print(f"\n  prompt SAM accept length: {avg:.2f}")
+        self.assertGreater(avg, 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()
