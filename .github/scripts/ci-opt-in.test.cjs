@@ -130,7 +130,7 @@ test('opted-in and scheduled AMD runs keep their changed-file flags', () => {
   assert.deepEqual(Object.values(amdFlags(scheduled)), flags.map(() => 'true'));
 });
 
-for (const file of ['pr-test-extra.yml', 'pr-test-amd-extra.yml', 'pr-test-amd.yml']) {
+for (const file of ['pr-test.yml', 'pr-test-extra.yml', 'pr-test-amd-extra.yml', 'pr-test-amd.yml']) {
   test(`${file}: no build, GPU or wait job runs without opt-in`, () => {
     const ctx = context();
     ctx.needs['check-changes'] = file === 'pr-test-amd.yml'
@@ -138,6 +138,8 @@ for (const file of ['pr-test-extra.yml', 'pr-test-amd-extra.yml', 'pr-test-amd.y
       : { result: 'success', outputs: amdFlags(ctx) };
     ctx.needs['wait-for-stage-a-amd'] = { result: 'skipped' };
     ctx.needs['wait-for-stage-b-amd'] = { result: 'skipped' };
+    ctx.needs['wait-for-base-a'] = { result: 'skipped' };
+    ctx.needs['wait-for-base-b'] = { result: 'skipped' };
     for (const [name, job] of Object.entries(workflow(file).jobs)) {
       if (['check-changes', 'call-gate', 'notify-pr-states'].includes(name) || name.endsWith('-finish')) continue;
       assert.ok(job.if, `${name} needs an explicit gate`);
@@ -163,3 +165,19 @@ test('scheduled CUDA extra runs still build and dispatch tests with a skipped PR
     assert.ok(evaluate(jobs[name].if, ctx), `${name} must still run on schedule`);
   }
 });
+
+
+for (const event of ['schedule', 'workflow_dispatch']) {
+  test(`Base ${event} still builds and dispatches tests with a skipped PR gate`, () => {
+    const ctx = context(event);
+    ctx.inputs.test_parallel_dispatch = event === 'workflow_dispatch';
+    ctx.needs['call-gate'] = { result: 'skipped', outputs: {} };
+    ctx.needs['check-changes'] = { result: 'success', outputs: amdFlags(ctx) };
+    ctx.needs['wait-for-base-a'] = { result: 'skipped' };
+    ctx.needs['wait-for-base-b'] = { result: 'skipped' };
+    const jobs = workflow('pr-test.yml').jobs;
+    for (const name of ['rust-ext-build', 'rust-ext-build-aarch64', 'base-a-test', 'base-a-test-cpu', 'base-b-test', 'base-c-test', 'base-c-test-aarch64', 'call-jit-kernel-tests', 'call-multimodal-gen-tests']) {
+      assert.ok(evaluate(jobs[name].if, ctx), `${name} must still run for ${event}`);
+    }
+  });
+}

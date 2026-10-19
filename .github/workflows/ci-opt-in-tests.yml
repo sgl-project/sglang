@@ -6,6 +6,7 @@ on:
       - '.github/workflows/*opt-in*.yml'
       - '.github/workflows/pr-gate.yml'
       - '.github/workflows/pr-test-extra.yml'
+      - '.github/workflows/pr-test.yml'
       - '.github/workflows/pr-test-amd*.yml'
       - '.github/scripts/ci-opt-in.test.cjs'
   pull_request:
@@ -13,6 +14,7 @@ on:
       - '.github/workflows/*opt-in*.yml'
       - '.github/workflows/pr-gate.yml'
       - '.github/workflows/pr-test-extra.yml'
+      - '.github/workflows/pr-test.yml'
       - '.github/workflows/pr-test-amd*.yml'
       - '.github/scripts/ci-opt-in.test.cjs'
   workflow_dispatch:
