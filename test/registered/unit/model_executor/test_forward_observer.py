@@ -30,24 +30,31 @@ class DeviceOutput:
 
 
 @pytest.mark.parametrize(
-    ("runner_kwargs", "topology"),
+    ("runner_kwargs", "topology", "mlx"),
     [
-        ({}, {}),
-        (dict(spec_algorithm=SpeculativeAlgorithm.EAGLE), {}),
-        (dict(is_draft_worker=True), {}),
-        ({}, dict(dllm_algorithm="dream")),
-        ({}, dict(pp_size=2)),
+        ({}, {}, False),
+        (dict(spec_algorithm=SpeculativeAlgorithm.EAGLE), {}, False),
+        (dict(is_draft_worker=True), {}, False),
+        (dict(is_generation=False), {}, False),
+        ({}, dict(dllm_algorithm="dream"), False),
+        ({}, dict(pp_size=2), False),
+        ({}, dict(enable_pdmux=True), False),
+        ({}, {}, True),
     ],
 )
-def test_forward_observer_registration(runner_kwargs, topology):
+def test_forward_observer_registration(runner_kwargs, topology, mlx):
     observer = Mock()
-    with published_topology(**topology):
+    with (
+        published_topology(**topology),
+        patch("sglang.srt.hardware_backend.mlx.runtime.use_mlx", return_value=mlx),
+    ):
         runner = object.__new__(ModelRunner)
         runner.spec_algorithm = SpeculativeAlgorithm.NONE
         runner.is_draft_worker = False
+        runner.is_generation = True
         runner._forward_observer = None
         runner.__dict__.update(runner_kwargs)
-        if runner_kwargs or topology:
+        if runner_kwargs or topology or mlx:
             with pytest.raises(ValueError, match="configured forward path"):
                 runner.forward_observer = observer
         else:
