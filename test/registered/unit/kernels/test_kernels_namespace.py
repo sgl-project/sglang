@@ -332,5 +332,12 @@ def test_deep_select_spec_matches_wrapper_architectures():
     )
 
 
+def test_bf16_skinny_gemm_spec_is_cuda_only():
+    spec = K.registry.get_backend("gemm.bf16_skinny_gemm", KernelBackend.TRITON)
+    assert spec.target == "sglang.kernels.ops.gemm.bf16_skinny_gemm:bf16_skinny_gemm"
+    assert K.capabilities_satisfied(spec.capabilities, _SM90)
+    assert not K.capabilities_satisfied(spec.capabilities, _HIP)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

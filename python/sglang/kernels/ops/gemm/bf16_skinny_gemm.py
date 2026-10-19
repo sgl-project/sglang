@@ -75,14 +75,11 @@ def bf16_skinny_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 
 def bf16_skinny_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    assert bf16_skinny_supported(x, weight), (
-        x.shape,
-        x.dtype,
-        x.device,
-        weight.shape,
-        weight.dtype,
-        weight.device,
-    )
+    if not bf16_skinny_supported(x, weight):
+        raise ValueError(
+            "unsupported operands: "
+            f"{(x.shape, x.dtype, x.device, weight.shape, weight.dtype, weight.device)}"
+        )
     m, k = x.shape
     n = weight.shape[0]
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
