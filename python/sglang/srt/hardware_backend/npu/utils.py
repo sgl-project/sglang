@@ -203,10 +203,19 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("Failed to import NPU kernel package 'sgl_kernel_npu': %s", e)
+
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError as e:
+        if not (
+            "sglang.multimodal_gen" in sys.modules
+            and isinstance(e, ModuleNotFoundError)
+            and e.name == "custom_ops"
+        ):
+            logger.warning("Failed to import NPU kernel package 'custom_ops': %s", e)
 
     import torch_npu
 

@@ -107,6 +107,11 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+# Monokernels for gfx950 (--monokernel-backend amd); the ROCm image checks out this pin too.
+monokernels_hip = [
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e07665c8b36f7d42a48f6615bacf911d0656f5c5",
+]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 #
@@ -114,6 +119,7 @@ tracing = [
 # in its compressed-tensors and torch pins. A dependency added here has to be
 # added there too; nothing enforces that.
 srt_hip = [
+  "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
@@ -126,8 +132,19 @@ srt_hip_rocm724 = [
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
+  "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch==2.11.0",
+  "wave-lang==3.8.2",
+]
+
+# Same as srt_hip_rocm724 above except for the torch pin; keep them in step by
+# hand. ROCm 10.1 publishes no torch 2.11 wheel, so it has to be 2.12.
+srt_hip_rocm101 = [
+  "compressed-tensors==0.16.0",
+  "petit_kernel==0.0.2",
+  "sglang[runtime_common]",
+  "torch==2.12.0",
   "wave-lang==3.8.2",
 ]
 
@@ -216,12 +233,14 @@ test = [
 
 all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
 all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
+all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
+dev_hip_rocm101 = ["sglang[all_hip_rocm101]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
