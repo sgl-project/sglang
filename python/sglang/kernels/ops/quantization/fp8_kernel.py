@@ -25,6 +25,7 @@ from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -36,6 +37,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
