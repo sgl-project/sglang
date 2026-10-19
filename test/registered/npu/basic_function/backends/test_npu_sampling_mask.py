@@ -90,9 +90,27 @@ class TestAscendSamplingMask(CustomTestCase):
             # The mask must describe the support the kernel drew the token from.
             self.assertIn(token_id, mask)
             self.assertEqual(len(mask), len(set(mask)))
-            self.assertLessEqual(len(mask), _TOP_K)
+            # The fused op can retain cutoff ties, so realized support may
+            # contain more than top_k tokens.
+            self.assertLessEqual(len(mask), _SAMPLING_MASK_MAX_TOKENS)
             self.assertEqual(len(mask), len(logprobs))
             self.assertTrue(all(math.isfinite(logprob) for logprob in logprobs))
+            if len(mask) > _TOP_K:
+                self.assertTrue(
+                    all(
+                        logprob == logprobs[_TOP_K - 1] for logprob in logprobs[_TOP_K:]
+                    )
+                )
+
+    def test_min_p_sampling_mask(self):
+        body = self._generate({"top_k": _TOP_K, "top_p": 1.0, "min_p": 0.1})
+        output_ids = body["output_ids"]
+        masks = body["meta_info"]["output_token_sampling_mask"]
+
+        self.assertEqual(len(masks), len(output_ids))
+        for token_id, mask in zip(output_ids, masks, strict=True):
+            self.assertIn(token_id, mask)
+            self.assertGreaterEqual(len(mask), 1)
 
     def test_greedy_sampling_mask(self):
         # Greedy sampling pins top_k to 1, so the support is the single argmax token.

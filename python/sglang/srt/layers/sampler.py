@@ -889,7 +889,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
         probs_top_k_top_p = logits_top_k_top_p.softmax(dim=-1)
 
         if need_min_p_sampling:
-            min_p_thresholds = probs_top_k_top_p.max(dim=-1) * min_ps
+            min_p_thresholds = probs_top_k_top_p.max(dim=-1).values * min_ps
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
@@ -951,10 +951,9 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             logprobs = probs_sort.to(
                 torch.float64
             )  # Using float64 for numerical stability
-            if not return_filtered_probs:
-                # Drop the float32 weights before allocating their float64 copy;
-                # filtered_probs keeps them alive when the export asked for them.
-                del probs_sort
+            # The exported weights are a separate vocab-ordered scatter copy.
+            # The sorted float32 weights are no longer needed for the draw.
+            del probs_sort
             logprobs.log_()
             sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
         probs_idx = probs_idx.to(torch.int32)

@@ -533,7 +533,7 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
         # extra is materialized and existing callers keep working unchanged.
         self.assertEqual(tuple(sampled.shape), (batch_size,))
 
-    def test_fused_export_is_vocab_ordered_and_bounded_by_top_k(self):
+    def test_fused_export_is_vocab_ordered(self):
         """The production path: the fused op supplies the post-filter weights."""
         batch_size, vocab_size, top_k = 2, 16, 4
         torch.manual_seed(0)
@@ -578,6 +578,53 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             self.assertIn(
                 int(sampled[row]), output.next_token_sampling_mask_idx[row].tolist()
             )
+
+    def test_fused_export_preserves_top_k_cutoff_ties(self):
+        logits = torch.tensor([[3.0, 2.0, 2.0, 0.0]])
+        fused_logits = torch.tensor([[3.0, 2.0, 2.0, float("-inf")]])
+        with patch.object(
+            sampler_module,
+            "torch_npu",
+            SimpleNamespace(npu_top_k_top_p=MagicMock(return_value=fused_logits)),
+            create=True,
+        ):
+            _, filtered_probs = (
+                sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend(
+                    logits,
+                    torch.tensor([2], dtype=torch.int32),
+                    torch.tensor([1.0]),
+                    torch.tensor([0.0]),
+                    False,
+                    None,
+                    torch.zeros(1, dtype=torch.int64),
+                    npu_top_k_top_p_eligible=True,
+                    return_filtered_probs=True,
+                )
+            )
+
+        self.assertEqual((filtered_probs[0] > 0).nonzero().view(-1).tolist(), [0, 1, 2])
+
+    def test_fused_min_p_filters_exported_weights(self):
+        logits = torch.tensor([[3.0, 2.0, 1.0, 0.0]])
+        sampling_info = self._sampling_info(
+            1, top_k=4, top_p=1.0, min_p=0.2, need_min_p=True, npu_eligible=True
+        )
+        with patch.object(
+            sampler_module,
+            "torch_npu",
+            SimpleNamespace(npu_top_k_top_p=MagicMock(return_value=logits.clone())),
+            create=True,
+        ):
+            sampled, _, capture = self.sampler._forward_ascend_backend(
+                logits.clone(),
+                sampling_info,
+                simple_sampling_case=False,
+                return_logprob=False,
+                positions=torch.zeros(1, dtype=torch.int64),
+            )
+
+        self.assertEqual((capture.weights[0] > 0).nonzero().view(-1).tolist(), [0, 1])
+        self.assertIn(int(sampled[0]), [0, 1])
 
     def test_seeded_fused_export_keeps_float32_support(self):
         """A seeded draw must export the same support the unseeded one does."""
