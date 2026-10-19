@@ -165,10 +165,8 @@ class TestDSV41PackedMainKVLayout(CustomTestCase):
                     return_value=True,
                 ),
             ):
-                actual = (
-                    DeepseekV4AttnBackend._low_ratio_prefill_reads_page_indices(
-                        backend, forward_batch, layer
-                    )
+                actual = DeepseekV4AttnBackend._low_ratio_prefill_reads_page_indices(
+                    backend, forward_batch, layer
                 )
                 self.assertIs(actual, expected)
 

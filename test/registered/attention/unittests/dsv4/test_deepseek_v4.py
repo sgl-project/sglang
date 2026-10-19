@@ -35,8 +35,8 @@ from sglang.test.kits.attention_unittest.attention_methods.dsv4_attention import
     run_dsv4_attention_case,
     run_dsv4_compress_attention_case,
     run_dsv4_draft_extend_attention_case,
-    run_dsv41_packed_prefill_case,
     run_dsv4_target_verify_attention_case,
+    run_dsv41_packed_prefill_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (  # noqa: E402
     run_dsv4_cuda_graph_decode_case,

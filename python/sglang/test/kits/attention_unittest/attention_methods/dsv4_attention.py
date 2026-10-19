@@ -32,10 +32,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_main_kv_layout import (
     resolve_dsv41_main_kv_layout_specs,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (

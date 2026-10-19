@@ -3342,15 +3342,11 @@ class DeepseekV4AttnBackend(
             ),
         )
 
-    def _low_ratio_prefill_reads_page_indices(
-        self, forward_batch: ForwardBatch, layer
-    ):
+    def _low_ratio_prefill_reads_page_indices(self, forward_batch: ForwardBatch, layer):
         # Every prefill consumer of sparse_page_indices needs a True clause here;
         # packed Main KV always takes the mixed path instead of sparse prefill.
         return (
-            self.token_to_kv_pool.get_extra_key_layout(
-                layer.layer_id
-            ).is_packed_main_kv
+            self.token_to_kv_pool.get_extra_key_layout(layer.layer_id).is_packed_main_kv
             or self.trtllm_attn
             or not forward_batch.forward_mode.is_extend_without_speculative()
             or get_platform().is_sm120
