@@ -6,6 +6,9 @@ from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+    ReplaySSMDecodeMixin,
+)
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,
@@ -88,7 +91,7 @@ class _AscendKDAExtendKernel:
         return out
 
 
-class AscendKDAAttnBackend(KDAAttnBackend):
+class AscendKDAAttnBackend(ReplaySSMDecodeMixin, KDAAttnBackend):
     """Ascend implementation of Kimi Delta Attention.
 
     The model, scheduler, metadata, and non-operator control flow stay in the
@@ -164,11 +167,32 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             conv_states=conv_states,
             bias=layer.bias,
             query_start_loc=query_start_loc,
-            cache_indices=cache_indices,
+            cache_indices=cache_indices.clamp_min(0),
             activation_mode=1,
             pad_slot_id=-1,
             run_mode=1,
         )
+
+        # ReplaySSM ring
+        core_attn_out = self.replayssm_decode_npu(
+            layer=layer,
+            layer_cache=layer_cache,
+            packed_qkv=qkv,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            is_kda=True,
+        )
+        if core_attn_out is not None:
+            self._track_mamba_state_decode(
+                forward_batch,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                layer.layer_id,
+            )
+            return core_attn_out
 
         if self.kernel_dispatcher.supports_packed_decode:
             assert qkv.shape[0] == cache_indices.shape[0], (
