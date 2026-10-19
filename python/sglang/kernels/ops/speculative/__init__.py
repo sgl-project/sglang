@@ -44,7 +44,7 @@ register_kernel(
         op="speculative.simulated_accept",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 
