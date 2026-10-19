@@ -38,10 +38,12 @@ import triton.language as tl
 if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_lora,
+    get_model,
     get_parallel,
     get_server_args,
 )
@@ -106,8 +108,6 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
-    shared_topk_slots,
-    waterfill_routes_shared_experts,
 )
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
@@ -258,9 +258,7 @@ class TopKConfig:
     topk_group: Optional[int] = None
     num_expert_group: Optional[int] = None
     renormalize: bool = True
-    # Trailing columns of top_k that the router fills with fused shared experts.
-    # Zero when Waterfill appends the shared expert after routing.
-    num_shared_topk_slots: int = 0
+    shared_experts: SharedExpertsConfig = SharedExpertsConfig()
     custom_routing_function: Optional[Callable] = None
     correction_bias: Optional[torch.Tensor] = None
     torch_native: bool = False
@@ -284,6 +282,10 @@ class TopKConfig:
     _correction_bias_cache_key: Optional[Tuple] = field(
         default=None, init=False, repr=False, compare=False
     )
+
+    @property
+    def num_shared_topk_slots(self) -> int:
+        return self.shared_experts.num_shared_topk_slots
 
     def correction_bias_for_dtype(self, dtype: torch.dtype) -> Optional[torch.Tensor]:
         """Return correction bias in ``dtype``, reusing a per-TopK lazy copy."""
@@ -588,12 +590,11 @@ def _simulate_balanced_routing(
 class TopK(BaseFusedOp):
     """
     Parameters:
-    --top_k: The all number of top experts selected per token, including the fused shared expert(s).
+    --top_k: the number of routed experts selected per token. When the model being built
+      fuses shared experts (``get_num_fused_shared_experts``), their columns follow: written
+      by the router (``TopKConfig.num_shared_topk_slots``), or appended by Waterfill.
     --layer_id: global index of the owning layer. Required: routed-experts capture and
       per-layer EPLB state are keyed by it.
-    --num_fused_shared_experts: shared experts the experts layer runs as extra expert slots.
-      Their trailing top-k columns are written by the router, or by Waterfill when it is
-      enabled (``TopKConfig.num_shared_topk_slots`` then excludes them).
     --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
     --fused_shared_experts_scaling_factor: absolute appended weight on the global AITER
       path; otherwise multiplies the router's existing shared weight under standard EP.
@@ -609,7 +610,6 @@ class TopK(BaseFusedOp):
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
         renormalize: bool = True,
-        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
@@ -632,23 +632,21 @@ class TopK(BaseFusedOp):
 
         self.layer_id = layer_id
 
-        self.enable_waterfill = waterfill_routes_shared_experts(
-            num_fused_shared_experts
-        )
+        shared_experts = get_model().shared_experts
+        self.enable_waterfill = shared_experts.use_waterfill
         self.waterfill_balancer = None
-        num_shared_slots = shared_topk_slots(num_fused_shared_experts)
-        num_routed_experts_per_token = top_k - num_fused_shared_experts
+        num_shared_slots = shared_experts.num_shared_topk_slots
 
         # Under the flashinfer_mxfp4 backend, fp4-expert ckpts take STANDARD
         # (consumes topk_ids/weights); otherwise BYPASSED. No-op on other backends.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
-            top_k=num_routed_experts_per_token + num_shared_slots,
+            top_k=top_k + num_shared_slots,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
-            num_shared_topk_slots=num_shared_slots,
+            shared_experts=shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,

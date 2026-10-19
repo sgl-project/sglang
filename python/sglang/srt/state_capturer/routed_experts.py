@@ -49,9 +49,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     ) -> Optional["RoutedExpertsCapturer"]:
         if not get_exec().features.enable_return_routed_experts:
             return None
-        # The model's own attribute is the baked decision (0 when its gate
-        # disabled fusion); the ACTIVE flag can be holding another runner's.
-        num_fused_shared_experts = getattr(model, "num_fused_shared_experts", 0)
+        # The loader attaches this to every entry model, including wrappers.
+        # Size from the owner, independent of which runner is currently active.
+        num_fused_shared_experts = model.shared_experts_config.num_fused_shared_experts
         return RoutedExpertsCapturer(
             model_config,
             num_tokens=num_tokens,

@@ -24,9 +24,8 @@ from sglang.srt.layers.moe.topk import (
 )
 from sglang.srt.layers.moe.utils import (
     has_per_rank_fused_shared_slots,
-    shared_topk_slots,
-    waterfill_routes_shared_experts,
 )
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -41,7 +40,7 @@ class HashTopK(nn.Module):
         self,
         topk,
         num_experts,
-        num_fused_shared_experts,
+        *,
         vocab_size,
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
@@ -51,20 +50,18 @@ class HashTopK(nn.Module):
         super().__init__()
         self.layer_id = layer_id
 
-        self.enable_waterfill = waterfill_routes_shared_experts(
-            num_fused_shared_experts
-        )
+        self.shared_experts = get_model().shared_experts
+        self.enable_waterfill = self.shared_experts.use_waterfill
         self.waterfill_balancer = None
-        num_routed_experts_per_token = topk - num_fused_shared_experts
 
         self.num_experts = num_experts
-        # Trailing columns the hash router fills with fused shared experts.
-        self.num_shared_topk_slots = shared_topk_slots(num_fused_shared_experts)
-        self.topk = num_routed_experts_per_token + self.num_shared_topk_slots
+        # topk counts routed experts; the trailing columns the hash router fills
+        # with fused shared experts follow them.
+        self.topk = topk + self.num_shared_topk_slots
         self.routed_scaling_factor = routed_scaling_factor
         self.score_func = scoring_func
         self.tid2eid = nn.Parameter(
-            torch.empty(vocab_size, num_routed_experts_per_token, dtype=torch.int32),
+            torch.empty(vocab_size, topk, dtype=torch.int32),
             requires_grad=False,
         )
         self._init_default_tid2eid()
@@ -77,6 +74,10 @@ class HashTopK(nn.Module):
                 "HashTopK + apply_routed_scaling_factor_on_output is not supported "
                 "with fused shared experts; pass --disable-shared-experts-fusion."
             )
+
+    @property
+    def num_shared_topk_slots(self) -> int:
+        return self.shared_experts.num_shared_topk_slots
 
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
@@ -286,7 +287,7 @@ class HashTopK(nn.Module):
                 num_physical_routed_experts,
                 TopKConfig(
                     top_k=self.topk,
-                    num_shared_topk_slots=num_shared_topk_slots,
+                    shared_experts=self.shared_experts,
                     routed_scaling_factor=self.routed_scaling_factor,
                     apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
                 ),

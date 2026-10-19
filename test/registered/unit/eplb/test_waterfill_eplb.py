@@ -1,5 +1,7 @@
 """Unit tests for Waterfill and EPLB updater compatibility."""
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
+from sglang.srt.runtime_context import get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -12,7 +14,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
@@ -63,7 +64,7 @@ class TestWaterfillEPLB(CustomTestCase):
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_shared_topk_slots=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
@@ -106,7 +107,7 @@ class TestWaterfillEPLB(CustomTestCase):
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_shared_topk_slots=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
@@ -149,7 +150,7 @@ class TestWaterfillEPLB(CustomTestCase):
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_shared_topk_slots=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
@@ -187,23 +188,25 @@ class TestWaterfillEPLB(CustomTestCase):
 
     def test_the_shared_expert_column_has_exactly_one_writer(self):
         """Shared slots must be written exactly once, by routing or Waterfill."""
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
         for enable_waterfill in (False, True):
-            exec_config = SimpleNamespace(
-                moe=SimpleNamespace(enable_waterfill=enable_waterfill)
-            )
-            with (
-                self.subTest(enable_waterfill=enable_waterfill),
-                patch.object(moe_utils, "get_exec", return_value=exec_config),
-            ):
-                topk = TopK(top_k=9, layer_id=0, num_fused_shared_experts=1)
-                hash_topk = HashTopK(
-                    topk=9,
-                    num_experts=256,
-                    num_fused_shared_experts=1,
-                    vocab_size=4,
-                    layer_id=0,
-                )
-                unfused_topk = TopK(top_k=8, layer_id=0)
+            with self.subTest(enable_waterfill=enable_waterfill):
+                with get_model().override(
+                    shared_experts=SharedExpertsConfig(
+                        num_fused_shared_experts=1, use_waterfill=enable_waterfill
+                    )
+                ):
+                    topk = TopK(top_k=8, layer_id=0)
+                    hash_topk = HashTopK(
+                        topk=8, num_experts=256, vocab_size=4, layer_id=0
+                    )
+                with get_model().override(shared_experts=SharedExpertsConfig()):
+                    unfused_topk = TopK(top_k=8, layer_id=0)
 
                 for layer, router_top_k, router_shared_columns in (
                     (

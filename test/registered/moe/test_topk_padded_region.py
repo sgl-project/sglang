@@ -4,6 +4,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.moe.topk as topk_mod
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _can_fuse_padded_region,
@@ -163,7 +164,9 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
         topk_ids = torch.randint(0, 64, (n, k), device=self.DEVICE, dtype=torch.int32)
         router_logits = torch.rand((n, 64), device=self.DEVICE, dtype=torch.float32)
         pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
-        cfg = TopKConfig(top_k=k, num_shared_topk_slots=0)
+        cfg = TopKConfig(
+            top_k=k, shared_experts=SharedExpertsConfig(num_fused_shared_experts=0)
+        )
         _, out_weights, _ = _post_process_topk_ids(
             topk_ids,
             topk_weights,
@@ -197,7 +200,9 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
         topk_ids = torch.randint(0, 64, (n, k), device=self.DEVICE, dtype=torch.int32)
         router_logits = torch.rand((n, 64), device=self.DEVICE)
         pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
-        cfg = TopKConfig(top_k=k + 1, num_shared_topk_slots=1)
+        cfg = TopKConfig(
+            top_k=k + 1, shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+        )
         orig_skip = topk_mod._skip_hip_pad_mask
         orig_aiter = topk_mod._use_aiter
         topk_mod._skip_hip_pad_mask = True
@@ -301,7 +306,7 @@ class TestSelectExpertsPerRankSharedSlotPadMask(CustomTestCase):
                     use_grouped_topk=num_expert_group is not None,
                     num_expert_group=num_expert_group,
                     topk_group=4 if num_expert_group else None,
-                    num_shared_topk_slots=1,
+                    shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
                     correction_bias=bias.to(self.DEVICE),
                     scoring_func=scoring_func,
                     routed_scaling_factor=2.5,

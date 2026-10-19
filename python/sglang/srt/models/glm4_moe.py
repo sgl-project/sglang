@@ -69,7 +69,7 @@ from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_t
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -414,9 +414,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.config = config
         self.layer_id = layer_id
@@ -450,7 +448,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         )
 
         self.topk = TopK(
-            top_k=self.top_k + self.num_fused_shared_experts,
+            top_k=self.top_k,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
@@ -458,7 +456,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             apply_routed_scaling_factor_on_output=getattr(
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
@@ -995,8 +992,8 @@ class Glm4MoeForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1033,11 +1030,10 @@ class Glm4MoeForCausalLM(nn.Module):
             return "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

@@ -16,6 +16,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -37,7 +38,7 @@ def _jit_routed(monkeypatch, logits, hidden, bias, groups):
         renormalize=True,
         use_grouped_topk=True,
         num_expert_group=groups,
-        num_shared_topk_slots=SHARED,
+        shared_experts=SharedExpertsConfig(num_fused_shared_experts=SHARED),
         topk_group=1,
         scoring_func="sigmoid",
         correction_bias=bias,

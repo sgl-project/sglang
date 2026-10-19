@@ -129,10 +129,10 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
+    get_num_fused_shared_experts,
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
     is_sbo_enabled,
-    is_shared_experts_fusion_disabled,
     is_tbo_enabled,
     should_add_replicated_moe_output,
     sum_post_experts_output,
@@ -676,11 +676,13 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = is_shared_experts_fusion_disabled()
-
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
-        self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        assert self.num_fused_shared_experts in (0, n_shared_experts), (
+            f"The model fuses {self.num_fused_shared_experts} shared experts, but "
+            f"this MoE block has {n_shared_experts}."
+        )
 
         # DeepEP and MegaMOE shared expert fusion: shared expert is fused into
         # the same MoE kernel as a local expert at each EP rank. Expert layout
@@ -762,9 +764,8 @@ class DeepseekV2MoE(nn.Module):
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
-                topk=config.num_experts_per_tok + self.num_fused_shared_experts,
+                topk=config.num_experts_per_tok,
                 num_experts=config.n_routed_experts,
-                num_fused_shared_experts=self.num_fused_shared_experts,
                 vocab_size=config.vocab_size,
                 scoring_func=config.scoring_func,
                 routed_scaling_factor=self.routed_scaling_factor,
@@ -778,12 +779,11 @@ class DeepseekV2MoE(nn.Module):
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
             topk_kwargs = dict(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                top_k=config.num_experts_per_tok,
                 layer_id=self.layer_id,
                 renormalize=config.norm_topk_prob,
                 use_grouped_topk=True,
                 num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
                 topk_group=config.topk_group,
                 scoring_func=config.scoring_func,
                 correction_bias=self.gate.e_score_correction_bias,
@@ -3282,7 +3282,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -3330,7 +3331,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         """Why this checkpoint cannot fuse its shared expert, or None.
 
         Evaluated by the loader once per runner, before any layer is built (see
-        ``install_shared_experts_fusion_decision``), so it takes the config and
+        ``resolve_shared_experts_config``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
         # Need to disable if quant precision mismatch, even if
@@ -3397,11 +3398,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Return the model's fusable shared-expert count."""
+        return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
