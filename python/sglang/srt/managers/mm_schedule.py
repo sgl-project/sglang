@@ -22,6 +22,12 @@ _is_xpu = is_xpu()
 _NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS = {
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen2_5_VLForConditionalGeneration",
+    "Glm4vForConditionalGeneration",
+    "KimiVLForConditionalGeneration",
+    "MiniCPMO",
+    "Phi4MMForCausalLM",
+    "MultiModalityCausalLM",
 }
 
 embedding_cache: Optional[MultiModalStaticCache] = None
