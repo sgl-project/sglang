@@ -411,6 +411,86 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
             assert mismatch.item() < 1e-4
 
 
+@pytest.mark.parametrize("counts_kind", ["all_zero", "one_hot", "uneven", "full"])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind):
+    """The masked kernel's grid is capped at the resident CTAs, so one CTA may walk
+    several real rows of masked_m. Every real row must match the contig kernel
+    byte for byte, and no padded row may be written."""
+    from sglang.kernels.ops.moe.dsv4 import (
+        silu_and_mul_contig_post_quant,
+        silu_and_mul_masked_post_quant,
+    )
+
+    group_size, hidden, experts, topk = 128, 2048, 8, 8
+    scale_ue8m0 = transposed
+    # 4x the resident CTAs at hidden 2048 (256 threads, at most 8 CTAs per SM).
+    capacity = 4 * torch.cuda.get_device_properties(0).multi_processor_count
+    counts = {
+        "all_zero": [0] * experts,
+        "one_hot": [0, 0, 0, 0, 0, capacity, 0, 0],
+        "uneven": [0, capacity, 1, 0, 0, capacity - 1, 37, 2],
+        "full": [capacity] * experts,
+    }[counts_kind]
+    masked_m = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    groups = hidden // group_size
+    rows = experts * capacity
+
+    torch.manual_seed(7)
+    x = torch.randn(experts, capacity, 2 * hidden, device="cuda").bfloat16() * 5
+
+    sentinel = 0x5A5A5A5A
+    q = torch.full((experts, capacity, hidden // 4), sentinel, dtype=torch.int32)
+    q = q.cuda().view(fp8_dtype)
+    scale_shape = (
+        (experts, groups // 4, capacity) if transposed else (experts, capacity, groups)
+    )
+    scale = torch.full(scale_shape, sentinel, device="cuda", dtype=torch.int32)
+    silu_and_mul_masked_post_quant(
+        x,
+        q,
+        scale if transposed else scale.view(torch.float32),
+        group_size,
+        masked_m,
+        scale_ue8m0=scale_ue8m0,
+        topk=topk,
+        transposed=transposed,
+    )
+
+    q_ref = torch.empty(rows, hidden, device="cuda", dtype=fp8_dtype)
+    if transposed:
+        scale_ref = torch.empty(groups // 4, rows, device="cuda", dtype=torch.int32)
+        scale_ref_arg = scale_ref.T
+    else:
+        scale_ref = torch.empty(rows, groups, device="cuda", dtype=torch.float32)
+        scale_ref_arg = scale_ref
+    silu_and_mul_contig_post_quant(
+        x.flatten(0, 1),
+        q_ref,
+        scale_ref_arg,
+        group_size,
+        scale_ue8m0=scale_ue8m0,
+        transposed=transposed,
+    )
+    torch.cuda.synchronize()
+
+    q_bytes = q.view(torch.uint8)
+    q_ref_bytes = q_ref.view(torch.uint8).view(experts, capacity, hidden)
+    if transposed:
+        scale_ref = scale_ref.view(groups // 4, experts, capacity).permute(1, 0, 2)
+    else:
+        scale_ref = scale_ref.view(torch.int32).view(experts, capacity, groups)
+    for expert, count in enumerate(counts):
+        assert torch.equal(q_bytes[expert, :count], q_ref_bytes[expert, :count])
+        assert (q_bytes[expert, count:] == 0x5A).all()
+        if transposed:
+            assert torch.equal(scale[expert, :, :count], scale_ref[expert, :, :count])
+            assert (scale[expert, :, count:] == sentinel).all()
+        else:
+            assert torch.equal(scale[expert, :count], scale_ref[expert, :count])
+            assert (scale[expert, count:] == sentinel).all()
+
+
 @pytest.mark.parametrize("column_major", [True, False])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
 def test_fused_silu(scale_ue8m0, column_major):
