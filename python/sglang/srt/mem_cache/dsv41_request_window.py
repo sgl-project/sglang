@@ -205,6 +205,11 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        # The SWA history check runs on the device: buffer() folds each layer
+        # into a step flag and copies it to pinned memory on the same stream;
+        # activate() reads the copies whose events have completed.
+        self.history_missing = None
+        self.history_checks = []
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -233,8 +238,10 @@ class RequestWindow:
     def activate(self, layout):
         if self.layout is layout:
             return
+        self._raise_if_history_missing()
         self.layout = layout
         self.prepared = None
+        self.history_missing = None
         if self.workspace is None:
             self._ensure_workspace(layout.size)
         elif self.workspace.size < layout.size:
@@ -252,6 +259,34 @@ class RequestWindow:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
+
+    def _raise_if_history_missing(self):
+        pending = []
+        for check in self.history_checks:
+            host, event = check
+            if not event.query():
+                pending.append(check)
+            elif host.item():
+                raise RuntimeError(
+                    "SWA history is missing: replay or window ownership is invalid"
+                )
+        self.history_checks = pending
+
+    def _check_history(self, layer, src, layout):
+        missing = (
+            (self.tags[layer, src] != layout.history_pos) & layout.history_valid
+        ).any()
+        if self.history_missing is None:
+            self.history_checks.append(
+                [torch.empty((), dtype=torch.bool, pin_memory=True), None]
+            )
+        else:
+            missing |= self.history_missing
+        self.history_missing = missing
+        check = self.history_checks[-1]
+        check[0].copy_(missing, non_blocking=True)
+        check[1] = torch.cuda.Event()
+        check[1].record()
 
     def _history_src(self, layout):
         return torch.where(
@@ -271,13 +306,7 @@ class RequestWindow:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
             if not in_capture:
-                valid = layout.history_valid
-                if not torch.equal(
-                    self.tags[layer, src][valid], layout.history_pos[valid]
-                ):
-                    raise RuntimeError(
-                        "SWA history is missing: replay or window ownership is invalid"
-                    )
+                self._check_history(layer, src, layout)
             copy_packed_tokens(
                 self.state.kv_buffer[layer],
                 self.workspace.kv_buffer[0],
