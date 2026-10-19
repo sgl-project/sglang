@@ -12,6 +12,7 @@ import torch
 from safetensors.torch import save_file
 
 from sglang.srt.environ import envs
+from sglang.srt.model_loader.loader import post_load_weights
 from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
 from sglang.srt.models.step5_mtp import Step5MTP
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -92,6 +93,9 @@ class _FakeStep5:
 
     def load_weights(self, weights):
         return Step5ForCausalLM.load_weights(self, weights)
+
+    def post_load_weights(self):
+        return Step5ForCausalLM.post_load_weights(self)
 
     def expert_calls(self, param_name: str) -> list[tuple[str, int]]:
         param = self.params[_EXPERTS + param_name]
@@ -267,6 +271,25 @@ class TestStep5WeightUpdates(CustomTestCase):
                 ]
             )
         self.assertEqual(model.calls, [])
+
+    def test_follow_a_loader_that_skips_load_weights(self):
+        """After --load-format dummy (or another loader that fills weights without
+        load_weights), the first streamed bucket is an update, not the checkpoint."""
+        model = _FakeStep5()
+        post_load_weights(model)
+
+        model.load_weights(
+            [
+                (
+                    _EXPERTS + "2.gate_proj.weight",
+                    torch.zeros(4, 4, dtype=torch.float8_e4m3fn),
+                ),
+                (_EXPERTS + "2.gate_proj.weight_scale_inv", torch.ones(1, 1)),
+            ]
+        )
+
+        self.assertEqual(model.expert_calls("w13_weight"), [("w1", 2)])
+        self.assertEqual(model.duplicate_scans, 0)
 
     def test_may_send_any_subset_and_skip_the_disk_index(self):
         model = _loaded()
