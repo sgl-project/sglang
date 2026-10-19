@@ -60,6 +60,11 @@ def fit_sts_temperatures(
         raise ValueError("fit_sts_temperatures requires at least one sample.")
     if observed_mask is None:
         observed_mask = torch.ones_like(prefix_mask)
+    if observed_mask.shape != logits.shape:
+        raise ValueError(
+            f"observed_mask shape {tuple(observed_mask.shape)} does not match "
+            f"logits shape {tuple(logits.shape)}."
+        )
     observed_mask = observed_mask.bool()
     grid_values = grid.to(torch.float64).tolist()
 
@@ -137,9 +142,15 @@ def load_collected_shards(
         shard = torch.load(shard_path, map_location="cpu")
         shard_logits = shard["logits"]
         shard_prefix_mask = shard["prefix_mask"]
-        # Shards without a mask are treated as fully observed.
         shard_observed_mask = shard.get("observed_mask")
         if shard_observed_mask is None:
+            logger.warning(
+                "%s has no observed_mask (collected before acceptance labels): "
+                "fitting it as fully observed, which is right only for "
+                "all-greedy runs with a static verify window (no compact "
+                "verify or cap-accept).",
+                shard_path,
+            )
             shard_observed_mask = torch.ones_like(shard_prefix_mask)
         if not (
             shard_logits.shape == shard_prefix_mask.shape == shard_observed_mask.shape

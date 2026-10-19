@@ -64,8 +64,7 @@ class StsDataRecorder:
             observed_mask = torch.ones_like(prefix_mask)
         else:
             # A verify window of length L checks only its first L - 1 drafts.
-            # Later positions are unobserved for every row: keeping only rows
-            # rejected inside the window would bias them toward rejection.
+            # Counting later positions as rejections would bias the fit.
             caps = (
                 verify_lens.detach().to(device="cpu", dtype=torch.int64).view(-1, 1) - 1
             )
