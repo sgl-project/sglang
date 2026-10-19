@@ -181,6 +181,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                             smg_grpc_mode=False,
                             grpc_mode=False,
                             api_key="metadata-key",
+                            admin_api_key="metadata-admin-key",
                         ),
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
@@ -191,6 +192,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                     port=50051,
                     server_info_json=leader_json,
                     api_key="metadata-key",
+                    admin_api_key="metadata-admin-key",
                 )
 
 

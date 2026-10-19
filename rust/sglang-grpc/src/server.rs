@@ -1109,11 +1109,11 @@ pub async fn run_grpc_server(
     listener: std::net::TcpListener,
     mode: ServerMode,
     shutdown: Arc<Notify>,
-    api_key: Option<String>,
+    auth: crate::auth::ApiKeyAuth,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (bridge, response_timeout) = match mode {
         ServerMode::Metadata(service) => {
-            return serve_grpc(listener, service, shutdown, None, api_key).await;
+            return serve_grpc(listener, service, shutdown, None, auth).await;
         }
         ServerMode::Inference {
             bridge,
@@ -1140,14 +1140,7 @@ pub async fn run_grpc_server(
         }
     });
 
-    let result = serve_grpc(
-        listener,
-        service,
-        shutdown,
-        Some(stream_shutdown_tx),
-        api_key,
-    )
-    .await;
+    let result = serve_grpc(listener, service, shutdown, Some(stream_shutdown_tx), auth).await;
     monitor.abort();
     result
 }
@@ -1157,7 +1150,7 @@ async fn serve_grpc(
     service: impl proto::sglang_service_server::SglangService,
     shutdown: Arc<Notify>,
     stream_shutdown: Option<watch::Sender<bool>>,
-    api_key: Option<String>,
+    auth: crate::auth::ApiKeyAuth,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -1169,10 +1162,7 @@ async fn serve_grpc(
     tracing::info!("gRPC server listening on {}", addr);
 
     let result = tonic::transport::Server::builder()
-        .add_service(tonic::service::interceptor::InterceptedService::new(
-            svc,
-            crate::auth::ApiKeyAuth::new(api_key),
-        ))
+        .add_service(crate::auth::AuthService::new(svc, auth))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             if let Some(stream_shutdown) = stream_shutdown {

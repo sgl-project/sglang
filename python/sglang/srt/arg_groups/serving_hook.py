@@ -404,14 +404,9 @@ def handle_deprecated_args(server_args: Any):
                 "Native gRPC does not yet support --tokenizer-worker-num > 1. "
                 "Unset --grpc-port or set --tokenizer-worker-num 1."
             )
-        if cfg.api_key and envs.SGLANG_RUST_SERVER.get():
+        if (cfg.api_key or cfg.admin_api_key) and envs.SGLANG_RUST_SERVER.get():
             raise ValueError(
                 "Native gRPC API-key authentication is not supported with SGLANG_RUST_SERVER."
-            )
-        if cfg.admin_api_key:
-            raise ValueError(
-                "--grpc-port is incompatible with --admin-api-key: "
-                "native gRPC supports --api-key but not separate admin permissions."
             )
 
 
