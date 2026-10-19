@@ -5,6 +5,7 @@
 
 REASONING_PARSER_NAMES = [
     "apertus2509",
+    "beam",
     "deepseek-r1",
     "deepseek-v3",
     "deepseek-v4",
@@ -38,4 +39,5 @@ REASONING_PARSER_NAMES = [
     "iquest_q1",
     "cohere_command4",
     "gigachat35",
+    "response_template",
 ]

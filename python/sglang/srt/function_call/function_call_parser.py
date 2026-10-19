@@ -13,8 +13,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.environ import ToolStrictLevel, envs
 from sglang.srt.function_call.apertus2509_detector import Apertus2509Detector
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.cohere_command4_detector import CohereCommand4Detector
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
@@ -59,6 +60,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ class FunctionCallParser:
 
     ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "beam": BeamDetector,
         "cohere_command4": CohereCommand4Detector,
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
@@ -115,11 +118,20 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1Detector,
+        "response_template": ResponseTemplateToolDetector,
     }
 
     def __init__(
-        self, tools: List[Tool], tool_call_parser: str, tokenizer=None, tool_choice=None
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        prefix: str = "",
+        constrained: bool = False,
     ):
+        self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -127,6 +139,12 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
+            if issubclass(detector_class, ResponseTemplateToolDetector):
+                if prefix:
+                    kwargs["prefix"] = prefix
+                kwargs["constrained"] = constrained
+                # Forced calls are parsed in the format of the tag for these tools.
+                kwargs["tools"] = self.structural_tag_tools()
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
@@ -139,8 +157,6 @@ class FunctionCallParser:
             tool_choice = ToolChoice(function={"name": tool_choice["name"]})
         self._required_tool_parser = detector.get_required_tool_parser(tool_choice)
         self.detector = self._required_tool_parser or detector
-        self.tools = tools
-        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
 
     def owns_tool_format(self) -> bool:
         return (
@@ -176,15 +192,47 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
+        result = self.parse_non_stream_result(full_text)
+        return result.normal_text, result.calls
+
+    def parse_non_stream_result(
+        self, full_text: str, *, preserve_incomplete: bool = False
+    ) -> StreamingParseResult:
+        """Parse full output with optional ordering and retained cutoff calls.
+
+        Responses opts into the streaming lifecycle for template parsers so
+        recognized but unfinished calls survive. Tuple callers keep the legacy
+        full-parse behavior.
+        """
         if not self.tools:
-            return full_text, []
+            return StreamingParseResult(normal_text=full_text)
+        if preserve_incomplete and isinstance(
+            self.detector, ResponseTemplateToolDetector
+        ):
+            parsed = self.parse_stream_chunk_result(full_text)
+            end = self.parse_stream_end_result()
+            calls = {}
+            parts = []
+            for part in [*parsed.ordered_parts, *end.ordered_parts]:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif part.tool_index not in calls:
+                    calls[part.tool_index] = part.model_copy()
+                    parts.append(calls[part.tool_index])
+                else:
+                    call = calls[part.tool_index]
+                    call.name = part.name or call.name
+                    call.parameters += part.parameters
+            return StreamingParseResult(
+                normal_text=parsed.normal_text + end.normal_text,
+                calls=list(calls.values()),
+                ordered_parts=parts,
+            )
         has_tool_call = self.detector.has_tool_call(full_text)
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
-        tool_call_list = parsed_result.calls
-        if tool_call_list or has_tool_call:
-            return parsed_result.normal_text, tool_call_list
-        else:
-            return full_text, []
+        result = self.detector.detect_and_parse(full_text, self.tools)
+        if result.calls or has_tool_call:
+            return result
+        return StreamingParseResult(normal_text=full_text)
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
@@ -198,19 +246,14 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
+        result = self.parse_stream_chunk_result(chunk_text)
+        return result.normal_text, result.calls
+
+    def parse_stream_chunk_result(self, chunk_text: str) -> StreamingParseResult:
+        """Parse a chunk without discarding optional text/tool ordering."""
         if not self.tools:
-            return chunk_text, []
-        final_normal_text = ""
-        final_calls = []
-
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
-
-        return final_normal_text, final_calls
+            return StreamingParseResult(normal_text=chunk_text)
+        return self.detector.parse_streaming_increment(chunk_text, self.tools)
 
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
@@ -218,10 +261,19 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
+        result = self.parse_stream_end_result()
+        return result.normal_text, result.calls
+
+    def parse_stream_end_result(self) -> StreamingParseResult:
+        """Flush the parser, retaining optional text/tool ordering."""
         if not self.tools:
-            return "", []
-        sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+            return StreamingParseResult()
+        return self.detector.finish(self.tools)
+
+    @property
+    def supports_abort_flush(self) -> bool:
+        """Whether finalization can safely retain calls after generation aborts."""
+        return isinstance(self.detector, ResponseTemplateToolDetector)
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
@@ -275,10 +327,22 @@ class FunctionCallParser:
             at_least_one=at_least_one,
         )
 
+    def structural_tag_tools(self) -> List[Tool]:
+        """The tools as structural tags constrain them: all strict at the
+        PARAMETER strict level."""
+        if self.tool_strict_level < ToolStrictLevel.PARAMETER or not self.tools:
+            return self.tools
+        return [
+            tool.model_copy(
+                update={"function": tool.function.model_copy(update={"strict": True})}
+            )
+            for tool in self.tools
+        ]
+
     def get_structure_constraint(
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
-        parallel_tool_calls: bool = True,
+        parallel_tool_calls: Optional[bool] = True,
         thinking_mode: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
@@ -287,16 +351,28 @@ class FunctionCallParser:
 
         Args:
             tool_choice: The tool choice setting from the request
+            parallel_tool_calls: Whether multiple calls are allowed; None defaults to True.
 
         Returns:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
+        if parallel_tool_calls is None:
+            parallel_tool_calls = True
+
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
         should_constrain_auto = tool_choice == "auto" and (
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        structural_tag_tools = self.structural_tag_tools()
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            should_constrain_auto = self.detector.validate_structure_constraint_request(
+                tools=structural_tag_tools,
+                tool_choice=tool_choice,
+                parallel_tool_calls=parallel_tool_calls,
+                strict_requested=should_constrain_auto,
+            )
 
         try:
             if (
@@ -337,18 +413,6 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                structural_tag_tools = self.tools
-                if self.tool_strict_level >= ToolStrictLevel.PARAMETER:
-                    structural_tag_tools = [
-                        tool.model_copy(
-                            update={
-                                "function": tool.function.model_copy(
-                                    update={"strict": True}
-                                )
-                            }
-                        )
-                        for tool in self.tools
-                    ]
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,

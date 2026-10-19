@@ -45,12 +45,19 @@ from openai.types.responses import ResponseOutputMessage as OpenAIResponseOutput
 from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
+    ResponseStreamEvent,
     ResponseTextConfig,
 )
 from openai.types.responses.easy_input_message_param import EasyInputMessageParam
 from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_custom_tool_call_param import (
+    ResponseCustomToolCallParam,
+)
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
+)
+from openai.types.responses.response_function_tool_call_param import (
+    ResponseFunctionToolCallParam,
 )
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
@@ -58,6 +65,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     field_serializer,
     field_validator,
@@ -71,6 +79,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.entrypoints.openai.responses_adapters import ResponseToolState
 from sglang.utils import convert_json_schema_to_str
 
 logger = logging.getLogger(__name__)
@@ -856,6 +865,12 @@ def _has_message_level_tools(messages: Any) -> bool:
 
 
 class ChatCompletionRequest(PDRoutingFields):
+    _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
+    _format_add_special_tokens: bool = PrivateAttr(default=False)
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
@@ -1676,6 +1691,14 @@ class TokenizeRequest(BaseModel):
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+    add_generation_prompt: Optional[bool] = Field(
+        default=None,
+        description=(
+            "With messages: render them as given, passing this to the chat template, "
+            "and encode with add_special_tokens (default false). Omitted, messages are "
+            "rendered as for a chat completion."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tokenize_input(self) -> TokenizeRequest:
@@ -1691,7 +1714,14 @@ class TokenizeRequest(BaseModel):
         extra = getattr(self, "__pydantic_extra__", None)
         if extra:
             data.update(extra)
-        return ChatCompletionRequest.model_validate(data)
+        request = ChatCompletionRequest.model_validate(data)
+        if self.add_generation_prompt is not None:
+            request._format_add_generation_prompt = self.add_generation_prompt
+            request._format_add_special_tokens = (
+                "add_special_tokens" in self.model_fields_set
+                and self.add_special_tokens
+            )
+        return request
 
 
 class TokenizeResponse(BaseModel):
@@ -1759,6 +1789,7 @@ RESPONSE_TOOL_TYPES = Literal[
     "image_generation",
     "computer_use_preview",
     "local_shell",
+    "shell",
     "mcp",
     "custom",
     "namespace",
@@ -1768,6 +1799,8 @@ RESPONSE_TOOL_TYPES = Literal[
 
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
+
+    model_config = ConfigDict(extra="allow")
 
     type: RESPONSE_TOOL_TYPES = Field(description="Type of tool to enable")
     name: Optional[str] = None
@@ -1795,7 +1828,17 @@ class ResponseOutputMessage(OpenAIResponseOutputMessage):
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
+class NamespacedFunctionCallParam(ResponseFunctionToolCallParam, total=False):
+    namespace: Optional[str]
+
+
+class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
+    namespace: Optional[str]
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    NamespacedFunctionCallParam,
+    NamespacedCustomCallParam,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
@@ -1806,6 +1849,11 @@ ResponseInputOutputItem: TypeAlias = Union[
 
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
+
+    _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
+    _response_parser_prefix: str = PrivateAttr(default="")
+    _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
@@ -1821,9 +1869,10 @@ class ResponsesRequest(PDRoutingFields):
             ]
         ]
     ] = None
-    # Accept dict-shaped items as the loose arm; downstream normalization
-    # handles replayed shapes that don't satisfy every openai TypedDict.
-    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
+    # Preserve JSON input for downstream validation; SDK TypedDicts discard extra fields.
+    input: Union[str, List[Dict[str, Any]], List[ResponseInputOutputItem]] = Field(
+        union_mode="left_to_right"
+    )
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -1988,10 +2037,7 @@ class ResponsesRequest(PDRoutingFields):
         return self._json_schema_from_text_format(self.text) is not None
 
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
-        """``tool_choice`` reduced to what the server can actually honor: of the
-        object forms only a named ``function`` / ``custom`` tool survives, the
-        rest (web_search, mcp, ...) can't be forced through the tool-call
-        parser."""
+        """Normalize supported choices; unsupported built-ins fall back to auto."""
         tool_choice = self.tool_choice
         if not isinstance(tool_choice, dict):
             return tool_choice
@@ -1999,7 +2045,10 @@ class ResponsesRequest(PDRoutingFields):
             "name"
         )
         if tool_choice.get("type") in ("function", "custom") and name:
-            return {"type": "function", "name": name}
+            choice = {"type": tool_choice["type"], "name": name}
+            if "namespace" in tool_choice:
+                choice["namespace"] = tool_choice["namespace"]
+            return choice
         return "auto"
 
     def to_sampling_params(
@@ -2235,6 +2284,7 @@ class ResponsesResponse(BaseModel):
                 {"format": {"type": "text"}} if _is_text_only(output) else None
             )
 
+        tool_state = request._tool_state
         return cls(
             id=request.request_id,
             created_at=created_time,
@@ -2247,8 +2297,16 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.effective_tool_choice(),
-            tools=request.tools,
+            tool_choice=(
+                tool_state.public_choice
+                if tool_state.public_choice is not None
+                else request.effective_tool_choice()
+            ),
+            tools=(
+                tool_state.public_tools
+                if tool_state.public_tools is not None
+                else request.tools
+            ),
             # fields for parity with v1/responses
             error=None,
             incomplete_details=(
@@ -2276,6 +2334,23 @@ class ResponsesResponse(BaseModel):
         )
 
 
+class ResponsesLifecycleEvent(BaseModel):
+    """Response lifecycle event using SGLang's public response schema."""
+
+    type: Literal[
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ]
+    response: ResponsesResponse
+    sequence_number: int = -1
+
+
+ResponsesStreamEvent: TypeAlias = Union[ResponseStreamEvent, ResponsesLifecycleEvent]
+
+
 class RequestResponseMetadata(BaseModel):
     """Metadata for request/response tracking."""
 
@@ -2296,6 +2371,11 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # The tool-call constraint is the response template's own grammar.
+    template_tool_call_grammar: bool = False
+    # The tool-call constraint for output that starts the assistant message.
+    message_start_tool_call_constraint: Optional[ToolCallConstraint] = None
+    uses_response_template: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
@@ -2313,7 +2393,17 @@ class ResponseReasoningTextContent(BaseModel):
     type: Literal["reasoning_text"] = "reasoning_text"
 
 
+class NamespacedFunctionCallParam(ResponseFunctionToolCallParam, total=False):
+    namespace: Optional[str]
+
+
+class NamespacedCustomCallParam(ResponseCustomToolCallParam, total=False):
+    namespace: Optional[str]
+
+
 ResponseInputOutputItem: TypeAlias = Union[
+    NamespacedFunctionCallParam,
+    NamespacedCustomCallParam,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
