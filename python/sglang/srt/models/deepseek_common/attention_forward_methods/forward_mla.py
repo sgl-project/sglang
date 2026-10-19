@@ -118,6 +118,10 @@ def _apply_attention_output_gate(module, attn_output, gate):
 
 
 class DeepseekMLAForwardMixin:
+    # Set by subclasses whose prepare_mla_qkv needs the absorbed query
+    # materialized: disables deferred BMM fusion and born-FP8 query packing.
+    needs_unfused_mla_qkv = False
+
     def is_dcp_mla_decode_phase(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
@@ -167,11 +171,7 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
-        # Custom preparation needs the absorbed query before attention runs.
-        if (
-            getattr(self.prepare_mla_qkv, "__func__", None)
-            is not DeepseekMLAForwardMixin.prepare_mla_qkv
-        ):
+        if self.needs_unfused_mla_qkv:
             return False
         if getattr(self, "_kimi_split_gguf_kv_b", False):
             return False
@@ -251,11 +251,7 @@ class DeepseekMLAForwardMixin:
         """
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
-        # Custom preparation must see the absorbed query before FP8 packing.
-        if (
-            getattr(self.prepare_mla_qkv, "__func__", None)
-            is not DeepseekMLAForwardMixin.prepare_mla_qkv
-        ):
+        if self.needs_unfused_mla_qkv:
             return None
         if llama_4_scaling is not None:
             return None
@@ -328,7 +324,10 @@ class DeepseekMLAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare absorbed Q and normalized KV on the unfused rotary path."""
+        """Prepare absorbed Q and normalized KV on the unfused rotary path.
+
+        Overrides that transform ``q`` must set ``needs_unfused_mla_qkv``.
+        """
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         return q, q_pe, k, k_pe
 

@@ -77,6 +77,7 @@ def test_prepare_dispatches_hooks_and_preserves_index_reuse(
         return result
 
     attn.prepare_mla_qkv = Mock(side_effect=prepare)
+    attn.needs_unfused_mla_qkv = True
     monkeypatch.setattr(
         forward_mla,
         "get_attn_tp_context",
@@ -133,8 +134,8 @@ def test_default_prepare_keeps_bmm_attention_fusion(monkeypatch):
         use_deep_gemm_bmm=False,
         w_kc=torch.empty(2, 4, 4),
         current_attention_backend="dsa",
+        needs_unfused_mla_qkv=False,
     )
-    attn.prepare_mla_qkv = MethodType(MLA.prepare_mla_qkv, attn)
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
     monkeypatch.setattr(forward_mla, "is_graph_dsa_split_op_surface", lambda _: True)
     monkeypatch.setattr(forward_mla, "is_in_prefill_graph_scope", lambda: True)
@@ -155,9 +156,7 @@ def test_born_fp8_requires_default_query_preparation(monkeypatch, custom_prepare
         kv_lora_rank=128,
         num_local_heads=2,
     )
-    attn.prepare_mla_qkv = (
-        Mock() if custom_prepare else MethodType(MLA.prepare_mla_qkv, attn)
-    )
+    attn.needs_unfused_mla_qkv = custom_prepare
     monkeypatch.setattr(forward_mla, "_is_cpu", False)
     monkeypatch.setattr(forward_mla, "_is_hip", False)
     monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: False)
