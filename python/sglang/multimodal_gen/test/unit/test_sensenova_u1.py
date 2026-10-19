@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import functools
 import json
 import time
 from collections import deque
@@ -31,7 +32,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+    modeling_neo_chat,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+    NEOChatConfig,
     NEOLLMConfig,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
@@ -477,6 +482,87 @@ def test_sensenova_u1_randn_fallback_preserves_device_rng(monkeypatch):
     assert torch.equal(first, second)
     assert torch.equal(torch.get_rng_state(), cpu_rng_state)
     assert torch.equal(device_module.get_rng_state(device), device_rng_state)
+
+
+class _FakeThinkTokenizer(_FakeTokenizer):
+    def __call__(self, text, return_tensors, add_special_tokens=True):
+        return super().__call__(text, return_tensors)
+
+    def convert_tokens_to_ids(self, token):
+        return {"</think>": 500}.get(token, 501)
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        return " ".join(map(str, token_ids))
+
+
+def _make_tiny_sensenova_u1_model():
+    config = NEOChatConfig(
+        vision_config=dict(
+            patch_size=4, hidden_size=16, llm_hidden_size=32, downsample_ratio=0.5
+        ),
+        llm_config=dict(
+            architectures=["Qwen3ForCausalLM"],
+            vocab_size=512,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            max_position_embeddings=512,
+            max_position_embeddings_hw=64,
+        ),
+        downsample_ratio=0.5,
+        template="neo1_0",
+        fm_head_layers=2,
+        use_pixel_head=False,
+        concat_time_token_num=0,
+        noise_scale=1.0,
+        noise_scale_mode="none",
+        noise_scale_base_image_seq_len=64,
+        add_noise_scale_embedding=False,
+        noise_scale_max_value=8.0,
+        time_schedule="standard",
+        time_shift_type="exponential",
+        base_shift=0.5,
+        max_shift=1.15,
+        base_image_seq_len=64,
+        max_image_seq_len=4096,
+    )
+    torch.manual_seed(0)
+    return NEOChatModel(config).eval()
+
+
+def test_sensenova_u1_think_mode_image_attends_to_reasoning(monkeypatch):
+    """In think mode the image tokens must attend to the whole cached prefix,
+    including the generated reasoning and <img>, not just the prompt."""
+    model = _make_tiny_sensenova_u1_model()
+    model._generate_think = functools.partial(model._generate_think, max_think_tokens=4)
+    kwargs = dict(
+        prompt="a red apple",
+        cfg_scale=1.0,
+        image_size=(32, 32),
+        num_steps=2,
+        think_mode=True,
+        seed=1,
+    )
+    with torch.inference_mode():
+        actual, _ = model.t2i_generate(_FakeThinkTokenizer(), **kwargs)
+
+    # One unpadded prompt: without prefix lengths the attention reads the
+    # whole cache, which is the reference.
+    prepare_flash_kv_cache = modeling_neo_chat.prepare_flash_kv_cache
+    monkeypatch.setattr(
+        modeling_neo_chat,
+        "prepare_flash_kv_cache",
+        lambda *args, prefix_lengths=None, **inner_kwargs: prepare_flash_kv_cache(
+            *args, prefix_lengths=None, **inner_kwargs
+        ),
+    )
+    with torch.inference_mode():
+        expected, _ = model.t2i_generate(_FakeThinkTokenizer(), **kwargs)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_sensenova_u1_registry_resolves_local_and_hf_paths(tmp_path):
