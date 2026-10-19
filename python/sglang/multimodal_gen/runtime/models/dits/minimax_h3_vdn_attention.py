@@ -523,14 +523,21 @@ def _vdn_ulysses_hybrid_core(
     # the linear readout and its a2a run on the side stream while FA4 (issued
     # first) holds the current one; both read the exchanged q/k/v, frame sums and
     # gate, so the side stream waits for them and the current stream joins before the merge
-    main_stream = torch.cuda.current_stream(q.device)
-    side_stream = _linear_branch_stream(q.device)
-    side_stream.wait_stream(main_stream)
-    softmax_out = softmax()
-    softmax_work, softmax_recv = a2a_back(softmax_out, role="vdn_out0")
-    with torch.cuda.stream(side_stream):
+    if q.device.type == "npu":
+        # Ascend has no CUDA side-stream contract here; run both branches on the
+        # current stream and keep the two backward a2a trips overlapped.
+        softmax_out = softmax()
+        softmax_work, softmax_recv = a2a_back(softmax_out, role="vdn_out0")
         linear_work, linear_recv = a2a_back(linear_branch(), role="vdn_out1")
-    main_stream.wait_stream(side_stream)
+    else:
+        main_stream = torch.cuda.current_stream(q.device)
+        side_stream = _linear_branch_stream(q.device)
+        side_stream.wait_stream(main_stream)
+        softmax_out = softmax()
+        softmax_work, softmax_recv = a2a_back(softmax_out, role="vdn_out0")
+        with torch.cuda.stream(side_stream):
+            linear_work, linear_recv = a2a_back(linear_branch(), role="vdn_out1")
+        main_stream.wait_stream(side_stream)
     softmax_work.wait()
     linear_work.wait()
     merged_softmax = _vdn_merge_heads(softmax_recv)
