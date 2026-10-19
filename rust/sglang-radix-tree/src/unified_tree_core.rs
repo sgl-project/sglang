@@ -53,7 +53,7 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
-/// A node's position and FULL value length on a root-to-node path.
+/// A node's position, topology, and FULL value length on a root-to-node path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TreePathNodeInfo {
     pub node_id: NodeId,
@@ -63,6 +63,8 @@ pub struct TreePathNodeInfo {
     pub path_end: usize,
     /// Logical FULL device indices; None when absent.
     pub full_value_len: Option<usize>,
+    /// Number of immediate children at the time of the snapshot.
+    pub num_children: usize,
 }
 
 /// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
@@ -742,6 +744,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         full_value_len: node
                             .has_device_value(FULL)
                             .then(|| node.device_value_len(FULL)),
+                        num_children: node.children.len(),
                     });
                     current = parent;
                 }

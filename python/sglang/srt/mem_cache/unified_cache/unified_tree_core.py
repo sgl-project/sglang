@@ -690,6 +690,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         start,
                         end,
                         None if value is None else len(value),
+                        len(node.children),
                     )
                 )
                 start = end

@@ -1013,7 +1013,7 @@ impl HostEvictionResultBinding {
     }
 }
 
-type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>);
+type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>, usize);
 
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
@@ -1419,6 +1419,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                             node.path_start,
                             node.path_end,
                             node.full_value_len,
+                            node.num_children,
                         )
                     })
                     .collect()

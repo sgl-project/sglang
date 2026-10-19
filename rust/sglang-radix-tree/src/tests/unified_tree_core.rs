@@ -161,9 +161,9 @@ fn assert_path_info<K: ChildKeyType>() {
     let root_id = core.arena.node(root).id;
     let key = K::key_from(std::borrow::Cow::Owned(vec![1, 2, 3, 4, 5, 6, 7])).into_owned();
     let total = key.atom_len();
-    let (head_key, tail_key) = key.split_at(2);
-    let head = add_leaf(&mut core, root, head_key);
-    let tail = add_leaf(&mut core, head, tail_key);
+    let tail = add_leaf(&mut core, root, key);
+    let (head, action) = core.split_node_(tail, 2);
+    assert!(action.is_none());
     let other_key = K::key_from(std::borrow::Cow::Owned(vec![20, 21, 22])).into_owned();
     let other_len = other_key.atom_len();
     let other = add_leaf(&mut core, root, other_key);
@@ -177,6 +177,7 @@ fn assert_path_info<K: ChildKeyType>() {
             path_start: 0,
             path_end: 2,
             full_value_len: Some(2),
+            num_children: 1,
         },
         TreePathNodeInfo {
             node_id: tail_id,
@@ -184,6 +185,7 @@ fn assert_path_info<K: ChildKeyType>() {
             path_start: 2,
             path_end: total,
             full_value_len: Some(total - 2),
+            num_children: 0,
         },
     ];
     let snapshot = core
@@ -200,11 +202,24 @@ fn assert_path_info<K: ChildKeyType>() {
                 path_start: 0,
                 path_end: other_len,
                 full_value_len: Some(other_len),
+                num_children: 0,
             }],
             full_path.clone(),
         ]
     );
     assert!(core.collect_path_info(&[]).unwrap().is_empty());
+
+    let branch_key = K::key_from(std::borrow::Cow::Owned(vec![40, 41, 42])).into_owned();
+    let branch = add_leaf(&mut core, head, branch_key);
+    let branch_id = core.arena.node(branch).id;
+    let branched = core.collect_path_info(&[tail_id, branch_id]).unwrap();
+    for path in &branched {
+        assert_eq!(path[0].num_children, 2);
+        assert_eq!(path[1].num_children, 0);
+    }
+    assert_eq!(snapshot[0], full_path); // Child counts are snapshots too.
+    core.evict_device_leaf(branch_id, false).unwrap();
+    assert_eq!(core.collect_path_info(&[tail_id]).unwrap()[0], full_path);
 
     core.commit_backup(head_id, Tensor::from_slice(&[30i64, 31]), HashMap::new())
         .unwrap();

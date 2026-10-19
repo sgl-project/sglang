@@ -116,6 +116,7 @@ class TreePathNodeInfo(msgspec.Struct, frozen=True):
     path_end: int
     # Logical FULL device indices; None when the value is absent.
     full_value_len: Optional[int]
+    num_children: int
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
