@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from functools import partial
 from http import HTTPStatus
 from typing import (
     Annotated,
@@ -183,6 +184,7 @@ from sglang.srt.utils import (
     add_prometheus_track_response_middleware,
     build_server_info,
     delete_directory,
+    freeze_gc,
     get_bool_env_var,
     init_http_request_metrics,
     is_mps,
@@ -293,21 +295,18 @@ async def lifespan(fast_api_app: FastAPI):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
         thread_label = "Tokenizer"
-        tokenizer_worker_id = None
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        warmup_thread_kwargs = dict(server_args=server_args)
-        tokenizer_worker_id = _global_state.tokenizer_manager.worker_id
-        thread_label = f"MultiTokenizer-{tokenizer_worker_id}"
+        worker_id = _global_state.tokenizer_manager.worker_id
+        warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
+        thread_label = f"MultiTokenizer-{worker_id}"
 
     # Add prometheus middleware
     if get_observability().enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
-        init_http_request_metrics(
-            worker_id=None if tokenizer_worker_id is None else str(tokenizer_worker_id)
-        )
+        init_http_request_metrics()
 
     # Init tracing
     if get_observability().enable_trace:
@@ -2471,6 +2470,19 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
+    return partial(freeze_gc, f"Tokenizer worker {worker_id}", gc_threshold)
+
+
+def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
+    return dict(
+        server_args=server_args,
+        post_warmup_callback=_tokenizer_worker_gc_callback(
+            worker_id, server_args.gc_threshold
+        ),
+    )
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2494,6 +2506,7 @@ def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    post_warmup_callback: Optional[Callable[[], None]] = None,
 ):
     if get_model().checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
@@ -2512,6 +2525,8 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    if post_warmup_callback is not None:
+        post_warmup_callback()
     _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
@@ -2583,7 +2598,7 @@ def _run_granian_server(
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
     target = (
-        app if tokenizer_worker_num == 1 else "sglang.srt.entrypoints.http_server:app"
+        app if tokenizer_worker_num == 1 else envs.SGLANG_HTTP_SERVER_APP_PATH.get()
     )
     granian_kwargs = dict(
         target=target,
@@ -2845,7 +2860,7 @@ def _setup_and_run_http_server(
                 )
             else:
                 uvicorn.run(
-                    "sglang.srt.entrypoints.http_server:app",
+                    envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
                     host=get_serving().host,
                     port=get_serving().port,
                     root_path=get_serving().fastapi_root_path,
