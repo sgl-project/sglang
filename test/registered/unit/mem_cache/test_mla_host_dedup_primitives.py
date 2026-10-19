@@ -1,10 +1,13 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
@@ -15,7 +18,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
     make_dsa_indexer_pool_decl,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -60,13 +63,28 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             end_layer=2,
         )
         mla_host = MLATokenToKVPoolHost(
-            mla_device_pool,
+            MLAHostAllocation(
+                dtype=mla_device_pool.store_dtype,
+                kv_lora_rank=mla_device_pool.kv_lora_rank,
+                qk_rope_head_dim=mla_device_pool.qk_rope_head_dim,
+                kv_cache_dim=(
+                    mla_device_pool.kv_lora_rank + mla_device_pool.qk_rope_head_dim
+                ),
+                size_per_token=(
+                    mla_device_pool.kv_lora_rank + mla_device_pool.qk_rope_head_dim
+                )
+                * mla_device_pool.store_dtype.itemsize
+                * (mla_device_pool.layer_num),
+            ),
             host_to_device_ratio=2,
             host_size=0,
             page_size=2,
             layout="page_first",
             pin_memory=False,
-            is_dummy=True,
+            device_capacity_tokens=mla_device_pool.size,
+            start_layer=mla_device_pool.start_layer,
+            end_layer=mla_device_pool.end_layer,
+            target_layer_num=mla_device_pool.layer_num,
         )
 
         self.assertTrue(mla_host._is_dummy)
@@ -139,51 +157,98 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
     )
     def test_dummy_and_physical_hosts_share_capacity_geometry(self, _host_budget):
         """Dedup peers must allocate identical IDs despite different host payloads."""
-        for dcp_size in (1, 2):
-            for host_size in (0, 0.000002):
-                with self.subTest(dcp_size=dcp_size, host_size=host_size):
-                    pool = _device_pool_stub(
-                        layer_num=2,
-                        store_dtype=torch.float16,
-                        kv_lora_rank=4,
-                        qk_rope_head_dim=2,
-                        size=8,
-                        host_capacity_tokens=16,
-                        start_layer=7,
-                        end_layer=9,
-                        device="cpu",
-                        kv_buffer=[torch.zeros(10, 1, 6) for _ in range(2)],
-                    )
-                    pool.data_ptrs = torch.tensor(
-                        [buffer.data_ptr() for buffer in pool.kv_buffer],
-                        dtype=torch.uint64,
-                    )
-                    kwargs = dict(
-                        host_to_device_ratio=2,
-                        host_size=host_size,
-                        page_size=4,
-                        layout="page_first",
-                        pin_memory=False,
-                        dcp_size=dcp_size,
-                    )
-                    host = MLATokenToKVPoolHost(pool, **kwargs)
-                    dummy = MLATokenToKVPoolHost(pool, **kwargs, is_dummy=True)
-                    self.addCleanup(host.destroy)
-                    self.addCleanup(dummy.destroy)
-                    self.assertEqual(
-                        (host.size, host.page_num, host.page_size, host.size_per_token),
-                        (
-                            dummy.size,
-                            dummy.page_num,
-                            dummy.page_size,
-                            dummy.size_per_token,
+        for dcp_size, host_size, packed_fp8, draft_layers in product(
+            (1, 2), (0, 0.000002), (False, True), (0, 1)
+        ):
+            with self.subTest(
+                dcp_size=dcp_size,
+                host_size=host_size,
+                packed_fp8=packed_fp8,
+                draft_layers=draft_layers,
+            ):
+                pool_args = dict(
+                    size=8,
+                    page_size=2,
+                    dtype=torch.float8_e4m3fn if packed_fp8 else torch.float16,
+                    kv_lora_rank=4,
+                    qk_rope_head_dim=2,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    use_dsa=packed_fp8,
+                    override_kv_cache_dim=10 if packed_fp8 else None,
+                )
+                pool = MLATokenToKVPool(
+                    layer_num=2, start_layer=7, end_layer=9, **pool_args
+                )
+                pool.host_capacity_tokens = 16
+                drafts = tuple(
+                    MLATokenToKVPool(layer_num=1, **pool_args)
+                    for _ in range(draft_layers)
+                )
+                kwargs = dict(kv_pool=pool, page_size=4, mtp_draft_device_pools=drafts)
+                with (
+                    mock.patch.object(
+                        hybrid_pool_assembler,
+                        "get_parallel",
+                        return_value=SimpleNamespace(
+                            dcp_enabled=dcp_size > 1,
+                            attn_dcp_size=dcp_size,
+                            attn_dcp_rank=0,
                         ),
-                    )
-                    self.assertIsNone(dummy.kv_buffer)
-                    count = host.logical_size // 4 * 4
-                    self.assertEqual(
-                        host.alloc(count).tolist(), dummy.alloc(count).tolist()
-                    )
+                    ),
+                    mock.patch.object(
+                        hybrid_pool_assembler,
+                        "get_memory",
+                        return_value=SimpleNamespace(
+                            hicache_ratio=2,
+                            hicache_size=host_size,
+                            hicache_mem_layout="page_first",
+                        ),
+                    ),
+                    mock.patch.object(
+                        hybrid_pool_assembler,
+                        "_get_allocator_type",
+                        return_value="default",
+                    ),
+                    mock.patch.object(
+                        hybrid_pool_assembler,
+                        "MLATokenToKVPoolHost",
+                        side_effect=lambda *args, **kw: MLATokenToKVPoolHost(
+                            *args, **kw, pin_memory=False
+                        ),
+                    ),
+                ):
+                    host = hybrid_pool_assembler.build_kv_host_pool(**kwargs)
+                    self.addCleanup(host.destroy)
+                    with mock.patch.dict(
+                        "sglang.srt.mem_cache.pool_host.mla.ALLOC_MEMORY_FUNCS",
+                        {"cpu": mock.Mock(side_effect=AssertionError("dummy payload"))},
+                    ):
+                        dummy = hybrid_pool_assembler.build_kv_host_pool(
+                            **kwargs, is_dummy=True
+                        )
+                    self.addCleanup(dummy.destroy)
+
+                for field in (
+                    "size",
+                    "page_num",
+                    "page_size",
+                    "size_per_token",
+                    "kv_cache_dim",
+                    "layer_num",
+                    "start_layer",
+                    "end_layer",
+                    "dsa_kv_cache_store_fp8",
+                ):
+                    self.assertEqual(getattr(host, field), getattr(dummy, field), field)
+                self.assertFalse(host._is_dummy)
+                self.assertTrue(dummy._is_dummy)
+                self.assertIsNone(dummy.kv_buffer)
+                self.assertFalse(hasattr(dummy, "device_kv_buffers"))
+                count = host.logical_size // 4 * 4
+                self.assertEqual(
+                    host.alloc(count).tolist(), dummy.alloc(count).tolist()
+                )
 
     def test_layer_broadcast_reuses_full_staging_capacity(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)

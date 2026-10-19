@@ -1636,7 +1636,10 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
             attn_dp_size=4,
             tp_size=4,
         )
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta=None)
+        server_args._model_config = SimpleNamespace(
+            nvfp4_moe_meta=None,
+            hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
+        )
         return server_args
 
     def test_auto_resolves_mxfp8_and_normalizes_trtllm(self):
@@ -1665,7 +1668,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_auto_resolves_hybrid_nvfp4_metadata_to_nvfp4(self):
         server_args = self._make_args(quantization="fp8", dispatch_type="auto")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -1698,7 +1701,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
 
     def test_explicit_nvfp4_checks_hybrid_metadata_for_mxfp8_quantization(self):
         server_args = self._make_args(quantization="mxfp8", dispatch_type="nvfp4")
-        server_args._model_config = SimpleNamespace(nvfp4_moe_meta={})
+        server_args._model_config.nvfp4_moe_meta = {}
         handle_a2a_moe(server_args)
 
         self.assertEqual(
@@ -2384,6 +2387,28 @@ class TestHiCacheArgs(CustomTestCase):
                 },
                 "expected_io_backend": "direct",
                 "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "unified_memory_with_page_first_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_mem_layout": "page_first_direct",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
+            },
+            {
+                "name": "unified_memory_mooncake_with_direct",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "enable_unified_memory": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_io_backend": "direct",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "kernel",
+                "expected_mem_layout": "page_first",
             },
             {
                 "name": "fa3_kernel_with_explicit_decode_backend",
@@ -4393,6 +4418,31 @@ class TestNoneMeansUnset(CustomTestCase):
             model_path=self._checkpoint(), device="cuda", mamba_full_memory_ratio=0.9
         )
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
+
+
+class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
+    """Under the Rust server every attention-DP leader hosts its own listener;
+    a control request (abort, server info) sent to a leader other than rank 0
+    must reach its scheduler instead of being overwritten by rank 0's
+    broadcast."""
+
+    def test_rust_server_broadcasts_control_within_each_dp_group(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            attn_dp_size=2,
+            tp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        with envs.SGLANG_RUST_SERVER.override(True):
+            parallel_hook.handle_data_parallelism(server_args)
+        self.assertTrue(
+            resolution_result(
+                server_args, "enable_dp_attention_local_control_broadcast", False
+            )
+        )
 
 
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):

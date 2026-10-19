@@ -3,6 +3,7 @@ softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] 
 smallm_moe_gfx950 consumes. SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is f
 _kernels: dict = {}
 _ws: dict = {}
 _disabled = False
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -67,7 +69,7 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
             _check(_hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
             _kernels.update({r: _Kernel(mod, f"smallm_router_r{r}") for r in (1, 2)})
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
-            print(f"[smallm_router] disabled: {e}", flush=True)
+            logger.warning("smallm_router disabled: %s", e)
             _disabled = True
             return None
     tok = x.shape[0]
