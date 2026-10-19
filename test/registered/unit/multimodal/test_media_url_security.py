@@ -1,8 +1,11 @@
 """Security tests for client-supplied remote multimodal media URLs."""
 
 import http.server
+import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import requests
@@ -12,7 +15,10 @@ from sglang.srt.utils.common import (
     configure_media_url_security,
     download_remote_media,
     get_image_bytes,
+    get_video_bytes,
     load_audio,
+    load_image,
+    load_video,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -177,6 +183,82 @@ class TestMediaURLSecurity(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "not allowed"):
                         loader("https://blocked.example/media")
             self.assertEqual(download.call_count, 3)
+
+    def test_local_regular_file_over_the_cap_is_rejected(self):
+        """Local image, audio, and video inputs over the media byte cap are refused."""
+        configure_media_url_security([], max_file_size_mb=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "media.bin"
+            path.write_bytes(b"")
+            os.truncate(path, 1024 * 1024 + 1)
+            uri = path.as_uri()
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                get_image_bytes(str(path))
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                load_image(uri)
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                load_audio(uri)
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                _normalize_video_input(uri)
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                get_video_bytes(str(path))
+
+    @unittest.skipUnless(os.path.exists("/dev/zero"), "requires /dev/zero")
+    def test_local_device_node_is_rejected(self):
+        """A device path is refused instead of being read until EOF."""
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            _normalize_video_input("file:///dev/zero")
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            get_image_bytes("/dev/zero")
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            load_image("file:///dev/zero")
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            load_audio("file:///dev/zero")
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            get_video_bytes("file:///dev/zero")
+
+    def test_local_file_within_the_cap_is_read(self):
+        """A small local file is still read, including when the byte cap is disabled."""
+        payload = b"small-local-media"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "media.bin"
+            path.write_bytes(payload)
+            configure_media_url_security([], max_file_size_mb=1)
+            self.assertEqual(get_image_bytes(str(path)), payload)
+            self.assertEqual(get_video_bytes(str(path)), payload)
+            self.assertEqual(_normalize_video_input(path.as_uri()), payload)
+            configure_media_url_security([], max_file_size_mb=0)
+            self.assertEqual(get_image_bytes(str(path)), payload)
+            self.assertEqual(_normalize_video_input(path.as_uri()), payload)
+
+    def test_percent_encoded_video_path_is_the_file_that_was_checked(self):
+        """A %20 in the path must not select a different file from the size check."""
+        configure_media_url_security([], max_file_size_mb=1)
+        with tempfile.TemporaryDirectory() as directory:
+            checked = Path(directory) / "a b.mp4"
+            checked.write_bytes(b"tiny")
+            literal = Path(directory) / "a%20b.mp4"
+            literal.write_bytes(b"")
+            os.truncate(literal, 1024 * 1024 + 1)
+            self.assertEqual(_normalize_video_input(str(literal)), b"tiny")
+            with patch(
+                "sglang.srt.utils.common.VideoDecoderWrapper",
+                return_value="decoder",
+            ) as wrapper:
+                self.assertEqual(load_video(str(literal), use_gpu=False), "decoder")
+            wrapper.assert_called_once_with(b"tiny", device="cpu")
+
+    def test_preprocess_snapshot_rejects_an_oversized_local_image(self):
+        """The preprocess-cache snapshot uses the same local byte cap."""
+        from sglang.srt.multimodal.cache.identity import _read_media_bytes
+
+        configure_media_url_security([], max_file_size_mb=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "frame.png"
+            path.write_bytes(b"")
+            os.truncate(path, 1024 * 1024 + 1)
+            with self.assertRaisesRegex(ValueError, "size limit"):
+                _read_media_bytes(str(path))
 
 
 if __name__ == "__main__":
