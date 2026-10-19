@@ -21,6 +21,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import pybase64
+import torch
 from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -457,6 +459,26 @@ class TestAbortOutputPayload(CustomTestCase):
 
 class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
     """Test that _handle_batch_output removes rid from rid_to_state on completion."""
+
+    def test_batch_output_encodes_expert_tensors_and_preserves_strings(self):
+        tensor = torch.arange(120, dtype=torch.int32).reshape(5, 4, 6).transpose(0, 1)
+        encoded = pybase64.b64encode(tensor.numpy().tobytes()).decode("utf-8")
+        for value in (tensor, encoded, None):
+            with self.subTest(value_type=type(value).__name__):
+                tm = _make_tokenizer_manager(self)
+                rid = "expert-output"
+                state = _make_req_state(rid)
+                tm.rid_to_state[rid] = state
+                batch = _make_batch_str_output(rid)
+                batch.routed_experts = [value]
+                batch.indexer_topk = [value]
+                asyncio.run(tm._handle_batch_output(batch))
+                meta = state.out_list[0]["meta_info"]
+                for name in ("routed_experts", "indexer_topk"):
+                    if value is None:
+                        self.assertNotIn(name, meta)
+                    else:
+                        self.assertEqual(meta[name], encoded)
 
     def test_batch_output_removes_rid_on_finish(self):
         """When a request finishes in _handle_batch_output, rid should be removed."""

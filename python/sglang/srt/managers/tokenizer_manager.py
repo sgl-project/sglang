@@ -2617,13 +2617,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     # BatchStrOutput is pre-encoded by the detokenizer;
                     # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
                     if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                        val = pybase64.b64encode_as_string(
+                            memoryview(np.ascontiguousarray(val.numpy()))
+                        )
                     meta_info["routed_experts"] = val
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
                     if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                        val = pybase64.b64encode_as_string(
+                            memoryview(np.ascontiguousarray(val.numpy()))
+                        )
                     meta_info["indexer_topk"] = val
             if getattr(recv_obj, "dp_ranks", None):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]

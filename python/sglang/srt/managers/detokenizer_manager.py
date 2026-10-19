@@ -20,6 +20,7 @@ import signal
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import psutil
 import pybase64
 import setproctitle
@@ -434,7 +435,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return None
         return [
             (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                pybase64.b64encode_as_string(
+                    memoryview(np.ascontiguousarray(item.numpy()))
+                )
                 if item is not None
                 else None
             )
