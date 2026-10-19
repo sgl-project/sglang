@@ -2,11 +2,28 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI B200 pool",
-        "description": "Reference estimates for B200-only diffusion cases, split out from the shared diffusion baseline file.",
-        "last_updated": "2026-07-01"
+        "description": "B200 diffusion references with stage, denoise and allocated-memory checks enabled; previously enforced E2E/load references and runner overrides retained.",
+        "last_updated": "2026-10-18",
+        "calibration_runs": [
+            38482436865,
+            38554777367,
+            38725436953,
+            38979902269,
+            39027561441,
+            39077836460
+        ],
+        "calibration_policy": "At least five comparable main CI runs per case. Newly enabled timing checks use the observed maximum plus 5%; memory references use the maximum plus 1%. Existing tolerances, E2E/load references and runner overrides remain unchanged."
     },
     "runner_overrides": {
         "b200-cirrascale1-0123": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1574.32
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17742.04
+            }
+        },
+        "b200-cirrascale1-4567": {
             "flux1_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 1574.32
             },
@@ -23,6 +40,22 @@
             }
         },
         "b200-cirrascale3-4567": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1471.19
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17346.65
+            }
+        },
+        "b200-cirrascale4-0123": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1470.24
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17894.49
+            }
+        },
+        "b200-cirrascale4-4567": {
             "flux1_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 1471.19
             },
@@ -76,74 +109,82 @@
         "flux1_modelopt_nvfp4_t2i": {
             "expected_load_ms": 38841.5,
             "stages_ms": {
-                "InputValidationStage": 0.04,
-                "TextEncodingStage": 16.55,
-                "LatentPreparationStage": 0.14,
-                "TimestepPreparationStage": 18.55,
-                "DenoisingStage": 623.33,
-                "DecodingStage": 18.67
+                "InputValidationStage": 0.06,
+                "TextEncodingStage": 25.48,
+                "LatentPreparationStage": 0.23,
+                "TimestepPreparationStage": 2.09,
+                "DenoisingStage": 1097.5,
+                "DecodingStage": 15.42
             },
             "denoise_step_ms": {
-                "0": 61.5,
+                "0": 100.7,
                 "1": 51.43,
-                "2": 51.19,
+                "2": 92.65,
                 "3": 50.75,
-                "4": 51.09,
+                "4": 91.21,
                 "5": 51.0,
                 "6": 51.14,
-                "7": 50.65,
+                "7": 91.25,
                 "8": 50.41,
-                "9": 50.45,
+                "9": 90.48,
                 "10": 50.42,
-                "11": 50.9
+                "11": 90.57
             },
             "expected_e2e_ms": 836.71,
-            "expected_avg_denoise_ms": 51.74,
-            "expected_median_denoise_ms": 50.95,
-            "estimated_full_test_time_s": 71.2
+            "expected_avg_denoise_ms": 91.2,
+            "expected_median_denoise_ms": 90.58,
+            "estimated_full_test_time_s": 71.2,
+            "load_peak_vram_mb": 18297.16,
+            "runtime_peak_vram_mb": 23335.04,
+            "load_peak_allocated_mb": 18112.88,
+            "runtime_peak_allocated_mb": 19195.3
         },
         "flux2_modelopt_nvfp4_t2i": {
             "expected_load_ms": 71333.99,
             "stages_ms": {
-                "InputValidationStage": 0.04,
-                "TextEncodingStage": 330.43,
+                "InputValidationStage": 0.1,
+                "TextEncodingStage": 701.31,
                 "ImageVAEEncodingStage": 0.01,
-                "LatentPreparationStage": 0.32,
-                "TimestepPreparationStage": 12.36,
-                "DenoisingStage": 1184.2,
-                "DecodingStage": 17.18
+                "LatentPreparationStage": 0.82,
+                "TimestepPreparationStage": 4.35,
+                "DenoisingStage": 1501.8,
+                "DecodingStage": 15.72
             },
             "denoise_step_ms": {
-                "0": 96.2,
+                "0": 143.39,
                 "1": 30.93,
-                "2": 66.88,
+                "2": 121.58,
                 "3": 98.59,
-                "4": 97.53,
+                "4": 130.89,
                 "5": 100.31,
                 "6": 100.42,
-                "7": 98.55,
+                "7": 138.77,
                 "8": 97.93,
-                "9": 98.11,
+                "9": 106.67,
                 "10": 99.03,
-                "11": 99.53
+                "11": 106.87
             },
             "expected_e2e_ms": 1990.84,
-            "expected_avg_denoise_ms": 90.33,
-            "expected_median_denoise_ms": 98.33,
-            "estimated_full_test_time_s": 592.3
+            "expected_avg_denoise_ms": 115.55,
+            "expected_median_denoise_ms": 125.74,
+            "estimated_full_test_time_s": 592.3,
+            "load_peak_vram_mb": 26684.2,
+            "runtime_peak_vram_mb": 33020.94,
+            "load_peak_allocated_mb": 26206.26,
+            "runtime_peak_allocated_mb": 27679.14
         },
         "qwen_image_2512_modelopt_nvfp4_t2i": {
             "expected_load_ms": 46619.98,
             "stages_ms": {
-                "InputValidationStage": 0.04,
-                "TextEncodingStage": 221.4,
-                "LatentPreparationStage": 0.13,
-                "TimestepPreparationStage": 10.48,
-                "DenoisingStage": 9380.87,
-                "DecodingStage": 27.2
+                "InputValidationStage": 0.07,
+                "TextEncodingStage": 247.17,
+                "LatentPreparationStage": 0.3,
+                "TimestepPreparationStage": 3.09,
+                "DenoisingStage": 18934.88,
+                "DecodingStage": 38.96
             },
             "denoise_step_ms": {
-                "0": 203.71,
+                "0": 398.42,
                 "1": 190.75,
                 "2": 186.34,
                 "3": 186.88,
@@ -153,7 +194,7 @@
                 "7": 186.61,
                 "8": 185.09,
                 "9": 190.7,
-                "10": 186.22,
+                "10": 370.1,
                 "11": 185.68,
                 "12": 190.85,
                 "13": 186.54,
@@ -163,7 +204,7 @@
                 "17": 186.04,
                 "18": 185.14,
                 "19": 185.39,
-                "20": 184.56,
+                "20": 342.95,
                 "21": 188.41,
                 "22": 184.77,
                 "23": 185.5,
@@ -172,7 +213,7 @@
                 "26": 185.62,
                 "27": 191.78,
                 "28": 186.4,
-                "29": 187.19,
+                "29": 356.39,
                 "30": 185.61,
                 "31": 188.86,
                 "32": 185.2,
@@ -182,7 +223,7 @@
                 "36": 186.95,
                 "37": 189.05,
                 "38": 187.4,
-                "39": 188.8,
+                "39": 333.99,
                 "40": 193.13,
                 "41": 187.5,
                 "42": 184.56,
@@ -192,53 +233,61 @@
                 "46": 188.3,
                 "47": 191.32,
                 "48": 186.01,
-                "49": 185.95
+                "49": 595.74
             },
             "expected_e2e_ms": 9650.06,
-            "expected_avg_denoise_ms": 187.56,
-            "expected_median_denoise_ms": 186.57,
-            "estimated_full_test_time_s": 120.0
+            "expected_avg_denoise_ms": 378.62,
+            "expected_median_denoise_ms": 345.81,
+            "estimated_full_test_time_s": 120.0,
+            "load_peak_vram_mb": 17806.3,
+            "runtime_peak_vram_mb": 21062.54,
+            "load_peak_allocated_mb": 17269.02,
+            "runtime_peak_allocated_mb": 18870.33
         },
         "wan22_modelopt_nvfp4_t2v": {
             "expected_load_ms": 79653.94,
             "stages_ms": {
                 "InputValidationStage": 0.04,
-                "TextEncodingStage": 316.23,
+                "TextEncodingStage": 346.51,
                 "LatentPreparationStage": 0.11,
-                "TimestepPreparationStage": 1.44,
-                "DenoisingStage": 5413.33,
-                "DecodingStage": 82.95
+                "TimestepPreparationStage": 2.35,
+                "DenoisingStage": 5788.41,
+                "DecodingStage": 256.27
             },
             "denoise_step_ms": {
-                "0": 306.5,
+                "0": 375.77,
                 "1": 410.26,
-                "2": 409.53,
+                "2": 446.02,
                 "3": 407.43,
-                "4": 406.74,
+                "4": 443.38,
                 "5": 406.78,
                 "6": 406.75,
-                "7": 406.78,
+                "7": 443.45,
                 "8": 899.72,
-                "9": 406.75,
+                "9": 562.42,
                 "10": 406.77,
-                "11": 404.41
+                "11": 591.1
             },
             "expected_e2e_ms": 5964.13,
-            "expected_avg_denoise_ms": 439.87,
-            "expected_median_denoise_ms": 406.77,
-            "estimated_full_test_time_s": 181.8
+            "expected_avg_denoise_ms": 478.63,
+            "expected_median_denoise_ms": 443.42,
+            "estimated_full_test_time_s": 181.8,
+            "load_peak_vram_mb": 4920.72,
+            "runtime_peak_vram_mb": 9895.98,
+            "load_peak_allocated_mb": 4858.5,
+            "runtime_peak_allocated_mb": 6460.38
         },
         "ideogram4_nvfp4_t2i": {
             "expected_load_ms": 33439.28,
             "stages_ms": {
                 "InputValidationStage": 0.04,
-                "Ideogram4TextEncodingStage": 129.35,
-                "LatentPreparationStage": 0.1,
-                "DenoisingStage": 5233.76,
-                "Ideogram4DecodingStage": 53.08
+                "Ideogram4TextEncodingStage": 214.77,
+                "LatentPreparationStage": 0.13,
+                "DenoisingStage": 5818.9,
+                "Ideogram4DecodingStage": 56.33
             },
             "denoise_step_ms": {
-                "0": 88.71,
+                "0": 124.05,
                 "1": 83.99,
                 "2": 109.67,
                 "3": 110.03,
@@ -247,7 +296,7 @@
                 "6": 109.73,
                 "7": 109.89,
                 "8": 111.44,
-                "9": 108.37,
+                "9": 117.9,
                 "10": 110.23,
                 "11": 110.11,
                 "12": 109.81,
@@ -257,7 +306,7 @@
                 "16": 109.8,
                 "17": 109.88,
                 "18": 109.82,
-                "19": 110.23,
+                "19": 115.63,
                 "20": 109.81,
                 "21": 109.99,
                 "22": 110.21,
@@ -266,7 +315,7 @@
                 "25": 110.39,
                 "26": 109.8,
                 "27": 109.92,
-                "28": 109.83,
+                "28": 119.92,
                 "29": 109.88,
                 "30": 109.83,
                 "31": 109.89,
@@ -276,7 +325,7 @@
                 "35": 110.02,
                 "36": 109.67,
                 "37": 110.06,
-                "38": 109.8,
+                "38": 116.34,
                 "39": 110.35,
                 "40": 110.19,
                 "41": 110.43,
@@ -285,12 +334,16 @@
                 "44": 109.8,
                 "45": 109.94,
                 "46": 109.81,
-                "47": 110.02
+                "47": 259.5
             },
             "expected_e2e_ms": 5421.76,
-            "expected_avg_denoise_ms": 108.99,
-            "expected_median_denoise_ms": 109.9,
-            "estimated_full_test_time_s": 300.0
+            "expected_avg_denoise_ms": 121.13,
+            "expected_median_denoise_ms": 116.68,
+            "estimated_full_test_time_s": 300.0,
+            "load_peak_vram_mb": 13691.56,
+            "runtime_peak_vram_mb": 34903.58,
+            "load_peak_allocated_mb": 13661.57,
+            "runtime_peak_allocated_mb": 31120.37
         }
     }
 }

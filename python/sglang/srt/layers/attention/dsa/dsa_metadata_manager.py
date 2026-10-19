@@ -29,12 +29,9 @@ _is_hip = is_hip()
 logger = logging.getLogger(__name__)
 
 
-def kpool_metadata_fusion_supported(pool_size, page_size, topk):
+def kpool_metadata_fusion_supported(kpool, page_size, topk):
     return (
-        pool_size > 1
-        and page_size == 64
-        and page_size % pool_size == 0
-        and topk % pool_size == 0
+        kpool > 1 and page_size == 64 and page_size % kpool == 0 and topk % kpool == 0
     )
 
 
@@ -44,7 +41,7 @@ class DSAMetadataManagementMixin:
     def _init_kpool_metadata_fusion(self):
         requested = envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
         supported = kpool_metadata_fusion_supported(
-            self.dsa_index_kpool, self.real_page_size, self.dsa_index_topk
+            self.dsa_index_kpool, self.physical_page_size, self.dsa_index_topk
         )
         self.experimental_kpool_metadata_fusion = (
             requested and supported and is_cuda() and not is_hip()
@@ -217,6 +214,7 @@ class DSAMetadataManagementMixin:
                 dst.pooled_paged_mqa_schedule_metadata,
                 src.pooled_paged_mqa_schedule_metadata,
             )
+            and _match(dst.pooled_topk_v2_plan, src.pooled_topk_v2_plan)
             and _match(dst.kpool_write_plan, src.kpool_write_plan)
         ):
             return False
@@ -226,6 +224,7 @@ class DSAMetadataManagementMixin:
             and _match(dst_plan.seqlens_per_q, src_plan.seqlens_per_q)
             and _match(dst_plan.pool_schedule_metadata, src_plan.pool_schedule_metadata)
             and _match(dst_plan.effective_n_per_batch, src_plan.effective_n_per_batch)
+            and _match(dst_plan.pool_topk_v2_plan, src_plan.pool_topk_v2_plan)
         ):
             return False
         return True
@@ -301,6 +300,8 @@ class DSAMetadataManagementMixin:
             metadata.pooled_paged_mqa_schedule_metadata.copy_(
                 src_metadata.pooled_paged_mqa_schedule_metadata
             )
+        if metadata.pooled_topk_v2_plan is not None:
+            metadata.pooled_topk_v2_plan.copy_(src_metadata.pooled_topk_v2_plan)
 
         dst_plan = metadata.kpool_write_plan
         src_plan = src_metadata.kpool_write_plan
@@ -318,3 +319,5 @@ class DSAMetadataManagementMixin:
             dst_plan.pool_schedule_metadata.copy_(src_plan.pool_schedule_metadata)
         if dst_plan.effective_n_per_batch is not None:
             dst_plan.effective_n_per_batch.copy_(src_plan.effective_n_per_batch)
+        if dst_plan.pool_topk_v2_plan is not None:
+            dst_plan.pool_topk_v2_plan.copy_(src_plan.pool_topk_v2_plan)
