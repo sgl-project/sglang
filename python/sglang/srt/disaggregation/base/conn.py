@@ -30,6 +30,9 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
+    # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
+    # DSpark draft's SWA valid-from.
+    REQUEST_ROW = "request_row"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).
@@ -58,6 +61,8 @@ class KVArgs:
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
+    # KV byte layout both PD roles must share; None for pools with only one.
+    kv_layout: Optional[str] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None
@@ -81,6 +86,9 @@ class KVArgs:
     # scatter transfer can slice each independently head-sharded sub-block; None
     # per tensor when the single contiguous slice already matches the layout.
     state_conv_shard_groups: List[List[Optional[List[int]]]]
+    # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
+    # None when the SWA state is not held in an MHA sub-pool.
+    swa_kv_cache_layout: Optional[str]
     ib_device: str
     gpu_id: int
     kv_head_num: int
@@ -125,6 +133,13 @@ class BaseKVManager(ABC):
 
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
+
+    def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
+        """Whether the checksum sent by the prefill at bootstrap_addr is comparable
+        with one over this rank's local KV. A backend returns False for a peer
+        whose digest covers a different byte range, e.g. a TP width mismatch where
+        each decode rank receives only a slice of what the sender digested."""
+        return True
 
     @abstractmethod
     def __init__(

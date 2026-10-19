@@ -1,0 +1,287 @@
+name: Release Docker EFA Images
+#
+# Layers docker/efa.Dockerfile on top of already-published images, so the main
+# image workflows and docker/Dockerfile stay untouched. Runs after each base
+# workflow succeeds:
+#
+#   Release Docker Images (tag push)
+#     lmsysorg/sglang:v{version}         -> v{version}-efa, latest-efa,
+#                                           v{version}-cu130-efa, latest-cu130-efa
+#   Release Docker Runtime Images (tag push)
+#     lmsysorg/sglang:v{version}-runtime -> v{version}-runtime-efa, latest-runtime-efa,
+#                                           v{version}-cu130-runtime-efa, latest-cu130-runtime-efa
+#   Build and Push Development Docker Images (schedule or workflow_dispatch)
+#     lmsysorg/sglang:nightly-dev-{date}-{short_sha} -> nightly-dev-efa-{date}-{short_sha}, dev-efa
+#
+# The EFA image inherits the base's SGLang commit and, for nightlies, its exact
+# {date}-{short_sha} suffix, so nightly-dev-efa-X matches nightly-dev-X.
+#
+# A manual dev run publishes a nightly-dev-* tag only when it has no tag or
+# pr_number input; PR and custom-tag builds publish dev-<suffix> instead and
+# are skipped here, since there is no dated nightly to pair with.
+#
+# Manually dispatched release runs are not followed: their inputs (version,
+# image_repo) are not in the workflow_run payload. Use this workflow's own
+# workflow_dispatch for those, and for one-off builds.
+on:
+  workflow_run:
+    workflows:
+      - Release Docker Images
+      - Release Docker Runtime Images
+      - Build and Push Development Docker Images
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "Published lmsysorg/sglang tag to layer EFA on (e.g. v0.5.21-runtime, nightly-dev-20261013-7224fce1)"
+        required: true
+      output_tags:
+        description: "Comma-separated tags to publish (e.g. v0.5.21-runtime-efa,latest-runtime-efa). Overwrites existing tags."
+        required: true
+      image_repo:
+        description: "Docker Hub repo to push the EFA image to; the base is always pulled from lmsysorg/sglang. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
+
+concurrency:
+  # One group per base run (re-runs of it share the id), so only a re-run
+  # supersedes an in-progress EFA build. A coarser key would let one base run
+  # cancel another's EFA build: e.g. a manual PR build of the dev image, which
+  # resolves to skip, would cancel the EFA build for a manual nightly run, and
+  # that day would get no nightly-dev-efa-* at all.
+  group: >-
+    release-docker-efa-${{ github.event_name == 'workflow_dispatch' && inputs.output_tags ||
+    github.event.workflow_run.id }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    if: >-
+      github.repository == 'sgl-project/sglang' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        (github.event.workflow_run.event == 'push' ||
+         github.event.workflow_run.event == 'schedule' ||
+         github.event.workflow_run.event == 'workflow_dispatch')))
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.resolve.outputs.skip }}
+      nightly: ${{ steps.resolve.outputs.nightly }}
+      base_image: ${{ steps.resolve.outputs.base_image }}
+      out_images: ${{ steps.resolve.outputs.out_images }}
+      primary_image: ${{ steps.resolve.outputs.primary_image }}
+      environment: ${{ steps.resolve.outputs.environment }}
+    steps:
+      - name: Resolve base image and output tags
+        id: resolve
+        env:
+          # Inject via env so a crafted input or branch name cannot break out
+          # of the script.
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_WORKFLOW: ${{ github.event.workflow_run.name }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_REF: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_STARTED: ${{ github.event.workflow_run.run_started_at }}
+          INPUT_BASE_TAG: ${{ inputs.base_tag }}
+          INPUT_OUTPUT_TAGS: ${{ inputs.output_tags }}
+          INPUT_IMAGE_REPO: ${{ inputs.image_repo }}
+        run: |
+          set -euo pipefail
+
+          # Whole-string checks. A '^...$' regex anchors per LINE, so a
+          # multi-line value would pass and then inject extra GITHUB_OUTPUT lines.
+          validate_tag() {
+            case "$2" in
+              ""|[!a-zA-Z0-9_]*|*[!a-zA-Z0-9._-]*)
+                echo "::error::${1} '${2}' is not a valid Docker tag"
+                exit 1
+                ;;
+            esac
+          }
+
+          # Bases always come from the published repo. REPO is only where the
+          # EFA image is pushed; workflow_dispatch can point it at e.g.
+          # lmsysorg/sglang-staging, which has no nightly or release bases.
+          BASE_REPO="lmsysorg/sglang"
+          REPO="lmsysorg/sglang"
+          ENVIRONMENT=""
+          NIGHTLY="false"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            [ -n "${INPUT_IMAGE_REPO}" ] && REPO="${INPUT_IMAGE_REPO}"
+            case "${REPO}" in
+              ""|*[!a-z0-9._/-]*|/*|*/)
+                echo "::error::'${REPO}' is not a valid Docker Hub repo"
+                exit 1
+                ;;
+            esac
+            BASE_TAG="${INPUT_BASE_TAG}"
+            IFS=',' read -ra OUT_TAGS <<< "${INPUT_OUTPUT_TAGS}"
+          else
+            case "${SOURCE_WORKFLOW}/${SOURCE_EVENT}" in
+              "Release Docker Images/push"|"Release Docker Runtime Images/push")
+                # For tag pushes head_branch is the tag name, e.g. v0.5.21.
+                # Same check as the base release workflows; validate_tag below
+                # rejects anything unusable as a tag.
+                VERSION="${SOURCE_REF#v}"
+                if ! echo "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+                  echo "::error::Cannot derive a release version from '${SOURCE_REF}'"
+                  exit 1
+                fi
+                if [ "${SOURCE_WORKFLOW}" = "Release Docker Images" ]; then
+                  FLAVOR=""
+                else
+                  FLAVOR="-runtime"
+                fi
+                BASE_TAG="v${VERSION}${FLAVOR}"
+                OUT_TAGS=("v${VERSION}${FLAVOR}-efa" "latest${FLAVOR}-efa"
+                          "v${VERSION}-cu130${FLAVOR}-efa" "latest-cu130${FLAVOR}-efa")
+                # Match the base release workflows, which publish from `prod`.
+                ENVIRONMENT="prod"
+                ;;
+              "Build and Push Development Docker Images/schedule"|"Build and Push Development Docker Images/workflow_dispatch")
+                # The base nightly tag is nightly-dev-{date}-{short_sha}, where
+                # {date} is taken when its manifest is created. Look the tag up by
+                # commit instead of recomputing the date, so a run that crosses
+                # midnight still finds it and the EFA tag reuses the same suffix.
+                #
+                # Only accept a tag pushed after this base run started, i.e. by
+                # this run. Otherwise a manual PR or custom-tag build dispatched
+                # from a commit that already has a nightly would re-publish that
+                # older nightly, and could move dev-efa back to it. Comparing the
+                # first 19 characters (YYYY-MM-DDTHH:MM:SS) of both ISO 8601
+                # timestamps orders them correctly as strings.
+                SHORT_SHA="${SOURCE_SHA:0:8}"
+                case "${SHORT_SHA}" in
+                  *[!0-9a-f]*|"") echo "::error::Bad head_sha '${SOURCE_SHA}'"; exit 1 ;;
+                esac
+                BASE_TAG=""
+                for attempt in 1 2 3; do
+                  BASE_TAG="$(curl -fsS --retry 3 \
+                    "https://hub.docker.com/v2/repositories/${BASE_REPO}/tags/?name=-${SHORT_SHA}&page_size=100" \
+                    | jq -r --arg sha "${SHORT_SHA}" --arg since "${SOURCE_STARTED:0:19}" \
+                      '[.results[]
+                        | select(.name | test("^nightly-dev-[0-9]{8}-" + $sha + "$"))
+                        | select(.last_updated[0:19] >= $since)
+                        | .name] | first // empty')" || true
+                  [ -n "${BASE_TAG}" ] && break
+                  sleep 30
+                done
+                if [ -z "${BASE_TAG}" ]; then
+                  if [ "${SOURCE_EVENT}" = "schedule" ]; then
+                    # A successful scheduled run always publishes this tag, so
+                    # its absence is a real problem.
+                    echo "::error::No nightly-dev-<date>-${SHORT_SHA} tag pushed by this run found in ${BASE_REPO}"
+                    exit 1
+                  fi
+                  # Manual run that published no dated nightly here: a PR or
+                  # custom-tag build, build_only, or another image_repo.
+                  echo "No nightly-dev-<date>-${SHORT_SHA} tag pushed by this run in ${BASE_REPO}; nothing to do"
+                  echo "skip=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                SUFFIX="${BASE_TAG#nightly-dev-}"
+                OUT_TAGS=("nightly-dev-efa-${SUFFIX}" "dev-efa")
+                NIGHTLY="true"
+                ;;
+              *)
+                echo "Nothing to do for '${SOURCE_WORKFLOW}' (${SOURCE_EVENT})"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          fi
+
+          validate_tag base_tag "${BASE_TAG}"
+          [ "${#OUT_TAGS[@]}" -gt 0 ] || { echo "::error::No output tags"; exit 1; }
+          OUT_IMAGES=""
+          for t in "${OUT_TAGS[@]}"; do
+            t="$(echo "${t}" | xargs)"
+            validate_tag output_tag "${t}"
+            OUT_IMAGES="${OUT_IMAGES:+${OUT_IMAGES} }${REPO}:${t}"
+          done
+
+          echo "Base:    ${BASE_REPO}:${BASE_TAG}"
+          echo "Outputs: ${OUT_IMAGES}"
+          {
+            echo "skip=false"
+            echo "nightly=${NIGHTLY}"
+            echo "base_image=${BASE_REPO}:${BASE_TAG}"
+            echo "out_images=${OUT_IMAGES}"
+            echo "primary_image=${OUT_IMAGES%% *}"
+            echo "environment=${ENVIRONMENT}"
+          } >> "$GITHUB_OUTPUT"
+
+  build-and-publish:
+    needs: resolve
+    if: needs.resolve.outputs.skip == 'false'
+    # Same runner as patch-docker-dev.yml, which also layers onto published
+    # multi-arch images; it has the disk for both platforms' base layers.
+    runs-on: x64-docker-build-node
+    environment: ${{ needs.resolve.outputs.environment || null }}
+    env:
+      BASE_IMAGE: ${{ needs.resolve.outputs.base_image }}
+      OUT_IMAGES: ${{ needs.resolve.outputs.out_images }}
+      PRIMARY_IMAGE: ${{ needs.resolve.outputs.primary_image }}
+    steps:
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      # Always the default branch's efa.Dockerfile: older release tags do not
+      # have it, and the layer does not depend on the SGLang source.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push EFA image (amd64 + arm64)
+        run: |
+          set -euo pipefail
+          TAG_ARGS=()
+          for img in ${OUT_IMAGES}; do TAG_ARGS+=(-t "${img}"); done
+          # Each platform layers onto its own arch of the base manifest list, so
+          # the output stays a list. A single-arch base fails here on purpose:
+          # the output would not be pullable on the other arch.
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --no-cache \
+            -f docker/efa.Dockerfile \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            --build-arg EFA_IMAGE_TAG="${PRIMARY_IMAGE}" \
+            "${TAG_ARGS[@]}" \
+            --push \
+            docker/
+
+      - name: Write summary
+        run: |
+          {
+            echo "### Published EFA image"
+            echo "- **Base image:** \`${BASE_IMAGE}\`"
+            for img in ${OUT_IMAGES}; do echo "- \`${img}\`"; done
+            echo "- **Platforms:** \`linux/amd64,linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: docker buildx prune --filter "until=72h" -f || true
+
+  cleanup-nightly:
+    needs: [resolve, build-and-publish]
+    # Any run that published a nightly-dev-efa-* tag, scheduled or manual.
+    if: needs.resolve.outputs.nightly == 'true'
+    uses: ./.github/workflows/_docker-cleanup-nightly.yml
+    with:
+      # The cleanup regex is "^<prefix>-[0-9]", so this never touches the
+      # nightly-dev-<date>-* tags of the base workflow.
+      tag_prefixes: '["nightly-dev-efa"]'
+    secrets: inherit

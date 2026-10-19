@@ -18,8 +18,18 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestHelionKDADispatcher(unittest.TestCase):
-    def _make_dispatcher(self, decode_backend, prefill_backend):
-        helion_kernel = MagicMock(supports_packed_decode=True)
+    def _make_dispatcher(
+        self,
+        decode_backend,
+        prefill_backend,
+        verify_backend=LinearAttnKernelBackend.TRITON,
+    ):
+        helion_kernel = MagicMock(
+            spec=HelionKDAKernel,
+            supports_packed_decode=True,
+            supports_packed_decode_safe_gate=HelionKDAKernel.supports_packed_decode_safe_gate,
+            supports_safe_gate_verify=HelionKDAKernel.supports_safe_gate_verify,
+        )
         with (
             patch(
                 "sglang.srt.layers.attention.linear.kda_backend.is_cuda",
@@ -33,7 +43,7 @@ class TestHelionKDADispatcher(unittest.TestCase):
             dispatcher = KDAKernelDispatcher(
                 decode_backend=decode_backend,
                 prefill_backend=prefill_backend,
-                verify_backend=LinearAttnKernelBackend.TRITON,
+                verify_backend=verify_backend,
             )
         return dispatcher, helion_kernel, constructor
 
@@ -82,6 +92,21 @@ class TestHelionKDADispatcher(unittest.TestCase):
         self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
         self.assertIs(dispatcher.extend_kernel, helion_kernel)
         self.assertIsInstance(dispatcher.verify_kernel, TritonKDAKernel)
+
+    def test_explicit_helion_verify_reuses_adapter(self):
+        for decode in (LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.HELION):
+            with self.subTest(decode=decode):
+                dispatcher, helion_kernel, _ = self._make_dispatcher(
+                    decode,
+                    LinearAttnKernelBackend.TRITON,
+                    LinearAttnKernelBackend.HELION,
+                )
+                self.assertIs(dispatcher.verify_kernel, helion_kernel)
+                self.assertIsInstance(dispatcher.extend_kernel, TritonKDAKernel)
+                if decode.is_helion():
+                    self.assertIs(dispatcher.decode_kernel, helion_kernel)
+                else:
+                    self.assertIsInstance(dispatcher.decode_kernel, TritonKDAKernel)
 
     def test_replayssm_decode_uses_native_helion_kernel(self):
         kernel = HelionKDAKernel.__new__(HelionKDAKernel)
