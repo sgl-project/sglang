@@ -4567,7 +4567,7 @@ class DeepseekV4AttnBackend(
             return BuildDsparkSwaRingIndices.execute(
                 seq_lens_casual=seq_lens_casual,
                 req_pool_indices_repeated=req_pool_indices_repeated,
-                valid_from=pool.swa_req_ring_valid_from,
+                valid_from=pool.swa_valid_from,
                 ring_size=pool.swa_req_ring_size,
                 block_size=block_size,
                 swa_window=SWA_WINDOW,
@@ -4578,6 +4578,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices_repeated=req_pool_indices_repeated,
             block_size=block_size,
             swa_window=SWA_WINDOW,
+            valid_from=pool.swa_valid_from,
         )
 
         swa_page_indices, swa_topk_lengths = BuildDsparkSwaPageIndices.execute(

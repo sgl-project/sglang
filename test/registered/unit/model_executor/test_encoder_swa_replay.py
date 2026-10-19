@@ -614,6 +614,23 @@ class _View(SimpleNamespace):
         raise _PastEncoderReplayChecks(name)
 
 
+class TestEncoderReplayChunkFloor(CustomTestCase):
+    def _validate(self, chunked_prefill_size):
+        view = _View(
+            enable_encoder_swa_bounded_replay=True,
+            max_running_requests=8,
+            chunked_prefill_size=chunked_prefill_size,
+            page_size=256,
+        )
+        with patch.object(deepseek_v4_hook, "resolving_view", return_value=view):
+            deepseek_v4_hook.validate_deepseek_v41_encoder_replay_budget(object())
+
+    def test_chunk_holds_the_replay_rows_and_a_page(self):
+        self._validate(384)
+        with self.assertRaisesRegex(ValueError, "at least 384 chunked prefill"):
+            self._validate(383)
+
+
 class TestEncoderReplayDpStartupCheck(CustomTestCase):
     """ROCm replays hits in a forward of their own, so it must refuse attention DP."""
 
