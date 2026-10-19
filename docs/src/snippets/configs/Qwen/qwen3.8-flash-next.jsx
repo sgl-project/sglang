@@ -200,16 +200,16 @@ export const config = {
   },
 
   dockerImages: {
-    h200:   "lmsysorg/sglang:v0.5.22",
+    h200:   "lmsysorg/sglang:latest",
     // DGX Spark and RTX PRO 6000 recipes need the qwen4-main-squashed build
     // (4ccff141db: #38121 mixed-precision loader, file-backed PLE table, and the
     // #36811/#38290 router PDL fix for the GB10 MTP collapse); none of them run
     // on the qwen38flashnext image.
     "dgx-spark": "lmsysorg/sglang:dev-qwen38-next-local",
     rtx6000: "lmsysorg/sglang:dev-qwen38-next-local",
-    b200:   "lmsysorg/sglang:v0.5.22",
-    b300:   "lmsysorg/sglang:v0.5.22",
-    gb300:  "lmsysorg/sglang:v0.5.22-cu130",
+    b200:   "lmsysorg/sglang:latest",
+    b300:   "lmsysorg/sglang:latest",
+    gb300:  "lmsysorg/sglang:latest",
     mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
     mi355x: "lmsysorg/sglang-rocm:qwen38flashnext",
   },
