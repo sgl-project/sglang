@@ -172,6 +172,29 @@ Before H2D or D2H, both index lists keep positions owned by this rank and map `i
 
 The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, speculative decoding, and PD decode are not supported in this combination.
 
+### DCP × DSA (GLM-5.2, GLM-5.3)
+
+DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keeps the target's latent KV striped by position while the **index-K cache stays replicated** on every rank: each rank scores the whole sequence, takes the global top-k, and attends over the selected slots it owns. Decode, target verify and extend all follow the same path, so the prefix KV is never gathered.
+
+1. The index-K cache is addressed by the widened virtual slot and costs `c` times its usual share of each rank's KV budget (about 6% at DCP2 and 17% at DCP4 on GLM-5.3).
+2. Each layer maps the global top-k to rank-local rows with one Triton kernel; layers that share the previous layer's top-k reuse the mapping.
+3. The TRT-LLM sparse kernel returns the per-head LSE and the usual DCP merge combines the partial outputs.
+4. The MTP draft (nextn) layer keeps a replicated KV cache over the widened slots and attends without the DCP group, so MTP index share feeds the draft directly.
+
+Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
+
+```bash Command
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --trust-remote-code \
+  --tp-size 8 \
+  --dcp-size 2 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 5 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6
+```
+
 ## References
 
 - [DCP and Helix Parallelism roadmap](https://github.com/sgl-project/sglang/issues/29736)

@@ -28,9 +28,10 @@ The hook split is a decode-latency decision. ``init_forward_metadata_in_graph`` 
 *recorded* into the decode / target-verify / draft-extend graphs, so prep placed
 there replays for free; out of graph it lands on the per-step CPU path that a
 captured graph exists to avoid. ``init_forward_metadata_out_graph`` therefore takes
-only what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and the
-unified pool's slot translate. Prep consequently sits outside the graph, so every
-tensor a captured kernel reads lives in a graph-static buffer refilled in place.
+only what a phase cannot record: full-cuda-graph prefill (no in-graph hook) and
+custom slot translations. The unified pool's live v2p table has a stable address,
+so its gather can be captured too. Every tensor a captured kernel reads lives
+in a graph-static buffer refilled in place.
 """
 
 from __future__ import annotations
@@ -40,6 +41,9 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
+    fused_replay_state_indices,
+)
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     scatter_mamba_states_after_mtp_verify,
 )
@@ -49,7 +53,6 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.linear.short_conv_backend import ShortConvAttnBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.inkling_common.kernels.sconv import (
     HIS_ONES,
@@ -108,12 +111,9 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         self._mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
         self.conv_state_len: int = self.conv_states_shape[2]
         self.mamba_cache_chunk_size = mamba_cache_chunk_size()
-        # A plain table lookup is recordable; the unified pool's translate is an
-        # allocator lookup and must stay in the out-of-graph replay prep.
-        self._slot_gather_recordable = (
-            type(self.req_to_token_pool).translate_mamba_indices
-            is HybridReqToTokenPool.translate_mamba_indices
-        )
+        # Both identity and unified v2p gathers are recordable. The allocator
+        # updates the stable device table in place, including after compaction.
+        self._slot_gather_recordable = self.req_to_token_pool.mamba_translate_is_fusable
 
         self.sconv_metadata = InklingShortConvMetadata()
 
@@ -259,16 +259,18 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         req_pool_indices = forward_batch.req_pool_indices
         n = req_pool_indices.shape[0]
         buf = self._cache_indices_buf
-        if self._slot_gather_recordable and n <= buf.shape[0]:
-            # One launch; the base's gather-then-copy would add a second recorded
-            # kernel per step (the pool's table already has this dtype). No PAD
-            # sentinel needed: MambaSlotAllocator.clear reserves slot 0 as the dummy
-            # write target, so zero-filled padded rows already land there.
-            torch.index_select(
-                self.req_to_token_pool.req_index_to_mamba_index_mapping,
-                0,
-                req_pool_indices,
-                out=buf[:n],
+        if self._slot_gather_recordable and 0 < n <= buf.shape[0]:
+            # No PAD sentinel needed: slot 0 is the dummy write target, so the
+            # runner's zero-filled padded rows already land there. Fuse the live
+            # unified v2p gather and int32 store into the same recorded launch.
+            pool = self.req_to_token_pool
+            fused_replay_state_indices(
+                req_pool_indices=req_pool_indices.contiguous(),
+                mamba_index_mapping=pool.req_index_to_mamba_index_mapping,
+                out_state_indices=buf,
+                valid_bs=n,
+                total_bs=n,
+                v2p=pool.mamba_v2p_table,
             )
             self._cache_indices = buf[:n]
             self.forward_metadata = ForwardMetadata(
@@ -281,7 +283,10 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
     def _prepare_track_indices(self, forward_batch: ForwardBatch):
         # Every metadata view must explicitly provide virtual IDs or None.
         indices = forward_batch.mamba_track_indices
-        if indices is None or self._slot_gather_recordable:
+        if indices is None or (
+            self._slot_gather_recordable
+            and self.req_to_token_pool.mamba_v2p_table is None
+        ):
             self.sconv_metadata.track_cache_indices = indices
             return
         n = indices.shape[0]
