@@ -19,7 +19,7 @@ use crate::server::metrics::{
     StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
-use crate::workers::{DpRankGuard, LoadGuard, Worker};
+use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
@@ -189,10 +189,6 @@ async fn dispatch<T: Transport>(
     let prefill_rank = (dp_aware && !unpin_prefill)
         .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
         .flatten();
-    let decode_rank = decode
-        .as_deref()
-        .filter(|_| dp_aware)
-        .and_then(|decode| select_dp_rank(decode, None, &[], ctx.config.model.dp_rank_policy));
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -261,6 +257,9 @@ async fn dispatch<T: Transport>(
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let stream_abort = CancellationToken::new();
+    let decode_slot = (pd.is_some() && ctx.decode_gate.is_enabled() && engine_rid.is_some())
+        .then(DecodeSlot::default);
+    let mut unanswered = ReleaseOnDrop(decode_slot.clone());
     let (response_worker, response_leg, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
@@ -273,9 +272,34 @@ async fn dispatch<T: Transport>(
                 prefill_load_guards,
                 bootstrap.room,
                 stream_abort.clone(),
+                decode_slot.clone(),
             );
+            // Counted from arrival, so decode selection sees requests waiting here.
+            let decode_load = decode.load_guard();
+            if let Some(slot) = &decode_slot {
+                let mut abort = ctx.proxy.abort_on_drop(
+                    &prefill.url,
+                    prefill.protocol(),
+                    &headers,
+                    engine_rid.as_deref(),
+                );
+                admit_decode(
+                    ctx,
+                    request,
+                    &prefill,
+                    prefill_rank,
+                    request_started_at,
+                    slot,
+                    &stream_abort,
+                )
+                .await?;
+                abort.disarm();
+            }
+            let decode_rank = dp_aware
+                .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
+                .flatten();
             let decode_load_guards = (
-                decode.load_guard(),
+                decode_load,
                 ctx.router_inflight_load.register_aged(
                     decode.id.clone(),
                     decode.url.clone(),
@@ -316,6 +340,7 @@ async fn dispatch<T: Transport>(
         &metrics,
         expiration_token.clone(),
         stream_abort,
+        decode_slot,
     );
     let dispatch = async {
         match prefill_task {
@@ -332,6 +357,9 @@ async fn dispatch<T: Transport>(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
+        unanswered.0 = None;
+    }
     // A 2xx stream is already the client's; any other success or client error is final too.
     let retryable = matches!(
         dispatch_outcome::<T>(&result),
@@ -358,6 +386,55 @@ async fn dispatch<T: Transport>(
     })
 }
 
+async fn admit_decode(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+    prefill: &Worker,
+    rank: Option<u32>,
+    request_started_at: Instant,
+    slot: &DecodeSlot,
+    prefill_failed: &CancellationToken,
+) -> Result<(), ApiError> {
+    let budget = ctx
+        .router_inflight_load
+        .stale_request_timeout()
+        .saturating_sub(request_started_at.elapsed());
+    let admit = ctx.decode_gate.admit(&prefill.id, rank, slot);
+    tokio::select! {
+        admitted = tokio::time::timeout(budget, admit) => admitted.map_err(|_| {
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            ApiError::StaleRequestExpired {
+                model: request.model.0.clone(),
+            }
+        }),
+        () = prefill_failed.cancelled() => Ok(()),
+    }
+}
+
+struct ReleaseOnDrop(Option<DecodeSlot>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(slot) = &self.0 {
+            slot.release();
+        }
+    }
+}
+
+fn release_on_first_byte(
+    slot: Option<DecodeSlot>,
+    first_byte: Box<dyn FnOnce() + Send + 'static>,
+) -> Box<dyn FnOnce() + Send + 'static> {
+    match slot {
+        Some(slot) => Box::new(move || {
+            slot.release();
+            first_byte();
+        }),
+        None => first_byte,
+    }
+}
+
 /// How the selected workers are reached: HTTP clients over HTTP, gRPC clients over gRPC.
 trait Transport: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
@@ -382,6 +459,7 @@ trait Transport: Clone + Send + Sync + 'static {
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
+        decode_slot: Option<DecodeSlot>,
     ) -> impl Future<Output = Result<Self::Response, ApiError>> + Send;
 
     /// Run a PD prefill to completion and judge it.
@@ -457,6 +535,7 @@ impl Transport for Http {
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
+        decode_slot: Option<DecodeSlot>,
     ) -> Result<Response<Body>, ApiError> {
         forward_to_response_worker(
             ctx,
@@ -469,6 +548,7 @@ impl Transport for Http {
             metrics,
             expiration,
             stream_abort,
+            decode_slot,
         )
         .await
     }
@@ -529,12 +609,16 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
+        decode_slot: Option<DecodeSlot>,
     ) -> Result<Self::Response, ApiError> {
         let (guards, on_first_byte, on_stream_end): (Box<dyn Send + 'static>, _, _) =
             if metrics.streaming {
                 (
                     Box::new((load_guards, metrics.stream_duration_guard())),
-                    Some(metrics.first_byte_callback()),
+                    Some(release_on_first_byte(
+                        decode_slot,
+                        metrics.first_byte_callback(),
+                    )),
                     Some(metrics.stream_end_callback(worker.url.clone())),
                 )
             } else {
@@ -686,6 +770,7 @@ fn spawn_prefill_request<T: Transport>(
     load_guards: LoadGuards,
     bootstrap_room: u64,
     stream_abort: CancellationToken,
+    slot: Option<DecodeSlot>,
 ) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
@@ -694,6 +779,9 @@ fn spawn_prefill_request<T: Transport>(
         let failure = transport
             .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
             .await;
+        if let Some(slot) = &slot {
+            slot.release();
+        }
         let prefill_url = &prefill_worker.url;
         let outcome = failure
             .as_ref()
@@ -799,11 +887,13 @@ async fn forward_to_response_worker(
     metrics: &DispatchMetrics,
     expiration: CancellationToken,
     stream_abort: CancellationToken,
+    decode_slot: Option<DecodeSlot>,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
         let stream_guards: Box<dyn Send + 'static> =
             Box::new((load_guards, metrics.stream_duration_guard()));
+        let first_byte = release_on_first_byte(decode_slot, metrics.first_byte_callback());
         ctx.proxy
             .forward_streaming_to(
                 &worker.url,
@@ -814,7 +904,7 @@ async fn forward_to_response_worker(
                 body,
                 engine_rid,
                 Some(stream_guards),
-                Some(metrics.first_byte_callback()),
+                Some(first_byte),
                 Some(metrics.stream_end_callback(worker.url.clone())),
                 Some(expiration),
                 Some(stream_abort),
