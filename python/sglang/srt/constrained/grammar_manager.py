@@ -11,10 +11,14 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     create_grammar_backend,
 )
-from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObject
+from sglang.srt.constrained.reasoner_grammar_backend import (
+    ReasonerGrammarBackend,
+    ReasonerGrammarObject,
+)
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_serving, get_spec
+from sglang.srt.sampling.custom_logit_processor import consumes_thinking_budget
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
 )
@@ -122,14 +126,25 @@ class GrammarManager:
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:
-        # A custom logit processor (e.g. ThinkingBudgetLogitProcessor) owns the budget.
-        if req.custom_logit_processor is not None:
-            return None
         custom_params = req.sampling_params.custom_params
         if not isinstance(custom_params, dict):
             return None
         thinking_budget = custom_params.get("thinking_budget")
-        return thinking_budget if isinstance(thinking_budget, int) else None
+        if not isinstance(thinking_budget, int):
+            return None
+        # A ThinkingBudgetLogitProcessor enforces the budget itself; any other
+        # processor leaves it to the grammar.
+        if req.custom_logit_processor and consumes_thinking_budget(
+            req.custom_logit_processor
+        ):
+            return None
+        return thinking_budget
+
+    def _env_thinking_budget_active(self) -> bool:
+        return (
+            isinstance(self.grammar_backend, ReasonerGrammarBackend)
+            and self.grammar_backend.max_think_tokens >= 0
+        )
 
     def _apply_request_reasoning_config(self, req: Req) -> None:
         if not isinstance(req.grammar, ReasonerGrammarObject):
@@ -149,17 +164,25 @@ class GrammarManager:
             req.grammar.max_think_tokens = thinking_budget
 
     def _apply_constrained_reasoning_config(self, req: Req, key_type: str) -> None:
-        if self._get_request_thinking_budget(req) is not None and not (
+        if not (
             isinstance(req.grammar, ReasonerGrammarObject)
             and req.grammar.token_filter_fn is not None
         ):
-            req.set_finish_with_abort(
-                f"thinking_budget cannot be enforced together with a {key_type} "
-                f"constraint on this server; it requires --reasoning-parser, a "
-                f"grammar backend that supports token filtering (e.g., xgrammar), "
-                f"and a constraint that does not own the full assistant turn"
-            )
-            return
+            if self._get_request_thinking_budget(req) is not None:
+                req.set_finish_with_abort(
+                    f"thinking_budget cannot be enforced together with a {key_type} "
+                    f"constraint on this server; it requires --reasoning-parser, a "
+                    f"grammar backend that supports token filtering (e.g., xgrammar), "
+                    f"and a constraint that does not own the full assistant turn"
+                )
+                return
+            if self._env_thinking_budget_active():
+                req.set_finish_with_abort(
+                    f"SGLANG_MAX_THINK_TOKENS cannot be enforced on this {key_type} "
+                    f"constraint because it owns the full assistant turn; unset the "
+                    f"server-wide cap to use this constraint"
+                )
+                return
         self._apply_request_reasoning_config(req)
 
     def process_req_with_grammar(self, req: Req) -> bool:
