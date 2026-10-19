@@ -69,6 +69,91 @@ class TestLLGuidanceBatchedMask(unittest.TestCase):
         self.assertTrue(torch.equal(serial, batched))
         self.assertTrue((batched[1] == -1).all())
 
+    def test_termination_survives_scheduler_finished_sync(self):
+        tokenizer = self.template.llguidance_tokenizer
+        grammar = GuidanceGrammar(
+            llguidance_tokenizer=tokenizer,
+            serialized_grammar=grammar_from("regex", "ab"),
+        )
+        for token in tokenizer.tokenize_str("ab"):
+            grammar.accept_token(token)
+        before_eos = self._serial([grammar])
+        grammar.accept_token(tokenizer.eos_token)
+        self.assertTrue(grammar.is_terminated())
+
+        # The scheduler writes the request's finish state into grammar.finished;
+        # a request that keeps decoding (ignore_eos) must stay unconstrained.
+        grammar.finished = False
+        self.assertTrue(grammar.is_terminated())
+        self.assertTrue((self._batched([grammar]) == -1).all())
+
+        grammar.rollback(1)
+        self.assertFalse(grammar.is_terminated())
+        self.assertTrue(torch.equal(self._serial([grammar]), before_eos))
+
+    def test_rollback_across_eos_handled_outside_matcher(self):
+        # ``ab`` stops ll_matcher after "ab", so the EOS never reaches it; a
+        # multi-token rollback must count that EOS once, outside the matcher.
+        tokenizer = self.template.llguidance_tokenizer
+        a, b = tokenizer.tokenize_str("ab")
+        references = []
+        for prefix in ([], [a], [a, b]):
+            reference = GuidanceGrammar(
+                llguidance_tokenizer=tokenizer,
+                serialized_grammar=grammar_from("regex", "ab"),
+            )
+            for token in prefix:
+                reference.accept_token(token)
+            references.append(self._serial([reference]))
+
+        for steps, expected in ((2, references[1]), (3, references[0])):
+            with self.subTest(steps=steps):
+                grammar = GuidanceGrammar(
+                    llguidance_tokenizer=tokenizer,
+                    serialized_grammar=grammar_from("regex", "ab"),
+                )
+                for token in (a, b, tokenizer.eos_token):
+                    grammar.accept_token(token)
+                self.assertTrue(grammar.is_terminated())
+
+                grammar.rollback(steps)
+                self.assertFalse(grammar.is_terminated())
+                self.assertTrue(torch.equal(self._serial([grammar]), expected))
+
+                # The restored grammar accepts the rest of the string again.
+                for token in (a, b)[3 - steps :]:
+                    grammar.accept_token(token)
+                self.assertTrue(torch.equal(self._serial([grammar]), references[2]))
+
+    def test_extensible_grammar_terminates_on_first_eos(self):
+        # ``ab+`` can still extend after "ab", so ll_matcher consumes the EOS
+        # itself and stops; that first EOS terminates the grammar.
+        tokenizer = self.template.llguidance_tokenizer
+        grammar = GuidanceGrammar(
+            llguidance_tokenizer=tokenizer,
+            serialized_grammar=grammar_from("regex", "ab+"),
+        )
+        a, b = tokenizer.tokenize_str("ab")
+        grammar.accept_token(a)
+        after_a = self._serial([grammar])
+        grammar.accept_token(b)
+        after_ab = self._serial([grammar])
+
+        grammar.accept_token(tokenizer.eos_token)
+        self.assertTrue(grammar.is_terminated())
+        grammar.finished = False
+        self.assertTrue((self._batched([grammar]) == -1).all())
+
+        # ll_matcher tracked the EOS, so rollback must not skip a token.
+        grammar.rollback(1)
+        self.assertFalse(grammar.is_terminated())
+        self.assertTrue(torch.equal(self._serial([grammar]), after_ab))
+
+        grammar.accept_token(tokenizer.eos_token)
+        grammar.rollback(2)
+        self.assertFalse(grammar.is_terminated())
+        self.assertTrue(torch.equal(self._serial([grammar]), after_a))
+
     def test_unsupported_entry_uses_serial_fill(self):
         mask = self._allocate(self._fresh(1))
         fallback = MagicMock()
