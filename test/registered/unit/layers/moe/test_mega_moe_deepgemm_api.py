@@ -454,7 +454,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             topk=SimpleNamespace(
                 topk_config=TopKConfig(
                     top_k=2 + fused_shared,
-                    num_fused_shared_experts=fused_shared,
+                    num_shared_topk_slots=fused_shared,
                     renormalize=True,
                     routed_scaling_factor=2.0,
                     apply_routed_scaling_factor_on_output=scale_in_topk,

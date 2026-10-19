@@ -22,8 +22,11 @@ from sglang.srt.layers.moe.topk import (
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
 )
-from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.layers.moe.utils import (
+    has_per_rank_fused_shared_slots,
+    shared_topk_slots,
+    waterfill_routes_shared_experts,
+)
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -48,23 +51,20 @@ class HashTopK(nn.Module):
         super().__init__()
         self.layer_id = layer_id
 
-        self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+        self.enable_waterfill = waterfill_routes_shared_experts(
+            num_fused_shared_experts
         )
         self.waterfill_balancer = None
-
-        if self.enable_waterfill:
-            # Waterfill appends the shared expert after EPLB maps routed IDs.
-            topk -= num_fused_shared_experts
-            num_fused_shared_experts = 0
+        num_routed_experts_per_token = topk - num_fused_shared_experts
 
         self.num_experts = num_experts
-        self.topk = topk
+        # Trailing columns the hash router fills with fused shared experts.
+        self.num_shared_topk_slots = shared_topk_slots(num_fused_shared_experts)
+        self.topk = num_routed_experts_per_token + self.num_shared_topk_slots
         self.routed_scaling_factor = routed_scaling_factor
-        self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
         self.tid2eid = nn.Parameter(
-            torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
+            torch.empty(vocab_size, num_routed_experts_per_token, dtype=torch.int32),
             requires_grad=False,
         )
         self._init_default_tid2eid()
@@ -72,7 +72,7 @@ class HashTopK(nn.Module):
         self.apply_routed_scaling_factor_on_output = (
             apply_routed_scaling_factor_on_output
         )
-        if apply_routed_scaling_factor_on_output and num_fused_shared_experts > 0:
+        if apply_routed_scaling_factor_on_output and self.num_shared_topk_slots > 0:
             raise NotImplementedError(
                 "HashTopK + apply_routed_scaling_factor_on_output is not supported "
                 "with fused shared experts; pass --disable-shared-experts-fusion."
@@ -98,7 +98,7 @@ class HashTopK(nn.Module):
     def empty_topk_output(
         self, device: torch.device, *, layer_id: Optional[int] = None
     ):
-        topk = self.topk - self.num_fused_shared_experts
+        topk = self.topk - self.num_shared_topk_slots
         if layer_id is not None:
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 
@@ -111,8 +111,8 @@ class HashTopK(nn.Module):
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if has_per_rank_fused_shared_slots(self.num_fused_shared_experts):
-            n = self.num_fused_shared_experts
+        if has_per_rank_fused_shared_slots(self.num_shared_topk_slots):
+            n = self.num_shared_topk_slots
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
                     (0, topk_output.topk_ids.shape[-1] + n)
@@ -153,7 +153,7 @@ class HashTopK(nn.Module):
             (num_token, self.topk), dtype=scores.dtype, device=scores.device
         )
 
-        if self.num_fused_shared_experts == 1:
+        if self.num_shared_topk_slots == 1:
             topk_ids[:, :-1] = self.tid2eid[input_ids]
             topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
 
@@ -165,7 +165,7 @@ class HashTopK(nn.Module):
 
             topk_ids[:, -1] = torch.randint(
                 low=self.num_experts,
-                high=self.num_experts + self.num_fused_shared_experts,
+                high=self.num_experts + self.num_shared_topk_slots,
                 size=(num_token,),
                 dtype=topk_ids.dtype,
                 device=topk_ids.device,
@@ -195,7 +195,7 @@ class HashTopK(nn.Module):
 
             num_tokens = router_logits.size(0)
             topk_routed = self.tid2eid.size(1)
-            topk_fused = topk_routed + self.num_fused_shared_experts
+            topk_fused = topk_routed + self.num_shared_topk_slots
             topk_ids = torch.empty(
                 (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
             )
@@ -238,7 +238,7 @@ class HashTopK(nn.Module):
                 router_logits=router_logits,
                 input_ids=input_ids,
                 tid2eid=self.tid2eid,
-                num_fused_shared_experts=self.num_fused_shared_experts,
+                num_fused_shared_experts=self.num_shared_topk_slots,
                 routed_scaling_factor=self.routed_scaling_factor,
                 scoring_func=self.score_func,
             )
@@ -250,7 +250,7 @@ class HashTopK(nn.Module):
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 
-        num_fused_shared_experts = self.num_fused_shared_experts
+        num_shared_topk_slots = self.num_shared_topk_slots
         log2phy_prob = None
         if (
             expert_location_dispatch_info is not None
@@ -265,10 +265,10 @@ class HashTopK(nn.Module):
                 log2phy_prob = lplb_solver.solve(topk_ids)
 
         recorder_topk_ids = None
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts):
+        if has_per_rank_fused_shared_slots(num_shared_topk_slots):
             # The trailing columns are placeholders; the remap appends the real ones.
             routed_cols = topk_ids_logical_to_physical(
-                topk_ids[:, :-num_fused_shared_experts],
+                topk_ids[:, :-num_shared_topk_slots],
                 expert_location_dispatch_info,
                 log2phy_prob,
             )
@@ -281,12 +281,12 @@ class HashTopK(nn.Module):
             )
             topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
                 routed_cols,
-                topk_weights[:, :-num_fused_shared_experts],
-                num_fused_shared_experts,
+                topk_weights[:, :-num_shared_topk_slots],
+                num_shared_topk_slots,
                 num_physical_routed_experts,
                 TopKConfig(
                     top_k=self.topk,
-                    num_fused_shared_experts=num_fused_shared_experts,
+                    num_shared_topk_slots=num_shared_topk_slots,
                     routed_scaling_factor=self.routed_scaling_factor,
                     apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
                 ),
