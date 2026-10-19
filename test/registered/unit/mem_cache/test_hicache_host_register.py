@@ -27,8 +27,11 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKOnlyPoolHost,
+    MHATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
@@ -68,7 +71,7 @@ class _FakeCudart:
         return "injected error"
 
 
-class TestHiCacheHostRegister(unittest.TestCase):
+class TestHiCacheHostRegister(CustomTestCase):
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),
@@ -217,6 +220,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 pool.dtype = torch.float16
                 pool.token_stride_size = 2
                 pool.device_pool = SimpleNamespace(device="cpu")
+                pool._transfer_device = torch.device("cpu")
                 pool.device = "cpu"
                 pool.pin_memory = True
                 pool.allocator = object()
