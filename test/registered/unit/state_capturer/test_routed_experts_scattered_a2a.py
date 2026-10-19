@@ -1,4 +1,4 @@
-"""DeepEP-family backend recognition in RoutedExpertsCapturer."""
+"""RoutedExpertsCapturer: DeepEP-family backend recognition and capture width."""
 
 import unittest
 from types import SimpleNamespace
@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.state_capturer import routed_experts as re_mod
+from sglang.srt.state_capturer.base import BaseDeviceCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,6 +66,56 @@ class TestGetLocalSliceBackendBranch(CustomTestCase):
         ):
             out = self._slice(cap, n_local=999)
         self.assertTrue(torch.equal(out, buf[6:10, :, : self.K]))
+
+
+class TestCaptureRoutedIdsOnly(CustomTestCase):
+    TOPK_SIZE = 3
+
+    def _capturer(self):
+        cap = object.__new__(re_mod.RoutedExpertsCapturer)
+        cap.num_fused_shared_experts = 1
+        cap.device_cache = BaseDeviceCache(
+            max_batch_size=8,
+            num_layers=2,
+            topk_size=self.TOPK_SIZE + 1,
+            device="cpu",
+            name="routed_experts",
+        )
+        cap.gather_buffer = torch.empty((8, self.TOPK_SIZE + 1), dtype=torch.int32)
+        return cap
+
+    def _capture(self, cap, ids, backend):
+        with (
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend(backend)
+            ),
+            mock.patch.object(
+                re_mod,
+                "attn_tp_all_gather_into_tensor",
+                side_effect=lambda out, inp: out.copy_(inp),
+            ),
+            mock.patch.object(
+                re_mod, "get_parallel", return_value=SimpleNamespace(attn_tp_size=1)
+            ),
+        ):
+            cap.capture(layer_id=1, topk_indices=ids)
+
+    def test_routed_only_ids_fill_the_routed_columns(self):
+        """Routed-only capture must fill the routed columns, including scattered a2a."""
+        ids = torch.arange(4 * self.TOPK_SIZE, dtype=torch.int32).view(4, -1)
+        for backend in ("none", "deepep"):
+            with self.subTest(backend=backend):
+                cap = self._capturer()
+                self._capture(cap, ids, backend)
+                self.assertTrue(
+                    torch.equal(cap.device_cache.buffer[:4, 1, : self.TOPK_SIZE], ids)
+                )
+
+    def test_other_widths_are_rejected(self):
+        """Only the routed-only width may be padded; any other width is a caller bug."""
+        ids = torch.zeros((4, self.TOPK_SIZE - 1), dtype=torch.int32)
+        with self.assertRaises(ValueError):
+            self._capture(self._capturer(), ids, "none")
 
 
 if __name__ == "__main__":
