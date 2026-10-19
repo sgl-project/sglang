@@ -1279,6 +1279,8 @@ class DeepseekV4AttnBackend(
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # Set by write_tail_source_kv until exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
+        # The live batch of the prefill-graph replay; a tail break needs its exact rows.
+        self.prefill_graph_replay_batch: Optional[ForwardBatch] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
         self._bcg_tail_capacity: Optional[int] = None
@@ -3081,6 +3083,7 @@ class DeepseekV4AttnBackend(
             static_metadata,
             two_level=self._prefill_graph_two_level(),
         )
+        self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
         self.tail_forward_metadata = (
