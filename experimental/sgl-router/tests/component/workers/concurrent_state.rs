@@ -76,7 +76,7 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
                     url: format!("http://w{i}:30000"),
                     mode: WorkerMode::Plain,
                     model_ids: vec![model.clone()],
-                    bootstrap_port: None,
+                    ..Default::default()
                 });
                 let snapshot = r.workers_for(&model);
                 for w in &snapshot {
@@ -129,19 +129,19 @@ fn load_guard_decrements_on_panic_unwind() {
         url: "http://x:30000".into(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("m".into())],
-        bootstrap_port: None,
+        ..Default::default()
     }));
-    assert_eq!(w.active_load(), 0);
+    assert_eq!(w.router_inflight_load(), 0);
 
     let w_inner = w.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _g = w_inner.load_guard();
-        assert_eq!(w_inner.active_load(), 1);
+        assert_eq!(w_inner.router_inflight_load(), 1);
         panic!("synthetic panic to exercise Drop on unwind");
     }));
     assert!(result.is_err(), "the closure must have panicked");
     assert_eq!(
-        w.active_load(),
+        w.router_inflight_load(),
         0,
         "LoadGuard's Drop must decrement even when the holder panics",
     );

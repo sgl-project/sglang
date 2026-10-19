@@ -49,6 +49,7 @@ from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
     _install_tokenizer_warnings_filter,
+    get_tokenizer,
 )
 
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
@@ -253,6 +254,10 @@ def get_processor(
             revision=revision,
             **kwargs,
         )
+    if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        return get_tokenizer(
+            tokenizer_name, trust_remote_code=trust_remote_code, revision=revision
+        )
     is_ocr2 = _is_deepseek_ocr2_model(config)
     if _is_deepseek_ocr_model(config) or is_ocr2:
         config.model_type = "deepseek-ocr"
@@ -355,8 +360,6 @@ def get_processor(
     # AutoProcessor may internally create a TokenizersBackend tokenizer
     # (same issue as get_tokenizer). Replace it with a properly loaded one.
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
-        from .tokenizer import get_tokenizer
-
         logger.warning(
             "Processor tokenizer for %s is TokenizersBackend, "
             "reloading via get_tokenizer",

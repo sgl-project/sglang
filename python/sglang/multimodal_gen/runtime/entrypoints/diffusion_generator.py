@@ -34,9 +34,12 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    select_output_rollout_trajectory,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -57,15 +60,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 )
 
 logger = init_logger(__name__)
-
-try:
-    # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
-    # This must be done at the top level of the module, before any CUDA context
-    # or other processes are initialized.
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    # The start method can only be set once per program execution.
-    pass
 
 
 def _replace_sampling_params_for_prompt(
@@ -137,6 +131,10 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
+        # Not shared with from_server_args: the ServerArgs built below runs
+        # Platform.apply_server_args_defaults, which hooks must precede.
+        apply_plugin_hooks()
+
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
 
         if (server_args := kwargs.get("server_args", None)) is not None:
@@ -147,7 +145,7 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args, local_mode=local_mode)
+        return cls._create(server_args, local_mode=local_mode)
 
     @classmethod
     def from_server_args(
@@ -161,6 +159,16 @@ class DiffGenerator:
 
         Returns:
             The created DiffGenerator
+        """
+        apply_plugin_hooks()
+        return cls._create(server_args, local_mode=local_mode)
+
+    @classmethod
+    def _create(cls, server_args: ServerArgs, *, local_mode: bool) -> "DiffGenerator":
+        """Build and connect a generator, assuming hooks are already applied.
+
+        Each public constructor owns that step itself, so this shared body must
+        not repeat it.
         """
         globally_suppress_loggers()
         instance = cls(
@@ -184,6 +192,9 @@ class DiffGenerator:
         self,
     ) -> list[mp.Process]:
         """Check if a local server is running; if not, start it and return the process handles."""
+        # Not module scope: launch_server pulls in the whole worker graph.
+        from sglang.multimodal_gen.runtime.launch_server import launch_server
+
         # First, we need a client to test the server. Initialize it temporarily.
         sync_scheduler_client.initialize(self.server_args)
 
@@ -387,7 +398,11 @@ class DiffGenerator:
                         save_outputs(
                             output_batch.output,
                             requests[0].data_type,
-                            requests[0].fps,
+                            (
+                                output_batch.fps
+                                if output_batch.fps is not None
+                                else requests[0].fps
+                            ),
                             requests[0].save_output,
                             lambda idx: output_requests[idx].output_file_path(),
                             audio=output_batch.audio,
@@ -396,6 +411,7 @@ class DiffGenerator:
                             audios_out=audios_out,
                             frames_out=frames_out,
                             output_compression=requests[0].output_compression,
+                            x264_preset=requests[0].x264_preset,
                             enable_frame_interpolation=requests[
                                 0
                             ].enable_frame_interpolation,
@@ -519,10 +535,17 @@ class DiffGenerator:
             return
         if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
-            logger.info(
-                f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
-                total_duration_ms / 1000.0,
-            )
+            if results[0].metrics.get("warmup_failed"):
+                logger.warning(
+                    "Warmup failed, so this request ran cold: %.2f seconds "
+                    "includes first-use cost and is not a warmed-up timing",
+                    total_duration_ms / 1000.0,
+                )
+            else:
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
 
         peak_memories = [r.peak_memory_mb for r in results if r.peak_memory_mb]
         if peak_memories:
@@ -556,9 +579,12 @@ class DiffGenerator:
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
             action=output_batch.action_pred,
+            lidar=output_batch.lidar,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
-            rollout_trajectory_data=output_batch.rollout_trajectory_data,
+            rollout_trajectory_data=select_output_rollout_trajectory(
+                output_batch.rollout_trajectory_data, output_index
+            ),
             trajectory_decoded=output_batch.trajectory_decoded,
         )
 
@@ -667,55 +693,6 @@ class DiffGenerator:
         )
         # _send_lora_request already raises on error, so output.error is always None here
         return output.output or {}
-
-    def _ensure_lora_state(
-        self,
-        lora_path: str | None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-    ) -> None:
-        """
-        Ensure the LoRA state matches the desired configuration.
-
-        Note: This method does not cache client-side state. The server handles
-        idempotent operations, so redundant calls are safe but may have minor overhead.
-        """
-        if lora_path is None:
-            # Unmerge all LoRA weights when no lora_path is provided
-            self.unmerge_lora_weights()
-            return
-
-        lora_nickname = lora_nickname or self.server_args.lora_nickname
-
-        # Set the LoRA adapter (server handles idempotent logic)
-        self.set_lora(lora_nickname, lora_path)
-
-        # Merge or unmerge based on the merge_lora flag
-        if merge_lora:
-            self.merge_lora_weights()
-        else:
-            self.unmerge_lora_weights()
-
-    def generate_with_lora(
-        self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        *,
-        lora_path: str | None = None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-        **kwargs,
-    ):
-        self._ensure_lora_state(
-            lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
-        )
-        return self.generate(
-            sampling_params_kwargs=dict(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                **kwargs,
-            )
-        )
 
     def shutdown(self):
         """

@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # 3D causal CNN encoder for the MiniMax H3 visual VAE (inference-only bundle).
-import os
-
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -74,10 +72,6 @@ class ResnetBlock3D(nn.Module):
         out_channels = in_channels if out_channels is None else out_channels
         self.out_channels = out_channels
 
-        self.use_fused_norm = (
-            os.environ.get("MINIMAX_H3_USE_FUSED_NORM", "false").lower() == "true"
-        )
-
         if zq_ch is None:
             self.norm1 = get_group_norm_3d(
                 in_channels, use_t_isolated_gn=use_t_isolated_gn
@@ -136,17 +130,11 @@ class ResnetBlock3D(nn.Module):
     def forward(self, x, zq=None):
         h = x
 
-        if self.use_fused_norm:
-            h = self.norm1(h, zq)
-        else:
-            h = norm_silu(h, self.norm1, zq)
+        h = norm_silu(h, self.norm1, zq)
 
         h = self.conv1(h)
 
-        if self.use_fused_norm:
-            h = self.norm2(h, zq)
-        else:
-            h = norm_silu(h, self.norm2, zq)
+        h = norm_silu(h, self.norm2, zq)
 
         h = self.conv2(h)
 
@@ -182,13 +170,7 @@ class EncoderFCN3D(nn.Module):
         else:
             self.num_res_blocks = num_res_blocks
 
-        self.space_down_factors = space_down
-        self.time_down_factors = time_down
         self.in_channels = in_channels
-
-        self.use_fused_norm = (
-            os.environ.get("MINIMAX_H3_USE_FUSED_NORM", "false").lower() == "true"
-        )
 
         block_mid = [ch * ch_mult[i] for i in range(self.num_levels)]
         block_in = [block_mid[0]] + block_mid[:-1]
@@ -267,10 +249,7 @@ class EncoderFCN3D(nn.Module):
             if hasattr(self.down[i_level], "downsample"):
                 h = self.down[i_level].downsample(h)
 
-        if self.use_fused_norm:
-            h = self.norm_out(h, zq)
-        else:
-            h = norm_silu(h, self.norm_out, zq)
+        h = norm_silu(h, self.norm_out, zq)
 
         h = self.conv_out(h)
         return h

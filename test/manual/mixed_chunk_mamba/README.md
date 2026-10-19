@@ -6,6 +6,23 @@ prefill that is co-batched with running decodes claimed a ping-pong slot and a
 donate depth but never wrote the checkpoint, so later prefix hits restored
 stale state. Not part of CI.
 
+## Validated revisions
+
+These scripts preserve the original September 2026 GPU A/B protocol: base
+`242d8a70c05bce1aace1e361000bb2f8b4f85469` and the production change in
+`b75d97ca03` (the same production tree as GPU-tested commit `2b26b465`).
+The raw evidence remains on the
+[evidence-39342 branch](https://github.com/200lz/sglang/tree/evidence-39342).
+
+The instrumentation patch and launch flags below are tied to those revisions.
+They must not be applied unchanged to current main: the standalone
+`MambaRadixCache` has been replaced by `UnifiedRadixCache`, and the prefill
+graph and launch interfaces have changed. A new GPU run needs matching hooks
+for the current cache lifecycle and must verify actual mixed-batch exposure.
+The updated CPU regression in
+`test/registered/unit/managers/test_schedule_batch_mixed_mamba_track.py`
+exercises the current cache interface; it does not replace a fresh GPU A/B.
+
 ## Layout
 
 | file | role |

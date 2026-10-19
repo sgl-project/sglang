@@ -1,34 +1,75 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
+//! Streaming passthrough: an SSE body for HTTP, a chunk stream for gRPC.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::body::Body;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+
+/// Why the SSE pump stopped, independently of any SSE error event it observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamEndReason {
+    Completed,
+    UpstreamError,
+    IdleTimeout,
+    /// The router's stale-request deadline expired, regardless of worker health.
+    Expired,
+    /// The router aborted the stream before its first chunk.
+    Aborted,
+    ClientDisconnect,
+    PumpPanicked,
+}
+
+/// A stream the router ended itself; it reads as before, and a gRPC caller
+/// maps `reason` to the router's error contract.
+#[derive(Debug)]
+pub struct RouterStreamError {
+    pub reason: StreamEndReason,
+    message: String,
+}
+
+impl RouterStreamError {
+    fn io(reason: StreamEndReason, message: impl Into<String>) -> std::io::Error {
+        let message = message.into();
+        std::io::Error::other(Self { reason, message })
+    }
+}
+
+impl std::fmt::Display for RouterStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RouterStreamError {}
 
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
-    /// No upstream stream error and no pump panic.
-    pub transport_ok: bool,
-    /// An SSE error event (`data: {"error"...}`) rode the stream.
+    pub reason: StreamEndReason,
+    /// An SSE error event (`data: {"error"...}`) or native error abort rode the stream.
     pub saw_error_event: bool,
-    /// The client dropped the response body before upstream finished.
-    pub client_disconnect: bool,
 }
 
 /// A `data:` line whose payload's first JSON key is `error` — tolerant of
 /// SSE-legal framing variants (no space after `data:`, whitespace after `{`),
 /// so the match is anchored to the spec rather than one serializer's bytes.
 fn is_error_event_line(line: &[u8]) -> bool {
-    line.strip_prefix(b"data:")
-        .map(|p| p.trim_ascii_start())
-        .and_then(|p| p.strip_prefix(b"{"))
+    line.strip_prefix(b"data:").is_some_and(is_error_payload)
+}
+
+/// A JSON payload whose first key is `error`: an SSE event's data or a gRPC chunk.
+pub(crate) fn is_error_payload(payload: &[u8]) -> bool {
+    payload
+        .trim_ascii_start()
+        .strip_prefix(b"{")
         .map(|p| p.trim_ascii_start())
         .is_some_and(|p| p.starts_with(b"\"error\""))
 }
@@ -36,11 +77,20 @@ fn is_error_event_line(line: &[u8]) -> bool {
 /// Line-start bytes that suffice to decide `is_error_event_line`.
 const LINE_PROBE: usize = 32;
 
+/// Native `/generate` streams an error as an abort with a status code,
+/// which a user abort leaves null; neither key can occur unescaped in a JSON string.
+const NATIVE_ABORT: &[u8] = br#""type":"abort""#;
+const NATIVE_STATUS: &[u8] = br#""status_code":"#;
+
 /// Finds error events emitted after an SSE response commits a 200.
 /// Line-anchored, so lookalike text inside event payloads cannot match.
 #[derive(Default)]
-struct ErrorEventScanner {
+pub struct ErrorEventScanner {
     line_start: Vec<u8>,
+    /// The current line's last bytes, so a native key split across chunks matches.
+    line_tail: Vec<u8>,
+    native_abort: bool,
+    native_status: bool,
 }
 
 impl ErrorEventScanner {
@@ -48,151 +98,218 @@ impl ErrorEventScanner {
         let mut hit = false;
         for (i, segment) in chunk.split(|&b| b == b'\n').enumerate() {
             if i > 0 {
-                hit |= is_error_event_line(&self.line_start);
+                let native = self.native_abort && self.native_status;
+                hit |= is_error_event_line(&self.line_start)
+                    || (native && self.line_start.starts_with(b"data:"));
                 self.line_start.clear();
+                self.line_tail.clear();
+                (self.native_abort, self.native_status) = (false, false);
             }
             let room = LINE_PROBE - self.line_start.len();
             self.line_start
                 .extend_from_slice(&segment[..segment.len().min(room)]);
+            self.scan_native(segment);
         }
         hit
     }
+
+    /// Look for the native error keys in `segment` and where it joins the line so far.
+    fn scan_native(&mut self, segment: &[u8]) {
+        let head = &segment[..segment.len().min(NATIVE_STATUS.len())];
+        let boundary = [self.line_tail.as_slice(), head].concat();
+        for hay in [boundary.as_slice(), segment] {
+            let quotes = hay.iter().enumerate().filter(|&(_, &b)| b == b'"');
+            for rest in quotes.map(|(i, _)| &hay[i..]) {
+                self.native_abort |= rest.starts_with(NATIVE_ABORT);
+                let status = rest.strip_prefix(NATIVE_STATUS).and_then(<[u8]>::first);
+                self.native_status |= status.is_some_and(u8::is_ascii_digit);
+            }
+        }
+        let keep = segment.len().min(NATIVE_STATUS.len());
+        self.line_tail
+            .extend_from_slice(&segment[segment.len() - keep..]);
+        let excess = self.line_tail.len().saturating_sub(NATIVE_STATUS.len());
+        self.line_tail.drain(..excess);
+    }
 }
 
-/// Bridge a byte stream into an axum Body that streams chunks unchanged.
-///
-/// Spawns one tokio task per stream so the handler can return immediately.
-/// Uses a **bounded** 64-slot channel so `tx.send().await` naturally
-/// backpressures the upstream read when the client (axum Body consumer) falls
-/// behind — an unbounded channel would buffer hundreds of MB for a slow client
-/// receiving a long completion.
-///
-/// # Backpressure note
-/// The channel bound of 64 absorbs short bursts while still limiting
-/// worst-case outstanding bytes to 64 × chunk_size (typically a few MB).
-///
-/// # Client disconnect
-/// When the axum Body is dropped the receiver is closed; `tx.send()` then
-/// returns `Err`, which breaks the loop — no upstream bytes are read after the
-/// client disconnects.
-///
-/// # Panic safety
-/// The pump future is wrapped in `AssertUnwindSafe(..).catch_unwind()`. If the
-/// upstream stream panics, we surface a loud `io::Error` to the client; without
-/// this, the body would EOF cleanly and clients couldn't distinguish that from
-/// success — the worst failure class (truncated output that looks complete).
-///
-/// # Stream guards
-/// When `stream_guards` is `Some`, the value is **moved into the spawned task**
-/// and held for the entire body lifetime.  It is dropped only when the SSE
-/// pump finishes (stream exhausted, client disconnects, or upstream errors).
-/// The opaque `Box<dyn Send + 'static>` accepts any drop-only payload — most
-/// commonly a tuple of [`crate::workers::LoadGuard`] and
-/// [`crate::policies::active_load::ActiveLoadGuard`]. The proxy does not
-/// inspect the value; it relies entirely on `Drop` semantics, so callers can
-/// pack arbitrary cleanup state in. Pass `None` for callers that manage the
-/// guard externally (e.g. non-streaming paths where the handler itself is the
-/// guard scope).
-///
-/// # Completion hook
-/// When `on_complete` is `Some`, it runs exactly once when the pump task
-/// finishes with the transport, SSE error-event, and client-disconnect state.
-///
-/// # First-byte hook
-/// When `on_first_byte` is `Some`, the closure runs exactly once, the moment
-/// the first `Ok` chunk is read from the upstream stream — i.e. time to first
-/// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
-/// arrives. `forward_streaming_to` passes a closure that records
-/// `sgl_router_ttft_seconds` for successful streaming responses.
+/// Whether a buffered SSE body carries an error event.
+pub fn has_error_event(body: &[u8]) -> bool {
+    ErrorEventScanner::default().feed(body)
+}
+
+/// An upstream item the pump forwards unchanged.
+pub trait PumpItem: Send + 'static {
+    /// Whether this item carries an error event; `scanner` keeps line state across items.
+    fn is_error_event(&self, _scanner: &mut ErrorEventScanner) -> bool {
+        false
+    }
+}
+
+impl PumpItem for Bytes {
+    fn is_error_event(&self, scanner: &mut ErrorEventScanner) -> bool {
+        scanner.feed(self)
+    }
+}
+
+/// Bounds on a streaming response beyond what the upstream stream itself provides.
+#[derive(Debug, Clone, Default)]
+pub struct StreamLimits {
+    /// Maximum silence between upstream chunks. `None` waits indefinitely.
+    pub idle_timeout: Option<Duration>,
+    /// Fires when the stale-request janitor expires the request.
+    pub expiration: Option<CancellationToken>,
+    /// Aborts the stream if it fires before the first upstream chunk.
+    pub abort: Option<CancellationToken>,
+}
+
+/// Bridge a byte stream into an axum Body that streams chunks unchanged; see [`pump`].
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
-    stream_guards: Option<Box<dyn Send + 'static>>,
+    guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    limits: StreamLimits,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
-    E: std::fmt::Display + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    Body::from_stream(pump(stream, guards, on_complete, on_first_byte, limits))
+}
+
+/// Forward upstream items unchanged.
+///
+/// One tokio task pumps upstream chunks through a bounded 64-slot channel so a
+/// slow client backpressures the upstream read. The pump stops as soon as the
+/// client disconnects, even while upstream is silent, when `limits.idle_timeout`
+/// elapses between chunks, when `limits.expiration` fires, or when
+/// `limits.abort` fires before the first chunk.
+///
+/// The terminal result travels on a separate channel and is chained after the
+/// data, so a full queue cannot block cleanup or turn a failed stream into a
+/// clean EOF. A pump panic is reported the same way.
+///
+/// `guards` is held until the pump finishes; `on_first_byte` runs on the first
+/// `Ok` chunk; `on_complete` runs exactly once with the final [`StreamEnd`].
+/// An upstream error is wrapped, not stringified, so a gRPC caller can recover its `Status`.
+pub fn pump<T, S, E>(
+    mut stream: S,
+    guards: Option<Box<dyn Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
+    mut on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    limits: StreamLimits,
+) -> impl futures::Stream<Item = Result<T, std::io::Error>> + Send + 'static
+where
+    T: PumpItem,
+    S: futures::Stream<Item = Result<T, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel::<T>(64);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let tx_for_panic = tx.clone();
-        let outcome = Arc::new(parking_lot::Mutex::new(StreamEnd {
-            transport_ok: true,
+        let mut end = StreamEnd {
+            reason: StreamEndReason::Completed,
             saw_error_event: false,
-            client_disconnect: false,
-        }));
-        let outcome_setter = Arc::clone(&outcome);
-        // `None` once an error event is found — the scan is done for good.
-        let mut scanner = Some(ErrorEventScanner::default());
-        let pump = AssertUnwindSafe(async move {
-            // Hold the guards for the task's lifetime — dropped when this
-            // block exits (stream done or client disconnect).  Leading
-            // underscore suppresses the "unused variable" lint while
-            // keeping intent explicit.
-            let _hold = stream_guards;
-            let mut on_first_byte = on_first_byte;
-            let mut s = stream;
-            while let Some(chunk) = s.next().await {
-                let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
-                    let msg = e.to_string();
-                    tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
-                    std::io::Error::other(msg)
-                });
-                let is_err_chunk = item.is_err();
-                match &item {
-                    Ok(bytes) => {
-                        // TTFT hook: at most once (`take()`); an error-first
-                        // stream never produced a token, so it stays unfired.
+        };
+        let mut scanner = ErrorEventScanner::default();
+        let idle = limits.idle_timeout.unwrap_or(Duration::MAX);
+        let started = AtomicBool::new(false);
+        let expired = cancelled(limits.expiration);
+        let aborted = async {
+            cancelled(limits.abort).await;
+            if started.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+        };
+        // Disconnect and expiration race the whole forwarding loop, so they
+        // fire while `send` waits on a full queue as well as while upstream is silent.
+        let pump = async {
+            tokio::select! {
+                biased;
+                _ = tx.closed() => {
+                    end.reason = StreamEndReason::ClientDisconnect;
+                    Ok(())
+                }
+                _ = expired => {
+                    end.reason = StreamEndReason::Expired;
+                    Err(RouterStreamError::io(end.reason, "SSE stream exceeded stale_request_timeout"))
+                }
+                _ = aborted => {
+                    end.reason = StreamEndReason::Aborted;
+                    Err(RouterStreamError::io(end.reason, "SSE stream aborted by the router"))
+                }
+                result = async {
+                    loop {
+                        let item = match tokio::time::timeout(idle, stream.next()).await {
+                            Ok(None) => return (StreamEndReason::Completed, Ok(())),
+                            Ok(Some(Ok(item))) => item,
+                            Ok(Some(Err(e))) => return (
+                                StreamEndReason::UpstreamError,
+                                Err(std::io::Error::other(e)),
+                            ),
+                            Err(_) => return (
+                                StreamEndReason::IdleTimeout,
+                                Err(RouterStreamError::io(StreamEndReason::IdleTimeout, "SSE upstream idle timeout")),
+                            ),
+                        };
+                        started.store(true, Ordering::Relaxed);
                         if let Some(hook) = on_first_byte.take() {
                             hook();
                         }
-                        if scanner.as_mut().is_some_and(|scanner| scanner.feed(bytes)) {
-                            outcome_setter.lock().saw_error_event = true;
-                            scanner = None;
+                        if !end.saw_error_event {
+                            end.saw_error_event = item.is_error_event(&mut scanner);
+                        }
+                        if tx.send(item).await.is_err() {
+                            // Receiver gone; the `tx.closed()` arm reports the disconnect.
+                            std::future::pending::<()>().await;
                         }
                     }
-                    Err(_) => outcome_setter.lock().transport_ok = false,
-                }
-                if tx.send(item).await.is_err() {
-                    // Receiver dropped. If we were about to ship an upstream
-                    // error there's nothing left to report; otherwise this is
-                    // a clean client-side disconnect — log at debug since it's
-                    // not a router-side fault.
-                    if !is_err_chunk {
-                        tracing::debug!("SSE client disconnected mid-stream");
-                        outcome_setter.lock().client_disconnect = true;
-                    }
-                    break;
-                }
-                if is_err_chunk {
-                    // Surfaced upstream error to client; stop reading.
-                    break;
+                } => {
+                    end.reason = result.0;
+                    result.1
                 }
             }
-        });
-        let pump_result = pump.catch_unwind().await;
-        let panicked = pump_result.is_err();
-        if let Err(panic_payload) = pump_result {
-            let msg = panic_payload
-                .downcast_ref::<&'static str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            tracing::error!(error = %msg, "SSE pump task panicked");
-            let _ = tx_for_panic
-                .send(Err(std::io::Error::other(format!(
-                    "SSE pump panicked: {msg}"
-                ))))
-                .await;
-        }
+        };
+        let result = match AssertUnwindSafe(pump).catch_unwind().await {
+            Ok(result) => result,
+            Err(payload) => {
+                end.reason = StreamEndReason::PumpPanicked;
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("<non-string panic payload>");
+                Err(RouterStreamError::io(
+                    end.reason,
+                    format!("SSE pump panicked: {message}"),
+                ))
+            }
+        };
         if let Some(hook) = on_complete {
-            let mut end = *outcome.lock();
-            end.transport_ok &= !panicked;
             hook(end);
         }
+        drop(guards);
+        let _ = terminal_tx.send(result);
     });
-    Body::from_stream(ReceiverStream::new(rx))
+    let terminal = futures::stream::once(terminal_rx).filter_map(|result| {
+        futures::future::ready(match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(Err(error)),
+            Err(_) => Some(Err(RouterStreamError::io(
+                StreamEndReason::PumpPanicked,
+                "SSE pump cancelled",
+            ))),
+        })
+    });
+    ReceiverStream::new(rx).map(Ok).chain(terminal)
+}
+
+async fn cancelled(token: Option<CancellationToken>) {
+    match token {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +319,143 @@ mod tests {
     use futures::stream;
     use http_body_util::BodyExt;
 
+    fn limited_body<S>(
+        stream: S,
+        limits: StreamLimits,
+    ) -> (Body, tokio::sync::oneshot::Receiver<StreamEnd>)
+    where
+        S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream,
+            None,
+            Some(Box::new(move |end| {
+                let _ = tx.send(end);
+            })),
+            None,
+            limits,
+        );
+        (body, rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_disconnect_releases_guards_without_waiting_for_upstream() {
+        struct Release(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream::pending::<Result<Bytes, std::io::Error>>(),
+            Some(Box::new(Release(Some(tx)))),
+            None,
+            None,
+            StreamLimits::default(),
+        );
+        tokio::task::yield_now().await;
+        drop(body);
+        tokio::time::timeout(Duration::from_millis(1), rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_is_a_visible_upstream_failure() {
+        let (body, end) = limited_body(
+            stream::pending(),
+            StreamLimits {
+                idle_timeout: Some(Duration::from_secs(1)),
+                expiration: None,
+                abort: None,
+            },
+        );
+        assert!(body
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("idle timeout"));
+        let end = end.await.unwrap();
+        assert_eq!(end.reason, StreamEndReason::IdleTimeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expiration_releases_guards_while_queue_is_full() {
+        struct Release(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let token = CancellationToken::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        let body = bytes_stream_to_body(
+            stream::repeat_with(|| Ok::<_, std::io::Error>(Bytes::from_static(b"chunk"))),
+            Some(Box::new(Release(Some(release_tx)))),
+            Some(Box::new(move |end| {
+                let _ = end_tx.send(end);
+            })),
+            None,
+            StreamLimits {
+                idle_timeout: None,
+                expiration: Some(token.clone()),
+                abort: None,
+            },
+        );
+        tokio::task::yield_now().await;
+        token.cancel();
+        // Cleanup must finish before the client frees any channel capacity.
+        tokio::time::timeout(Duration::from_millis(1), release_rx)
+            .await
+            .expect("expiration must release guards while the queue remains full")
+            .unwrap();
+        assert_eq!(end_rx.await.unwrap().reason, StreamEndReason::Expired);
+        // The queue is full, so the failure must ride the terminal channel.
+        assert!(body
+            .collect()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stale_request_timeout"));
+    }
+
+    #[tokio::test]
+    async fn abort_ends_the_stream_only_before_its_first_chunk() {
+        for started in [false, true] {
+            let token = CancellationToken::new();
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (body, end) = limited_body(
+                ReceiverStream::new(rx),
+                StreamLimits {
+                    abort: Some(token.clone()),
+                    ..Default::default()
+                },
+            );
+            let mut data = body.into_data_stream();
+            if started {
+                tx.send(Ok(Bytes::from_static(b"data: a\n\n")))
+                    .await
+                    .unwrap();
+                data.next().await.unwrap().unwrap();
+            }
+            token.cancel();
+            drop(tx);
+            let rest: Vec<_> = StreamExt::collect(data).await;
+            assert_eq!(rest.iter().any(Result::is_err), !started);
+            let expected = if started {
+                StreamEndReason::Completed
+            } else {
+                StreamEndReason::Aborted
+            };
+            assert_eq!(end.await.unwrap().reason, expected);
+        }
+    }
+
     #[tokio::test]
     async fn passes_through_a_simple_byte_stream() {
         let chunks = vec![
@@ -209,7 +463,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -233,6 +487,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            StreamLimits::default(),
         );
         let _ = body.collect().await.unwrap();
         assert_eq!(
@@ -260,6 +515,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            StreamLimits::default(),
         );
         let _ = body.collect().await;
         assert_eq!(
@@ -276,7 +532,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -338,8 +594,9 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let (body, end) = limited_body(s, StreamLimits::default());
         let result = body.collect().await;
+        assert_eq!(end.await.unwrap().reason, StreamEndReason::PumpPanicked);
         assert!(
             result.is_err(),
             "expected body collect to surface non-string panic as Err, got Ok"
@@ -361,7 +618,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, StreamLimits::default());
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -420,7 +677,7 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None, None);
+        let body = bytes_stream_to_body(stream, None, None, None, StreamLimits::default());
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();
@@ -431,7 +688,7 @@ mod tests {
         // Give the pump generous time to make additional polls if its break is
         // broken. Healthy code: pump fills the 64-slot channel, then on the
         // next iteration tx.send().await detects receiver-drop and breaks.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         let final_polls = polls.load(Ordering::SeqCst);
         assert!(
             final_polls <= 70,
@@ -451,6 +708,23 @@ mod tests {
         assert!(
             scanner.feed(b"data: {\"error\": {\"message\": \"queue is full\", \"code\": 503}}\n\n")
         );
+    }
+
+    #[test]
+    fn error_event_scanner_detects_native_error_abort() {
+        let event = |reason: &str| {
+            format!("data: {{\"text\":\"\",\"meta_info\":{{\"finish_reason\":{reason}}}}}\n\n")
+        };
+        let error = event(r#"{"type":"abort","message":"boom","status_code":500}"#);
+        assert!(has_error_event(error.as_bytes()));
+        // A user abort (`/abort_request`) carries no status code; lookalike text is escaped.
+        let user = event(r#"{"type":"abort","message":"Aborted","status_code":null}"#);
+        assert!(!has_error_event(user.as_bytes()));
+        let text = r#"data: {"text":"\"type\":\"abort\",\"status_code\":500"}"#;
+        assert!(!has_error_event(format!("{text}\n\n").as_bytes()));
+        let mut scanner = ErrorEventScanner::default();
+        let bytes = error.as_bytes().chunks(1);
+        assert!(bytes.fold(false, |hit, byte| scanner.feed(byte) || hit));
     }
 
     #[test]
@@ -490,6 +764,7 @@ mod tests {
         let big = vec![b'x'; 1 << 20];
         assert!(!scanner.feed(&big));
         assert_eq!(scanner.line_start.len(), LINE_PROBE);
+        assert_eq!(scanner.line_tail.len(), NATIVE_STATUS.len());
     }
 
     fn body_with_completion(
@@ -503,6 +778,7 @@ mod tests {
                 let _ = tx.send(end);
             })),
             None,
+            StreamLimits::default(),
         );
         (body, rx)
     }
@@ -520,9 +796,8 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
         let end = stream_end(completion).await;
-        assert!(end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::Completed);
         assert!(end.saw_error_event);
-        assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
@@ -536,7 +811,7 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await;
         let end = stream_end(completion).await;
-        assert!(!end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::UpstreamError);
         assert!(end.saw_error_event);
     }
 
@@ -546,9 +821,8 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await;
         let end = stream_end(completion).await;
-        assert!(!end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::UpstreamError);
         assert!(!end.saw_error_event);
-        assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
@@ -559,9 +833,8 @@ mod tests {
         let (body, completion) = body_with_completion(chunks);
         let _ = body.collect().await.unwrap();
         let end = stream_end(completion).await;
-        assert!(end.transport_ok);
+        assert_eq!(end.reason, StreamEndReason::Completed);
         assert!(!end.saw_error_event);
-        assert!(!end.client_disconnect);
     }
 
     #[tokio::test]
@@ -576,7 +849,6 @@ mod tests {
         let _ = stream.next().await;
         drop(stream);
         let end = stream_end(completion).await;
-        assert!(end.transport_ok);
-        assert!(end.client_disconnect);
+        assert_eq!(end.reason, StreamEndReason::ClientDisconnect);
     }
 }

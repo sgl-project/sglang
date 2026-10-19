@@ -24,6 +24,7 @@ import unittest
 import torch
 
 from sglang.srt.environ import envs
+from sglang.test.test_utils import publish_build_topology
 
 MODEL = "Qwen/Qwen2-0.5B"
 
@@ -43,7 +44,8 @@ def _init_model_parallel() -> None:
             local_rank=0,
             distributed_init_method="tcp://127.0.0.1:29634",
         )
-        initialize_model_parallel(tensor_model_parallel_size=1)
+        publish_build_topology(tp_size=1)
+        initialize_model_parallel()
         monkey_patch_vllm_parallel_state()
     except AssertionError:
         pass

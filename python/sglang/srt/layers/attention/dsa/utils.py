@@ -1,11 +1,17 @@
+import logging
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_needs_budget_check,
+    mqa_logits_static_budget_bytes,
+)
+from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -18,8 +24,10 @@ from sglang.srt.runtime_context import (
     get_parallel,
     process_model_config,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_musa
 from sglang.srt.utils.common import ceil_div
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -43,7 +51,6 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
 
     Set ``SGLANG_DSA_HIP_DISABLE_PRESHUFFLE=1`` to force the legacy path even when
     the gluon kernel would otherwise be available (useful for CI bisection).
-    ``SGLANG_NSA_HIP_DISABLE_PRESHUFFLE`` is a deprecated alias.
     """
     if not is_hip():
         return False
@@ -59,6 +66,82 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
         return Version(Version(triton.__version__).base_version) >= Version("3.5.0")
     except Exception:
         return False
+
+
+@lru_cache(maxsize=1)
+def gfx950_fused_indexer_runtime_ok() -> bool:
+    """Whether this runtime can serve the gfx950 fused indexer: aiter with
+    preshuffled paged MQA, and kernels that build.
+
+    Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
+    first. Every decline here is therefore a configuration or toolchain error;
+    it is logged, as a warning when the path was asked for by name."""
+    from sglang.srt.runtime_context import get_exec
+
+    requested = get_exec().kernel.enable_dsa_fused_indexer
+    if requested is False:
+        return False  # asked for the standard path; not worth a line per server
+
+    # Every decline logs its reason. Without this the path is invisible: a run
+    # with the switch on and one with it off produce identical logs, and telling
+    # the two apart cost a day of bisecting benchmark results.
+    def _refuse(reason: str) -> bool:
+        # Asked for by name: warn, but still start on the standard path.
+        log = logger.warning if requested is True else logger.info
+        log("gfx950 fused DSA indexer disabled: %s", reason)
+        return False
+
+    # No hardware term here: fused_decode.supported_hardware() is the hardware
+    # half of the gate and runs first, so anything reaching this point is
+    # already on gfx950. What is left is what a deployment can get wrong.
+    if not get_bool_env_var("SGLANG_USE_AITER"):
+        return _refuse("SGLANG_USE_AITER is not set")
+    if not aiter_can_use_preshuffle_paged_mqa():
+        return _refuse("aiter cannot use preshuffled paged MQA logits")
+    from sglang.kernels.ops.attention.dsa.hip_gfx950 import loader
+
+    # modules_or_none logged the build error; do not repeat the compiler output.
+    if loader.modules_or_none() is None:
+        return _refuse("the kernels failed to build, see the warning above")
+    logger.info("gfx950 fused DSA indexer enabled")
+    return True
+
+
+def gfx950_model_shape_supported(**kwargs) -> bool:
+    """Static per-model half of the gate: shapes and dtypes that cannot change
+    after load."""
+    from sglang.kernels.ops.attention.dsa.hip_gfx950 import model_shape_supported
+
+    return model_shape_supported(**kwargs)
+
+
+def hadamard_preserved(indexer) -> bool:
+    """Whether Indexer._maybe_rotate still applies the Hadamard the fused kernels
+    fold in. If not, the fused path must stay off, or prefill and decode would
+    write different index-K formats."""
+    device = indexer.k_norm.weight.device
+    probe = torch.zeros(1, indexer.head_dim, dtype=torch.bfloat16, device=device)
+    probe[0, 0] = 1.0
+    rotated = indexer._maybe_rotate(probe)
+    # A 128-point Hadamard sends e_0 to a vector whose every entry is 128**-0.5;
+    # the identity leaves 127 zeros. Check the magnitude too, so a transform that
+    # is merely dense does not pass for the rotation the kernels assume.
+    expected = float(indexer.head_dim) ** -0.5
+    if not bool(
+        (rotated != 0).all()
+        and torch.allclose(
+            rotated.float().abs(),
+            torch.full_like(rotated.float(), expected),
+            rtol=0.05,
+            atol=0.0,
+        )
+    ):
+        logger.warning(
+            "gfx950 fused DSA indexer disabled: Indexer._maybe_rotate does not "
+            "apply the Hadamard rotation the fused kernels assume"
+        )
+        return False
+    return True
 
 
 # Tile size for the indexer FP8 K-cache preshuffle layout. Store and gather
@@ -115,7 +198,7 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
 
 
 def is_dsa_enable_prefill_cp():
-    if is_hip() or is_npu() or is_musa():
+    if is_musa():
         return False
 
     # Generic prefill CP derives activation from the runtime topology and model
@@ -125,15 +208,13 @@ def is_dsa_enable_prefill_cp():
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config
+    if is_hip():
+        return is_deepseek_v4(hf_config)
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_interleave():
     return is_dsa_enable_prefill_cp() and get_parallel().cp_strategy == "interleave"
-
-
-# Retain the name imported by the unchanged HIP radix attention backend.
-is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 
 
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
@@ -143,7 +224,7 @@ is_dsa_prefill_cp_round_robin_split = is_dsa_prefill_cp_interleave
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        is_cuda()
+        (is_cuda() or is_hip())
         and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
         and forward_batch.forward_mode.is_extend_without_speculative()
     )
@@ -185,10 +266,8 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         )
     if dp_padding_mode.is_max_len():
         tokens = max(global_num_tokens)
-    elif len(global_num_tokens) > 1:
-        tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
-        tokens = global_num_tokens[0]
+        tokens = global_num_tokens[dp_slot_in(global_num_tokens)]
     if can_dsa_prefill_cp_interleave(forward_batch):
         tokens = ceil_div(tokens, attn_cp_size)
     return tokens
@@ -225,6 +304,25 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return False
 
 
+def maybe_prefetch_next_full_attention_kv(
+    forward_batch: "ForwardBatch",
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
+
+    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
+    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
+    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
+    overlaps it with the current layer's attention compute.
+    """
+    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+    if prefetch_kv_buffer is not None:
+        prefetch_kv_buffer(next_full_attention_layer_id)
+
+
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 
@@ -249,3 +347,156 @@ def fp8_mqa_logits_make_fused_kv(
             kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)
         )
     return fused.view(num_phys_blocks, block_kv, 1, per_token_size)
+
+
+def _use_torch_mqa_logits() -> bool:
+    return envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+
+
+@lru_cache(maxsize=1)
+def resolve_num_sms() -> int:
+    """SM count used to size the paged-MQA-logits schedule.
+
+    DeepGEMM exposes this as ``get_num_sms()``, but on the torch fallback path
+    DeepGEMM may not be installed at all, so read it off the device instead.
+    Both consumers only use it to shape the schedule metadata buffer, so the
+    raw device SM count is an acceptable stand-in.
+    """
+    if not _use_torch_mqa_logits():
+        import deep_gemm
+
+        return deep_gemm.get_num_sms()
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+@lru_cache(maxsize=1)
+def resolve_paged_mqa_logits_metadata_fn():
+    if _use_torch_mqa_logits():
+        from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
+
+        return get_paged_mqa_logits_metadata
+    import deep_gemm
+
+    return deep_gemm.get_paged_mqa_logits_metadata
+
+
+def _fp8_paged_mqa_logits_torch(
+    q_fp8,
+    kv_cache_fp8,
+    weights,
+    context_lens,
+    block_table,
+    schedule_metadata,
+    max_seq_len,
+    clean_logits=False,
+    indices=None,
+):
+    from sglang.srt.layers.attention.dsv4.indexer import fp8_paged_mqa_logits_torch
+
+    assert indices is None, "torch paged MQA logits does not take an index tensor"
+    if context_lens.dim() == 2:
+        assert context_lens.shape[1] == 1, (
+            "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH does not support next_n > 1 "
+            f"(got {context_lens.shape[1]}); disable speculative decoding."
+        )
+        context_lens = context_lens[:, 0]
+    batch_size = q_fp8.shape[0]
+    block_size = kv_cache_fp8.shape[1]
+    head_dim = q_fp8.shape[-1]
+    padded_seq_len = block_table.shape[1] * block_size
+    per_token_work_bytes = 2 * (head_dim + 4) + 2 * head_dim + 4
+    per_row_bytes = padded_seq_len * per_token_work_bytes + max_seq_len * 4
+    if (
+        q_fp8.is_cuda
+        and per_row_bytes > 0
+        and mqa_logits_needs_budget_check(
+            num_rows=batch_size, num_cols=max(max_seq_len, padded_seq_len)
+        )
+    ):
+        device_index = q_fp8.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        budget_bytes = mqa_logits_static_budget_bytes(device_index=device_index)
+        rows_per_chunk = max(budget_bytes // per_row_bytes, 1)
+    else:
+        rows_per_chunk = batch_size
+    if rows_per_chunk < batch_size:
+        logits_chunks = []
+        for start in range(0, batch_size, rows_per_chunk):
+            end = min(start + rows_per_chunk, batch_size)
+            logits_chunks.append(
+                fp8_paged_mqa_logits_torch(
+                    q_fp8[start:end],
+                    kv_cache_fp8,
+                    weights[start:end],
+                    context_lens[start:end],
+                    block_table[start:end],
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+            )
+        return torch.cat(logits_chunks, dim=0)
+    return fp8_paged_mqa_logits_torch(
+        q_fp8,
+        kv_cache_fp8,
+        weights,
+        context_lens,
+        block_table,
+        schedule_metadata,
+        max_seq_len,
+        clean_logits=clean_logits,
+    )
+
+
+@lru_cache(maxsize=1)
+def resolve_fp8_paged_mqa_logits_fn():
+    if _use_torch_mqa_logits():
+        return _fp8_paged_mqa_logits_torch
+    import deep_gemm
+
+    return deep_gemm.fp8_paged_mqa_logits
+
+
+def _fp8_mqa_logits_torch(
+    q_fp8, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0
+):
+    """Pure-torch prefill indexer fallback (no DeepGEMM).
+
+    Accumulates per-head relu(q·k) weighted by gate, then applies fp8 scale.
+    Iterates over heads to keep the [num_q, num_kv] intermediate small.
+    """
+    assert not clean_logits, "torch fp8_mqa_logits only implements clean_logits=False"
+    k_fp8, k_scale = kv
+    num_q, num_heads, head_dim = q_fp8.shape
+    num_kv = k_fp8.shape[0]
+
+    q = q_fp8.to(torch.bfloat16)
+    k_t = k_fp8.reshape(num_kv, head_dim).to(torch.bfloat16).t()
+
+    # Pad rows to a multiple of 4: topk_v2 needs an aligned score_stride.
+    num_kv_padded = (num_kv + 3) // 4 * 4
+    logits_storage = torch.zeros(
+        num_q, num_kv_padded, dtype=torch.float32, device=q_fp8.device
+    )
+    logits = logits_storage[:, :num_kv]
+    w = weights.float()
+    for h in range(num_heads):
+        scores = torch.mm(q[:, h], k_t).float()
+        logits.addcmul_(torch.relu(scores), w[:, h : h + 1])
+    logits *= k_scale.reshape(1, num_kv).float()
+
+    positions = torch.arange(num_kv, device=logits.device).unsqueeze(0)
+    valid = (positions >= ks.unsqueeze(1)) & (positions < ke.unsqueeze(1))
+    return logits.masked_fill_(~valid, 0.0)
+
+
+@lru_cache(maxsize=1)
+def resolve_fp8_mqa_logits_fn():
+    if _use_torch_mqa_logits():
+        return _fp8_mqa_logits_torch
+    import deep_gemm
+
+    return deep_gemm.fp8_mqa_logits

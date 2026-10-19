@@ -3,8 +3,8 @@
 prepare_for_extend claims a ping-pong slot and stamps mamba_last_track_seqlen
 for every tracked extend row before the scheduler decides to mix. The merge
 into the running decode batch dropped the batch's track tensors, so the MIXED
-forward skipped the checkpoint write while cache_unfinished_req /
-cache_finished_req still donated the claimed slot at the stamped depth. Every
+forward skipped the checkpoint write while the cache still donated the
+claimed slot at the stamped depth. Every
 later request sharing that prefix then restored whatever the slot held before
 (#39342).
 
@@ -34,12 +34,18 @@ from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend  # noq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch  # noqa: E402
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator  # noqa: E402
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
-from sglang.srt.mem_cache.common import release_kv_cache  # noqa: E402
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache  # noqa: E402
+from sglang.srt.mem_cache.common import (  # noqa: E402
+    checkpoint_kv_cache,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.memory_pool import (  # noqa: E402
     HybridLinearKVPool,
     HybridReqToTokenPool,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: E402
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardBatch,
     ForwardMode,
@@ -116,12 +122,14 @@ class _Lifecycle:
             kvcache=kv_pool,
             need_sort=False,
         )
-        self.tree = MambaRadixCache(
+        self.tree = UnifiedRadixCache(
             params=CacheInitParams(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=1,
                 disable=False,
+                tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+                tree_core_backend="python",
                 enable_mamba_extra_buffer=extra_buffer,
                 enable_mamba_extra_buffer_lazy=lazy,
             )
@@ -159,8 +167,7 @@ class _Lifecycle:
         self, reqs: list[Req], extend_lens: list[int], *, chunked_req=None
     ) -> ScheduleBatch:
         for req, extend_len in zip(reqs, extend_lens, strict=True):
-            prefix_len = len(req.prefix_indices)
-            req.set_extend_range(prefix_len, prefix_len + extend_len)
+            req.extend_end = req.prefix_len + extend_len
         batch = ScheduleBatch.init_new(
             reqs=reqs,
             req_to_token_pool=self.req_to_token_pool,
@@ -193,6 +200,8 @@ class _Lifecycle:
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_prefill_track_mask_cpu=batch.mamba_prefill_track_mask_cpu,
+            mamba_track_seqlens_cpu=batch.mamba_track_seqlens_cpu,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=torch.tensor(batch.prefix_lens, dtype=torch.int32),
             extend_seq_lens_cpu=list(batch.extend_lens),
@@ -234,7 +243,7 @@ class _Lifecycle:
         req.output_ids.append(token)
         req.update_finish_state()
         assert req.finished()
-        release_kv_cache(req, self.tree)
+        release_kv_cache(req, self.tree, checkpoint=True)
 
     def restored_state(self, tokens: list[int]):
         """What a new request over ``tokens`` resumes from: the matched
@@ -242,10 +251,10 @@ class _Lifecycle:
         req = self.new_req(f"probe-{tokens[0]}", tokens, max_new_tokens=1)
         src = req.kv.mamba_cow_src_index
         if src is None:
-            return len(req.prefix_indices), None, None
+            return req.prefix_len, None, None
         slot = int(src.item())
         return (
-            len(req.prefix_indices),
+            req.prefix_len,
             self.ssm_states[slot].flatten()[0].item(),
             self.conv_states[slot][0].tolist(),
         )
@@ -293,7 +302,7 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         batch = lc.prefill_batch([req], [len(prompt)])
         lc.run_extend_forward(batch, tag=0)
         req.output_ids.append(60)
-        lc.tree.cache_unfinished_req(req)
+        checkpoint_kv_cache(req, lc.tree)
         # The prefill batch becomes the running batch; update_running_batch
         # filters it and prepares the decode step.
         batch.filter_batch()
@@ -331,11 +340,11 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         mixed.mix_with_running(running)
         self.assertEqual(mixed.forward_mode, ForwardMode.MIXED)
         lc.run_extend_forward(mixed, tag=1)
-        # process_batch_result_prefill: chunked -> cache_unfinished_req,
-        # finished -> release_kv_cache, prefill-complete -> cache_unfinished_req.
-        lc.tree.cache_unfinished_req(chunked, chunked=True)
+        # The result processor publishes unfinished rows and releases finished
+        # ones through the same UnifiedRadixCache / MambaComponent lifecycle.
+        checkpoint_kv_cache(chunked, lc.tree)
         lc.finish_at_first_token(finishing, 99)
-        lc.tree.cache_unfinished_req(short)
+        checkpoint_kv_cache(short, lc.tree)
 
         # Row 0 (10 tokens) checkpoints depth 8 from the chunk grid: packed
         # chunk 2 of the batch, conv window over inputs 5..7. Row 1 (8 tokens)
@@ -349,6 +358,14 @@ class TestMixedChunkMambaTracking(CustomTestCase):
             (8, final(1, 1), [15.0, 16.0, 17.0]),
         )
         self.assertEqual(lc.restored_state([70, 71, 72]), (0, None, None))
+        self.assertEqual(mixed.mamba_prefill_track_mask_cpu, [True, True, False, False])
+        self.assertEqual(mixed.mamba_track_seqlens_cpu, [10, 8, -1, -1])
+        self.assertEqual(
+            mixed.mamba_prefill_track_mask_cpu, mixed.mamba_track_mask.tolist()
+        )
+        self.assertEqual(
+            mixed.mamba_track_seqlens_cpu, mixed.mamba_track_seqlens.tolist()
+        )
         # The decode tail neither claimed nor wrote anything on the mixed step.
         self.assertEqual(
             (
@@ -379,6 +396,8 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         mixed.mix_with_running(running)
         self.assertIsNotNone(mixed.mamba_track_mask)
         self.assertEqual(mixed.mamba_track_mask.tolist(), [True, False])
+        self.assertEqual(mixed.mamba_prefill_track_mask_cpu, [True, False])
+        self.assertEqual(mixed.mamba_track_seqlens_cpu, [8, -1])
 
         md = lc.run_extend_forward(mixed, tag=1)
         decode_slots = {slot_at(decoding, 0), slot_at(decoding, 1)}
@@ -408,6 +427,8 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         self.assertIsNotNone(mixed.mamba_track_mask)
         self.assertEqual(mixed.mamba_track_mask.tolist(), [True, False])
         self.assertEqual(mixed.mamba_track_seqlens.tolist(), [8, -1])
+        self.assertEqual(mixed.mamba_prefill_track_mask_cpu, [True, False])
+        self.assertEqual(mixed.mamba_track_seqlens_cpu, [8, -1])
         self.assertEqual(
             mixed.mamba_track_indices.tolist(),
             [
@@ -445,12 +466,14 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         self.assertIsNotNone(mixed.mamba_track_mask)
         self.assertEqual(mixed.mamba_track_mask.tolist(), [True, False])
         self.assertEqual(mixed.mamba_track_seqlens.tolist(), [10, -1])
+        self.assertEqual(mixed.mamba_prefill_track_mask_cpu, [True, False])
+        self.assertEqual(mixed.mamba_track_seqlens_cpu, [10, -1])
         self.assertEqual(
             mixed.mamba_track_indices.tolist(), [extend_slot, boundary_slot]
         )
 
         lc.run_extend_forward(mixed, tag=1)
-        lc.tree.cache_unfinished_req(extend)
+        checkpoint_kv_cache(extend, lc.tree)
         self.assertEqual(
             lc.restored_state(list(range(10, 18)) + [90]),
             (8, h_state(1, 2), [5.0, 6.0, 7.0]),
@@ -476,6 +499,49 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         self.assertIsNone(mixed.mamba_track_mask)
         self.assertIsNone(mixed.mamba_track_indices)
         self.assertIsNone(mixed.mamba_track_seqlens)
+        self.assertIsNone(mixed.mamba_prefill_track_mask_cpu)
+        self.assertIsNone(mixed.mamba_track_seqlens_cpu)
+
+    def test_untracked_extend_with_two_decode_tails_writes_no_checkpoint(self):
+        self._publish("extra_buffer")
+        lc = _Lifecycle(extra_buffer=True)
+        decoders = [
+            lc.new_req("D50", list(range(50, 57)), max_new_tokens=8),
+            lc.new_req("D80", list(range(80, 86)), max_new_tokens=8),
+        ]
+        running = lc.prefill_batch(decoders, [7, 6])
+        lc.run_extend_forward(running, tag=0)
+        for req in decoders:
+            req.output_ids.append(60)
+            checkpoint_kv_cache(req, lc.tree)
+        running.filter_batch()
+        running.prepare_for_decode()
+        self.assertEqual(running.mamba_track_mask.tolist(), [True, False])
+
+        short = lc.new_req("S", [10, 11], max_new_tokens=8)
+        mixed = lc.prefill_batch([short], [2])
+        # Keep references to the prepared CPU mirrors: mixing must append new
+        # rows without mutating metadata held by another forward snapshot.
+        extend_mask = mixed.mamba_prefill_track_mask_cpu
+        extend_seqlens = mixed.mamba_track_seqlens_cpu
+        track_slots = [slot_at(req, i) for req in [short, *decoders] for i in range(2)]
+        ssm_before = lc.ssm_states[track_slots].clone()
+        conv_before = lc.conv_states[track_slots].clone()
+
+        mixed.mix_with_running(running)
+        self.assertEqual(mixed.mamba_prefill_track_mask_cpu, [False] * 3)
+        self.assertEqual(mixed.mamba_track_seqlens_cpu, [-1] * 3)
+        self.assertEqual(mixed.mamba_track_mask.tolist(), [False] * 3)
+        self.assertEqual(mixed.mamba_track_seqlens.tolist(), [-1] * 3)
+        self.assertEqual(extend_mask, [False])
+        self.assertEqual(extend_seqlens, [-1])
+
+        md = lc.run_extend_forward(mixed, tag=1)
+        self.assertFalse(md.has_mamba_track_mask)
+        torch.testing.assert_close(lc.ssm_states[track_slots], ssm_before)
+        torch.testing.assert_close(lc.conv_states[track_slots], conv_before)
+        checkpoint_kv_cache(short, lc.tree)
+        self.assertEqual(lc.restored_state([10, 11, 12]), (0, None, None))
 
     def test_post_forward_filter_and_decode_prepare_rebuild_tracking(self):
         """After the mixed forward the scheduler filters the finished and
@@ -496,20 +562,24 @@ class TestMixedChunkMambaTracking(CustomTestCase):
         )
         mixed.mix_with_running(running)
         lc.run_extend_forward(mixed, tag=1)
-        lc.tree.cache_unfinished_req(chunked, chunked=True)
+        checkpoint_kv_cache(chunked, lc.tree)
         lc.finish_at_first_token(finishing, 99)
-        lc.tree.cache_unfinished_req(short)
+        checkpoint_kv_cache(short, lc.tree)
         short.output_ids.append(61)
         decoding.output_ids.append(62)
 
-        mixed.filter_batch(chunked_req_to_exclude=[chunked])
+        mixed.filter_batch(reqs_to_exclude=[chunked])
         self.assertEqual([r.rid for r in mixed.reqs], ["S", "D50"])
         self.assertIsNone(mixed.mamba_track_mask)
         self.assertIsNone(mixed.mamba_track_seqlens)
+        self.assertIsNone(mixed.mamba_prefill_track_mask_cpu)
+        self.assertIsNone(mixed.mamba_track_seqlens_cpu)
 
         mixed.prepare_for_decode()
         self.assertEqual(mixed.seq_lens_cpu.tolist(), [3, 8])
         self.assertEqual(mixed.mamba_track_mask.tolist(), [False, True])
+        self.assertIsNone(mixed.mamba_prefill_track_mask_cpu)
+        self.assertIsNone(mixed.mamba_track_seqlens_cpu)
         self.assertEqual(
             mixed.mamba_track_indices.tolist(),
             [
