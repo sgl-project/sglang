@@ -325,17 +325,10 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate Q/K together, with a bit-exact eager fallback."""
         tables = self._tables(query)
-        verified = _LTX25_DECODER_ROPE.verified
-        if (
-            not _LTX25_DECODER_ROPE.disabled
-            and _is_cuda
-            and query.is_cuda
-            and query.dtype is torch.bfloat16
-            and (verified or _LTX25_DECODER_ROPE.can_attempt_once())
-        ):
+        if _is_cuda and query.is_cuda and query.dtype is torch.bfloat16:
             dim_t, dim_h, _ = self.rope_dim_split
-            try:
-                fused = fused_ltx25_decoder_rope(
+            return _LTX25_DECODER_ROPE.run(
+                lambda: fused_ltx25_decoder_rope(
                     query,
                     key,
                     *tables[0],
@@ -343,23 +336,14 @@ class LTX2VideoVaeRotaryPosEmbed3D(nn.Module):
                     *tables[2],
                     dim_t,
                     dim_h,
-                )
-            except Exception as exc:
-                _LTX25_DECODER_ROPE.on_exception(exc, logger=logger)
-            else:
-                if verified:
-                    return fused
-                eager = self._apply_rope(query, tables), self._apply_rope(key, tables)
-                return _LTX25_DECODER_ROPE.accept_or_fallback(
-                    fused,
-                    eager,
-                    equal=tensors_equal,
-                    logger=logger,
-                    mismatch_msg=(
-                        "LTX-2.5 decoder fused RoPE is not bit-exact on this "
-                        "platform; falling back to eager"
-                    ),
-                )
+                ),
+                lambda: (
+                    self._apply_rope(query, tables),
+                    self._apply_rope(key, tables),
+                ),
+                equal=tensors_equal,
+                logger=logger,
+            )
         return self._apply_rope(query, tables), self._apply_rope(key, tables)
 
 
