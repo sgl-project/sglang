@@ -1903,6 +1903,219 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
     }
 }
 
+impl ::serde::Serialize for GenerateTokensRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.rid {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", v)?;
+        }
+        if let Some(v) = &self.input_ids {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_ids", v)?;
+        }
+        if let Some(v) = &self.sampling_params {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "sampling_params", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "stream", &self.stream)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_logprob",
+            &self.return_logprob,
+        )?;
+        if let Some(v) = &self.logprob_start_len {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "logprob_start_len", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "top_logprobs_num",
+            &self.top_logprobs_num,
+        )?;
+        if let Some(v) = &self.bootstrap_host {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_host", v)?;
+        }
+        if let Some(v) = &self.bootstrap_port {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_port", v)?;
+        }
+        if let Some(v) = &self.bootstrap_room {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_room", v)?;
+        }
+        if let Some(v) = &self.bootstrap_pair_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_pair_key", v)?;
+        }
+        if let Some(v) = &self.decode_tp_size {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "decode_tp_size", v)?;
+        }
+        if let Some(v) = &self.routed_dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routed_dp_rank", v)?;
+        }
+        if let Some(v) = &self.disagg_prefill_dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "disagg_prefill_dp_rank", v)?;
+        }
+        if let Some(v) = &self.extra_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for GenerateTokensRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = GenerateTokensRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct GenerateTokensRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_rid = None;
+                let mut f_input_ids = None;
+                let mut f_sampling_params = None;
+                let mut f_stream = None;
+                let mut f_return_logprob = None;
+                let mut f_logprob_start_len = None;
+                let mut f_top_logprobs_num = None;
+                let mut f_bootstrap_host = None;
+                let mut f_bootstrap_port = None;
+                let mut f_bootstrap_room = None;
+                let mut f_bootstrap_pair_key = None;
+                let mut f_decode_tp_size = None;
+                let mut f_routed_dp_rank = None;
+                let mut f_disagg_prefill_dp_rank = None;
+                let mut f_extra_key = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
+                            }
+                            f_rid =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "input_ids" => {
+                            if f_input_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input_ids"));
+                            }
+                            f_input_ids = Some(map.next_value::<Option<TokenIds>>()?);
+                        }
+                        "sampling_params" => {
+                            if f_sampling_params.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("sampling_params"));
+                            }
+                            f_sampling_params = Some(map.next_value::<Option<SamplingParams>>()?);
+                        }
+                        "stream" => {
+                            if f_stream.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stream"));
+                            }
+                            f_stream = Some(map.next_value::<bool>()?);
+                        }
+                        "return_logprob" => {
+                            if f_return_logprob.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("return_logprob"));
+                            }
+                            f_return_logprob = Some(map.next_value::<bool>()?);
+                        }
+                        "logprob_start_len" => {
+                            if f_logprob_start_len.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "logprob_start_len",
+                                ));
+                            }
+                            f_logprob_start_len = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "top_logprobs_num" => {
+                            if f_top_logprobs_num.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "top_logprobs_num",
+                                ));
+                            }
+                            f_top_logprobs_num = Some(map.next_value::<i64>()?);
+                        }
+                        "bootstrap_host" => {
+                            if f_bootstrap_host.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_host"));
+                            }
+                            f_bootstrap_host =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "bootstrap_port" => {
+                            if f_bootstrap_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_port"));
+                            }
+                            f_bootstrap_port = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "bootstrap_room" => {
+                            if f_bootstrap_room.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_room"));
+                            }
+                            f_bootstrap_room = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "bootstrap_pair_key" => {
+                            if f_bootstrap_pair_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "bootstrap_pair_key",
+                                ));
+                            }
+                            f_bootstrap_pair_key =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "decode_tp_size" => {
+                            if f_decode_tp_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("decode_tp_size"));
+                            }
+                            f_decode_tp_size = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "routed_dp_rank" => {
+                            if f_routed_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("routed_dp_rank"));
+                            }
+                            f_routed_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "disagg_prefill_dp_rank" => {
+                            if f_disagg_prefill_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "disagg_prefill_dp_rank",
+                                ));
+                            }
+                            f_disagg_prefill_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "extra_key" => {
+                            if f_extra_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("extra_key"));
+                            }
+                            f_extra_key =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(GenerateTokensRequest {
+                    rid: f_rid.flatten(),
+                    input_ids: f_input_ids.flatten(),
+                    sampling_params: f_sampling_params.flatten(),
+                    stream: f_stream.unwrap_or_default(),
+                    return_logprob: f_return_logprob.unwrap_or_default(),
+                    logprob_start_len: f_logprob_start_len.flatten(),
+                    top_logprobs_num: f_top_logprobs_num.unwrap_or_default(),
+                    bootstrap_host: f_bootstrap_host.flatten(),
+                    bootstrap_port: f_bootstrap_port.flatten(),
+                    bootstrap_room: f_bootstrap_room.flatten(),
+                    bootstrap_pair_key: f_bootstrap_pair_key.flatten(),
+                    decode_tp_size: f_decode_tp_size.flatten(),
+                    routed_dp_rank: f_routed_dp_rank.flatten(),
+                    disagg_prefill_dp_rank: f_disagg_prefill_dp_rank.flatten(),
+                    extra_key: f_extra_key.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl SamplingParamsOrList {
     /// Protobuf arrival: recurse the absent-defaults rule into the params.
     pub fn apply_absent_defaults(&mut self) {

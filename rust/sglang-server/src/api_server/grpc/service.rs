@@ -9,10 +9,11 @@ use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
+use super::direct::DirectIngress;
 use super::{info, native_api};
 use crate::api_server::core::{CoreHandle, HealthStatus};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
-use crate::message::request::into_requests;
+use crate::message::request::{from_generate_tokens, into_requests};
 use crate::message::wire::fill_preferred_sampling;
 use crate::utils::environ;
 
@@ -38,12 +39,20 @@ struct AdapterConfig {
 pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
+    /// `GenerateTokens` pushes straight to the scheduler ring when set; tests
+    /// built on the `CoreHandle` harness leave it unset.
+    direct: Option<DirectIngress>,
 }
 
 impl GrpcService {
-    pub(crate) fn new(core: CoreHandle, server_args: &ServerArgs) -> Self {
+    pub(crate) fn new(
+        core: CoreHandle,
+        server_args: &ServerArgs,
+        direct: Option<DirectIngress>,
+    ) -> Self {
         Self {
             core,
+            direct,
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
@@ -64,6 +73,7 @@ impl GrpcService {
     ) -> Self {
         Self {
             core,
+            direct: None,
             config: AdapterConfig {
                 preferred_sampling_params,
                 incremental_streaming_output,
@@ -112,6 +122,38 @@ impl SglangService for GrpcService {
                 stream,
                 incremental: self.config.incremental_streaming_output,
                 with_index: is_batch,
+                response_timeout: self.config.response_timeout,
+                created_at,
+            },
+        )))
+    }
+
+    type GenerateTokensStream = ResponseStream<api::GenerateStreamItem>;
+
+    /// Injection point: one pre-tokenized request, converted to the scheduler's
+    /// format and pushed onto its ring by `DirectIngress`. No server-side
+    /// defaults: the client sends complete sampling params.
+    async fn generate_tokens(
+        &self,
+        request: Request<api::GenerateTokensRequest>,
+    ) -> Result<Response<Self::GenerateTokensStream>, Status> {
+        let Some(direct) = &self.direct else {
+            return Err(Status::unimplemented(
+                "GenerateTokens needs the embedded scheduler ring",
+            ));
+        };
+        let request = request.into_inner();
+        let stream = request.stream;
+        let payload = from_generate_tokens(request)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let created_at = Instant::now();
+        let call = direct.submit(payload)?;
+        Ok(Response::new(native_api::generate_stream(
+            vec![call],
+            native_api::StreamOptions {
+                stream,
+                incremental: self.config.incremental_streaming_output,
+                with_index: false,
                 response_timeout: self.config.response_timeout,
                 created_at,
             },
@@ -452,6 +494,76 @@ mod tests {
         assert_eq!(output_ids(&only), [1, 2]);
         assert_eq!(meta(&only).completion_tokens, 2);
         assert!(stream.next().await.is_none());
+    }
+
+    fn tokens_request(ids: &[i64], rid: Option<&str>) -> api::GenerateTokensRequest {
+        api::GenerateTokensRequest {
+            rid: rid.map(str::to_owned),
+            input_ids: Some(api::TokenIds { ids: ids.to_vec() }),
+            stream: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_tokens_injects_into_the_ring_and_streams_back() {
+        let mut harness = Harness::new(1, false, Duration::from_secs(1));
+        let rig = crate::api_server::grpc::direct::test_rig(4);
+        harness.service.direct = Some(rig.ingress.clone());
+        let request = tokens_request(&[5, 6, 7], Some("tok"));
+        let mut stream = harness
+            .service
+            .generate_tokens(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // Injected straight onto the ring: Intake (CoreHandle) never saw it.
+        assert!(harness.intake_rx.try_recv().is_err());
+        let pushed = rig.ring.drain(4);
+        assert_eq!(pushed.len(), 1);
+        assert!(!pushed[0].buffers.is_empty(), "input_ids ride as a buffer");
+
+        // The detok registration is the stream's only way back.
+        let Ok(crate::message::detok::DetokMsg::Register { rid, sink, .. }) =
+            rig.detok_rx.try_recv()
+        else {
+            panic!("expected a detok registration");
+        };
+        sink.try_send(ResponseItem::Done(chunk(&rid, "", 1, true)))
+            .unwrap();
+        let only = frame(stream.next().await.unwrap().unwrap());
+        assert_eq!(only.index, None);
+        assert_eq!(meta(&only).id, "tok");
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_tokens_is_unimplemented_without_the_ring() {
+        let harness = Harness::new(1, false, Duration::from_secs(1));
+        let error = harness
+            .service
+            .generate_tokens(Request::new(tokens_request(&[1], None)))
+            .await
+            .err()
+            .expect("no direct ingress wired");
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn generate_tokens_rejects_empty_input_ids_before_injection() {
+        let mut harness = Harness::new(1, false, Duration::from_secs(1));
+        let rig = crate::api_server::grpc::direct::test_rig(4);
+        harness.service.direct = Some(rig.ingress.clone());
+        let error = harness
+            .service
+            .generate_tokens(Request::new(tokens_request(&[], None)))
+            .await
+            .err()
+            .expect("empty input_ids must be rejected");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(rig.ring.drain(4).is_empty());
     }
 
     #[tokio::test]

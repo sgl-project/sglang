@@ -104,7 +104,7 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
 
 /// Guard the ids that will reach the embedding lookup. Multimodal requests run
 /// this after placeholder expansion; all other requests also run it at intake.
-pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result<(), Error> {
+pub(crate) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result<(), Error> {
     if let Some(ids) = &g.input_ids {
         for &id in ids {
             if id < 0 || id as u64 >= vocab_size {

@@ -274,6 +274,35 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
         return encode_GenerateRequest(self)
 
 
+class GenerateTokensRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.GenerateTokensRequest: JSON object (unknown keys ignored)."""
+
+    rid: Optional[str] = None
+    input_ids: Optional[TokenIds] = None
+    sampling_params: Optional[SamplingParams] = None
+    stream: bool = False
+    return_logprob: bool = False
+    logprob_start_len: Optional[int] = None
+    top_logprobs_num: int = 0
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+    bootstrap_pair_key: Optional[str] = None
+    decode_tp_size: Optional[int] = None
+    routed_dp_rank: Optional[int] = None
+    disagg_prefill_dp_rank: Optional[int] = None
+    extra_key: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "GenerateTokensRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_GenerateTokensRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_GenerateTokensRequest(self)
+
+
 class LogprobEntry(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.LogprobEntry: JSON positional array [logprob, token_id, text]."""
 
@@ -1177,6 +1206,75 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["lora_path"] = v.lora_path
     if v.session_params is not None:
         d["session_params"] = v.session_params
+    return d
+
+
+def decode_GenerateTokensRequest(value: Any) -> GenerateTokensRequest:
+    m = _expect_map(value, expected="struct GenerateTokensRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "rid":
+            kw["rid"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "input_ids":
+            kw["input_ids"] = None if x is None else decode_TokenIds(x)
+        elif key == "sampling_params":
+            kw["sampling_params"] = None if x is None else decode_SamplingParams(x)
+        elif key == "stream":
+            kw["stream"] = _expect_bool(x, expected="a boolean")
+        elif key == "return_logprob":
+            kw["return_logprob"] = _expect_bool(x, expected="a boolean")
+        elif key == "logprob_start_len":
+            kw["logprob_start_len"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "top_logprobs_num":
+            kw["top_logprobs_num"] = _expect_int(x, expected="i64")
+        elif key == "bootstrap_host":
+            kw["bootstrap_host"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "bootstrap_port":
+            kw["bootstrap_port"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "bootstrap_room":
+            kw["bootstrap_room"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "bootstrap_pair_key":
+            kw["bootstrap_pair_key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "decode_tp_size":
+            kw["decode_tp_size"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "routed_dp_rank":
+            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "disagg_prefill_dp_rank":
+            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else _expect_str(x, expected="a string")
+    return GenerateTokensRequest(**kw)
+
+
+def encode_GenerateTokensRequest(v: GenerateTokensRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.rid is not None:
+        d["rid"] = v.rid
+    if v.input_ids is not None:
+        d["input_ids"] = encode_TokenIds(v.input_ids)
+    if v.sampling_params is not None:
+        d["sampling_params"] = encode_SamplingParams(v.sampling_params)
+    d["stream"] = v.stream
+    d["return_logprob"] = v.return_logprob
+    if v.logprob_start_len is not None:
+        d["logprob_start_len"] = v.logprob_start_len
+    d["top_logprobs_num"] = v.top_logprobs_num
+    if v.bootstrap_host is not None:
+        d["bootstrap_host"] = v.bootstrap_host
+    if v.bootstrap_port is not None:
+        d["bootstrap_port"] = v.bootstrap_port
+    if v.bootstrap_room is not None:
+        d["bootstrap_room"] = v.bootstrap_room
+    if v.bootstrap_pair_key is not None:
+        d["bootstrap_pair_key"] = v.bootstrap_pair_key
+    if v.decode_tp_size is not None:
+        d["decode_tp_size"] = v.decode_tp_size
+    if v.routed_dp_rank is not None:
+        d["routed_dp_rank"] = v.routed_dp_rank
+    if v.disagg_prefill_dp_rank is not None:
+        d["disagg_prefill_dp_rank"] = v.disagg_prefill_dp_rank
+    if v.extra_key is not None:
+        d["extra_key"] = v.extra_key
     return d
 
 

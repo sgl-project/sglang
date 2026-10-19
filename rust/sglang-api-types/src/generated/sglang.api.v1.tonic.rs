@@ -109,6 +109,28 @@ pub mod sglang_service_client {
                 .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Generate"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Single pre-tokenized request; same stream contract as Generate, minus the
+        /// batch `index`.
+        pub async fn generate_tokens(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GenerateTokensRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::GenerateStreamItem>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/GenerateTokens");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "GenerateTokens",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// `/health_generate`: fires a 1-token probe and watches the response
         /// heartbeat. UNAVAILABLE on a stalled pipeline.
         pub async fn health_check(
@@ -195,6 +217,17 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::GenerateRequest>,
         ) -> std::result::Result<tonic::Response<Self::GenerateStream>, tonic::Status>;
+        /// Server streaming response type for the GenerateTokens method.
+        type GenerateTokensStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::GenerateStreamItem, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Single pre-tokenized request; same stream contract as Generate, minus the
+        /// batch `index`.
+        async fn generate_tokens(
+            &self,
+            request: tonic::Request<super::GenerateTokensRequest>,
+        ) -> std::result::Result<tonic::Response<Self::GenerateTokensStream>, tonic::Status>;
         /// `/health_generate`: fires a 1-token probe and watches the response
         /// heartbeat. UNAVAILABLE on a stalled pipeline.
         async fn health_check(
@@ -315,6 +348,50 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GenerateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/GenerateTokens" => {
+                    #[allow(non_camel_case_types)]
+                    struct GenerateTokensSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::ServerStreamingService<super::GenerateTokensRequest>
+                        for GenerateTokensSvc<T>
+                    {
+                        type Response = super::GenerateStreamItem;
+                        type ResponseStream = T::GenerateTokensStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GenerateTokensRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::generate_tokens(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GenerateTokensSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
