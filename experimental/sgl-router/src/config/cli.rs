@@ -11,15 +11,15 @@ use std::num::NonZeroU32;
 use crate::config::sampling::{parse_sampling_overrides, ConflictPolicy};
 use crate::config::types::is_selector_empty;
 use crate::config::{
-    default_cb_cool_down, default_host, default_port, default_proxy_request_timeout_secs,
-    default_shutdown_drain_secs, default_stale_request_timeout_secs, resolve_mode, AffinityConfig,
-    AffinityMode, BalancedBy, CacheAwareConfig, CachePrefixProvider, ChatRoutingKind,
-    CircuitBreakerConfig, Config, DecodePolicyKind, DiscoveryBackend, EligibilityConfig,
-    FilterKind, FusedTerm, InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode,
-    KvIndexerEndpointConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    ServerConfig, SessionAffinityMode, StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind,
-    TokenizerBackend, TokenizerConfig, DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
-    DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
+    default_cb_cool_down, default_cb_threshold, default_host, default_port,
+    default_proxy_request_timeout_secs, default_shutdown_drain_secs,
+    default_stale_request_timeout_secs, resolve_mode, AffinityConfig, AffinityMode, BalancedBy,
+    CacheAwareConfig, CachePrefixProvider, ChatRoutingKind, CircuitBreakerConfig, Config,
+    DecodePolicyKind, DiscoveryBackend, DpRankPolicy, EligibilityConfig, FilterKind, FusedTerm,
+    InflightLoadConfig, K8sDiscoveryConfig, K8sDiscoveryMode, KvIndexerEndpointConfig, LogFormat,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, SessionAffinityMode,
+    StaticUrlsDiscoveryConfig, StickyConfig, StickyFallbackKind, TokenizerBackend, TokenizerConfig,
+    DEFAULT_FUSE, DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS, DEFAULT_KV_BOOTSTRAP_TIMEOUT_MS,
 };
 use crate::policies_reorg::admission::AdmissionLimits;
 use crate::policies_reorg::factory::AffinitySpec;
@@ -100,7 +100,7 @@ pub struct ModelArgs {
     /// Accepts temperature, top_p, top_k, min_p, repetition_penalty,
     /// frequency_penalty, presence_penalty, and n. Numeric values fill absent
     /// fields; {"min": LO, "max": HI} bands only constrain supplied values
-    /// and require reject mode. See README for domains and null handling.
+    /// and require reject mode. See REFERENCE.md for domains and null handling.
     #[arg(long, value_name = "JSON")]
     pub override_sampling_params: Option<String>,
 
@@ -125,6 +125,11 @@ pub struct ServerArgs {
     /// Port to bind the HTTP server to.
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
+
+    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
+    #[arg(long)]
+    pub grpc_port: Option<u16>,
 
     /// Keep serving after SIGTERM with /readyz returning 503 before stopping accepts.
     /// Leave time in the pod grace period for in-flight requests; cover readiness
@@ -164,6 +169,12 @@ pub struct ServerArgs {
     /// Upper bound on the backoff between retries, in milliseconds.
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
+
+    /// PD: at most N requests per prefill DP rank go to decode before their
+    /// first token; the rest wait and get their decode DP rank when sent.
+    /// Needs prefill engines with --optimistic-prefill-attempts above 0.
+    #[arg(long)]
+    pub decode_dispatch_limit: Option<NonZeroU32>,
 
     /// Maximum in-flight request lifetime in seconds, including streaming responses.
     /// Expiry returns 504 `stale_request_expired` before response headers are sent;
@@ -245,6 +256,11 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub dp_aware: bool,
 
+    /// How --dp-aware picks a rank that no routing key or cached prefix decides,
+    /// which in PD mode is every decode rank. Defaults to least_in_flight.
+    #[arg(long, value_enum, requires = "dp_aware")]
+    pub dp_rank_policy: Option<DpRankPolicy>,
+
     /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
     /// Omit to use the global candidate domain (default buckets with reorg).
     #[arg(long)]
@@ -260,27 +276,45 @@ pub struct RoutingArgs {
     #[arg(long, value_delimiter = ',')]
     pub filter: Vec<FilterKind>,
 
-    /// Router-local in-flight limit for `--filter overloaded`.
-    #[arg(long)]
-    pub max_in_flight: Option<usize>,
+    /// Router-local in-flight limit: for `--filter overloaded`, or reorg admission.
+    /// `--max-in-flight` is still accepted as an alias.
+    #[arg(long, visible_alias = "max-in-flight")]
+    pub max_inflight_requests: Option<usize>,
 
     /// Reorg admission: reject an engine whose KV tokens have reached this share
     /// of its reported capacity, in (0, 1].
     #[arg(long)]
     pub max_kv_usage: Option<f64>,
 
+    /// Reorg admission: reject an engine whose running requests have reached this
+    /// share of its reported capacity, in (0, 1].
+    #[arg(long)]
+    pub max_running_usage: Option<f64>,
+
+    /// Reorg admission: reject an engine reporting this many waiting requests.
+    #[arg(long)]
+    pub max_waiting_requests: Option<u64>,
+
+    /// Reorg admission: reject an engine reporting this many waiting uncached tokens.
+    #[arg(long)]
+    pub max_pending_prefill_tokens: Option<u64>,
+
     /// Minimum cached prompt share for `--filter prefix_cache`.
     #[arg(long)]
     pub prefix_cache_min_share: Option<f32>,
 
-    /// Consecutive upstream failures before opening the breaker. Must be positive; enables the breaker.
-    #[arg(long)]
-    pub cb_threshold: Option<NonZeroU32>,
+    /// Consecutive upstream failures before a worker's circuit breaker opens; must be positive.
+    #[arg(long, default_value_t = default_cb_threshold())]
+    pub cb_threshold: NonZeroU32,
 
-    /// Circuit-breaker cool-down in seconds. Only meaningful with
-    /// `--cb-threshold`; defaults to 30 when the breaker is enabled.
-    #[arg(long)]
-    pub cb_cool_down_secs: Option<u64>,
+    /// Seconds an open circuit breaker waits before letting a probe request through.
+    #[arg(long, default_value_t = default_cb_cool_down())]
+    pub cb_cool_down_secs: u64,
+
+    /// Turn off the per-worker circuit breaker. Under `--worker-urls` nothing else takes
+    /// a dead or hung worker out of routing.
+    #[arg(long, conflicts_with_all = ["cb_threshold", "cb_cool_down_secs"])]
+    pub disable_circuit_breaker: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -487,8 +521,12 @@ impl Cli {
                 "prefer, balanced, --affinity-balanced-by and --affinity-load-* require --chat-routing reorg"
             );
             ensure!(
-                self.routing.max_kv_usage.is_none(),
-                "--max-kv-usage requires --chat-routing reorg"
+                self.routing.max_kv_usage.is_none()
+                    && self.routing.max_running_usage.is_none()
+                    && self.routing.max_waiting_requests.is_none()
+                    && self.routing.max_pending_prefill_tokens.is_none(),
+                "--max-kv-usage, --max-running-usage, --max-waiting-requests and \
+                 --max-pending-prefill-tokens require --chat-routing reorg"
             );
             ensure!(
                 self.affinity.affinity_mode.is_none()
@@ -513,7 +551,7 @@ impl Cli {
             Some(path) => (Some(load_bucket_config(path)?), None),
             None => (None, None),
         };
-        let circuit_breaker = self.routing.build_circuit_breaker()?;
+        let circuit_breaker = self.routing.build_circuit_breaker();
         let kv_bootstrap_timeout_ms = self.cache.kv_bootstrap_timeout_ms;
         let kv_bootstrap_fetch_timeout_cap_ms = self.cache.kv_bootstrap_fetch_timeout_cap_ms;
         let kv_bootstrap_seed_required = self.cache.kv_bootstrap_seed_required;
@@ -542,7 +580,7 @@ impl Cli {
             }
         }
         let fused = self.routing.build_fused()?;
-        let eligibility = self.routing.build_eligibility()?;
+        let eligibility = self.routing.build_eligibility(reorg)?;
         let reorg_admission = self.routing.build_reorg_admission()?;
         let sticky = self.affinity.into_sticky_config(self.routing.policy)?;
         let sampling_overrides = self
@@ -576,6 +614,7 @@ impl Cli {
             server: ServerConfig {
                 host: self.server.host,
                 port: self.server.port,
+                grpc_port: self.server.grpc_port,
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
@@ -599,6 +638,7 @@ impl Cli {
                 policy: self.routing.policy,
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
+                dp_rank_policy: self.routing.dp_rank_policy.unwrap_or_default(),
                 bucket_config,
                 reorg_buckets,
                 reorg_admission,
@@ -618,6 +658,7 @@ impl Cli {
                 max_attempts: self.server.retry_max_attempts,
                 initial_backoff_ms: self.server.retry_initial_backoff_ms,
                 max_backoff_ms: self.server.retry_max_backoff_ms,
+                decode_dispatch_limit: self.server.decode_dispatch_limit,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -707,18 +748,11 @@ impl DiscoveryArgs {
 }
 
 impl RoutingArgs {
-    fn build_circuit_breaker(&self) -> Result<Option<CircuitBreakerConfig>> {
-        ensure!(
-            self.cb_cool_down_secs.is_none() || self.cb_threshold.is_some(),
-            "--cb-cool-down-secs requires --cb-threshold (the circuit breaker is \
-                 enabled by --cb-threshold)"
-        );
-        let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
-            threshold,
-            cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
-        });
-
-        Ok(circuit_breaker)
+    fn build_circuit_breaker(&self) -> Option<CircuitBreakerConfig> {
+        (!self.disable_circuit_breaker).then_some(CircuitBreakerConfig {
+            threshold: self.cb_threshold,
+            cool_down_secs: self.cb_cool_down_secs,
+        })
     }
 
     fn build_fused(&self) -> Result<Option<Vec<FusedTerm>>> {
@@ -751,7 +785,7 @@ impl RoutingArgs {
         Ok(Some(terms))
     }
 
-    fn build_eligibility(&self) -> Result<Option<EligibilityConfig>> {
+    fn build_eligibility(&self, reorg: bool) -> Result<Option<EligibilityConfig>> {
         for (i, kind) in self.filter.iter().enumerate() {
             ensure!(
                 !self.filter[..i].contains(kind),
@@ -760,12 +794,17 @@ impl RoutingArgs {
         }
         let has = |k: FilterKind| self.filter.contains(&k);
         ensure!(
-            (self.max_in_flight.is_some() == has(FilterKind::Overloaded)),
-            "--max-in-flight and `--filter overloaded` require each other"
+            !has(FilterKind::Overloaded) || self.max_inflight_requests.is_some(),
+            "`--filter overloaded` requires --max-inflight-requests"
+        );
+        // Reorg applies --max-inflight-requests as admission; legacy only through the filter.
+        ensure!(
+            reorg || self.max_inflight_requests.is_none() || has(FilterKind::Overloaded),
+            "--max-inflight-requests requires `--filter overloaded` or --chat-routing reorg"
         );
         ensure!(
-            self.max_in_flight != Some(0),
-            "--max-in-flight must be greater than 0"
+            self.max_inflight_requests != Some(0),
+            "--max-inflight-requests must be greater than 0"
         );
         ensure!(
             (self.prefix_cache_min_share.is_some() == has(FilterKind::PrefixCache)),
@@ -782,7 +821,7 @@ impl RoutingArgs {
         );
         let eligibility = (!self.filter.is_empty()).then_some(EligibilityConfig {
             filters: self.filter.clone(),
-            max_in_flight: self.max_in_flight,
+            max_in_flight: self.max_inflight_requests,
             min_prefix_share: self.prefix_cache_min_share,
         });
 
@@ -792,13 +831,15 @@ impl RoutingArgs {
     /// Reorg admission for groups without their own limits.
     fn build_reorg_admission(&self) -> Result<AdmissionLimits> {
         let limits = AdmissionLimits {
-            max_inflight_requests: self.max_in_flight.map(|n| n as u64),
+            max_running_usage: self.max_running_usage,
             max_kv_usage: self.max_kv_usage,
-            ..Default::default()
+            max_waiting_requests: self.max_waiting_requests,
+            max_pending_prefill_tokens: self.max_pending_prefill_tokens,
+            max_inflight_requests: self.max_inflight_requests.map(|n| n as u64),
         };
         limits
             .validate()
-            .map_err(|error| anyhow!("--max-in-flight / --max-kv-usage: {error}"))?;
+            .map_err(|error| anyhow!("reorg admission flags: {error}"))?;
         Ok(limits)
     }
 }
@@ -1179,18 +1220,63 @@ mod tests {
             session.model.affinity.unwrap().session_id_header,
             "x-session"
         );
-        let overloaded = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+        let overloaded = parse(&["--filter", "overloaded", "--max-inflight-requests", "2"])
             .unwrap()
             .model;
         assert_eq!(overloaded.eligibility.unwrap().max_in_flight, Some(2));
         assert_eq!(overloaded.reorg_admission.max_inflight_requests, Some(2));
+        let alias = parse(&["--filter", "overloaded", "--max-in-flight", "2"])
+            .unwrap()
+            .model;
+        assert_eq!(
+            alias.reorg_admission.max_inflight_requests,
+            Some(2),
+            "--max-in-flight stays an alias of --max-inflight-requests"
+        );
         let kv = parse(&["--max-kv-usage", "0.9"]).unwrap().model;
         assert_eq!(kv.reorg_admission.max_kv_usage, Some(0.9));
         assert!(kv.eligibility.is_none());
-        let legacy_kv = Cli::try_parse_from(base.iter().chain(&["--max-kv-usage", "0.9"]));
-        assert!(legacy_kv.unwrap().into_config().is_err());
+        let admission = parse(&[
+            "--max-inflight-requests",
+            "96",
+            "--max-running-usage",
+            "0.9",
+            "--max-waiting-requests",
+            "48",
+            "--max-pending-prefill-tokens",
+            "32768",
+        ])
+        .unwrap()
+        .model;
+        assert!(admission.eligibility.is_none());
+        assert_eq!(
+            admission.reorg_admission,
+            AdmissionLimits {
+                max_running_usage: Some(0.9),
+                max_kv_usage: None,
+                max_waiting_requests: Some(48),
+                max_pending_prefill_tokens: Some(32768),
+                max_inflight_requests: Some(96),
+            }
+        );
+        for args in [
+            ["--max-kv-usage", "0.9"],
+            ["--max-running-usage", "0.9"],
+            ["--max-waiting-requests", "48"],
+            ["--max-pending-prefill-tokens", "32768"],
+            ["--max-inflight-requests", "96"],
+        ] {
+            let legacy = Cli::try_parse_from(base.iter().chain(&args));
+            assert!(
+                legacy.unwrap().into_config().is_err(),
+                "legacy accepted {args:?}"
+            );
+        }
         for args in [
             vec!["--max-kv-usage", "1.5"],
+            vec!["--max-running-usage", "0"],
+            vec!["--max-waiting-requests", "0"],
+            vec!["--filter", "overloaded"],
             vec!["--policy", "round_robin"],
             vec!["--decode-policy", "legacy_host_affinity"],
             vec!["--policy", "session_aware", "--stable-pair"],
@@ -2003,7 +2089,15 @@ mod tests {
     }
 
     #[test]
-    fn cb_threshold_enables_circuit_breaker_with_default_cool_down() {
+    fn circuit_breaker_is_on_by_default() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        let cb = c.model.circuit_breaker.expect("cb enabled");
+        assert_eq!(cb.threshold.get(), 3);
+        assert_eq!(cb.cool_down_secs, 30);
+    }
+
+    #[test]
+    fn cb_threshold_keeps_default_cool_down() {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
@@ -2021,30 +2115,40 @@ mod tests {
         let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--cb-threshold",
-            "3",
             "--cb-cool-down-secs",
             "10",
         ]))
         .unwrap();
         let cb = c.model.circuit_breaker.expect("cb enabled");
+        assert_eq!(cb.threshold.get(), 3);
         assert_eq!(cb.cool_down_secs, 10);
     }
 
     #[test]
-    fn rejects_cb_cool_down_without_threshold() {
-        let err = into_config_owned(with_model(&[
+    fn disable_circuit_breaker_turns_it_off() {
+        let c = into_config_owned(with_model(&[
             "--worker-urls",
             "http://x:30000",
-            "--cb-cool-down-secs",
-            "10",
+            "--disable-circuit-breaker",
         ]))
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("--cb-cool-down-secs requires --cb-threshold"),
-            "got: {err}"
-        );
+        .unwrap();
+        assert!(c.model.circuit_breaker.is_none());
+    }
+
+    #[test]
+    fn disable_circuit_breaker_rejects_breaker_settings() {
+        for flag in ["--cb-threshold", "--cb-cool-down-secs"] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--disable-circuit-breaker",
+                flag,
+                "5",
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("cannot be used with"), "{flag}: {err}");
+        }
     }
 
     #[test]
@@ -2263,7 +2367,7 @@ mod tests {
             "round_robin",
             "--filter",
             "overloaded,prefix_cache",
-            "--max-in-flight",
+            "--max-inflight-requests",
             "64",
             "--prefix-cache-min-share",
             "0.6",
@@ -2289,12 +2393,23 @@ mod tests {
     #[test]
     fn filter_misconfigurations_fail_at_startup() {
         let cases: [(&[&str], &str); 8] = [
-            (&["--filter", "overloaded"], "require each other"),
-            (&["--max-in-flight", "64"], "require each other"),
+            (
+                &["--filter", "overloaded"],
+                "requires --max-inflight-requests",
+            ),
+            (
+                &["--max-inflight-requests", "64"],
+                "or --chat-routing reorg",
+            ),
             (&["--filter", "prefix_cache"], "require each other"),
             (&["--prefix-cache-min-share", "0.6"], "require each other"),
             (
-                &["--filter", "overloaded,overloaded", "--max-in-flight", "64"],
+                &[
+                    "--filter",
+                    "overloaded,overloaded",
+                    "--max-inflight-requests",
+                    "64",
+                ],
                 "listed more than once",
             ),
             (
@@ -2307,7 +2422,7 @@ mod tests {
                 "must be in (0, 1]",
             ),
             (
-                &["--filter", "overloaded", "--max-in-flight", "0"],
+                &["--filter", "overloaded", "--max-inflight-requests", "0"],
                 "must be greater than 0",
             ),
             (
@@ -2316,7 +2431,7 @@ mod tests {
                     "sticky",
                     "--filter",
                     "overloaded",
-                    "--max-in-flight",
+                    "--max-inflight-requests",
                     "1",
                 ],
                 "cannot be combined with --policy sticky",

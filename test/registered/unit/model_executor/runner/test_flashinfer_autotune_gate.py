@@ -96,7 +96,7 @@ class TestFp4GemmAutotuneGate(CustomTestCase):
         self.assertFalse(self._should_run("compressed-tensors", model, cutlass=False))
 
     def test_modelopt_fp4_still_runs_autotune(self):
-        self.assertTrue(self._should_run("modelopt_fp4", None))
+        self.assertTrue(self._should_run("modelopt_fp4", torch.nn.Module()))
 
 
 if __name__ == "__main__":

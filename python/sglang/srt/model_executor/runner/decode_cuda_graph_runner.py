@@ -70,6 +70,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    _dp_tp_moe_masks_pad_rows,
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
     get_required_capture_hidden_mode,
@@ -333,14 +334,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.captured_req_width,
             gathered_buffer_required=self.require_gathered_buffer,
         )
-        if self.dllm_uses_input_embeds:
-            max_requests = min(
-                self.dllm_config.max_running_requests, max(self.capture_bs)
-            )
-            self.capture_bs = sorted(
-                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
-            )
-            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -835,35 +828,76 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not envs.SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE.get()
         )
 
+    def _set_profile_trace_tag(
+        self,
+        bs: int,
+        stream_idx: Optional[int],
+        variant_label: Optional[str],
+        attention_variant: Optional[str],
+    ) -> None:
+        """Name the trace for one capture. bs alone is not unique: the capture
+        loop multiplies it by the lora and attention variants (DSA captures
+        dense + sparse per bs). Absent variants are omitted so single-variant
+        runners keep the historical `bs_<n>` stem.
+        """
+        if getattr(self, "_profiler", None) is None:
+            return
+        parts = [f"bs_{bs}"]
+        if attention_variant is not None:
+            parts.append(attention_variant)
+        if variant_label is not None:
+            parts.append(variant_label)
+        if stream_idx is not None:
+            parts.append(f"stream_{stream_idx}")
+        self._profile_trace_tag = "_".join(parts)
+
+    def _profile_runner_name(self) -> str:
+        """Runner name used in capture-trace filenames. DSPARK / DFLASH draft
+        workers capture their verify graphs with this base class too, at the
+        same shapes as the target, so the name alone would collide; prefix it.
+        Draft-specific subclasses (EAGLEDraft*, Uno*, ...) are already unique.
+        """
+        name = type(self).__name__
+        if type(self) is DecodeCudaGraphRunner and self.model_runner.is_draft_worker:
+            return f"Draft{name}"
+        return name
+
     def _init_profile_context_and_memory_record(self):
         if self._graph_batch_capture_active():
-            # Per-batch-size capture traces (SGLANG_GRAPH_BATCH_CAPTURE): a
-            # scheduled profiler is stepped once per batch size (see
-            # FullCudaGraphBackend.capture_one) and on_trace_ready writes one
-            # chrome trace per bs.
+            # SGLANG_GRAPH_BATCH_CAPTURE: the profiler is stepped once per
+            # captured shape (see FullCudaGraphBackend.capture_one), so
+            # on_trace_ready writes one chrome trace per shape.
             rank = get_parallel().tp_rank
-            runner_name = type(self).__name__
+            runner_name = self._profile_runner_name()
             trace_dir = graph_capture_profile_dir()
             os.makedirs(trace_dir, exist_ok=True)
 
-            # Track which BS is currently being captured for trace file naming
-            self._profile_bs_list = list(reversed(self.capture_bs))
-            self._profile_bs_idx = 0
+            self._profile_trace_tag = None
 
             def on_trace_ready(prof):
-                bs = self._profile_bs_list[self._profile_bs_idx]
+                tag = self._profile_trace_tag
+                if tag is None:
+                    # Reachable only if a subclass overrides _capture_one_stream
+                    # without tagging; exporting would collide every flush on
+                    # one name.
+                    logger.warning(
+                        "%s: capture trace flushed with no shape tag; skipping "
+                        "export. A subclass likely overrides _capture_one_stream "
+                        "without calling _set_profile_trace_tag.",
+                        runner_name,
+                    )
+                    return
                 trace_file = os.path.join(
-                    trace_dir, f"{runner_name}_bs_{bs}_rank{rank}.json.gz"
+                    trace_dir, f"{runner_name}_{tag}_rank{rank}.json.gz"
                 )
                 prof.export_chrome_trace(trace_file)
-                logger.info(f"Saved trace for bs={bs} to {trace_file}")
-                self._profile_bs_idx += 1
+                logger.info(f"Saved trace for {tag} to {trace_file}")
 
             profile_context = profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                 # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1
-                # (capture run); repeat=0 repeats the cycle so each batch size
-                # gets its own trace.
+                # (capture run); repeat=0 repeats the cycle so each captured
+                # shape gets its own trace.
                 schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
                 record_shapes=True,
                 with_stack=True,
@@ -905,7 +939,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # and the per-bs on_trace_ready handles export instead.
         export_cuda_graph_capture_trace(
             prof_context,
-            runner_name=type(self).__name__,
+            runner_name=self._profile_runner_name(),
         )
 
     def capture_prepare(
@@ -1173,6 +1207,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
                     _set_capture_attention_variant(attention_variant)
+                    self._set_profile_trace_tag(
+                        bs, stream_idx, variant_label, attention_variant
+                    )
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
@@ -1221,15 +1258,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata-prep hook. The unified memory pool
-                # records ZERO translate nodes here: all its read/write translates
-                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
-                # the captured graph reads already-physical locs. Base no-op for triton.
+                # Backends may gather live pool mappings into their static
+                # metadata here; these nodes run before any model KV reads.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
                 self._record_in_graph_metadata_prep_done()
-
-                # No invalidate_loc_cache() here: the unified pool translates its
-                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -1314,6 +1346,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
+        # An idle DP rank replays a fabricated batch whose count may not reach
+        # the slot, leaving the previous replay's value; the model masks DP pad
+        # rows by this count, so write the real one on every replay.
+        buf = self.buffers.num_token_non_padded
+        if buf is not None and _dp_tp_moe_masks_pad_rows():
+            buf.fill_(raw_num_token)
+
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
             raise RuntimeError(
@@ -1366,6 +1406,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"{ragged_layout.graph_num_tokens}"
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+            self._set_dp_real_num_tokens(self.raw_num_token)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
@@ -1457,6 +1498,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
         # from the planner already padded to the tier, invalid slots zeroed.
+        self._set_dp_real_num_tokens(raw_num_token)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
