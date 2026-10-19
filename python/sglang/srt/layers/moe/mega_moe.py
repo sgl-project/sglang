@@ -162,7 +162,13 @@ def is_mega_moe_experts_ready(experts) -> bool:
     if not experts._mega_moe_weights_built:
         return False
     if _device_sm == 90:
-        return is_sm90_fp8_mega_moe_available(experts)
+        from sglang.srt.layers.moe.mega_moe_sm90_fi_nvfp4 import (
+            is_sm90_fi_nvfp4_mega_moe_available,
+        )
+
+        return is_sm90_fp8_mega_moe_available(experts) or (
+            is_sm90_fi_nvfp4_mega_moe_available(experts)
+        )
     # The SM100 mega kernels exist for compute capability 10.x only.
     return _device_sm // 10 == 10
 
@@ -443,6 +449,31 @@ def run_mega_routed_experts(
         f"{num_max_tokens_per_rank}; raise the env var or lower "
         f"--cuda-graph-max-bs-decode / --chunked-prefill-size accordingly"
     )
+
+    if _device_sm == 90 and experts._mega_moe_sm90_fi_nvfp4:
+        from sglang.srt.layers.moe.mega_moe_sm90_fi_nvfp4 import (
+            run_sm90_fi_nvfp4_mega_routed,
+        )
+
+        if num_tokens > 0:
+            ids, wts = topk_ids, topk_weights
+        else:
+            ids = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+            wts = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+        return run_sm90_fi_nvfp4_mega_routed(
+            experts=experts,
+            hidden_states=hidden_states,
+            topk_ids=ids,
+            topk_weights=wts,
+            num_tokens=num_tokens,
+            ep_group=ep_group,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            activation_clamp=activation_clamp,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
     mma_type = _mega_moe_mma_type(experts)
     buf = _get_mega_moe_symm_buffer(
