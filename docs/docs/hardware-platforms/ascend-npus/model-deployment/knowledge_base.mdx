@@ -50,7 +50,7 @@ Use this order when standing up a new model on Ascend NPU:
 | --- | --- | --- | --- | --- |
 | Dense ≤8B low latency | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-8B W8A8 @ 5–11ms TPOT on 3.5k/6k+1.5k |
 | Dense ~30B MoE-A3B | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-30B-A3B W8A8 ~10ms low-latency / ~50ms throughput |
-| Dense 32B | Atlas 800I A2/A3 | **2** (throughput) / **8** (ultra-low latency) | PD Mixed | 2-card W8A8 ~50ms; 8-card BF16 can reach ~6ms on long context |
+| Dense 32B | Atlas 800I A2/A3 | **2** (throughput) / **8** (ultra-low latency) | PD Mixed | 2-card W8A8 is 50ms on A3 and 55ms on A2; 8-card BF16 can reach 6ms on long context |
 | Large MoE ~235B | Atlas 800I A3 | **8** | PD Mixed | Qwen3-235B-A22B: BF16 low-latency or W8A8 throughput rows |
 | Frontier MoE (DeepSeek-R1) | Atlas 800I A3 | **8 / 16 / 32** | PD Mixed or PD Disaggregation | 8-card mixed throughput; 16–32-card PD for published low-latency points |
 | Long-context MoE (DeepSeek-V3.2) | Atlas 800I A3 | **32** | PD Disaggregation | Published points use 128k+1k style datasets |
@@ -96,7 +96,7 @@ Deep dive: [Quantization](/docs/hardware-platforms/ascend-npus/optimization/quan
 | Qwen3-30B-A3B | 800I A3 | 1 | PD Mixed | 3.5k+1.5k | **10ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b) |
 | Qwen3-32B | 800I A3 | 8 | PD Mixed | 18k+4k | **6ms** | BF16 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) |
 | Qwen3-235B-A22B | 800I A3 | 8 | PD Mixed | 11k+1.5k | **8ms** | BF16 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b) |
-| DeepSeek-R1 | 800I A3 | 32 | PD Disagg | 3.5k+1.5k | **16ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
+| DeepSeek-R1 | 800I A3 | 32 | PD Disagg | 3.5k+1.5k | **20ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
 | DeepSeek-V3.2 | 800I A3 | 32 | PD Disagg | 128k+1k | **26ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2) |
 
 ### Throughput oriented
@@ -105,7 +105,7 @@ Deep dive: [Quantization](/docs/hardware-platforms/ascend-npus/optimization/quan
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Qwen3-8B | 800I A3 | 1 | PD Mixed | 3.5k+1.5k | **37ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b) |
 | Qwen3-30B-A3B | 800I A3 | 1 | PD Mixed | 3.5k+1.5k | **50ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b) |
-| Qwen3-32B | 800I A2 | 2 | PD Mixed | 3.5k+1.5k | **50ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) |
+| Qwen3-32B | 800I A2 | 2 | PD Mixed | 3.5k+1.5k | **55ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) |
 | Qwen3-32B | 800I A3 | 2 | PD Mixed | 3.5k+1.5k | **50ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) |
 | Qwen3-235B-A22B | 800I A3 | 8 | PD Mixed | 3.5k+1.5k | **50.1ms** | W8A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b) |
 | DeepSeek-R1 | 800I A3 | 8 | PD Mixed | 3.5k+1.5k | **50ms** | W4A8 INT8 | [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
