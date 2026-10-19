@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+from sglang.srt.configs.model_config import (
+    is_deepseek_dsa,
+    is_deepseek_v4,
+    is_qwen4_exp,
+)
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
@@ -36,7 +41,14 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
-        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+        # Skip replay_with_input_update for the following model configurations.
+        # See the detailed comments above the same skip condition in
+        # NPUGraphRunner.execute in npu_graph_runner.py.
+        if not (
+            is_deepseek_dsa(hf_config)
+            or is_deepseek_v4(hf_config)
+            or (is_qwen4_exp(hf_config) and is_qwen_qsa(hf_config))
+        ):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )

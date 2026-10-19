@@ -8,6 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
@@ -26,10 +30,21 @@ def qsa_fast_topk(
     row_ends: torch.Tensor,
     topk: int,
 ) -> torch.Tensor:
-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
+    """Select compressed blocks with platform kernels or a Torch reference.
+
+    Return int32 indices of shape [rows, topk], relative to each row's start.
+    Valid indices precede any -1 padding.
+    """
 
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+    if _is_npu:
+        from sgl_kernel_npu.qwen3_8_flash_next.qsa_topk import fast_topk
+
+        # Upstream supplies contiguous bounds and finite scores within each
+        # valid interval. Unsupported metadata/errors must not silently fall back.
+        return fast_topk(logits, lengths, topk, starts)
+
     if logits.is_cuda:
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
@@ -238,7 +253,7 @@ def expand_qsa_block_indices(
     compress_ratio: int,
     token_topk: int,
 ) -> torch.Tensor:
-    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
+    """Expand compressed blocks with platform kernels or the Torch fallback."""
 
     block_topk = (token_topk + compress_ratio - 1) // compress_ratio
     if block_indices.ndim != 2 or block_indices.shape[1] != block_topk:
@@ -249,6 +264,18 @@ def expand_qsa_block_indices(
     rows = block_indices.shape[0]
     if query_positions.numel() != rows or sequence_lengths.numel() != rows:
         raise ValueError("query positions and sequence lengths must match top-k rows")
+    if _is_npu:
+        from sgl_kernel_npu.qwen3_8_flash_next.qsa_expansion import expand_blocks
+
+        # The package wrapper owns the model contract and its internal dispatch.
+        # Unsupported metadata must not silently enter the generic reference.
+        return expand_blocks(
+            block_indices,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            token_topk,
+        )
     if block_indices.is_cuda:
         # The Triton kernel loads positions/lengths as scalars, so any integer
         # dtype works; skip the int64 conversion copies.
