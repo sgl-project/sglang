@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Single-host Ascend DWDP: resident local weights and remote-only prefetch.
+"""Ascend DWDP: resident local weights and remote-only prefetch.
 
 Only setup/cleanup use collectives. Two remote page slots are reused in layer
 order; pages intersecting a local shard remain private to that layer.
@@ -31,8 +31,6 @@ _WEIGHTS = ("w13_weight", "w2_weight")
 
 
 def validate_dwdp_args(cfg):
-    if cfg.nnodes != 1:
-        raise ValueError("NPU DWDP requires a single host (--nnodes 1) for ACL IPC")
     # Validate loaded MoE kernels/layouts in setup, not the model-wide quant label.
     if cfg.enable_lora:
         raise ValueError("NPU DWDP does not support LoRA")
@@ -45,6 +43,7 @@ class NPUDwdpManager(DwdpPrefetch):
         import acl
 
         self.acl = acl
+        self.nnodes = server_args.nnodes
         parallel = get_parallel()
         self.dwdp_size, self.dwdp_rank = parallel.dwdp_size, parallel.tp_rank
         self.group = parallel.tp_group
@@ -130,8 +129,7 @@ class NPUDwdpManager(DwdpPrefetch):
         pid, ret = self.acl.rt.device_get_bare_tgid()
         _check(ret, "device_get_bare_tgid")
         peers = self._gather((socket.gethostname(), pid))
-        if len({host for host, _ in peers}) != 1:
-            raise ValueError("NPU DWDP IPC is supported only within one host")
+        same_host = self.nnodes == 1 and len({host for host, _ in peers}) == 1
         peer_pids = [
             pid for rank, (_, pid) in enumerate(peers) if rank != self.dwdp_rank
         ]
@@ -140,13 +138,21 @@ class NPUDwdpManager(DwdpPrefetch):
         self._moe_layer_indices = [li for li, _ in layers]
         self._position = {li: pos for pos, li in enumerate(self._moe_layer_indices)}
         self._vmm = NPUWeightVMM(self.acl, self.device)
+        self._vmm.select_transport(peer_pids, self._gather, same_host)
         self._init_prefetch(torch.npu, self.device)
         local_handles = {}
-        for li, layer in layers:
-            for name in _WEIGHTS:
-                local_handles[li, name] = self._migrate_weight(
-                    (li, name), getattr(layer, name), peer_pids
-                )
+        error = None
+        try:
+            for li, layer in layers:
+                for name in _WEIGHTS:
+                    local_handles[li, name] = self._migrate_weight(
+                        (li, name), getattr(layer, name), peer_pids
+                    )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        errors = self._gather(error)
+        if any(errors):
+            raise RuntimeError(f"NPU DWDP weight migration/export failed: {errors}")
         self._weights = self._vmm.create_weights(
             self._specs,
             self.dwdp_rank,
@@ -199,13 +205,7 @@ class NPUDwdpManager(DwdpPrefetch):
             "copy local shard",
         )
         torch.npu.synchronize(self.device)
-        share, ret = self.acl.rt.mem_export_to_shareable_handle(handle, 0, 0)
-        _check(ret, "mem_export_to_shareable_handle")
-        self._exports[key] = share
-        _check(
-            self.acl.rt.mem_set_pid_to_shareable_handle(share, peer_pids),
-            "mem_set_pid_to_shareable_handle",
-        )
+        self._exports[key] = self._vmm.export_shard(handle, peer_pids)
         param.untyped_storage().resize_(0)
         # Return cached storage before the next driver-owned allocation.
         torch.npu.empty_cache()

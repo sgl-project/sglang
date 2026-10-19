@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import logging
 import math
 from types import SimpleNamespace
 
@@ -12,10 +14,71 @@ from sglang.srt.layers.moe.dwdp.layout import PageAlignedLayout
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
 from sglang.srt.utils.alignment import align_down, align_up
 
+logger = logging.getLogger(__name__)
+
 
 def _check(ret, operation):
     if ret != 0:
         raise RuntimeError(f"NPU DWDP: {operation} failed with ACL error {ret}")
+
+
+class _FabricHandleAPI:
+    """CANN V2 ABI; pyACL does not expose these APIs in all supported releases."""
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("libascendcl.so")
+        for name, args in (
+            (
+                "aclrtMemExportToShareableHandleV2",
+                [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_void_p],
+            ),
+            (
+                "aclrtMemSetPidToShareableHandleV2",
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_int32),
+                    ctypes.c_size_t,
+                ],
+            ),
+            (
+                "aclrtMemImportFromShareableHandleV2",
+                [
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_uint64,
+                    ctypes.POINTER(ctypes.c_void_p),
+                ],
+            ),
+        ):
+            function = getattr(self.lib, name)
+            function.argtypes, function.restype = args, ctypes.c_int
+
+    def export_handle(self, handle, peer_pids):
+        share = ctypes.create_string_buffer(128)  # aclrtMemFabricHandle.data[128]
+        _check(
+            self.lib.aclrtMemExportToShareableHandleV2(handle, 0, 2, share),
+            "aclrtMemExportToShareableHandleV2(FABRIC)",
+        )
+        pids = (ctypes.c_int32 * len(peer_pids))(*peer_pids)
+        _check(
+            self.lib.aclrtMemSetPidToShareableHandleV2(share, 2, pids, len(pids)),
+            "aclrtMemSetPidToShareableHandleV2(FABRIC)",
+        )
+        return share.raw
+
+    def import_handle(self, share):
+        if len(share) != 128:
+            raise ValueError("NPU DWDP: invalid FABRIC handle size")
+        share = ctypes.create_string_buffer(share, 128)
+        handle = ctypes.c_void_p()
+        _check(
+            self.lib.aclrtMemImportFromShareableHandleV2(
+                share, 2, 0, ctypes.byref(handle)
+            ),
+            "aclrtMemImportFromShareableHandleV2(FABRIC)",
+        )
+        return handle.value
 
 
 def tensor_from_pointer(pointer, nbytes, *, shape, dtype, device):
@@ -58,6 +121,49 @@ class NPUWeightVMM:
         self._reservations = []
         self._mappings = []
         self._imports = []
+        self._fabric = None
+
+    def select_transport(self, peer_pids, gather, same_host):
+        # Unlike CUDA, ACL forbids exporting one physical handle twice. Probe
+        # on a disposable handle before choosing how to export real weights.
+        fabric, probe, error, cleanup_error = None, None, None, None
+        try:
+            fabric = _FabricHandleAPI()
+            probe = self._allocate(self.granularity)
+            fabric.export_handle(probe, peer_pids)
+        except (AttributeError, OSError, RuntimeError) as exc:
+            error = str(exc)
+            logger.info("DWDP FABRIC probe failed: %s", exc)
+        if probe is not None:
+            try:
+                self._release_page(probe)
+            except RuntimeError as exc:
+                cleanup_error = str(exc)
+        results = gather((error, cleanup_error))
+        if any(cleanup for _, cleanup in results):
+            raise RuntimeError(f"NPU DWDP FABRIC probe cleanup failed: {results}")
+        if all(error is None for error, _ in results):
+            self._fabric = fabric
+        elif not same_host:
+            raise RuntimeError(
+                f"NPU DWDP across hosts requires FABRIC on every rank; "
+                f"same-host ACL IPC fallback is not available: {results}"
+            )
+        logger.info(
+            "DWDP handle exchange via %s",
+            "FABRIC" if self._fabric is not None else "ACL IPC (same host)",
+        )
+
+    def export_shard(self, handle, peer_pids):
+        if self._fabric is not None:
+            return self._fabric.export_handle(handle, peer_pids)
+        share, ret = self.rt.mem_export_to_shareable_handle(handle, 0, 0)
+        _check(ret, "mem_export_to_shareable_handle")
+        _check(
+            self.rt.mem_set_pid_to_shareable_handle(share, peer_pids),
+            "mem_set_pid_to_shareable_handle",
+        )
+        return share
 
     def _reserve(self, size):
         ptr, ret = self.rt.reserve_mem_address(size, 0, 0, 1)
@@ -137,8 +243,13 @@ class NPUWeightVMM:
         return tensors
 
     def import_shard(self, share, size, offset):
-        handle, ret = self.rt.mem_import_from_shareable_handle(share, self.device.index)
-        _check(ret, "mem_import_from_shareable_handle")
+        if self._fabric is not None:
+            handle = self._fabric.import_handle(share)
+        else:
+            handle, ret = self.rt.mem_import_from_shareable_handle(
+                share, self.device.index
+            )
+            _check(ret, "mem_import_from_shareable_handle")
         # Keep imported lifetimes separate: all importers must release their
         # mappings/handles before a producer releases resident physical pages.
         self._imports.append([handle, None, False])

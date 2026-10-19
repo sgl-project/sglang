@@ -9,6 +9,7 @@ import json
 import os
 import socket
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -64,7 +65,7 @@ def _int8_layer(layer_id, hidden, width, rank, large):
     return layer
 
 
-def _worker(rank, devices, port, dtype, large):
+def _worker(rank, devices, port, dtype, large, force_ipc):
     import torch_npu  # noqa: F401
 
     from sglang.srt.hardware_backend.npu.dwdp.vmm import NPUWeightVMM
@@ -192,8 +193,21 @@ def _worker(rank, devices, port, dtype, large):
             original_map(vmm, ptr, size, handle)
             mappings[ptr] = (size, handle)
 
-        with patch.object(NPUWeightVMM, "_map", record_map):
+        with (
+            patch.object(NPUWeightVMM, "_map", record_map),
+            patch(
+                "sglang.srt.hardware_backend.npu.dwdp.vmm._FabricHandleAPI",
+                side_effect=OSError("test-forced IPC fallback"),
+            )
+            if force_ipc
+            else nullcontext(),
+        ):
             manager.setup(model)
+        route = "FABRIC" if manager._vmm._fabric is not None else "ACL IPC"
+        assert manager._gather(route) == [route] * 2
+        if force_ipc:
+            assert route == "ACL IPC"
+        print(f"rank {rank}: DWDP route={route}", flush=True)
         assert manager._moe_layer_indices == [2, 4, 7, 9]
         assert len(migrated) == len(moe_layers) * 2
         if large:
@@ -295,7 +309,8 @@ def _worker(rank, devices, port, dtype, large):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.int8])
 @pytest.mark.parametrize("large", [False, True])
-def test_npu_dwdp(dtype, large):
+@pytest.mark.parametrize("force_ipc", [False, True])
+def test_npu_dwdp(dtype, large, force_ipc):
     if not os.environ.get("DWDP_TEST_DEVICES"):
         pytest.skip("Set DWDP_TEST_DEVICES to two idle NPU device IDs")
     devices = [int(value) for value in os.environ["DWDP_TEST_DEVICES"].split(",")]
@@ -303,13 +318,14 @@ def test_npu_dwdp(dtype, large):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(devices, port, dtype, large), nprocs=2, join=True)
+    mp.spawn(
+        _worker, args=(devices, port, dtype, large, force_ipc), nprocs=2, join=True
+    )
 
 
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        ({"nnodes": 2}, "single host"),
         ({"enable_lora": True}, "LoRA"),
         ({"enable_pdmux": True}, "layer-split"),
     ],
@@ -433,7 +449,8 @@ def test_dwdp_preserves_shared_expert_settings(device, shared_tp1, disable_fusio
         assert cfg.enable_dp_lm_head
 
 
-def test_npu_dwdp_full_resolution(tmp_path):
+@pytest.mark.parametrize("nnodes", [1, 2])
+def test_npu_dwdp_full_resolution(tmp_path, nnodes):
     from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
@@ -459,7 +476,12 @@ def test_npu_dwdp_full_resolution(tmp_path):
     )
     with envs.SGLANG_SHARED_EXPERT_TP1.override(False):
         args = ServerArgs(
-            model_path=str(tmp_path), device="npu", tp_size=2, dwdp_size=2
+            model_path=str(tmp_path),
+            device="npu",
+            tp_size=2,
+            dwdp_size=2,
+            nnodes=nnodes,
+            dist_init_addr="127.0.0.1:29999",
         )
         args.resolve_once()
         cfg = resolved_view(args)

@@ -1,6 +1,7 @@
 """NPU DWDP page coverage and failure cleanup without accelerator hardware."""
 
 import ast
+import ctypes
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -445,22 +446,27 @@ def test_npu_peer_tensor_wrap_preserves_shard_metadata(monkeypatch, dtype):
     )
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_migration_releases_source_only_after_success(monkeypatch, fail):
+@pytest.mark.parametrize("failure", [None, "copy", "export"])
+def test_migration_releases_source_only_after_success(monkeypatch, failure):
     manager = NPUDwdpManager.__new__(NPUDwdpManager)
     manager.device, manager.dwdp_rank = torch.device("cpu"), 0
     manager._position = {5: 0}
     manager._specs = {(5, "w13_weight"): WeightSpec(4, (2, 3), (4, 3), torch.float16)}
     manager._weights, manager._exports = {}, {}
-    manager._vmm = NS(create_local=lambda *args: (100, 1))
+    calls = []
+
+    def export(handle, peers):
+        calls.append((handle, peers))
+        if failure == "export":
+            raise RuntimeError("export failed")
+        return 7
+
+    manager._vmm = NS(create_local=lambda *args: (100, 1), export_shard=export)
     manager.acl = NS(
         rt=NS(
-            memcpy=lambda *args: int(fail),
-            mem_export_to_shareable_handle=lambda *args: (7, 0),
-            mem_set_pid_to_shareable_handle=lambda *args: 0,
+            memcpy=lambda *args: int(failure == "copy"),
         )
     )
-    calls = []
     monkeypatch.setattr(
         torch,
         "npu",
@@ -475,13 +481,16 @@ def test_migration_releases_source_only_after_success(monkeypatch, fail):
         torch.ops.npu, "npu_format_cast", lambda data, fmt: data, raising=False
     )
     source = torch.nn.Parameter(torch.ones(2, 3, dtype=torch.float16))
-    if fail:
-        with pytest.raises(RuntimeError, match="copy local shard"):
+    if failure:
+        with pytest.raises(RuntimeError, match="copy local shard|export failed"):
             manager._migrate_weight((5, "w13_weight"), source, [123])
     else:
         assert manager._migrate_weight((5, "w13_weight"), source, [123]) == 1
-    assert (source.untyped_storage().nbytes() > 0) == fail
-    assert calls == ([] if fail else ["cache"])
+    assert (source.untyped_storage().nbytes() > 0) == bool(failure)
+    assert calls == (
+        [] if failure == "copy" else [(1, [123])] + ([] if failure else ["cache"])
+    )
+    assert manager._exports == ({} if failure else {(5, "w13_weight"): 7})
 
 
 class _FakeACL:
@@ -561,6 +570,234 @@ class _FakeACL:
         self.freed.append(handle)
         del self.allocations[handle]
         return 0
+
+
+def test_fabric_handle_v2_abi_and_errors(monkeypatch):
+    from sglang.srt.hardware_backend.npu.dwdp import vmm as module
+
+    payload, calls = bytes(range(128)), []
+
+    def export(handle, flags, kind, share):
+        assert (handle, flags, kind, ctypes.sizeof(share)) == (0x1234, 0, 2, 128)
+        ctypes.memmove(share, payload, 128)
+        calls.append("export")
+        return 0
+
+    def authorize(share, kind, pids, count):
+        assert ctypes.string_at(share, 128) == payload
+        assert (kind, count, list(pids)) == (2, 2, [17, 29])
+        calls.append("authorize")
+        return 0
+
+    def import_handle(share, kind, flags, handle):
+        assert ctypes.string_at(share, 128) == payload
+        assert (kind, flags) == (2, 0)
+        ctypes.cast(handle, ctypes.POINTER(ctypes.c_void_p))[0] = 0x5678
+        calls.append("import")
+        return 0
+
+    library = NS(
+        aclrtMemExportToShareableHandleV2=export,
+        aclrtMemSetPidToShareableHandleV2=authorize,
+        aclrtMemImportFromShareableHandleV2=import_handle,
+    )
+    monkeypatch.setattr(module.ctypes, "CDLL", lambda path: library)
+    api = module._FabricHandleAPI()
+    assert export.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    assert authorize.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_size_t,
+    ]
+    assert import_handle.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    assert all(
+        function.restype is ctypes.c_int
+        for function in (export, authorize, import_handle)
+    )
+    assert api.export_handle(0x1234, [17, 29]) == payload
+    assert api.import_handle(payload) == 0x5678
+    assert calls == ["export", "authorize", "import"]
+    with pytest.raises(ValueError, match="handle size"):
+        api.import_handle(payload[:-1])
+    for name in vars(library):
+        with monkeypatch.context() as patch:
+            patch.setattr(library, name, lambda *args: 1)
+            with pytest.raises(RuntimeError, match="ACL error 1"):
+                if "Import" in name:
+                    api.import_handle(payload)
+                else:
+                    api.export_handle(0x1234, [17, 29])
+
+
+@pytest.mark.parametrize("missing", ["library", "symbol"])
+def test_fabric_handle_api_requires_library_and_all_symbols(monkeypatch, missing):
+    from sglang.srt.hardware_backend.npu.dwdp import vmm as module
+
+    def load(path):
+        assert path == "libascendcl.so"
+        if missing == "library":
+            raise OSError("missing library")
+        return NS()
+
+    monkeypatch.setattr(module.ctypes, "CDLL", load)
+    with pytest.raises(OSError if missing == "library" else AttributeError):
+        module._FabricHandleAPI()
+
+
+@pytest.mark.parametrize(
+    "local_error, peer_error, same_host",
+    [
+        (None, None, True),
+        (None, None, False),
+        ("export", None, True),
+        ("allocate", None, True),
+        (None, "peer failed", True),
+        ("library", None, True),
+        ("symbol", None, True),
+        ("export", None, False),
+        (None, "peer failed", False),
+    ],
+)
+def test_fabric_selection_and_same_host_fallback(
+    monkeypatch, local_error, peer_error, same_host
+):
+    from sglang.srt.hardware_backend.npu.dwdp import vmm as module
+
+    rt, calls, peers = _FakeACL(), [], [17, 29]
+    rt.fail_after_allocations = 0 if local_error == "allocate" else None
+
+    def export(handle, pids):
+        calls.append(("fabric export", handle, pids))
+        if local_error == "export":
+            raise RuntimeError("export failed")
+        return bytes([handle]) * 128
+
+    def api_factory():
+        if local_error in ("library", "symbol"):
+            raise (OSError if local_error == "library" else AttributeError)(local_error)
+        return api
+
+    def legacy_export(handle, flags, kind):
+        calls.append(("legacy export", handle, flags, kind))
+        return handle + 100, 0
+
+    def authorize(share, pids):
+        calls.append(("legacy authorize", share, pids))
+        return 0
+
+    def import_handle(share):
+        calls.append(("fabric import", share))
+        return rt.malloc_physical(8)[0]
+
+    api = NS(export_handle=export, import_handle=import_handle)
+    monkeypatch.setattr(module, "_FabricHandleAPI", api_factory)
+    monkeypatch.setattr(
+        rt, "mem_export_to_shareable_handle", legacy_export, raising=False
+    )
+    monkeypatch.setattr(rt, "mem_set_pid_to_shareable_handle", authorize, raising=False)
+    monkeypatch.setattr(
+        rt,
+        "mem_import_from_shareable_handle",
+        lambda share, device: rt.malloc_physical(8),
+        raising=False,
+    )
+    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
+
+    def gather(result):
+        error, cleanup_error = result
+        assert bool(error) == bool(local_error) and cleanup_error is None
+        return [result, (peer_error, None)]
+
+    if not same_host and (local_error or peer_error):
+        with pytest.raises(RuntimeError, match="requires FABRIC on every rank"):
+            vmm.select_transport(peers, gather, same_host)
+        assert vmm._fabric is None
+    else:
+        vmm.select_transport(peers, gather, same_host)
+        fabric = local_error is None and peer_error is None
+        assert (vmm._fabric is api) == fabric
+        assert not rt.allocations and not vmm._handles
+        handle = vmm._allocate(8)
+        share = vmm.export_shard(handle, peers)
+        assert calls[-1 if fabric else -2] == (
+            ("fabric export", handle, peers)
+            if fabric
+            else ("legacy export", handle, 0, 0)
+        )
+        assert (
+            len(
+                [
+                    call
+                    for call in calls
+                    if call[0].endswith("export") and call[1] == handle
+                ]
+            )
+            == 1
+        )
+        assert vmm.import_shard(share, 8, 1) == vmm._imports[0][1] + 1
+    vmm.close()
+    assert not rt.allocations and not rt.reservations and not rt.mappings
+
+
+def test_selected_fabric_does_not_retry_real_weight_exports_with_ipc(monkeypatch):
+    from sglang.srt.hardware_backend.npu.dwdp import vmm as module
+
+    rt, exports = _FakeACL(), []
+
+    def export(handle, peers):
+        exports.append(handle)
+        if len(exports) == 2:
+            raise RuntimeError("real export failed")
+        return b"x" * 128
+
+    monkeypatch.setattr(module, "_FabricHandleAPI", lambda: NS(export_handle=export))
+    monkeypatch.setattr(
+        rt,
+        "mem_export_to_shareable_handle",
+        lambda *args: pytest.fail("cannot re-export through IPC"),
+        raising=False,
+    )
+    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
+    vmm.select_transport([17], lambda result: [result, result], True)
+    handle = vmm._allocate(8)
+    with pytest.raises(RuntimeError, match="real export failed"):
+        vmm.export_shard(handle, [17])
+    assert exports == [1, handle] and handle != 1
+    vmm.close()
+    assert not rt.allocations
+
+
+@pytest.mark.parametrize("peer_failure", [False, True])
+def test_fabric_probe_cleanup_failure_is_fatal_and_retryable(monkeypatch, peer_failure):
+    from sglang.srt.hardware_backend.npu.dwdp import vmm as module
+
+    rt = _FakeACL()
+    rt.fail_free_after = None if peer_failure else 0
+    api = NS(export_handle=lambda *args: b"x" * 128)
+    monkeypatch.setattr(module, "_FabricHandleAPI", lambda: api)
+    vmm = NPUWeightVMM(NS(rt=rt), NS(index=0))
+
+    def gather(result):
+        assert result[0] is None and bool(result[1]) != peer_failure
+        return [result, (None, "peer cleanup failed" if peer_failure else None)]
+
+    with pytest.raises(RuntimeError, match="probe cleanup failed"):
+        vmm.select_transport([17], gather, True)
+    assert vmm._fabric is None
+    assert len(vmm._handles) == (0 if peer_failure else 1)
+    vmm.close()
+    assert not rt.allocations and not vmm._handles
 
 
 def _fake_import_vmm(monkeypatch):
