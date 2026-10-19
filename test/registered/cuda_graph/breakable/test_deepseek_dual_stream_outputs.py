@@ -114,9 +114,9 @@ class TestDualStreamOutputs(CustomTestCase):
                             x, 0, False, replicated
                         )
 
+                    # opcheck validates the registered op, not its eager wrapper
                     torch.library.opcheck(
-                        invoke_op
-                        := deepseek_v2.dsv4_flashinfer_moe_dual_stream_outputs,
+                        torch.ops.sglang.dsv4_flashinfer_moe_dual_stream_outputs.default,
                         (value, 0, False, replicated),
                         test_utils=("test_schema", "test_faketensor"),
                     )

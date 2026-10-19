@@ -9,8 +9,8 @@ use super::preparation::{
 };
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::policies::dp_rank::select_dp_rank;
-use crate::proxy::grpc::GrpcResponse;
-use crate::proxy::sse::{self, StreamEnd, StreamEndReason};
+use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
+use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -19,12 +19,13 @@ use crate::server::metrics::{
     StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
-use crate::workers::{DpRankGuard, LoadGuard, Worker};
+use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
+use sglang_api_types::runtime::v1::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -87,15 +88,20 @@ pub(super) async fn forward_request(
     })
 }
 
-/// [`forward_request`] for a gRPC client: the engines are called over gRPC too.
+/// [`forward_request`] for a gRPC client: the engines are called with `rpc`.
 /// The log context is `None` when the request failed before dispatch.
-pub(super) async fn forward_request_grpc(
+pub(super) async fn forward_request_grpc<R: EngineRpc>(
+    rpc: R,
     ctx: &AppContext,
     request: &mut PreparedRequest,
     routing: &super::ModelRouting<'_>,
     headers: HeaderMap,
     request_started_at: Instant,
-) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
+) -> (
+    Result<GrpcResponse<R::Reply>, ApiError>,
+    Option<RequestLogContext>,
+) {
+    let transport = Grpc(Arc::new(rpc));
     let mut excluded = Vec::new();
     let mut failed = None;
     let mut duration = None;
@@ -124,7 +130,7 @@ pub(super) async fn forward_request_grpc(
             RequestDurationGuard::new(ctx, &request.model, request_started_at)
         });
         let dispatched = match dispatch(
-            Grpc,
+            transport.clone(),
             ctx,
             request,
             workers,
@@ -183,10 +189,6 @@ async fn dispatch<T: Transport>(
     let prefill_rank = (dp_aware && !unpin_prefill)
         .then(|| prompt_dp_rank(ctx, request, &headers, &prefill))
         .flatten();
-    let decode_rank = decode
-        .as_deref()
-        .filter(|_| dp_aware)
-        .and_then(|decode| select_dp_rank(decode, None, &[], ctx.config.model.dp_rank_policy));
 
     // Track worker occupancy and the prompt's contribution to active load.
     let worker_load_guard = if track_dispatch_timestamps {
@@ -224,13 +226,29 @@ async fn dispatch<T: Transport>(
     });
     let path = request.path;
     let engine_rid = request.engine_rid();
+    let additions = Additions {
+        rid: engine_rid.clone(),
+        bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
+            bootstrap_host: bootstrap.host.clone(),
+            bootstrap_port: bootstrap.port.map_or(0, i32::from),
+            bootstrap_room: bootstrap.room as i64,
+        }),
+        sampling_defaults: request.sampling_defaults(),
+        routed_dp_rank: None,
+    };
     let body = request.outgoing_body(
         ctx,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
-    let (prefill_headers, prefill_body) =
-        with_dp_rank(dp_aware, headers.clone(), &body, prefill_rank, None);
+    let prefill_leg = Leg::new(
+        dp_aware,
+        headers.clone(),
+        &body,
+        &additions,
+        prefill_rank,
+        None,
+    );
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
@@ -239,22 +257,49 @@ async fn dispatch<T: Transport>(
 
     // In PD mode, prefill runs independently and decode supplies the client response.
     let stream_abort = CancellationToken::new();
-    let (response_worker, response_headers, response_body, response_load_guards, prefill_task) =
+    let decode_slot = (pd.is_some() && ctx.decode_gate.is_enabled() && engine_rid.is_some())
+        .then(DecodeSlot::default);
+    let mut unanswered = ReleaseOnDrop(decode_slot.clone());
+    let (response_worker, response_leg, response_load_guards, prefill_task) =
         if let Some((decode, bootstrap)) = pd {
             let task = spawn_prefill_request(
-                transport,
+                transport.clone(),
                 ctx,
                 &metrics,
                 Arc::clone(&prefill),
                 path,
-                prefill_headers,
-                prefill_body,
+                prefill_leg,
                 prefill_load_guards,
                 bootstrap.room,
                 stream_abort.clone(),
+                decode_slot.clone(),
             );
+            // Counted from arrival, so decode selection sees requests waiting here.
+            let decode_load = decode.load_guard();
+            if let Some(slot) = &decode_slot {
+                let mut abort = ctx.proxy.abort_on_drop(
+                    &prefill.url,
+                    prefill.protocol(),
+                    &headers,
+                    engine_rid.as_deref(),
+                );
+                admit_decode(
+                    ctx,
+                    request,
+                    &prefill,
+                    prefill_rank,
+                    request_started_at,
+                    slot,
+                    &stream_abort,
+                )
+                .await?;
+                abort.disarm();
+            }
+            let decode_rank = dp_aware
+                .then(|| select_dp_rank(&decode, None, &[], ctx.config.model.dp_rank_policy))
+                .flatten();
             let decode_load_guards = (
-                decode.load_guard(),
+                decode_load,
                 ctx.router_inflight_load.register_aged(
                     decode.id.clone(),
                     decode.url.clone(),
@@ -264,23 +309,22 @@ async fn dispatch<T: Transport>(
                 ),
                 decode_rank.map(|rank| decode.dp_rank_guard(rank)),
             );
-            let (decode_headers, decode_body) =
-                with_dp_rank(dp_aware, headers, &body, decode_rank, prefill_rank);
+            let decode_leg = Leg::new(
+                dp_aware,
+                headers,
+                &body,
+                &additions,
+                decode_rank,
+                prefill_rank,
+            );
             (
                 decode,
-                decode_headers,
-                decode_body,
+                decode_leg,
                 decode_load_guards,
                 Some((task, prefill)),
             )
         } else {
-            (
-                prefill,
-                prefill_headers,
-                prefill_body,
-                prefill_load_guards,
-                None,
-            )
+            (prefill, prefill_leg, prefill_load_guards, None)
         };
 
     // In PD mode, prefill can finish before decode. Watch the registration
@@ -290,13 +334,13 @@ async fn dispatch<T: Transport>(
         ctx,
         &response_worker,
         path,
-        &response_headers,
-        response_body,
+        response_leg,
         engine_rid.as_deref(),
         response_load_guards,
         &metrics,
         expiration_token.clone(),
         stream_abort,
+        decode_slot,
     );
     let dispatch = async {
         match prefill_task {
@@ -313,6 +357,9 @@ async fn dispatch<T: Transport>(
             (Err(ApiError::StaleRequestExpired { model }), None)
         }
     };
+    if matches!(dispatch_outcome::<T>(&result), RequestOutcome::Success) {
+        unanswered.0 = None;
+    }
     // A 2xx stream is already the client's; any other success or client error is final too.
     let retryable = matches!(
         dispatch_outcome::<T>(&result),
@@ -339,8 +386,57 @@ async fn dispatch<T: Transport>(
     })
 }
 
+async fn admit_decode(
+    ctx: &AppContext,
+    request: &PreparedRequest,
+    prefill: &Worker,
+    rank: Option<u32>,
+    request_started_at: Instant,
+    slot: &DecodeSlot,
+    prefill_failed: &CancellationToken,
+) -> Result<(), ApiError> {
+    let budget = ctx
+        .router_inflight_load
+        .stale_request_timeout()
+        .saturating_sub(request_started_at.elapsed());
+    let admit = ctx.decode_gate.admit(&prefill.id, rank, slot);
+    tokio::select! {
+        admitted = tokio::time::timeout(budget, admit) => admitted.map_err(|_| {
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            ApiError::StaleRequestExpired {
+                model: request.model.0.clone(),
+            }
+        }),
+        () = prefill_failed.cancelled() => Ok(()),
+    }
+}
+
+struct ReleaseOnDrop(Option<DecodeSlot>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(slot) = &self.0 {
+            slot.release();
+        }
+    }
+}
+
+fn release_on_first_byte(
+    slot: Option<DecodeSlot>,
+    first_byte: Box<dyn FnOnce() + Send + 'static>,
+) -> Box<dyn FnOnce() + Send + 'static> {
+    match slot {
+        Some(slot) => Box::new(move || {
+            slot.release();
+            first_byte();
+        }),
+        None => first_byte,
+    }
+}
+
 /// How the selected workers are reached: HTTP clients over HTTP, gRPC clients over gRPC.
-trait Transport: Copy + Send + 'static {
+trait Transport: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
 
     fn status(response: &Self::Response) -> u16;
@@ -357,13 +453,13 @@ trait Transport: Copy + Send + 'static {
         ctx: &AppContext,
         worker: &Worker,
         path: &'static str,
-        headers: &HeaderMap,
-        body: Bytes,
+        leg: Leg,
         engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
+        decode_slot: Option<DecodeSlot>,
     ) -> impl Future<Output = Result<Self::Response, ApiError>> + Send;
 
     /// Run a PD prefill to completion and judge it.
@@ -372,9 +468,38 @@ trait Transport: Copy + Send + 'static {
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         path: &'static str,
-        headers: HeaderMap,
-        body: Bytes,
+        leg: Leg,
     ) -> impl Future<Output = PrefillFailure<Self::Response>> + Send;
+}
+
+/// One worker's request: the HTTP body, and the same additions as typed fields.
+struct Leg {
+    headers: HeaderMap,
+    body: Bytes,
+    additions: Additions,
+}
+
+impl Leg {
+    fn new(
+        dp_aware: bool,
+        headers: HeaderMap,
+        body: &Bytes,
+        additions: &Additions,
+        rank: Option<u32>,
+        prefill_rank: Option<u32>,
+    ) -> Self {
+        let (headers, body) = with_dp_rank(dp_aware, headers, body, rank, prefill_rank);
+        let routed_dp_rank = dp_aware.then_some(rank);
+        let additions = Additions {
+            routed_dp_rank,
+            ..additions.clone()
+        };
+        Self {
+            headers,
+            body,
+            additions,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -399,31 +524,33 @@ impl Transport for Http {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn send(
+    async fn send(
         self,
         ctx: &AppContext,
         worker: &Worker,
         path: &'static str,
-        headers: &HeaderMap,
-        body: Bytes,
+        leg: Leg,
         engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
-    ) -> impl Future<Output = Result<Response<Body>, ApiError>> + Send {
+        decode_slot: Option<DecodeSlot>,
+    ) -> Result<Response<Body>, ApiError> {
         forward_to_response_worker(
             ctx,
             worker,
             path,
-            headers,
-            body,
+            &leg.headers,
+            leg.body,
             engine_rid,
             load_guards,
             metrics,
             expiration,
             stream_abort,
+            decode_slot,
         )
+        .await
     }
 
     async fn prefill(
@@ -431,8 +558,7 @@ impl Transport for Http {
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         path: &'static str,
-        headers: HeaderMap,
-        body: Bytes,
+        leg: Leg,
     ) -> PrefillFailure {
         let result = proxy
             .forward_json_to(
@@ -440,8 +566,8 @@ impl Transport for Http {
                 worker.protocol(),
                 &worker.breaker,
                 path,
-                &headers,
-                body,
+                &leg.headers,
+                leg.body,
                 None,
             )
             .await;
@@ -449,12 +575,17 @@ impl Transport for Http {
     }
 }
 
-/// Reaches engines through their native `ChatComplete`, the only RPC routed so far.
-#[derive(Clone, Copy)]
-struct Grpc;
+/// Reaches engines through the native RPC the client called.
+struct Grpc<R>(Arc<R>);
 
-impl Transport for Grpc {
-    type Response = GrpcResponse;
+impl<R> Clone for Grpc<R> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<R: EngineRpc> Transport for Grpc<R> {
+    type Response = GrpcResponse<R::Reply>;
     async fn respond(
         _request: &mut PreparedRequest,
         response: Self::Response,
@@ -463,7 +594,7 @@ impl Transport for Grpc {
         response
     }
 
-    fn status(response: &GrpcResponse) -> u16 {
+    fn status(response: &Self::Response) -> u16 {
         response.status.as_u16()
     }
 
@@ -472,29 +603,34 @@ impl Transport for Grpc {
         ctx: &AppContext,
         worker: &Worker,
         _path: &'static str,
-        headers: &HeaderMap,
-        body: Bytes,
+        leg: Leg,
         engine_rid: Option<&str>,
         load_guards: LoadGuards,
         metrics: &DispatchMetrics,
         expiration: CancellationToken,
         stream_abort: CancellationToken,
-    ) -> Result<GrpcResponse, ApiError> {
+        decode_slot: Option<DecodeSlot>,
+    ) -> Result<Self::Response, ApiError> {
         let (guards, on_first_byte, on_stream_end): (Box<dyn Send + 'static>, _, _) =
             if metrics.streaming {
                 (
                     Box::new((load_guards, metrics.stream_duration_guard())),
-                    Some(metrics.first_byte_callback()),
+                    Some(release_on_first_byte(
+                        decode_slot,
+                        metrics.first_byte_callback(),
+                    )),
                     Some(metrics.stream_end_callback(worker.url.clone())),
                 )
             } else {
                 (Box::new(load_guards), None, None)
             };
         ctx.proxy
-            .chat_complete_grpc(
+            .forward_grpc(
                 worker,
-                headers,
-                body,
+                &*self.0,
+                &leg.headers,
+                leg.body,
+                &leg.additions,
                 engine_rid,
                 metrics.streaming,
                 Some(guards),
@@ -511,21 +647,23 @@ impl Transport for Grpc {
         proxy: Arc<Proxy>,
         worker: Arc<Worker>,
         _path: &'static str,
-        headers: HeaderMap,
-        body: Bytes,
-    ) -> PrefillFailure<GrpcResponse> {
+        leg: Leg,
+    ) -> PrefillFailure<Self::Response> {
+        let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
         let result = proxy
-            .chat_complete_grpc(
-                &worker, &headers, body, None, false, None, None, None, None, None,
+            .forward_grpc(
+                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
+                None,
             )
             .await;
         let status = match result {
             Ok(response) if response.status.is_success() => {
-                let chunks: Vec<_> = response.chunks.collect().await;
-                let clean = chunks.iter().all(|chunk| {
-                    chunk
+                let replies: Vec<_> = response.replies.collect().await;
+                let mut scanner = ErrorEventScanner::default();
+                let clean = replies.iter().all(|reply| {
+                    reply
                         .as_ref()
-                        .is_ok_and(|chunk| !sse::is_error_payload(&chunk.json_chunk))
+                        .is_ok_and(|reply| !reply.is_error_event(&mut scanner))
                 });
                 if clean {
                     return None;
@@ -628,19 +766,22 @@ fn spawn_prefill_request<T: Transport>(
     metrics: &DispatchMetrics,
     prefill_worker: Arc<Worker>,
     path: &'static str,
-    headers: HeaderMap,
-    body: Bytes,
+    leg: Leg,
     load_guards: LoadGuards,
     bootstrap_room: u64,
     stream_abort: CancellationToken,
+    slot: Option<DecodeSlot>,
 ) -> tokio::task::JoinHandle<PrefillFailure<T::Response>> {
     let proxy = Arc::clone(&ctx.proxy);
     let (registry, model) = (Arc::clone(&metrics.registry), metrics.model.clone());
     tokio::spawn(async move {
         let _load_guards = load_guards;
         let failure = transport
-            .prefill(proxy, Arc::clone(&prefill_worker), path, headers, body)
+            .prefill(proxy, Arc::clone(&prefill_worker), path, leg)
             .await;
+        if let Some(slot) = &slot {
+            slot.release();
+        }
         let prefill_url = &prefill_worker.url;
         let outcome = failure
             .as_ref()
@@ -746,11 +887,13 @@ async fn forward_to_response_worker(
     metrics: &DispatchMetrics,
     expiration: CancellationToken,
     stream_abort: CancellationToken,
+    decode_slot: Option<DecodeSlot>,
 ) -> Result<Response<Body>, ApiError> {
     if metrics.streaming {
         // Load and duration guards live until the SSE pump ends, not just until headers arrive.
         let stream_guards: Box<dyn Send + 'static> =
             Box::new((load_guards, metrics.stream_duration_guard()));
+        let first_byte = release_on_first_byte(decode_slot, metrics.first_byte_callback());
         ctx.proxy
             .forward_streaming_to(
                 &worker.url,
@@ -761,7 +904,7 @@ async fn forward_to_response_worker(
                 body,
                 engine_rid,
                 Some(stream_guards),
-                Some(metrics.first_byte_callback()),
+                Some(first_byte),
                 Some(metrics.stream_end_callback(worker.url.clone())),
                 Some(expiration),
                 Some(stream_abort),

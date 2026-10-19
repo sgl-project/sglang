@@ -35,13 +35,14 @@ _MPS_VARLEN_QUERY_CHUNK_SIZE = 128
 
 
 def torch_default_sdpa_backends():
-    """Context in which SDPA picks from every PyTorch backend, cuDNN included.
+    """Reference SDPA with a stable cuDNN-first preference and fallback set.
 
     The CUDA platform disables cuDNN SDPA process-wide (diffusers#9704). Modules
-    whose reference outputs were produced with PyTorch's defaults opt back in
-    around their own ``scaled_dot_product_attention`` calls.
+    opt back in locally. Priority must be explicit: restoring another SDPA
+    context can move disabled backends to the end of the ambient priority list,
+    otherwise changing reference outputs after the first DiT forward.
     """
-    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+    return sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
 
 
 class SDPABackend(AttentionBackend):
