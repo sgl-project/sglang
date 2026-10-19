@@ -97,6 +97,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    ObserveElasticEPMembershipReqInput,
+    ObserveElasticEPMembershipReqOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     RecoverElasticEPReqInput,
@@ -571,6 +573,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_recovery_operation_id = None
         self.elastic_recovery_topology_generation = None
         self.elastic_recovery_allocation_id = None
+        self.elastic_recovery_failed_allocation_incarnation = None
         self.elastic_recovery_rank_offset = None
         self.elastic_recovery_phase = "idle"
         self.elastic_recovery_succeeded = None
@@ -3811,11 +3814,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.topology_generation,
                 obj.allocation_id,
                 obj.rank_offset,
+                obj.failed_allocation_incarnation,
             )
             current = (
                 self.elastic_recovery_topology_generation,
                 self.elastic_recovery_allocation_id,
                 self.elastic_recovery_rank_offset,
+                getattr(self, "elastic_recovery_failed_allocation_incarnation", None),
             )
             if existing:
                 if requested != current:
@@ -3850,6 +3855,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.elastic_recovery_operation_id = operation_id
                 self.elastic_recovery_topology_generation = obj.topology_generation
                 self.elastic_recovery_allocation_id = obj.allocation_id
+                self.elastic_recovery_failed_allocation_incarnation = (
+                    obj.failed_allocation_incarnation
+                )
                 self.elastic_recovery_rank_offset = obj.rank_offset
                 self.elastic_recovery_phase = "submitting"
                 self.elastic_recovery_succeeded = None
@@ -3860,6 +3868,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 topology_generation=obj.topology_generation,
                 allocation_id=obj.allocation_id,
                 rank_offset=obj.rank_offset,
+                failed_allocation_incarnation=obj.failed_allocation_incarnation,
                 submission_id=uuid.uuid4().hex,
             )
             self.auto_create_handle_loop()
@@ -3893,6 +3902,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_recovery_phase = responses[0].recovery_phase
             responses[0].operation_id = operation_id
             return responses[0]
+
+    async def observe_elastic_ep_membership(
+        self, obj: ObserveElasticEPMembershipReqInput
+    ) -> ObserveElasticEPMembershipReqOutput:
+        """Fan out a CPU-only membership observation to schedulers."""
+        scheduler_obj = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id=obj.runtime_instance_id,
+            topology_generation=obj.topology_generation,
+            rank=obj.rank,
+            failed_allocation_incarnation=(obj.failed_allocation_incarnation),
+            membership_epoch=obj.membership_epoch,
+        )
+        self.auto_create_handle_loop()
+        responses = await self.recover_elastic_ep_communicator(scheduler_obj)
+        if not responses:
+            raise RuntimeError(
+                "Membership observation returned no scheduler responses."
+            )
+        accepted = next((response for response in responses if response.accepted), None)
+        if accepted is not None:
+            return accepted
+        return responses[0]
 
     def _current_elastic_recovery_output(
         self, operation_id: str

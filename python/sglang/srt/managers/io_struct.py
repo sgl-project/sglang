@@ -2367,6 +2367,7 @@ class RecoverElasticEPReqInput(BaseReq, kw_only=True):
     topology_generation: int
     allocation_id: str
     rank_offset: int
+    failed_allocation_incarnation: str = ""
     submission_id: Optional[str] = None
 
 
@@ -2378,6 +2379,20 @@ class RecoverElasticEPReqOutput(BaseReq, kw_only=True):
     submission_id: Optional[str] = None
     recovery_phase: str = "idle"
     terminal: bool = False
+
+
+class ObserveElasticEPMembershipReqInput(BaseReq, kw_only=True):
+    runtime_instance_id: str
+    topology_generation: int
+    rank: int
+    failed_allocation_incarnation: str
+    membership_epoch: int
+
+
+class ObserveElasticEPMembershipReqOutput(BaseReq, kw_only=True):
+    accepted: bool
+    message: str
+    observation_key: Optional[str] = None
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):

@@ -339,6 +339,8 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_runtime_instance_id",
     "max_ep_size",
     "elastic_ep_scale_timeout",
+    "elastic_ep_recovery_timeout",
+    "elastic_ep_recovery_policy",
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_shared_experts_fusion",
     "enforce_shared_experts_fusion",

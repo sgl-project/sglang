@@ -950,6 +950,13 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
+    elastic_ep_recovery_timeout: A[
+        float, "Timeout in seconds for a fixed-slot Elastic EP recovery operation."
+    ] = 600
+    elastic_ep_recovery_policy: A[
+        Literal["legacy", "fixed_slot", "fixed-slot"],
+        "Recovery policy. The fixed_slot policy is opt-in; legacy preserves fault EPLB behavior.",
+    ] = "legacy"
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False

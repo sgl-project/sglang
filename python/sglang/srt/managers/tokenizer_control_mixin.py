@@ -53,6 +53,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    ObserveElasticEPMembershipReqOutput,
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
@@ -143,6 +144,7 @@ _COMMUNICATOR_SPECS = [
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput, "queueing", "submission_id"),
     ("recover_elastic_ep", RecoverElasticEPReqOutput, "queueing", "submission_id"),
+    ("observe_elastic_ep_membership", ObserveElasticEPMembershipReqOutput),
 ]
 
 

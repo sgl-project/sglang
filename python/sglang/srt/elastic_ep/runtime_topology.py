@@ -6,11 +6,15 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from typing import Optional
+from urllib.parse import quote
 
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.environ import envs
 
 _RUNTIME_TOPOLOGY_KEY = "elastic_ep/runtime_topology"
+_MEMBERSHIP_OBSERVATION_KEY_PREFIX = "elastic_ep/membership_observation"
+_MEMBERSHIP_EPOCH_KEY_PREFIX = "elastic_ep/membership_epoch"
+_MEMBERSHIP_LATEST_KEY_PREFIX = "elastic_ep/membership_latest"
 
 
 class ElasticEPRecoveryRequiredError(RuntimeError):
@@ -48,6 +52,114 @@ class RuntimeTopology:
             )
         if self.topology_generation < 0:
             raise ValueError("Elastic EP topology generation must be non-negative.")
+
+
+@dataclass(frozen=True)
+class MembershipObservation:
+    runtime_instance_id: str
+    topology_generation: int
+    rank: int
+    failed_allocation_incarnation: str
+    membership_epoch: int
+
+    def validate(self, topology: RuntimeTopology) -> None:
+        if self.runtime_instance_id != topology.runtime_instance_id:
+            raise ValueError("Membership observation runtime instance is stale.")
+        if self.topology_generation != topology.topology_generation:
+            raise ValueError("Membership observation topology generation is stale.")
+        if self.rank < 0:
+            raise ValueError("Membership observation rank must be non-negative.")
+        if self.rank >= topology.max_committed_ep_size:
+            raise ValueError("Membership observation rank is outside the topology.")
+        if not self.failed_allocation_incarnation:
+            raise ValueError(
+                "Membership observation allocation incarnation is required."
+            )
+        if self.membership_epoch < 0:
+            raise ValueError("Membership observation epoch must be non-negative.")
+
+
+def _membership_observation_key(observation: MembershipObservation) -> str:
+    return (
+        f"{_MEMBERSHIP_OBSERVATION_KEY_PREFIX}/"
+        f"{quote(observation.runtime_instance_id, safe='')}/"
+        f"{observation.topology_generation}/"
+        f"{observation.rank}/"
+        f"{quote(observation.failed_allocation_incarnation, safe='')}/"
+        f"{observation.membership_epoch}"
+    )
+
+
+def _membership_epoch_key(observation: MembershipObservation) -> str:
+    return (
+        f"{_MEMBERSHIP_EPOCH_KEY_PREFIX}/"
+        f"{quote(observation.runtime_instance_id, safe='')}/"
+        f"{observation.topology_generation}/"
+        f"{observation.rank}/"
+        f"{quote(observation.failed_allocation_incarnation, safe='')}"
+    )
+
+
+def _membership_latest_key(observation: MembershipObservation) -> str:
+    return (
+        f"{_MEMBERSHIP_LATEST_KEY_PREFIX}/"
+        f"{quote(observation.runtime_instance_id, safe='')}/"
+        f"{observation.topology_generation}"
+    )
+
+
+def publish_membership_observation(
+    observation: MembershipObservation,
+) -> str:
+    """Publish one CPU-only, monotonic membership observation.
+
+    The compare-set keys make duplicate observations idempotently rejectable,
+    while the epoch watermark rejects stale and ABA observations.
+    """
+    topology = get_runtime_topology()
+    if topology is None:
+        raise RuntimeError("Elastic EP runtime topology has not been published.")
+    observation.validate(topology)
+    store = get_global_tcp_store()
+    if store is None:
+        raise RuntimeError("Elastic EP requires the global TCPStore.")
+
+    observation_key = _membership_observation_key(observation)
+    encoded = json.dumps(asdict(observation), sort_keys=True).encode()
+    if store.check([observation_key]):
+        raise ValueError("Duplicate Elastic EP membership observation.")
+    epoch_key = _membership_epoch_key(observation)
+    if store.check([epoch_key]):
+        previous_epoch = int(store.get(epoch_key).decode())
+        if observation.membership_epoch <= previous_epoch:
+            raise ValueError("Stale or ABA Elastic EP membership observation.")
+    if hasattr(store, "compare_set"):
+        existing = store.compare_set(observation_key, b"", encoded)
+        if existing != encoded:
+            raise ValueError("Duplicate Elastic EP membership observation.")
+        store.set(epoch_key, str(observation.membership_epoch).encode())
+    else:
+        store.set(observation_key, encoded)
+        store.set(epoch_key, str(observation.membership_epoch).encode())
+    store.set(_membership_latest_key(observation), encoded)
+    return observation_key
+
+
+def get_membership_observation() -> Optional[MembershipObservation]:
+    topology = get_runtime_topology()
+    store = get_global_tcp_store()
+    if topology is None or store is None:
+        return None
+    key = (
+        f"{_MEMBERSHIP_LATEST_KEY_PREFIX}/"
+        f"{quote(topology.runtime_instance_id, safe='')}/"
+        f"{topology.topology_generation}"
+    )
+    if not store.check([key]):
+        return None
+    observation = MembershipObservation(**json.loads(store.get(key).decode()))
+    observation.validate(topology)
+    return observation
 
 
 def _decode_runtime_topology(value: bytes) -> RuntimeTopology:

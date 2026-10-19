@@ -676,7 +676,7 @@ def handle_elastic_ep(server_args: Any):
                 elastic_ep_runtime_instance_id=existing.runtime_instance_id,
             )
         cfg = resolving_view(server_args)
-    elif cfg.elastic_ep_allocation_index is not None:
+    elif getattr(cfg, "elastic_ep_allocation_index", None) is not None:
         raise AssertionError(
             "--elastic-ep-allocation-index is only valid with "
             "--elastic-ep-join-mode auto."
@@ -788,6 +788,9 @@ def handle_elastic_ep(server_args: Any):
 
         assert cfg.elastic_ep_scale_timeout > 0, (
             "--elastic-ep-scale-timeout must be greater than zero."
+        )
+        assert cfg.elastic_ep_recovery_timeout > 0, (
+            "--elastic-ep-recovery-timeout must be greater than zero."
         )
         assert cfg.tokenizer_worker_num == 1, (
             "Elastic EP runtime scale-up currently requires --tokenizer-worker-num 1."

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 from urllib.parse import quote
 
@@ -12,9 +12,12 @@ import torch
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.elastic_ep.runtime_topology import (
+    MembershipObservation,
     RuntimeTopology,
     commit_runtime_topology,
+    get_membership_observation,
     get_runtime_topology,
+    publish_membership_observation,
     publish_runtime_topology,
     validate_append_candidate,
 )
@@ -49,15 +52,15 @@ class ScaleOperation:
 
 @dataclass(frozen=True)
 class ScaleCohort:
-    runtime_instance_id: str
-    operation_id: str
-    rank_offset: int
-    target_ep_size: int
-    ready_rank_count: int
-    allocation_id: Optional[str]
-    cuda_graph_enabled: bool
-    attn_tp_size: int
-    attn_cp_size: int
+    runtime_instance_id: str = ""
+    operation_id: str = ""
+    rank_offset: int = 0
+    target_ep_size: int = 0
+    ready_rank_count: int = 0
+    allocation_id: Optional[str] = None
+    cuda_graph_enabled: bool = False
+    attn_tp_size: int = 1
+    attn_cp_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,7 @@ class RecoveryOperation:
     allocation_id: str
     rank_offset: int
     rank_count: int = 1
+    failed_allocation_incarnation: str = ""
 
     def validate(self, topology: RuntimeTopology) -> None:
         if self.runtime_instance_id != topology.runtime_instance_id:
@@ -82,6 +86,11 @@ class RecoveryOperation:
             raise ValueError("Recovery operation ID must not be empty.")
         if not self.allocation_id:
             raise ValueError("Recovery allocation ID must not be empty.")
+        if (
+            self.failed_allocation_incarnation
+            and "/" in self.failed_allocation_incarnation
+        ):
+            raise ValueError("Recovery allocation incarnation must not contain '/'.")
         if topology.allocation_width != 1 or self.rank_count != 1:
             raise RuntimeError(
                 "Fixed-slot recovery currently supports exactly one TP1 allocation."
@@ -115,7 +124,9 @@ class RecoveryLifecycle:
         self.phase = next_phase
 
 
-_PENDING_RECOVERY_PHASES = frozenset({"restoring", "slot_restored", "warming_up"})
+_PENDING_RECOVERY_PHASES = frozenset(
+    {"awaiting_recovery", "restoring", "slot_restored", "warming_up"}
+)
 
 
 def _recovery_operation_key(runtime_instance_id: str, operation_id: str) -> str:
@@ -146,6 +157,7 @@ def get_recovery_operation_for_slot(
     topology_generation: int,
     rank_offset: int,
     allocation_id: str,
+    failed_allocation_incarnation: Optional[str] = None,
 ) -> Optional[RecoveryOperation]:
     probe = RecoveryOperation(
         runtime_instance_id=runtime_instance_id,
@@ -153,11 +165,19 @@ def get_recovery_operation_for_slot(
         operation_id="probe",
         allocation_id=allocation_id,
         rank_offset=rank_offset,
+        failed_allocation_incarnation=failed_allocation_incarnation or allocation_id,
     )
     value = _load_store_json(_recovery_slot_key(probe))
     if value is None:
         return None
-    return get_recovery_operation(runtime_instance_id, value["operation_id"])
+    operation = get_recovery_operation(runtime_instance_id, value["operation_id"])
+    if (
+        operation is not None
+        and failed_allocation_incarnation is not None
+        and operation.failed_allocation_incarnation != failed_allocation_incarnation
+    ):
+        return None
+    return operation
 
 
 def register_recovery_operation(operation: RecoveryOperation) -> RecoveryOperation:
@@ -245,10 +265,21 @@ def get_scale_operation(rank_offset: int) -> Optional[ScaleOperation]:
 def register_scale_cohort(
     rank_offset: int,
     target_ep_size: int,
-    timeout: float,
+    timeout: Optional[float] = None,
     allocation_id: Optional[str] = None,
     cuda_graph_enabled: bool = False,
 ) -> ScaleCohort:
+    if timeout is None:
+        cohort = ScaleCohort(
+            target_ep_size=target_ep_size,
+            allocation_id=allocation_id,
+            cuda_graph_enabled=cuda_graph_enabled,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
+        )
+        _store_json(f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}", cohort.__dict__)
+        return cohort
+
     deadline = time.monotonic() + timeout
     operation = get_scale_operation(rank_offset)
     while operation is None and time.monotonic() < deadline:
@@ -361,11 +392,13 @@ class ElasticEPState:
     recovery_operation_id: Optional[str] = None
     recovery_topology_generation: Optional[int] = None
     recovery_allocation_id: Optional[str] = None
+    recovery_failed_allocation_incarnation: Optional[str] = None
     recovery_rank_offset: Optional[int] = None
     recovery_phase: str = "idle"
     recovery_succeeded: Optional[bool] = None
     recovery_error: Optional[str] = None
     recovery_warmup_succeeded: bool = False
+    recovery_membership_epoch: Optional[int] = None
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -518,6 +551,9 @@ class ElasticEPStateManager:
             inst.recovery_operation_id = operation.operation_id
             inst.recovery_topology_generation = operation.topology_generation
             inst.recovery_allocation_id = operation.allocation_id
+            inst.recovery_failed_allocation_incarnation = (
+                operation.failed_allocation_incarnation
+            )
             inst.recovery_rank_offset = operation.rank_offset
             inst.recovery_phase = "restoring"
 
@@ -531,6 +567,7 @@ class ElasticEPStateManager:
             or inst.recovery_operation_id is None
             or inst.recovery_allocation_id is None
             or inst.recovery_rank_offset is None
+            or inst.recovery_failed_allocation_incarnation is None
         ):
             raise RuntimeError("Elastic EP recovery has no fully bound operation.")
         return RecoveryOperation(
@@ -539,6 +576,7 @@ class ElasticEPStateManager:
             operation_id=inst.recovery_operation_id,
             allocation_id=inst.recovery_allocation_id,
             rank_offset=inst.recovery_rank_offset,
+            failed_allocation_incarnation=inst.recovery_failed_allocation_incarnation,
         )
 
     @staticmethod
@@ -612,16 +650,46 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None:
             return False
+        fixed_slot_recovery = _fixed_slot_recovery_enabled()
+        if fixed_slot_recovery and not operation.failed_allocation_incarnation:
+            operation = replace(
+                operation,
+                failed_allocation_incarnation=operation.allocation_id,
+            )
+        if fixed_slot_recovery:
+            if inst.recovery_phase == "awaiting_recovery":
+                if (
+                    inst.recovery_membership_epoch is None
+                    or inst.runtime_instance_id != operation.runtime_instance_id
+                    or inst.recovery_topology_generation
+                    != operation.topology_generation
+                    or inst.recovery_rank_offset != operation.rank_offset
+                    or inst.recovery_failed_allocation_incarnation
+                    != operation.failed_allocation_incarnation
+                ):
+                    raise RuntimeError(
+                        "Recovery operation does not match the awaiting membership "
+                        "observation."
+                    )
+            elif inst.recovery_phase not in _PENDING_RECOVERY_PHASES:
+                raise RuntimeError(
+                    "Recovery admission requires an awaiting membership observation."
+                )
         same_operation = (
             inst.recovery_operation_id == operation.operation_id
             and inst.runtime_instance_id == operation.runtime_instance_id
             and inst.recovery_topology_generation == operation.topology_generation
             and inst.recovery_allocation_id == operation.allocation_id
             and inst.recovery_rank_offset == operation.rank_offset
+            and inst.recovery_failed_allocation_incarnation
+            == operation.failed_allocation_incarnation
         )
         if same_operation:
             return True
-        if inst.recovery_phase in _PENDING_RECOVERY_PHASES:
+        if (
+            inst.recovery_phase in _PENDING_RECOVERY_PHASES
+            and inst.recovery_phase != "awaiting_recovery"
+        ):
             raise RuntimeError(
                 "Recovery operation conflicts with the pending recovery operation."
             )
@@ -644,11 +712,15 @@ class ElasticEPStateManager:
         inst.recovery_operation_id = operation.operation_id
         inst.recovery_topology_generation = operation.topology_generation
         inst.recovery_allocation_id = operation.allocation_id
+        inst.recovery_failed_allocation_incarnation = (
+            operation.failed_allocation_incarnation
+        )
         inst.recovery_rank_offset = operation.rank_offset
         inst.recovery_phase = "restoring"
         inst.recovery_succeeded = None
         inst.recovery_error = None
         inst.recovery_warmup_succeeded = False
+        inst.pending_since = time.monotonic()
         return True
 
     @classmethod
@@ -710,6 +782,17 @@ class ElasticEPStateManager:
             and topology.runtime_instance_id == inst.runtime_instance_id
             and topology.topology_generation == inst.recovery_topology_generation
             and topology.effective_ep_size == inst.effective_ep_size
+        )
+
+    @classmethod
+    def recovery_timed_out(cls) -> bool:
+        inst = cls._instance
+        if inst is None or inst.pending_since is None:
+            return False
+        if inst.recovery_phase not in _PENDING_RECOVERY_PHASES:
+            return False
+        return time.monotonic() - inst.pending_since > getattr(
+            get_exec().moe, "elastic_ep_recovery_timeout", 600
         )
 
     @classmethod
@@ -881,6 +964,153 @@ class ElasticEPStateManager:
             return True
         active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
         return active_count < inst.effective_ep_size
+
+
+def observe_recovery_membership(
+    *,
+    runtime_instance_id: str,
+    topology_generation: int,
+    rank: int,
+    failed_allocation_incarnation: str,
+    membership_epoch: int,
+) -> str:
+    """Publish a CPU-only membership observation without touching device state."""
+    if not _fixed_slot_recovery_enabled():
+        raise RuntimeError("Fixed-slot Elastic EP recovery is not enabled.")
+    state = ElasticEPStateManager.instance()
+    if state is not None and state.recovery_phase == "awaiting_recovery":
+        raise ValueError("Recovery membership observation is awaiting recovery.")
+    if (
+        state is not None
+        and state.active_ranks_cpu is not None
+        and 0 <= rank < len(state.active_ranks_cpu)
+    ):
+        state.active_ranks_cpu[rank] = 1
+    return publish_membership_observation(
+        MembershipObservation(
+            runtime_instance_id=runtime_instance_id,
+            topology_generation=topology_generation,
+            rank=rank,
+            failed_allocation_incarnation=failed_allocation_incarnation,
+            membership_epoch=membership_epoch,
+        )
+    )
+
+
+def consume_recovery_membership_observation(
+    *,
+    require_idle: bool = True,
+) -> bool:
+    """Consume an accepted observation at the CPU-only runner boundary."""
+    state = ElasticEPStateManager.instance()
+    if (
+        state is None
+        or not _fixed_slot_recovery_enabled()
+        or state.pending_ep_size is not None
+        or (require_idle and state.recovery_phase != "idle")
+    ):
+        return False
+    observation = get_membership_observation()
+    if observation is None:
+        return False
+    if state.recovery_phase == "awaiting_recovery":
+        return False
+    if state.active_ranks_cpu is None or observation.rank >= len(
+        state.active_ranks_cpu
+    ):
+        return False
+    if (
+        state.recovery_membership_epoch is not None
+        and observation.membership_epoch <= state.recovery_membership_epoch
+    ):
+        return False
+    state.runtime_instance_id = observation.runtime_instance_id
+    state.recovery_topology_generation = observation.topology_generation
+    state.recovery_rank_offset = observation.rank
+    state.recovery_failed_allocation_incarnation = (
+        observation.failed_allocation_incarnation
+    )
+    state.active_ranks_cpu[observation.rank] = 0
+    state.recovery_membership_epoch = observation.membership_epoch
+    state.recovery_phase = "awaiting_recovery"
+    state.pending_since = time.monotonic()
+    return True
+
+
+def poll_recovery_control_plane() -> bool:
+    """Consume observations and fail closed when recovery exceeds its deadline."""
+    consumed = consume_recovery_membership_observation()
+    state = ElasticEPStateManager.instance()
+    if state is not None and ElasticEPStateManager.recovery_timed_out():
+        error = "Elastic EP recovery timed out."
+        ElasticEPStateManager.fail_recovery(error)
+        logger.error(error)
+        return True
+    return consumed
+
+
+def _fixed_slot_recovery_enabled() -> bool:
+    try:
+        policy = getattr(get_exec().moe, "elastic_ep_recovery_policy", "legacy")
+    except ValueError:
+        policy = "legacy"
+    return policy in (
+        "fixed_slot",
+        "fixed-slot",
+    )
+
+
+def pre_dispatch_recovery_fence(
+    *,
+    internal_warmup: bool = False,
+) -> Optional[int]:
+    """Return the generation allowed for a runner dispatch, or fence it."""
+    if not _fixed_slot_recovery_enabled():
+        return None
+    state = ElasticEPStateManager.instance()
+    if state is None:
+        return None
+    if state.recovery_phase == "idle":
+        consume_recovery_membership_observation()
+        if state.recovery_phase == "idle":
+            return None
+    if state.recovery_phase in {
+        "awaiting_recovery",
+        "restoring",
+        "slot_restored",
+    }:
+        raise RuntimeError(
+            "Elastic EP recovery generation fence rejected user forward."
+        )
+    if state.recovery_phase != "warming_up":
+        if internal_warmup:
+            raise RuntimeError(
+                "Elastic EP recovery warmup is not allowed outside warming_up."
+            )
+        raise RuntimeError(
+            "Elastic EP recovery generation fence rejected user forward."
+        )
+    if not internal_warmup:
+        raise RuntimeError(
+            "Elastic EP recovery generation fence rejected user forward."
+        )
+    if ElasticEPStateManager.recovery_timed_out():
+        ElasticEPStateManager.fail_recovery("Elastic EP recovery timed out.")
+        raise RuntimeError("Elastic EP recovery timed out.")
+    topology = get_runtime_topology()
+    if topology is None or topology.topology_generation != (
+        state.recovery_topology_generation
+    ):
+        raise RuntimeError("Elastic EP recovery generation fence rejected dispatch.")
+    return topology.topology_generation
+
+
+def validate_post_forward_recovery_generation(generation: Optional[int]) -> None:
+    if generation is None:
+        return
+    topology = get_runtime_topology()
+    if topology is None or topology.topology_generation != generation:
+        raise RuntimeError("Elastic EP recovery generation changed during forward.")
 
 
 def elastic_expanded_world_enabled() -> bool:
@@ -1095,6 +1325,12 @@ def maybe_recover_ep_ranks(
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
+        return False
+    if (
+        _fixed_slot_recovery_enabled()
+        and elastic_ep_state.recovery_phase in _PENDING_RECOVERY_PHASES
+    ):
+        logger.info("Suppressing fault EPLB while fixed-slot recovery is pending")
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
