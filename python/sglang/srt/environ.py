@@ -364,6 +364,8 @@ class Envs:
     # IPC, broadcasters, and ports
     # ===================================================================
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
+    # Use ZeroMQ frame buffers for MessagePack IPC. Pickle IPC is unaffected.
+    SGLANG_ENABLE_MSGPACK_ZERO_COPY = EnvBool(False)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)

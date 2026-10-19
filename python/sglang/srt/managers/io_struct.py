@@ -2676,6 +2676,7 @@ _msgpack_decoder = msgspec.msgpack.Decoder(
     Union[_all_types], dec_hook=dec_hook, ext_hook=ext_hook
 )
 _USE_PICKLE_IPC = envs.SGLANG_USE_PICKLE_IPC.get()
+_USE_MSGPACK_ZERO_COPY = envs.SGLANG_ENABLE_MSGPACK_ZERO_COPY.get()
 
 
 def hook_custom_types(*new_types: Type):
@@ -2711,7 +2712,7 @@ def msgpack_encode(obj: Any) -> bytes:
     return _msgpack_encoder.encode(_maybe_wrap_pickle(obj))
 
 
-def msgpack_decode(data: bytes) -> Any:
+def msgpack_decode(data: Union[bytes, memoryview]) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
@@ -2720,15 +2721,15 @@ def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
         socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
         return
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    socket.send(msgpack_encode(obj), flags=flags, copy=not _USE_MSGPACK_ZERO_COPY)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
         return socket.recv_pyobj(flags=flags)
 
-    data = socket.recv(flags=flags)
-    return msgpack_decode(data)
+    data = socket.recv(flags=flags, copy=not _USE_MSGPACK_ZERO_COPY)
+    return msgpack_decode(data.buffer if _USE_MSGPACK_ZERO_COPY else data)
 
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
@@ -2736,12 +2737,12 @@ async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) 
         await socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
         return
 
-    await socket.send(msgpack_encode(obj), flags=flags)
+    await socket.send(msgpack_encode(obj), flags=flags, copy=not _USE_MSGPACK_ZERO_COPY)
 
 
 async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
         return await socket.recv_pyobj(flags=flags)
 
-    data = await socket.recv(flags=flags)
-    return msgpack_decode(data)
+    data = await socket.recv(flags=flags, copy=not _USE_MSGPACK_ZERO_COPY)
+    return msgpack_decode(data.buffer if _USE_MSGPACK_ZERO_COPY else data)
