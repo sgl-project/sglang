@@ -40,11 +40,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.runtime_context import (
-    get_flags,
-    get_forward,
-    get_parallel,
-)
+from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.srt.utils.common import ceil_align, is_npu
 
 logger = logging.getLogger(__name__)
@@ -207,8 +203,8 @@ _npu_mm_reduce_scatter_base = None
 _npu_all_gather_base_mm = None
 if is_npu():
     try:
-        import torch_npu  # noqa: F401
         import acl
+        import torch_npu  # noqa: F401
 
         # arch35 (Ascend 950) MC2 fused ops accumulate at lower GEMM precision
         # and regress model accuracy; keep the plain collective fallback there.
