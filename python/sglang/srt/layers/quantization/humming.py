@@ -788,8 +788,6 @@ class HummingLinearMethod(LinearMethodBase):
                         output_dim=0,
                         weight_loader=orig_weight_loader,
                     )
-                    layer.weight.tp_size = layer.tp_size
-                    layer.weight.tp_rank = layer.tp_rank
                     set_weight_attrs(layer.weight, extra_weight_attrs)
 
                 param = layer.weight

@@ -85,6 +85,8 @@ pub struct SnapshotParams {
     /// match [`crate::state::kv_events::bootstrap::CURSORS_ONLY_PARAM`].
     #[serde(default)]
     cursors_only: bool,
+    #[serde(default)]
+    include_lora: bool,
 }
 
 /// `GET /internal/kv_snapshot` — serve this replica's KV tree so a newly
@@ -98,7 +100,8 @@ pub struct SnapshotParams {
 ///
 /// `?max_age_ms=N` bounds how stale a cached export may be; omitted,
 /// [`PRODUCER_CACHE_TTL`] applies. `?cursors_only=true` is answered from the
-/// live cursor map and bypasses the export cache.
+/// live cursor map and bypasses the export cache. `?include_lora=true` opts into
+/// version-2 LoRA mappings; legacy callers receive the base-model version-1 view.
 ///
 /// # Exposure
 ///
@@ -118,14 +121,27 @@ pub async fn kv_snapshot(
     if params.cursors_only {
         // Read live, so there is nothing for `max_age_ms` to bound; it is
         // ignored when both are sent.
-        return json_ok(index.peer_cursors_body());
+        let body = index.peer_cursors_body();
+        if body.is_empty() {
+            // Same shape as the full export's failure answer below: a 200
+            // carrying an empty body would hand the caller JSON it cannot
+            // decode. Unreachable in practice (the body is a plain struct),
+            // kept so the two paths cannot drift apart.
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cursor table could not be encoded",
+            );
+        }
+        return json_ok(body);
     }
     let max_age = params
         .max_age_ms
         .map_or(PRODUCER_CACHE_TTL, Duration::from_millis);
     // Pre-encoded (both encodings) and cached by the producer; handing `Bytes`
     // to the body is a refcount bump, not a copy.
-    let body = index.peer_snapshot_body(max_age).await;
+    let body = index
+        .peer_snapshot_body_for_client(max_age, params.include_lora)
+        .await;
     if body.is_empty() {
         // The encode failed. A 200 would carry a body the caller cannot
         // decode; a non-success status reads as "no snapshot here".
@@ -197,10 +213,13 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 /// out-of-band admin call would skew the state the request router uses to
 /// pick workers.
 ///
+/// The caller's `Authorization` header is forwarded, so engines started with
+/// `--api-key` flush only for a caller holding that key.
+///
 /// Status: `200 OK` when every worker flushed successfully (or the fleet is
 /// empty); `502 BAD_GATEWAY` when at least one worker failed. The JSON body
 /// always carries the full breakdown so a partial failure is actionable.
-pub async fn flush_cache(State(ctx): State<Arc<AppContext>>) -> Response {
+pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
     let workers = ctx.registry.all();
     let total_workers = workers.len();
 
@@ -220,6 +239,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>) -> Response {
         &workers,
         ctx.proxy.admin_client(),
         ctx.proxy.request_timeout,
+        headers.get(header::AUTHORIZATION),
     )
     .await;
 
@@ -262,6 +282,7 @@ async fn fan_out_flush(
     workers: &[Arc<Worker>],
     client: &Client,
     timeout: Duration,
+    auth: Option<&HeaderValue>,
 ) -> (Vec<String>, Vec<FailedWorker>) {
     // Snapshot the URLs into owned Strings up front so the per-worker stream
     // does not borrow the `workers` slice across the await points.
@@ -269,12 +290,13 @@ async fn fan_out_flush(
 
     let outcomes = stream::iter(urls)
         .map(|url| {
-            let client = client.clone();
-            async move {
-                let flush_url = format!("{}/flush_cache", url.trim_end_matches('/'));
-                let result = client.post(&flush_url).timeout(timeout).send().await;
-                (url, result)
+            let mut request = client
+                .post(format!("{}/flush_cache", url.trim_end_matches('/')))
+                .timeout(timeout);
+            if let Some(auth) = auth {
+                request = request.header(header::AUTHORIZATION, auth);
             }
+            async move { (url, request.send().await) }
         })
         .buffer_unordered(MAX_CONCURRENT_FLUSH)
         .collect::<Vec<_>>()
@@ -350,7 +372,7 @@ mod tests {
                     url: (*url).to_string(),
                     mode: WorkerMode::Plain,
                     model_ids: vec![ModelId("stub-model".into())],
-                    bootstrap_port: None,
+                    ..Default::default()
                 })
                 .expect("worker accepted");
         }
@@ -436,6 +458,35 @@ mod tests {
         assert!(failed[0]["error"].as_str().unwrap().contains("404"));
     }
 
+    /// The caller's `Authorization` reaches workers started with `--api-key`.
+    #[tokio::test]
+    async fn forwards_caller_authorization() {
+        let app = Router::new().route(
+            "/flush_cache",
+            post(|headers: HeaderMap| async move {
+                match headers.get(header::AUTHORIZATION) {
+                    Some(v) if v == "Bearer k" => StatusCode::OK,
+                    _ => StatusCode::UNAUTHORIZED,
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let keyed = Request::post("/flush_cache")
+            .header(header::AUTHORIZATION, "Bearer k")
+            .body(Body::empty())
+            .unwrap();
+        let res = crate::server::app::build_router(ctx_with_workers(&[&url]))
+            .oneshot(keyed)
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let (status, _) = post_flush(ctx_with_workers(&[&url])).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
     /// A worker URL with a trailing slash must still resolve to
     /// `<url>/flush_cache` (not `<url>//flush_cache`). Guards the
     /// `trim_end_matches('/')` in `fan_out_flush` against a regression that
@@ -470,6 +521,7 @@ mod tests {
                 mode: WorkerMode::Prefill,
                 model_ids: vec![ModelId("stub-model".into())],
                 bootstrap_port: Some(8998),
+                ..Default::default()
             })
             .expect("prefill accepted");
         ctx.registry
@@ -478,7 +530,7 @@ mod tests {
                 url: d_url.clone(),
                 mode: WorkerMode::Decode,
                 model_ids: vec![ModelId("stub-model".into())],
-                bootstrap_port: None,
+                ..Default::default()
             })
             .expect("decode accepted");
 
@@ -551,6 +603,55 @@ mod tests {
         assert_eq!(snap.workers.len(), 1);
         assert_eq!(snap.workers[0].url, "http://carrier:30000");
         assert_eq!(snap.cursors, vec![(0, 41)]);
+    }
+
+    #[tokio::test]
+    async fn mixed_snapshot_preserves_legacy_base_bootstrap_and_negotiates_lora() {
+        use crate::state::kv_events::bootstrap::{
+            fetch_snapshot, FetchAnswer, LORA_SNAPSHOT_FORMAT,
+        };
+        use crate::state::kv_events::BlockStored;
+        let ctx = ctx_with_seeded_index();
+        let index = ctx.kv_index.as_ref().unwrap().clone();
+        let worker = KvWorkerId::new("http://carrier:30000".into(), 0);
+        index.tree().store_event(
+            &worker,
+            &BlockStored {
+                block_hashes: vec![100],
+                parent_block_hash: None,
+                token_ids: vec![1, 2],
+                block_size: 64,
+                lora_id: None,
+                lora_name: Some("adapter-a".into()),
+                cache_salt: None,
+                is_bigram: false,
+                medium: Some("GPU".into()),
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::server::app::build_router(ctx.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let FetchAnswer::Body(full) = fetch_snapshot(&Client::new(), &url, Some(Duration::ZERO))
+            .await
+            .unwrap()
+        else {
+            panic!("new consumer must receive a snapshot")
+        };
+        assert_eq!(full.format, LORA_SNAPSHOT_FORMAT);
+        assert_eq!(full.nodes.len(), 2);
+        assert_eq!(full.lora_blocks.len(), 1);
+        // The cached legacy view keeps the same watermark and base holdings.
+        let legacy = parse_snapshot(get_snapshot(ctx, SNAPSHOT_PATH).await).await;
+        assert_eq!(legacy.format, 1);
+        assert!(legacy.lora_blocks.is_empty());
+        assert_eq!(legacy.nodes.len(), 1);
+        assert_eq!(legacy.nodes[0].block_hash, 7);
+        assert_eq!(legacy.workers, full.workers);
+        assert_eq!(legacy.cursors, full.cursors);
+        assert!(legacy.producer_ready);
+        server.abort();
+        index.shutdown().await;
     }
 
     /// No local index means 404, not an empty snapshot.

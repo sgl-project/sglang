@@ -2,8 +2,9 @@
 // hydration time, so keep the cookbook data self-contained.
 //
 // The serving settings in the six base recipes below were benchmarked with the
-// K2 Horizon runtime support in sgl-project/sglang#37654 and the pinned model
-// revisions. Playground overrides remain separate from the verified commands.
+// K2 Horizon runtime support in sgl-project/sglang#37654. The commands pin the
+// current model revisions; benchmark provenance is documented on the page.
+// Playground overrides remain separate from the verified commands.
 
 export const config = {
   modelName: "K2 Horizon",
@@ -213,7 +214,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 9b9ec1f7e17f62ed218df542687a144116219d84",
+        "--revision 6fbc54f7e4dc9d9cd671351f51498a1958dd2a01",
         "--tp 1",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -228,7 +229,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision c177771836a4c460743c00002c22483f6f18d1eb",
+        "--revision fe504ef19c7efa3120a9352bcfa180aa133946de",
         "--tp 1",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -243,7 +244,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 69ada542b68fe13d767479db2ab9421baff88681",
+        "--revision 85d46bbaf6ecd844a8ef61991f6e492d4faf4179",
         "--tp 1",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -258,7 +259,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision e1fd0277713e4eefcd3416348fd6fedacf7f2392",
+        "--revision eff3d24a3a40360c6fd1a1dd5723ce6329d93484",
         "--tp 2",
         "--dtype bfloat16",
         "--attention-backend fa3",
@@ -273,7 +274,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 16d20c739c687c08423422d1a2fbba6c529014cd",
+        "--revision e5c131d4d0ae196f5041284a0f9262d713083901",
         "--tp 2",
         "--dtype bfloat16",
         "--json-model-override-args '{\"xllm_source_router_gemm_partitions\":2}'",
@@ -289,7 +290,7 @@ sgl-eval run gsm8k \\
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
-        "--revision 12812264242a14dce44aa7ae27f931ff4584bcbf",
+        "--revision 70d7c58c1f8a2fc523c861c2cf7d2d339d7a8a0c",
         "--tp 8",
         "--dtype bfloat16",
         "--attention-backend fa3",

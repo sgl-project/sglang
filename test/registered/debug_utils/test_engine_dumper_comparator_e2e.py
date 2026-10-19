@@ -71,8 +71,8 @@ patches:
           hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
-              captured_last_layer_outputs=captured_last_layer_outputs,
-              capture_output=capture_output,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
               **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated')"
@@ -123,8 +123,8 @@ patches:
           hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
-              captured_last_layer_outputs=captured_last_layer_outputs,
-              capture_output=capture_output,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
               **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated dp:=attn_dp')"
@@ -197,7 +197,7 @@ class TestSourcePatcherE2ESGLang:
         _run_e2e_scenario(
             tmp_path=tmp_path,
             target_tp=BASELINE_TP,
-            extra_target_server_args=["--dp", "2", "--enable-dp-attention"],
+            extra_target_server_args=["--attn-dp-size", "2"],
             target_patch_config_yaml=PATCH_CONFIG_DP_ATTENTION_YAML,
             extra_comparator_args=[
                 "--token-aligner",
