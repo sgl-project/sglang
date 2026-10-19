@@ -89,43 +89,28 @@ class TestModelOptGGML(CustomTestCase):
 
     def test_mixed_expert_codecs_are_rejected(self):
         """One packed expert buffer cannot silently use the first expert's codec for all experts."""
-        config = quant_config(
-            {
-                "moe.experts.0.up_proj": recipe("IQ2_XXS"),
-                "moe.experts.1.up_proj": recipe("Q8_0"),
-            }
-        )
         layer = FusedMoE.__new__(FusedMoE)
         torch.nn.Module.__init__(layer)
-        with self.assertRaisesRegex(ValueError, "Mixed GGML expert formats"):
-            config.get_quant_method(layer, "moe.experts")
-
-    def test_module_level_expert_recipe_accepts_uniform_children_and_rejects_conflicts(
-        self,
-    ):
-        """An exact module recipe is valid; a conflicting child must still fail."""
-        layer = FusedMoE.__new__(FusedMoE)
-        torch.nn.Module.__init__(layer)
-        config = quant_config({"moe.experts": recipe("IQ2_XXS")})
-        method = config.get_quant_method(layer, "moe.experts")
-        expert, _ = self._expert_layer()
-        method.create_weights(expert, 2, 256, 256, torch.bfloat16)
-        expert.w13_weight.data.zero_()
-        source = torch.ones(512, 1, 66, dtype=torch.uint8)
-        method.weight_loader(expert.w13_weight, source, "up_proj.weight", "w1", 1)
-        torch.testing.assert_close(expert.w13_weight[1], source[256:])
-        for algo in ("IQ2_XXS", "Q8_0"):
-            config = quant_config(
-                {
-                    "moe.experts": recipe("IQ2_XXS"),
-                    "moe.experts.0.up_proj": recipe(algo),
+        for module_recipe in (False, True):
+            with self.subTest(module_recipe=module_recipe):
+                layers = {
+                    "moe.experts.0.up_proj": recipe("IQ2_XXS"),
+                    "moe.experts.1.up_proj": recipe("Q8_0"),
                 }
-            )
-            if algo == "IQ2_XXS":
-                config.get_quant_method(layer, "moe.experts")
-            else:
+                if module_recipe:
+                    layers["moe.experts"] = recipe("IQ2_XXS")
+                config = quant_config(layers)
                 with self.assertRaisesRegex(ValueError, "Mixed GGML expert formats"):
                     config.get_quant_method(layer, "moe.experts")
+
+    def test_module_level_expert_recipe_accepts_matching_children(self):
+        """An exact module recipe must accept absent or matching child recipes."""
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        for children in ({}, {"moe.experts.0.up_proj": recipe("IQ2_XXS")}):
+            with self.subTest(children=children):
+                config = quant_config({"moe.experts": recipe("IQ2_XXS"), **children})
+                config.get_quant_method(layer, "moe.experts")
 
     def test_uncombined_expert_output_request_is_rejected(self):
         """The helper combines outputs, so it must reject no_combine."""
@@ -235,8 +220,16 @@ class TestModelOptGGML(CustomTestCase):
         down = (
             torch.arange(256 * 2 * 66).remainder(251).to(torch.uint8).view(256, 2, 66)
         )
-        method.weight_loader(layer.w13_weight, up, "up_proj.weight", "w1", 1)
-        method.weight_loader(layer.w2_weight, down, "down_proj.weight", "w2", 1)
+        self.assertTrue(
+            method.weight_loader(
+                layer.w13_weight, up, "up_proj.weight", "w1", 1, return_success=True
+            )
+        )
+        self.assertTrue(
+            method.weight_loader(
+                layer.w2_weight, down, "down_proj.weight", "w2", 1, return_success=True
+            )
+        )
         torch.testing.assert_close(layer.w13_weight[1], up[256:])
         torch.testing.assert_close(layer.w2_weight[1], down[:, 1:])
 
@@ -249,17 +242,6 @@ class TestModelOptGGML(CustomTestCase):
         method.weight_loader(layer.w13_weight, up, "up_proj.weight", "w3", 1)
         torch.testing.assert_close(layer.w13_weight[1, :256], gate[256:])
         torch.testing.assert_close(layer.w13_weight[1, 256:], up[256:])
-
-    def test_expert_loader_success_request_still_copies_the_weight(self):
-        """Model loaders asking for success must receive True after the expert is loaded."""
-        layer, method = self._expert_layer()
-        layer.w13_weight.data.zero_()
-        source = torch.ones(512, 1, 66, dtype=torch.uint8)
-        success = method.weight_loader(
-            layer.w13_weight, source, "up_proj.weight", "w1", 1, return_success=True
-        )
-        self.assertTrue(success)
-        torch.testing.assert_close(layer.w13_weight[1], source[256:])
 
     def test_invalid_packed_expert_does_not_modify_storage(self):
         layer, method = self._expert_layer()

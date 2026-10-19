@@ -34,9 +34,28 @@ def packed_weight(rng, shape, algo):
             np.uint8
         )
     dense = gguf.dequantize(
-        raw.reshape(*shape[:-1], -1), getattr(gguf.GGMLQuantizationType, algo)
+        raw.reshape(*shape[:-1], -1), gguf.GGMLQuantizationType[algo]
     )
     return torch.from_numpy(raw).cuda(), torch.from_numpy(dense).cuda()
+
+
+def make_moe(rng, experts, *, gated, activation):
+    w1, dense1 = packed_weight(rng, (experts, 512 if gated else 256, 256), "IQ2_XXS")
+    w2, dense2 = packed_weight(rng, (experts, 256, 256), "IQ2_XXS")
+    layer = torch.nn.Module()
+    layer.moe_ep_size = layer.moe_tp_size = 1
+    layer.moe_tp_rank = 0
+    layer.num_fused_shared_experts = 0
+    layer.use_presharded_weights = False
+    config = MoeRunnerConfig(is_gated=gated, activation=activation)
+    layer.moe_runner_config = config
+    method = ModelOptGGMLMoEMethod("IQ2_XXS")
+    method.create_weights(layer, experts, 256, 256, torch.bfloat16)
+    layer.cuda()
+    layer.w13_weight.data.copy_(w1)
+    layer.w2_weight.data.copy_(w2)
+    method.create_moe_runner(layer, config)
+    return layer, method, dense1, dense2
 
 
 class TestModelOptGGMLGPU(CustomTestCase):
@@ -72,21 +91,9 @@ class TestModelOptGGMLGPU(CustomTestCase):
         torch.manual_seed(456)
         for algo in ("IQ2_XXS",):
             for gated, activation in ((False, "relu2"), (True, "silu")):
-                w1, dense1 = packed_weight(rng, (4, 512 if gated else 256, 256), algo)
-                w2, dense2 = packed_weight(rng, (4, 256, 256), algo)
-                layer = torch.nn.Module()
-                layer.moe_ep_size = layer.moe_tp_size = 1
-                layer.moe_tp_rank = 0
-                layer.num_fused_shared_experts = 0
-                layer.use_presharded_weights = False
-                config = MoeRunnerConfig(is_gated=gated, activation=activation)
-                layer.moe_runner_config = config
-                method = ModelOptGGMLMoEMethod(algo)
-                method.create_weights(layer, 4, 256, 256, torch.bfloat16)
-                layer.cuda()
-                layer.w13_weight.data.copy_(w1)
-                layer.w2_weight.data.copy_(w2)
-                method.create_moe_runner(layer, config)
+                layer, method, dense1, dense2 = make_moe(
+                    rng, 4, gated=gated, activation=activation
+                )
                 for tokens in (1, 7, 65):
                     with self.subTest(algo=algo, gated=gated, tokens=tokens):
                         x = (
@@ -138,6 +145,32 @@ class TestModelOptGGMLGPU(CustomTestCase):
                         self.assert_relative_error(
                             method.apply(layer, dispatch).hidden_states, expected
                         )
+
+    def test_moe_prefill_exceeding_cuda_grid_limit_matches_decoded_experts(self):
+        """Large prefills must preserve every token beyond the CUDA grid-z limit."""
+        rng = np.random.default_rng(789)
+        torch.manual_seed(789)
+        tokens, experts, topk = 7282, 16, 9
+        layer, method, dense1, dense2 = make_moe(
+            rng, experts, gated=False, activation="relu2"
+        )
+        x = torch.randn(tokens, 256, dtype=torch.bfloat16, device="cuda") * 0.1
+        ids = torch.arange(tokens * topk, device="cuda").remainder(experts)
+        ids = ids.view(tokens, topk).int()
+        weights = torch.rand(tokens, topk, device="cuda").softmax(-1)
+        expected = torch.zeros(tokens, 256, dtype=torch.float32, device="cuda")
+        for expert in range(experts):
+            rows, slots = torch.where(ids == expert)
+            first = F.linear(x[rows].float(), dense1[expert]).to(x.dtype)
+            intermediate = F.relu(first).square()
+            output = F.linear(intermediate.float(), dense2[expert]).to(x.dtype)
+            expected.index_add_(0, rows, output.float() * weights[rows, slots, None])
+        dispatch = SimpleNamespace(
+            hidden_states=x, topk_output=StandardTopKOutput(weights, ids, None)
+        )
+        actual = method.apply(layer, dispatch).hidden_states
+        self.assert_relative_error(actual, expected)
+        self.assert_relative_error(actual[-1:], expected[-1:])
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ Supported formats:
 
 Weights use [N, K / block_size, block_bytes] per linear layer or expert.
 Gated experts store gate/up in separate w13 halves. TP keeps blocks intact.
+Large expert batches are split to stay within the CUDA vector-kernel grid limit.
 EP, EPLB, fused shared experts and presharded expert weights are unsupported.
 Q8_0 experts are rejected. Other GGML codecs are not enabled by this adapter.
 """
@@ -238,15 +239,14 @@ class ModelOptGGMLMoEMethod(FusedMoEMethodBase):
             raise ValueError(
                 "ModelOpt GGML experts do not support applying router weights to inputs"
             )
+        activation_parameters = {
+            "gemm1_alpha": moe_runner_config.gemm1_alpha,
+            "gemm1_beta": moe_runner_config.gemm1_beta,
+            "gemm1_clamp_limit": moe_runner_config.gemm1_clamp_limit,
+            "swiglu_limit": moe_runner_config.swiglu_limit,
+        }
         custom_parameters = [
-            name
-            for name in (
-                "gemm1_alpha",
-                "gemm1_beta",
-                "gemm1_clamp_limit",
-                "swiglu_limit",
-            )
-            if getattr(moe_runner_config, name) is not None
+            name for name, value in activation_parameters.items() if value is not None
         ]
         if custom_parameters:
             raise ValueError(
@@ -267,15 +267,35 @@ class ModelOptGGMLMoEMethod(FusedMoEMethodBase):
             topk_output = topk_output.to_standard(layer_id=layer.layer_id)
         # GGUF kernels read expert IDs as int32.
         topk_ids = topk_output.topk_ids.to(torch.int32)
-        output = fused_moe_gguf(
-            x=dispatch_output.hidden_states,
-            w1=layer.w13_weight.flatten(-2),
-            w2=layer.w2_weight.flatten(-2),
-            topk_weights=topk_output.topk_weights,
-            topk_ids=topk_ids,
-            qweight_type=self.quant_type,
-            qweight_type2=self.quant_type,
-            activation=self.moe_runner_config.activation,
-            is_gated=self.moe_runner_config.is_gated,
-        )
+
+        def apply_weights(x, weights, ids):
+            return fused_moe_gguf(
+                x=x,
+                w1=layer.w13_weight.flatten(-2),
+                w2=layer.w2_weight.flatten(-2),
+                topk_weights=weights,
+                topk_ids=ids,
+                qweight_type=self.quant_type,
+                qweight_type2=self.quant_type,
+                activation=self.moe_runner_config.activation,
+                is_gated=self.moe_runner_config.is_gated,
+            )
+
+        x, weights = dispatch_output.hidden_states, topk_output.topk_weights
+        # The vector kernel needs one grid-z entry per token-expert pair.
+        chunk_size = 65535 // topk_ids.shape[1]
+        if x.shape[0] <= chunk_size:
+            output = apply_weights(x, weights, topk_ids)
+        else:
+            output = torch.cat(
+                [
+                    apply_weights(
+                        x[start : start + chunk_size],
+                        weights[start : start + chunk_size],
+                        topk_ids[start : start + chunk_size],
+                    )
+                    for start in range(0, x.shape[0], chunk_size)
+                ],
+                dim=0,
+            )
         return StandardCombineInput(hidden_states=output)
