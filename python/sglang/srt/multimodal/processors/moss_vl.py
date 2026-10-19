@@ -20,7 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import download_remote_media, resolve_media_url
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -452,9 +452,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return temp_path, temp_path
 
-        temp_path = self._write_video_bytes_to_tempfile(
-            pybase64.b64decode(value, validate=True)
-        )
+        resolved = resolve_media_url(value)
+        if resolved is None:
+            resolved = pybase64.b64decode(value, validate=True)
+        temp_path = self._write_video_bytes_to_tempfile(resolved)
         return temp_path, temp_path
 
     def _normalize_single_video_input(
