@@ -135,7 +135,7 @@ class DotsSWAMLAPrefillMetadata:
 class DotsSWAMLAAttnBackend(AttentionBackend):
     """Add Dots latent-cache SWA support around a FlashAttention backend."""
 
-    def __init__(self, backend: AttentionBackend):
+    def __init__(self, backend: AttentionBackend, *, num_swa_heads: int | None = None):
         self.backend = backend
         self._active_backend = backend
         self.token_to_kv_pool = backend.token_to_kv_pool
@@ -153,10 +153,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
             if isinstance(backend, HybridAttnBackend)
             else backend
         )
-        if (
-            getattr(native_backend, "num_attention_heads", None) == 64
-            and getattr(native_backend, "attn_cp_size", 1) == 1
-        ):
+        if num_swa_heads == 64 and getattr(native_backend, "attn_cp_size", 1) == 1:
             from sglang.srt.layers.attention.swa_mla import FlashInferMLASWA
 
             self._mla_swa = FlashInferMLASWA.create(native_backend.device)
@@ -583,8 +580,16 @@ def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
     if runner.model_config.is_draft_model:
         return _wrap_dots_swa_backend(full_attn_backend)
 
+    from sglang.srt.runtime_context import get_parallel
+
+    # FlashAttention's num_attention_heads describes full/DSA attention (128
+    # in Dots3), not SWA (64). Qualify using the actual local SWA head count.
+    num_swa_heads = (
+        runner.model_config.hf_text_config.swa_num_attention_heads
+        // get_parallel().attn_tp_size
+    )
     if runner.model_config.hf_text_config.index_topk is None:
-        return DotsSWAMLAAttnBackend(full_attn_backend)
+        return DotsSWAMLAAttnBackend(full_attn_backend, num_swa_heads=num_swa_heads)
 
     from sglang.srt.layers.attention.attention_registry import create_dsa_backend
 
@@ -595,5 +600,5 @@ def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
     )
     return DotsHybridAttnBackend(
         dsa_backend=create_dsa_backend(runner),
-        swa_backend=DotsSWAMLAAttnBackend(swa_backend),
+        swa_backend=DotsSWAMLAAttnBackend(swa_backend, num_swa_heads=num_swa_heads),
     )

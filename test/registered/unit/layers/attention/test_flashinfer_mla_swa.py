@@ -5,9 +5,10 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.swa_mla import FlashInferMLASWA
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 
 
 def test_cpu_keeps_fallback():
@@ -15,9 +16,12 @@ def test_cpu_keeps_fallback():
 
 
 @pytest.mark.parametrize(
-    "heads,cp,expected", [(64, 1, True), (8, 1, False), (64, 2, False)]
+    "heads,swa_heads,cp,expected",
+    [(128, 64, 1, True), (16, 8, 1, False), (128, 64, 2, False), (64, None, 1, False)],
 )
-def test_wrapper_prepares_only_qualified_domain(monkeypatch, heads, cp, expected):
+def test_wrapper_prepares_only_qualified_domain(
+    monkeypatch, heads, swa_heads, cp, expected
+):
     from sglang.srt.layers.attention.dots_hybrid_backend import DotsSWAMLAAttnBackend
 
     marker = object()
@@ -36,9 +40,39 @@ def test_wrapper_prepares_only_qualified_domain(monkeypatch, heads, cp, expected
         req_to_token_pool=object(),
         kv_index_translator=object(),
     )
-    wrapper = DotsSWAMLAAttnBackend(inner)
+    wrapper = DotsSWAMLAAttnBackend(inner, num_swa_heads=swa_heads)
     assert (wrapper._mla_swa is marker) == expected
     assert bool(calls) == expected
+
+
+@pytest.mark.parametrize("attn_tp_size,expected", [(1, 64), (8, 8)])
+def test_target_uses_swa_heads_not_full_attention_heads(
+    monkeypatch, attn_tp_size, expected
+):
+    from sglang.srt import runtime_context
+    from sglang.srt.layers.attention import dots_hybrid_backend as dots
+
+    monkeypatch.setattr(
+        runtime_context,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_tp_size=attn_tp_size),
+    )
+    calls = []
+    monkeypatch.setattr(
+        dots,
+        "DotsSWAMLAAttnBackend",
+        lambda backend, **kwargs: calls.append(kwargs["num_swa_heads"]),
+    )
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            is_draft_model=False,
+            hf_text_config=SimpleNamespace(
+                num_attention_heads=128, swa_num_attention_heads=64, index_topk=None
+            ),
+        )
+    )
+    dots.wrap_dots_attention_backend(runner, object())
+    assert calls == [expected]
 
 
 @pytest.mark.parametrize("kind", ["direct", "dots", "tbo", "absent"])
@@ -58,6 +92,7 @@ def test_startup_autotune_detects_native_adapter(monkeypatch, kind):
         backend = SimpleNamespace(primary=backend)
     runner = SimpleNamespace(
         device="cuda",
+        model=torch.nn.Module(),
         model_config=SimpleNamespace(quantization=None),
         attn_backend=backend,
         spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
@@ -96,17 +131,25 @@ def test_missing_aot_is_recoverable_but_other_errors_propagate(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_public_api_adapter_and_fallback(monkeypatch):
+@pytest.mark.parametrize("sq", [1, 4])
+def test_public_api_adapter_and_fallback(monkeypatch, tmp_path, sq):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("SM90 required")
     adapter = FlashInferMLASWA.create(torch.device("cuda", torch.cuda.current_device()))
     if adapter is None:
         pytest.skip("FlashInfer MLA+SWA API unavailable")
-    q = torch.randn(1, 4, 64, 1088, device="cuda", dtype=torch.bfloat16)
+    import flashinfer
+
+    q = torch.randn(1, sq, 64, 1088, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(17 * 64, 1, 1088, device="cuda", dtype=torch.bfloat16)
     table = torch.arange(17, device="cuda", dtype=torch.int32)[None]
     lengths = torch.tensor([1055], device="cuda", dtype=torch.int32)
     layer = SimpleNamespace(tp_k_head_num=1, scaling=0.0625, is_cross_attention=False)
+    cache = tmp_path / "mla_swa.json"
+    with flashinfer.autotune(True, cache=str(cache)):
+        adapter.forward(q, kv, table, lengths, layer, 1088, 1024, 513)
+    assert cache.is_file()
+    assert "mla_swa_sm90" in cache.read_text()
     expected = adapter.forward(q, kv, table, lengths, layer, 1088, 1024, 513)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
