@@ -42,7 +42,7 @@ def write_declared_regions(plan, checkpoint):
 class TestWeightLayout(unittest.TestCase):
     def test_linear_helpers_match_native_loaders(self):
         for kind in ("replicated", "column", "row", "merged"):
-            for size in (1, 2, 4):
+            for size in (1,) if kind == "replicated" else (1, 2, 4):
                 for rank in range(size):
                     with self.subTest(kind=kind, size=size, rank=rank):
                         group = SimpleNamespace(rank_in_group=rank, world_size=size)
@@ -326,7 +326,7 @@ class TestWeightLayout(unittest.TestCase):
         session = WeightTransferSession(
             engine, manifests[1], WeightParallelLayout(1), (), {}, layout_plan=plans[1]
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "layout mismatch"):
             pull_weights_from_source(
                 target_session=session,
                 source_runtime_manifests=(manifests[0],),

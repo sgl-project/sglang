@@ -3,6 +3,7 @@
 
 All child processes use this interpreter. Checkpoints are local paths; target
 daemons only use their config/tokenizer files. Logs and results stay in output-dir.
+Every case compares state; five representative layouts also run IPC inference.
 """
 
 import argparse
@@ -19,6 +20,9 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+import psutil
+import pynvml
 
 
 @dataclass(frozen=True)
@@ -47,14 +51,19 @@ class Layout:
 
 def cases():
     result = []
-    for model in ("qwen-small", "qwen-large"):
-        for source, target in ((1, 2), (2, 1), (2, 4), (4, 2)):
+    for model, pairs in (
+        ("qwen-small", ((1, 2), (2, 1), (2, 4), (4, 2))),
+        # Untied embedding coverage; the small model covers the other TP pairs.
+        ("qwen-large", ((1, 2), (2, 1))),
+    ):
+        for source, target in pairs:
             result.append(
                 (
                     f"{model}-tp{source}-to{target}",
                     model,
                     Layout(source),
                     Layout(target),
+                    model == "qwen-large" and target == 2,
                 )
             )
     for source, target in (
@@ -64,7 +73,15 @@ def cases():
         (Layout(2, adp=2), Layout(2)),
     ):
         suffix = f"{source.tp}p{source.pp}a{source.adp}-to{target.tp}p{target.pp}a{target.adp}"
-        result.append((f"qwen-small-{suffix}", "qwen-small", source, target))
+        result.append(
+            (
+                f"qwen-small-{suffix}",
+                "qwen-small",
+                source,
+                target,
+                target.pp == 2 or target.adp == 2,
+            )
+        )
     for source, target in (
         (Layout(2), Layout(4)),
         (Layout(4), Layout(2)),
@@ -76,7 +93,15 @@ def cases():
         suffix = (
             f"{source.tp}p{source.pp}e{source.ep}-to{target.tp}p{target.pp}e{target.ep}"
         )
-        result.append((f"deepseek-{suffix}", "deepseek", source, target))
+        result.append(
+            (
+                f"deepseek-{suffix}",
+                "deepseek",
+                source,
+                target,
+                target.ep == 2 or target.pp == 2,
+            )
+        )
     return result
 
 
@@ -86,14 +111,70 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def stop(process):
-    if process is not None and process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
+def live_group_pids(pgid):
+    pids = []
+    for process in psutil.process_iter(["pid", "status"]):
         try:
-            process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=15)
+            if (
+                process.info["status"] != psutil.STATUS_ZOMBIE
+                and os.getpgid(process.pid) == pgid
+            ):
+                pids.append(process.pid)
+        except ProcessLookupError:
+            pass
+    return pids
+
+
+def stop(process):
+    if process is None:
+        return
+    # A launcher can exit before its workers. Reap it and wait for the whole
+    # process group, escalating only this test's group if workers do not exit.
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 15
+        while True:
+            process.poll()
+            remaining = live_group_pids(process.pid)
+            if not remaining:
+                process.wait(timeout=15)
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.2)
+    raise TimeoutError(f"test workers did not exit: {remaining}")
+
+
+def gpu_free_memory(uuids):
+    pynvml.nvmlInit()
+    try:
+        return {
+            uuid: pynvml.nvmlDeviceGetMemoryInfo(
+                pynvml.nvmlDeviceGetHandleByUUID(uuid)
+            ).free
+            for uuid in uuids
+        }
+    finally:
+        pynvml.nvmlShutdown()
+
+
+def wait_for_gpu_memory(baseline, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        current = gpu_free_memory(baseline)
+        pending = {
+            uuid: baseline[uuid] - free
+            for uuid, free in current.items()
+            if free < baseline[uuid]
+        }
+        if not pending:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"source GPU memory was not released (bytes): {pending}")
+        time.sleep(0.2)
 
 
 def start(command, gpus, path, env):
@@ -204,8 +285,8 @@ def generate(model, layout, gpus, directory, env, timeout):
         stop(process)
 
 
-def run_case(name, model, source_layout, target_layout, args, uuids):
-    from test_weight_cache_state_compare import compare_rank
+def run_case(name, model, source_layout, target_layout, inference, args, uuids):
+    from sglang.test.weight_cache_state_compare import compare_rank
 
     directory = Path(args.output_dir) / name
     directory.mkdir(parents=True, exist_ok=True)
@@ -248,13 +329,22 @@ def run_case(name, model, source_layout, target_layout, args, uuids):
             "triton",
             "--moe-runner-backend",
             "triton",
+            "--timeout",
+            str(args.timeout),
+            "--weight-cache-timeout",
+            str(args.timeout),
         ]
+        source_memory = gpu_free_memory([uuids[i] for i in source_gpus])
         source = target = reference = None
         try:
             source = start(
                 [
                     *base,
                     *source_layout.args(),
+                    # Each local group gets its own store; no ephemeral TCP
+                    # port can be claimed between selection and worker startup.
+                    "--dist-init-method",
+                    f"file://{sockets}/source.dist",
                     "--weight-heterogeneous-transfer-mode",
                     "source",
                     "--weight-heterogeneous-transfer-host",
@@ -271,6 +361,8 @@ def run_case(name, model, source_layout, target_layout, args, uuids):
                 [
                     *base,
                     *target_layout.args(),
+                    "--dist-init-method",
+                    f"file://{sockets}/target.dist",
                     "--weight-heterogeneous-transfer-mode",
                     "target",
                     "--weight-heterogeneous-transfer-host",
@@ -285,10 +377,14 @@ def run_case(name, model, source_layout, target_layout, args, uuids):
             wait_ready(target, [uuids[i] for i in target_gpus], env, args.timeout)
             stop(source)
             source = None
-            # Wait for source workers to release their allocations before reusing GPUs.
-            time.sleep(3)
+            wait_for_gpu_memory(source_memory, args.timeout)
             reference = start(
-                [*base, *target_layout.args()],
+                [
+                    *base,
+                    *target_layout.args(),
+                    "--dist-init-method",
+                    f"file://{sockets}/reference.dist",
+                ],
                 reference_gpus,
                 directory / "reference.log",
                 env,
@@ -304,8 +400,9 @@ def run_case(name, model, source_layout, target_layout, args, uuids):
                 "state_entries": entries,
                 "compared_bytes": nbytes,
                 "status": "passed",
+                "inference": "skipped",
             }
-            if not args.skip_inference:
+            if inference and not args.skip_inference:
                 import torch
 
                 # Comparison copies reserve differently sized allocator blocks
@@ -371,7 +468,11 @@ def main():
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--case", action="append", choices=[c[0] for c in cases()])
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--skip-inference", action="store_true")
+    parser.add_argument(
+        "--skip-inference",
+        action="store_true",
+        help="Skip even the representative IPC inference smoke cases.",
+    )
     args = parser.parse_args()
     import torch
     from sglang.srt.platforms import current_platform
@@ -387,10 +488,14 @@ def main():
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     selected = {case[0]: case for case in cases()}
-    for name, model, source, target in (selected[n] for n in (args.case or selected)):
+    for name, model, source, target, inference in (
+        selected[n] for n in (args.case or selected)
+    ):
         print("RUN", name, flush=True)
         try:
-            result = run_case(name, models[model], source, target, args, uuids)
+            result = run_case(
+                name, models[model], source, target, inference, args, uuids
+            )
         except Exception as error:
             result = {"case": name, "status": "failed", "error": repr(error)}
         results.append(result)

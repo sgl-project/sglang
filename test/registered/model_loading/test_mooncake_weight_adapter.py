@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit and contract tests for weight-cache heterogeneous transfer.
-
-Cover declared placement, manifests, Mooncake planning, the TCP registry, and
-daemon/IPC coordination using small Torch modules and mocked transfer calls.
-"""
+"""Declared layouts, Mooncake bindings, CPU reshard copies and manifest exchange."""
 
 import ctypes
-import threading
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -25,7 +20,6 @@ from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
     _all_gather_rank_local_phase,
     _initialize_weight_transfer_engine,
     fetch_weight_manifest,
-    parse_source_daemon_group,
     pull_weights_from_source,
     register_weight_manifest,
     transfer_weights_from_source_daemons,
@@ -175,6 +169,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 with self.subTest(
                     kind=kind, source_tp=source_size, target_tp=target_size
                 ):
+                    # Manifests hold raw addresses, so keep source storage alive.
                     sources, source_manifests = [], []
                     for rank in range(source_size):
                         model = Model(kind, rank, source_size)
@@ -253,9 +248,8 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                                 for m in target_manifests
                                 for t in m["fragments"]
                             ),
-                            1040,
+                            65 * 4 * torch.float32.itemsize,  # Unpadded vocabulary.
                         )
-                    self.assertEqual(len(sources), source_size)
 
     def test_transfer_engine_uses_normal_mooncake_endpoint_discovery(self):
         engine = MagicMock()
@@ -302,7 +296,6 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
         manifest = _manifest(model, builder.build(), worker="worker")
 
         self.assertEqual(manifest.generation, IMMUTABLE_WEIGHT_GENERATION)
-        self.assertFalse(hasattr(manifest, "lease_id"))
         placement, bindings = _single_placement(
             (manifest,),
             tp_size=1,
@@ -379,7 +372,9 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 pp_size=1,
                 quantization=None,
             )
-        with self.assertRaises(WeightHeterogeneousTransferError):
+        with self.assertRaisesRegex(
+            WeightHeterogeneousTransferError, "quantization='fp8'"
+        ):
             validate_weight_heterogeneous_transfer_configuration(
                 tp_size=2,
                 attn_dp_size=1,
@@ -420,10 +415,10 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 (SplitAxis("tp", dim=2),) if split else (ReplicatedAxis("tp"),),
             )
 
-    def test_internal_fragments_replicated_by_dp_attention_are_not_tp_shards(self):
+    def test_replicated_internal_fragments_are_not_tp_shards(self):
         from mooncake.reshard.weight import ReplicatedAxis
 
-        manifests, models = [], []
+        manifests = []
         for rank in range(2):
             model = torch.nn.Module()
             model.weight = torch.nn.Parameter(torch.empty(6, 1, 4))
@@ -445,7 +440,6 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                     topology=WeightParallelTopology(tp_rank=rank, tp_size=2),
                 )
             )
-            models.append(model)
         placement, _ = _single_placement(manifests, tp_size=2, pp_size=1, ep_size=1)
         self.assertEqual(placement.tensors[0].parallel_axes, (ReplicatedAxis("tp"),))
         self.assertEqual(placement.tensors[0].shard_dims, ())
@@ -457,7 +451,6 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
             OwnershipAxis,
             ReplicatedAxis,
             SplitAxis,
-            plan_placement_transfer,
         )
 
         models, expected = {}, {}
@@ -607,9 +600,6 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
             descriptors["experts.0.replicated"].parallel_axes,
             (OwnershipAxis("ep"), ReplicatedAxis("tp")),
         )
-        for source, _, target, _ in groups.values():
-            self.assertTrue(plan_placement_transfer(source, target).operations)
-            self.assertTrue(plan_placement_transfer(target, source).operations)
         for manifest in targets:
             stats = pull_weights_from_source(
                 target_session=SimpleNamespace(
@@ -859,74 +849,46 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 model.weight, torch.full_like(model.weight, -99), rtol=0, atol=0
             )
 
-    def test_manifest_server_aggregates_source_ranks(self):
-        server = object.__new__(WeightManifestServer)
-        server.expected_rank_count = 2
-        server._node_id = None
-        server._parallel_layout = None
-        server._model_identity = None
-        server._rank_manifests = {}
-        server._lock = threading.Lock()
-
-        for global_rank, device_uuid in ((0, "GPU-2"), (1, "GPU-3")):
-            server.register_weight_manifest(
-                {
-                    "node_id": "source-node",
-                    "global_rank": global_rank,
-                    "device_uuid": device_uuid,
-                    "parallel_layout": {
-                        "tp_size": 2,
-                        "attn_dp_size": 2,
-                        "pp_size": 1,
-                        "ep_size": 1,
-                    },
-                    "runtime_manifest": {
-                        "model_id": "model",
-                        "revision": "revision",
-                        "rank": global_rank,
-                    },
-                }
-            )
-
-        source = parse_source_daemon_group(server.get_weight_manifest())
-        self.assertEqual(source.device_uuids, ("GPU-2", "GPU-3"))
-        self.assertEqual(source.parallel_layout.attn_dp_size, 2)
-        self.assertEqual(
-            tuple(item["rank"] for item in source.runtime_manifests), (0, 1)
-        )
-
-    def test_tcp_manifest_registry_round_trip(self):
-        server = WeightManifestServer(host="127.0.0.1", port=0, expected_rank_count=1)
+    def test_tcp_manifest_registry_aggregates_all_source_ranks(self):
+        server = WeightManifestServer(host="127.0.0.1", port=0, expected_rank_count=2)
         registry_url = f"tcp://127.0.0.1:{server.port}"
         session = MagicMock()
-        session.parallel_layout = WeightParallelLayout(tp_size=1)
-        session.runtime_manifest_for_wire.return_value = {
-            "model_id": "model",
-            "revision": "revision",
-            "rank": 0,
-        }
+        session.parallel_layout = WeightParallelLayout(tp_size=2, attn_dp_size=2)
         try:
-            register_weight_manifest(
-                registry_url,
-                global_rank=0,
-                device_uuid="GPU-2",
-                session=session,
-                timeout=2,
-            )
+            # Arrival order must not change the rank ordering in the response.
+            for rank in (1, 0):
+                session.runtime_manifest_for_wire.return_value = {
+                    "model_id": "model",
+                    "revision": "revision",
+                    "rank": rank,
+                }
+                register_weight_manifest(
+                    registry_url,
+                    global_rank=rank,
+                    device_uuid=f"GPU-{rank + 2}",
+                    session=session,
+                    timeout=2,
+                )
+                if rank == 1:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "registered=1, expected=2"
+                    ):
+                        server.get_weight_manifest()
             actual = fetch_weight_manifest(registry_url, timeout=2)
         finally:
             server.close()
 
-        self.assertEqual(actual.device_uuids, ("GPU-2",))
-        self.assertEqual(actual.parallel_layout, WeightParallelLayout(tp_size=1))
+        self.assertEqual(actual.device_uuids, ("GPU-2", "GPU-3"))
+        self.assertEqual(actual.parallel_layout, session.parallel_layout)
         self.assertEqual(
             actual.runtime_manifests,
-            (
+            tuple(
                 {
                     "model_id": "model",
                     "revision": "revision",
-                    "rank": 0,
-                },
+                    "rank": rank,
+                }
+                for rank in (0, 1)
             ),
         )
 

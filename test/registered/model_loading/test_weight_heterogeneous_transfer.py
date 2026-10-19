@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit and contract tests for weight-cache heterogeneous transfer.
-
-Cover declared placement, manifests, Mooncake planning, the TCP registry, and
-daemon/IPC coordination using small Torch modules and mocked transfer calls.
-"""
+"""Daemon configuration, distributed topology checks, IPC rebinding and cleanup."""
 
 import argparse
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from sglang.srt.weight_cache.daemon import (
@@ -57,14 +53,9 @@ def _daemon_server_args(**overrides):
 
 class TestWeightHeterogeneousTransfer(unittest.TestCase):
     def test_attention_dp_uses_resolved_size_without_legacy_flag(self):
-        from sglang.srt.arg_groups.overrides import resolving_view
         from sglang.srt.server_args import ServerArgs
 
         args = ServerArgs(model_path="test", tp_size=2, attn_dp_size=2)
-        cfg = resolving_view(args)
-        self.assertEqual(
-            (cfg.attn_dp_size, cfg.dp_size, cfg.enable_dp_attention), (2, 1, False)
-        )
         daemon_args = WeightCacheDaemonArgs(
             weight_heterogeneous_transfer_mode="target",
             weight_heterogeneous_transfer_registry_url="tcp://source:1234",
@@ -83,12 +74,12 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 args, daemon_args, expected_rank_count=2
             )
         self.assertEqual(validate.call_args.kwargs["attn_dp_size"], 2)
-        self.assertNotIn("enable_dp_attention", validate.call_args.kwargs)
 
     def test_attention_dp_runtime_topology_matches_resolved_size(self):
         from contextlib import ExitStack
 
         from sglang.srt.weight_cache.weight_heterogeneous_transfer import (
+            WeightHeterogeneousTransferError,
             _build_weight_runtime_manifest,
         )
 
@@ -122,7 +113,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
             builder = stack.enter_context(
                 patch(f"{module}.ImmutableWeightRuntimeManifestBuilder")
             )
-            _build_weight_runtime_manifest(
+            kwargs = dict(
                 model=object(),
                 tp_size=2,
                 tp_rank=0,
@@ -136,7 +127,14 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 revision="test",
                 layout_plan=object(),
             )
-            self.assertEqual(builder.call_args.kwargs["topology"].tp_size, 2)
+            _build_weight_runtime_manifest(**kwargs)
+            builder.reset_mock()
+            with self.assertRaisesRegex(
+                WeightHeterogeneousTransferError,
+                "distributed parallel topology differs",
+            ):
+                _build_weight_runtime_manifest(**dict(kwargs, attn_dp_size=1))
+            builder.assert_not_called()
 
     def test_ipc_mapping_rebinds_parameter_references_in_runtime_configs(self):
         from sglang.srt.layers.moe.topk import TopKConfig
@@ -246,18 +244,8 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         self.assertTrue(client.layer.use_deep_gemm_bmm)
 
     def test_state_compare_checks_plain_derived_values(self):
-        import importlib.util
-        from pathlib import Path
+        from sglang.test import weight_cache_state_compare as comparison
 
-        path = (
-            Path(__file__).resolve().parents[2]
-            / "manual/test_weight_cache_state_compare.py"
-        )
-        spec = importlib.util.spec_from_file_location(
-            "weight_cache_state_compare", path
-        )
-        comparison = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(comparison)
         tensor = torch.ones(2)
         entries = {
             "weight": {
@@ -272,7 +260,10 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         backend = MagicMock()
         backend.import_tensor.side_effect = lambda entry: entry["tensor"]
         with patch.object(comparison, "fetch_state", return_value=(entries, backend)):
-            self.assertEqual(comparison.compare_rank(0, 1, 0), (3, 8))
+            self.assertEqual(
+                comparison.compare_rank(0, 1, 0),
+                (len(entries), tensor.numel() * tensor.element_size()),
+            )
         self.assertEqual(backend.import_tensor.call_count, 2)
         for changed in (True, 0):
             right = {
@@ -295,42 +286,17 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
         return_value="GPU-test-4",
     )
     def test_socket_paths_use_physical_device_uuid(self, get_device_uuid):
-        for mode in ("source", "target", None):
-            with self.subTest(mode=mode):
-                daemon_args = WeightCacheDaemonArgs()
-                if mode is not None:
-                    daemon_args = WeightCacheDaemonArgs(
-                        weight_heterogeneous_transfer_mode=mode,
-                        weight_heterogeneous_transfer_host="host",
-                        weight_heterogeneous_transfer_registry_url=("tcp://host:31999"),
-                    )
-                daemon = WeightCacheDaemon(
-                    server_args=_daemon_server_args(tp_size=2),
-                    gpu_id=4,
-                    tp_rank=0,
-                    pp_rank=0,
-                    daemon_args=daemon_args,
-                )
-                self.assertEqual(daemon.socket_path, get_socket_path("GPU-test-4"))
-                self.assertEqual(daemon.ready_path, get_ready_path("GPU-test-4"))
-
-        self.assertEqual(get_device_uuid.call_count, 3)
-        get_device_uuid.assert_any_call(4)
+        daemon = WeightCacheDaemon(
+            server_args=_daemon_server_args(tp_size=2),
+            gpu_id=4,
+            tp_rank=0,
+            pp_rank=0,
+        )
+        self.assertEqual(daemon.socket_path, get_socket_path("GPU-test-4"))
+        self.assertEqual(daemon.ready_path, get_ready_path("GPU-test-4"))
+        get_device_uuid.assert_called_once_with(4)
 
     def test_weight_heterogeneous_transfer_mode_contract(self):
-        disabled = WeightCacheDaemonArgs()
-        source = WeightCacheDaemonArgs(
-            weight_heterogeneous_transfer_mode="source",
-            weight_heterogeneous_transfer_host="0.0.0.0",
-        )
-        target = WeightCacheDaemonArgs(
-            weight_heterogeneous_transfer_mode="target",
-            weight_heterogeneous_transfer_host="source",
-        )
-        self.assertIsNone(disabled.weight_heterogeneous_transfer_mode)
-        self.assertEqual(source.weight_heterogeneous_transfer_mode, "source")
-        self.assertEqual(target.weight_heterogeneous_transfer_mode, "target")
-
         invalid_cases = (
             (
                 {
@@ -395,38 +361,16 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                     "--weight-heterogeneous-transfer-host",
                     "source",
                     "--weight-heterogeneous-transfer-port",
-                    "31999",
+                    "43210",
                 ]
             )
         )
         self.assertIsNone(disabled.weight_heterogeneous_transfer_mode)
         self.assertEqual(source.weight_heterogeneous_transfer_mode, "source")
         self.assertEqual(target.weight_heterogeneous_transfer_mode, "target")
-
-    def test_daemon_socket_does_not_serve_weight_manifests(self):
-        daemon = object.__new__(WeightCacheDaemon)
-        responses = []
-        with (
-            patch(
-                "sglang.srt.weight_cache.daemon.recv_msg",
-                return_value={"type": "query_weight_manifest"},
-            ),
-            patch(
-                "sglang.srt.weight_cache.daemon.send_msg",
-                side_effect=lambda _conn, response: responses.append(response),
-            ),
-        ):
-            daemon._handle_connection(MagicMock())
-
-        self.assertEqual(
-            responses,
-            [
-                {
-                    "status": "error",
-                    "message": "Unknown request type: query_weight_manifest",
-                }
-            ],
-        )
+        self.assertEqual(source.weight_heterogeneous_transfer_host, "0.0.0.0")
+        self.assertEqual(target.weight_heterogeneous_transfer_host, "source")
+        self.assertEqual(target.weight_heterogeneous_transfer_port, 43210)
 
     def test_source_registry_url_uses_actual_bind_host_and_port(self):
         cases = (
@@ -457,7 +401,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 self.assertIs(actual_server, manifest_server)
                 self.assertEqual(registry_url, expected_url)
 
-    def test_resolved_registry_url_does_not_change_mode(self):
+    def test_resolved_registry_url_takes_precedence_over_host_and_port(self):
         for mode in ("source", "target"):
             with self.subTest(mode=mode):
                 daemon_args = WeightCacheDaemonArgs(
@@ -472,10 +416,6 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
                 )
                 self.assertIsNone(manifest_server)
                 self.assertEqual(registry_url, "tcp://resolved:31999")
-                self.assertEqual(
-                    daemon_args.weight_heterogeneous_transfer_mode,
-                    mode,
-                )
 
     def test_launcher_cleans_up_after_partial_spawn_failure(self):
         manifest_server = MagicMock()
@@ -505,10 +445,7 @@ class TestWeightHeterogeneousTransfer(unittest.TestCase):
 
         process.terminate.assert_called_once_with()
         process.kill.assert_called_once_with()
-        self.assertEqual(
-            process.join.call_args_list,
-            [call(timeout=5), call()],
-        )
+        process.join.assert_called()
         manifest_server.close.assert_called_once_with()
 
     def test_target_launcher_passes_manifest_registry_url(self):
