@@ -274,6 +274,9 @@ mod tests {
                     hicache: server_args.as_ref().into(),
                 },
             ),
+            generation_policy: crate::message::request::GenerationPolicy::from(
+                server_args.as_ref(),
+            ),
             server_args,
             chat_formatter: Some(
                 load_chat_formatter(

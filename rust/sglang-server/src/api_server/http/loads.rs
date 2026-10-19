@@ -477,6 +477,7 @@ mod tests {
                     hicache: Default::default(),
                 },
             ),
+            generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
         });

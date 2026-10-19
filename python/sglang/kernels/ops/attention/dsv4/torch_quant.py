@@ -4,8 +4,6 @@ Indexer values use per-32 UE8M0 scales; compressed KV uses per-16 E4M3 scales.
 Both paths round to the E2M1 grid with ties to even.
 """
 
-from typing import Optional
-
 import torch
 
 FP8_MAX = 448.0
@@ -62,57 +60,3 @@ def fake_quant_compressed_kv(x: torch.Tensor) -> torch.Tensor:
     scaled = (blocks / scale).clamp(-FP4_MAX, FP4_MAX)
     deq = round_fp4(scaled) * scale
     return deq.flatten(-2).to(x.dtype)
-
-
-# ---------------------------------------------------------------------------
-# Pure-torch reference of the paged V4.1 fp8 KV cache format read by the sparse
-# decode kernel (528 B/token, "V41").
-# ---------------------------------------------------------------------------
-
-
-def ceil_pow2_scale(x: torch.Tensor) -> torch.Tensor:
-    """``2 ** ceil(log2(max(x, 1e-4)))`` as fp32, computed on the IEEE bits so
-    that it is exact at (and just above) powers of two."""
-    x = x.float()
-    scale = ceil_pow2(torch.clamp_min(x, 1e-4))
-    # ceil_pow2 works on the bits of a finite value; a NaN or inf amax passes
-    # through (both become the ue8m0 NaN byte, but only the NaN one turns the
-    # whole tile's payload into NaN).
-    return torch.where(torch.isfinite(x), scale, x)
-
-
-def quantize_k_cache_v41(
-    k: torch.Tensor, page_bytes: Optional[int] = None
-) -> torch.Tensor:
-    """``k`` ``[num_pages, page_size, 512]`` -> uint8 ``[num_pages, page_bytes]``
-    pages of the V41 layout: 512 e4m3 per token, then 16 ue8m0 scales per token
-    (one per 32 values), ``scale = 2 ** ceil(log2(max(amax / 448, 1e-4)))``."""
-    num_pages, page_size, d = k.shape
-    assert d == 512
-    x = k.float().view(num_pages, page_size, 16, 32)
-    scale = ceil_pow2_scale(x.abs().amax(dim=-1) / 448.0)
-    data = (x / scale.unsqueeze(-1)).to(torch.float8_e4m3fn).view(torch.uint8)
-    scale_u8 = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
-    raw = page_size * 528
-    if page_bytes is None:
-        page_bytes = -(-raw // 512) * 512
-    assert page_bytes >= raw
-    out = torch.zeros((num_pages, page_bytes), dtype=torch.uint8, device=k.device)
-    out[:, : page_size * 512] = data.reshape(num_pages, page_size * 512)
-    out[:, page_size * 512 : raw] = scale_u8.reshape(num_pages, page_size * 16)
-    return out
-
-
-def dequantize_k_cache_v41(pages: torch.Tensor, page_size: int) -> torch.Tensor:
-    """Inverse of :func:`quantize_k_cache_v41`: ``[num_pages, page_size, 512]`` bf16."""
-    num_pages = pages.shape[0]
-    pages = pages.view(torch.uint8)
-    data = pages[:, : page_size * 512].reshape(num_pages, page_size, 512)
-    scale = pages[:, page_size * 512 : page_size * 528].reshape(
-        num_pages, page_size, 16
-    )
-    values = data.view(torch.float8_e4m3fn).to(torch.bfloat16)
-    scale_bf16 = scale.view(torch.float8_e8m0fnu).to(torch.bfloat16)
-    return (values.view(num_pages, page_size, 16, 32) * scale_bf16.unsqueeze(-1)).view(
-        num_pages, page_size, 512
-    )

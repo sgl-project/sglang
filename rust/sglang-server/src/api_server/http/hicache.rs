@@ -138,6 +138,7 @@ mod tests {
         (
             routes().with_state(Arc::new(AppState {
                 core,
+                generation_policy: crate::message::request::GenerationPolicy::from(&args),
                 server_args: Arc::new(args),
                 chat_formatter: None,
             })),

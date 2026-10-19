@@ -60,6 +60,11 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "GetHiCacheStorageRequest" => {
                 check::<api::GetHiCacheStorageRequest>(&name, input, canonical)
             }
+            "ListModelsResponse" => check::<api::ListModelsResponse>(&name, input, canonical),
+            "DetokenizeRequest" => check::<api::DetokenizeRequest>(&name, input, canonical),
+            "DetokenizeResponse" => check::<api::DetokenizeResponse>(&name, input, canonical),
+            "AbortRequest" => check::<api::AbortRequest>(&name, input, canonical),
+            "AbortResponse" => check::<api::AbortResponse>(&name, input, canonical),
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }
