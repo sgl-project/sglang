@@ -317,18 +317,7 @@ class TestSamplingMaskCapture(CustomTestCase):
 
 
 class TestAscendSamplingMaskCapture(CustomTestCase):
-    """Ascend (NPU) sampling-mask support.
-
-    The Ascend backend samples straight from temperature-scaled logits through a
-    fused kernel, so the mask has to come from the post-filter weights that kernel
-    exported instead of being replayed afterwards. These tests pin that export
-    contract on the torch fallback branch of
-    ``top_k_top_p_min_p_sampling_from_logits_ascend``, which runs on any device
-    once torch_npu's fused op is hidden.
-
-    End-to-end coverage on an NPU host lives in
-    ``test/registered/npu/basic_function/backends/test_npu_sampling_mask.py``.
-    """
+    """Ascend mask capture with mocked fused and torch fallback paths."""
 
     def setUp(self):
         self.sampler = Sampler.__new__(Sampler)
@@ -368,11 +357,7 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
 
     @staticmethod
     def _fused_op_output(logits, top_k):
-        """What torch_npu.npu_top_k_top_p returns: the top_k logits of each row.
-
-        The op filters in logit space, so the excluded entries are driven to -inf
-        and the softmax applied right after it yields exact zeros for them.
-        """
+        """Mock fused logits with non-top-k entries set to -inf."""
         masked = torch.full_like(logits, float("-inf"))
         top_ids = logits.topk(top_k, dim=-1).indices
         return masked.scatter_(1, top_ids, logits.gather(1, top_ids))
@@ -427,18 +412,12 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             mask = output.next_token_sampling_mask_idx[row].tolist()
             weights = capture.weights[row]
             support = weights > 0
-            # The mask is duplicate-free, bounded by top_k and, most importantly,
-            # contains the token the kernel actually drew.
             self.assertEqual(len(mask), len(set(mask)))
             self.assertLessEqual(len(mask), top_k)
             self.assertIn(int(sampled[row]), mask)
             self.assertTrue(bool(support[int(sampled[row])]))
-            # Support is packed in descending weight order, so the mask must be the
-            # top-weighted entries of the exported row, in that same order.
             self.assertEqual(mask, weights.topk(len(mask)).indices.tolist())
-            # Truncated entries are exact zeros so weights > 0 is the support.
             self.assertEqual(int((~support).sum()), vocab_size - len(mask))
-            # Logprob contract: log(p_selected / sum(p_support)).
             expected = math.log(
                 float(weights[int(sampled[row])]) / float(weights[support].sum())
             )
@@ -505,8 +484,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             )
         )
 
-        # Vocab order is what lets the mask builder read the column index as the
-        # token id, so compare against the top-k computed in token order.
         expected_ids = torch.softmax(logits, dim=-1).topk(top_k, dim=-1).indices[0]
         support_ids = (filtered_probs[0] > 0).nonzero(as_tuple=True)[0]
         self.assertEqual(sorted(support_ids.tolist()), sorted(expected_ids.tolist()))
@@ -529,8 +506,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             torch.zeros(batch_size, dtype=torch.int64),
         )
 
-        # Without the opt-in the caller gets the bare token IDs back, so nothing
-        # extra is materialized and existing callers keep working unchanged.
         self.assertEqual(tuple(sampled.shape), (batch_size,))
 
     def test_fused_export_is_vocab_ordered(self):
@@ -560,8 +535,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
             )
 
         self.assertIsNotNone(capture)
-        # The exported weights must be the op's own softmax in vocabulary order.
-        # Every drawn column is positive in that copy, so the repair is a no-op.
         self.assertTrue(
             torch.equal(capture.weights, torch.softmax(fused_logits, dim=-1))
         )
@@ -665,13 +638,10 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
                 )
             )
 
-        # Exporting before the float64 log-space draw skips the exp() round trip,
-        # so the support is the op's float32 softmax, not a re-exp'd copy of it.
         self.assertEqual(filtered_probs.dtype, torch.float32)
         self.assertTrue(
             torch.equal(filtered_probs, torch.softmax(fused_logits, dim=-1))
         )
-        # multinomial_with_seed is mocked to draw index 0 of the vocab-ordered row.
         self.assertEqual(int(sampled[0]), 0)
 
     def test_seeded_torch_fallback_export_is_vocab_ordered(self):
@@ -703,8 +673,6 @@ class TestAscendSamplingMaskCapture(CustomTestCase):
         self.assertEqual(filtered_probs.dtype, torch.float32)
         support_ids = (filtered_probs[0] > 0).nonzero(as_tuple=True)[0]
         self.assertEqual(sorted(support_ids.tolist()), sorted(expected_ids.tolist()))
-        # The mocked draw takes sorted-order index 0, which the code maps back
-        # through probs_idx, so the sampled token is the row's top-1 token.
         self.assertEqual(int(sampled[0]), int(expected_ids[0]))
 
 

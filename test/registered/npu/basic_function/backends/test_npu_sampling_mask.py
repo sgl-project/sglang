@@ -22,12 +22,7 @@ _MAX_NEW_TOKENS = 4
 
 
 class TestAscendSamplingMask(CustomTestCase):
-    """Testcase: Verify that the Ascend sampling backend reports the sampling support
-    it actually drew from when `return_sampling_mask` is requested.
-
-    The Ascend backend samples through a fused kernel that keeps the truncated
-    distribution internal, so it cannot replay top-k/top-p afterwards the way the
-    other backends do; it has to export the post-filter weights of that kernel.
+    """Verify Ascend sampling-mask output.
 
     [Test Category] Backends
     [Test Target] --sampling-backend ascend, return_sampling_mask
@@ -87,11 +82,9 @@ class TestAscendSamplingMask(CustomTestCase):
         for token_id, mask, logprobs in zip(
             output_ids, masks, sampling_logprobs, strict=True
         ):
-            # The mask must describe the support the kernel drew the token from.
             self.assertIn(token_id, mask)
             self.assertEqual(len(mask), len(set(mask)))
-            # The fused op can retain cutoff ties, so realized support may
-            # contain more than top_k tokens.
+            # Cutoff ties can make support larger than top_k.
             self.assertLessEqual(len(mask), _SAMPLING_MASK_MAX_TOKENS)
             self.assertEqual(len(mask), len(logprobs))
             self.assertTrue(all(math.isfinite(logprob) for logprob in logprobs))
@@ -113,7 +106,6 @@ class TestAscendSamplingMask(CustomTestCase):
             self.assertGreaterEqual(len(mask), 1)
 
     def test_greedy_sampling_mask(self):
-        # Greedy sampling pins top_k to 1, so the support is the single argmax token.
         body = self._generate({"temperature": 0.0, "top_k": 1})
         output_ids = body["output_ids"]
         masks = body["meta_info"]["output_token_sampling_mask"]

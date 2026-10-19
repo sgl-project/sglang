@@ -627,12 +627,7 @@ class Sampler(nn.Module):
         """Sample from temperature-scaled logits without softmax.
 
         Used for the Ascend NPU backend which handles softmax internally.
-
-        When the batch requested sampling masks, also returns the post-filter
-        weights the token was drawn from, in vocabulary order and for the full
-        batch. The Ascend backend needs this export because its fused kernels
-        otherwise keep the truncated distribution internal, leaving nothing to
-        build a sampling mask from.
+        Also returns vocab-ordered filtered weights when a mask is requested.
         """
         return_sampling_mask = sampling_info.sampling_mask_batch_indices is not None
         filtered_probs = None
@@ -646,14 +641,12 @@ class Sampler(nn.Module):
             else:
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             if return_sampling_mask:
-                # Nothing is truncated here, so the whole softmax is the support
-                # the token was drawn from.
                 filtered_probs = probs
         else:
             assert self.use_ascend_backend, (
                 "Only ascend backend supports sampling from logits"
             )
-            ascend_result = top_k_top_p_min_p_sampling_from_logits_ascend(
+            sample_result = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
                 sampling_info.top_ks,
                 sampling_info.top_ps,
@@ -665,9 +658,9 @@ class Sampler(nn.Module):
                 return_filtered_probs=return_sampling_mask,
             )
             if return_sampling_mask:
-                batch_next_token_ids, filtered_probs = ascend_result
+                batch_next_token_ids, filtered_probs = sample_result
             else:
-                batch_next_token_ids = ascend_result
+                batch_next_token_ids = sample_result
         return batch_next_token_ids.to(torch.int32), filtered_probs
 
     def _forward_ascend_backend(
@@ -687,7 +680,7 @@ class Sampler(nn.Module):
             A tuple of (batch_next_token_ids, logprobs, sampling_mask_capture).
             logprobs is None when return_logprob is False or
             SGLANG_RETURN_ORIGINAL_LOGPROB is set. sampling_mask_capture is None
-            unless the batch requested sampling masks.
+            unless a sampling mask is requested.
         """
         return_sampling_mask = sampling_info.sampling_mask_batch_indices is not None
         logits.div_(sampling_info.temperatures)
@@ -710,13 +703,7 @@ class Sampler(nn.Module):
         filtered_probs: torch.Tensor,
         sampling_info: SamplingBatchInfo,
     ) -> _SamplingMaskCapture:
-        """Build the mask capture from the weights the Ascend kernel exported.
-
-        Replaying top-k/top-p would risk disagreeing with the kernel that drew the
-        token, so the exported copy is the support source. The drawn column is left
-        exactly as exported, which keeps ``weights > 0`` the same support predicate
-        the other backends use.
-        """
+        """Capture exported weights without replaying top-k/top-p."""
         capture_rows = sampling_info.sampling_mask_batch_indices
         assert capture_rows is not None, (
             "Sampling-mask capture requested without any opted-in batch rows."
@@ -874,13 +861,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
     """A top-k, top-p and min-p sampling implementation for ascend npu with torch_npu interface.
 
     Takes temperature-scaled logits as input (softmax is applied internally).
-
-    By default, returns only the sampled token IDs. With return_filtered_probs,
-    also returns the post-filter weights in **vocabulary order** (full batch,
-    shape [batch, vocab]): exactly the distribution the returned token was drawn
-    from, with truncated entries set to an exact 0. Callers use it to report the
-    sampling support, so the filters must keep writing exact zeros for it to
-    describe the sampler's action space.
+    With return_filtered_probs, also returns vocab-ordered filtered weights.
     """
     filtered_probs = None
     # torch_npu.npu_top_k_top_p requires top_k value range in [1, 1024]
@@ -894,10 +875,6 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
         if return_filtered_probs:
-            # The fused op preserves token order and the filters above only write
-            # exact zeros, so this is already vocab-ordered support. Reference it
-            # before the seeded draw below makes a float64 copy: neither
-            # multinomial nor that conversion mutates this tensor.
             filtered_probs = probs_top_k_top_p
 
         if sampling_seed is None:
@@ -906,10 +883,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             logprobs_top_k_top_p = probs_top_k_top_p.to(
                 torch.float64
             )  # Using float64 for numerical stability
-            if not return_filtered_probs:
-                # Drop the float32 weights before allocating their float64 copy;
-                # filtered_probs keeps them alive when the export asked for them.
-                del probs_top_k_top_p
+            del probs_top_k_top_p
             logprobs_top_k_top_p.log_()
             batch_next_token_ids = multinomial_with_seed(
                 logprobs_top_k_top_p, sampling_seed, positions
@@ -936,11 +910,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
         if return_filtered_probs:
-            # probs_sort is in descending order; scatter it back to token-id order
-            # once, in float32, before sampling consumes it. Exporting here instead
-            # of after the draw below also avoids the float64 log/exp round trip,
-            # which would perturb the support by an ulp. probs_idx is still int64,
-            # which scatter_ requires.
+            # Keep filtered float32 weights in token order.
             filtered_probs = torch.zeros_like(probs_sort).scatter_(
                 1, probs_idx, probs_sort
             )
@@ -951,8 +921,6 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             logprobs = probs_sort.to(
                 torch.float64
             )  # Using float64 for numerical stability
-            # The exported weights are a separate vocab-ordered scatter copy.
-            # The sorted float32 weights are no longer needed for the draw.
             del probs_sort
             logprobs.log_()
             sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
