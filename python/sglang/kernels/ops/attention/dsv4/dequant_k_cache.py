@@ -11,7 +11,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
-# v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
+# v4 KV cache layout (see kvcache.dsv4_main_kv_store._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
 #              7 ue8m0 scales padded to 8 bytes.
 #   per-page:  [token 0..P-1 nope+rope (P*576 bytes)] [token 0..P-1 scale (P*8 bytes)]

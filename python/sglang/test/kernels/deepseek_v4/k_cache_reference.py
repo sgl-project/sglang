@@ -12,7 +12,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     PADDED_SCALE_PER_TOKEN,
     TILE_SIZE,
 )
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn

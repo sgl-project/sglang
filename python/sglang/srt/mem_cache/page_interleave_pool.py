@@ -56,10 +56,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged,
 )
+from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -794,7 +794,7 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
             "cannot write indexer keys for a skip-topk layer"
         )
         if pool._shard_extend_active:
-            index_buf_accessor.SetKAndS.execute(
+            dsa_index_k_cache.SetKAndS.execute(
                 pool=pool,
                 buf=pool._slots[layer_id % 2].tensors["index_k"],
                 loc=pool.translate_loc_to_scratch(loc),

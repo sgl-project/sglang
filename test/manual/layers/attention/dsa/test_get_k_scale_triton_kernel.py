@@ -1,6 +1,6 @@
 import torch
 
-from sglang.kernels.ops.attention.dsa.index_buf_accessor import (
+from sglang.kernels.ops.kvcache.dsa_index_k_cache import (
     _get_k_and_s_triton_kernel,
 )
 

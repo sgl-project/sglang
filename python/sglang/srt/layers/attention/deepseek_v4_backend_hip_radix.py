@@ -2800,6 +2800,7 @@ class DeepseekV4HipRadixBackend(
         wo_a_quant_freqs (fp8 decode): return the inverse-RoPE'd wo_a mxfp8
         operands instead of the attention output."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
@@ -2832,7 +2833,7 @@ class DeepseekV4HipRadixBackend(
             if save_kv_cache:
                 # Only verify reaches this under fp8; plain decode's rows are
                 # written by the fused kernel itself, which leaves kv None.
-                runtime.store_swa_into_unified(
+                dsv4_unified_kv_store.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
                     positions=positions,
@@ -3044,7 +3045,7 @@ class DeepseekV4HipRadixBackend(
             n_real = kv.shape[0] if _cp_active else state_slot_full.shape[0]
             # the store launches one program per kv row and never checks these lengths
             assert min(state_slot_full.shape[0], positions_full.shape[0]) >= n_real
-            runtime.store_swa_into_unified(
+            dsv4_unified_kv_store.store_swa_into_unified(
                 kv=kv[:n_real],
                 state_slot=state_slot_full[:n_real],
                 positions=positions_full[:n_real],
