@@ -36,7 +36,6 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
     mmmu_pro_max_tokens = 32768
     mmmu_pro_load_preset_from_model_id = MODEL
 
-    tp_size = 4
     mem_fraction_static = "0.8"
     max_running_requests = "32"
     graph_args = [
@@ -63,7 +62,7 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
             other_args=[
                 "--trust-remote-code",
                 "--tp",
-                str(cls.tp_size),
+                "4",
                 "--speculative-algorithm",
                 "DSPARK",
                 "--speculative-dspark-block-size",
