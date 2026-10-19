@@ -2,12 +2,8 @@ import pytest
 import torch
 
 from sglang.kernels.ops.diffusion import (
-    fused_gelu_active,
-    mount_fused_linear_gelu,
-    mount_nvfp4_bias_gelu,
-    nvfp4_bias_gelu_active,
-    unmount_fused_linear_gelu,
-    unmount_nvfp4_bias_gelu,
+    FUSED_LINEAR_GELU,
+    NVFP4_BIAS_GELU,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
@@ -48,13 +44,13 @@ def test_wan_gelu_mlp_quality_path_and_lossless_restore():
 
     x = torch.randn(2, 129, 64, device="cuda", dtype=torch.bfloat16)
     reference = mlp(x)
-    assert not fused_gelu_active(mlp)
+    assert not FUSED_LINEAR_GELU.is_enabled(mlp)
 
-    assert mount_fused_linear_gelu(mlp)
+    assert FUSED_LINEAR_GELU.mount(mlp)
     torch.testing.assert_close(mlp(x), reference, atol=2e-2, rtol=2e-2)
 
-    unmount_fused_linear_gelu(mlp)
-    assert not fused_gelu_active(mlp)
+    FUSED_LINEAR_GELU.unmount(mlp)
+    assert not FUSED_LINEAR_GELU.is_enabled(mlp)
     assert torch.equal(mlp(x), reference)
 
 
@@ -71,13 +67,13 @@ def test_wan_nvfp4_mlp_defers_bias_for_gelu_fusion():
     assert mlp.fuse_bias_gelu_tanh
     assert not mlp.fc_in.skip_bias_add
     assert not mlp.fc_out.skip_bias_add
-    assert not nvfp4_bias_gelu_active(mlp)
+    assert not NVFP4_BIAS_GELU.is_enabled(mlp)
 
-    assert mount_nvfp4_bias_gelu(mlp)
-    assert nvfp4_bias_gelu_active(mlp)
+    assert NVFP4_BIAS_GELU.mount(mlp)
+    assert NVFP4_BIAS_GELU.is_enabled(mlp)
     assert mlp.fc_in.skip_bias_add
-    unmount_nvfp4_bias_gelu(mlp)
-    assert not nvfp4_bias_gelu_active(mlp)
+    NVFP4_BIAS_GELU.unmount(mlp)
+    assert not NVFP4_BIAS_GELU.is_enabled(mlp)
     assert not mlp.fc_in.skip_bias_add
 
 
@@ -94,4 +90,4 @@ def test_wan_nvfp4_mlp_does_not_mark_excluded_linear():
 
     assert not mlp.fuse_bias_gelu_tanh
     assert not mlp.fc_in.skip_bias_add
-    assert not mount_nvfp4_bias_gelu(mlp)
+    assert not NVFP4_BIAS_GELU.mount(mlp)
