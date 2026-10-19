@@ -1818,9 +1818,7 @@ def biased_grouped_topk_gpu(
         # The kernel wants the total width; select_experts passes a routed-only
         # topk on the aiter path only (`num_routed_topk if _use_aiter else top_k`).
         #
-        # On aiter this route folds whatever the flag says, as
-        # aiter_biased_grouped_topk does and is_routed_scaling_factor_fused_in_topk
-        # assumes, whether or not this call is given the shared slots.
+        # AITER folds this route even when no shared slots are requested.
         return jit_grouped_gate(
             gating_output,
             correction_bias.to(dtype=torch.float32),
@@ -2211,21 +2209,12 @@ else:
 
 
 def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
-    """Whether the routed weights a TopK with this config emits already carry
-    routed_scaling_factor.
-
-    When true, no step after top-k may apply the factor again, and a fused
-    shared expert's weight must not compensate for it. HashTopK routing folds
-    the factor only when its own flag asks for it.
-    """
+    """Whether routing already applied the scale that the MoE epilogue must skip."""
     if topk_config.apply_routed_scaling_factor_on_output:
         return True
     if not _use_aiter:
         return False
-    # Two aiter routes fold the factor whatever the flag says: grouped routing with
-    # a correction bias (aiter_biased_grouped_topk, or the unified Triton router),
-    # and ungrouped sqrtsoftplus routing (aiter topk_gating, or rocm_router_gate).
-    # Grouped routing without a bias and the other ungrouped routes do not.
+    # AITER always folds biased grouped and ungrouped sqrtsoftplus routing.
     if topk_config.use_grouped_topk:
         return topk_config.correction_bias is not None
     return (
@@ -2237,8 +2226,7 @@ def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
 def fused_shared_expert_weight(
     *, routed_scaling_factor: Optional[float], fused_in_topk: bool
 ) -> float:
-    """Top-k weight that makes a fused shared expert's output count exactly once;
-    fused_in_topk is is_routed_scaling_factor_fused_in_topk's answer."""
+    """Shared-slot weight that cancels any later routed-output scaling."""
     if fused_in_topk or not routed_scaling_factor:
         return 1.0
     # The routed output, shared column included, is scaled by the factor later.
@@ -2252,16 +2240,7 @@ def remap_topk_for_per_rank_shared_slots(
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK IDs to a per-rank shared-slot layout.
-
-    DeepEP and MegaMoE dispatch need each rank's shared expert at a unique ID
-    so tokens route to the correct rank. The layout is ordered by rank:
-    [rank0 routed..., rank0 shared, rank1 routed..., rank1 shared, ...].
-
-    Routed IDs:  e -> e + (e // num_local_routed) * num_fused_shared_experts
-    Shared IDs:  ep_rank * num_local_experts + num_local_routed
-    Shared weight: fused_shared_expert_weight.
-    """
+    """Map routed and shared columns into rank-major expert blocks."""
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
 

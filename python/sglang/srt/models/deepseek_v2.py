@@ -638,8 +638,7 @@ def _scale_routed_and_add_shared(
     routed_scaling_factor: float,
     fused_in_topk: bool,
 ) -> torch.Tensor:
-    """Finish an all-to-all MoE output: apply routed_scaling_factor unless top-k
-    already did, then add the shared experts' output."""
+    """Apply any outstanding routed scale before adding the shared output."""
     if shared is not None:
         if fused_in_topk:
             return shared.add_(routed)
@@ -831,8 +830,7 @@ class DeepseekV2MoE(nn.Module):
                 and not _uses_per_rank_shared_slots
                 and not self.routed_scaling_factor_fused_in_topk
             ):
-                # The global AITER append also needs to compensate for this
-                # model's post-MoE multiply, in addition to EP replication.
+                # Compensate for both post-MoE scaling and EP replication.
                 self.topk.topk_config.fused_shared_experts_scaling_factor = (
                     fused_shared_expert_weight(
                         routed_scaling_factor=self.routed_scaling_factor,

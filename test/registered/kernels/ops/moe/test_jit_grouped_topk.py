@@ -186,9 +186,7 @@ def test_router_is_asked_for_the_total_width(monkeypatch, use_aiter):
 def test_routed_weights_carry_the_factor_where_later_steps_skip_it(
     monkeypatch, use_aiter
 ):
-    """On aiter the steps after top-k skip routed_scaling_factor, so the router
-    must fold it even when select_experts hands it no shared slots, which it
-    does on that path; elsewhere the caller's flag (off here) decides."""
+    """AITER routing must fold the scale even without shared slots."""
     from sglang.srt.layers.moe import topk as topk_mod
 
     monkeypatch.setenv("SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK", "1")

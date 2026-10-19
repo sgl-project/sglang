@@ -1,18 +1,4 @@
-"""Unit tests for routed_scaling_factor counting exactly once around a MoE block.
-
-routed_scaling_factor is applied either in top-k, folded into the routed weights
-(aiter, or a quant method that asks for it), or to the MoE output after the
-experts. Every step that applies it or compensates for it must agree on which:
-
-  * a fused shared expert's topk weight, on the per-rank-slot path and under
-    Waterfill: 1.0 when the factor is folded in top-k, else 1/rsf so that the
-    later multiply nets it out to 1.0x.
-  * the two-batch-overlap MoE epilogue: scales the routed output only when top-k
-    did not.
-  * standard EP path (no per-rank slots): every rank computes the fused shared
-    expert and the outputs are all-reduced, so the model-supplied 1/ep_size
-    factor must be applied to the shared weight.
-"""
+"""Routed and shared contributions must each receive their scale exactly once."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -131,9 +117,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         return topk.waterfill_balancer.shared_weight
 
     def test_waterfill_shared_weight_matches_the_per_rank_slot(self):
-        # Waterfill and the per-rank slot place the same fused shared expert, and
-        # its weight is 1.0 only where the route really folded rsf: a folding
-        # quant method's flag, or aiter's biased grouped router (not aiter as such).
+        # Both append paths must compensate for the same routing scale.
         rsf = self.ROUTED_SCALING_FACTOR
         cases = (
             # (use_aiter, folded_in_topk, routing, shared weight for a net 1.0x)
@@ -161,8 +145,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                 self.assertAlmostEqual(per_rank_slot, expected)
 
     def test_two_batch_overlap_epilogue_applies_factor_once(self):
-        """The two-batch-overlap MoE epilogue must not scale the combined routed
-        output again when top-k already folded routed_scaling_factor into it."""
+        """The overlap epilogue must apply the routed scale exactly once."""
         torch.manual_seed(0)
         routed = torch.randn(4, 6)
         shared = torch.randn(4, 6)
@@ -253,10 +236,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             )
 
     def test_deepseek_moe_takes_the_fold_from_the_router_it_builds(self):
-        """Every step after top-k reads routed_scaling_factor_fused_in_topk, so it
-        must follow the router the block built: the quant method's fold flag, or
-        on aiter a route that folds (biased grouped routing, DeepSeek-V4's
-        sqrtsoftplus gate), never grouped routing without a bias or hash routing."""
+        """The MoE epilogue must follow the constructed router's folding policy."""
         cases = (
             # (folded_in_topk, use_aiter, route, routed weights carry rsf)
             (False, False, {}, False),

@@ -26,8 +26,7 @@ def _set_dummy_server_args():
 
 @pytest.mark.parametrize("use_aiter", [False, True])
 def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch, use_aiter):
-    # Hash routing never folds routed_scaling_factor, on aiter either, so the
-    # shared slot keeps 1/rsf for the multiply after the experts.
+    # Hash routing leaves scaling to the MoE epilogue, including on AITER.
     monkeypatch.setattr(topk_module, "_use_aiter", use_aiter)
     monkeypatch.setattr(hash_topk_module, "_is_xpu", False)
     monkeypatch.setattr(
