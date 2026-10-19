@@ -391,6 +391,7 @@ def run_bench_serving(
     gsp_num_groups=None,
     gsp_prompts_per_group=None,
     cache_report=False,
+    min_host_hit_rate_pct=None,
     env=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
@@ -623,6 +624,24 @@ def run_bench_serving(
         reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
+
+    if min_host_hit_rate_pct is not None:
+        host_hit = metrics.get("host_hit_rate_pct")
+        if host_hit is None:
+            raise Exception(
+                "No host hit rate found in bench_serving output while "
+                "min_host_hit_rate_pct is set (did the server run with "
+                "--enable-cache-report and the bench with --cache-report?)"
+            )
+        dump_metric("host_hit_rate", float(host_hit), labels={"type": "perf"})
+        dump_metric(
+            "host_hit_rate_baseline",
+            float(min_host_hit_rate_pct),
+            labels={"type": "perf"},
+        )
+        assert float(host_hit) >= float(min_host_hit_rate_pct), (
+            f"L2 host hit rate {host_hit}% is below {min_host_hit_rate_pct}%"
+        )
 
     return metrics
 
@@ -1027,32 +1046,6 @@ def assert_metrics(self, metrics):
         self.assertGreaterEqual(
             float(metrics["accept_length"]) / spec_num_draft_tokens,
             self.accept_rate,
-        )
-
-    # L2 (host) hit rate from --cache-report: dumped whenever the report is
-    # present; once a host_hit_rate baseline is set, a missing report must
-    # fail the test instead of being silently skipped.
-    host_hit_rate = getattr(self, "host_hit_rate", None)
-    if host_hit_rate and metrics.get("host_hit_rate_pct"):
-        dump_metric(
-            "host_hit_rate",
-            float(metrics["host_hit_rate_pct"]),
-            labels={"test_case": tc_name, "type": "perf"},
-        )
-        dump_metric(
-            "host_hit_rate_baseline",
-            float(host_hit_rate),
-            labels={"test_case": tc_name, "type": "perf"},
-        )
-    if host_hit_rate:
-        self.assertIsNotNone(
-            metrics.get("host_hit_rate_pct"),
-            "host hit rate not found in bench_serving output "
-            "while host_hit_rate baseline is set",
-        )
-        self.assertGreaterEqual(
-            float(metrics["host_hit_rate_pct"]),
-            float(host_hit_rate),
         )
 
 

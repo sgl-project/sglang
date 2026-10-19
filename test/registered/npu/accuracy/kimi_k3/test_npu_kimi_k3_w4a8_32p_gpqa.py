@@ -8,7 +8,6 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
-    assert_metrics,
     run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -141,7 +140,6 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     }
     timeout = 10000
     seed = 42
-    tpot = ttft = mean_e2e_latency = output_token_throughput = None
     host_hit_rate = 10
 
     def test_npu_kimi_k3_w4a8_32p_gpqa(self):
@@ -149,10 +147,10 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
         self.run_accuracy()
 
     def test_npu_kimi_k3_w4a8_32p_l2_host_hit_rate(self):
-        """Run the 64k GSP bench; assert_metrics checks the host hit rate"""
+        """Run the 64k GSP bench; run_bench_serving asserts the host hit rate"""
         # 3 groups x 32 prompts share a 57600-token prefix (64k * 0.9), which
         # exceeds L1 so evictions land in L2 (observed host hit 15.9%~20.5%).
-        metrics = run_bench_serving(
+        run_bench_serving(
             host=self.host,
             port=self.port,
             model_path=self.model_config.get("model_path"),
@@ -166,8 +164,8 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
             seed=42,
             warmup_requests=16,
             cache_report=True,
+            min_host_hit_rate_pct=self.host_hit_rate,
         )
-        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":
