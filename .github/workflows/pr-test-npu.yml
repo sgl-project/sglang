@@ -320,7 +320,7 @@ jobs:
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -368,10 +368,7 @@ jobs:
         run: python3 scripts/ci/utils/diffusion/prefetch_input_image.py
 
       - name: Run test
-        # Coverage mode: round-robin sharding is less balanced than PR-mode
-        # LPT (heavier part gets 4 targets incl. server starts per target),
-        # so widen the cap.
-        timeout-minutes: ${{ inputs.coverage_mode == true && 90 || 60 }}
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -380,32 +377,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
-        # bash only: the k8s runner pool defaults to `sh -e`, which lacks
-        # `[[` and mapfile — under sh the coverage branch silently falls
-        # through to the PR-mode path below.
-        shell: bash
         run: |
-          # Coverage mode: enumerate case-level pytest node ids and run each
-          # through run_tests_with_coverage.sh (per-target coverage dirs on
-          # the 800t shared disk). PR mode below stays unchanged.
-          if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
-            pip install coverage==7.8.*
-            # Coverage tracing inflates Python-heavy stage timings (e.g. text
-            # encoding ~2.5x); widen the non-denoise stage tolerance so
-            # coverage runs collect data without perf-gating.
-            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=3.0
-            python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-1-npu-a3 \
-              --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 2 \
-              -o /tmp/selected_tests.txt
-            echo "Selected test targets:"
-            cat /tmp/selected_tests.txt
-            if [ -s /tmp/selected_tests.txt ]; then
-              mapfile -t targets < /tmp/selected_tests.txt
-              bash scripts/ci/npu/precise-test/run_tests_with_coverage.sh "${targets[@]}"
-            fi
-            exit 0
-          fi
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-npu \
@@ -423,7 +395,7 @@ jobs:
 
   multimodal-gen-test-4-npu-a3:
     needs: [check-changes, pr-gate, set-image-config, base-a-test-npu]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.multimodal_gen == 'true' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -466,10 +438,7 @@ jobs:
           python3 scripts/ci/utils/diffusion/prefetch_consistency_gt.py
 
       - name: Run test
-        # Coverage mode: round-robin sharding is less balanced than PR-mode
-        # LPT (heavier part gets 4 targets incl. server starts per target),
-        # so widen the cap.
-        timeout-minutes: ${{ inputs.coverage_mode == true && 90 || 60 }}
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -478,32 +447,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
-        # bash only: the k8s runner pool defaults to `sh -e`, which lacks
-        # `[[` and mapfile — under sh the coverage branch silently falls
-        # through to the PR-mode path below.
-        shell: bash
         run: |
-          # Coverage mode: enumerate case-level pytest node ids and run each
-          # through run_tests_with_coverage.sh (per-target coverage dirs on
-          # the 800t shared disk). PR mode below stays unchanged.
-          if [[ "${{ inputs.coverage_mode }}" == "true" ]]; then
-            pip install coverage==7.8.*
-            # Coverage tracing inflates Python-heavy stage timings (e.g. text
-            # encoding ~2.5x); widen the non-denoise stage tolerance so
-            # coverage runs collect data without perf-gating.
-            export SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=3.0
-            python3 scripts/ci/npu/precise-test/list_tests.py --hw npu --suite multimodal-gen-test-4-npu-a3 \
-              --auto-partition-id ${{ matrix.part }} \
-              --auto-partition-size 2 \
-              -o /tmp/selected_tests.txt
-            echo "Selected test targets:"
-            cat /tmp/selected_tests.txt
-            if [ -s /tmp/selected_tests.txt ]; then
-              mapfile -t targets < /tmp/selected_tests.txt
-              bash scripts/ci/npu/precise-test/run_tests_with_coverage.sh "${targets[@]}"
-            fi
-            exit 0
-          fi
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-npu \
@@ -722,8 +666,6 @@ jobs:
         base-b-test-4-npu-a3,
         base-b-test-8-npu-a3,
         base-b-test-16-npu-a3,
-        multimodal-gen-test-1-npu-a3,
-        multimodal-gen-test-4-npu-a3,
         base-c-test-acc-2-npu-a3,
         base-c-test-acc-16-npu-a3,
         base-c-test-perf-2-npu-a3,

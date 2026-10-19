@@ -17,7 +17,6 @@ Usage:
 import argparse
 import glob
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -40,75 +39,6 @@ HW_MAPPING = {
     "xpu": HWBackend.XPU,
     "mlx": HWBackend.MLX,
 }
-
-# Multimodal diffusion suites are driven by their own runner
-# (sglang/multimodal_gen/test/run_suite.py), not the test/registered
-# registry, so they are enumerated separately: case-level pytest node ids
-# for the parametrized server tests, file-level for standalone tests.
-# Keys are the job/suite names passed via --suite (same convention as the
-# registered suites).
-MULTIMODAL_SUITE_FILES = {
-    "multimodal-gen-test-1-npu-a3": ("ascend/test_server_1_npu.py",),
-    "multimodal-gen-test-4-npu-a3": (
-        "ascend/test_server_2_npu.py",
-        "ascend/test_glm_image_distributed.py",
-    ),
-}
-MULTIMODAL_TEST_ROOT = (
-    REPO_ROOT / "python" / "sglang" / "multimodal_gen" / "test" / "server"
-)
-
-
-def list_multimodal_targets(suites) -> list:
-    """List multimodal test targets (absolute paths) for the given suites.
-
-    Parametrized server tests are listed as case-level pytest node ids so
-    each case gets its own coverage directory; files without parametrized
-    diffusion cases (standalone tests) are listed as file-level targets.
-    """
-    targets = []
-    for suite in sorted(suites):
-        for rel_path in MULTIMODAL_SUITE_FILES.get(suite, ()):
-            test_file = MULTIMODAL_TEST_ROOT / rel_path
-            if not test_file.is_file():
-                print(f"Warning: multimodal test file not found: {test_file}")
-                continue
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    "--collect-only",
-                    "-q",
-                    f"--rootdir={REPO_ROOT}",
-                    str(test_file),
-                ],
-                cwd=str(REPO_ROOT),
-                capture_output=True,
-                text=True,
-            )
-            node_ids = [
-                line
-                for line in proc.stdout.splitlines()
-                if "::test_diffusion_generation[" in line
-            ]
-            if not node_ids:
-                if proc.returncode != 0:
-                    print(
-                        f"Warning: pytest collection failed for {test_file}:\n"
-                        f"{proc.stderr.strip()}"
-                    )
-                # Standalone (or uncollectable) file: file-level target.
-                targets.append(str(test_file))
-                continue
-            for node_id in node_ids:
-                # --collect-only emits rootdir-relative node ids; absolutize
-                # so the coverage dir encoding keeps the full workspace
-                # prefix (____w__sglang__sglang__...) of the CI checkout.
-                if not os.path.isabs(node_id):
-                    node_id = str(REPO_ROOT / node_id)
-                targets.append(node_id)
-    return targets
 
 
 def main():
@@ -200,22 +130,9 @@ def main():
             ci_tests, args.auto_partition_id, args.auto_partition_size
         )
 
-    # Multimodal diffusion suites (own runner, not test/registered): append
-    # their case-level pytest node ids. Returns [] for non-multimodal suites,
-    # so existing jobs are unaffected.
-    multimodal_targets = list_multimodal_targets(suites)
-    # auto_partition only handles CIRegistry objects; round-robin the string
-    # targets so each matrix shard gets a balanced subset.
-    if args.auto_partition_size:
-        multimodal_targets = multimodal_targets[
-            args.auto_partition_id :: args.auto_partition_size
-        ]
-
     with open(args.output, "w") as f:
         for t in ci_tests:
             f.write(t.filename + "\n")
-        for target in multimodal_targets:
-            f.write(target + "\n")
 
 
 if __name__ == "__main__":
