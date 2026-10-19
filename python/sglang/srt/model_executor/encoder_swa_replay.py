@@ -28,6 +28,12 @@ def fold_encoder_swa_replay(worker, batch) -> Optional[FoldedExtend]:
     return _fold_batch(batch=batch, runner=runner, rows=rows)
 
 
+def resets_swa_window(req) -> bool:
+    """Whether this step starts the request's SWA window: a new request slot or a
+    retraction. The prefill budget and `encoder_swa_reset` both read this."""
+    return req.kv.req_pool_idx is None or req.is_retracted
+
+
 def replay_len(prefix_len: int) -> int:
     """Cached tokens replayed in front of a hit's extend: the last SWA window.
     The prefill budget, the MLP-sync row count and the fold all read this."""
@@ -49,14 +55,16 @@ def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:
     forward_batch.encoder_swa_compress_rows = folded.keep_rows
 
 
-def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
+def drop_folded_rows(
+    *, logits_output, folded: FoldedExtend, tail_lens: Optional[list[int]] = None
+) -> None:
     """Hand downstream consumers (the DSpark draft) only the original extend rows."""
     hidden = logits_output.hidden_states
     token_indices = logits_output.hidden_states_token_indices
     if token_indices is not None:
         # Decoder-SWA tail rows index the folded extend; keep those on original rows.
         keep = _tail_rows_on_original(
-            folded=folded, num_tail_rows=token_indices.shape[0]
+            folded=folded, tail_lens=tail_lens, num_tail_rows=token_indices.shape[0]
         ).to(token_indices.device, non_blocking=True)
         logits_output.hidden_states_token_indices = folded.scheduled_row[
             token_indices[keep]
@@ -68,13 +76,11 @@ def drop_folded_rows(*, logits_output, folded: FoldedExtend) -> None:
         logits_output.hidden_states = hidden[folded.keep_rows]
 
 
-def _tail_rows_on_original(*, folded: FoldedExtend, num_tail_rows: int):
-    # Each request's tail is its last SWA_WINDOW folded rows; replay rows lead it.
-    from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
-
+def _tail_rows_on_original(
+    *, folded: FoldedExtend, tail_lens: list[int], num_tail_rows: int
+):
     keep, off = [], 0
-    for n, r in zip(folded.batch.extend_lens, folded.replay_lens):
-        tail = min(SWA_WINDOW, n)
+    for n, r, tail in zip(folded.batch.extend_lens, folded.replay_lens, tail_lens):
         keep.append(torch.arange(off + max(0, tail - (n - r)), off + tail))
         off += tail
     assert off == num_tail_rows, (off, num_tail_rows)

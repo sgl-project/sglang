@@ -9,6 +9,13 @@ from sglang.kernels.ops.attention.dsv4.request_window_copy import (
     copy_packed_rows,
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
+
+# A window row the replay expects but no longer holds; that request's attention
+# would read the wrong rows.
+_SWA_HISTORY_PRESENT = Invariant(
+    "dsv41.swa_history_present", Bucket.FATAL_CONTAINABLE, IsTrue()
+)
 
 
 class WindowLayout(msgspec.Struct, frozen=True):
@@ -271,13 +278,12 @@ class RequestWindow:
                 raise RuntimeError("request-window metadata was not activated")
             src = self._history_src(layout)
             if not in_capture:
-                valid = layout.history_valid
-                if not torch.equal(
-                    self.tags[layer, src][valid], layout.history_pos[valid]
-                ):
-                    raise RuntimeError(
-                        "SWA history is missing: replay or window ownership is invalid"
-                    )
+                expect(
+                    _SWA_HISTORY_PRESENT,
+                    (self.tags[layer, src] == layout.history_pos)
+                    | ~layout.history_valid,
+                    msg="replay or window ownership is invalid",
+                )
             copy_packed_tokens(
                 self.state.kv_buffer[layer],
                 self.workspace.kv_buffer[0],
