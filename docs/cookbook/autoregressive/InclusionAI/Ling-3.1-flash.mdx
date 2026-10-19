@@ -85,7 +85,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 
 ### Performance
 
-On H200 TP8 + EP8 with NEXTN and the decode gates enabled, batch-size-1 output throughput measures **251.2 tokens/s**. GB300 NEXTN batch-size-1 result: `180.0 tok/s (TPOT 5.14 ms, accept 2.59)`.
+On H200 TP8 with NEXTN and the decode gates enabled, batch-size-1 output throughput measures **269.2 tokens/s** (TP8 + EP8: 239.5 tokens/s). GB300 TP4 with NEXTN measures **175.3 tokens/s** (`TPOT 5.22 ms, accept 2.60`; TP4 + EP4: 160.0 tokens/s).
 
 Acceptance length is the mean number of tokens accepted per speculative verification step, including the target bonus token:
 
@@ -122,7 +122,7 @@ python3 -m sglang.bench_serving \
   --flush-cache --seed 11
 ```
 
-For the concurrency-32 row in the benchmark widget:
+For the saturation row in the benchmark widget, launch the H200 **High-Throughput** recipe instead and run:
 
 ```bash Command
 python3 -m sglang.bench_serving \
@@ -130,9 +130,9 @@ python3 -m sglang.bench_serving \
   --host localhost --port 30000 \
   --model inclusionAI/Ling-3.1-flash \
   --dataset-name random \
-  --random-input-len 4096 --random-output-len 512 \
+  --random-input-len 8192 --random-output-len 1024 \
   --random-range-ratio 1 \
-  --num-prompts 96 --max-concurrency 32 \
+  --num-prompts 256 --max-concurrency 48 \
   --flush-cache --seed 11
 ```
 
@@ -147,7 +147,7 @@ sgl-eval run gsm8k \
   --num-threads 32
 ```
 
-Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. For the H200 NEXTN recipe, compare the stop rate with the measured 99.85%; accuracy alone can hide generations that reach the token limit.
+Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. For the H200 NEXTN recipes, compare the stop rate with the measured 99.77% (Low-Latency) or 99.92% (High-Throughput); accuracy alone can hide generations that reach the token limit.
 
 </Accordion>
 
