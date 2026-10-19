@@ -254,7 +254,7 @@ def _reference(t, ratio: int):
     )
     index_cache = tuple(torch.zeros_like(buf) for buf in t.index_cache)
     if t.index_k_split:
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
             store_fp4_index_k_cache_split,
         )
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4

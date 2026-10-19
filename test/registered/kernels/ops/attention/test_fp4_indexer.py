@@ -16,12 +16,12 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
-    store_fp4_index_k_cache,
 )
 from sglang.kernels.ops.attention.dsv4.rope import (
     apply_rotary_emb_triton,
     precompute_freqs_cis,
 )
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (

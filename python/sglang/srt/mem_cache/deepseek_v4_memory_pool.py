@@ -718,7 +718,7 @@ class DeepSeekV4IndexerPool(KVCache):
         if self.uses_aiter_fp4_layout:
             # the FlyDSL kernels read the fp4 payload and the packed ue8m0 scales
             # from two buffers
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
                 store_fp4_index_k_cache_split,
             )
 
@@ -731,7 +731,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 rne=self.index_k_rne,
                 page8=self.index_k_page8,
             )
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
             store_fp4_index_k_cache,
         )
 

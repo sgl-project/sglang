@@ -86,7 +86,7 @@ _TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
 # halving from bf16→fp8 = 2× saving — net ~46% read bandwidth reduction).
 _FP8_GROUP_SIZE = 64
 # Match the KV-cache write format: fnuz only on AMD gfx942; Other platform e.g.
-# gfx950 store e4m3fn. See quant_k_cache.py / indexer.py FP8_DTYPE.
+# gfx950 store e4m3fn. See quantization/dsa_quant_k_cache.py / indexer.py FP8_DTYPE.
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 

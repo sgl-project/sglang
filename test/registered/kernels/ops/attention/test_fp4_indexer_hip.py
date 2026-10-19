@@ -58,7 +58,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     rowgroup_paged_mqa_logits,
     rowgroup_prefill_query_start_loc,
     rowgroup_table_columns,
-    store_fp4_index_k_cache_split,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
@@ -76,6 +75,9 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 )
 from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
+    store_fp4_index_k_cache_split,
+)
 from sglang.kernels.ops.quantization.fp4_indexer_quant import (
     _fp4_e2m1_code_rne,
     quantize_fp4_indexer_tensor,

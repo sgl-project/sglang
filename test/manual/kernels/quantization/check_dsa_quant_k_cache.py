@@ -1,7 +1,7 @@
 import torch
 import triton
 
-from sglang.kernels.ops.attention.dsa.quant_k_cache import (
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     _quantize_k_cache_fast_wrapped,
     quantize_k_cache,
     quantize_k_cache_separate,

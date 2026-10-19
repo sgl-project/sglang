@@ -83,3 +83,13 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.store_fp4_index_k_cache",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache:store_fp4_index_k_cache"
+        ),
+    )
+)
