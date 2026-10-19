@@ -238,15 +238,19 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
     cfg = resolving_view(server_args)
     if not cfg.enable_encoder_swa_bounded_replay:
         return
+    # A hit's first chunk also runs up to 128 replay rows and floors its extend to
+    # whole pages, so a smaller chunk leaves the hit no page and it never admits.
+    min_chunk = 128 + (cfg.page_size or 1)
     if (
         cfg.max_running_requests is None
         or cfg.max_running_requests <= 0
         or not cfg.chunked_prefill_size
-        or cfg.chunked_prefill_size < 128
+        or cfg.chunked_prefill_size < min_chunk
     ):
         raise ValueError(
             "encoder SWA replay requires --max-running-requests > 0 and at least "
-            "128 chunked prefill tokens per attention DP rank"
+            f"{min_chunk} chunked prefill tokens per attention DP rank (128 replay "
+            "tokens plus one page)"
         )
 
 
