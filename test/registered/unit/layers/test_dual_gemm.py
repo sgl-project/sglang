@@ -13,7 +13,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="4-gpu-b200")
 
 _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 2048

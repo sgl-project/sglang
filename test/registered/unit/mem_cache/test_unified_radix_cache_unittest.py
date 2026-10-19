@@ -125,7 +125,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=75, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 # A dedicated test entry point overrides this without changing the process-wide

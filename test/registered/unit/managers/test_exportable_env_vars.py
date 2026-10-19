@@ -9,7 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs, exportable_env_vars
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestSchedulerInternalStateEnvVars(unittest.TestCase):

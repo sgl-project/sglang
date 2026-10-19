@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 probe = OpenAIServingChat._probe_prompt_text_round_trip
 engine_prompt = OpenAIServingChat._engine_prompt

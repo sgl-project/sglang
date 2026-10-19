@@ -39,7 +39,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.runtime_context import get_context
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class CustomTokenizerWorker(TokenizerWorker):

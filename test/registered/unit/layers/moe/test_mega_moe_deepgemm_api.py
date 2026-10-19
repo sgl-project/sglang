@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.runtime_context import get_context, get_exec, get_flags, get_parallel
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):

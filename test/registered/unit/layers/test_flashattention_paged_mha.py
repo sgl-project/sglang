@@ -26,7 +26,7 @@ with patch.dict(
     )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _backend():

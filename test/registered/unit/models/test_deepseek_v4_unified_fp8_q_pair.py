@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # deliberately != head_dim below: the row width has to come off the pool, since
 # that is the stride the kernel reads Q with. Sharing head_dim's value would let
