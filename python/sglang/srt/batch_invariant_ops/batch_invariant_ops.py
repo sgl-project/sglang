@@ -199,8 +199,9 @@ def _matmul_persistent_configs() -> dict:
         },
     }
     if _is_gfx95:
-        # Measured on MI350X: the fastest configuration over the bf16 GEMM shapes of
-        # Qwen3-8B and Qwen3.8-27B, M = 1-4096; it needs gfx950's 160 KB of LDS.
+        # Measured on MI350X: faster than the default on average over M = 1-4096
+        # on dense and MoE linear shapes up to N ~ 8k, neutral on wider N; needs
+        # gfx950's 160 KB of LDS.
         configs[torch.bfloat16] = {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 64,
