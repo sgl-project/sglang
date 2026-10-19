@@ -161,7 +161,7 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
         mamba_pool=target_mamba,
         full_layer_mapping={layer: i for i, layer in enumerate(full_layers)},
         swa_layer_mapping={layer: i for i, layer in enumerate(swa_layers)},
-        mamba_layer_mapping={i: i for i in range(target_layers)},
+        start_layer=0,
         page_size=16,
         tp_group=None,
         load_cache_event=None,

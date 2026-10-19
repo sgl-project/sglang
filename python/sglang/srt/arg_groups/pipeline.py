@@ -112,6 +112,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
+    # Model-arch environment defaults; must precede handle_gpu_memory_settings,
+    # whose heuristic reads the post-capture KV sizing switch.
+    from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+    apply_muse_spark_env_defaults(server_args)
+
     run_hook(handle_multimodal, server_args)
     run_hook(handle_ssl_validation, server_args)
     run_hook(handle_asr_validation, server_args)
