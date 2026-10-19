@@ -16,6 +16,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
@@ -77,6 +78,22 @@ def _resolve_trtllm_sparse_decode():
     except ImportError:
         return None
     return trtllm_batch_decode_with_kv_cache
+
+
+@lru_cache(maxsize=1)
+def _resolve_flydsl_sparse_decode():
+    """The fused gfx950 FlyDSL decode module, or None when off or unavailable."""
+    if not (is_hip() and envs.SGLANG_ENABLE_QSA_FLYDSL_DECODE.get()):
+        return None
+    try:
+        from aiter.ops.flydsl import qsa_sparse_decode as qsa_flydsl
+    except ImportError:
+        logger.warning(
+            "QSA FlyDSL decode requested but aiter.ops.flydsl.qsa_sparse_decode "
+            "is unavailable"
+        )
+        return None
+    return qsa_flydsl
 
 
 @lru_cache(maxsize=1)
@@ -253,6 +270,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
         self._trtllm_counters = {}
+        self._flydsl_decode_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
@@ -1814,6 +1832,75 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return output.reshape(q.shape[0], -1)
 
+    def _forward_flydsl_fused_sparse(
+        self,
+        flydsl_decode,
+        q: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        layer,
+        forward_batch,
+        metadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """gfx950 sparse decode straight from the pool: no gather, KV split across CTAs.
+
+        Each query row is its own length-one sequence, so speculative verify rows
+        need nothing extra.
+        """
+        batch, topk = topk_indices.shape
+        num_kv_heads = k_buffer.shape[1]
+        num_splits = flydsl_decode.recommended_num_splits(
+            batch, num_kv_heads, topk, q.device
+        )
+        workspace = self._get_flydsl_decode_workspace(
+            flydsl_decode,
+            batch * q.shape[1] * num_splits,
+            q.shape[1],
+            num_kv_heads,
+            k_buffer.shape[2],
+            topk,
+            q.device,
+        )
+        output = flydsl_decode.flydsl_qsa_sparse_decode(
+            q.contiguous(),
+            k_buffer,
+            v_buffer,
+            self.req_to_token_pool.req_to_token,
+            (
+                metadata.row_req_pool_indices
+                if metadata.row_req_pool_indices is not None
+                else forward_batch.req_pool_indices
+            ),
+            topk_indices,
+            metadata.sequence_lengths,
+            layer.scaling,
+            num_splits=num_splits,
+            workspace=workspace,
+        )
+        return output.reshape(q.shape[0], -1)
+
+    def _get_flydsl_decode_workspace(
+        self, flydsl_decode, partials, num_q_heads, num_kv_heads, head_dim, topk, device
+    ):
+        # Sized once for every captured batch: graphs keep raw pointers to it, so
+        # it is never reallocated. A larger eager batch gets a per-call workspace.
+        if self._flydsl_decode_workspace is None:
+            capacity = max(
+                partials,
+                flydsl_decode.workspace_partials(
+                    self._cuda_graph_max_tokens, num_q_heads, num_kv_heads, topk, device
+                ),
+            )
+            self._flydsl_decode_workspace = (
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity, dtype=torch.float32, device=device),
+                torch.empty(capacity * head_dim, dtype=torch.float32, device=device),
+            )
+        if self._flydsl_decode_workspace[0].numel() < partials:
+            return None
+        return self._flydsl_decode_workspace
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1868,6 +1955,21 @@ class QwenSparseAttnBackend(AttentionBackend):
                 metadata,
                 topk_indices,
                 trtllm_decode,
+            )
+
+        flydsl_decode = _resolve_flydsl_sparse_decode()
+        if flydsl_decode is not None and flydsl_decode.can_use_flydsl_qsa_sparse_decode(
+            q, k_buffer, v_buffer
+        ):
+            return self._forward_flydsl_fused_sparse(
+                flydsl_decode,
+                q,
+                k_buffer,
+                v_buffer,
+                layer,
+                forward_batch,
+                metadata,
+                topk_indices,
             )
 
         batch, topk = topk_indices.shape
