@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -19,11 +20,12 @@ _UNO_INTERNAL_LORA_NAME = "__uno_draft__"
 
 # LoRA pool capacity includes the base-model slot.
 _UNO_LORA_POOL_CAPACITY = 2
+logger = logging.getLogger(__name__)
 
 
 def uno_lora_backend_for_device(device: str) -> str:
     """Select the internal UNO LoRA backend for the execution device."""
-    return "ascend" if str(device).startswith("npu") else "uno_cublas"
+    return "uno_ascend" if str(device).startswith("npu") else "uno_cublas"
 
 
 def init_uno_lora_manager(
@@ -73,6 +75,12 @@ def init_uno_lora_manager(
     #   None             -> base model
     #   uno_ref.lora_id  -> base model + UNO draft LoRA
     manager.fetch_new_loras({None, uno_ref.lora_id})
+    logger.info(
+        "UNO LoRA initialized: backend=%s, rank=%s, adapter=%s",
+        manager.lora_backend.name,
+        manager.max_lora_rank,
+        lora_path,
+    )
 
     return manager, uno_ref.lora_id
 

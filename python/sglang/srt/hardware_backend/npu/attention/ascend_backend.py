@@ -1465,7 +1465,9 @@ class AscendAttnBackend(AttentionBackend):
             # recomputes it): gathering seq_lens[:bs] here would force a D2H
             # sync for models (e.g. DSA+MTP) whose replay path is otherwise
             # sync-free.
-            if _is_dflash_verify(spec_info):
+            if _is_uno_forward(spec_info):
+                metadata.seq_lens_cpu_list = attention_kv_lens_cpu.tolist()
+            elif _is_dflash_verify(spec_info):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:

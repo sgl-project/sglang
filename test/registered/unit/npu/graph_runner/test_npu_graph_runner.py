@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=12, suite="base-a-test-npu")
 
 
-def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
+def make_backend(*, dflash=False, dspark=False, uno=False, width=1, bs=4, raw_bs=2):
     backend = mod.NPUCudaGraphBackend.__new__(mod.NPUCudaGraphBackend)
     attention = SimpleNamespace(forward_metadata=None)
     runner = runner_mod.DecodeCudaGraphRunner.__new__(runner_mod.DecodeCudaGraphRunner)
@@ -29,6 +29,7 @@ def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
                 hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
             ),
             spec_algorithm=SimpleNamespace(
+                is_uno=lambda: uno,
                 is_dflash=lambda: dflash,
                 is_dspark=lambda: dspark,
                 is_dflash_family=lambda: dflash or dspark,
@@ -334,3 +335,12 @@ def test_dflash_preparation_refreshes_lengths_and_cache_slots():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def test_uno_replay_uses_final_host_lengths_without_adding_width():
+    backend, runner, _ = make_backend(uno=True, width=8)
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_target_verify=lambda: True),
+        seq_lens_cpu=torch.tensor([32, 64], dtype=torch.int32),
+    )
+    assert backend._decode_update_lengths(batch) == [32, 64, 0, 0]
