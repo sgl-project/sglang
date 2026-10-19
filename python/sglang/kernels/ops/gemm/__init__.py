@@ -166,6 +166,17 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.nvfp4_gemm_swiglu_nvfp4_quant",
+        backend=KernelBackend.CUTE_DSL,
+        target=(
+            "sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant"
+            ":nvfp4_gemm_swiglu_nvfp4_quant"
+        ),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
         target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",

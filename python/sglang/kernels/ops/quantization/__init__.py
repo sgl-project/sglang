@@ -123,19 +123,6 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
-register_kernel(
-    KernelSpec(
-        op="quantization.nvfp4_gemm_swiglu_nvfp4_quant",
-        backend=KernelBackend.CUTE_DSL,
-        target=(
-            "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
-            ":nvfp4_gemm_swiglu_nvfp4_quant"
-        ),
-        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
-    )
-)
-
-
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(

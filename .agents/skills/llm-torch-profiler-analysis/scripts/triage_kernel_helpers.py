@@ -700,7 +700,7 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
         pattern="Fused MoE activation + quant / re-quant",
         candidate_path=(
             "python/sglang/srt/layers/moe/ep_moe/kernels.py"
-            "<br>python/sglang/kernels/ops/quantization/nvfp4_gemm_swiglu_nvfp4_quant.py"
+            "<br>python/sglang/kernels/ops/gemm/nvfp4_gemm_swiglu_nvfp4_quant.py"
             "<br>python/sglang/srt/layers/moe/cutlass_w4a8_moe.py"
         ),
         active_keywords=(

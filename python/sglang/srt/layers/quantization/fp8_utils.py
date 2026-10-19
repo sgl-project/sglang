@@ -938,13 +938,13 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
 
         return dot_scaled_mxfp8_blockscaled_linear
     if backend.is_gfx95_mxfp8_native():
-        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
             mxfp8_native_blockscaled_linear,
         )
 
         return mxfp8_native_blockscaled_linear
     if backend.is_gfx95_mxfp8_aiter():
-        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import (
             aiter_mxfp8_blockscaled_linear,
         )
 
