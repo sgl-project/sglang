@@ -208,6 +208,7 @@ class AFDDirectDeepEPAdapter:
             True,
             self._role is AFDRole.ATTN,
             True,
+            True,
         )
 
         torch.cuda.synchronize()
