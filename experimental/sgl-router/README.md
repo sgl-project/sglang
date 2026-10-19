@@ -325,9 +325,14 @@ unset fields inherit the CLI flags. See
   `session_aware`); see [optional tokenizer](REFERENCE.md#optional-tokenizer-for-load-only-routing).
 - **Retries**: `--retry-max-attempts N` resends a request that failed before
   any response to another worker; see [retries](REFERENCE.md#retries).
+- **Circuit breaker**: a worker leaves routing after `--cb-threshold`
+  consecutive failures; `--disable-circuit-breaker` turns this off; see
+  [circuit breaker](REFERENCE.md#circuit-breaker).
 - **DP-rank routing**: `--dp-aware` also picks the DP rank inside multi-rank
   engines, and `--dp-rank-policy round_robin` cycles ranks that no routing key
-  or cached prefix decides; see [DP-rank routing](REFERENCE.md#dp-rank-routing).
+  or cached prefix decides; in PD mode, `--decode-dispatch-limit N` picks the
+  decode rank shortly before the KV arrives; see
+  [DP-rank routing](REFERENCE.md#dp-rank-routing).
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).

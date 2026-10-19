@@ -663,7 +663,16 @@ class TpModelWorker(BaseTpWorker):
                     drop_folded_rows,
                 )
 
-                drop_folded_rows(logits_output=logits_output, folded=folded)
+                tail = self.model_runner.attn_backend.tail_forward_metadata
+                drop_folded_rows(
+                    logits_output=logits_output,
+                    folded=folded,
+                    tail_lens=(
+                        None
+                        if tail is None
+                        else tail.late_layer_tail.extend_seq_lens_cpu
+                    ),
+                )
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,

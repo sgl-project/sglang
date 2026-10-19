@@ -449,7 +449,10 @@ struct TopKRadixBase : TopKConfig {
     uint32_t count_gt;
     float v_hi;
     float v_lo;
-    uint32_t warp_sum[kNumWarps];
+    union {
+      uint32_t warp_sum[kNumWarps];
+      uint32_t tie_nonzero;
+    };
     // The coarse histogram is dead once find_threshold() has published its
     // boundaries, and the tie machinery only comes alive after that, so the two
     // phases overlay. tie_handle and tie_values are live TOGETHER, so they sit
@@ -470,6 +473,14 @@ struct TopKRadixBase : TopKConfig {
   };
 
  protected:
+  SGL_DEVICE static bool is_zero_bin(float lower) {
+#ifdef USE_ROCM
+    return __float_as_uint(lower) == 0u;
+#else
+    return false;
+#endif
+  }
+
   template <uint32_t N = 1, typename F>
   SGL_DEVICE static void for_each_input(const float* __restrict__ in, uint32_t seq_len, F&& fn) {
     constexpr auto kStride = N * kBlockSize;
@@ -719,6 +730,12 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto topk = problem.topk;
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
+    const bool zero_bin = is_zero_bin(v_lo);
+    if (zero_bin) {
+      // find_threshold has finished using the overlaid warp sums.
+      if (tx == 0) smem->tie_nonzero = 0;
+      __syncthreads();
+    }
 
 #pragma unroll
     for (uint32_t i = 0; i < kLocalVecs; ++i) {
@@ -736,6 +753,7 @@ struct TopKRegister : TopKRadixBase<12> {
           }
         } else if (val >= v_lo) {
           const auto pos = atomicAdd(&smem->count_eq, 1);
+          if (zero_bin && __float_as_uint(val) != 0u) atomicOr(&smem->tie_nonzero, 1u);
           if (pos < kMaxNumTie) [[likely]] {
             smem->tie_values[pos] = {val, idx};
           }
@@ -745,7 +763,7 @@ struct TopKRegister : TopKRadixBase<12> {
 
     // Phase 4: Handle ties.
     __syncthreads();
-    if (smem->count_eq > kMaxNumTie) [[unlikely]] {
+    if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
       // Buffer holds an arrival-order subset; re-stage it on the exact key.
       refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
     }
@@ -805,6 +823,11 @@ struct TopKStreaming : TopKRadixBase<12> {
     const auto v_hi = smem->v_hi;
     const auto v_lo = smem->v_lo;
     const auto topk = problem.topk;
+    const bool zero_bin = is_zero_bin(v_lo);
+    if (zero_bin) {
+      if (tx == 0) smem->tie_nonzero = 0;
+      __syncthreads();
+    }
     for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t idx) {
       if (val >= v_hi) {
         const auto pos = atomicAdd(&smem->count_gt, 1);
@@ -813,6 +836,7 @@ struct TopKStreaming : TopKRadixBase<12> {
         }
       } else if (val >= v_lo) {
         const auto pos = atomicAdd(&smem->count_eq, 1);
+        if (zero_bin && __float_as_uint(val) != 0u) atomicOr(&smem->tie_nonzero, 1u);
         if (pos < kMaxNumTie) [[likely]] {
           smem->tie_values[pos] = {val, idx};
         }
@@ -825,7 +849,7 @@ struct TopKStreaming : TopKRadixBase<12> {
     // "above" and "tie" sets. above_count is < topk by the threshold-bin invariant,
     // so the count_gt guard above effectively never triggers.
     __syncthreads();
-    if (smem->count_eq > kMaxNumTie) [[unlikely]] {
+    if (smem->count_eq > kMaxNumTie && (!zero_bin || smem->tie_nonzero != 0)) [[unlikely]] {
       // See the register path.
       refine_ties(problem, smem, v_lo, v_hi, smem->count_eq);
     }
