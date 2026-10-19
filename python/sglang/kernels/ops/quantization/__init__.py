@@ -122,13 +122,3 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
-
-# Public entry points inventoried by logical operator group (RFC #29630).
-register_kernel(
-    KernelSpec(
-        op="quantization.cvt_fp8_e4m3",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.quantization.fp8_cvt:cvt_fp8_e4m3",
-        capabilities=CUDA_ONLY,
-    )
-)
