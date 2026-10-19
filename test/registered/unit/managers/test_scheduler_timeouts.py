@@ -141,6 +141,8 @@ class TestWaitingTimeout(CustomTestCase):
             self.assertEqual(s._poll_timeout_aborts(), [])
 
     def test_dllm_waiting_timeout_after_queue_transfer(self):
+        """Queued dLLM timeouts must preserve their reason through abort cleanup."""
+        enter_scope(self, published_topology())
         now = time.perf_counter()
         stale = _req("stale", wait_entry=now - 10)
         denoising = _req("denoising", wait_entry=now - 10, forward_entry=now - 5)
@@ -157,6 +159,32 @@ class TestWaitingTimeout(CustomTestCase):
 
         self.assertEqual([a.rid for a in aborts], ["stale"])
         self.assertEqual(s.dllm_manager.waiting_queue, [stale, denoising])
+        s.chunked_req = None
+        s.mm_receiver = None
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.grammar_manager = MagicMock()
+        s.tree_cache = MagicMock(spec=["finish"])
+        stale.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
+        with patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(weight_version="v0"),
+        ):
+            s.abort_request(aborts[0])
+
+        sent_abort, sent_req = (
+            s.ipc_channels.send_to_tokenizer.send_output.call_args.args
+        )
+        self.assertIs(sent_req, stale)
+        self.assertEqual(sent_abort.rid, "stale")
+        self.assertEqual(
+            sent_abort.finished_reason,
+            {
+                "type": "abort",
+                "status_code": 503,
+                "message": "Request waiting timeout reached.",
+            },
+        )
+        self.assertEqual(s.dllm_manager.waiting_queue, [denoising])
 
 
 class TestRunningTimeout(CustomTestCase):

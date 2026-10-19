@@ -5611,7 +5611,7 @@ class Scheduler(
             ):
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
                 )
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
