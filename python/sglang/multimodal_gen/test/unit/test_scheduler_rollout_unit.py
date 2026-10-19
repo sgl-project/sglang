@@ -45,6 +45,9 @@ from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import 
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     prepare_rollout_if_enabled,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+    truncate_rollout_schedule,
+)
 
 _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
 
@@ -692,6 +695,65 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         self.assertEqual(_recorded_steps([0, 1, 2]), [0, 1, 2])
         # Filter includes only step_index=T -> only the final latent survives.
         self.assertEqual(_recorded_steps([3]), [3])
+
+
+class TestRolloutStopStepUnit(unittest.TestCase):
+    def _run(
+        self, stop_step_index: int | None
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        if stop_step_index is not None:
+            truncate_rollout_schedule(scheduler, stop_step_index)
+        batch = types.SimpleNamespace(
+            rollout_log_prob_no_const=True,
+            rollout_noise_level=1.0,
+            rollout_sde_type="cps",
+            rollout_debug_mode=False,
+            rollout_sde_step_indices=None,
+            rollout_return_dit_trajectory=False,
+            rollout_return_step_indices=None,
+            latents=torch.randn(1, 4, 8, 8, generator=torch.Generator().manual_seed(0)),
+        )
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
+        )
+        current_rollout_controller = _make_rollout_controller(
+            batch, pipeline_config, generator=torch.Generator().manual_seed(1)
+        )
+        transition = functools.partial(
+            current_rollout_controller.transition, batch=batch
+        )
+        latents, step_inputs = batch.latents, []
+        for t in scheduler.timesteps:
+            step_inputs.append(latents)
+            latents = scheduler.step(
+                torch.tanh(latents), t, latents, transition=transition
+            ).prev_sample
+        return step_inputs, latents
+
+    def test_stopped_rollout_keeps_prefix_and_returns_x0_prediction(self):
+        """Stopping at step i must replay the full rollout's x_i bit for bit, and
+        the last step must land on x_i's x0 prediction instead of re-noising."""
+        full_inputs, _ = self._run(None)
+        stop_step_index = 2
+        stopped_inputs, final = self._run(stop_step_index)
+
+        self.assertEqual(len(stopped_inputs), stop_step_index + 1)
+        for full, stopped in zip(full_inputs, stopped_inputs):
+            self.assertTrue(torch.equal(full, stopped))
+
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        x_i = stopped_inputs[stop_step_index]
+        x0_pred = x_i - scheduler.sigmas[stop_step_index] * torch.tanh(x_i)
+        torch.testing.assert_close(final, x0_pred, rtol=0, atol=1e-6)
+
+    def test_stop_step_outside_schedule_is_rejected(self):
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        with self.assertRaises(ValueError):
+            truncate_rollout_schedule(scheduler, 4)
 
 
 if __name__ == "__main__":
