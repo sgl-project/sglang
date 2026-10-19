@@ -16,7 +16,7 @@ export SGLANG_STEP5_QUANTIZE_BF16_MOE=0
 #   --moe-runner-backend flashinfer_trtllm
 ```
 
-Retained BF16 experts use TRTLLM automatically; no BF16 backend environment variable is needed. Missing FlashInfer SwigluStep support fails startup. For the validated B300 TP4 configuration with attention DP=1:
+Retained BF16 experts use TRTLLM automatically when FlashInfer has the SwigluStep patch; no BF16 backend environment variable is needed. Without the patch they run the Triton runner, which applies the same post-SiLU clamp. For the validated B300 TP4 configuration with attention DP=1:
 
 - FP8 experts use `forward_mega_moe_local_experts`.
 - Checkpoint BF16 experts bypass MegaMoE and use the routed TRTLLM BF16 runner, with StandardDispatcher and Step5's existing reduction of local expert contributions.

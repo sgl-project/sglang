@@ -643,9 +643,7 @@ class Step5MoE(nn.Module):
             logging.getLogger(__name__).info(
                 "Step5 layer %d: preserving checkpoint BF16 MoE experts (%s)",
                 layer_id,
-                "flashinfer_trtllm"
-                if self.bf16_trtllm
-                else get_moe_runner_backend().value,
+                "flashinfer_trtllm" if self.bf16_trtllm else "triton",
             )
         # DP shared reduction must finish before the in-place gather.
         # TODO(yhyang201): frozen SGLANG_STEP5_SHARED_OVERLAP_MAX_ROWS; prune dead paths.
@@ -1791,14 +1789,14 @@ class Step5ForCausalLM(nn.Module):
                     loaded_weight = loaded_weight.unsqueeze(0)
             if name not in expected:
                 raise ValueError(f"Unknown Step5 target weight: {name}")
-            if not checkpoint_load and name in self._checkpoint_duplicate_names:
-                if name in first_copies:
-                    if not torch.equal(first_copies[name], loaded_weight):
+            if not checkpoint_load and seen_key in self._checkpoint_duplicate_names:
+                if seen_key in first_copies:
+                    if not torch.equal(first_copies[seen_key], loaded_weight):
                         raise ValueError(
                             f"Step5 duplicate copies differ: {original_name}"
                         )
                     continue
-                first_copies[name] = loaded_weight
+                first_copies[seen_key] = loaded_weight
             if seen_key in seen:
                 raise ValueError(f"Duplicate Step5 target weight: {original_name}")
             seen.add(seen_key)
