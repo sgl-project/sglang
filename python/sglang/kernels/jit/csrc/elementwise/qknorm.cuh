@@ -67,10 +67,8 @@ __global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
-/// \brief `fused_qknorm_warp` for head_dim 128, two rows per warp: 16 lanes per
-/// row, 16 B per lane. Lane r of a row covers warp-kernel lanes 2r and 2r + 1: it
-/// keeps their two partial sums and replays their xor butterfly, so the output is
-/// bit-identical to the one-row-per-warp kernel.
+// Head_dim-128 variant of fused_qknorm_warp: two rows per warp, 16 lanes x 16 B per row.
+// Each lane replays the warp kernel's butterfly on two partial sums, so the output is bit-identical.
 template <bool kUsePDL, typename Float>
 __global__ void fused_qknorm_half_warp(const QKNormParams __grid_constant__ params) {
   using namespace device;
@@ -167,7 +165,7 @@ __global__ void fused_qknorm_cta(const QKNormParams __grid_constant__ params) {
   PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
 }
 
-/// \brief Whether `fused_qknorm_half_warp` covers this head_dim.
+// Head_dims that fused_qknorm_half_warp covers
 template <int64_t kHeadDim>
 inline constexpr bool kUseHalfWarp =
 #ifdef USE_ROCM
