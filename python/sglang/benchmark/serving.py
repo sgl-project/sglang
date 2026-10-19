@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
+import msgspec
 import numpy as np
 import orjson
 import requests
@@ -42,6 +43,11 @@ from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.goodput import (
+    GOODPUT_SLO_METRICS,
+    calculate_goodput,
+    print_goodput,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
@@ -1666,6 +1672,11 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+    goodput = None
+    if args.goodput:
+        goodput = calculate_goodput(
+            outputs=outputs, goodput_slos=dict(args.goodput), dur_s=benchmark_duration
+        )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1735,6 +1746,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if goodput:
+        print_goodput(goodput)
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1894,6 +1907,9 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
 
+        if goodput:
+            result.update(msgspec.structs.asdict(goodput))
+
         if args.cache_report:
             result["cache_report"] = {
                 "total_prompt_tokens": total_prompt_tokens,
@@ -2025,6 +2041,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+
+    if not hasattr(args, "goodput"):
+        args.goodput = None
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2224,6 +2243,17 @@ def _finite_positive_float(value) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"expected a finite float > 0, got {value!r}")
     return parsed
+
+
+def _goodput_slo(pair: str) -> Tuple[str, float]:
+    """argparse type for one --goodput KEY:VALUE entry; VALUE is in milliseconds."""
+    name, _, value = pair.partition(":")
+    if name not in GOODPUT_SLO_METRICS:
+        raise argparse.ArgumentTypeError(
+            f"expected KEY:VALUE with KEY in {', '.join(GOODPUT_SLO_METRICS)}, "
+            f"got {pair!r}"
+        )
+    return name, _finite_positive_float(value)
 
 
 def _validate_parsed_gsp_args(
@@ -2453,6 +2483,16 @@ def cli_main():
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
+    )
+    parser.add_argument(
+        "--goodput",
+        nargs="+",
+        type=_goodput_slo,
+        default=None,
+        metavar="KEY:VALUE",
+        help="SLOs for goodput as KEY:VALUE pairs in milliseconds, with KEY in "
+        f"{', '.join(GOODPUT_SLO_METRICS)}, e.g. --goodput ttft:500 tpot:50. A request "
+        "counts toward goodput only if it succeeds and meets every given SLO.",
     )
     parser.add_argument(
         "--print-requests",
