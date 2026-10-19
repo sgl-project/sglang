@@ -4,15 +4,34 @@ import torch
 import torch.distributed as dist
 
 from sglang.kernels.ops.communication.all_reduce import Communicator, PullPlane
-from sglang.kernels.ops.moe.moe_route_quant_fused import QuantGather, route_quant_fused
+from sglang.kernels.ops.moe.moe_route_quant_fused import (
+    QuantGather,
+    available,
+    route_quant_fused,
+)
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     _SEMAPHORE_BYTES,
     _allocate_symmetric_memory,
 )
+from sglang.srt.runtime_context import get_buffer
 
 # Serving wins measured for single-token decode and an eight-token verify block.
 # The gather kernel itself takes a runtime row count.
 FRONT_SHARD_ROWS = (1, 8)
+
+
+def sharded_front_available(group, hidden_size: int) -> bool:
+    def check():
+        # All TP ranks must select the same collective path.
+        ready = torch.tensor(
+            [available(group.world_size, hidden_size)], dtype=torch.int32, device="cpu"
+        )
+        dist.all_reduce(ready, op=dist.ReduceOp.MIN, group=group.cpu_group)
+        return bool(ready.item())
+
+    return get_buffer(
+        f"k3_front_gather_available_{group.unique_name}_{hidden_size}", check
+    )
 
 
 class KimiK3FrontWorkspace:

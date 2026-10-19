@@ -82,11 +82,14 @@ def _jit_module(gather_world: int = 0, gather_hidden: int = 0) -> Module:
 
 
 @cache_once
-def available() -> bool:
+def available(gather_world: int = 0, gather_hidden: int = 0) -> bool:
     import logging
 
     try:
-        _jit_module()
+        if gather_world:
+            _jit_module(gather_world, gather_hidden)
+        else:
+            _jit_module()
         return True
     except Exception as e:  # pragma: no cover - toolchain dependent
         logging.getLogger(__name__).warning(
