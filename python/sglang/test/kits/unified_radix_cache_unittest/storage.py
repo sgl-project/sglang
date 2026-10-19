@@ -274,6 +274,11 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             context_length=context_length,
         )
 
+    def _build_buffer_hicache_fixture(self, storage_dir, **init_kwargs):
+        fixture = build_fixture(self.cfg)
+        self._init_buffer_hicache(fixture[0], storage_dir, **init_kwargs)
+        return fixture
+
     def _pump_hicache_until(self, cache, cond, msg, timeout: float = 10.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -320,8 +325,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         self, storage_dir, seq, marker=None, *, extra_key=None, cache_salt=None
     ):
         """Producer tree in buffer mode: insert seq and push it to L3."""
-        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(prod, storage_dir)
+        prod, prod_alloc, prod_rtp = self._build_buffer_hicache_fixture(storage_dir)
         self._insert(
             prod,
             prod_alloc,
@@ -387,8 +391,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         return kv_writes, extra_writes
 
     def _assert_masked_full_is_reused(self, storage_dir, seq, live_tail: int):
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         cons.enable_storage_metrics = True
         cons.storage_metrics_collector = mock.Mock()
 
@@ -511,8 +514,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             storage_dir, seq, marker=9
         )
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         avail0 = self._host_avail_sizes(cons)
 
         req_id = CacheRequestHandle(f"growth-trim-{len(seq)}", 0)
@@ -624,23 +626,34 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             node = node_parent(cache, node)
         return False
 
-    def _l3_produce(self, storage_dir, seq):
+    def _l3_produce(self, storage_dir, seq, marker=None):
+        """Producer tree: insert seq and push it to L3. With ``marker``, fill its
+        KV first and return the snapshot a consumer should read back."""
         prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
         self._init_hicache(
             prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
         leaf = match_prefix(prod, seq).last_device_node
+        expected = None
+        if marker is not None:
+            indices = prod.path_device_indices(leaf)
+            self._fill_full_kv(prod_alloc, indices, marker=marker)
+            expected = self._snapshot_full_kv(prod_alloc, indices)
         self._backup_node(prod, leaf)
         self._write_path_to_l3(prod, leaf)
         self._flush_l3_backups(prod)
+        return expected
 
     def _l3_consumer(self, storage_dir):
-        cons, _, _ = build_fixture(self.cfg)
+        fixture = build_fixture(self.cfg)
         self._init_hicache(
-            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+            fixture[0],
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
         )
-        return cons
+        return fixture
 
     def _consume_prefetch(self, cons, seq, req_id):
         cons.prefetch_from_storage(
@@ -668,7 +681,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
 
         # Baseline (single rank) must actually adopt SWA, else the TP assertions
         # below would be vacuous -> skip.
-        base = self._l3_consumer(storage_dir)
+        base, _, _ = self._l3_consumer(storage_dir)
         self._consume_prefetch(base, seq, CacheRequestHandle("base", 0))
         if not self._swa_host_on_path(base, seq):
             self.skipTest("fixture does not exercise SWA L3 prefetch")

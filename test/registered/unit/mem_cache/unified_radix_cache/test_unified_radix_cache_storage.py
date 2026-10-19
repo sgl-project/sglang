@@ -362,35 +362,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             num_pages = max(num_pages, sw_pages + 1)
         seq = self._make_seq(1, num_pages)
 
-        # --- Producer tree: fill KV, backup D->H, offload H->L3. ---
-        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
-        self._init_hicache(
-            prod,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
-        self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = match_prefix(prod, seq)
-        prod_leaf = mp.last_device_node
-        self._fill_full_kv(
-            prod_alloc, prod.path_device_indices(mp.last_device_node), marker=7
-        )
-        expected_k, expected_v = self._snapshot_full_kv(
-            prod_alloc, prod.path_device_indices(mp.last_device_node)
-        )
-        self._backup_node(prod, prod_leaf)
-        self._write_path_to_l3(prod, prod_leaf)
-        self._flush_l3_backups(prod)
-
-        # --- Consumer tree: prefetch the same tokens straight from L3. ---
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_hicache(
-            cons,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
+        expected_k, expected_v = self._l3_produce(storage_dir, seq, marker=7)
+        cons, cons_alloc, cons_rtp = self._l3_consumer(storage_dir)
         req_id = CacheRequestHandle("l3-prefetch-req", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
@@ -440,29 +413,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
         storage_dir = self._make_storage_dir()
 
-        # --- Producer tree: D->H backup, H->L3 offload, flush. ---
-        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
-        self._init_hicache(
-            prod,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
-        self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = match_prefix(prod, seq)
-        prod_leaf = mp.last_device_node
-        self._backup_node(prod, prod_leaf)
-        self._write_path_to_l3(prod, prod_leaf)
-        self._flush_l3_backups(prod)
-
-        # --- Consumer tree: prefetch the same tokens straight from L3. ---
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_hicache(
-            cons,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
+        self._l3_produce(storage_dir, seq)
+        cons, _, _ = self._l3_consumer(storage_dir)
         req_id = CacheRequestHandle("abort-req", 0)
 
         cc = cons.cache_controller
@@ -595,29 +547,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
         storage_dir = self._make_storage_dir()
 
-        # --- Producer tree: D->H backup, H->L3 offload, flush. ---
-        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
-        self._init_hicache(
-            prod,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
-        self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = match_prefix(prod, seq)
-        prod_leaf = mp.last_device_node
-        self._backup_node(prod, prod_leaf)
-        self._write_path_to_l3(prod, prod_leaf)
-        self._flush_l3_backups(prod)
-
-        # --- Consumer tree: prefetch the same tokens straight from L3. ---
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_hicache(
-            cons,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
+        self._l3_produce(storage_dir, seq)
+        cons, _, _ = self._l3_consumer(storage_dir)
         req_id = CacheRequestHandle("abort-req", 0)
 
         cc = cons.cache_controller
@@ -804,8 +735,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             )
 
         # The whole chain is still served end to end from the sparse store.
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
         handle = CacheRequestHandle("tail-only-req", 0)
         cons.prefetch_from_storage(
             handle, cons.root_node_handle(), array("q", seq), None, None
@@ -850,8 +780,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         pool namespace, beliefs registered, re-hits skipped."""
         storage_dir = self._make_storage_dir()
 
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_buffer_hicache(cache, storage_dir)
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
         avail0 = self._host_avail_sizes(cache)
 
         seq_a = self._make_seq(1, 2)
@@ -1055,8 +986,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     def test_buffer_only_split_intent_writes_every_piece(self):
         """Repeated splits preserve every pool's write once, parents first."""
         storage_dir = self._make_storage_dir()
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_buffer_hicache(cache, storage_dir)
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
         pipeline = cache.buffer_pipeline
         ps = self.cfg.page_size
 
@@ -1115,8 +1047,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     def test_buffer_only_finish_writes_prompt_and_output(self):
         """The finish-path split preserves both prompt and output writes."""
         storage_dir = self._make_storage_dir()
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_buffer_hicache(cache, storage_dir)
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
         cache.tree_core.write_through_threshold = 1  # the write_through trigger
 
         prompt = self._make_seq(1, 6)
@@ -1437,8 +1370,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
 
         # A root anchor has no namespace; probe and prefetch must use the request's.
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
         self.assertEqual(
             cons.query_storage_hit_length(
                 cons.root_node_handle(),
@@ -1492,8 +1424,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
         # A mid-tree anchor is pinned while its suffix is in flight and
         # released as soon as the staged span is consumed.
-        cons2, cons2_alloc, cons2_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons2, storage_dir)
+        cons2, cons2_alloc, cons2_rtp = self._build_buffer_hicache_fixture(storage_dir)
         prefix = seq[: self.cfg.page_size]
         suffix = seq[self.cfg.page_size :]
         self._insert(
@@ -1569,8 +1500,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         storage_dir = self._make_storage_dir()
 
         seq = self._buffer_swa_seq()
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         stats = cons._prefetch_outcome_stats
 
         # Query BEFORE any producer wrote the span: full miss -> revoked.
@@ -1666,8 +1596,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
 
         # Zero headroom -> zero cap: no pin can ever deadlock such a pool.
-        cache2, _alloc2, _rtp2 = build_fixture(self.cfg)
-        self._init_buffer_hicache(cache2, storage_dir, context_length=pool)
+        cache2, _alloc2, _rtp2 = self._build_buffer_hicache_fixture(
+            storage_dir, context_length=pool
+        )
         self.assertEqual(cache2.buffer_pipeline.anchor_lock_cap_tokens, 0)
 
     @requires_hicache
@@ -1693,8 +1624,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         seq = self._buffer_swa_seq()  # one full window + 1 page
         self._produce_buffer_l3(storage_dir, seq)
 
-        cons, cons_alloc, _ = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, _ = self._build_buffer_hicache_fixture(storage_dir)
         req_id = CacheRequestHandle("buffer-swa-admission-oom", 0)
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
@@ -1799,8 +1729,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         cons.enable_storage_metrics = True
         cons.storage_metrics_collector = mock.Mock()
         avail0 = self._host_avail_sizes(cons)
@@ -1889,8 +1818,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         _, expected_kv = self._produce_buffer_l3(storage_dir, seq, marker=3)
         split_at = len(seq) - page_size
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
 
         # Shares seq[:split_at] then diverges, so the FULL run ends mid-node.
         sibling = seq[:split_at] + self._make_seq(9000, 1)
@@ -1967,8 +1895,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._produce_buffer_l3(storage_dir, seq)
         split_at = len(seq) - page_size
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
 
         # The tree holds the head alone, SWA-tombstoned. It is a leaf, so it is
         # the victim the tail's evict-before-alloc would pick.
@@ -2029,8 +1956,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
 
         req_id = CacheRequestHandle("post-check-overlap", 0)
         cons.prefetch_from_storage(
@@ -2115,8 +2041,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         avail0 = self._host_avail_sizes(cons)
 
         req_id = CacheRequestHandle("covered-hold", 0)
@@ -2167,8 +2092,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
 
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, cons_alloc, cons_rtp = self._build_buffer_hicache_fixture(storage_dir)
         avail0 = self._host_avail_sizes(cons)
         stats = cons._prefetch_outcome_stats
 
@@ -2214,8 +2138,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         # 1. A root-anchored sub-window request is declined before querying.
         seq = self._make_seq(1, sw_pages - 1)
         self._produce_buffer_l3(storage_dir, seq, marker=5)
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
         self.assertEqual(cons.prefetch_threshold, sw_pages * self.cfg.page_size)
         self.assertEqual(
             cons.cache_controller.prefetch_threshold, cons.prefetch_threshold
@@ -2239,8 +2162,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             seq_a = self._make_seq(1, max(2, sw_pages))
             seq_ab = seq_a + self._make_seq(900, sw_pages)
             self._produce_buffer_l3(storage_dir, seq_ab, marker=14)
-            cons2, cons2_alloc, cons2_rtp = build_fixture(self.cfg)
-            self._init_buffer_hicache(cons2, storage_dir)
+            cons2, cons2_alloc, cons2_rtp = self._build_buffer_hicache_fixture(
+                storage_dir
+            )
             avail2 = self._host_avail_sizes(cons2)
             self._insert(cons2, cons2_alloc, cons2_rtp, seq_a)
             m = match_prefix(cons2, seq_a)
@@ -2308,8 +2232,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         full = self._make_seq(6000, sw_pages + 1)
         stored = full[: (sw_pages - 1) * self.cfg.page_size]
         self._produce_buffer_l3(storage_dir, stored, marker=6)
-        cons3, _, _ = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons3, storage_dir)
+        cons3, _, _ = self._build_buffer_hicache_fixture(storage_dir)
         avail3 = self._host_avail_sizes(cons3)
         cons3.prefetch_from_storage(
             CacheRequestHandle("partial-req", 0),
@@ -2349,7 +2272,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             return
         storage_dir, seq = setup
 
-        cons = self._l3_consumer(storage_dir)
+        cons, _, _ = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
@@ -2369,7 +2292,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             return
         storage_dir, seq = setup
 
-        cons = self._l3_consumer(storage_dir)
+        cons, _, _ = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, CacheRequestHandle("keep", 0))
@@ -2390,7 +2313,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             return
         storage_dir, seq = setup
 
-        cons = self._l3_consumer(storage_dir)
+        cons, _, _ = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
         avail_before = cons.swa_kv_pool_host.available_size()
@@ -2480,8 +2403,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         storage_dir = self._make_storage_dir()
         seq = self._buffer_swa_seq()
         self._produce_buffer_l3(storage_dir, seq)
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
+        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
         pool = cons.swa_kv_pool_host
         avail = pool.available_size()
         real_alloc = pool.alloc
