@@ -1,13 +1,12 @@
 """A causal boundary around the existing, non-overlapping SGLang scheduler."""
 
 import math
-import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
 
 import zmq
-from sglang_simulator.simulation.client import validate_endpoint
+from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     Cancel,
     Coordinator,
@@ -17,34 +16,9 @@ from sglang_simulator.simulation.coordinator import (
     decode_ready,
     encode_message,
 )
-from sglang_simulator.simulation.manager import Envs, StateManager
+from sglang_simulator.simulation.manager import StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.timing_metadata import attach_timing_output
-
-
-def validate_server_args(args) -> None:
-    validate_endpoint(Envs.coordinator_endpoint())
-    if Envs.simulation_mode() != "OFFLINE":
-        raise ValueError("coordinator requires OFFLINE")
-    for name in (
-        "enable_hierarchical_cache",
-        "enable_lora",
-        "enable_dp_attention",
-        "speculative_algorithm",
-    ):
-        if getattr(args, name, None):
-            raise ValueError(f"coordinator does not support {name}")
-    if getattr(args, "disaggregation_mode", "null") != "null":
-        raise ValueError("coordinator does not support disaggregation")
-    if not getattr(args, "skip_server_warmup", False):
-        raise ValueError("coordinator requires skip_server_warmup")
-    if not getattr(args, "enable_cache_report", False):
-        raise ValueError("coordinator requires enable_cache_report")
-    for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
-        if float(os.getenv(name, "-1")) > 0:
-            raise ValueError(
-                f"coordinator requires a virtual deadline instead of {name}"
-            )
 
 
 class CoordinatedScheduler:
@@ -55,14 +29,24 @@ class CoordinatedScheduler:
     """
 
     def __init__(self, *, scheduler, endpoint: str, timeout_s: float = 30.0):
+        endpoint = validate_coordinator_endpoint(endpoint)
+        # Model defaults can resolve a cadence absent from the launch arguments.
+        if getattr(scheduler, "prefill_decode_interval", 0):
+            raise ValueError("coordinator does not support prefill_decode_interval")
         self.scheduler = scheduler
         self.clock = Coordinator()
         self.timeout_s = timeout_s
+        self._closed = False
+        self._watchdogs = []
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REP)
-        self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.setsockopt(zmq.IPV6, 1)
-        self._socket.bind(validate_endpoint(endpoint))
+        try:
+            self._socket.setsockopt(zmq.LINGER, 0)
+            self._socket.setsockopt(zmq.IPV6, 1)
+            self._socket.bind(endpoint)
+        except Exception:
+            self.close()
+            raise
         self._reply_pending = False
         self._payloads = {}
         self._seen_payloads = set()
@@ -80,9 +64,21 @@ class CoordinatedScheduler:
             watchdog = getattr(scheduler, name, None)
             if watchdog is not None:
                 active = watchdog.is_active
+                self._watchdogs.append((watchdog, active))
                 watchdog.is_active = lambda active=active: (
                     not self._waiting and active()
                 )
+
+    def close(self) -> None:
+        """Release control resources without resetting native scheduler state."""
+        if self._closed:
+            return
+        self._closed = True
+        for watchdog, active in self._watchdogs:
+            watchdog.is_active = active
+        self._watchdogs.clear()
+        self._socket.close(linger=0)
+        self._context.term()
 
     @contextmanager
     def _guard(self):
@@ -167,34 +163,11 @@ class CoordinatedScheduler:
                     self._socket.poll(5)
                     return
                 if self.clock.awaiting_ready and self._socket.poll(0):
-                    self._reply_pending = True
-                    ready = decode_ready(self._socket.recv())
-                    lengths = {
-                        len(op.rid) for op in ready.operations if isinstance(op, Submit)
-                    }
-                    if self._rid_length is not None:
-                        lengths.add(self._rid_length)
-                    if len(lengths) > 1:
-                        raise ProtocolError(
-                            "request IDs must have a fixed length within a run"
-                        )
-                    if lengths:
-                        self._rid_length = lengths.pop()
-                    if self.clock.run_id is None:
+                    first_ready = self.clock.run_id is None
+                    self._accept_ready()
+                    if first_ready:
                         # Dataset preparation before the first Ready is unbounded.
                         start = time.monotonic()
-                    self.clock.accept_ready(ready)
-                    for op in ready.operations:
-                        if isinstance(op, Cancel) and self.clock.is_cancelled(op.rid):
-                            self._cancel(op.rid)
-                    unexpected = {
-                        rid for rid in self._aborts if not self.clock.is_terminal(rid)
-                    }
-                    if unexpected:
-                        raise ProtocolError(
-                            f"HTTP abort without Cancel: {sorted(unexpected)}"
-                        )
-                    self._aborts.clear()
                 if not self.clock.awaiting_ready:
                     self._match_payloads()
                     if not self.clock.pending_rids:
@@ -235,6 +208,25 @@ class CoordinatedScheduler:
                 self._socket.poll(5)
         finally:
             self._waiting = False
+
+    def _accept_ready(self) -> None:
+        self._reply_pending = True
+        ready = decode_ready(self._socket.recv())
+        lengths = {len(op.rid) for op in ready.operations if isinstance(op, Submit)}
+        if self._rid_length is not None:
+            lengths.add(self._rid_length)
+        if len(lengths) > 1:
+            raise ProtocolError("request IDs must have a fixed length within a run")
+        self.clock.accept_ready(ready)
+        if lengths:
+            self._rid_length = lengths.pop()
+        for op in ready.operations:
+            if isinstance(op, Cancel) and self.clock.is_cancelled(op.rid):
+                self._cancel(op.rid)
+        unexpected = {rid for rid in self._aborts if not self.clock.is_terminal(rid)}
+        if unexpected:
+            raise ProtocolError(f"HTTP abort without Cancel: {sorted(unexpected)}")
+        self._aborts.clear()
 
     def _match_payloads(self) -> None:
         for rid in self.clock.pending_rids:

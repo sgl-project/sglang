@@ -4,6 +4,7 @@ The scheduler owns payloads and batch execution. This module only records the
 driver's causal promise, checks the input barrier, and commits virtual events.
 """
 
+from collections import deque
 from typing import Literal
 
 import msgspec
@@ -93,6 +94,7 @@ class Coordinator:
         self.next_round = 0
         self._ready: Ready | None = None
         self._requests: dict[str, _Request] = {}
+        self._pending: deque[str] = deque()
         self._terminals: list[Terminal] = []
         self._driver_finished = False
         self._closed = False
@@ -116,15 +118,14 @@ class Coordinator:
     @property
     def pending_rids(self) -> tuple[str, ...]:
         """Payloads required by this Ready, in manifest order."""
-        if self._ready is None:
-            return ()
-        return tuple(
-            op.rid
-            for op in self._ready.operations
-            if isinstance(op, Submit)
-            and self.is_open(op.rid)
-            and not self._requests[op.rid].admitted
-        )
+        self._skip_terminal_payloads()
+        return tuple(rid for rid in self._pending if self.is_open(rid))
+
+    def _skip_terminal_payloads(self) -> None:
+        # Cancelled or rejected payloads can be skipped without an HTTP arrival.
+        # Each entry leaves this queue once, including cancellations out of order.
+        while self._pending and not self.is_open(self._pending[0]):
+            self._pending.popleft()
 
     @property
     def open_rids(self) -> tuple[str, ...]:
@@ -181,7 +182,7 @@ class Coordinator:
         if ready.finished and wakeup is not None:
             raise self._error("finished driver cannot register a timer")
 
-        known = set(self._requests)
+        submitted: set[str] = set()
         for op in ready.operations:
             if not isinstance(op, (Submit, Cancel)):
                 raise self._error(f"unsupported operation {type(op).__name__}")
@@ -190,10 +191,10 @@ class Coordinator:
             if isinstance(op, Submit):
                 if ready.finished:
                     raise self._error(f"finished driver submitted rid={op.rid!r}")
-                if op.rid in known:
+                if op.rid in self._requests or op.rid in submitted:
                     raise self._error(f"duplicate Submit rid={op.rid!r}")
-                known.add(op.rid)
-            elif op.rid not in known:
+                submitted.add(op.rid)
+            elif op.rid not in self._requests and op.rid not in submitted:
                 raise self._error(f"Cancel for unknown rid={op.rid!r}")
 
         self.run_id = ready.run_id
@@ -202,15 +203,19 @@ class Coordinator:
         for op in ready.operations:
             if isinstance(op, Submit):
                 self._requests[op.rid] = _Request(len(self._requests), self.now_ns)
+                self._pending.append(op.rid)
             else:
                 self.terminal(op.rid, "CANCELLED", reason=op.reason)
 
     def mark_admitted(self, rid: str) -> None:
         if self._ready is None:
             raise self._error(f"cannot admit rid={rid!r} before Ready")
-        pending = self.pending_rids
-        if not pending or rid != pending[0]:
-            raise self._error(f"payload rid={rid!r} is not next in manifest {pending}")
+        self._skip_terminal_payloads()
+        if not self._pending or rid != self._pending[0]:
+            raise self._error(
+                f"payload rid={rid!r} is not next in manifest {self.pending_rids}"
+            )
+        self._pending.popleft()
         self._requests[rid].admitted = True
 
     def advance(self, now_ns: int) -> None:

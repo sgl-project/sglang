@@ -102,3 +102,4 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_bridge.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_fork_join_example.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_closed_loop_example.py

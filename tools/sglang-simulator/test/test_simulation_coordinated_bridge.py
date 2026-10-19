@@ -42,6 +42,7 @@ def test_coordinator_server_args_are_opt_in(monkeypatch, coordinated, as_dict):
         "skip_server_warmup": False,
         "enable_cache_report": False,
         "enable_hierarchical_cache": not coordinated,
+        "prefill_decode_interval": 0 if coordinated else 1,
     }
     args = values if as_dict else SimpleNamespace(**values)
     apply_simulator_server_args(args)
@@ -57,6 +58,8 @@ def test_coordinator_server_args_are_opt_in(monkeypatch, coordinated, as_dict):
     [
         ({"SGLANG_SIMULATOR_OUTPUT_MODE": "BLOCKING"}, {}, "requires OFFLINE"),
         ({}, {"enable_hierarchical_cache": True}, "enable_hierarchical_cache"),
+        ({}, {"prefill_decode_interval": 1}, "prefill_decode_interval"),
+        ({}, {"prefill_decode_interval": 22}, "prefill_decode_interval"),
         ({}, {"skip_server_warmup": False}, "requires skip_server_warmup"),
         ({"SGLANG_REQ_WAITING_TIMEOUT": "1"}, {}, "virtual deadline"),
         ({"SGLANG_REQ_RUNNING_TIMEOUT": "1"}, {}, "virtual deadline"),
@@ -200,8 +203,7 @@ class Harness:
             context.term()
 
     def close(self):
-        self.bridge._socket.close(linger=0)
-        self.bridge._context.term()
+        self.bridge.close()
 
 
 @pytest.fixture
@@ -222,6 +224,54 @@ def harness(monkeypatch):
         instance.close()
         StateManager.reset()
         request_stats_manager.reset()
+
+
+@pytest.mark.parametrize("interval", [1, 22])
+def test_resolved_prefill_cadence_is_rejected_before_binding(harness, interval):
+    scheduler = FakeScheduler()
+    scheduler.prefill_decode_interval = interval
+    with pytest.raises(ValueError, match="prefill_decode_interval"):
+        CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+
+
+def test_close_restores_watchdogs_and_releases_endpoint(harness):
+    harness.close()
+    active = lambda: True
+    watchdog = SimpleNamespace(is_active=active)
+    scheduler = FakeScheduler()
+    scheduler.watchdog = watchdog
+    scheduler.soft_watchdog = SimpleNamespace(is_active=active)
+    bridge = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    try:
+        assert watchdog.is_active()
+        bridge._waiting = True
+        assert not watchdog.is_active()
+        assert not scheduler.soft_watchdog.is_active()
+    finally:
+        bridge.close()
+        bridge.close()
+    assert watchdog.is_active is active
+    assert scheduler.soft_watchdog.is_active is active
+    assert bridge._socket.closed
+    assert bridge._context.closed
+    replacement = CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+    replacement.close()
+
+
+def test_bind_failure_releases_context(harness, monkeypatch):
+    contexts = []
+    context_factory = zmq.Context
+
+    def make_context():
+        context = context_factory()
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(coordinated.zmq, "Context", make_context)
+    with pytest.raises(zmq.ZMQError, match="Address already in use"):
+        CoordinatedScheduler(scheduler=FakeScheduler(), endpoint=harness.endpoint)
+    assert len(contexts) == 1
+    assert contexts[0].closed
 
 
 def test_payload_timeout_excludes_pre_run_dataset_preparation(harness, monkeypatch):

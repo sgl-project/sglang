@@ -62,6 +62,19 @@ async def _generate(
         return body
 
 
+def test_native_prefill_cadence_is_rejected_at_startup(tmp_path, monkeypatch, capfd):
+    with pytest.raises(RuntimeError, match="server exited during startup"):
+        _start_server(
+            tmp_path / "unsupported-cadence",
+            monkeypatch,
+            extra_args=["--prefill-decode-interval", "1"],
+        )
+    captured = capfd.readouterr()
+    assert "coordinator does not support prefill_decode_interval" in (
+        captured.out + captured.err
+    )
+
+
 async def _fork_join(base_url, endpoint, delay):
     tasks = {}
     grants = []

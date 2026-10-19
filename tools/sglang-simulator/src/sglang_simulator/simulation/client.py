@@ -1,12 +1,11 @@
 """Async control client; model payloads still use the existing HTTP API."""
 
 import asyncio
-import ipaddress
 import math
-from urllib.parse import urlsplit
 
 import zmq
 import zmq.asyncio
+from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     PROTOCOL_VERSION,
     Grant,
@@ -17,29 +16,6 @@ from sglang_simulator.simulation.coordinator import (
 )
 
 
-def validate_endpoint(endpoint: str) -> str:
-    """Limit the initial single-driver protocol to explicit loopback TCP."""
-    try:
-        parsed = urlsplit(endpoint)
-        address = ipaddress.ip_address(parsed.hostname or "")
-        valid = (
-            parsed.scheme == "tcp"
-            and address.is_loopback
-            and parsed.port is not None
-            and 0 < parsed.port < 65536
-            and not parsed.path
-            and not parsed.query
-            and not parsed.fragment
-            and parsed.username is None
-            and parsed.password is None
-        )
-    except ValueError:
-        valid = False
-    if not valid:
-        raise ValueError("coordinator endpoint must be tcp://<loopback IP>:<port>")
-    return endpoint
-
-
 class AsyncCoordinatorClient:
     """One outstanding exchange, with wall-clock failure detection.
 
@@ -48,7 +24,7 @@ class AsyncCoordinatorClient:
     """
 
     def __init__(self, endpoint: str, *, timeout_s: float = 30.0):
-        self.endpoint = validate_endpoint(endpoint)
+        self.endpoint = validate_coordinator_endpoint(endpoint)
         if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be positive and finite")
         self.timeout_s = timeout_s

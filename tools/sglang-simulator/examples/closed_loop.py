@@ -14,7 +14,9 @@ async def run(base_url: str, coordinator: str, tool_delay_s: float) -> list[dict
     run_id = uuid.uuid4().hex
     connector = aiohttp.TCPConnector(limit=0, limit_per_host=0)
     async with (
-        aiohttp.ClientSession(connector=connector) as http,
+        aiohttp.ClientSession(
+            connector=connector, timeout=aiohttp.ClientTimeout(total=30)
+        ) as http,
         AsyncCoordinatorClient(coordinator) as control,
     ):
         round_id = 0
@@ -37,10 +39,19 @@ async def run(base_url: str, coordinator: str, tool_delay_s: float) -> list[dict
                     response.raise_for_status()
                     return await response.json()
 
-            _, grant = await asyncio.gather(
-                send(),
-                control.request(Ready(run_id, round_id, [Submit(rid)])),
+            tasks = (
+                asyncio.create_task(send()),
+                asyncio.create_task(
+                    control.request(Ready(run_id, round_id, [Submit(rid)]))
+                ),
             )
+            try:
+                _, grant = await asyncio.gather(*tasks)
+            finally:
+                # A failed exchange aborts the run; reap its HTTP/control peer.
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             if len(grant.terminals) != 1 or grant.terminals[0].kind != "COMPLETED":
                 raise RuntimeError(f"unexpected request terminal: {grant}")
             events.append({"turn": turn, "completed_ns": grant.now_ns})

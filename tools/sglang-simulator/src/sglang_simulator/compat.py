@@ -1,8 +1,10 @@
 """Early compatibility checks for the SGLang surfaces used by the simulator."""
 
 import inspect
+import ipaddress
 import os
 from importlib import metadata
+from urllib.parse import urlsplit
 
 SIMULATOR_SERVER_ARG_OVERRIDES = {
     # The simulator models the target deployment topology separately through
@@ -24,6 +26,56 @@ SIMULATOR_SERVER_ARG_OVERRIDES = {
 
 class SGLangCompatibilityError(RuntimeError):
     pass
+
+
+def validate_coordinator_endpoint(endpoint: str) -> str:
+    """Limit the initial single-driver protocol to explicit loopback TCP."""
+    try:
+        parsed = urlsplit(endpoint)
+        address = ipaddress.ip_address(parsed.hostname or "")
+        valid = (
+            parsed.scheme == "tcp"
+            and address.is_loopback
+            and parsed.port is not None
+            and 0 < parsed.port < 65536
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("coordinator endpoint must be tcp://<loopback IP>:<port>")
+    return endpoint
+
+
+def _validate_coordinator_server_args(args, endpoint: str) -> None:
+    validate_coordinator_endpoint(endpoint)
+    if os.getenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE").upper() != "OFFLINE":
+        raise ValueError("coordinator requires OFFLINE")
+    for name in (
+        "enable_hierarchical_cache",
+        "enable_lora",
+        "enable_dp_attention",
+        "speculative_algorithm",
+        # A cadence-only scheduling pass is not a virtual-time idle boundary.
+        "prefill_decode_interval",
+    ):
+        if getattr(args, name, None):
+            raise ValueError(f"coordinator does not support {name}")
+    if getattr(args, "disaggregation_mode", "null") != "null":
+        raise ValueError("coordinator does not support disaggregation")
+    if not getattr(args, "skip_server_warmup", False):
+        raise ValueError("coordinator requires skip_server_warmup")
+    if not getattr(args, "enable_cache_report", False):
+        raise ValueError("coordinator requires enable_cache_report")
+    for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
+        if float(os.getenv(name, "-1")) > 0:
+            raise ValueError(
+                f"coordinator requires a virtual deadline instead of {name}"
+            )
 
 
 def _sglang_version() -> str:
@@ -63,10 +115,8 @@ def apply_simulator_server_args(target) -> None:
 
 def validate_simulator_server_args(server_args) -> None:
     """Fail early if a process bypassed a simulator-owned launch entry point."""
-    if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
-        from sglang_simulator.simulation.sglang.coordinated import validate_server_args
-
-        validate_server_args(server_args)
+    if endpoint := os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        _validate_coordinator_server_args(server_args, endpoint)
     mismatches = [
         f"{name}={getattr(server_args, name, None)!r} (expected {expected!r})"
         for name, expected in SIMULATOR_SERVER_ARG_OVERRIDES.items()

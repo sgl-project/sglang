@@ -6,10 +6,8 @@ from contextlib import contextmanager
 import pytest
 import zmq
 import zmq.asyncio
-from sglang_simulator.simulation.client import (
-    AsyncCoordinatorClient,
-    validate_endpoint,
-)
+from sglang_simulator.compat import validate_coordinator_endpoint as validate_endpoint
+from sglang_simulator.simulation.client import AsyncCoordinatorClient
 from sglang_simulator.simulation.coordinator import (
     Cancel,
     Coordinator,
@@ -155,6 +153,131 @@ def test_manifest_validation_is_atomic():
     coordinator.accept_ready(Ready("run", 0, [Submit("a")]))
     with pytest.raises(ProtocolError, match="previous Ready"):
         coordinator.accept_ready(Ready("run", 0, []))
+
+
+@pytest.mark.parametrize(
+    "operations, pattern",
+    [
+        ([Submit("b"), Cancel("b"), Submit("b")], "duplicate Submit"),
+        ([Cancel("b"), Submit("b")], "unknown rid"),
+        ([Cancel("a"), Submit("b"), Submit("b")], "duplicate Submit"),
+        ([Submit("b"), Cancel("unknown")], "unknown rid"),
+    ],
+)
+def test_invalid_manifest_preserves_existing_requests(operations, pattern):
+    coordinator = Coordinator()
+    coordinator.accept_ready(Ready("run", 0, [Submit("a")]))
+    coordinator.mark_admitted("a")
+    coordinator.advance(10)
+    coordinator.grant()
+
+    with pytest.raises(ProtocolError, match=pattern):
+        coordinator.accept_ready(Ready("run", 1, operations))
+    assert coordinator.awaiting_ready
+    assert coordinator.run_id == "run"
+    assert coordinator.next_round == 1
+    assert coordinator.now_ns == 10
+    assert coordinator.open_rids == ("a",)
+    assert coordinator.pending_rids == ()
+    assert not coordinator.has_terminals
+    assert not coordinator.driver_finished
+
+    # Reusing b proves that the rejected manifest did not consume its ID.
+    coordinator.accept_ready(Ready("run", 1, [Submit("b"), Cancel("a")]))
+    coordinator.mark_admitted("b")
+    assert coordinator.grant().terminals == [
+        Terminal("a", "CANCELLED", 10, "cancelled by driver")
+    ]
+
+
+def test_admission_skips_cancelled_and_rejected_payloads_in_manifest_order():
+    coordinator = Coordinator()
+    coordinator.accept_ready(
+        Ready(
+            "run",
+            0,
+            [
+                Submit("a"),
+                Submit("b"),
+                Submit("c"),
+                Submit("d"),
+                Submit("e"),
+                Cancel("b"),
+                Cancel("d"),
+            ],
+        )
+    )
+    coordinator.terminal("a", "ERROR", reason="rejected")
+    assert coordinator.pending_rids == ("c", "e")
+    with pytest.raises(ProtocolError, match="not next in manifest"):
+        coordinator.mark_admitted("e")
+    coordinator.mark_admitted("c")
+    coordinator.terminal("e", "ERROR", reason="rejected")
+    assert coordinator.pending_rids == ()
+    assert [event.rid for event in coordinator.grant().terminals] == [
+        "a",
+        "b",
+        "d",
+        "e",
+    ]
+
+    coordinator.accept_ready(Ready("run", 1, [Submit("f"), Cancel("c")]))
+    assert coordinator.pending_rids == ("f",)
+    coordinator.mark_admitted("f")
+    assert [event.rid for event in coordinator.grant().terminals] == ["c"]
+
+
+class CountingRequests(dict):
+    """Count ledger visits without depending on machine speed."""
+
+    visits = 0
+
+    def __iter__(self):
+        for key in super().__iter__():
+            self.visits += 1
+            yield key
+
+    def __contains__(self, key):
+        self.visits += 1
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        self.visits += 1
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.visits += 1
+        return super().get(key, default)
+
+
+@pytest.mark.parametrize("size", [64, 256])
+def test_serial_rounds_do_not_rescan_request_history(size):
+    coordinator = Coordinator()
+    requests = CountingRequests()
+    coordinator._requests = requests
+    for index in range(size):
+        rid = str(index)
+        coordinator.accept_ready(Ready("run", index, [Submit(rid)]))
+        coordinator.mark_admitted(rid)
+        coordinator.advance(index + 1)
+        coordinator.terminal(rid, "COMPLETED")
+        coordinator.grant()
+    assert requests.visits <= 12 * size
+
+
+@pytest.mark.parametrize("size", [64, 256])
+def test_burst_admission_visits_each_request_a_bounded_number_of_times(size):
+    coordinator = Coordinator()
+    requests = CountingRequests()
+    coordinator._requests = requests
+    coordinator.accept_ready(
+        Ready("run", 0, [Submit(str(index)) for index in range(size)])
+    )
+    for index in range(size):
+        coordinator.mark_admitted(str(index))
+    coordinator.advance(10)
+    coordinator.grant()
+    assert requests.visits <= 12 * size
 
 
 def test_finish_requires_no_open_requests_and_cannot_resume():

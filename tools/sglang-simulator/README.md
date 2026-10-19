@@ -170,6 +170,12 @@ transport is JSON over a loopback ZeroMQ REQ/REP connection, separate from HTTP.
 [`AsyncCoordinatorClient`](src/sglang_simulator/simulation/client.py) implements
 the exchange; it does not execute workloads.
 
+The adapter interface is `AsyncCoordinatorClient` and the `Ready`, `Submit`,
+`Cancel`, `Grant`, and `Terminal` message types in
+[`simulation.coordinator`](src/sglang_simulator/simulation/coordinator.py).
+The server-side `Coordinator`, scheduler bridge, and native request objects are
+implementation details; workload adapters should not depend on them.
+
 Protocol version 1 has two messages:
 
 | Message | Fields |
@@ -202,6 +208,8 @@ exchange must not be retried on the same run.
 The initial scope is one local driver and scheduler, text generation with
 ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
 sessions, LoRA, speculative decoding, and asynchronous grammar are rejected.
+Coordinated runs also require `--prefill-decode-interval 0`, so native scheduling
+does not defer ready prefill work across otherwise idle iterations.
 Phase deadlines are driver-owned virtual timers; native wall-time waiting/running
 timeouts must be disabled. HTTP/SSE transport and predictor execution time do not
 contribute to virtual CPU overhead. Unmodeled frontend/CPU costs are zero.
