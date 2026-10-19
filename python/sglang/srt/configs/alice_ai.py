@@ -45,6 +45,7 @@ class AliceAIConfig(PretrainedConfig):
         max_position_embeddings=262144,
         rope_theta=1_000_000.0,
         rope_scaling=None,
+        rope_parameters=None,
         partial_rotary_factor=0.25,
         rms_norm_eps=1e-6,
         hidden_act="silu",
@@ -79,9 +80,17 @@ class AliceAIConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.kda_allow_negative_eigenvalues = kda_allow_negative_eigenvalues
         self.max_position_embeddings = max_position_embeddings
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.partial_rotary_factor = partial_rotary_factor
+        # Normalize legacy checkpoint fields into the v5 serialization schema.
+        self.rope_parameters = dict(
+            rope_parameters if rope_parameters is not None else rope_scaling or {}
+        )
+        self.rope_parameters.setdefault(
+            "rope_type", self.rope_parameters.get("type", "default")
+        )
+        self.rope_parameters.setdefault("rope_theta", rope_theta)
+        self.rope_parameters.setdefault("partial_rotary_factor", partial_rotary_factor)
+        self.rope_theta = self.rope_parameters["rope_theta"]
+        self.partial_rotary_factor = self.rope_parameters["partial_rotary_factor"]
         self.rms_norm_eps = rms_norm_eps
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range

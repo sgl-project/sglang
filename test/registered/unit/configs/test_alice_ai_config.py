@@ -6,7 +6,7 @@ import unittest
 from sglang.srt.configs.alice_ai import AliceAIConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils.hf_transformers_utils import get_config
+from sglang.srt.utils.hf_transformers_utils import get_config, get_rope_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -68,6 +68,65 @@ class TestAliceAIConfig(CustomTestCase):
         self.assertEqual(loaded.layer_types, config.layer_types)
         self.assertEqual(loaded.mtp_num_hidden_layers, 1)
         self.assertEqual(loaded.num_nextn_predict_layers, 1)
+        self.assertEqual(get_rope_config(loaded)[0], 1_000_000.0)
+        self.assertEqual(loaded.partial_rotary_factor, 0.25)
+
+    def test_rope_parameters_survive_checkpoint_roundtrip(self):
+        """Saving a legacy scaling config must not erase it on a v5 reload."""
+        cases = [
+            (
+                {
+                    "rope_theta": 2_000_000.0,
+                    "rope_scaling": {"type": "linear", "factor": 2.0},
+                    "partial_rotary_factor": 0.5,
+                },
+                {
+                    "rope_type": "linear",
+                    "factor": 2.0,
+                    "rope_theta": 2_000_000.0,
+                    "partial_rotary_factor": 0.5,
+                },
+            ),
+            (
+                {
+                    "rope_scaling": {"rope_type": "linear", "factor": 2.0},
+                    "rope_parameters": {
+                        "rope_type": "linear",
+                        "factor": 3.0,
+                        "rope_theta": 3_000_000.0,
+                        "partial_rotary_factor": 0.75,
+                    },
+                },
+                {
+                    "rope_type": "linear",
+                    "factor": 3.0,
+                    "rope_theta": 3_000_000.0,
+                    "partial_rotary_factor": 0.75,
+                },
+            ),
+            (
+                {"rope_parameters": {"rope_theta": 123456.0}},
+                {
+                    "rope_type": "default",
+                    "rope_theta": 123456.0,
+                    "partial_rotary_factor": 0.25,
+                },
+            ),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(overrides=overrides):
+                config = AliceAIConfig(**overrides)
+                with tempfile.TemporaryDirectory() as directory:
+                    config.save_pretrained(directory)
+                    loaded = get_config(directory, trust_remote_code=False)
+                theta, parameters = get_rope_config(loaded)
+                self.assertIsNotNone(parameters)
+                self.assertEqual(theta, expected["rope_theta"])
+                self.assertEqual(
+                    loaded.partial_rotary_factor, expected["partial_rotary_factor"]
+                )
+                for name, value in expected.items():
+                    self.assertEqual(parameters.get(name), value)
 
 
 if __name__ == "__main__":

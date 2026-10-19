@@ -10,7 +10,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.alice_ai import AliceAIConfig
-from sglang.srt.models import alice_ai
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    speculative_moe_a2a_backend_context,
+)
+from sglang.srt.models import alice_ai, alice_ai_mtp
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -52,11 +58,90 @@ class _Transform(nn.Module):
 
 
 class TestAliceAI(CustomTestCase):
+    def test_standard_ep_partitions_routed_and_shared_experts(self):
+        """EP partitions routed experts while the shared MLP stays TP-sharded."""
+        config = AliceAIConfig(
+            hidden_size=128,
+            vocab_size=256,
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=128,
+            shared_expert_intermediate_size=128,
+            mtp_num_hidden_layers=1,
+        )
+        for tp_size in (2, 4):
+            for model_class in (
+                alice_ai.AliceAIForCausalLM,
+                alice_ai_mtp.AliceAIForCausalLMMTP,
+            ):
+                with (
+                    self.subTest(tp_size=tp_size, model=model_class.__name__),
+                    get_context().override_server_args(tp_size=tp_size, ep_size=2),
+                    get_parallel().override(
+                        tp_rank=0,
+                        attn_tp_rank=0,
+                        moe_ep_rank=0,
+                        moe_tp_rank=0,
+                        # Construction only: no collectives or GPU allocations.
+                        tp_group=SimpleNamespace(world_size=tp_size, cpu_group=None),
+                    ),
+                    get_flags().moe.override(
+                        a2a_backend=MoeA2ABackend.NONE,
+                        runner_backend=MoeRunnerBackend.TRITON,
+                    ),
+                    # Skip optional RoPE kernel setup; this checks MoE partitioning.
+                    patch.object(alice_ai, "get_rope", return_value=nn.Identity()),
+                    torch.device("meta"),
+                ):
+                    model = model_class(config)
+                    moe = model.model.layers[0].mlp
+                    self.assertEqual(moe.experts.num_local_experts, 2)
+                    self.assertEqual(
+                        moe.experts.w13_weight.shape,
+                        (2, 2 * config.moe_intermediate_size // (tp_size // 2), 128),
+                    )
+                    self.assertEqual(
+                        moe.shared_expert.down_proj.weight.shape,
+                        (128, config.shared_expert_intermediate_size // tp_size),
+                    )
+
+    def test_unsupported_expert_dispatch_is_rejected(self):
+        config = AliceAIConfig()
+        for options in (
+            {"enable_eplb": True},
+            {"ep_num_redundant_experts": 2},
+            {"init_expert_location": "random"},
+        ):
+            with (
+                self.subTest(options=options),
+                get_context().override_server_args(tp_size=2, ep_size=2, **options),
+                get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
+                self.assertRaisesRegex(NotImplementedError, "expert-location trivial"),
+            ):
+                alice_ai.AliceAISparseMoeBlock(config, 0, None, "model.layers.0.mlp")
+
+        with (
+            get_context().override_server_args(tp_size=2, ep_size=2),
+            get_flags().moe.override(
+                a2a_backend=MoeA2ABackend.NONE,
+                speculative_a2a_backend=MoeA2ABackend.DEEPEP,
+            ),
+            speculative_moe_a2a_backend_context(),
+            self.assertRaisesRegex(NotImplementedError, "MoE A2A backend 'none'"),
+        ):
+            alice_ai.AliceAISparseMoeBlock(config, 0, None, "model.layers.0.mlp")
+
     def test_shared_expert_uses_input_before_routed_expert_overwrites_it(self):
         """An in-place routed expert must not change the shared expert's input."""
         block = alice_ai.AliceAISparseMoeBlock.__new__(alice_ai.AliceAISparseMoeBlock)
         nn.Module.__init__(block)
         block.tp_size = 1
+        block.alt_stream = None
         block.gate = lambda value: (value.new_zeros((value.shape[0], 1)), None)
         block.topk = lambda value, logits: None
 

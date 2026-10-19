@@ -23,17 +23,27 @@ from sglang.srt.models.alice_ai import (
     AliceAIFullAttention,
     AliceAISparseMoeBlock,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import get_stream
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 
 class AliceAIMTPDecoderBlock(nn.Module):
-    def __init__(self, config: AliceAIConfig, prefix: str):
+    def __init__(
+        self,
+        config: AliceAIConfig,
+        prefix: str,
+        alt_stream: torch.cuda.Stream | None = None,
+    ):
         super().__init__()
         self.self_attn = AliceAIFullAttention(
             config, layer_id=0, quant_config=None, prefix=f"{prefix}.self_attn"
         )
         self.mlp = AliceAISparseMoeBlock(
-            config, layer_id=0, quant_config=None, prefix=f"{prefix}.mlp"
+            config,
+            layer_id=0,
+            quant_config=None,
+            prefix=f"{prefix}.mlp",
+            alt_stream=alt_stream,
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -55,6 +65,7 @@ class AliceAIMTPDecoderBlock(nn.Module):
 class AliceAIMultiTokenPredictor(nn.Module):
     def __init__(self, config: AliceAIConfig, prefix: str):
         super().__init__()
+        alt_stream = get_stream("alt") if is_cuda() else None
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
@@ -65,7 +76,9 @@ class AliceAIMultiTokenPredictor(nn.Module):
         self.pre_fc_norm_hidden = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.layers = make_layers(
             1,
-            lambda idx, prefix: AliceAIMTPDecoderBlock(config, prefix),
+            lambda idx, prefix: AliceAIMTPDecoderBlock(
+                config, prefix, alt_stream=alt_stream
+            ),
             prefix=f"{prefix}.layers",
         )
         self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -145,14 +158,13 @@ class AliceAIForCausalLMMTP(AliceAIForCausalLM):
             self.lm_head.weight = head
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # EAGLE shares the target embedding/head before draft capture and inference.
         def draft_weights():
             for name, weight in weights:
                 if name.startswith("mtp."):
                     yield "model." + name.removeprefix("mtp."), weight
-                elif name in ("model.embed_tokens.weight", "lm_head.weight"):
-                    yield name, weight
 
-        return super().load_weights(draft_weights())
+        return super().load_weights(draft_weights(), is_mtp=True)
 
 
 EntryClass = AliceAIForCausalLMMTP

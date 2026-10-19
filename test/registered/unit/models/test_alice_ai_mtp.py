@@ -69,6 +69,7 @@ class TestAliceAIMTP(CustomTestCase):
             ),
             patch.object(alice_ai_mtp, "AliceAIFullAttention", _Attention),
             patch.object(alice_ai_mtp, "AliceAISparseMoeBlock", _Moe),
+            patch.object(alice_ai_mtp, "is_cuda", return_value=False),
         ):
             model = alice_ai_mtp.AliceAIMultiTokenPredictor(config, "model")
         layer = model.layers[0]
@@ -134,11 +135,10 @@ class TestAliceAIMTP(CustomTestCase):
                 actual = model(ids, positions, batch, input_embeds)
                 torch.testing.assert_close(actual, expected)
 
-    def test_published_mtp_namespace_loads_without_target_layers_or_missing_weights(
-        self,
-    ):
+    def test_published_mtp_namespace_loads_only_draft_weights(self):
         """Bare packed-expert tensors under mtp.* must be loaded into the
-        draft while the target's own decoder tensors are ignored.
+        draft while target tensors, including the embedding/head that EAGLE
+        shares before inference, are ignored. Missing MTP weights still fail.
         """
         model = alice_ai_mtp.AliceAIForCausalLMMTP.__new__(
             alice_ai_mtp.AliceAIForCausalLMMTP
@@ -148,6 +148,8 @@ class TestAliceAIMTP(CustomTestCase):
         model.model = nn.Module()
         model.model.embed_tokens = nn.Embedding(3, 2)
         model.lm_head = nn.Linear(2, 3, bias=False)
+        initial_embedding = model.model.embed_tokens.weight.detach().clone()
+        initial_head = model.lm_head.weight.detach().clone()
         model.model.fc = nn.Linear(4, 2, bias=False)
         for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"):
             module = nn.Module()
@@ -231,13 +233,15 @@ class TestAliceAIMTP(CustomTestCase):
             ("model.norm.weight", torch.full((2,), -999.0)),
         ]
         loaded = model.load_weights(iter(entries))
-        self.assertEqual(loaded, set(dict(model.named_parameters())))
+        self.assertEqual(
+            loaded,
+            set(dict(model.named_parameters()))
+            - {"model.embed_tokens.weight", "lm_head.weight"},
+        )
         torch.testing.assert_close(model.model.norm.weight, weights["mtp.norm.weight"])
         torch.testing.assert_close(model.model.fc.weight, weights["mtp.fc.weight"])
-        torch.testing.assert_close(
-            model.model.embed_tokens.weight, weights["model.embed_tokens.weight"]
-        )
-        torch.testing.assert_close(model.lm_head.weight, weights["lm_head.weight"])
+        torch.testing.assert_close(model.model.embed_tokens.weight, initial_embedding)
+        torch.testing.assert_close(model.lm_head.weight, initial_head)
         torch.testing.assert_close(
             attention.qkv_proj.weight,
             torch.cat(

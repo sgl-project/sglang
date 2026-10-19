@@ -4,7 +4,9 @@
 """Inference-only AliceAI: KDA, gated full attention, block AttnRes and MoE.
 
 Supports ordinary generation and checkpoint MTP through NEXTN/EAGLE.
-Pipeline/expert parallelism and DP attention are not supported.
+Tensor and expert parallelism use the standard all-reduce MoE path.
+Expert placement is fixed; EPLB and redundant experts are not supported.
+Pipeline parallelism, DP attention and all-to-all MoE backends are not supported.
 The companion AliceAI MTP model loads the checkpoint's mtp.* weights.
 """
 
@@ -25,9 +27,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -37,11 +41,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.models.llama import LlamaMLP
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 def _attention_residual(
@@ -113,13 +119,16 @@ class AliceAIFullAttention(nn.Module):
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        rope_theta, rope_scaling = get_rope_config(config)
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
-            partial_rotary_factor=config.partial_rotary_factor,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            partial_rotary_factor=(rope_scaling or {}).get(
+                "partial_rotary_factor", config.partial_rotary_factor
+            ),
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
@@ -182,8 +191,31 @@ class AliceAIFullAttention(nn.Module):
 
 
 class AliceAISparseMoeBlock(nn.Module):
-    def __init__(self, config: AliceAIConfig, layer_id: int, quant_config, prefix: str):
+    def __init__(
+        self,
+        config: AliceAIConfig,
+        layer_id: int,
+        quant_config,
+        prefix: str,
+        alt_stream: torch.cuda.Stream | None = None,
+    ):
         super().__init__()
+        self.alt_stream = alt_stream
+        if not get_moe_a2a_backend().is_none():
+            raise NotImplementedError(
+                "AliceAI requires MoE A2A backend 'none' for both target and draft"
+            )
+        moe_config = get_exec().moe
+        # TopK returns logical IDs, so weights must keep the original expert order.
+        if (
+            moe_config.enable_eplb
+            or moe_config.ep_num_redundant_experts
+            or moe_config.init_expert_location != "trivial"
+        ):
+            raise NotImplementedError(
+                "AliceAI requires --init-expert-location trivial without EPLB "
+                "or redundant experts"
+            )
         self.tp_size = get_parallel().tp_size
         self.gate = ReplicatedLinear(
             config.hidden_size, config.num_experts, bias=False, prefix=f"{prefix}.gate"
@@ -199,6 +231,11 @@ class AliceAISparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             reduce_results=False,
+            # FlashInfer names Alice's normalized sigmoid+bias routing MiniMax2.
+            routing_method_type=RoutingMethodType.MiniMax2,
+            routed_scaling_factor=1.0,
+            # Shared and routed experts can read the input concurrently.
+            inplace=config.shared_expert_intermediate_size == 0,
             prefix=f"{prefix}.experts",
         )
         self.topk = TopK(
@@ -223,28 +260,55 @@ class AliceAISparseMoeBlock(nn.Module):
             config.hidden_size, 1, bias=False, prefix=f"{prefix}.shared_expert_gate"
         )
 
+    def _forward_shared_expert(self, hidden_states):
+        shared_output = self.shared_expert(hidden_states)
+        gate = self.shared_expert_gate(hidden_states)[0].sigmoid()
+        return gate * shared_output
+
+    def _forward_router_experts(self, hidden_states):
+        router_logits = self.gate(hidden_states)[0]
+        topk_output = self.topk(hidden_states, router_logits)
+        return self.experts(hidden_states, topk_output)
+
     def forward(self, hidden_states):
+        shared_output = None
         if hidden_states.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+            output = self.experts(hidden_states, topk_output)
+        elif (
+            self.alt_stream is not None
+            and self.shared_expert is not None
+            and get_is_capture_mode()
+            and not torch.compiler.is_compiling()
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            shared_output = self._forward_shared_expert(hidden_states)
+            with torch.cuda.stream(self.alt_stream):
+                output = self._forward_router_experts(hidden_states)
+            current_stream.wait_stream(self.alt_stream)
         else:
-            router_logits = self.gate(hidden_states)[0]
-            topk_output = self.topk(hidden_states, router_logits)
-        shared_output = None
-        if self.shared_expert is not None and hidden_states.shape[0] > 0:
-            shared_output = self.shared_expert(hidden_states)
-            gate = self.shared_expert_gate(hidden_states)[0].sigmoid()
-            shared_output = gate * shared_output
-        # The routed MoE may overwrite hidden_states in place.
-        output = self.experts(hidden_states, topk_output)
+            if self.shared_expert is not None:
+                shared_output = self._forward_shared_expert(hidden_states)
+            output = self._forward_router_experts(hidden_states)
         if shared_output is not None:
             output = output + shared_output
+        # Routed experts use EP x MoE TP; the shared expert uses the full TP group.
+        # Both leave partial outputs for this single reduction.
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output
 
 
 class AliceAIDecoderBlock(nn.Module):
-    def __init__(self, config: AliceAIConfig, layer_id: int, quant_config, prefix: str):
+    def __init__(
+        self,
+        config: AliceAIConfig,
+        layer_id: int,
+        quant_config,
+        prefix: str,
+        alt_stream: torch.cuda.Stream | None = None,
+    ):
         super().__init__()
         self.layer_idx = layer_id
         self.layer_type = config.layer_types[layer_id]
@@ -264,7 +328,11 @@ class AliceAIDecoderBlock(nn.Module):
                 config, layer_id, quant_config, prefix=f"{prefix}.self_attn"
             )
         self.mlp = AliceAISparseMoeBlock(
-            config, layer_id, quant_config, prefix=f"{prefix}.mlp"
+            config,
+            layer_id,
+            quant_config,
+            prefix=f"{prefix}.mlp",
+            alt_stream=alt_stream,
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -339,9 +407,12 @@ class AliceAIModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size, config.hidden_size, prefix=f"{prefix}.embed_tokens"
         )
+        alt_stream = get_stream("alt") if is_cuda() else None
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: AliceAIDecoderBlock(config, idx, quant_config, prefix),
+            lambda idx, prefix: AliceAIDecoderBlock(
+                config, idx, quant_config, prefix, alt_stream=alt_stream
+            ),
             prefix=f"{prefix}.layers",
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -400,14 +471,6 @@ class AliceAIForCausalLM(nn.Module):
             raise NotImplementedError(
                 "AliceAI does not yet support data/sequence parallel attention or MoE"
             )
-        if parallel.moe_ep_size != 1:
-            raise NotImplementedError(
-                "AliceAI expert parallelism is not implemented in this initial port"
-            )
-        if get_spec().speculative_algorithm not in (None, "EAGLE"):
-            raise NotImplementedError(
-                "AliceAI checkpoint MTP requires NEXTN/EAGLE speculative decoding"
-            )
         if (
             config.num_attention_heads % parallel.attn_tp_size
             or config.linear_num_key_heads % parallel.attn_tp_size
@@ -457,7 +520,9 @@ class AliceAIForCausalLM(nn.Module):
             num_groups=1,
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], *, is_mtp: bool = False
+    ) -> set[str]:
         stacked_mapping = [
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
@@ -546,6 +611,9 @@ class AliceAIForCausalLM(nn.Module):
                     )
             loaded.add(name)
         missing = params.keys() - loaded
+        if is_mtp:
+            # The draft worker shares these tensors with the target model.
+            missing -= {"model.embed_tokens.weight", "lm_head.weight"}
         if missing:
             raise ValueError(
                 "AliceAI checkpoint is missing weights: " + ", ".join(sorted(missing))
