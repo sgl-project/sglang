@@ -2,6 +2,8 @@ import logging
 import warnings
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     resolved_view,
@@ -52,8 +54,6 @@ def register_attention_backend(name):
 
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
-    import torch
-
     if not runner.use_mla_backend:
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
@@ -104,8 +104,6 @@ def create_trtllm_mla_backend(runner):
                 "kernel and returns no rank-local LSE for the cross-rank merge. "
                 "Select cutedsl_mla."
             )
-    import torch
-
     if decode_backend == "cutedsl_mla" and runner.kv_cache_dtype == torch.float8_e4m3fn:
         from sglang.srt.layers.attention.cutedsl_mla_backend import (
             CuteDslMLAPrefillBackend,
