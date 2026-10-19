@@ -422,6 +422,9 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
+    # that skips the per-layer load wait reads unloaded layers
+    SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES = EnvInt(0)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
@@ -572,6 +575,10 @@ class Envs:
     # Per-call move cap on a non-urgent lazy-compaction flush, so a large
     # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
     SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    # Max pages one compaction move-kernel launch copies (eager or lazy, urgent
+    # or not); a larger move is issued as consecutive launches of this size
+    # within the same compaction call.
+    SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -964,6 +971,8 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
+    SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
@@ -1015,6 +1024,10 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
+    SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
+    # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
+    SGLANG_MLA_HCA_KV_SPLITS = EnvInt(4)
 
     # ===================================================================
     # Apple Silicon and MLX
@@ -1073,7 +1086,6 @@ class Envs:
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
-    SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
@@ -1261,7 +1273,6 @@ class Envs:
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
-    SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
@@ -1326,10 +1337,6 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
-    # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
-    # by the model-specific dispatcher configuration; all other paths retain
-    # their existing behavior.
-    SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
@@ -1381,7 +1388,7 @@ class Envs:
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
-    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
+    # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
@@ -1855,6 +1862,16 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+
+    # ===================================================================
+    # Muse Spark
+    # ===================================================================
+    SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR = EnvBool(True)
+    # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
+    SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
+    )
 
     # ===================================================================
     # MiniMax M3

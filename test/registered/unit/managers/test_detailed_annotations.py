@@ -195,6 +195,36 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
         fb = _fb(ForwardMode.DECODE, batch_size=2, seq_lens_cpu=None)
         self.assertEqual(self._name(fb), "step[DECODE bs=2]")
 
+    def test_forward_id_disambiguates_identical_shapes_and_preserves_model(self):
+        # Consecutive forwards can have identical shapes and prefix sums. The
+        # recorder's runner-local ID binds them without matching by shape/order.
+        fb = _fb(
+            ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            seq_lens_cpu=[10, 20],
+            num_tokens_per_req=3,
+        )
+        for is_draft, stage in [(False, "VERIFY"), (True, "DRAFT")]:
+            for forward_id in (41, 42):
+                self.assertEqual(
+                    build_step_span_name(
+                        fb,
+                        detailed_annotations=True,
+                        is_draft_worker=is_draft,
+                        forward_id=forward_id,
+                    ),
+                    f"step[{stage} bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30 forward_id={forward_id}]",
+                )
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=False, forward_id=42),
+            "step[VERIFY bs=2]",
+        )
+        fb.seq_lens_cpu = None
+        self.assertEqual(
+            build_step_span_name(fb, detailed_annotations=True, forward_id=42),
+            "step[VERIFY bs=2 forward_id=42]",
+        )
+
 
 class TestStepSpanGating(CustomTestCase):
     def test_disabled_flag_emits_base_label(self):
