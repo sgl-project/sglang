@@ -500,7 +500,8 @@ def create_scheduler_watchdog(
         )
 
         parts = []
-        # Checked before is_initializing: CUDA graph capture registers too.
+        # Checked before is_initializing: CUDA graph capture registers too, and
+        # only the soft watchdog runs that early.
         if (registration := describe_registration_in_progress()) is not None:
             parts.append(f"symmetric-memory registration in progress: {registration}")
         if not scheduler.is_initializing:
