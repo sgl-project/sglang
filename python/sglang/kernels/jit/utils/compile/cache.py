@@ -298,10 +298,15 @@ def _normalize_text(text: str) -> str:
     return text
 
 
-def build_key_dir(*, module_name: str, build_key: str) -> pathlib.Path:
+def cache_root() -> pathlib.Path:
     configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
-    root = pathlib.Path(configured).expanduser()
-    return root / _target_tag() / module_name / f"{_BUILD_KEY_PREFIX}{build_key}"
+    return pathlib.Path(configured).expanduser()
+
+
+def build_key_dir(*, module_name: str, build_key: str) -> pathlib.Path:
+    return (
+        cache_root() / _target_tag() / module_name / f"{_BUILD_KEY_PREFIX}{build_key}"
+    )
 
 
 # ---------------------------------------------------------------------------

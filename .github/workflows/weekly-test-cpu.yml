@@ -1,0 +1,49 @@
+# Weekly CPU tests. Holds the CPU-only unit tests that are not worth a
+# per-commit slot -- debug tooling (dump comparator, source patcher) whose
+# breakage is fine to notice once a week.
+#
+# Separate from weekly-test-nvidia.yml because CPU goes through a different
+# reusable workflow, and `uses:` takes no expressions -- so it cannot be another
+# row in that file's matrix. Both run the same shared stage their per-commit
+# counterparts do, so a test behaves identically in a PR and in the weekly run.
+name: Weekly Test (CPU)
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Sunday 00:00 UTC, alongside the Nvidia weekly run
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-test-cpu-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  # run_all_tests skips the paths-filter, so every test runs regardless of what
+  # the last commit touched.
+  check-changes:
+    uses: ./.github/workflows/_pr-test-check-changes.yml
+    with:
+      pr_test_yml: '.github/workflows/weekly-test-cpu.yml'
+      run_all_tests: true
+      force_continue_on_error: true
+    secrets: inherit
+
+  # No rust_ext_artifact: nothing builds one here, so the stage falls back to
+  # its cache and compiles on a miss.
+  weekly-test-cpu:
+    needs: check-changes
+    if: github.repository == 'sgl-project/sglang'
+    uses: ./.github/workflows/_pr-test-stage-cpu.yml
+    with:
+      self_name: weekly-test-cpu
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '90'
+    secrets: inherit

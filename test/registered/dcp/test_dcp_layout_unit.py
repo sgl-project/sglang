@@ -22,15 +22,18 @@ import torch
 from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.layers.dcp.layout import get_dcp_lens
-from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.dcp.layout import (
+    filter_dcp_local_chunk_kv_indices,
+    get_dcp_lens,
+)
+from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 DCP_SIZES = [1, 2, 3, 4, 8]
 LENS = list(range(0, 41))
@@ -42,9 +45,99 @@ def _owner_count(length: int, n: int, rank: int, start: int) -> int:
     return sum(1 for p in range(start, start + length) if p % n == rank)
 
 
-def _legacy_inplace_formula(length: int, n: int, rank: int) -> int:
-    """The pre-refactor update_local_kv_lens_for_dcp body (start == 0 case)."""
-    return (length - rank - 1) // n + 1
+class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
+    PAGE = 64
+
+    def _build_chunk(self, starts, lens, dcp_size, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        widened = self.PAGE * dcp_size
+        runs = []
+        for start, length in zip(starts, lens):
+            if length == 0:
+                runs.append(torch.empty(0, dtype=torch.int64))
+                continue
+            pos = torch.arange(start, start + length)
+            page_of = pos // widened
+            bases = (
+                torch.randint(0, 64, (int(page_of.max()) + 1,), generator=g) * widened
+            )
+            runs.append(bases[page_of] + pos % widened)
+        return torch.cat(runs) if runs else torch.empty(0, dtype=torch.int64)
+
+    def _owner_rule(self, kv, dcp_size, dcp_rank):
+        # Selection only: the filters leave ids WIDENED and the collapse now
+        # happens once, in KVIndexTranslator.translate_dcp_read_ids.
+        return kv[kv % dcp_size == dcp_rank]
+
+    def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
+        kv = self._build_chunk(starts, lens, dcp_size, seed)
+        with rc.get_parallel().override(
+            dcp_enabled=dcp_size > 1, dcp_size=dcp_size, dcp_rank=dcp_rank
+        ):
+            got = filter_dcp_local_chunk_kv_indices(
+                kv, torch.tensor(starts), torch.tensor(lens)
+            )
+        return kv, got
+
+    def test_matches_owner_rule_on_unaligned_runs(self):
+        cases = [
+            ([0], [1]),
+            ([0, 0], [2048, 2048]),
+            ([8192], [3]),
+            ([5, 13, 31], [7, 0, 19]),
+            ([1365, 1365, 1365], [1365, 1365, 1365]),
+            ([43690, 43690], [43690, 17]),
+            ([7, 7, 7, 7, 7], [11, 13, 0, 1, 40]),
+        ]
+        for dcp_size in [2, 3, 4, 8]:
+            for dcp_rank in range(dcp_size):
+                for i, (starts, lens) in enumerate(cases):
+                    kv, got = self._run(starts, lens, dcp_size, dcp_rank, seed=i)
+                    torch.testing.assert_close(
+                        got,
+                        self._owner_rule(kv, dcp_size, dcp_rank),
+                        msg=f"size={dcp_size} rank={dcp_rank} "
+                        f"starts={starts} lens={lens}",
+                    )
+
+    def test_row_count_matches_get_dcp_lens(self):
+        starts, lens = [1365, 2730, 0], [1365, 900, 37]
+        for dcp_size in [2, 3, 4, 8]:
+            for dcp_rank in range(dcp_size):
+                _, got = self._run(starts, lens, dcp_size, dcp_rank)
+                expected = get_dcp_lens(
+                    torch.tensor(lens), dcp_size, dcp_rank, start=torch.tensor(starts)
+                )
+                self.assertEqual(
+                    got.numel(),
+                    int(expected.sum()),
+                    f"size={dcp_size} rank={dcp_rank}",
+                )
+
+    def test_second_chunk_at_batch_three(self):
+        starts, lens = [2730, 2730, 2730], [1365, 1365, 1365]
+        for dcp_rank in range(8):
+            kv, got = self._run(starts, lens, 8, dcp_rank)
+            torch.testing.assert_close(got, self._owner_rule(kv, 8, dcp_rank))
+            naive = kv[dcp_rank::8] // 8
+            self.assertNotEqual(
+                got.numel(),
+                naive.numel(),
+                f"rank={dcp_rank}: phase-free stride happens to match here, "
+                f"so this case no longer guards the phase term",
+            )
+
+    def test_identity_without_dcp(self):
+        kv = torch.arange(37)
+        with rc.get_parallel().override(
+            dcp_enabled=False, dcp_size=1, dcp_rank=0, attn_dcp_rank=0
+        ):
+            self.assertIs(
+                filter_dcp_local_chunk_kv_indices(
+                    kv, torch.tensor([0]), torch.tensor([37])
+                ),
+                kv,
+            )
 
 
 class TestGetDcpLens(CustomTestCase):
@@ -59,21 +152,6 @@ class TestGetDcpLens(CustomTestCase):
                 self.assertTrue(
                     torch.equal(got.to(torch.int32), expected),
                     f"start=None mismatch at n={n}, rank={rank}: {got.tolist()} != {expected.tolist()}",
-                )
-
-    def test_start_none_matches_legacy_inplace_formula(self):
-        # The collapse claim: get_dcp_lens (start=None) == legacy floor((L-rank-1)/N)+1.
-        for n in DCP_SIZES:
-            for rank in range(n):
-                lens = torch.tensor(LENS, dtype=torch.int64)
-                got = get_dcp_lens(lens, n, rank)
-                legacy = torch.tensor(
-                    [_legacy_inplace_formula(L, n, rank) for L in LENS],
-                    dtype=torch.int64,
-                )
-                self.assertTrue(
-                    torch.equal(got.to(torch.int64), legacy),
-                    f"legacy-formula mismatch at n={n}, rank={rank}",
                 )
 
     def test_start_tensor_matches_owner_count(self):
@@ -168,6 +246,38 @@ class TestGetDcpLens(CustomTestCase):
         self.assertTrue(torch.equal(kernel_k[0], k[:, 0:1]))
         self.assertTrue(torch.equal(out, q))
 
+    def test_triton_dcp_write_marks_the_rank_local_loc(self):
+        """Each rank writes at `out_cache_loc // dcp_size` with the batch's
+        physical mark, masked by position to the tokens it owns."""
+        writes = []
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.dcp_size, backend.dcp_rank = 2, 1
+        backend.token_to_kv_pool = SimpleNamespace(
+            set_kv_buffer=lambda *args, **kwargs: writes.append((args, kwargs))
+        )
+        out_cache_loc = torch.tensor([8, 9, 10, 11, 12])
+        forward_batch = SimpleNamespace(
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_is_physical=True,
+            positions=torch.arange(5),
+            dcp_kv_mask=None,
+        )
+        k = torch.zeros(5, 1, 2)
+
+        backend._set_kv_buffer(forward_batch, SimpleNamespace(), None, k, k.clone())
+
+        ((args, kwargs),) = writes
+        loc_info = args[1]
+        self.assertIsInstance(loc_info, KVWriteLoc)
+        self.assertTrue(loc_info.physical)
+        self.assertTrue(torch.equal(loc_info.loc, out_cache_loc // 2))
+        self.assertTrue(
+            torch.equal(
+                kwargs["dcp_kv_mask"],
+                torch.tensor([False, True, False, True, False]),
+            )
+        )
+
     def test_dense_q_indptr_matches_the_arange_it_replaces(self):
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
@@ -257,18 +367,39 @@ class TestGetDcpLens(CustomTestCase):
         v_weight = torch.arange(16, dtype=torch.float32).view(4, hidden_size) + 200
 
         for tp_rank in range(4):
-            layer = QKVParallelLinear(
-                hidden_size=hidden_size,
-                head_size=head_size,
-                total_num_heads=8,
-                total_num_kv_heads=2,
-                bias=False,
-                params_dtype=torch.float32,
-                tp_rank=tp_rank,
+            group = SimpleNamespace(rank_in_group=tp_rank, world_size=4)
+            with rc.get_parallel().override(
+                tp_group=group,
+                attn_tp_group=group,
                 tp_size=4,
-                kv_tp_rank=tp_rank // 2,
-                kv_tp_size=2,
-            )
+                tp_rank=tp_rank,
+                attn_tp_rank=tp_rank,
+                moe_tp_rank=tp_rank,
+                attn_dp_rank=0,
+                attn_cp_rank=0,
+                moe_dp_rank=0,
+                moe_ep_rank=0,
+                dcp_rank=tp_rank % 2,
+                **rc.derive_parallel_widths(
+                    tp_size=4,
+                    attn_cp_size=1,
+                    attn_dp_size=1,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    dcp_size=2,
+                    dcp_enabled=True,
+                ),
+            ):
+                layer = QKVParallelLinear(
+                    hidden_size=hidden_size,
+                    head_size=head_size,
+                    total_num_heads=8,
+                    total_num_kv_heads=2,
+                    bias=False,
+                    params_dtype=torch.float32,
+                    parallel_group="attn_tp",
+                    kv_parallel_group=ReplicatedParallelGroup("attn_tp", 2),
+                )
             layer.weight_loader(layer.weight, q_weight, "q")
             layer.weight_loader(layer.weight, k_weight, "k")
             layer.weight_loader(layer.weight, v_weight, "v")
@@ -312,13 +443,18 @@ class TestGetDcpLens(CustomTestCase):
                 kv_cache_dtype=torch.bfloat16,
                 device="cpu",
                 is_draft_worker=False,
+                kv_shard_size=1,
+                kv_shard_spec=None,
             )
             # The allocator widens from get_parallel(), not from the injected
             # server_args stand-in -- drive the cause, not the effect.
-            with patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
-                return_value=False,
-            ), rc.get_parallel().override(attn_dcp_size=dcp_size):
+            with (
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.current_platform.is_out_of_tree",
+                    return_value=False,
+                ),
+                rc.get_parallel().override(attn_dcp_size=dcp_size),
+            ):
                 allocators[dcp_size] = (
                     KVCacheConfigurator._build_token_to_kv_pool_allocator(
                         configurator,

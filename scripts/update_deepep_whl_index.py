@@ -5,7 +5,7 @@ import hashlib
 import pathlib
 import re
 
-SUPPORTED_CUDA_VERSIONS = ("129", "130")
+SUPPORTED_CUDA_VERSIONS = ("130",)
 WHEEL_PATTERN = re.compile(
     r"^sgl_deep_ep-(?P<version>[0-9][^-]*)-[^-]+-[^-]+-[^-]+\.whl$"
 )

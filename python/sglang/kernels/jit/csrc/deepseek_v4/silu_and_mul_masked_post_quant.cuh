@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+#include <algorithm>
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -37,16 +38,6 @@ struct alignas(16) CTAWork {
   uint32_t expert_token_id;
   bool valid;
 };
-
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-  static_assert(device::kWarpThreads == 32);
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
 
 template <bool kApplySwigluLimit, bool kPrecise = true, typename DType2>
 SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
@@ -92,7 +83,7 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   const uint32_t val = tx < params.num_experts ? params.masked_m[tx] : 0u;
 
   // Per-warp inclusive scan of masked_m.
-  const uint32_t warp_inclusive = warp_inclusive_sum(lane_id, val);
+  const uint32_t warp_inclusive = warp::inclusive_sum(val, lane_id);
   const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
@@ -108,17 +99,16 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   return result;
 }
 
-template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr uint32_t kGroupSize = 128u;
-  constexpr uint32_t kWorkThreads = 16u;
+  constexpr uint32_t kWorkThreads = kGroupSize / 8u;
   // each thread will handle 8 elements
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
-  static_assert(8 * kWorkThreads == 128, "Invalid tiling");
+  static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto [expert_id, token_id, valid] = get_work(params);
@@ -208,7 +198,18 @@ struct SiluAndMulClampParams {
   const void* __restrict__ input;
   void* __restrict__ output;
   float swiglu_limit;
+  uint32_t out_vecs;
+  uint32_t blocks_per_row;
 };
+
+template <typename DType2>
+SGL_DEVICE bf16x2_t to_bf16x2(DType2 value) {
+  if constexpr (std::is_same_v<DType2, bf16x2_t>) {
+    return value;
+  } else {
+    return device::cast<bf16x2_t>(device::cast<fp32x2_t>(value));
+  }
+}
 
 template <typename DType, bool kUsePDL>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
@@ -219,21 +220,27 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   constexpr auto kVecSize = 16 / sizeof(DType);
   static_assert(kVecSize % 2 == 0 && kVecSize > 0);
   using Vec = AlignedVector<DType2, kVecSize / 2>;
-  const auto bid = blockIdx.x;
-  const auto tile = tile::Memory<Vec>::cta();
+  const auto row = blockIdx.x / params.blocks_per_row;
+  const auto block_in_row = blockIdx.x % params.blocks_per_row;
+  const auto vec_id = block_in_row * blockDim.x + threadIdx.x;
   const float limit = params.swiglu_limit;
 
   PDLWaitPrimary<kUsePDL>();
-  const auto gate = tile.load(params.input, bid * 2 + 0);
-  const auto up = tile.load(params.input, bid * 2 + 1);
-  Vec out;
+  if (vec_id < params.out_vecs) {
+    const auto input = static_cast<const Vec*>(params.input);
+    auto output = static_cast<Vec*>(params.output);
+    const auto input_row = row * 2 * params.out_vecs;
+    const auto gate = input[input_row + vec_id];
+    const auto up = input[input_row + params.out_vecs + vec_id];
+    Vec out;
 
 #pragma unroll
-  for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-    out[i] = cast<DType2>(silu_and_mul<true>(cast<bf16x2_t>(gate[i]), cast<bf16x2_t>(up[i]), limit));
-  }
+    for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+      out[i] = cast<DType2>(silu_and_mul<true>(to_bf16x2(gate[i]), to_bf16x2(up[i]), limit));
+    }
 
-  tile.store(params.output, out, bid);
+    output[row * params.out_vecs + vec_id] = out;
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -242,11 +249,11 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 struct SiluAndMulMaskedPostQuantKernel {
-  static_assert(kGroupSize == 128);
+  static_assert(kGroupSize == 32 || kGroupSize == 128);
   static constexpr auto kernel_normal =
-      silu_mul_quant_varlen_kernel<kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_varlen_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
   static constexpr auto kernel_transposed =
-      silu_mul_quant_varlen_kernel<true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_varlen_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
 
   static void
   run(const tvm::ffi::TensorView input,
@@ -349,16 +356,20 @@ struct SiluAndMulClampKernel {
     constexpr uint32_t kVecSize = 16 / sizeof(DType);
     const auto out_dim = static_cast<uint32_t>(H.unwrap());
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    RuntimeCheck(out_dim > 0, "out_dim must be positive");
     RuntimeCheck(out_dim % kVecSize == 0, "out_dim must be divisible by vector size");
-    const auto num_threads = out_dim / kVecSize;
-    RuntimeCheck(num_threads <= 1024, "out_dim too large for single-block-per-row launch");
+    const auto out_vecs = out_dim / kVecSize;
+    const auto num_threads = std::min(out_vecs, 1024u);
+    const auto blocks_per_row = host::div_ceil(out_vecs, num_threads);
 
     const auto params = SiluAndMulClampParams{
         .input = input.data_ptr(),
         .output = output.data_ptr(),
         .swiglu_limit = static_cast<float>(swiglu_limit),
+        .out_vecs = out_vecs,
+        .blocks_per_row = blocks_per_row,
     };
-    LaunchKernel(num_tokens, num_threads, device.unwrap())  //
+    LaunchKernel(num_tokens * blocks_per_row, num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
@@ -373,16 +384,15 @@ struct SiluMulQuantContigParams {
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
 };
 
-template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr uint32_t kGroupSize = 128u;
-  constexpr uint32_t kWorkThreads = 16u;
+  constexpr uint32_t kWorkThreads = kGroupSize / 8u;
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
-  static_assert(8 * kWorkThreads == 128, "Invalid tiling");
+  static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
   const auto token_id = blockIdx.x;
@@ -461,11 +471,11 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
 struct SiluAndMulContigPostQuantKernel {
-  static_assert(kGroupSize == 128);
+  static_assert(kGroupSize == 32 || kGroupSize == 128);
   static constexpr auto kernel_normal =
-      silu_mul_quant_contig_kernel<kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
   static constexpr auto kernel_transposed =
-      silu_mul_quant_contig_kernel<true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
 
   static void
   run(const tvm::ffi::TensorView input,

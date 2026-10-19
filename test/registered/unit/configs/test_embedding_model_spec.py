@@ -14,7 +14,7 @@ from sglang.srt.configs.embedding_model_spec import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestEmbeddingModelSpec(unittest.TestCase):
@@ -52,7 +52,9 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 7)
+        self.assertEqual(len(matrix), 8)
+        self.assertIn("EmbeddingGemma2Model", by_architecture)
+        self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")
         self.assertEqual(by_architecture["BertModel"]["attention"], "bidirectional")
         self.assertTrue(by_architecture["CLIPModel"]["supports_multimodal"])
@@ -71,7 +73,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         )
         plan = resolved_embedding_plan(
             spec,
-            server_args=SimpleNamespace(
+            config=SimpleNamespace(
                 is_embedding=True,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(
@@ -116,6 +118,22 @@ class TestEmbeddingModelSpec(unittest.TestCase):
 
         self.assertEqual(spec.task, EmbeddingTask.NONE)
         self.assertEqual(spec.family, "none")
+
+    def test_embedding_gemma2_declares_multimodal_spec(self):
+        spec = resolve_embedding_model_spec(
+            ["EmbeddingGemma2Model"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+
+        self.assertEqual(spec.family, "embedding_gemma2")
+        self.assertEqual(spec.task, EmbeddingTask.EMBED)
+        self.assertEqual(spec.execution, EmbeddingExecution.MULTIMODAL)
+        self.assertEqual(spec.pooling, PoolingStrategy.MEAN)
+        self.assertTrue(spec.supports_multimodal)
+        self.assertFalse(spec.requires_embedding_flag)
+        self.assertTrue(spec.auto_enable_embedding)
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
 
 
 if __name__ == "__main__":

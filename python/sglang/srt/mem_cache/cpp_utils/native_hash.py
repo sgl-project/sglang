@@ -24,19 +24,20 @@ def _load_native_hash_module() -> Any:
         )
 
     try:
-        from torch.utils.cpp_extension import load
+        from sglang.srt.utils.cpp_extension_loader import (
+            load_extension_with_recovery,
+        )
 
         abs_path = os.path.dirname(os.path.abspath(__file__))
         extra_cflags = ["-O3", "-std=c++17", "-DNDEBUG"]
         if _cpu_supports_avx2():
             extra_cflags.append("-mavx2")
-        return load(
+        return load_extension_with_recovery(
             name="hicache_hash_cpp",
             sources=[f"{abs_path}/hash_binding.cpp"],
             extra_cflags=extra_cflags,
             extra_ldflags=["-lcrypto"],
             with_cuda=False,
-            verbose=False,
         )
     except Exception as exc:
         raise RuntimeError("Failed to load HiCache native hash extension") from exc
@@ -59,7 +60,7 @@ def _native_hash_input(token_ids: Any) -> tuple[array, int, int, bool]:
         return raw, logical_len, 2 if is_bigram else 1, is_bigram
 
     if is_bigram:
-        return array("I", raw[: logical_len + 1]), logical_len, 2, is_bigram
+        return array("q", raw[: logical_len + 1]), logical_len, 2, is_bigram
 
     if logical_len == 0:
         return array("I"), logical_len, 1, is_bigram
@@ -68,13 +69,13 @@ def _native_hash_input(token_ids: Any) -> tuple[array, int, int, bool]:
     if isinstance(first_token, tuple):
         unit_width = len(first_token)
         return (
-            array("I", (elem for token in raw[:logical_len] for elem in token)),
+            array("q", (elem for token in raw[:logical_len] for elem in token)),
             logical_len,
             unit_width,
             is_bigram,
         )
 
-    return array("I", raw[:logical_len]), logical_len, 1, is_bigram
+    return array("q", raw[:logical_len]), logical_len, 1, is_bigram
 
 
 def get_native_hash(

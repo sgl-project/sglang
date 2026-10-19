@@ -12,8 +12,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(
     est_time=0,
-    suite="base-a-test-cpu",
-    nightly=True,
+    stage="weekly",
+    runner_config="cpu",
     disabled="helper module, no tests",
 )
 

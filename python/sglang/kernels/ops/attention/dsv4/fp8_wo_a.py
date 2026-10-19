@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 from .utils import make_name
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 _GROUP_SIZE = 128
+_UE8M0_SCALES_PER_PACK = 4
 
 
 @cache_once
@@ -71,23 +72,34 @@ def sglang_per_token_group_quant_fp8_dsv4_wo_a(
     """Quantize DSV4 wo_a activations for DeepGEMM fp8_einsum.
 
     The input is a [T, G, D] bf16/fp16 tensor whose hidden dimension is
-    contiguous. The output codes are contiguous [T, G, D] fp8 values. The scale
-    tensor is returned as logical [T, G, D/128] fp32 UE8M0 values backed by
-    contiguous [G, T, D/128] storage, so each group/head [T, S] panel is
-    contiguous for the DeepGEMM recipe=(1, 1, 128) consumer. Group size is fixed
-    to 128 and the absmax floor is fixed to 1e-10.
+    contiguous. The output codes are contiguous [T, G, D] fp8 values. Four
+    UE8M0 scale exponent bytes are packed into each int32. The returned logical
+    scale tensor has shape [T, G, ceil((D/128)/4)] and DeepGEMM's native
+    TMA-aligned strides, so fp8_einsum can consume it without a scale-layout
+    conversion kernel. Group size is fixed to 128 and the absmax floor is fixed
+    to 1e-10.
     """
     num_tokens, num_groups, hidden = x.shape
     hidden_groups = hidden // _GROUP_SIZE
+    packed_hidden_groups = (
+        hidden_groups + _UE8M0_SCALES_PER_PACK - 1
+    ) // _UE8M0_SCALES_PER_PACK
+    aligned_num_tokens = (
+        (num_tokens + _UE8M0_SCALES_PER_PACK - 1)
+        // _UE8M0_SCALES_PER_PACK
+        * _UE8M0_SCALES_PER_PACK
+    )
     x_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
     x_s_storage = torch.empty(
-        (num_groups, num_tokens, hidden_groups),
+        (num_groups, packed_hidden_groups, aligned_num_tokens),
         device=x.device,
-        dtype=torch.float32,
+        dtype=torch.int32,
     )
 
     if x.numel() > 0:
         fp8_wo_a_group_major_quant_ue8m0(x, x_q, x_s_storage)
 
-    # DeepGEMM fp8_einsum consumes each group/head [T, S] scale panel contiguously.
-    return x_q, x_s_storage.transpose(0, 1)
+    # DeepGEMM permutes this to [G, T, packed_hidden_groups], where tokens are
+    # contiguous and the packed-hidden stride is aligned_num_tokens.
+    x_s = x_s_storage.transpose(-1, -2)[:, :num_tokens, :].transpose(0, 1)
+    return x_q, x_s

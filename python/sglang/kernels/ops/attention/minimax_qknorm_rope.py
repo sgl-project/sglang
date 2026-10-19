@@ -113,9 +113,9 @@ def minimax_qknorm_rope_grouped(
     """
     groups = [(w, off, cnt) for (w, off, cnt) in groups if cnt > 0]
     num_groups = len(groups)
-    assert (
-        1 <= num_groups <= _MAX_GROUPS
-    ), f"need 1..{_MAX_GROUPS} groups, got {num_groups}"
+    assert 1 <= num_groups <= _MAX_GROUPS, (
+        f"need 1..{_MAX_GROUPS} groups, got {num_groups}"
+    )
 
     weights: List[torch.Tensor] = [g[0] for g in groups]
     offsets: List[int] = [int(g[1]) for g in groups]

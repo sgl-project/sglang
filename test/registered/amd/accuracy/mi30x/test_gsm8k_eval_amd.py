@@ -20,7 +20,6 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2,
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1,
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -80,9 +79,6 @@ def remove_failing_models(model_str):
     return ",".join(filtered)
 
 
-DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
-    DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1
-)
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
 )
@@ -185,9 +181,9 @@ def check_model_scores(results):
         line = f"| {model} | {tp_size} | {score:.3f} | {threshold_str} | {startup_str} | {eval_str} | {total_str} | {status} |\n"
         summary += line
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY - TP=2 Instruction Models (gsm8k)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(summary)
     print(f"\n📊 Final Statistics:")
     print(f"   Passed: {passed_count}")
@@ -206,7 +202,6 @@ class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model_groups = [
-            (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1), False, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
@@ -224,19 +219,19 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         all_results = []
         total_test_start = time.time()
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("AMD GSM8K Evaluation Test (TP=2 Instruction Models)")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Benchmark: gsm8k (chat completions)")
-        print(f"{'='*60}\n")
+        print(f"{'=' * 60}\n")
 
         for model_group, is_fp8, is_tp2 in self.model_groups:
             for model in model_group:
                 with self.subTest(model=model):
                     tp_size = 2 if is_tp2 else 1
-                    print(f"\n{'='*60}")
+                    print(f"\n{'=' * 60}")
                     print(f"Testing: {model} (TP={tp_size}, FP8={is_fp8})")
-                    print(f"{'='*60}")
+                    print(f"{'=' * 60}")
 
                     model_start = time.time()
                     startup_time = None
@@ -331,7 +326,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
         # Check all scores after collecting all results
         check_model_scores(all_results)
         print(
-            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time/60:.1f} min)"
+            f"\n⏱️  Total test runtime: {total_test_time:.1f}s ({total_test_time / 60:.1f} min)"
         )
 
 

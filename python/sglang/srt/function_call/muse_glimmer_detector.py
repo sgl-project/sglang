@@ -38,7 +38,7 @@ _PARAM_RE = re.compile(
 )
 
 # Recipients whose bodies are prose, never tool calls.
-_NON_TOOL_RECIPIENTS = frozenset({"self", "user"})
+_NON_TOOL_RECIPIENTS = frozenset({"commentary", "self", "user"})
 
 
 def _is_tool_channel(recipient: Optional[str]) -> bool:
@@ -250,6 +250,11 @@ class MuseGlimmerDetector(BaseFormatDetector):
 
     def supports_structural_tag(self) -> bool:
         return False
+
+    def parses_required_natively(self) -> bool:
+        """The model only ever emits ATEM tool calls, so the JSON-array grammar
+        the default required/named path forces cannot parse its output."""
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

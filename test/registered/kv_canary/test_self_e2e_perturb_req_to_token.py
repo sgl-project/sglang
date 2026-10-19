@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.consts import SWA_POOL_SERVER_ARGS
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
-register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=194, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=175, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
@@ -22,6 +22,9 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         # still looks busy). That's expected for this test; disable strict
         # mode so the leak warning doesn't crash the scheduler.
         "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
+        # A perturbed slot reaches free_swa with its peer already released: that
+        # is the corruption under test, not a swa.peer_mapped regression.
+        "SGLANG_INVARIANT_CHECK": "0",
     }
 
     @classmethod

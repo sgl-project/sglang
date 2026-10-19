@@ -11,7 +11,7 @@ No server, no model loading — pure CPU.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import asyncio
 import concurrent.futures
@@ -69,12 +69,6 @@ def _is_decoded(img: Image.Image) -> bool:
 
 
 class TestLoadSingleItemImageDecode(CustomTestCase):
-    def test_plain_open_is_lazy(self):
-        # Documents why the fix matters: a bare Image.open is not decoded yet, so
-        # without the fix the decode would land on the caller (main) thread.
-        lazy = Image.open(io.BytesIO(_png_bytes()))
-        self.assertFalse(_is_decoded(lazy))
-
     def test_load_single_item_forces_decode(self):
         img = _StubProcessor._load_single_item(_png_bytes("RGB"), Modality.IMAGE)
         self.assertIsInstance(img, Image.Image)

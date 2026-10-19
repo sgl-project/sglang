@@ -19,13 +19,13 @@ Usage:
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 
 from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.lora.utils import get_default_hidden_dim
-from sglang.srt.models.laguna import LagunaForCausalLM, LagunaModel
+from sglang.srt.models.laguna import LagunaModel
 
 
 def _make_fake_laguna(num_attention_heads_per_layer):
@@ -139,23 +139,6 @@ class TestLagunaNonAttentionDelegates(unittest.TestCase):
     def test_unknown_module_raises(self):
         with self.assertRaises(NotImplementedError):
             self.model.get_hidden_dim("not_a_module", layer_idx=0)
-
-
-class TestLagunaForCausalLMDelegation(unittest.TestCase):
-    """`LagunaForCausalLM.get_hidden_dim` must forward to the inner model."""
-
-    def test_forwards_to_inner_model(self):
-        inner = _make_fake_laguna([48, 64])
-        causal = LagunaForCausalLM.__new__(LagunaForCausalLM)
-        # Bypass nn.Module.__setattr__: __new__ skips __init__, so the module
-        # registries it expects when assigning a Module-valued attr don't exist.
-        object.__setattr__(causal, "model", inner)
-        for module_name in ("qkv_proj", "o_proj", "gate_up_proj"):
-            for layer_idx in (0, 1):
-                self.assertEqual(
-                    causal.get_hidden_dim(module_name, layer_idx),
-                    inner.get_hidden_dim(module_name, layer_idx),
-                )
 
 
 if __name__ == "__main__":

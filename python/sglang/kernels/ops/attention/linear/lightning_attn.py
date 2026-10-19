@@ -392,7 +392,6 @@ def _fwd_none_diag_kernel(
 
 
 class _attention(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, q, k, v, s, kv_history):
         # Forward pass of the lightning attention algorithm

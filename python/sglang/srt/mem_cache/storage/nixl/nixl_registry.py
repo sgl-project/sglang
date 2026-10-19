@@ -51,6 +51,12 @@ class NixlRegistry:
         # from a single monotonic counter.
         self._obj_devid_lock = threading.Lock()
         self._obj_devid_next = 1
+        # FILE path-mode devIds must also be globally unique: nixlBasicDesc
+        # matches by (devId, addr, len) and excludes metaInfo (the file path),
+        # so per-batch i+1 collides across concurrent batches and deregister
+        # can close the wrong fd (EBADF). Mirror the OBJ counter above.
+        self._file_devid_lock = threading.Lock()
+        self._file_devid_next = 1
         self.path_mode = mem_type == "FILE" and self._probe_path_mode()
         if mem_type == "FILE" and self.path_mode:
             logger.info("HiCacheNixl: path-mode FILE registration active.")
@@ -148,8 +154,12 @@ class NixlRegistry:
                 if self.file_manager.use_direct_io:
                     parts.append("direct")
                 spec = ",".join(parts)
+                n = len(keys)
+                with self._file_devid_lock:
+                    base = self._file_devid_next
+                    self._file_devid_next += n
                 tuples = [
-                    (0, sizes[i], i + 1, f"{spec}:{keys[i]}") for i in range(len(keys))
+                    (0, sizes[i], base + i, f"{spec}:{keys[i]}") for i in range(n)
                 ]
                 with self._registered(tuples, "FILE") as reg:
                     if reg is None:

@@ -11,24 +11,19 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
-from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-    is_graph_dsa_split_op_surface,
-)
-from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
+from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.layers.radix_attention import unified_attention_with_output
-from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
 )
@@ -49,10 +44,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    get_tc_piecewise_forward_context,
-    is_in_tc_piecewise_cuda_graph,
-)
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
@@ -66,12 +57,16 @@ from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import BumpAllocator
-from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_full_prefill_graph,
+    is_in_prefill_graph_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -93,17 +88,8 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def is_dcp_mla_decode_phase(forward_batch: ForwardBatch) -> bool:
-    if not get_parallel().dcp_enabled:
-        return False
-    return (
-        forward_batch.forward_mode.is_decode()
-        or forward_batch.forward_mode.is_target_verify()
-    )
-
-
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    return attention_backend in {"flashmla", "cutedsl_mla"}
+    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
 if _is_cuda:
@@ -115,10 +101,43 @@ def should_defer_dsa_cp_kv_gather(
     dsa_prefill_cp: bool,
     fuse_rope_for_trtllm_mla: bool,
 ) -> bool:
+    """Compatibility predicate imported by the unchanged ROCm MLA path."""
     return dsa_prefill_cp and fuse_rope_for_trtllm_mla
 
 
+def _apply_attention_output_gate(module, attn_output, gate):
+    apply_gate = getattr(module, "apply_attention_output_gate", None)
+    if apply_gate is not None:
+        return apply_gate(attn_output, gate)
+    if hasattr(module, "_apply_gated"):
+        return module._apply_gated(attn_output, gate)
+    raise RuntimeError(
+        "Prepared MLA attention gates are unsigmoided and require a "
+        "model-specific application hook"
+    )
+
+
 class DeepseekMLAForwardMixin:
+    def is_dcp_mla_decode_phase(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        if self.dcp_size == 1:
+            return False
+        mode = forward_batch.forward_mode
+        return (
+            mode.is_decode()
+            or mode.is_target_verify()
+            or (self.use_dsa and mode.is_extend())
+        )
+
+    def is_dcp_q_replicate_phase(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
+            return False
+        mode = forward_batch.forward_mode
+        return mode.is_decode() or mode.is_target_verify()
+
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_exec().kernel.flashinfer_mla_disable_ragged
@@ -148,16 +167,23 @@ class DeepseekMLAForwardMixin:
     def _can_fuse_bmm_into_attention(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
-        # Shared activation surface with the DSA indexer graph dispatch
-        # (in piecewise/breakable graph + non-speculative extend). Like the indexer
-        # dispatch, this fusion is on by default on that surface.
-        if not is_graph_dsa_split_op_surface(forward_batch):
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            return False
+        if self.dcp_size > 1:
+            return False
+        # Like the DSA indexer eager region, this fusion is enabled for
+        # non-speculative CUDA BCG prefill.
+        if not is_in_prefill_graph_scope() or not is_graph_dsa_split_op_surface(
+            forward_batch
+        ):
             return False
         if not self.use_dsa:
             return False
         if self.use_deep_gemm_bmm:
             return False
         if is_kv_b_lora_active(self):
+            return False
+        if getattr(self, "learnable_sink_param", None) is not None:
             return False
         # The isolated 1-kernel graph is the bf16 fallback BMM. The fp8 and
         # DeepGEMM branches already use different fused paths.
@@ -240,19 +266,11 @@ class DeepseekMLAForwardMixin:
             return None
         # Graph/compile surfaces run their own dispatch; the python-side
         # stash handshake is eager-only.
-        if is_graph_dsa_split_op_surface(forward_batch):
-            return None
-        if get_tc_piecewise_forward_context() is not None:
-            return None
-        if is_in_breakable_cuda_graph():
+        if is_in_breakable_cuda_graph() or is_in_full_prefill_graph():
             return None
         if get_is_capture_mode():
             return None
-        if get_parallel().dcp_enabled:
-            return None
-        # Context-parallel prefill reshuffles the KV side; keep the handshake
-        # out of those paths.
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+        if self.dcp_size > 1:
             return None
         # Kernel shape constraints (tl.arange / tl.dot / block tiling).  K
         # (qk_nope_head_dim) needs only K % 16 == 0 and K <= 256: power-of-2
@@ -289,6 +307,11 @@ class DeepseekMLAForwardMixin:
         # True between the alt-stream fork and its consumption in the born
         # block; also suppresses the duplicate split/rope on that path.
         self._q8kv8_qprep_overlap_pending = False
+        attention_output_gate = (
+            self.prepare_attention_output_gate(hidden_states)
+            if hasattr(self, "prepare_attention_output_gate")
+            else None
+        )
 
         fuse_bmm_attention = (
             self.q_lora_rank is not None
@@ -297,8 +320,7 @@ class DeepseekMLAForwardMixin:
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
         q_replicate_active = (
-            get_parallel().dcp_replicate_q_proj
-            and is_dcp_mla_decode_phase(forward_batch)
+            self.is_dcp_q_replicate_phase(forward_batch)
             and not self.use_deep_gemm_bmm
             and self.w_kc_qrep is not None
             and self.q_b_proj_qrep_weight is not None
@@ -374,7 +396,7 @@ class DeepseekMLAForwardMixin:
                     # full-head Q from the gathered weight (skips Q all-gather)
                     q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
-                        self.num_local_heads * get_parallel().attn_dcp_size,
+                        self.num_local_heads * self.dcp_size,
                         self.qk_head_dim,
                     )
                 else:
@@ -446,7 +468,7 @@ class DeepseekMLAForwardMixin:
                     hidden_states, self.q_b_proj_qrep_weight
                 ).view(
                     -1,
-                    self.num_local_heads * get_parallel().attn_dcp_size,
+                    self.num_local_heads * self.dcp_size,
                     self.qk_head_dim,
                 )
             else:
@@ -476,6 +498,17 @@ class DeepseekMLAForwardMixin:
                 torch.bmm(q_nope.transpose(0, 1), self.w_kc_qrep)
                 .transpose(0, 1)
                 .contiguous()
+            )
+        elif getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            k_type = int(self.k_b_qweight_type.weight_type)
+            q_nope_out = torch.stack(
+                [
+                    fused_mul_mat_gguf(q_nope[:, head], self.k_b_qweight[head], k_type)
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
             )
         elif fusion_plan is not None:
             # The composite split op fills q_nope_out_buf and attention reads
@@ -586,40 +619,25 @@ class DeepseekMLAForwardMixin:
                 absorbed_bmm_concat_cast_q_fp8(
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
-            born_q_backend.q8kv8_stash_born_q(num_tokens, self.attn_mqa.layer_id)
+            born_q_backend.q8kv8_stash_born_q(
+                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                self.attn_mqa.layer_id,
+            )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
 
-        dsa_prefill_cp = dsa_use_prefill_cp(forward_batch)
-        mla_prefill_cp = mla_use_prefill_cp(forward_batch)
-        defer_kv_gather_until_after_rope = should_defer_dsa_cp_kv_gather(
-            dsa_prefill_cp=dsa_prefill_cp,
-            fuse_rope_for_trtllm_mla=fuse_rope_for_trtllm_mla,
+        k_nope, k_pe = prepare_kv_for_attention(
+            self,
+            forward_batch,
+            k_nope,
+            k_pe,
+            defer_materialization=fuse_rope_for_trtllm_mla,
         )
-        if dsa_prefill_cp and not defer_kv_gather_until_after_rope:
-            from sglang.srt.layers.attention.dsa_backend import materialize_full_kv_cp
-
-            k_nope, k_pe = materialize_full_kv_cp(
-                self,
-                forward_batch,
-                latent_cache,
-                k_nope,
-                k_pe,
-            )
-        elif mla_prefill_cp and not is_cp_v2_active(forward_batch):
-            # CP-v1 gathers the latent here; CP-v2 gathers it in the attention
-            # backend via the strategy (materialize_full_mla_kv).
-            k_nope, k_pe = self.rebuild_cp_kv_cache(
-                latent_cache,
-                forward_batch,
-                k_nope,
-                k_pe,
-            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if get_parallel().dcp_enabled:
-            if is_dcp_mla_decode_phase(forward_batch):
+        if self.dcp_size > 1:
+            if self.is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
                         q_nope_out=q_nope_out,
@@ -654,6 +672,13 @@ class DeepseekMLAForwardMixin:
             topk_indices,
             llama_4_scaling,
             fusion_plan,
+            # Bailing's DsV3MLA appends its own gate to inner_state, so this
+            # slot is emitted only for models owning the gate hook.
+            *(
+                (attention_output_gate,)
+                if hasattr(self, "prepare_attention_output_gate")
+                else ()
+            ),
         )
 
     def forward_absorb_core(
@@ -668,24 +693,22 @@ class DeepseekMLAForwardMixin:
         topk_indices,
         llama_4_scaling,
         fusion_plan: Optional[MlaBmmFusionPlan] = None,
+        attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
+            if getattr(self, "learnable_sink_param", None) is not None:
+                extra_args["attn_sink"] = self.learnable_sink_param
             if self._fuse_rope_for_trtllm_mla(forward_batch):
-                extra_args = {
-                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                    "is_neox": self.rotary_emb.is_neox_style,
-                    "llama_4_scaling": llama_4_scaling,
-                }
-            if fusion_plan is not None:
-                bmm_attention_fn = (
-                    bcg_mla_bmm_then_unified_attention
-                    if is_in_breakable_cuda_graph()
-                    else mla_bmm_then_unified_attention
+                extra_args.update(
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    is_neox=self.rotary_emb.is_neox_style,
+                    llama_4_scaling=llama_4_scaling,
                 )
-                bmm_attention_fn(
+            if fusion_plan is not None:
+                self._eager_bmm_attention(
                     fusion_plan.q_nope_t,
                     self.w_kc,
                     fusion_plan.q_nope_out_buf,
@@ -693,7 +716,6 @@ class DeepseekMLAForwardMixin:
                     k_nope,
                     fusion_plan.attn_output_buf,
                     save_kv_cache,
-                    self.layer_id,
                     q_pe,
                     k_pe,
                     cos_sin_cache=extra_args.get("cos_sin_cache"),
@@ -702,7 +724,7 @@ class DeepseekMLAForwardMixin:
                     topk_indices=topk_indices,
                 )
                 attn_output = fusion_plan.attn_output_buf
-            elif is_dcp_mla_decode_phase(forward_batch):
+            elif self.is_dcp_mla_decode_phase(forward_batch):
                 # set return_lse=True to correct attn_output
                 attn_output, lse = self.attn_mqa_for_dcp_decode(
                     q_nope_out,
@@ -751,10 +773,10 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if is_dcp_mla_decode_phase(forward_batch):
+        if self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * get_parallel().attn_dcp_size,
+                self.num_local_heads * self.dcp_size,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():
@@ -797,7 +819,20 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
-        if self.use_deep_gemm_bmm:
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+            v_type = int(self.v_b_qweight_type.weight_type)
+            attn_bmm_output = torch.stack(
+                [
+                    fused_mul_mat_gguf(
+                        attn_output[:, head], self.v_b_qweight[head], v_type
+                    )
+                    for head in range(self.num_local_heads)
+                ],
+                dim=1,
+            ).flatten(1, 2)
+        elif self.use_deep_gemm_bmm:
             (
                 attn_output_val,
                 attn_output_scale,
@@ -852,26 +887,18 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_tc_piecewise_cuda_graph():
-                # torch dynamo requires out= op was called where output tensor was non-contiguous
-                attn_bmm_output = (
-                    torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-                    .transpose(0, 1)
-                    .flatten(1, 2)
-                )
-            else:
-                attn_bmm_output = torch.empty(
-                    (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
-                    dtype=attn_output.dtype,
-                    device=attn_output.device,
-                )
-                torch.bmm(
-                    attn_output.transpose(0, 1),
-                    self.w_vc,
-                    out=attn_bmm_output.view(
-                        -1, self.num_local_heads, self.v_head_dim
-                    ).transpose(0, 1),
-                )
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.bmm(
+                attn_output.transpose(0, 1),
+                self.w_vc,
+                out=attn_bmm_output.view(
+                    -1, self.num_local_heads, self.v_head_dim
+                ).transpose(0, 1),
+            )
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
                 kv_b_lora_v_apply,
@@ -883,6 +910,10 @@ class DeepseekMLAForwardMixin:
         elif is_kv_b_lora_active(self):
             attn_bmm_output = apply_kv_b_lora_v_correction(
                 self, attn_output, attn_bmm_output
+            )
+        if attention_output_gate is not None:
+            attn_bmm_output = _apply_attention_output_gate(
+                self, attn_bmm_output, attention_output_gate
             )
         output, _ = self.o_proj(attn_bmm_output)
 
@@ -901,6 +932,8 @@ class DeepseekMLAForwardMixin:
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
+        if self.rotary_emb is None:
+            return False
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
                 get_exec().kernel.dsa_decode_backend == "trtllm"
@@ -918,53 +951,34 @@ class DeepseekMLAForwardMixin:
             and get_attn_backend().data_type == torch.float8_e4m3fn
         )
 
-
-# Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
-# into one eager split op under both PCG and BCG. Without this, the bf16
-# fallback BMM is captured alone in its own single-kernel CUDA graph submodule,
-# paying per-submodule host overhead with no fusion benefit.
-#
-# `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
-# `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
-# `q_nope_out_view`, so the alias's storage is mutated too. Declare it in
-# `mutates_args` to keep the schema honest.
-@register_custom_op(
-    mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
-)
-@register_split_op()
-def mla_bmm_then_unified_attention(
-    q_nope_t: torch.Tensor,
-    w_kc: torch.Tensor,
-    q_nope_out_buf: torch.Tensor,
-    q_nope_out_view: torch.Tensor,
-    k_nope: torch.Tensor,
-    attn_output_buf: torch.Tensor,
-    save_kv_cache: bool,
-    layer_id: int,
-    q_pe: torch.Tensor,
-    k_pe: torch.Tensor,
-    cos_sin_cache: Optional[torch.Tensor] = None,
-    is_neox: Optional[bool] = None,
-    llama_4_scaling: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
-) -> None:
-    torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
-    unified_attention_with_output(
-        q_nope_out_view,
-        k_nope,
-        k_nope,
-        attn_output_buf,
-        save_kv_cache,
-        layer_id,
-        q_rope=q_pe,
-        k_rope=k_pe,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=is_neox,
-        llama_4_scaling=llama_4_scaling,
-        topk_indices=topk_indices,
-    )
-
-
-bcg_mla_bmm_then_unified_attention = eager_on_graph(True)(
-    mla_bmm_then_unified_attention
-)
+    @eager_on_graph
+    def _eager_bmm_attention(
+        self,
+        q_nope_t: torch.Tensor,
+        w_kc: torch.Tensor,
+        q_nope_out_buf: torch.Tensor,
+        q_nope_out_view: torch.Tensor,
+        k_nope: torch.Tensor,
+        attn_output_buf: torch.Tensor,
+        save_kv_cache: bool,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+        self.attn_mqa._eager_attention.run_eager(
+            q_nope_out_view,
+            k_nope,
+            k_nope,
+            attn_output_buf,
+            save_kv_cache,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+            llama_4_scaling=llama_4_scaling,
+            topk_indices=topk_indices,
+        )

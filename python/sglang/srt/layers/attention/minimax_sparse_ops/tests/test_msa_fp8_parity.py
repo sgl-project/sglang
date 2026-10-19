@@ -131,7 +131,7 @@ def test_msa_fp8_decode_vs_triton_fp8():
     )
     err = (o_msa.float() - o_bf16.float()).abs().mean()
     ref = o_bf16.float().abs().mean()
-    assert err / ref < 0.06, f"mean rel err {err/ref:.4f} too high vs bf16 MSA"
+    assert err / ref < 0.06, f"mean rel err {err / ref:.4f} too high vs bf16 MSA"
 
 
 def test_msa_fp8_decode_scales():

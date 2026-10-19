@@ -612,6 +612,14 @@ inline at::vec::Vectorized<float> fast_silu(const at::vec::Vectorized<float>& x)
 #endif
 }
 
+// exact (erf) gelu, matching torch.nn.functional.gelu(approximate="none")
+inline at::vec::Vectorized<float> fast_gelu(const at::vec::Vectorized<float>& x) {
+  const auto half = at::vec::Vectorized<float>(0.5f);
+  const auto one = at::vec::Vectorized<float>(1.f);
+  const auto inv_sqrt2 = at::vec::Vectorized<float>(0.70710678118654752440f);
+  return half * x * (one + (x * inv_sqrt2).erf());
+}
+
 inline at::vec::Vectorized<float>
 fast_sigmoid_glu(const at::vec::Vectorized<float>& x, const at::vec::Vectorized<float>& alpha) {
 #if defined(CPU_CAPABILITY_AVX512)
