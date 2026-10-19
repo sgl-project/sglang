@@ -109,6 +109,10 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
+    # Forward copies keep their penalty owner so speculative verify can feed
+    # accepted tokens before draft-extend, without re-applying penalties.
+    spec_penalty_source: Optional["SamplingBatchInfo"] = None
+
     watermark_keys: Optional[torch.Tensor] = None
     watermark_context_windows: Optional[torch.Tensor] = None
     watermark_enabled: Optional[torch.Tensor] = None
@@ -687,7 +691,32 @@ class SamplingBatchInfo:
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
         self.update_draft_penalty_state()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        forward = dataclasses.replace(self, penalizer_orchestrator=None)
+        forward.spec_penalty_source = (
+            self
+            if self.penalizer_orchestrator is not None
+            and self.penalizer_orchestrator.is_required
+            else None
+        )
+        return forward
+
+    def cumulate_accepted_output_tokens(
+        self, accepted: torch.Tensor, accept_lens: torch.Tensor
+    ):
+        """Feed every accepted speculative token into the penalty state.
+
+        Runs on the forward stream inside verify, before ``on_publish`` records
+        the relay event. The next iteration's penalty snapshot therefore sees
+        this verify's commits even though overlap scheduling has not processed
+        the result or extended ``Req.output_ids`` yet.
+        """
+        orchestrator = self.penalizer_orchestrator
+        if orchestrator is None or not orchestrator.is_required:
+            return
+        for position in range(accepted.shape[1]):
+            orchestrator.cumulate_output_tokens_masked(
+                accepted[:, position], accept_lens > position
+            )
 
     def update_draft_penalty_state(self):
         """Capture coefficients needed to extend penalties over draft tokens."""

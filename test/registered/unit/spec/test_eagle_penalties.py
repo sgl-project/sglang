@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.draft_penalties import apply_draft_token_penalties
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -157,6 +158,57 @@ class TestPenaltyCumulation(CustomTestCase):
         batch.cumulate_penalty_output_tokens()
 
         self.assertEqual(calls, [([12, 7], [0, 1])])
+
+    def test_external_cumulation_skips_stale_output_ids(self):
+        calls = []
+
+        class FakeOrchestrator:
+            def cumulate_output_tokens(self, output_ids, row_indices=None):
+                calls.append((output_ids.tolist(), row_indices.tolist()))
+
+        batch = object.__new__(ScheduleBatch)
+        batch.device = "cpu"
+        batch.reqs = [
+            SimpleNamespace(
+                output_ids=[10, 11],
+                origin_input_ids=[1, 2, 3],
+                penalty_cumulated_output_len=0,
+                penalty_external_cumulation=True,
+            )
+        ]
+        batch.sampling_info = SimpleNamespace(penalizer_orchestrator=FakeOrchestrator())
+
+        batch.cumulate_penalty_output_tokens()
+
+        self.assertEqual(calls, [])
+
+
+class TestAcceptedTokenCumulation(CustomTestCase):
+    def test_accept_lens_mask_each_verify_position(self):
+        calls = []
+
+        class FakeOrchestrator:
+            is_required = True
+
+            def cumulate_output_tokens_masked(self, output_ids, mask):
+                calls.append((output_ids.tolist(), mask.tolist()))
+
+        sampling_info = object.__new__(SamplingBatchInfo)
+        sampling_info.penalizer_orchestrator = FakeOrchestrator()
+
+        sampling_info.cumulate_accepted_output_tokens(
+            torch.tensor([[10, 11, 12], [20, 21, 22]]),
+            torch.tensor([2, 1]),
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                ([10, 20], [True, True]),
+                ([11, 21], [True, False]),
+                ([12, 22], [False, False]),
+            ],
+        )
 
 
 if __name__ == "__main__":

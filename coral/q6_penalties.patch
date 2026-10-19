@@ -1,18 +1,22 @@
 diff --git a/python/sglang/srt/managers/schedule_batch.py b/python/sglang/srt/managers/schedule_batch.py
-index 6bc0dbf6..22fdd256 100755
+index 6bc0dbf6..61c99451 100755
 --- a/python/sglang/srt/managers/schedule_batch.py
 +++ b/python/sglang/srt/managers/schedule_batch.py
-@@ -1101,6 +1101,9 @@ class Req(ReqDllmMixin):
+@@ -1101,6 +1101,13 @@ class Req(ReqDllmMixin):
          # The index of the extend / decode batch
          self.extend_batch_idx = 0
          self.decode_batch_idx = 0
 +        # None until the last prompt token has been seeded; afterwards the
 +        # number of output tokens already fed to the penalizers.
 +        self.penalty_cumulated_output_len: Optional[int] = None
++        # Spec verify feeds accepted tokens on the forward stream, before
++        # overlap scheduling updates output_ids. Once seeded, skip the stale
++        # output-id path for this request.
++        self.penalty_external_cumulation = False
  
          # For multi-http worker
          self.http_worker_ipc = http_worker_ipc
-@@ -3542,23 +3545,45 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+@@ -3542,23 +3549,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
      def cumulate_penalty_output_tokens(self):
          # Under overlap batch.input_ids is just a placeholder here -- the
          # real token is relayed via future_map and resolved at forward
@@ -45,6 +49,8 @@ index 6bc0dbf6..22fdd256 100755
 +                else:
 +                    new_tokens = [req.origin_input_ids[-1]]
 +                    req.penalty_cumulated_output_len = 0
++            elif getattr(req, "penalty_external_cumulation", False):
++                new_tokens = []
 +            elif req.penalty_cumulated_output_len < output_len:
 +                start = req.penalty_cumulated_output_len
 +                new_tokens = list(req.output_ids[start:output_len])
@@ -76,10 +82,10 @@ index 6bc0dbf6..22fdd256 100755
      def prepare_for_decode(self):
          self.forward_mode = ForwardMode.DECODE
 diff --git a/python/sglang/srt/sampling/penaltylib/frequency_penalty.py b/python/sglang/srt/sampling/penaltylib/frequency_penalty.py
-index 5abeaf75..48b3dea7 100644
+index 5abeaf75..35dd6d1e 100644
 --- a/python/sglang/srt/sampling/penaltylib/frequency_penalty.py
 +++ b/python/sglang/srt/sampling/penaltylib/frequency_penalty.py
-@@ -43,6 +43,15 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
+@@ -43,6 +43,28 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
              src=self.frequency_penalties,
          )
  
@@ -92,14 +98,27 @@ index 5abeaf75..48b3dea7 100644
 +            accumulate=True,
 +        )
 +
++    def _cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        rows = torch.arange(output_ids.shape[0], device=output_ids.device)
++        delta = torch.where(
++            mask,
++            self.frequency_penalties[:, 0],
++            torch.zeros_like(self.frequency_penalties[:, 0]),
++        )
++        self.cumulated_frequency_penalties.index_put_(
++            (rows, output_ids), delta, accumulate=True
++        )
++
      def _apply(self, logits: torch.Tensor) -> torch.Tensor:
          logits.sub_(self.cumulated_frequency_penalties)
  
 diff --git a/python/sglang/srt/sampling/penaltylib/min_new_tokens.py b/python/sglang/srt/sampling/penaltylib/min_new_tokens.py
-index 51ad26cf..aaafa886 100644
+index 51ad26cf..177d284f 100644
 --- a/python/sglang/srt/sampling/penaltylib/min_new_tokens.py
 +++ b/python/sglang/srt/sampling/penaltylib/min_new_tokens.py
-@@ -82,6 +82,15 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
+@@ -82,6 +82,20 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
      def _cumulate_output_tokens(self, output_ids: torch.Tensor):
          self.len_output_tokens += 1
  
@@ -112,14 +131,19 @@ index 51ad26cf..aaafa886 100644
 +            source=torch.ones_like(row_indices, dtype=self.len_output_tokens.dtype),
 +        )
 +
++    def _cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        self.len_output_tokens += mask.to(self.len_output_tokens.dtype).unsqueeze(1)
++
      def _apply(self, logits: torch.Tensor):
          # Boolean-mask indexing (logits[mask]) is data-dependent and forces a
          # device-to-host sync every decode step; torch.where is a plain
 diff --git a/python/sglang/srt/sampling/penaltylib/orchestrator.py b/python/sglang/srt/sampling/penaltylib/orchestrator.py
-index 5cdbe83f..99544260 100644
+index 5cdbe83f..da36340a 100644
 --- a/python/sglang/srt/sampling/penaltylib/orchestrator.py
 +++ b/python/sglang/srt/sampling/penaltylib/orchestrator.py
-@@ -42,15 +42,21 @@ class BatchedPenalizerOrchestrator:
+@@ -42,15 +42,32 @@ class BatchedPenalizerOrchestrator:
      def reqs(self):
          return self.batch.reqs
  
@@ -134,16 +158,27 @@ index 5cdbe83f..99544260 100644
              output_ids (torch.Tensor): The output tokens.
 +            row_indices (Optional[torch.Tensor]): Batch rows to update. When
 +                unset, every row receives one token.
-         """
-         for penalizer in self.penalizers.values():
--            penalizer.cumulate_output_tokens(output_ids=output_ids)
++        """
++        for penalizer in self.penalizers.values():
 +            penalizer.cumulate_output_tokens(
 +                output_ids=output_ids, row_indices=row_indices
 +            )
++
++    def cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        """Feed one output token per row, skipping rows where ``mask`` is false.
++
++        The mask keeps speculative acceptance on the forward stream: accepted
++        lengths are device tensors, so no data-dependent host indexing is needed.
+         """
+         for penalizer in self.penalizers.values():
+-            penalizer.cumulate_output_tokens(output_ids=output_ids)
++            penalizer.cumulate_output_tokens_masked(output_ids=output_ids, mask=mask)
  
      def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
          """
-@@ -209,11 +215,18 @@ class _BatchedPenalizer(abc.ABC):
+@@ -209,11 +226,18 @@ class _BatchedPenalizer(abc.ABC):
          self._teardown()
          self._is_prepared = False
  
@@ -164,7 +199,7 @@ index 5cdbe83f..99544260 100644
  
      def apply(self, logits: torch.Tensor) -> torch.Tensor:
          if not self._is_prepared:
-@@ -258,6 +271,14 @@ class _BatchedPenalizer(abc.ABC):
+@@ -258,6 +282,29 @@ class _BatchedPenalizer(abc.ABC):
          """
          pass
  
@@ -176,14 +211,29 @@ index 5cdbe83f..99544260 100644
 +            f"{type(self).__name__} does not support subset penalty cumulation"
 +        )
 +
++    def cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        if not self._is_prepared:
++            return
++        self._cumulate_output_tokens_masked(output_ids=output_ids, mask=mask)
++
++    def _cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        """Cumulate one token per row, skipping masked rows."""
++        raise NotImplementedError(
++            f"{type(self).__name__} does not support masked penalty cumulation"
++        )
++
      @abc.abstractmethod
      def _apply(self, logits: torch.Tensor) -> torch.Tensor:
          """
 diff --git a/python/sglang/srt/sampling/penaltylib/presence_penalty.py b/python/sglang/srt/sampling/penaltylib/presence_penalty.py
-index 5d6004eb..e9900b61 100644
+index 5d6004eb..e8c462b6 100644
 --- a/python/sglang/srt/sampling/penaltylib/presence_penalty.py
 +++ b/python/sglang/srt/sampling/penaltylib/presence_penalty.py
-@@ -43,6 +43,13 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
+@@ -43,6 +43,21 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
              src=self.presence_penalties,
          )
  
@@ -194,14 +244,22 @@ index 5d6004eb..e9900b61 100644
 +            (row_indices, output_ids), self.presence_penalties[row_indices, 0]
 +        )
 +
++    def _cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        rows = torch.arange(output_ids.shape[0], device=output_ids.device)
++        current = self.cumulated_presence_penalties[rows, output_ids]
++        values = torch.where(mask, self.presence_penalties[:, 0], current)
++        self.cumulated_presence_penalties[rows, output_ids] = values
++
      def _apply(self, logits: torch.Tensor) -> torch.Tensor:
          logits.sub_(self.cumulated_presence_penalties)
  
 diff --git a/python/sglang/srt/sampling/penaltylib/repetition_penalty.py b/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
-index 7d589181..51398098 100644
+index 7d589181..6a1007ce 100644
 --- a/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
 +++ b/python/sglang/srt/sampling/penaltylib/repetition_penalty.py
-@@ -56,6 +56,13 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
+@@ -56,6 +56,21 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
              src=self.repetition_penalties,
          )
  
@@ -212,11 +270,19 @@ index 7d589181..51398098 100644
 +            (row_indices, output_ids), self.repetition_penalties[row_indices, 0]
 +        )
 +
++    def _cumulate_output_tokens_masked(
++        self, output_ids: torch.Tensor, mask: torch.Tensor
++    ):
++        rows = torch.arange(output_ids.shape[0], device=output_ids.device)
++        current = self.cumulated_repetition_penalties[rows, output_ids]
++        values = torch.where(mask, self.repetition_penalties[:, 0], current)
++        self.cumulated_repetition_penalties[rows, output_ids] = values
++
      def _apply(self, logits: torch.Tensor) -> torch.Tensor:
          apply_scaling_penalties(logits, self.cumulated_repetition_penalties)
          return logits
 diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
-index fee776bd..7ce33e93 100644
+index fee776bd..f2e5f716 100644
 --- a/python/sglang/srt/sampling/sampling_batch_info.py
 +++ b/python/sglang/srt/sampling/sampling_batch_info.py
 @@ -82,6 +82,13 @@ class SamplingBatchInfo:
@@ -233,13 +299,50 @@ index fee776bd..7ce33e93 100644
  
      # Whether any request has custom logit processor
      has_custom_logit_processor: bool = False
-@@ -679,8 +686,30 @@ class SamplingBatchInfo:
+@@ -102,6 +109,10 @@ class SamplingBatchInfo:
+     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+     sampling_mask_top_ks: Optional[List[int]] = None
+ 
++    # Forward copies keep their penalty owner so speculative verify can feed
++    # accepted tokens before draft-extend, without re-applying penalties.
++    spec_penalty_source: Optional["SamplingBatchInfo"] = None
++
+     watermark_keys: Optional[torch.Tensor] = None
+     watermark_context_windows: Optional[torch.Tensor] = None
+     watermark_enabled: Optional[torch.Tensor] = None
+@@ -679,7 +690,54 @@ class SamplingBatchInfo:
      def copy_for_forward(self):
          # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
          self.update_penalties()
+-        return dataclasses.replace(self, penalizer_orchestrator=None)
 +        self.update_draft_penalty_state()
-         return dataclasses.replace(self, penalizer_orchestrator=None)
- 
++        forward = dataclasses.replace(self, penalizer_orchestrator=None)
++        forward.spec_penalty_source = (
++            self
++            if self.penalizer_orchestrator is not None
++            and self.penalizer_orchestrator.is_required
++            else None
++        )
++        return forward
++
++    def cumulate_accepted_output_tokens(
++        self, accepted: torch.Tensor, accept_lens: torch.Tensor
++    ):
++        """Feed every accepted speculative token into the penalty state.
++
++        Runs on the forward stream inside verify, before ``on_publish`` records
++        the relay event. The next iteration's penalty snapshot therefore sees
++        this verify's commits even though overlap scheduling has not processed
++        the result or extended ``Req.output_ids`` yet.
++        """
++        orchestrator = self.penalizer_orchestrator
++        if orchestrator is None or not orchestrator.is_required:
++            return
++        for position in range(accepted.shape[1]):
++            orchestrator.cumulate_output_tokens_masked(
++                accepted[:, position], accept_lens > position
++            )
++
 +    def update_draft_penalty_state(self):
 +        """Capture coefficients needed to extend penalties over draft tokens."""
 +        orchestrator = self.penalizer_orchestrator
@@ -260,10 +363,9 @@ index fee776bd..7ce33e93 100644
 +                self.draft_cumulated_repetition_penalties = (
 +                    penalizer.cumulated_repetition_penalties
 +                )
-+
+ 
  
  def merge_bias_tensor(
-     lhs: Optional[torch.Tensor],
 diff --git a/python/sglang/srt/speculative/draft_penalties.py b/python/sglang/srt/speculative/draft_penalties.py
 new file mode 100644
 index 00000000..5075ebb7
@@ -362,7 +464,7 @@ index 00000000..5075ebb7
 +
 +        logits[row_indices, position_indices, token_indices] = tail
 diff --git a/python/sglang/srt/speculative/eagle_utils.py b/python/sglang/srt/speculative/eagle_utils.py
-index 149b7e56..25e94f90 100644
+index 149b7e56..36db7fbc 100644
 --- a/python/sglang/srt/speculative/eagle_utils.py
 +++ b/python/sglang/srt/speculative/eagle_utils.py
 @@ -759,6 +759,7 @@ def eagle_sample(
@@ -402,12 +504,44 @@ index 149b7e56..25e94f90 100644
      predict_shape = list(next_token_logits.shape)[:-1]
      predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
      accept_index = torch.full(
+@@ -1112,9 +1115,12 @@ def eagle_sample(
+ def eagle_prepare_for_decode(batch: ScheduleBatch):
+     batch.maybe_evict_swa()
+ 
+-    # Accumulate penalty
+-    # This is a relaxed version of penalties for speculative decoding.
++    # Seed the prefill boundary, then let verify feed accepted tokens directly.
++    # Overlap schedules the next batch before result processing extends
++    # output_ids, so the output-id path would lag one verify step.
+     if batch.sampling_info.penalizer_orchestrator.is_required:
++        for req in batch.reqs:
++            req.penalty_external_cumulation = True
+         batch.cumulate_penalty_output_tokens()
+ 
+     page_size = batch.token_to_kv_pool_allocator.page_size
+diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
+index 7507a695..025848f5 100644
+--- a/python/sglang/srt/speculative/eagle_worker_common.py
++++ b/python/sglang/srt/speculative/eagle_worker_common.py
+@@ -801,6 +801,12 @@ def run_eagle_verify(
+             num_draft_tokens=num_draft_tokens,
+         )
+ 
++    penalty_source = getattr(batch.sampling_info, "spec_penalty_source", None)
++    if penalty_source is not None and not batch.forward_mode.is_idle():
++        penalty_source.cumulate_accepted_output_tokens(
++            predict.reshape(bs, num_draft_tokens), accept_lens
++        )
++
+     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+ 
+     # verify_forward_batch transitively holds verify-time GPU tensors
 diff --git a/test/registered/unit/spec/test_eagle_penalties.py b/test/registered/unit/spec/test_eagle_penalties.py
 new file mode 100644
-index 00000000..cdbb3d04
+index 00000000..615656ca
 --- /dev/null
 +++ b/test/registered/unit/spec/test_eagle_penalties.py
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,217 @@
 +"""CPU-only tests for speculative verify penalties."""
 +
 +from types import SimpleNamespace
@@ -415,6 +549,7 @@ index 00000000..cdbb3d04
 +import torch
 +
 +from sglang.srt.managers.schedule_batch import ScheduleBatch
++from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 +from sglang.srt.speculative.draft_penalties import apply_draft_token_penalties
 +from sglang.test.ci.ci_register import register_cpu_ci
 +from sglang.test.test_utils import CustomTestCase
@@ -567,6 +702,57 @@ index 00000000..cdbb3d04
 +        batch.cumulate_penalty_output_tokens()
 +
 +        self.assertEqual(calls, [([12, 7], [0, 1])])
++
++    def test_external_cumulation_skips_stale_output_ids(self):
++        calls = []
++
++        class FakeOrchestrator:
++            def cumulate_output_tokens(self, output_ids, row_indices=None):
++                calls.append((output_ids.tolist(), row_indices.tolist()))
++
++        batch = object.__new__(ScheduleBatch)
++        batch.device = "cpu"
++        batch.reqs = [
++            SimpleNamespace(
++                output_ids=[10, 11],
++                origin_input_ids=[1, 2, 3],
++                penalty_cumulated_output_len=0,
++                penalty_external_cumulation=True,
++            )
++        ]
++        batch.sampling_info = SimpleNamespace(penalizer_orchestrator=FakeOrchestrator())
++
++        batch.cumulate_penalty_output_tokens()
++
++        self.assertEqual(calls, [])
++
++
++class TestAcceptedTokenCumulation(CustomTestCase):
++    def test_accept_lens_mask_each_verify_position(self):
++        calls = []
++
++        class FakeOrchestrator:
++            is_required = True
++
++            def cumulate_output_tokens_masked(self, output_ids, mask):
++                calls.append((output_ids.tolist(), mask.tolist()))
++
++        sampling_info = object.__new__(SamplingBatchInfo)
++        sampling_info.penalizer_orchestrator = FakeOrchestrator()
++
++        sampling_info.cumulate_accepted_output_tokens(
++            torch.tensor([[10, 11, 12], [20, 21, 22]]),
++            torch.tensor([2, 1]),
++        )
++
++        self.assertEqual(
++            calls,
++            [
++                ([10, 20], [True, True]),
++                ([11, 21], [True, False]),
++                ([12, 22], [False, False]),
++            ],
++        )
 +
 +
 +if __name__ == "__main__":

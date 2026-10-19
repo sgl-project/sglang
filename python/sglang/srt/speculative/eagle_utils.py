@@ -1115,9 +1115,12 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Seed the prefill boundary, then let verify feed accepted tokens directly.
+    # Overlap schedules the next batch before result processing extends
+    # output_ids, so the output-id path would lag one verify step.
     if batch.sampling_info.penalizer_orchestrator.is_required:
+        for req in batch.reqs:
+            req.penalty_external_cumulation = True
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size

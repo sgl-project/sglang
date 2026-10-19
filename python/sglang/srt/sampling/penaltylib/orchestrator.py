@@ -58,6 +58,17 @@ class BatchedPenalizerOrchestrator:
                 output_ids=output_ids, row_indices=row_indices
             )
 
+    def cumulate_output_tokens_masked(
+        self, output_ids: torch.Tensor, mask: torch.Tensor
+    ):
+        """Feed one output token per row, skipping rows where ``mask`` is false.
+
+        The mask keeps speculative acceptance on the forward stream: accepted
+        lengths are device tensors, so no data-dependent host indexing is needed.
+        """
+        for penalizer in self.penalizers.values():
+            penalizer.cumulate_output_tokens_masked(output_ids=output_ids, mask=mask)
+
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
         Apply all penalizers to the logits in-place.
@@ -277,6 +288,21 @@ class _BatchedPenalizer(abc.ABC):
         """Cumulate one token for a subset of batch rows."""
         raise NotImplementedError(
             f"{type(self).__name__} does not support subset penalty cumulation"
+        )
+
+    def cumulate_output_tokens_masked(
+        self, output_ids: torch.Tensor, mask: torch.Tensor
+    ):
+        if not self._is_prepared:
+            return
+        self._cumulate_output_tokens_masked(output_ids=output_ids, mask=mask)
+
+    def _cumulate_output_tokens_masked(
+        self, output_ids: torch.Tensor, mask: torch.Tensor
+    ):
+        """Cumulate one token per row, skipping masked rows."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support masked penalty cumulation"
         )
 
     @abc.abstractmethod

@@ -1104,6 +1104,10 @@ class Req(ReqDllmMixin):
         # None until the last prompt token has been seeded; afterwards the
         # number of output tokens already fed to the penalizers.
         self.penalty_cumulated_output_len: Optional[int] = None
+        # Spec verify feeds accepted tokens on the forward stream, before
+        # overlap scheduling updates output_ids. Once seeded, skip the stale
+        # output-id path for this request.
+        self.penalty_external_cumulation = False
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
@@ -3557,6 +3561,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 else:
                     new_tokens = [req.origin_input_ids[-1]]
                     req.penalty_cumulated_output_len = 0
+            elif getattr(req, "penalty_external_cumulation", False):
+                new_tokens = []
             elif req.penalty_cumulated_output_len < output_len:
                 start = req.penalty_cumulated_output_len
                 new_tokens = list(req.output_ids[start:output_len])

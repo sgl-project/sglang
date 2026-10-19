@@ -801,6 +801,12 @@ def run_eagle_verify(
             num_draft_tokens=num_draft_tokens,
         )
 
+    penalty_source = getattr(batch.sampling_info, "spec_penalty_source", None)
+    if penalty_source is not None and not batch.forward_mode.is_idle():
+        penalty_source.cumulate_accepted_output_tokens(
+            predict.reshape(bs, num_draft_tokens), accept_lens
+        )
+
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
     # verify_forward_batch transitively holds verify-time GPU tensors
