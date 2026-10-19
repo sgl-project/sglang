@@ -296,6 +296,8 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Native gRPC listener on `host`; `None` disables it.
+    pub grpc_port: Option<u16>,
     /// Pause after SIGTERM with `/readyz` returning 503 before stopping accepts.
     /// Allows endpoint removal or readiness-probe failures to reach load balancers.
     /// Leave time in the pod grace period for in-flight draining; 0 disables the pause.
@@ -331,6 +333,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            grpc_port: None,
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
@@ -391,9 +394,10 @@ pub struct ModelConfig {
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
     pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
-    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// Reorg admission for groups that leave a limit unset: `--max-inflight-requests`
     /// and `--max-kv-usage`.
     pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
+    /// Per-worker circuit breaker; `None` under `--disable-circuit-breaker`.
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -727,8 +731,12 @@ pub struct CircuitBreakerConfig {
     pub cool_down_secs: u64,
 }
 
-/// Default circuit-breaker cool-down, applied when `--cb-threshold` is
-/// set without an explicit `--cb-cool-down-secs`.
+/// Default circuit-breaker threshold, without `--cb-threshold`.
+pub fn default_cb_threshold() -> NonZeroU32 {
+    NonZeroU32::new(3).expect("3 is non-zero")
+}
+
+/// Default circuit-breaker cool-down, without `--cb-cool-down-secs`.
 pub fn default_cb_cool_down() -> u64 {
     30
 }
