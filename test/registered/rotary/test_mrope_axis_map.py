@@ -169,9 +169,9 @@ class TestMRopeAxisMap(CustomTestCase):
             head_dim=256,
             attn_output_gate=True,
             q_norm=SimpleNamespace(
-                weight=qkv.new_full((256,), 0.25), variance_epsilon=1e-6
+                gemma_weight=qkv.new_full((256,), 1.25), variance_epsilon=1e-6
             ),
-            k_norm=SimpleNamespace(weight=qkv.new_full((256,), -0.25)),
+            k_norm=SimpleNamespace(gemma_weight=qkv.new_full((256,), 0.75)),
         )
         multimodal = torch.tensor([[0, 1], [2, 3], [4, 5]])
         with patch.object(
@@ -186,12 +186,8 @@ class TestMRopeAxisMap(CustomTestCase):
                 )
                 args = fused.call_args.kwargs.copy()
                 self.assertIs(args.pop("qkv"), qkv)
-                torch.testing.assert_close(
-                    args.pop("q_weight"), qkv.new_full((256,), 1.25)
-                )
-                torch.testing.assert_close(
-                    args.pop("k_weight"), qkv.new_full((256,), 0.75)
-                )
+                self.assertIs(args.pop("q_weight"), layer.q_norm.gemma_weight)
+                self.assertIs(args.pop("k_weight"), layer.k_norm.gemma_weight)
                 torch.testing.assert_close(
                     args.pop("cos_sin"),
                     rope.cos_sin_cache[positions.expand(3, -1)].to(qkv),

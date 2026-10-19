@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import (
@@ -460,7 +461,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         self.reset()
@@ -664,6 +668,34 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = []
+        for node_id in end_node_ids:
+            node = self.node_by_id(node_id)
+            chain = []
+            while node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+            path = []
+            start = 0
+            for node in reversed(chain):
+                end = start + len(node.key)
+                value = node.component_data[BASE_COMPONENT_TYPE].value
+                path.append(
+                    TreePathNodeInfo(
+                        node.id,
+                        node.parent.id,
+                        start,
+                        end,
+                        None if value is None else len(value),
+                    )
+                )
+                start = end
+            paths.append(tuple(path))
+        return tuple(paths)
+
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
         node = UnifiedTreeNode(self.component_types, priority=priority)
@@ -696,8 +728,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
-        node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
+        or unanchored one would silently release (or steal) another holder's segment."""
+        assert params.node_id == node.id, (
             f"lock receipt anchored on node {params.node_id} released on node {node.id}"
         )
 
@@ -1366,18 +1398,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
-        components = self.components
-        if self.is_write_back:
-            swa = self.components_by_type.get(ComponentType.SWA)
-            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in components
+            for component in self.components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
+        if self.is_write_back:
+            return False
         if state.is_new_leaf:
             leaf_end = state.total_prefix_length + len(state.target_node.key)
             return (
@@ -2754,7 +2784,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             remaining = remaining[prefix_len:]
 
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
         """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
         ranges: list[tuple[int, int]] = []
@@ -2762,7 +2796,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             seg_end = pos + prefix_len
             if seg_end <= start:
                 continue
-            if child.component_data[ComponentType.SWA].value is not None:
+            if child.component_data[component_type].value is not None:
                 continue
             lo, hi = max(start, pos), min(end, seg_end)
             if ranges and ranges[-1][1] == lo:
@@ -2779,6 +2813,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA slice to an existing tombstoned tree span."""
         assert len(swa_values) == window_end - window_start, (
@@ -2793,7 +2828,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 continue
             seg_start = max(pos, window_start)
             assign_end = min(seg_end, window_end)
-            assert child.component_data[ComponentType.SWA].value is None, (
+            assert child.component_data[component_type].value is None, (
                 f"attach_swa_window over live SWA at [{seg_start}, {assign_end}) "
                 f"of [{window_start}, {window_end})"
             )
@@ -2804,6 +2839,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 assign_end,
                 swa_values[seg_start - window_start : assign_end - window_start],
                 actions,
+                component_type,
             )
             covered = assign_end
             if covered >= window_end:
@@ -2821,6 +2857,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         seg_end: int,
         values: torch.Tensor,
         actions: list[CacheAction | ComponentAction],
+        component_type: ComponentType,
     ) -> None:
         target = node
         if seg_start > node_start:
@@ -2832,7 +2869,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if action is not None:
                 actions.append(action)
             target = fragment
-        self.set_component_device_value(target.id, ComponentType.SWA, values.clone())
+        self.set_component_device_value(target.id, component_type, values.clone())
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
@@ -2855,17 +2892,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             self.component_evictable_size_[component_type] += ledger
 
-    def adjust_component_ledger(
-        self, node: UnifiedTreeNode, component_type: ComponentType, delta: int
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
     ) -> None:
-        """A component changed how many pool tokens evicting ``node`` would
-        reclaim (``TreeComponent.reclaimable_tokens``) while the value stays
-        on device: move the ledger the node is on by ``delta``. A tombstoned
-        value is on neither ledger."""
-        if delta == 0:
-            return
+        node = self.node_by_id(node_id)
+        if component_type not in self.components_by_type:
+            raise ValueError(f"component is not enabled: {component_type}")
         cd = node.component_data[component_type]
-        if cd.value is None:
+        if node is self.root_node or cd.value is None:
             return
         if cd.lock_ref > 0:
             self.component_protected_size_[component_type] += delta

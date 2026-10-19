@@ -1,143 +1,15 @@
 import re
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-import sglang.kernels.fused_op as fused_op_module
-from sglang import kernels
-from sglang.kernels.ops.layernorm import (
-    GemmaFusedAddRMSNormOp,
-    GemmaRMSNormOp,
-)
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, PlatformInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
-
-
-def _fake_sgl_kernel_npu(gemma_kernel, add_gemma_kernel):
-    package = ModuleType("sgl_kernel_npu")
-    package.__path__ = []
-    norm_package = ModuleType("sgl_kernel_npu.norm")
-    norm_package.__path__ = []
-    gemma_module = ModuleType("sgl_kernel_npu.norm.gemma_rmsnorm")
-    gemma_module.npu_gemma_rms_norm = gemma_kernel
-    add_module = ModuleType("sgl_kernel_npu.norm.add_rmsnorm_bias")
-    add_module.add_gemma_rms_norm = add_gemma_kernel
-    return {
-        "sgl_kernel_npu": package,
-        "sgl_kernel_npu.norm": norm_package,
-        "sgl_kernel_npu.norm.gemma_rmsnorm": gemma_module,
-        "sgl_kernel_npu.norm.add_rmsnorm_bias": add_module,
-    }
-
-
-@pytest.mark.parametrize(
-    "op_name",
-    ["layernorm.gemma_rmsnorm", "layernorm.gemma_fused_add_rmsnorm"],
-)
-def test_registry_exposes_only_sgl_kernel_npu_provider(op_name):
-    registered_backends = {spec.backend for spec in kernels.registry.get(op_name)}
-    spec = kernels.registry.get_backend(op_name, KernelBackend.SGL_KERNEL_NPU)
-
-    assert KernelBackend.TORCH_NPU not in registered_backends
-    assert spec.capabilities == frozenset({CapabilityRequirement.NPU})
-    assert spec.target.endswith(".forward_sgl_kernel_npu")
-
-
-@pytest.mark.parametrize("op_cls", [GemmaRMSNormOp, GemmaFusedAddRMSNormOp])
-def test_sgl_kernel_npu_is_selected_on_npu(op_cls):
-    with patch.object(
-        fused_op_module, "_platform", return_value=PlatformInfo(device_type="npu")
-    ):
-        backend = op_cls().auto_selected_backend()
-
-    assert backend is KernelBackend.SGL_KERNEL_NPU
-
-
-def test_missing_kernel_package_reports_actionable_error():
-    package = ModuleType("sgl_kernel_npu")
-    package.__path__ = []
-    norm_package = ModuleType("sgl_kernel_npu.norm")
-    norm_package.__path__ = []
-
-    with patch.dict(
-        sys.modules,
-        {
-            "sgl_kernel_npu": package,
-            "sgl_kernel_npu.norm": norm_package,
-        },
-    ):
-        sys.modules.pop("sgl_kernel_npu.norm.gemma_rmsnorm", None)
-        with pytest.raises(RuntimeError, match="requires a target-specific"):
-            GemmaRMSNormOp().forward_sgl_kernel_npu(
-                torch.randn(2, 4), torch.randn(4), 1e-5
-            )
-
-
-def test_incompatible_kernel_package_reports_actionable_error():
-    """A wheel that imports but lacks the symbol must name the module it lacks.
-
-    Covers the AttributeError branch (the test above covers ImportError), and
-    pins each op to its own module so the message cannot drift into a
-    copy-pasted sibling name.
-    """
-    modules = _fake_sgl_kernel_npu(MagicMock(), MagicMock())
-    del modules["sgl_kernel_npu.norm.gemma_rmsnorm"].npu_gemma_rms_norm
-    del modules["sgl_kernel_npu.norm.add_rmsnorm_bias"].add_gemma_rms_norm
-
-    with patch.dict(sys.modules, modules):
-        with pytest.raises(RuntimeError, match=r"norm\.gemma_rmsnorm\."):
-            GemmaRMSNormOp().forward_sgl_kernel_npu(
-                torch.randn(2, 4), torch.randn(4), 1e-5
-            )
-        with pytest.raises(RuntimeError, match=r"norm\.add_rmsnorm_bias\."):
-            GemmaFusedAddRMSNormOp().forward_sgl_kernel_npu(
-                torch.randn(2, 4), torch.randn(2, 4), torch.randn(4), 1e-5
-            )
-
-
-def test_sgl_kernel_npu_normal_out_contract():
-    x = torch.randn(2, 4)
-    weight = torch.randn(4)
-    expected = torch.randn_like(x)
-    out = torch.empty_like(x)
-    gemma_kernel = MagicMock(return_value=(expected, "rstd"))
-
-    with patch.dict(sys.modules, _fake_sgl_kernel_npu(gemma_kernel, MagicMock())):
-        result = GemmaRMSNormOp().forward_sgl_kernel_npu(x, weight, 1e-5, out=out)
-
-    assert result is out
-    torch.testing.assert_close(out, expected)
-    gemma_kernel.assert_called_once_with(x, weight, 1e-5)
-
-
-def test_sgl_kernel_npu_fused_in_place_contract():
-    x = torch.randn(2, 4)
-    residual = torch.randn(2, 4)
-    weight = torch.randn(4)
-    norm_output = torch.randn_like(x)
-    residual_sum = torch.randn_like(residual)
-    add_gemma_kernel = MagicMock(return_value=(norm_output, residual_sum))
-
-    with patch.dict(sys.modules, _fake_sgl_kernel_npu(MagicMock(), add_gemma_kernel)):
-        result = GemmaFusedAddRMSNormOp().forward_sgl_kernel_npu(
-            x, residual, weight, 1e-5
-        )
-
-    assert result is None
-    torch.testing.assert_close(x, norm_output)
-    torch.testing.assert_close(residual, residual_sum)
-    add_gemma_kernel.assert_called_once()
-    args = add_gemma_kernel.call_args.args
-    assert args[0] is x
-    assert args[1] is weight
-    assert args[2] is residual
-    assert args[3] == 1e-5
 
 
 @pytest.mark.parametrize(
@@ -156,6 +28,54 @@ def test_srt_gemma_layers_delegate_plain_npu_path(layer_name, eps_attr):
 
     assert result is x
     unified_op.assert_called_once_with(x, layer.weight, getattr(layer, eps_attr))
+
+
+@pytest.mark.parametrize("hidden_size", [256, 5120, 8192])
+@pytest.mark.parametrize(
+    ("weight_dtype", "input_dtype"),
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("with_post_residual", [False, True])
+def test_srt_gemma_residual_reuses_precomputed_weight(
+    hidden_size, weight_dtype, input_dtype, with_post_residual
+):
+    from sglang.srt.layers import layernorm as layernorm_module
+
+    layer = layernorm_module.GemmaRMSNorm(hidden_size).to(weight_dtype)
+    weight = torch.linspace(-0.5, 0.5, hidden_size, dtype=weight_dtype)
+    layer.weight.weight_loader(layer.weight, weight)
+    x = torch.randn(2, hidden_size, dtype=input_dtype)
+    residual = torch.randn_like(x)
+    post_residual = torch.randn_like(x) if with_post_residual else None
+    output, residual_sum = torch.empty_like(x), torch.empty_like(x)
+    fused_op = MagicMock(return_value=(output, None, residual_sum))
+
+    with patch.object(
+        layernorm_module,
+        "torch_npu",
+        SimpleNamespace(npu_add_rms_norm=fused_op),
+        create=True,
+    ):
+        result = layer.forward_npu(x, residual, post_residual)
+
+    assert result[0] is output
+    assert result[1] is residual_sum
+    fused_op.assert_called_once()
+    actual_residual, actual_x, gamma, eps = fused_op.call_args.args
+    assert actual_x is x
+    assert eps == layer.variance_epsilon
+    if with_post_residual:
+        torch.testing.assert_close(actual_residual, residual + post_residual)
+    else:
+        assert actual_residual is residual
+    assert gamma.dtype == input_dtype
+    torch.testing.assert_close(gamma, (1.0 + weight).to(input_dtype))
+    if weight_dtype == input_dtype:
+        assert gamma is layer.gemma_weight
 
 
 def test_srt_falls_back_to_torch_npu_on_wheels_without_the_provider():

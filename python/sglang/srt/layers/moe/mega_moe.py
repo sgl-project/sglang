@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
+from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.utils import is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -97,14 +98,19 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
+    # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
+    # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
+    # from token TMA loads, so intermediate % 128 suffices, including V4.1
+    # Flash's 2304-wide intermediate dimension.
+    # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    hidden_align = 16 * scale_group
+    if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
-            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
+            f"of {hidden_align} and moe_intermediate_size to be a multiple of "
+            f"{align}; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -194,7 +200,8 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
         and moe.shared_experts_is_fp8
-        and moe.shared_experts_weight_block_size == [128, 128]
+        and moe.shared_experts_weight_block_size is not None
+        and moe.shared_experts_weight_block_size[1] % 32 == 0
     )
 
 
@@ -256,19 +263,31 @@ def _run_mega_routed(
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
+        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if (
+            not moe.is_hash
+            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+        ):
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        else:
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -561,6 +580,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
     experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
     experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+    # EPLB moves each expert's slice of every parameter, so the UTCCP copies
+    # move with the scales they are transposed from.
+    experts.register_parameter(
+        "mega_w13_weight_scale_utccp",
+        torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+    )
+    experts.register_parameter(
+        "mega_w2_weight_scale_utccp",
+        torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+    )
 
     experts._mega_moe_weights_built = True
 
@@ -589,10 +618,21 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
     if sf.dtype == torch.int32:
         # Requantized for the DeepGEMM linear runner.
         sf = inverse_transform_scale_ue8m0(sf, mn=n)[:, : k // 128]
+        block_m, block_k = 128, 128
+    else:
+        block_m, block_k = linear.quant_method.quant_config.weight_block_size
+    sf = sf.repeat_interleave(block_k // 32, dim=-1)
+    if block_m == 128:
+        return transform_sf_into_required_layout(
+            sf, mn=n, k=k, recipe=(128, 32), disable_ue8m0_cast=False
+        )
+    if block_m != 1:
+        sf = sf.repeat_interleave(block_m, dim=0)
     return transform_sf_into_required_layout(
-        sf.repeat_interleave(4, dim=-1),
+        sf.unsqueeze(0).contiguous(),
         mn=n,
         k=k,
-        recipe=(128, 32),
+        recipe=(1, 32),
+        num_groups=1,
         disable_ue8m0_cast=False,
-    )
+    ).squeeze(0)

@@ -21,34 +21,21 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
-    mount_flux2_nvfp4_swiglu_quant,
-    mount_fused_gate_rmsnorm,
-    mount_fused_linear_gelu,
-    mount_fused_ln_modulate,
-    mount_helios_gated_residual,
-    mount_hunyuan_qknorm,
-    mount_lingbot_video_gated_residual,
-    mount_lingbot_video_rmsnorm,
-    mount_ltx2_qknorm_split_rope,
-    mount_ltx2_rms_norm_modulate,
-    mount_minimax_h3_norm_modulate,
-    mount_nvfp4_bias_gelu,
-    mount_qwen_image_added_qkv,
-    mount_sana_video_linear_attention,
-    unmount_flux2_nvfp4_swiglu_quant,
-    unmount_fused_gate_rmsnorm,
-    unmount_fused_linear_gelu,
-    unmount_fused_ln_modulate,
-    unmount_helios_gated_residual,
-    unmount_hunyuan_qknorm,
-    unmount_lingbot_video_gated_residual,
-    unmount_lingbot_video_rmsnorm,
-    unmount_ltx2_qknorm_split_rope,
-    unmount_ltx2_rms_norm_modulate,
-    unmount_minimax_h3_norm_modulate,
-    unmount_nvfp4_bias_gelu,
-    unmount_qwen_image_added_qkv,
-    unmount_sana_video_linear_attention,
+    FLUX2_NVFP4_SWIGLU_QUANT,
+    FUSED_GATE_RMSNORM,
+    FUSED_LINEAR_GELU,
+    FUSED_LN_MODULATE,
+    HELIOS_GATED_RESIDUAL,
+    HUNYUAN_QKNORM,
+    LINGBOT_VIDEO_GATED_RESIDUAL,
+    LINGBOT_VIDEO_RMSNORM,
+    LTX2_QKNORM_SPLIT_ROPE,
+    LTX2_RMS_NORM_MODULATE,
+    MINIMAX_H3_NORM_MODULATE,
+    NVFP4_BIAS_GELU,
+    QWEN_IMAGE_ADDED_QKV,
+    SANA_VIDEO_LINEAR_ATTENTION,
+    QualityGatedFusion,
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
@@ -186,99 +173,41 @@ logger = init_logger(__name__)
 # to "high". No entry is tier "exact": the default must keep running the same
 # kernels it runs today, so a by-construction bit-exact fast path has to come
 # with a BitExactFusionGate before it can move there.
-_QUALITY_FUSION_HANDLERS: tuple[
-    tuple[str, str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
-] = (
-    (
-        # quantizes FC2's input before the reference BF16 intermediate exists
-        "high",
-        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
-        mount_flux2_nvfp4_swiglu_quant,
-        unmount_flux2_nvfp4_swiglu_quant,
-    ),
-    (
-        "lossless",
-        "fused linear+GELU (cublasLt epilogue)",
-        mount_fused_linear_gelu,
-        unmount_fused_linear_gelu,
-    ),
-    (
-        "lossless",
-        "Wan NVFP4 fused bias+GELU",
-        mount_nvfp4_bias_gelu,
-        unmount_nvfp4_bias_gelu,
-    ),
-    (
-        "lossless",
-        "Qwen-Image fused added-QKV",
-        mount_qwen_image_added_qkv,
-        unmount_qwen_image_added_qkv,
-    ),
-    (
-        "lossless",
-        "fused LN+modulate (affine folding)",
-        mount_fused_ln_modulate,
-        unmount_fused_ln_modulate,
-    ),
-    (
-        "lossless",
-        "LTX-2 Hopper QKNorm+split-RoPE",
-        mount_ltx2_qknorm_split_rope,
-        unmount_ltx2_qknorm_split_rope,
-    ),
-    (
-        "lossless",
-        "LTX-2 fused RMSNorm+modulate",
-        mount_ltx2_rms_norm_modulate,
-        unmount_ltx2_rms_norm_modulate,
-    ),
-    (
-        # Ideogram's reference keeps the norm statistics in fp32; the
-        # BF16-native kernel rounds them, which lowers accumulation precision
-        "high",
-        "fused gate RMSNorm (BF16-native Triton)",
-        mount_fused_gate_rmsnorm,
-        unmount_fused_gate_rmsnorm,
-    ),
-    (
-        "lossless",
-        "HunyuanVideo strided QK RMSNorm",
-        mount_hunyuan_qknorm,
-        unmount_hunyuan_qknorm,
-    ),
-    (
-        "lossless",
-        "LingBot Video fused RMSNorm",
-        mount_lingbot_video_rmsnorm,
-        unmount_lingbot_video_rmsnorm,
-    ),
-    (
-        "lossless",
-        "LingBot Video per-token gated residual",
-        mount_lingbot_video_gated_residual,
-        unmount_lingbot_video_gated_residual,
-    ),
-    (
-        "lossless",
-        "Helios per-token gated residual",
-        mount_helios_gated_residual,
-        unmount_helios_gated_residual,
-    ),
-    (
-        "lossless",
-        "MiniMax-H3 fused RMSNorm + AdaLN",
-        mount_minimax_h3_norm_modulate,
-        unmount_minimax_h3_norm_modulate,
-    ),
-    (
-        # the first attention GEMM takes BF16 inputs where the reference
-        # promotes them to FP32
-        "high",
-        "SANA-Video BF16-input linear attention",
-        mount_sana_video_linear_attention,
-        unmount_sana_video_linear_attention,
-    ),
+_QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
+    # quantizes FC2's input before the reference BF16 intermediate exists
+    ("high", FLUX2_NVFP4_SWIGLU_QUANT),
+    ("lossless", FUSED_LINEAR_GELU),
+    ("lossless", NVFP4_BIAS_GELU),
+    ("lossless", QWEN_IMAGE_ADDED_QKV),
+    ("lossless", FUSED_LN_MODULATE),
+    ("lossless", LTX2_QKNORM_SPLIT_ROPE),
+    ("lossless", LTX2_RMS_NORM_MODULATE),
+    # Ideogram's reference keeps the norm statistics in fp32; the
+    # BF16-native kernel rounds them, which lowers accumulation precision
+    ("high", FUSED_GATE_RMSNORM),
+    ("lossless", HUNYUAN_QKNORM),
+    ("lossless", LINGBOT_VIDEO_RMSNORM),
+    ("lossless", LINGBOT_VIDEO_GATED_RESIDUAL),
+    ("lossless", HELIOS_GATED_RESIDUAL),
+    ("lossless", MINIMAX_H3_NORM_MODULATE),
+    # the first attention GEMM takes BF16 inputs where the reference
+    # promotes them to FP32
+    ("high", SANA_VIDEO_LINEAR_ATTENTION),
 )
+
+
+def toggle_quality_fusions(transformers: list[nn.Module | None], quality: str) -> None:
+    """Mount the fusions ``quality`` allows on each transformer, unmount the rest."""
+    mounted_fusions: set[str] = set()
+    for transformer in filter(None, transformers):
+        for tier, fusion in _QUALITY_FUSION_HANDLERS:
+            if quality_allows(quality, tier):
+                if fusion.mount(transformer):
+                    mounted_fusions.add(fusion.name)
+            else:
+                fusion.unmount(transformer)
+    for name in sorted(mounted_fusions):
+        logger.debug("Mounted %s for quality=%s", name, quality)
 
 
 def _ensure_tensor_model_output(model_output):
@@ -372,11 +301,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     @property
     def role_affinity(self):
         return RoleType.DENOISER
-
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
 
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
@@ -564,6 +488,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     module.to("cpu")
                     moved.append(module)
         return moved
+
+    def _explicit_dit_layerwise_offload(self) -> bool:
+        """True when the user asked for layerwise DiT residency, not a compile-only window."""
+        args = self.server_args
+        if args.dit_layerwise_offload:
+            return True
+        return bool(getattr(args, "is_dit_layerwise_offload_selected", False))
 
     def _maybe_torch_compile(self, module: object) -> None:
         """
@@ -829,21 +760,23 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         quality = getattr(batch.sampling_params, "quality", "lossless")
         if quality == self._mounted_quality:
             return
-        mounted_fusions: set[str] = set()
-        for transformer in filter(None, [self.transformer, self.transformer_2]):
-            for tier, description, mount, unmount in _QUALITY_FUSION_HANDLERS:
-                if quality_allows(quality, tier):
-                    if mount(transformer):
-                        mounted_fusions.add(description)
-                else:
-                    unmount(transformer)
-
+        toggle_quality_fusions([self.transformer, self.transformer_2], quality)
         self._mounted_quality = quality
-        for description in sorted(mounted_fusions):
-            logger.debug("Mounted %s for quality=%s", description, quality)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
+
+    def _cache_dit_has_separate_cfg(self, batch: Req) -> bool:
+        """Whether CFG runs as separate cond/uncond transformer calls per step."""
+        return (
+            batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
+
+    def _cache_dit_joint_cfg_decision(self) -> bool:
+        """Whether one forward carries the whole CFG pair (see
+        ``enable_cache_on_transformer``)."""
+        return False
 
     def _cache_dit_requested(self) -> bool:
         """Request-independent server default (init-time decisions only)."""
@@ -1076,11 +1009,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
-        has_separate_cfg = (
-            requested
-            and batch.do_classifier_free_guidance
-            and not self.server_args.enable_cfg_parallel
-        )
+        has_separate_cfg = requested and self._cache_dit_has_separate_cfg(batch)
         desired_key = (
             (
                 cache_dit_overrides_key(self._cache_dit_request_overrides),
@@ -1191,6 +1120,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
@@ -1206,6 +1136,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 sp_group=sp_group,
                 tp_group=tp_group,
                 has_separate_cfg=has_separate_cfg,
+                joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -2063,11 +1994,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 for module in moved:
                     module.to(device)
             return
-        # prepare for first real request: restore the user-configured residency
-        for module in self._offloaded_dit_modules_for_compile:
-            module.disable_offload()
+        # Compile-only offload is undone so the real request is GPU-resident.
+        # An explicit layerwise request must stay enabled: disable_offload()
+        # clears manager.enabled, and the next use-site then raises
+        # ComponentResidencyError (Wan transformer_2).
+        if not self._explicit_dit_layerwise_offload():
+            for module in self._offloaded_dit_modules_for_compile:
+                module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
+        # The warmup traced the offload hooks, whose graph breaks inside the
+        # block loop make Dynamo skip the DiT frame for good. Forget it, so
+        # this request compiles whole graphs from the cached autotune results.
+        torch._dynamo.reset()
         yield
 
     def forward(
