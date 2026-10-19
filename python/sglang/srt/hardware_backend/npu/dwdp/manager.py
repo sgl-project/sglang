@@ -84,13 +84,11 @@ class NPUDwdpManager(DwdpPrefetch):
                     or weight.device != self.device
                     or weight.dtype not in supported.get(kernel, ())
                     or weight.ndim != 3
+                    or weight.shape[0] * self.dwdp_size
+                    != layer.num_global_routed_experts
                 ):
                     raise ValueError(
                         f"NPU DWDP layer {li}: incompatible kernel/device/dtype/shape for {name}"
-                    )
-                if weight.shape[0] * self.dwdp_size != layer.num_global_routed_experts:
-                    raise ValueError(
-                        f"NPU DWDP layer {li}: unexpected expert weight layout"
                     )
 
     def setup(self, model):
@@ -155,9 +153,19 @@ class NPUDwdpManager(DwdpPrefetch):
         )
         for li, layer in layers:
             self._replicate_small_params(layer)
-            layer.bind_full_expert_weights(
-                {name: self._weights[li, name] for name in _WEIGHTS}
-            )
+            weights = {name: self._weights[li, name] for name in _WEIGHTS}
+            count = layer.num_global_routed_experts // self.dwdp_size
+            self._peer_ranges[li] = [
+                (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
+            ]
+            for name, full in weights.items():
+                self._remote_slices[li, name] = build_remote_slices(
+                    full,
+                    self.dwdp_rank * count,
+                    (self.dwdp_rank + 1) * count,
+                    layer.num_global_routed_experts,
+                )
+            layer.bind_full_expert_weights(weights)
 
         for rank, handles in enumerate(self._gather(self._exports)):
             if rank == self.dwdp_rank:
@@ -173,7 +181,6 @@ class NPUDwdpManager(DwdpPrefetch):
                     dtype=spec.dtype,
                     device=self.device,
                 )
-        self._prepare_copy_views()
         torch.npu.synchronize(self.device)
         dist.barrier(group=self.group.cpu_group)
         torch.npu.empty_cache()
@@ -216,19 +223,6 @@ class NPUDwdpManager(DwdpPrefetch):
             ):
                 full = full.to(torch.float16)
             layer.replace_expert_tensor(name, full)
-
-    def _prepare_copy_views(self):
-        for key, full in self._weights.items():
-            li, _ = key
-            spec = self._specs[key]
-            count = spec.local_experts
-            start, end = self.dwdp_rank * count, (self.dwdp_rank + 1) * count
-            self._peer_ranges[li] = [
-                (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
-            ]
-            self._remote_slices[key] = build_remote_slices(
-                full, start, end, spec.num_experts
-            )
 
     def _get_remote_slices(self, layer_idx, name):
         return self._remote_slices[layer_idx, name]
