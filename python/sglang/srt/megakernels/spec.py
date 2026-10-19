@@ -83,6 +83,8 @@ class BuildContext(msgspec.Struct, frozen=True):
     widths: tuple[int, ...]  # step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
+    # SGLang's runtime state for this model (megakernels/binding.py)
+    binding: Any = None
 
 
 class Step(msgspec.Struct, frozen=True):
@@ -90,6 +92,8 @@ class Step(msgspec.Struct, frozen=True):
 
     mode: str  # "decode" or "target_verify"
     rows: int
+    # the running forward's ForwardView, set by SGLang before forward runs the step
+    view: Any = None
 
 
 class BuiltMegakernel(Protocol):
@@ -104,6 +108,10 @@ class BuiltMegakernel(Protocol):
     on every rank, since it replaces the proposal's rank-0 broadcast; write
     draft_tokens[: bs * gamma] and the sampled rows' step_logits; and advance
     noise.offset once per sampled block.
+
+    SGLang's runtime state reaches a build as BuildContext.binding and a covered
+    step as Step.view (megakernels/binding.py, which also lists what else may be
+    called, written or read).
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested

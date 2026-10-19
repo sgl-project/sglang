@@ -8,10 +8,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import msgspec
 import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
+from sglang.srt.megakernels.binding import MegakernelBinding
 from sglang.srt.megakernels.guards import deadline_s, device_isa
 from sglang.srt.megakernels.spec import (
     FLAG,
@@ -70,10 +72,12 @@ def install_megakernel(
     _refuse(_gather_reasons(reasons))
 
     tokens = _tokens_per_request()
+    binding = MegakernelBinding(model=model)
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
+        binding=binding,
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
     built = spec.build(model, hf_config, context)
@@ -110,7 +114,7 @@ def install_megakernel(
         used_mib,
         context.deadline_s,
     )
-    dispatch = _Dispatch(built=built, original=model.forward)
+    dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
     if _decode_graphs_enabled():
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
@@ -219,8 +223,10 @@ def _model_disable_reasons(
 class _Dispatch:
     """The installed forward: covered steps run the built megakernel."""
 
-    def __init__(self, *, built: BuiltMegakernel, original: Callable):
-        self.built, self.original = built, original
+    def __init__(
+        self, *, built: BuiltMegakernel, original: Callable, binding: MegakernelBinding
+    ):
+        self.built, self.original, self.binding = built, original, binding
         # batch size -> the step planned while capturing its decode graphs; plan reads
         # only the mode and rows, so every graph variant of a batch size plans alike
         self.captured: dict[int, Optional[Step]] = {}
@@ -237,7 +243,7 @@ class _Dispatch:
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
             return self.built.forward(
-                step,
+                msgspec.structs.replace(step, view=self.binding.forward_view()),
                 self.original,
                 input_ids,
                 positions,
@@ -268,6 +274,7 @@ class _CaptureCheck:
         if self.is_done or not set(runner.capture_bs) <= set(captured):
             return
         self.is_done = True
+        self.dispatch.binding.assert_live()
         routed = sorted(bs for bs, step in captured.items() if step is not None)
         if not routed:
             raise ValueError(

@@ -10,6 +10,7 @@ from msgspec.structs import replace
 
 from sglang.srt.megakernels import runtime
 from sglang.srt.megakernels import spec as registry
+from sglang.srt.megakernels.binding import MegakernelBinding
 from sglang.srt.megakernels.guards import deadline_s
 from sglang.srt.megakernels.spec import (
     MegakernelSpec,
@@ -42,7 +43,7 @@ class FakeBuilt:
 
     def __init__(self, widths):
         self.widths = tuple(w for w in widths if w <= 4)
-        self.steps = []
+        self.steps, self.views = [], []
 
     def summary(self):
         return "fake"
@@ -53,6 +54,7 @@ class FakeBuilt:
 
     def forward(self, step, original, input_ids, positions, forward_batch, **kw):
         self.steps.append(step.rows)
+        self.views.append(step.view)
         return "megakernel"
 
 
@@ -136,6 +138,12 @@ class TestMegakernelRuntime(CustomTestCase):
         registry.register(architecture=ARCH, path=f"{__name__}:SPEC")
         publish(server_args(), role="test")
         self.addCleanup(reset_context)
+        # the running forward's view reads its attention backend, which tests lack
+        view_patch = patch.object(
+            MegakernelBinding, "forward_view", return_value="view"
+        )
+        view_patch.start()
+        self.addCleanup(view_patch.stop)
 
     def _install_spec(self, spec, **kw):
         with patch.object(runtime, "find_spec", return_value=(spec, "")):
@@ -264,6 +272,9 @@ class TestMegakernelRuntime(CustomTestCase):
             self.assertEqual(lm(batch(4).input_ids, None, batch(4)), "megakernel")
             self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard")
         self.assertEqual(built.steps, [4])
+        # only a covered step gets the running forward's view, through Step.view
+        self.assertEqual(built.views, ["view"])
+        self.assertIsInstance(lm.context.binding, MegakernelBinding)
         # graph runners and supports_pp read the original forward's parameters
         self.assertEqual(inspect.signature(lm.forward), inspect.signature(Lm().forward))
         self.assertIn("--enable-nvidia-megakernel", lm._derived_weight_cache_error)
