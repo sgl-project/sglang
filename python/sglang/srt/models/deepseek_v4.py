@@ -137,7 +137,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
-    _clone_if_runai_streamed_tensor,
+    clone_if_runai_streamed_tensor,
     default_weight_loader,
 )
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
@@ -3397,9 +3397,9 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
-            stage_facts=(
-                functools.partial(hc_boundary.stages, config) if _is_cuda else None
-            ),
+            stage_facts=functools.partial(hc_boundary.stages, config)
+            if _is_cuda
+            else None,
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4913,7 +4913,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 if key not in cache_compressor_weight:
                                     cache_compressor_weight[key] = (
                                         is_kv,
-                                        _clone_if_runai_streamed_tensor(loaded_weight),
+                                        clone_if_runai_streamed_tensor(loaded_weight),
                                     )
                                 else:
                                     assert key in cache_compressor_weight
@@ -4960,7 +4960,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 assert shard_key not in bucket, (
                                     f"duplicate shard {shard_key} for {param_name}"
                                 )
-                                bucket[shard_key] = _clone_if_runai_streamed_tensor(
+                                bucket[shard_key] = clone_if_runai_streamed_tensor(
                                     loaded_weight
                                 )
                                 if len(bucket) == 2:
@@ -5121,7 +5121,7 @@ def _dequant_fp8_wo_a_streaming(
                 emitted = True
                 yield name, _dequant_fp8(tensor, scale)
             else:
-                bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
+                bucket["weight"] = clone_if_runai_streamed_tensor(tensor)
             continue
 
         if name.endswith(".wo_a.scale"):
@@ -5134,7 +5134,7 @@ def _dequant_fp8_wo_a_streaming(
                 emitted = True
                 yield prefix + ".weight", _dequant_fp8(weight, tensor)
             else:
-                bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
+                bucket["scale"] = clone_if_runai_streamed_tensor(tensor)
             continue
 
         yield name, tensor

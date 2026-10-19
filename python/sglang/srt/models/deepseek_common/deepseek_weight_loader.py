@@ -46,7 +46,7 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import (
-    _clone_if_runai_streamed_tensor,
+    clone_if_runai_streamed_tensor,
     default_weight_loader,
 )
 from sglang.srt.models.deepseek_common.utils import (
@@ -103,12 +103,12 @@ def _load_fused_indexer_wk(
     if ".indexer.weights_proj." in name:
         is_scale = name.endswith(".weight_scale_inv")
         if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-            w = _clone_if_runai_streamed_tensor(loaded_weight)
+            w = clone_if_runai_streamed_tensor(loaded_weight)
             fused_param.data[-w.shape[0] :].copy_(w)
             return True
 
         entry = pending.setdefault(fused_name + ".weights_proj", {})
-        entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+        entry["scale" if is_scale else "weight"] = clone_if_runai_streamed_tensor(
             loaded_weight
         )
         if "weight" in entry and "scale" in entry:
@@ -123,12 +123,12 @@ def _load_fused_indexer_wk(
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
     is_scale = name.endswith(".weight_scale_inv")
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-        w = _clone_if_runai_streamed_tensor(loaded_weight)
+        w = clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
         return True
 
     entry = pending.setdefault(fused_name, {})
-    entry["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+    entry["scale" if is_scale else "weight"] = clone_if_runai_streamed_tensor(
         loaded_weight
     )
     if "weight" in entry and "scale" in entry:
@@ -406,7 +406,7 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = _clone_if_runai_streamed_tensor(
+                            cached_a_proj[name] = clone_if_runai_streamed_tensor(
                                 loaded_weight
                             )
                             q_a_proj_name = (
