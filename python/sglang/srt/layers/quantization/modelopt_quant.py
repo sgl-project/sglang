@@ -3272,7 +3272,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
+            slot = getattr(layer, "_nvfp4_layout_slot", None)
+            pair_weight = slot[0].pair[slot[1]] if slot and slot[0].is_pair else None
             quant_info = FlashInferCutlassMoeQuantInfo(
+                pair_w2_weight=pair_weight,
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
