@@ -1106,7 +1106,7 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         nn.init.zeros_(self.conv1d.weight)
         self._prefetch_stream = (
-            torch.cuda.Stream() if config.ple_offload_embedding else None
+            torch.get_device_module().Stream() if config.ple_offload_embedding else None
         )
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
@@ -1313,9 +1313,9 @@ class Qwen4ExpPLELayer(nn.Module):
         offloaded_embedding = self.ple_embedding.ngram_embedding
 
         stream = self._prefetch_stream
-        stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(torch.get_device_module().current_stream())
         lookup_ids.record_stream(stream)
-        with torch.cuda.stream(stream):
+        with torch.get_device_module().stream(stream):
             offloaded_embedding.gather(lookup_ids, out=output_view)
         self._prefetch_state = prefetched, semantic_tokens, physical_tokens
 
@@ -1325,7 +1325,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if self._prefetch_state is None:
             raise RuntimeError("PLE prefetch state is missing")
         embeddings, semantic_tokens, physical_tokens = self._prefetch_state
-        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+        torch.get_device_module().current_stream().wait_stream(self._prefetch_stream)
         embeddings = self.ple_embedding.ngram_embedding.reduce(embeddings)
         embeddings = embeddings * self.ple_embedding.ngram_embedding.weight_scale
         embeddings = self.ple_embedding._finish_embedding_lookup(
