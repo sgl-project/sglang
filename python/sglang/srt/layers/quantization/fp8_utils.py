@@ -240,6 +240,22 @@ if _use_aiter:
         smallm_fp8_gemm_supported,
     )
 
+# gfx1250 cannot use the CK block-fp8 GEMMs above, but aiter's mxfp8_128 GEMM
+# (FlyDSL) runs there: e8m0 block scales and a (16, 16)-shuffled weight.
+_use_aiter_mxfp8_gfx1250 = False
+if get_bool_env_var("SGLANG_USE_AITER") and _is_hip and _is_gfx1250_supported:
+    try:
+        from aiter import dtypes as aiter_dtypes
+        from aiter.ops.gemm_op_a8w8 import (
+            gemm_a8w8_blockscale_bpreshuffle as aiter_mxfp8_gemm_bpreshuffle,
+        )
+        from aiter.ops.quant import per_group_quant_hip as aiter_per_group_quant
+        from aiter.ops.shuffle import shuffle_weight as aiter_shuffle_weight
+
+        _use_aiter_mxfp8_gfx1250 = True
+    except ImportError:
+        pass
+
 
 if _is_cuda:
     from sglang.kernels.ops.gemm import fp8_scaled_mm
@@ -1044,6 +1060,8 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
+    elif _use_aiter_mxfp8_gfx1250:
+        return aiter_mxfp8_gfx1250_block_fp8_linear
     elif is_npu_arch35():
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             npu_w8a8_mxfp8_linear,
@@ -1539,6 +1557,64 @@ def aiter_w8a8_block_fp8_linear(
         output += bias
 
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def gfx1250_mxfp8_prepare_weight(
+    weight: torch.Tensor, weight_scale: torch.Tensor, block_size: List[int]
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """(16, 16)-shuffled weight and e8m0 128x128 scales for the gfx1250 mxfp8_128
+    GEMM, or None when the layer must stay on the Triton GEMM: e8m0 holds only
+    powers of two, so the checkpoint's block scales have to be exactly that."""
+    if list(block_size) != [128, 128] or weight.dtype != torch.float8_e4m3fn:
+        return None
+    n, k = weight.shape
+    if n % 16 or k % 128 or weight_scale.dtype != torch.float32:
+        return None
+    mantissa, exponent = torch.frexp(weight_scale)
+    if not bool((mantissa == 0.5).all()):
+        return None
+    scale = (exponent - 1 + 127).clamp(0, 254).to(torch.uint8)
+    return aiter_shuffle_weight(weight, (16, 16)), scale.view(aiter_dtypes.fp8_e8m0)
+
+
+def aiter_mxfp8_gfx1250_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> torch.Tensor:
+    # Layers gfx1250_mxfp8_prepare_weight left alone keep fp32 scales.
+    if weight_scale.dtype != aiter_dtypes.fp8_e8m0:
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias, **kwargs
+        )
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    input_2d = input.view(-1, input.shape[-1])
+    m, k = input_2d.shape
+    if input_scale is not None:
+        # Pre-quantized fp8 with fp32 1x128 scales: the e8m0 GEMM needs
+        # power-of-two scales, so dequantize and requantize.
+        groups = input_2d.float().view(m, k // 128, 128)
+        input_2d = (groups * input_scale.float().reshape(m, -1, 1)).view(m, k)
+        input_2d = input_2d.to(torch.bfloat16)
+    if m == 0:
+        return input_2d.new_empty(output_shape)
+    q_input, x_scale = aiter_per_group_quant(
+        input_2d,
+        quant_dtype=aiter_dtypes.fp8,
+        group_size=128,
+        transpose_scale=True,
+        scale_type=aiter_dtypes.fp8_e8m0,
+    )
+    output = aiter_mxfp8_gemm_bpreshuffle(
+        q_input, weight, x_scale, weight_scale, dtype=input_2d.dtype
+    )
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(
