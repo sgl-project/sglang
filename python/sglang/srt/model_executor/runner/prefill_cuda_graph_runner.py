@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import tqdm
 
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
 from sglang.srt.configs.model_config import is_qwen4_exp

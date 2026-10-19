@@ -10,14 +10,17 @@ but their QK/accumulation orders differ, so MSA-fp8 vs Triton-fp8 tolerances
 cover two independent P-quantization errors (~1e-1 worst-case elementwise).
 
 Requires SM100 + fmha_sm100 (first run JIT-compiles the fp8 variants).
-Run: pytest python/sglang/srt/layers/attention/minimax_sparse_ops/tests/test_msa_fp8_parity.py -v
+Run: pytest test/manual/kernels/attention/test_minimax_msa_fp8_parity.py -v
 """
 
 import pytest
 import torch
 
-from sglang.srt.layers.attention.minimax_sparse_ops.decode.topk_sparse import (
+from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
+)
+from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
+    flash_prefill_with_gqa_share_sparse,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
     build_msa_decode_cg_plan,
@@ -25,9 +28,6 @@ from sglang.srt.layers.attention.minimax_sparse_ops.msa import (
     msa_sparse_decode_main,
     msa_sparse_prefill_main,
     update_msa_decode_cg_meta,
-)
-from sglang.srt.layers.attention.minimax_sparse_ops.prefill.topk_sparse import (
-    flash_prefill_with_gqa_share_sparse,
 )
 
 DEVICE = "cuda"

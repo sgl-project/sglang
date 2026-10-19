@@ -523,7 +523,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
-            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+            from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
                 fused_kda_conv_gating_verify,
             )
 

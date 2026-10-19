@@ -482,7 +482,9 @@ FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
     ),
     FusionPatternSpec(
         pattern="Fused QK RoPE reshape + KV cache write",
-        candidate_path="python/sglang/srt/layers/attention/utils.py",
+        candidate_path=(
+            "python/sglang/kernels/ops/attention/fused_qk_rope_reshape_and_cache.py"
+        ),
         active_keywords=("fused_qk_rope_reshape_and_cache",),
         split_groups=(
             ("rotary", "rope", "mrope"),

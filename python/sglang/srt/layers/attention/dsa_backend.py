@@ -38,14 +38,14 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_pad
+from sglang.kernels.ops.attention.pad import seqlens_expand_triton
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
     mla_quantize_for_fp8_no_rope,
-    q8kv8_topk_length_from_indices,
-    seqlens_expand_triton,
 )
-from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
 )

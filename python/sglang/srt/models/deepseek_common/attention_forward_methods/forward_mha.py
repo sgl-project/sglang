@@ -7,7 +7,7 @@ import torch
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
 )
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend

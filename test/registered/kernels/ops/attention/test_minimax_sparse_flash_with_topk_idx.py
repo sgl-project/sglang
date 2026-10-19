@@ -8,6 +8,11 @@ from sglang.kernels.ops.attention.minimax_sparse.decode.flash_with_topk_idx impo
 )
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device, is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# ~8 min of Triton autotuning on a cold cache: nightly rather than per-commit.
+register_cuda_ci(est_time=600, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=500, stage="nightly", runner_config="4-gpu-b200")
 
 DEVICE = get_device()
 RTOL_VS_REF = 5e-3
