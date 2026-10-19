@@ -112,9 +112,13 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        weight_row_split: int = 0,
+        weight_row_offset: int = 0,
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
+        self.weight_row_split = weight_row_split
+        self.weight_row_offset = weight_row_offset
         self.cta_m = cta_m
         self.cta_n = cta_n
         self.cta_k = cta_k
@@ -159,6 +163,11 @@ class TgvGemmCuteExtKernel:
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
             f"_bias{int(self.has_bias)}"
             f"_out{self.out_dtype.__name__.lower()}"
+            + (
+                f"_rows{self.weight_row_split}_{self.weight_row_offset}"
+                if self.weight_row_offset
+                else ""
+            )
         )
 
     @cute.experimental.jit
@@ -400,7 +409,13 @@ class TgvGemmCuteExtKernel:
         gA_tile = cute.local_tile(  # (cta_m, cta_k, Tiles_K)
             mA,
             a_tiler_mk,
-            (work_tile_info.M_idx, None, work_tile_info.L_idx),
+            (
+                work_tile_info.M_idx
+                + cutlass.Int32(work_tile_info.M_idx >= self.weight_row_split)
+                * self.weight_row_offset,
+                None,
+                work_tile_info.L_idx,
+            ),
         )
         # gB n-index: 1-CTA just bidy; 2-CTA each cluster N_idx covers
         # num_mma_ctas tiles of b_tiler, each CTA loads one half.
@@ -1102,6 +1117,8 @@ def _get_compiled_cute_ext_kernel(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    weight_row_split: int = 0,
+    weight_row_offset: int = 0,
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1123,6 +1140,8 @@ def _get_compiled_cute_ext_kernel(
         a_leading,
         b_leading,
         c_leading,
+        weight_row_split,
+        weight_row_offset,
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1148,6 +1167,8 @@ def _get_compiled_cute_ext_kernel(
         use_pdl=use_pdl,
         has_bias=has_bias,
         out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
+        weight_row_split=weight_row_split,
+        weight_row_offset=weight_row_offset,
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
@@ -1258,9 +1279,13 @@ def _run_tgv(
     out: torch.Tensor,
     pdl: bool,
     tactic: int,
+    prefix_size: int = 0,
+    row_offset: int = 0,
 ) -> torch.Tensor:
     """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
+    if row_offset:
+        assert bias is None and prefix_size % cta_m == 0 and row_offset % cta_m == 0
     has_bias = bias is not None
 
     a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
@@ -1283,6 +1308,8 @@ def _run_tgv(
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
+        weight_row_split=prefix_size // cta_m if row_offset else 0,
+        weight_row_offset=row_offset // cta_m,
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
@@ -1292,6 +1319,15 @@ def _run_tgv(
     else:
         compiled(a_, b_, c_, stream)
     return out
+
+
+def supports_weight_row_mapping(
+    m: int, k: int, prefix_size: int, shard_size: int
+) -> bool:
+    """The two source segments must start on the chosen weight-row tile."""
+    tactic = _pick_tactic(m, prefix_size + shard_size, k)
+    cta_m, _, _, _ = _resolve_tactic(tactic)
+    return k % 8 == 0 and prefix_size % cta_m == 0 and shard_size % cta_m == 0
 
 
 # (tactic, cta_m, cta_n, num_mma_ctas), smallest cta_n first.
@@ -1428,6 +1464,8 @@ def _tgv_bf16_gemm_out_run(
     weight: torch.Tensor,
     out: torch.Tensor,
     bias: Optional[torch.Tensor],
+    prefix_size: int = 0,
+    row_offset: int = 0,
 ) -> None:
     if not is_sm100_supported():
         raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
@@ -1436,16 +1474,22 @@ def _tgv_bf16_gemm_out_run(
     assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
-    assert out.is_contiguous() and out.shape == (x.shape[0], weight.shape[0])
+    assert out.is_contiguous() and out.shape == (
+        x.shape[0],
+        weight.shape[0] - row_offset,
+    )
     if x.shape[0] == 0:
         return None
+    tactic = _pick_tactic(x.shape[0], out.shape[1], weight.shape[1])
     _run_tgv(
         x,
         weight.t(),
         bias,
         out,
         pdl=True,
-        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
+        tactic=tactic,
+        prefix_size=prefix_size,
+        row_offset=row_offset,
     )
     return None
 
@@ -1463,6 +1507,8 @@ def _tgv_bf16_gemm_out_fake(
     weight: torch.Tensor,
     out: torch.Tensor,
     bias: Optional[torch.Tensor],
+    prefix_size: int = 0,
+    row_offset: int = 0,
 ) -> None:
     return None
 
@@ -1498,7 +1544,16 @@ def cutedsl_bf16_gemm_out(
     weight: torch.Tensor,
     out: torch.Tensor,
     bias: torch.Tensor | None = None,
+    *,
+    prefix_size: int = 0,
+    row_offset: int = 0,
 ) -> torch.Tensor:
-    """Write the BF16 GEMM directly into a caller-owned contiguous tensor."""
-    torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(x, weight, out, bias)
+    """Write GEMM into ``out``; optionally skip weight rows after a shared prefix.
+
+    The sliced weight ends at the last requested row, preserving TMA zero padding.
+    ``prefix_size`` and ``row_offset`` must align to the selected CTA row tile.
+    """
+    torch.ops.sglang.cutedsl_tgv_bf16_gemm_out(
+        x, weight, out, bias, prefix_size, row_offset
+    )
     return out
