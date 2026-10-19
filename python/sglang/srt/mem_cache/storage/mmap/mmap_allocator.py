@@ -99,9 +99,10 @@ def _mmap_prefaulted(fileno: int, alloc_bytes: int, flags: int) -> mmap.mmap:
 def _mmap_private_parallel_prefaulted(alloc_bytes: int, num_threads: int) -> mmap.mmap:
     """Private anonymous THP mapping, prefaulted by `num_threads` threads.
 
-    Unlike shared (shmem) mappings, private faults scale with threads. MAP_PRIVATE
-    is safe to pin only with MADV_DONTFORK, which avoids COW after fork() moving
-    the parent off the pinned page; so a fork()ed child cannot see this buffer.
+    Shared (shmem) faults plateau at a few GB/s; private THP faults scale with
+    threads. MAP_PRIVATE is safe to pin only with MADV_DONTFORK, which avoids COW
+    after fork() moving the parent off the pinned page; so a fork()ed child
+    cannot see this buffer.
     Pages are prefaulted before return, as cudaHostRegister requires.
     """
     if _libc is None:
