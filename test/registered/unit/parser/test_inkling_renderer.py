@@ -1,5 +1,6 @@
 import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
@@ -291,6 +292,43 @@ class TestInklingOutputParser(unittest.TestCase):
                     output_ids, separate_reasoning=True, parse_tool_calls=True
                 )
                 self.assertEqual(parsed.content, "")
+
+    def test_renders_and_parses_off_the_creating_thread(self):
+        """Prompts render on executor threads and outputs parse on the event loop,
+        so neither may depend on the thread that first loaded tml-renderers."""
+        messages = [{"role": "user", "content": "Weather in Paris?"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {"type": "object"}},
+            }
+        ]
+        output_ids = _ids(
+            "<|message_model|>",
+            "<|content_thinking|>",
+            "plan",
+            "<|end_message|>",
+            "<|message_model|>",
+            "<|content_invoke_tool_json|>",
+            '{"name":"get_weather","args":{"city":"Paris"}}',
+            "<|end_message|>",
+            "<|content_model_end_sampling|>",
+        )
+        prompt_ids = render_inkling_messages(messages, tools=tools)
+        parser = InklingOutputParser(separate_reasoning=True, parse_tool_calls=True)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            self.assertEqual(
+                executor.submit(
+                    render_inkling_messages, messages, tools=tools
+                ).result(),
+                prompt_ids,
+            )
+            parsed = executor.submit(parser.finish, output_ids).result()
+        self.assertEqual(parsed.reasoning, "plan")
+        self.assertEqual(
+            [(call.name, call.arguments) for call in parsed.tool_calls],
+            [("get_weather", '{"city": "Paris"}')],
+        )
 
     def test_finish_flushes_once(self):
         """A finish_reason stays set on later stream chunks; finishing again must
