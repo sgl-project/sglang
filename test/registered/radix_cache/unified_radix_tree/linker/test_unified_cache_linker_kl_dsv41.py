@@ -142,9 +142,6 @@ class TestDSV41FlashLinkerKLPagedSWA(
         self._run_linker_case(super().test_multiturn_decode_cache_hit_branching)
 
 
-# NOTE(kpham-sgl): encoder SWA replay refuses prompt logprobs, so the KL replay
-# cannot score the rebuilt window; enable once the mode can score prompt tokens.
-@unittest.skip("encoder SWA replay cannot return prompt logprobs")
 class TestDSV41FlashLinkerKLEncoderReplay(TestDSV41FlashLinkerKLPagedSWA):
     """The per-request window is rebuilt on restore instead of stored."""
 
