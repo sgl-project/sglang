@@ -272,6 +272,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         is_unified_kv_fp8,
         is_unified_kv_triton,
     )
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
 
     cfg = resolving_view(server_args)
     if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
@@ -339,8 +343,9 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups), incl. PD
-        # transfer and the external cache linker; the bf16 rows, encoder replay,
-        # spec and HiCache are not wired / validated for them.
+        # transfer, the external cache linker and DSpark (its draft keeps a bf16
+        # ring of its own); the bf16 rows, encoder replay and HiCache are not
+        # wired / validated for them.
         (
             "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
             is_unified_kv_triton() and not is_unified_kv_fp8(),
@@ -351,9 +356,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "the unified KV layout with encoder SWA bounded replay",
             is_unified_kv_triton() and cfg.enable_encoder_swa_bounded_replay,
         ),
+        # the draft's block window assumes uniform verify blocks, and the PD
+        # transfer does not carry the draft ring of a ratio-1/2 model yet
         (
-            "the unified KV layout with speculative decoding",
-            is_unified_kv_triton() and cfg.speculative_algorithm is not None,
+            "the unified KV layout with compact ragged verify",
+            is_unified_kv_triton()
+            and cfg.speculative_algorithm is not None
+            and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC,
+        ),
+        (
+            "the unified KV layout with DSpark under PD disaggregation",
+            is_unified_kv_triton()
+            and cfg.speculative_algorithm is not None
+            and cfg.disaggregation_mode != "null",
         ),
         (
             "the unified KV layout with HiCache",
@@ -374,11 +389,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
         # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
         supported_prefill_cp = (
             cfg.disaggregation_mode == "prefill"

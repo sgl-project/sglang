@@ -1477,7 +1477,8 @@ class DeepseekV4HipRadixBackend(
     def _uses_dspark_draft_window(self) -> bool:
         """Whether the V4.1 DSpark draft block takes the block-window metadata; DSv4's
         draft keeps the causal verify indices, and unified_kv addresses its ring by
-        (slot, position) and keeps its own path."""
+        (slot, position) and builds the window into its decode streams
+        (_attach_dspark_draft_block_streams)."""
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
@@ -2634,6 +2635,9 @@ class DeepseekV4HipRadixBackend(
         state_slot = state_slot[:N]
         if core.unified is None:
             core.unified = UnifiedKvMetadata()
+        if self.is_dspark_draft and self.is_dsv41 and num_draft > 0:
+            self._attach_dspark_draft_block_streams(core, state_slot, num_draft)
+            return
         swa_len = core.swa_topk_lengths
         if core.low_ratios and not (self.has_c4 or self.has_c128) and num_draft == 0:
             # DeepSeek-V4.1 (compressed layers all ratio 1 / 2): no c4 / c128
@@ -2747,7 +2751,7 @@ class DeepseekV4HipRadixBackend(
                 num_reqs,
                 epi=self._fp8_verify_epi,
             )
-            if pays(128):
+            if self.has_c128 and pays(128):
                 (
                     u.grp_hca_indices,
                     u.grp_hca_indptr,
@@ -2793,6 +2797,36 @@ class DeepseekV4HipRadixBackend(
         # Per-token req-slot map for the target-verify SWA ring store; plain
         # decode's store reads req_pool_indices instead.
         core.unified.verify_store_state_slot = state_slot
+
+    def _attach_dspark_draft_block_streams(
+        self, core: DSV4AttnMetadata, state_slot: torch.Tensor, block_size: int
+    ) -> None:
+        """DeepSeek-V4.1 DSpark draft block: every row of a request reads the same
+        window and the whole block, as the paged draft's block window does, not the
+        causal verify window. The draft layers are all ratio 0."""
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+        pool = self.token_to_kv_pool
+        ring = pool.unified_swa_ring_size
+        positions = core.positions_casual[: state_slot.shape[0]]
+        u = core.unified
+        u.swa_indices, u.swa_indptr = runtime.build_dspark_block_streams(
+            state_slot=state_slot,
+            positions=positions,
+            block_size=block_size,
+            win=pool.unified_swa_window,
+            ring_stride=ring,
+        )
+        u.hca_indices = u.hca_indptr = u.csa_indices = u.csa_indptr = None
+        u.gasm_indices = u.gasm_kv_indptr = u.gasm_qo_indptr = None
+        u.grp_qo_indptr = None
+        u.grp_hca_indices = u.grp_hca_indptr = u.grp_hca_bounds = None
+        u.grp_swa_indices = u.grp_swa_indptr = u.grp_swa_bounds = None
+        u.low_ratio_streams = {}
+        u.swa_loc = (
+            state_slot.to(torch.int64) * ring + positions.to(torch.int64) % ring
+        ).to(torch.int32)
+        u.verify_store_state_slot = state_slot
 
     def _attach_unified_kv_prefill_meta(
         self,

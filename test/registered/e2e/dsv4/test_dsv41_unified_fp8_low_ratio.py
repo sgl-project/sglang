@@ -6,7 +6,7 @@ moves the bytes, so every written row must match the paged V4 row byte for byte:
 the 64 bf16 rope values in the second pool. Rows nobody wrote must stay zero.
 
 The TP2 cases run the fused query/K store and the decode split merge at 32 local
-heads (TP4 runs 16).
+heads (TP4 runs 16). The DSpark cases cover target verify and the draft block window.
 """
 
 import contextlib
@@ -21,7 +21,13 @@ from sglang.kernels.ops.attention.dsv4.low_ratio_compress import (
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 from sglang.kernels.ops.attention.fused_qk_norm_rope_store import pack_q_fp8_2buff
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4UnifiedKVPool
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+    BuildDsparkSwaRingIndices,
+)
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4UnifiedKVPool,
+    get_compress_state_ring_size,
+)
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -901,6 +907,157 @@ class TestDecodeInvRope(CustomTestCase):
             )
             exact = float((got[..., :NOPE] == ref[..., :NOPE]).float().mean())
             self.assertGreaterEqual(exact, 0.9999, (T, L, splits))
+
+
+@_needs_gfx950
+class TestC2VerifyRejection(_Base):
+    """Verify parks every even draft row at pos % ring. A rejected tail must not
+    clobber the accepted row the next verify pairs with, so verify, reject and
+    re-verify leave the pool, the outputs and the ring as a token-by-token decode
+    of the accepted tokens does."""
+
+    def test_reverify_after_rejection_matches_decode(self):
+        torch.manual_seed(11)
+        D = 6  # DSpark block 5 verifies gamma + 1 rows per request
+        ring = get_compress_state_ring_size(2, D)
+        p0, accepted = [10, 7, 0, 33], [1, 2, 5, 6]
+        n_req, row_base = len(p0), 321
+        lens = [k + D for k in accepted]
+        w = torch.randn(HEAD, dtype=torch.bfloat16, device=DEV)
+        fc = freqs(4096)
+        state0 = torch.randn(n_req * ring, 2 * HEAD, dtype=torch.float32, device=DEV)
+        true_kv = [
+            torch.randn(n, 2 * HEAD, dtype=torch.float32, device=DEV) for n in lens
+        ]
+        bad_kv = [torch.randn(D, 2 * HEAD, dtype=torch.float32, device=DEV) for _ in p0]
+
+        def loc(r, q):  # both halves of a pair share slot loc >> 1; 0 is padding
+            return 2 * (1 + 100 * r + q // 2) + q % 2
+
+        def store(kv, state, pools, rows, draft_len):
+            n = len(rows)
+            out = torch.zeros(n, HEAD, dtype=torch.bfloat16, device=DEV)
+            c2_decode_norm_rope_store(
+                kv,
+                state,
+                w,
+                torch.tensor([q for _, q in rows], device=DEV),
+                torch.tensor([r for r, _ in rows], device=DEV),
+                torch.tensor([loc(r, q) for r, q in rows], device=DEV),
+                EPS,
+                fc,
+                pools[0],
+                page_size=1,
+                ring_size=ring,
+                draft_len=draft_len,
+                out=out,
+                fp8_2buff=True,
+                k_cache_rope=pools[1],
+                row_base=row_base,
+            )
+            return out
+
+        def verify(state, pools, starts, kv_rows):
+            rows = [(r, s + i) for r, s in enumerate(starts) for i in range(D)]
+            return store(torch.cat(kv_rows), state, pools, rows, D)
+
+        pool_rows = row_base + 100 * n_req + 64
+        # token by token over the accepted tokens
+        ref_state, ref_pools = state0.clone(), two_pool(pool_rows)
+        ref_out = [[None] * n for n in lens]
+        for i in range(max(lens)):
+            live = [r for r in range(n_req) if i < lens[r]]
+            kv = torch.cat([true_kv[r][i : i + 1] for r in live])
+            out = store(kv, ref_state, ref_pools, [(r, p0[r] + i) for r in live], 1)
+            for j, r in enumerate(live):
+                ref_out[r][i] = out[j]
+
+        state, pools = state0.clone(), two_pool(pool_rows)
+        verify(
+            state,
+            pools,
+            p0,
+            [
+                torch.cat([t[:k], b[: D - k]])
+                for t, b, k in zip(true_kv, bad_kv, accepted)
+            ],
+        )
+        # pairs the rejected tail completed, which the re-verify has to overwrite
+        stale = [
+            row_base + (loc(r, q) >> 1)
+            for r, k in enumerate(accepted)
+            for q in range(p0[r] + k, p0[r] + D)
+            if q % 2
+        ]
+        self.assertTrue(stale)
+        for row in stale:
+            self.assertFalse(torch.equal(pools[1][row], ref_pools[1][row]), row)
+        out = verify(
+            state,
+            pools,
+            [p + k for p, k in zip(p0, accepted)],
+            [t[k : k + D] for t, k in zip(true_kv, accepted)],
+        )
+        self.assertTrue(
+            torch.equal(pools[0].view(torch.uint8), ref_pools[0].view(torch.uint8))
+        )
+        self.assertTrue(torch.equal(pools[1], ref_pools[1]))
+        for r, k in enumerate(accepted):
+            for i in range(D):
+                if (p0[r] + k + i) % 2:  # completing rows; parked ones leave out alone
+                    self.assertTrue(
+                        torch.equal(out[r * D + i], ref_out[r][k + i]), (r, i)
+                    )
+        # the next step pairs with what the re-verify parked
+        nxt = [(r, p0[r] + n) for r, n in enumerate(lens)]
+        self.assertTrue(all(q % 2 for _, q in nxt))
+        kv = torch.randn(n_req, 2 * HEAD, dtype=torch.float32, device=DEV)
+        self.assertTrue(
+            torch.equal(
+                store(kv, state, pools, nxt, 1),
+                store(kv, ref_state, ref_pools, nxt, 1),
+            )
+        )
+
+
+class TestDsparkDraftBlockStream(CustomTestCase):
+    """The unified draft reads the paged ring draft's block window: every row of a
+    block sees its request's last window rows and the whole block. The ring must
+    hold window and block at once, or a stream would read one row twice."""
+
+    def test_matches_ring_window(self):
+        win = 128
+        for block in (5, 3):
+            ring = win + block  # get_swa_ring_size under DSpark: window + gamma
+            prefixes = [0, 3, win - 1, win, win + 1, 5000]
+            bs = len(prefixes)
+            slots = torch.randperm(16, device=DEV)[:bs]
+            req_rep = slots.repeat_interleave(block)
+            positions = torch.tensor(
+                prefixes, device=DEV, dtype=torch.int32
+            ).repeat_interleave(block) + torch.arange(
+                block, device=DEV, dtype=torch.int32
+            ).repeat(bs)
+            ref, ref_len = BuildDsparkSwaRingIndices.execute(
+                seq_lens_casual=positions + 1,
+                req_pool_indices_repeated=req_rep,
+                valid_from=torch.zeros(16, dtype=torch.int64, device=DEV),
+                ring_size=ring,
+                block_size=block,
+                swa_window=win,
+                page_index_aligned_size=64,
+            )
+            idx, indptr = runtime.build_dspark_block_streams(
+                state_slot=req_rep,
+                positions=positions,
+                block_size=block,
+                win=win,
+                ring_stride=ring,
+            )
+            for t in range(bs * block):
+                got = idx[int(indptr[t]) : int(indptr[t + 1])].tolist()
+                self.assertEqual(got, ref[t, : int(ref_len[t])].tolist(), (block, t))
+                self.assertEqual(len(set(got)), len(got), (block, t))
 
 
 if __name__ == "__main__":
