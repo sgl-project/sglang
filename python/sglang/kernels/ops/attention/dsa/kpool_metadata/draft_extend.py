@@ -18,7 +18,7 @@ from sglang.kernels.ops.attention.dsa.kpool_metadata.scan import bounded_scan_nu
         "num_splits",
     ]
 )
-def _fused_dsa_draft_extend_metadata_kernel(
+def _fused_dsa_draft_extend_metadata_kpool_kernel(
     seq_lens,
     extend_seq_lens,
     req_pool_indices,
@@ -194,7 +194,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
             )
 
 
-def fused_dsa_draft_extend_metadata(
+def fused_dsa_draft_extend_metadata_kpool(
     seq_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -270,7 +270,7 @@ def fused_dsa_draft_extend_metadata(
     num_splits = bounded_scan_num_splits(bs, num_col_blocks)
     grid = (1 + bs * num_splits,)
 
-    _fused_dsa_draft_extend_metadata_kernel[grid](
+    _fused_dsa_draft_extend_metadata_kpool_kernel[grid](
         seq_lens,
         extend_seq_lens,
         req_pool_indices,

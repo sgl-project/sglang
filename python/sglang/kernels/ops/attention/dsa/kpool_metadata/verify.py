@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.dsa.kpool_metadata.scan import bounded_scan_nu
         "num_splits",
     ]
 )
-def _fused_dsa_target_verify_metadata_kernel(
+def _fused_dsa_target_verify_metadata_kpool_kernel(
     seq_lens,
     req_pool_indices,
     req_to_token,
@@ -157,7 +157,7 @@ def _fused_dsa_target_verify_metadata_kernel(
             )
 
 
-def _prep_fused_dsa_target_verify_metadata_launch(
+def _prep_fused_dsa_target_verify_metadata_kpool_launch(
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -265,7 +265,7 @@ def _prep_fused_dsa_target_verify_metadata_launch(
     return grid, args, constexprs
 
 
-def fused_dsa_target_verify_metadata(
+def fused_dsa_target_verify_metadata_kpool(
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -291,7 +291,7 @@ def fused_dsa_target_verify_metadata(
         dsa_cu_seqlens_k[:1].zero_()
         return
 
-    grid, args, constexprs = _prep_fused_dsa_target_verify_metadata_launch(
+    grid, args, constexprs = _prep_fused_dsa_target_verify_metadata_kpool_launch(
         seq_lens,
         req_pool_indices,
         req_to_token,
@@ -310,4 +310,4 @@ def fused_dsa_target_verify_metadata(
         paged_mqa_ctx_lens_2d,
         index_kpool,
     )
-    _fused_dsa_target_verify_metadata_kernel[grid](*args, **constexprs)
+    _fused_dsa_target_verify_metadata_kpool_kernel[grid](*args, **constexprs)
