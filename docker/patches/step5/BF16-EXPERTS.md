@@ -4,6 +4,8 @@ Step5 now honors the checkpoint's expert exclusions in `quantization_config.igno
 
 `SGLANG_STEP5_QUANTIZE_BF16_MOE=1` explicitly restores load-time FP8 quantization. Its default is `0`. The same policy covers the expert layers a ModelOpt NVFP4 export left in BF16 (`quantization_config.exclude_modules`).
 
+The variable only selects how checkpoint BF16 experts are served. Weight updates after the checkpoint load re-quantize BF16 weights sent for FP8 experts to 128x128 block FP8 (with scales) either way, and refuse FP8 weights sent for BF16 experts.
+
 ## MegaMoE with TRTLLM BF16 experts
 
 Build the FlashInfer 0.7.1 overlay using the [existing builder](README.md#isolated-build). Patch 04 and its source hashes are included in the manifest. The main Dockerfiles do not apply this patch automatically; a deployment image must include the patched package and rebuilt module. Do not reuse an older AOT MoE binary.

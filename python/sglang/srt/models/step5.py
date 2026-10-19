@@ -1856,6 +1856,16 @@ class Step5ForCausalLM(nn.Module):
                     continue
                 name = name[: -len(suffix)] + ".moe.experts." + param_name
                 param = params_dict[name]
+                if (
+                    weight_name.endswith(".weight")
+                    and loaded_weight.dtype == torch.float8_e4m3fn
+                    and param.dtype != torch.float8_e4m3fn
+                ):
+                    # Without its scales, copying FP8 into BF16 silently drops the dequantization.
+                    raise ValueError(
+                        f"Refusing FP8 weight for {param.dtype} Step5 experts: {original_name}. "
+                        "Send these experts in their served precision."
+                    )
                 # Native loaders own EP/TP slicing; quantize only resident experts.
                 quantize_bf16 = (
                     weight_name.endswith(".weight")
@@ -1863,7 +1873,12 @@ class Step5ForCausalLM(nn.Module):
                     and param.dtype == torch.float8_e4m3fn
                 )
                 if quantize_bf16:
-                    if not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get():
+                    # Weight updates re-quantize BF16 into FP8 experts; at checkpoint load the
+                    # experts' precision must come from the checkpoint or the explicit opt-in.
+                    if (
+                        checkpoint_load
+                        and not envs.SGLANG_STEP5_QUANTIZE_BF16_MOE.get()
+                    ):
                         raise ValueError(
                             f"Refusing implicit BF16-to-FP8 expert quantization: {original_name}. "
                             "Declare the BF16 experts in quantization_config.ignored_layers "

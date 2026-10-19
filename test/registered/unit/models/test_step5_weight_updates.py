@@ -29,6 +29,7 @@ class _RecordingParam:
 
     def __init__(self, dtype: torch.dtype, calls: list):
         self.dtype = dtype
+        self.device = torch.device("cpu")
         self._calls = calls
 
     def weight_loader(self, param, weight, *args, shard_id=None, expert_id=None):
@@ -36,18 +37,32 @@ class _RecordingParam:
 
 
 class _FakeStep5:
-    """The attributes Step5ForCausalLM.load_weights reads, around one FP8 MoE layer and a norm."""
+    """The attributes Step5ForCausalLM.load_weights reads, around one MoE layer and a norm.
 
-    def __init__(self):
+    FP8 experts use 2x2 weight blocks so 4x4 test tensors span several scale blocks."""
+
+    def __init__(self, *, bf16_experts: bool = False):
         self.calls = []
         fp8, fp32 = torch.float8_e4m3fn, torch.float32
         self.params = {
-            _EXPERTS + "w13_weight": _RecordingParam(fp8, self.calls),
-            _EXPERTS + "w2_weight": _RecordingParam(fp8, self.calls),
-            _EXPERTS + "w13_weight_scale_inv": _RecordingParam(fp32, self.calls),
-            _EXPERTS + "w2_weight_scale_inv": _RecordingParam(fp32, self.calls),
             "model.norm.weight": _RecordingParam(torch.bfloat16, self.calls),
         }
+        if bf16_experts:
+            for name in ("w13_weight", "w2_weight"):
+                self.params[_EXPERTS + name] = _RecordingParam(
+                    torch.bfloat16, self.calls
+                )
+        else:
+            for name in ("w13_weight", "w2_weight"):
+                self.params[_EXPERTS + name] = _RecordingParam(fp8, self.calls)
+                self.params[_EXPERTS + name + "_scale_inv"] = _RecordingParam(
+                    fp32, self.calls
+                )
+        self.experts = SimpleNamespace(
+            quant_method=SimpleNamespace(weight_block_size=[2, 2]),
+            num_local_experts=_NUM_EXPERTS,
+            _map_global_expert_id_to_local_expert_id=lambda expert_id: expert_id,
+        )
         self.config = SimpleNamespace(
             moe_num_experts=_NUM_EXPERTS,
             num_hidden_layers=92,
@@ -63,6 +78,10 @@ class _FakeStep5:
 
     def named_parameters(self):
         return list(self.params.items())
+
+    def get_submodule(self, name):
+        assert name == _EXPERTS.rstrip(".")
+        return self.experts
 
     def _checkpoint_duplicate_owners(self, expected, model_path):
         return Step5ForCausalLM._checkpoint_duplicate_owners(expected, model_path)
@@ -81,10 +100,18 @@ class _FakeStep5:
         return [(shard, expert) for p, _, shard, expert in self.calls if p is param]
 
 
-def _checkpoint() -> list[tuple[str, torch.Tensor]]:
+def _checkpoint(*, bf16_experts: bool = False) -> list[tuple[str, torch.Tensor]]:
     """Every target weight, experts packed as the released checkpoint stores them."""
     weights = [("model.norm.weight", torch.ones(8, dtype=torch.bfloat16))]
     for projection in ("gate_proj", "up_proj", "down_proj"):
+        if bf16_experts:
+            weights.append(
+                (
+                    f"{_PACKED}{projection}.weight",
+                    torch.zeros(_NUM_EXPERTS, 4, 4, dtype=torch.bfloat16),
+                )
+            )
+            continue
         weights.append(
             (
                 f"{_PACKED}{projection}.weight",
@@ -92,7 +119,7 @@ def _checkpoint() -> list[tuple[str, torch.Tensor]]:
             )
         )
         weights.append(
-            (f"{_PACKED}{projection}.weight_scale_inv", torch.ones(_NUM_EXPERTS, 1, 1))
+            (f"{_PACKED}{projection}.weight_scale_inv", torch.ones(_NUM_EXPERTS, 2, 2))
         )
     return weights
 
@@ -111,9 +138,9 @@ def _save_with_a_duplicated_norm(root: str) -> None:
         json.dump({"weight_map": owners}, index)
 
 
-def _loaded() -> _FakeStep5:
-    model = _FakeStep5()
-    model.load_weights(_checkpoint())
+def _loaded(*, bf16_experts: bool = False) -> _FakeStep5:
+    model = _FakeStep5(bf16_experts=bf16_experts)
+    model.load_weights(_checkpoint(bf16_experts=bf16_experts))
     model.calls.clear()
     return model
 
@@ -200,6 +227,49 @@ class TestStep5WeightUpdates(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "Duplicate Step5 target weight"):
             model.load_weights([(name, weight), (name, weight)])
+
+    def test_bf16_into_fp8_experts_is_requantized_without_the_opt_in(self):
+        """A BF16 trainer update for FP8 experts is re-quantized to block FP8 with its
+        scales, without SGLANG_STEP5_QUANTIZE_BF16_MOE, which only picks how checkpoint
+        BF16 experts are served; a checkpoint load still refuses the implicit cast."""
+        model = _loaded()
+        weight = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4) - 8
+
+        model.load_weights([(_EXPERTS + "2.gate_proj.weight", weight)])
+
+        self.assertEqual(model.expert_calls("w13_weight"), [("w1", 2)])
+        self.assertEqual(model.expert_calls("w13_weight_scale_inv"), [("w1", 2)])
+        loaded = {p: w for p, w, _, _ in model.calls if p in model.params.values()}
+        fp8 = loaded[model.params[_EXPERTS + "w13_weight"]]
+        scale = loaded[model.params[_EXPERTS + "w13_weight_scale_inv"]]
+        self.assertEqual((fp8.dtype, scale.shape), (torch.float8_e4m3fn, (2, 2)))
+        dequantized = fp8.float() * scale.repeat_interleave(2, 0).repeat_interleave(
+            2, 1
+        )
+        torch.testing.assert_close(dequantized, weight.float(), rtol=0.07, atol=0)
+
+        bf16_checkpoint = [
+            (name, w.to(torch.bfloat16) if name.endswith("proj.weight") else w)
+            for name, w in _checkpoint()
+            if not name.endswith("_scale_inv")
+        ]
+        with self.assertRaisesRegex(ValueError, "implicit BF16-to-FP8"):
+            _FakeStep5().load_weights(bf16_checkpoint)
+
+    def test_refuse_fp8_into_bf16_experts_before_writing(self):
+        """Copying an FP8 update into checkpoint-BF16 experts drops its scales; it is
+        refused before the expert weight is overwritten."""
+        model = _loaded(bf16_experts=True)
+        weight = torch.ones(4, 4).to(torch.float8_e4m3fn)
+
+        with self.assertRaisesRegex(ValueError, "Refusing FP8 weight"):
+            model.load_weights(
+                [
+                    (_EXPERTS + "2.gate_proj.weight", weight),
+                    (_EXPERTS + "2.gate_proj.weight_scale_inv", torch.ones(2, 2)),
+                ]
+            )
+        self.assertEqual(model.calls, [])
 
     def test_a_disk_reload_may_resend_what_the_checkpoint_duplicates(self):
         """A tensor the checkpoint stores in two shards arrives twice on a disk reload;
