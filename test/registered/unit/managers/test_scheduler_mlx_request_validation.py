@@ -25,6 +25,7 @@ class TestSchedulerMlxRequestValidation(CustomTestCase):
         )
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
         scheduler.tokenizer = None
         scheduler.dllm_config = None
         scheduler.validate_dllm_request = MagicMock(return_value=None)

@@ -630,26 +630,6 @@ def _load_safetensors_file(path: str) -> dict[str, torch.Tensor]:
     return safetensors_load_file(path)
 
 
-def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
-    """Load one safetensors checkpoint, including an indexed sharded set."""
-    index_path = _select_safetensors_index_file(model_path, _DEFAULT_SAFETENSORS_INDEX)
-    safetensors_files = _list_safetensors_files(model_path)
-    if index_path is not None:
-        state_dict: dict[str, torch.Tensor] = {}
-        for path in safetensors_files:
-            state_dict.update(_load_safetensors_file(path))
-        return state_dict
-
-    if not safetensors_files:
-        raise ValueError(f"No safetensors files found in {model_path}")
-    if len(safetensors_files) != 1:
-        raise ValueError(
-            f"Found {len(safetensors_files)} safetensors files in {model_path} "
-            "and no index to disambiguate them."
-        )
-    return _load_safetensors_file(safetensors_files[0])
-
-
 BYTES_PER_GB = 1024**3
 
 

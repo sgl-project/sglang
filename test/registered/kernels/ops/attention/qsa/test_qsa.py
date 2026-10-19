@@ -149,8 +149,8 @@ def test_qsa_trtllm_sparse_decode_arch_gate(
     flashinfer_decode = ModuleType("flashinfer.decode")
     flashinfer_decode.trtllm_batch_decode_with_kv_cache = trtllm_decode_func
 
-    monkeypatch.setattr("sglang.srt.utils.is_sm100_supported", lambda: sm100)
-    monkeypatch.setattr("sglang.srt.utils.is_sm120", lambda: sm120)
+    monkeypatch.setattr(qsa_backend_module, "is_sm100_supported", lambda: sm100)
+    monkeypatch.setattr(qsa_backend_module, "is_sm120", lambda: sm120)
     monkeypatch.setitem(sys.modules, flashinfer_decode.__name__, flashinfer_decode)
 
     try:

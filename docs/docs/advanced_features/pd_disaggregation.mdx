@@ -111,6 +111,49 @@ uv pip install mooncake-transfer-engine
 
 ### AWS EFA
 
+#### EFA Docker images
+
+Each published CUDA 13 image has an EFA variant for EFA-enabled AWS EC2 instances, built from the same SGLang commit with `docker/efa.Dockerfile`:
+
+| Base image | EFA image |
+|---|---|
+| `latest`, `v<version>` | `latest-efa`, `v<version>-efa` |
+| `latest-runtime`, `v<version>-runtime` | `latest-runtime-efa`, `v<version>-runtime-efa` |
+| `nightly-dev-<date>-<sha>` | `nightly-dev-efa-<date>-<sha>`, plus the moving `dev-efa` |
+
+Each EFA image matches its base and adds:
+
+- The AWS EFA userspace stack: libfabric with the EFA provider, rdma-core, and the aws-ofi-nccl plugin. The host does not need its own EFA userspace install.
+- On x86_64, the EFA build of Mooncake with `MOONCAKE_PROTOCOL=efa`. On arm64 the standard Mooncake package is kept and `MOONCAKE_PROTOCOL=tcp` is set, because the EFA build is x86_64-only.
+- `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`, so NIXL transfers use EFA on both architectures.
+- `NCCL_NET_PLUGIN=ofi` and `NCCL_TUNER_PLUGIN=ofi`, so NCCL uses aws-ofi-nccl.
+
+To add EFA to another CUDA 13 SGLang image, build `docker/efa.Dockerfile` on top of it:
+
+```bash
+docker build -f docker/efa.Dockerfile \
+  --build-arg BASE_IMAGE=lmsysorg/sglang:latest-runtime \
+  -t sglang:efa docker/
+```
+
+The host still needs the EFA kernel driver. Pass the EFA devices into the container and lift the locked-memory limit:
+
+```bash
+HF_CACHE_DIR="/path/to/huggingface-cache"
+docker run -it --gpus all \
+  --network host \
+  --ipc=host \
+  $(for d in /dev/infiniband/uverbs*; do echo -n "--device $d "; done) \
+  --ulimit memlock=-1 \
+  -v "$HF_CACHE_DIR:/root/.cache/huggingface" \
+  --env HF_TOKEN \
+  lmsysorg/sglang:latest-runtime-efa bash
+```
+
+Inside the container, `fi_info -p efa -t FI_EP_RDM` lists the EFA devices.
+
+#### Install into your own environment
+
 On an x86_64 AWS EFA instance, replace the standard CUDA 13 Mooncake package with the EFA build. The two packages install the same `mooncake` Python module, so do not install them side by side.
 
 The following commands replace the package in an SGLang CUDA 13 environment while preserving its existing Python dependencies:
@@ -130,6 +173,10 @@ fi_info -p efa -t FI_EP_RDM
 ```
 
 The EFA wheel expects a compatible AWS EFA userspace installation on the host and does not bundle `libfabric` or `libefa`. The current wheel is available only for x86_64. It is built without Mooncake EP/PG and the NVLink/MNNVL components, so use the standard Mooncake CUDA package for those features.
+
+#### CUDA VMM limitations
+
+These limitations apply whenever `MOONCAKE_PROTOCOL=efa`, including in the EFA Docker images.
 
 The current libfabric EFA provider cannot transfer CUDA VMM-backed buffers. Until [libfabric issue #12853](https://github.com/ofiwg/libfabric/issues/12853) is resolved, apply these settings to both prefill and decode workers:
 
