@@ -57,6 +57,8 @@ pub enum ResponseItem {
     /// bytes for the core to decode (e.g. detokenized text), not a
     /// client-facing wire payload and not a generation frame.
     Data(Bytes),
+    /// Reply to `RequestKind::Tokenize`: the encoded token ids.
+    TokenIds(TokenIds),
     /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
@@ -482,6 +484,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
             // compiled clean and silently shipped zeros.
             text: String::new(),
             completion_tokens: 0,
+            stop_token_trimmed: false,
         })
     };
 
@@ -587,6 +590,9 @@ pub struct ChunkEvent {
     /// `completion_tokens` is this chunk's count.
     pub text: String,
     pub completion_tokens: u64,
+    /// Set by the detok shard when the last of `token_ids` is a matched stop
+    /// token kept in `output_ids` but left out of `text`.
+    pub stop_token_trimmed: bool,
     /// Logprob + hidden-state columns — `None` unless the request asked for them.
     /// Boxed to keep the common token/text/finish frame small at large decode
     /// batches (the decoder allocates it only when a column is non-empty).
@@ -1227,12 +1233,12 @@ mod tests {
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`.
+    /// `ChunkExtras`. 152 since the matched stop token rides in the frame (#42637).
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();
         assert!(
-            sz <= 144,
+            sz <= 152,
             "ChunkEvent grew to {sz} bytes; keep rare columns behind ChunkExtras"
         );
     }
