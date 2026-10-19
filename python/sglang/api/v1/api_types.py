@@ -267,6 +267,14 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     kv_hints: Optional[KvHintsEnvelopeOrList] = None
     routing_key: Optional[str] = None
     max_thinking_tokens: Optional[int] = None
+    session_id: Optional[str] = None
+    custom_logit_processor: Optional[OptionalStringOrList] = None
+    custom_labels: Optional[CustomLabels] = None
+    images_config: Optional[Any] = None
+    return_prompt_token_ids: Optional[bool] = None
+    routed_experts_start_len: Optional[int] = None
+    return_sampling_mask: Optional[BoolOrList] = None
+    modalities: Optional[OptionalStringList] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -347,6 +355,9 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     e2e_latency: Optional[float] = None
     cached_tokens: int = 0
     reasoning_tokens: int = 0
+    output_token_logprobs_length: Optional[int] = None
+    weight_version: Optional[str] = None
+    weight_versions: Optional[WeightVersionSpans] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -358,6 +369,23 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
         return encode_GenerateMetaInfo(self)
 
 
+class WeightVersionSpan(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WeightVersionSpan: JSON object (unknown keys ignored)."""
+
+    version: str = ""
+    start: int = 0
+    end: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WeightVersionSpan":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WeightVersionSpan(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WeightVersionSpan(self)
+
+
 class GenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.GenerateResponse: JSON object (unknown keys ignored)."""
 
@@ -365,6 +393,7 @@ class GenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
     meta_info: Optional[GenerateMetaInfo] = None
     output_ids: Optional[TokenIds] = None
     index: Optional[int] = None
+    prompt_token_ids: Optional[TokenIds] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateResponse":
@@ -720,6 +749,9 @@ MatchedTokens = List[int]
 # sglang.api.v1.FinishReason: JSON object tagged by its type key; unknown tags pass through as a dict.
 FinishReason = Union[FinishStop, FinishLength, FinishAbort, Dict[str, Any]]
 
+# sglang.api.v1.CustomLabels: JSON: the wrapped value itself, null when unset.
+CustomLabels = Dict[str, str]
+
 # sglang.api.v1.OptionalKvHintsEnvelope: JSON: the wrapped value itself, null when unset.
 OptionalKvHintsEnvelope = Optional[KvHintsEnvelope]
 
@@ -737,6 +769,9 @@ NullableTopLogprobs = Optional[TopLogprobRow]
 
 # sglang.api.v1.HiddenStateRow: JSON bare array.
 HiddenStateRow = List[float]
+
+# sglang.api.v1.WeightVersionSpans: JSON bare array.
+WeightVersionSpans = List[WeightVersionSpan]
 
 # sglang.api.v1.ImageGridThw: JSON bare array.
 ImageGridThw = List[Int64List]
@@ -1337,6 +1372,22 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "max_thinking_tokens":
             kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "session_id":
+            kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "custom_logit_processor":
+            kw["custom_logit_processor"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "custom_labels":
+            kw["custom_labels"] = None if x is None else decode_CustomLabels(x)
+        elif key == "images_config":
+            kw["images_config"] = x
+        elif key == "return_prompt_token_ids":
+            kw["return_prompt_token_ids"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "routed_experts_start_len":
+            kw["routed_experts_start_len"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "return_sampling_mask":
+            kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
+        elif key == "modalities":
+            kw["modalities"] = None if x is None else decode_OptionalStringList(x)
     return GenerateRequest(**kw)
 
 
@@ -1404,7 +1455,31 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["routing_key"] = v.routing_key
     if v.max_thinking_tokens is not None:
         d["max_thinking_tokens"] = v.max_thinking_tokens
+    if v.session_id is not None:
+        d["session_id"] = v.session_id
+    if v.custom_logit_processor is not None:
+        d["custom_logit_processor"] = encode_OptionalStringOrList(v.custom_logit_processor)
+    if v.custom_labels is not None:
+        d["custom_labels"] = encode_CustomLabels(v.custom_labels)
+    if v.images_config is not None:
+        d["images_config"] = v.images_config
+    if v.return_prompt_token_ids is not None:
+        d["return_prompt_token_ids"] = v.return_prompt_token_ids
+    if v.routed_experts_start_len is not None:
+        d["routed_experts_start_len"] = v.routed_experts_start_len
+    if v.return_sampling_mask is not None:
+        d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
+    if v.modalities is not None:
+        d["modalities"] = encode_OptionalStringList(v.modalities)
     return d
+
+
+def decode_CustomLabels(value: Any) -> CustomLabels:
+    return {} if value is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(value, expected="a map").items()}
+
+
+def encode_CustomLabels(v: CustomLabels) -> Any:
+    return dict(v)
 
 
 def decode_KvHintsEnvelopeOrList(value: Any) -> KvHintsEnvelopeOrList:
@@ -1585,6 +1660,12 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["cached_tokens"] = _expect_uint(x, expected="u32")
         elif key == "reasoning_tokens":
             kw["reasoning_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "output_token_logprobs_length":
+            kw["output_token_logprobs_length"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "weight_version":
+            kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "weight_versions":
+            kw["weight_versions"] = None if x is None else decode_WeightVersionSpans(x)
     return GenerateMetaInfo(**kw)
 
 
@@ -1612,7 +1693,42 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["e2e_latency"] = float(v.e2e_latency)
     d["cached_tokens"] = v.cached_tokens
     d["reasoning_tokens"] = v.reasoning_tokens
+    if v.output_token_logprobs_length is not None:
+        d["output_token_logprobs_length"] = v.output_token_logprobs_length
+    if v.weight_version is not None:
+        d["weight_version"] = v.weight_version
+    if v.weight_versions is not None:
+        d["weight_versions"] = encode_WeightVersionSpans(v.weight_versions)
     return d
+
+
+def decode_WeightVersionSpan(value: Any) -> WeightVersionSpan:
+    m = _expect_map(value, expected="struct WeightVersionSpan")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "version":
+            kw["version"] = _expect_str(x, expected="a string")
+        elif key == "start":
+            kw["start"] = _expect_int(x, expected="i64")
+        elif key == "end":
+            kw["end"] = _expect_int(x, expected="i64")
+    return WeightVersionSpan(**kw)
+
+
+def encode_WeightVersionSpan(v: WeightVersionSpan) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["version"] = v.version
+    d["start"] = v.start
+    d["end"] = v.end
+    return d
+
+
+def decode_WeightVersionSpans(value: Any) -> WeightVersionSpans:
+    return [decode_WeightVersionSpan(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_WeightVersionSpans(v: WeightVersionSpans) -> List[Any]:
+    return [encode_WeightVersionSpan(e) for e in v]
 
 
 def decode_GenerateResponse(value: Any) -> GenerateResponse:
@@ -1627,6 +1743,8 @@ def decode_GenerateResponse(value: Any) -> GenerateResponse:
             kw["output_ids"] = None if x is None else decode_TokenIds(x)
         elif key == "index":
             kw["index"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "prompt_token_ids":
+            kw["prompt_token_ids"] = None if x is None else decode_TokenIds(x)
     return GenerateResponse(**kw)
 
 
@@ -1639,6 +1757,8 @@ def encode_GenerateResponse(v: GenerateResponse) -> Dict[str, Any]:
         d["output_ids"] = encode_TokenIds(v.output_ids)
     if v.index is not None:
         d["index"] = v.index
+    if v.prompt_token_ids is not None:
+        d["prompt_token_ids"] = encode_TokenIds(v.prompt_token_ids)
     return d
 
 

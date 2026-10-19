@@ -563,7 +563,11 @@ fn alias_def(m: &MessageModel) -> Option<(String, &'static str, Vec<String>)> {
             refs(&[&item.kind]),
         )),
         MessageKind::Transparent { field } => Some((
-            format!("Optional[{}]", inner_ty(&field.kind)),
+            if matches!(field.kind, FieldKind::Map { .. }) {
+                inner_ty(&field.kind)
+            } else {
+                format!("Optional[{}]", inner_ty(&field.kind))
+            },
             "JSON: the wrapped value itself, null when unset",
             refs(&[&field.kind]),
         )),
@@ -751,15 +755,27 @@ fn emit_transparent_codec(out: &mut String, m: &MessageModel, field: &FieldModel
             format!("decode_{rust_path}(value)"),
             format!("encode_{rust_path}(v)"),
         ),
+        FieldKind::Map { .. } => (de_expr(&field.kind, "value"), enc_expr(&field.kind, "v")),
         other => panic!(
-            "{name}: transparent field must be an optional scalar or a message, got {other:?}"
+            "{name}: transparent field must be an optional scalar, message, or map, got {other:?}"
         ),
     };
+    let nullable = !matches!(field.kind, FieldKind::Map { .. });
+    let de = if nullable {
+        format!("None if value is None else {de}")
+    } else {
+        de
+    };
+    let en = if nullable {
+        format!("None if v is None else {en}")
+    } else {
+        en
+    };
     out.push_str(&format!(
-        "def decode_{name}(value: Any) -> {name}:\n    return None if value is None else {de}\n\n\n"
+        "def decode_{name}(value: Any) -> {name}:\n    return {de}\n\n\n"
     ));
     out.push_str(&format!(
-        "def encode_{name}(v: {name}) -> Any:\n    return None if v is None else {en}\n\n\n"
+        "def encode_{name}(v: {name}) -> Any:\n    return {en}\n\n\n"
     ));
 }
 

@@ -411,6 +411,31 @@ pub struct GenerateRequest {
     pub max_thinking_tokens: ::core::option::Option<u64>,
     #[prost(message, optional, tag = "29")]
     pub kv_hints: ::core::option::Option<KvHintsEnvelopeOrList>,
+    /// Python serving extensions forwarded by the shared OpenAI processor.
+    /// Their presence in the wire contract does not imply native Rust support.
+    #[prost(string, optional, tag = "33")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "34")]
+    pub custom_logit_processor: ::core::option::Option<OptionalStringOrList>,
+    #[prost(message, optional, tag = "35")]
+    pub custom_labels: ::core::option::Option<CustomLabels>,
+    #[prost(string, optional, tag = "36")]
+    pub images_config: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "37")]
+    pub return_prompt_token_ids: ::core::option::Option<bool>,
+    #[prost(int64, optional, tag = "38")]
+    pub routed_experts_start_len: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "39")]
+    pub return_sampling_mask: ::core::option::Option<BoolOrList>,
+    #[prost(message, optional, tag = "40")]
+    pub modalities: ::core::option::Option<OptionalStringList>,
+}
+/// Preserve an explicitly empty label map, distinct from an absent map.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CustomLabels {
+    #[prost(map = "string, string", tag = "1")]
+    pub values:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KvHintsEnvelopeOrList {
@@ -554,6 +579,27 @@ pub struct GenerateMetaInfo {
     pub cached_tokens: u32,
     #[prost(uint64, tag = "14")]
     pub reasoning_tokens: u64,
+    /// Python reports the cumulative count even for incremental logprob frames.
+    #[prost(uint64, optional, tag = "15")]
+    pub output_token_logprobs_length: ::core::option::Option<u64>,
+    #[prost(string, optional, tag = "16")]
+    pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "17")]
+    pub weight_versions: ::core::option::Option<WeightVersionSpans>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WeightVersionSpan {
+    #[prost(string, tag = "1")]
+    pub version: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub start: i64,
+    #[prost(int64, tag = "3")]
+    pub end: i64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WeightVersionSpans {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<WeightVersionSpan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
@@ -570,6 +616,8 @@ pub struct GenerateResponse {
     /// Batch position; only on batch responses/frames.
     #[prost(uint32, optional, tag = "4")]
     pub index: ::core::option::Option<u32>,
+    #[prost(message, optional, tag = "5")]
+    pub prompt_token_ids: ::core::option::Option<TokenIds>,
 }
 /// One request's failure inside a Generate stream; carries its batch position
 /// (the HTTP SSE shape puts `index` beside the error object the same way).

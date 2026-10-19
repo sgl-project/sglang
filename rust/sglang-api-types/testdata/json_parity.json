@@ -125,7 +125,7 @@
           "h1",
           "h2"
         ],
-        "session_id": "ignored"
+        "conversation_id": "ignored"
       },
       "canonical": "{\"text\":\"see\",\"stream\":false,\"image_data\":[[\"a\",null],null,[]],\"mm_hashes\":[\"h1\",\"h2\"],\"video_data\":{\"url\":\"v\",\"fps\":2.0,\"use_audio\":true},\"audio_data\":\"data:audio/wav;base64,AA==\"}"
     },
@@ -437,6 +437,61 @@
         }
       },
       "canonical": "{\"text\":\"\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":1,\"completion_tokens\":0,\"finish_reason\":{\"type\":\"novel\",\"detail\":3,\"again\":[1,{\"z\":1,\"a\":2}]},\"cached_tokens\":0,\"reasoning_tokens\":0}}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "processor extensions preserve nullable custom processors and empty custom labels",
+      "input": {
+        "input_ids": [
+          [
+            1
+          ],
+          [
+            2
+          ]
+        ],
+        "session_id": "session",
+        "custom_logit_processor": [
+          null,
+          "processor"
+        ],
+        "custom_labels": {},
+        "return_prompt_token_ids": true,
+        "return_sampling_mask": false,
+        "modalities": []
+      },
+      "canonical": "{\"input_ids\":[[1],[2]],\"stream\":false,\"session_id\":\"session\",\"custom_logit_processor\":[null,\"processor\"],\"custom_labels\":{},\"return_prompt_token_ids\":true,\"return_sampling_mask\":false,\"modalities\":[]}"
+    },
+    {
+      "type": "GenerateResponse",
+      "name": "processor metadata retains cumulative logprob count and weight spans",
+      "input": {
+        "text": "ok",
+        "meta_info": {
+          "id": "r",
+          "prompt_tokens": 2,
+          "completion_tokens": 1,
+          "output_token_logprobs_length": 8,
+          "weight_version": "v2",
+          "weight_versions": [
+            {
+              "version": "v1",
+              "start": 0,
+              "end": 7
+            },
+            {
+              "version": "v2",
+              "start": 7,
+              "end": 8
+            }
+          ]
+        },
+        "prompt_token_ids": [
+          1,
+          2
+        ]
+      },
+      "canonical": "{\"text\":\"ok\",\"meta_info\":{\"id\":\"r\",\"prompt_tokens\":2,\"completion_tokens\":1,\"finish_reason\":null,\"cached_tokens\":0,\"reasoning_tokens\":0,\"output_token_logprobs_length\":8,\"weight_version\":\"v2\",\"weight_versions\":[{\"version\":\"v1\",\"start\":0,\"end\":7},{\"version\":\"v2\",\"start\":7,\"end\":8}]},\"prompt_token_ids\":[1,2]}"
     }
   ]
 }

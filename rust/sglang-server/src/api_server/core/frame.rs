@@ -207,6 +207,7 @@ impl CoreOutput {
                 ids: self.token_ids,
             }),
             index,
+            prompt_token_ids: None,
         }
     }
 
