@@ -86,6 +86,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         token_to_kv_pool=pool,
         pending_ring_slots=torch.arange(8),
         get_token_to_batch_idx=lambda: torch.zeros(8, dtype=torch.int32),
+        prefill_max_row_keys=lambda *_: None,
         get_prefill_mqa_inputs=lambda *args, **kwargs: (
             compressed_keys,
             row_starts,
@@ -113,7 +114,9 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         qsa_indexer, "cp_materialize_global_token_order", gather_raw_keys
     )
 
-    def score_queries(q, k, starts, ends, query_positions, sequence_lengths):
+    def score_queries(
+        q, k, starts, ends, query_positions, sequence_lengths, max_row_keys=None
+    ):
         # Use the same operand check as GPU scoring; the CPU reference otherwise
         # accepts mixed dtypes and would conceal the FP8 compatibility failure.
         assert _scoring_dtype(q, k) == compressed_dtype

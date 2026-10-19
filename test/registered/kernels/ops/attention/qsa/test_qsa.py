@@ -541,6 +541,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
             decode_logical_positions=None,
             pending_ring_slots=None,
             get_token_to_batch_idx=lambda: mapping,
+            prefill_max_row_keys=lambda *_: None,
             get_prefill_mqa_inputs=lambda layer_id, logical_positions: (
                 torch.empty(0, 1, 128),
                 torch.zeros(15, dtype=torch.int32),
@@ -565,7 +566,7 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
                     rope_rows=rope.numel(),
                 )
             ),
-            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths: (
+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths, **_: (
                 q.squeeze(1)
             ),
         )
@@ -978,7 +979,7 @@ class _DispatchIndexer:
         rows = hidden_states.shape[0]
         return torch.zeros(rows, 4, 128), torch.zeros(rows, 1, 128), False
 
-    def select_prefill_tokens(self, *args):
+    def select_prefill_tokens(self, *args, **kwargs):
         self.selected = "prefill"
         return torch.tensor([1])
 
@@ -1012,6 +1013,10 @@ class _DispatchMetadata:
             torch.ones(1, dtype=torch.int32),
             1,
         )
+
+    @staticmethod
+    def prefill_max_row_keys(*_):
+        return None
 
     @staticmethod
     def get_prefill_mqa_inputs(layer_id, positions):
