@@ -1,8 +1,12 @@
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, Callable
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     enable_breakable_cuda_graph,
@@ -13,6 +17,8 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.cont
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
     set_tc_piecewise_forward_context as piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 
 from ..attention_methods.dense_attention import DEFAULT_DEVICE as DENSE_DEFAULT_DEVICE
 from ..attention_methods.dense_attention import DEFAULT_DTYPE as DENSE_DEFAULT_DTYPE
@@ -304,20 +310,49 @@ def _run_split_op_extend_case(
         max_context_len=max_context_len,
     )
 
+    layers = adapter.attention_layers(split_fixture)
     with (
+        ExitStack() as stack,
         torch.no_grad(),
+        set_forward_batch(static_batch) if breakable else nullcontext(),
+        prefill_graph_scope(full_graph=False, raw_num_tokens=raw_num_tokens)
+        if breakable
+        else nullcontext(),
         _split_op_context(breakable=breakable),
         forward_context(ForwardContext(attn_backend=split_fixture.backend)),
         piecewise_forward_context(
             static_batch,
-            adapter.attention_layers(split_fixture),
+            layers,
             None,
             [],
             [],
         ),
     ):
+        eager_calls = []
+        if breakable:
+            for layer in layers:
+                if isinstance(layer, RadixAttention):
+                    eager_calls.append(
+                        stack.enter_context(
+                            patch.object(
+                                layer, "_eager_attention", wraps=layer._eager_attention
+                            )
+                        )
+                    )
+                elif isinstance(layer, RadixLinearAttention):
+                    eager_calls.append(
+                        stack.enter_context(
+                            patch.object(
+                                layer,
+                                "_eager_linear_attention",
+                                wraps=layer._eager_linear_attention,
+                            )
+                        )
+                    )
         split_fixture.backend.init_forward_metadata(raw_batch)
         actual = adapter.run_forward(split_fixture, static_batch, static_inputs)
+        for eager_call in eager_calls:
+            eager_call.assert_called()
 
     actual = _slice_live_tokens(actual, raw_num_tokens)
     torch.testing.assert_close(actual, expected, atol=adapter.atol, rtol=adapter.rtol)

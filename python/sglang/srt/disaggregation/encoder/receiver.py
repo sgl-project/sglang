@@ -36,6 +36,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -46,7 +47,7 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -164,7 +165,9 @@ class EncoderBootstrapServer:
                     except (asyncio.CancelledError, Exception):
                         pass
 
-        self.app = FastAPI(lifespan=lifespan, openapi_url=None)
+        self.app = FastAPI(
+            lifespan=lifespan, openapi_url=None, **fastapi_telemetry_disabled_kwargs()
+        )
 
         @self.app.get("/health")
         async def _health() -> Response:
@@ -2608,7 +2611,7 @@ class MMReceiverBase(ABC):
             return flat
 
         def to_raw_url(mm_item):
-            if isinstance(mm_item, ImageData):
+            if isinstance(mm_item, (ImageData, VideoData)):
                 return mm_item.url
             if isinstance(mm_item, dict):
                 # tolerate {"url": ...} shaped payloads

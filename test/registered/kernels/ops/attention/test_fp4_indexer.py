@@ -25,6 +25,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
 )
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.deepseek_v4.common import (
+    ceil_ue8m0_exp_ref,
+    fp4_e2m1_code_ref,
+)
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -43,32 +47,15 @@ PAGE_SIZE = 64
 E2M1_MAX = 6.0
 
 
-def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
-    bits = x.to(torch.float32).contiguous().view(torch.int32)
-    exp = (bits >> 23) & 0xFF
-    mantissa = bits & 0x7FFFFF
-    exp = exp + (mantissa != 0).to(torch.int32)
-    return exp.clamp(1, 254)
-
-
-def _fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
-    ax = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
-    idx = torch.zeros_like(ax, dtype=torch.uint8)
-    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        idx += (ax > threshold).to(torch.uint8)
-    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
-    return idx | sign
-
-
 def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     x = x.contiguous().view(-1, HEAD_DIM).float()
     groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
     scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
-    scale_exp = _ceil_ue8m0_exp_ref(scale_raw)
+    scale_exp = ceil_ue8m0_exp_ref(scale_raw)
     scale = (scale_exp << 23).contiguous().view(torch.float32)
 
     scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = _fp4_e2m1_code_ref(scaled)
+    code = fp4_e2m1_code_ref(scaled)
     packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
         torch.uint8
     )
@@ -615,6 +602,14 @@ def test_hopper_indexer_backends_replay(ratio):
     req_table[:, : width * ratio : ratio] = (slots[::6] * ratio).int()
     positions = (lens * ratio - 1).clamp_min(0)
     pool = SimpleNamespace(get_index_k_with_scale_buffer=lambda layer: table)
+    # A unit page keeps the per-row table valid under the shuffled slots below.
+    page_table = torch.empty((batch, capacity), device=q.device, dtype=torch.int32)
+    page_table.copy_(req_table[req.long(), ::ratio] // ratio)
+    metadata = SimpleNamespace(
+        max_compressed_seq_len=capacity,
+        page_table=page_table,
+        compressed_page_size=1,
+    )
     indexer = SimpleNamespace(
         queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
     )
@@ -626,7 +621,7 @@ def test_hopper_indexer_backends_replay(ratio):
         x=weights,
         positions=positions,
         req_rows=req,
-        paged_metadata=SimpleNamespace(max_compressed_seq_len=capacity),
+        paged_metadata=metadata,
         is_verify=True,
     )
     kwargs = dict(
@@ -636,14 +631,14 @@ def test_hopper_indexer_backends_replay(ratio):
     candidates = DenseBlocksBackend(
         **kwargs, candidate_topk_blocks=4, candidate_block_size=8
     )
+    # DeepSelect fills a full top-k buffer of exactly live rows by topk, as at
+    # runtime; the candidate paths also clear padded rows and columns.
     outputs = [
         SimpleNamespace(
-            page_indices=torch.empty(
-                (batch + 1, topk + 8), device=q.device, dtype=torch.int32
-            ),
+            page_indices=torch.empty(shape, device=q.device, dtype=torch.int32),
             raw_indices=None,
         )
-        for _ in range(3)
+        for shape in ((batch, topk), (batch + 1, topk + 8), (batch + 1, topk + 8))
     ]
     decode_inputs = [
         DecodeInputs(
@@ -686,6 +681,7 @@ def test_hopper_indexer_backends_replay(ratio):
         positions.copy_(lens * ratio - 1)
         req.copy_(req.roll(1))
         req_table[:, : width * ratio : ratio] = (slots[::6].roll(step, 1) * ratio).int()
+        page_table.copy_(req_table[req.long(), ::ratio] // ratio)
         q.neg_()
         for scores in captured_scores:
             scores.fill_(torch.inf)
@@ -741,7 +737,7 @@ def test_hopper_indexer_backends_replay(ratio):
                     expected_raw = torch.full_like(out.raw_indices[row], -1)
                     expected_raw[:count] = selected.sort().values.int()
                     torch.testing.assert_close(out.raw_indices[row], expected_raw)
-        for out in outputs:
+        for out in outputs[1:]:
             assert (out.page_indices[batch] == -1).all().item()
             if out.raw_indices is not None:
                 assert (out.raw_indices[batch] == -1).all().item()
