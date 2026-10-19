@@ -172,6 +172,11 @@ from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
     forward_layer_fused_boundary,
 )
+from sglang.srt.models.deepseek_v4_tail_graphs import (
+    DecoderTailGraphs,
+    bcg_tail_kv_store,
+    in_decoder_tail_graph,
+)
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -2305,6 +2310,10 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
+            elif in_decoder_tail_graph():
+                assert not fuse_q_rope
+                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                kv = None
             else:
                 self._compute_kv_to_cache(
                     x_linear,
@@ -2324,7 +2333,10 @@ class MQALayer(MqaAttentionBase):
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                and (
+                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                    or in_decoder_tail_graph()
+                )
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -3532,6 +3544,8 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
+    # Class-level default for instances built without running __init__.
+    decoder_tail_graphs: Optional[DecoderTailGraphs] = None
 
     def __init__(
         self,
@@ -3698,6 +3712,44 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
+        self.decoder_tail_graphs: Optional[DecoderTailGraphs] = None
+        tail_graph_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
+        if (
+            self.tail_writes_source_kv
+            and _is_cuda
+            and tail_graph_rows > 0
+            # Borrowed graph-pool storage forbids capturing mid-serving.
+            and not envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.get()
+        ):
+            from sglang.srt.layers.attention.deepseek_v4_backend import SWA_WINDOW
+
+            self.decoder_tail_graphs = DecoderTailGraphs(
+                model=self,
+                layer_ids=range(self.late_layer_start, self.end_layer),
+                row_step=SWA_WINDOW,
+                max_rows=tail_graph_rows,
+            )
+
+    def _tail_graph_plan(
+        self, tail: Optional[LateLayerTail], *, tail_in_graph: bool
+    ) -> bool:
+        """Whether an eager step runs the tail layers from a decoder tail graph;
+        prefill-graph steps keep the tail in their own graph."""
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        return not (
+            tail is None
+            or tail_in_graph
+            or get_parallel().attn_dp_size > 1
+            or get_is_capture_mode()
+            or is_unified_kv_triton()
+            or get_global_expert_distribution_recorder().recording
+            or not self.decoder_tail_graphs.warm
+            or tail.cp_metadata is not None
+            or self.decoder_tail_graphs.bucket_rows(tail.positions.shape[0]) is None
+        )
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3831,6 +3883,10 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
+        use_tail_graph = False
+        if self.decoder_tail_graphs is not None and tail is not None:
+            self.decoder_tail_graphs.ready(input_ids.shape[0])
+            use_tail_graph = self._tail_graph_plan(tail, tail_in_graph=tail_in_graph)
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -3890,6 +3946,19 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+                if use_tail_graph:
+                    residual, pre, aux = self.decoder_tail_graphs.run(
+                        state=state,
+                        positions=positions,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        forward_batch=forward_batch,
+                        capture_dspark=capture_dspark,
+                    )
+                    dspark_aux_hidden_states.extend(aux)
+                    residual_batch.clear(forward_batch)
+                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+                    return residual, pre, tail
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
