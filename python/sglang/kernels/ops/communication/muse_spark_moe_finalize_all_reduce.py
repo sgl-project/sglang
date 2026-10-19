@@ -19,10 +19,10 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.muse_spark import (
-    fi_trtllm_moe_finalize_with_rmsnorm_cutedsl,
+from sglang.kernels.ops.communication import (
+    muse_spark_moe_finalize_all_reduce_cutedsl,
 )
-from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
+from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce_cutedsl import (
     FinalizePushWorkspace,
 )
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
@@ -103,7 +103,7 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
             from token count for H=4096; other shapes use a single CTA.
     """
 
-    op = "muse_spark.post_expert_finalize"
+    op = "communication.muse_spark_moe_finalize_all_reduce"
     priority = (KernelBackend.CUTE_DSL, KernelBackend.HELION)
     capabilities = {
         KernelBackend.CUTE_DSL: {CapabilityRequirement.CUDA},
@@ -132,7 +132,7 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
             return self._helion_eligible(*args, **kwargs)
         if backend is not KernelBackend.CUTE_DSL:
             return True
-        if not fi_trtllm_moe_finalize_with_rmsnorm_cutedsl.HAS_CUTEDSL:
+        if not muse_spark_moe_finalize_all_reduce_cutedsl.HAS_CUTEDSL:
             global _missing_cutedsl_warning_logged
             if not _missing_cutedsl_warning_logged:
                 _missing_cutedsl_warning_logged = True
@@ -249,7 +249,7 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
         from cutlass import Int32
         from cutlass.cute.runtime import make_ptr
 
-        kernel_module = fi_trtllm_moe_finalize_with_rmsnorm_cutedsl
+        kernel_module = muse_spark_moe_finalize_all_reduce_cutedsl
 
         assert gemm2_output.is_cuda
         cutlass_dtype = kernel_module._torch_to_cutlass_dtype[gemm2_output.dtype]
@@ -354,7 +354,7 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
         *,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> bool:
-        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
+        from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
         return (
             helion_supported("post_expert_finalize", output)
@@ -385,12 +385,12 @@ class FusedPostExpertNormWeightedSumTRTLLM(BaseFusedOp):
     ) -> None:
         """Run Helion finalize, then a separate AR when delegated by the model."""
 
-        from sglang.kernels.ops.muse_spark.helion_post_expert import (
+        from sglang.kernels.jit.utils.helion_runtime import (
+            run_pinned_helion,
+        )
+        from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce_helion import (
             POST_EXPERT_FINALIZE_CONFIGS,
             _post_expert_finalize_helion_kernel,
-        )
-        from sglang.kernels.ops.muse_spark.helion_runtime import (
-            run_pinned_helion,
         )
 
         run_pinned_helion(

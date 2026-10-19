@@ -143,7 +143,7 @@ def _triton_config(n_rows: int) -> tuple[int, int]:
 class FusedQKNorm(BaseFusedOp):
     """Per-head RMS norm of the Q and K slices of a QKV projection output."""
 
-    op = "muse_spark.qk_norm"
+    op = "attention.muse_spark_qk_norm_rope_store"
     priority = (KernelBackend.TRITON, KernelBackend.HELION)
     capabilities = {
         KernelBackend.HELION: {CapabilityRequirement.CUDA},
@@ -375,7 +375,7 @@ class FusedQKNorm(BaseFusedOp):
         cos_sin_cache: Optional[torch.Tensor] = None,
         kv_store: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> bool:
-        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
+        from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
         return (
             helion_supported("qk_norm", qkv)
@@ -405,12 +405,12 @@ class FusedQKNorm(BaseFusedOp):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run Helion behind the existing fused operation boundary."""
 
-        from sglang.kernels.ops.muse_spark.helion_qk_norm import (
+        from sglang.kernels.jit.utils.helion_runtime import (
+            run_pinned_helion,
+        )
+        from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store_helion import (
             QK_NORM_CONFIGS,
             _qk_norm_helion_kernel,
-        )
-        from sglang.kernels.ops.muse_spark.helion_runtime import (
-            run_pinned_helion,
         )
 
         if kv_store is None:

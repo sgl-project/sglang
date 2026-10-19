@@ -19,25 +19,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.muse_spark.all_gather_norm_residual import (
-    all_gather_norm_residual_supported,
-)
-from sglang.kernels.ops.muse_spark.fused_muse_spark_routing import (
-    FusedMuseSparkRouting,
-)
-from sglang.kernels.ops.muse_spark.fused_norm_gate import FusedRMSNormGate
-from sglang.kernels.ops.muse_spark.fused_norm_residual import (
-    FusedPostNormResidualPreNorm,
-)
-from sglang.kernels.ops.muse_spark.fused_qk_norm import FusedQKNorm
-from sglang.kernels.ops.muse_spark.gemm_ag import (
+from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store import FusedQKNorm
+from sglang.kernels.ops.communication.muse_spark_all_gather import (
     gemm_ag,
     gemm_ag_supported,
     gemm_local,
     reserve_projection_workspace,
 )
-from sglang.kernels.ops.muse_spark.router_gemm import (
+from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
+    all_gather_norm_residual_supported,
+)
+from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
+)
+from sglang.kernels.ops.layernorm.muse_spark_norm_gate import FusedRMSNormGate
+from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
+    FusedPostNormResidualPreNorm,
+)
+from sglang.kernels.ops.moe.muse_spark_routing import (
+    FusedMuseSparkRouting,
 )
 from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
@@ -1064,7 +1064,7 @@ class MuseSpark1xModel(nn.Module):
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
-            from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
+            from sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce_cutedsl import (
                 FinalizePushWorkspace,
             )
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (

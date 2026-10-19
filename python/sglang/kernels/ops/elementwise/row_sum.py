@@ -1,4 +1,4 @@
-"""Row sum over [N, K] fp32, bitwise-identical to ``sglang.kernels.ops.muse_spark.triton_sum``.
+"""Row sum over [N, K] fp32, bitwise-identical to ``sglang.test.kernels.triton_sum``.
 
 Same contract: the reduction order is fixed by the kernel (tl.sum's pairwise
 tree), not by the CUDA runtime version, so results are stable across toolkits.

@@ -106,7 +106,7 @@ def _fused_norm_fp4_quant_jit(
 class _FusedNormFP4Quant(BaseFusedOp):
     """Backend dispatcher for the Muse Spark fused norm/quant boundary."""
 
-    op = "muse_spark.norm_fp4_quant"
+    op = "layernorm.muse_spark_rmsnorm_nvfp4_quant"
     priority = (KernelBackend.JIT, KernelBackend.HELION)
     capabilities = {
         KernelBackend.HELION: {CapabilityRequirement.CUDA},
@@ -137,7 +137,7 @@ class _FusedNormFP4Quant(BaseFusedOp):
         if backend is not KernelBackend.HELION:
             return True
 
-        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
+        from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
         return (
             helion_supported("norm_fp4_quant", x)
@@ -194,7 +194,7 @@ class _FusedNormFP4Quant(BaseFusedOp):
         quantize: bool = True,
         want_normed: bool = False,
     ):
-        from sglang.kernels.ops.muse_spark.helion_norm_fp4_quant import (
+        from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant_helion import (
             fused_norm_fp4_quant_helion,
         )
 

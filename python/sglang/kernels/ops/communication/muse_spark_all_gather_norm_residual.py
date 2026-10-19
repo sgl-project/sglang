@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.muse_spark.norm_residual import (
+from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import (
     norm_residual_launch_config,
 )
 

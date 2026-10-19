@@ -8,7 +8,7 @@ import torch
 from helion.autotuner import BooleanFragment
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.muse_spark.helion_runtime import (
+from sglang.kernels.jit.utils.helion_runtime import (
     token_count_specialization_key,
 )
 
@@ -680,7 +680,7 @@ def fused_norm_fp4_quant_helion(
     assert weight.dtype == torch.bfloat16 and weight.shape == (x.shape[1],)
 
     weight = weight.contiguous()
-    from sglang.kernels.ops.muse_spark.helion_runtime import run_pinned_helion
+    from sglang.kernels.jit.utils.helion_runtime import run_pinned_helion
 
     fp4, sf, per_token_scale = run_pinned_helion(
         _norm_fp4_quant_helion_kernel,

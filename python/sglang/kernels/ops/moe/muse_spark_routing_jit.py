@@ -1,7 +1,7 @@
 """Fused MuseSpark MoE routing (CUDA JIT).
 
 Drop-in replacement for the Triton ``fused_muse_spark_routing`` topk8 path in
-``sglang.kernels.ops.muse_spark.fused_muse_spark_routing``: sigmoid/softmax normalization,
+``sglang.kernels.ops.moe.muse_spark_routing``: sigmoid/softmax normalization,
 bias-scored iterative top-k, and renormalization by the selected unbiased score
 sum, fused into one kernel with one warp per token.
 

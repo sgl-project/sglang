@@ -19,10 +19,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
-from sglang.kernels.ops.muse_spark import fused_op_tuning
-from sglang.kernels.ops.muse_spark.all_gather_norm_residual import (
+from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
     all_gather_norm_residual,
 )
+from sglang.kernels.ops.layernorm import _muse_spark_tuning
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
@@ -39,7 +39,7 @@ def _fused_norm_residual_config(
     post_norm_is_input_scale: bool,
 ) -> tuple[int, int, dict]:
     """Resolve launch parameters for the exact residual-norm shape."""
-    cfg = fused_op_tuning.resolve(
+    cfg = _muse_spark_tuning.resolve(
         "fused_norm_residual",
         {"num_warps": 8, "num_stages": 1},
         hidden_size=hidden_size,
@@ -47,12 +47,12 @@ def _fused_norm_residual_config(
         num_tokens=num_tokens,
         post_norm_is_input_scale=post_norm_is_input_scale,
     )
-    extra = fused_op_tuning.split_extra(cfg, ("num_warps", "num_stages"))
+    extra = _muse_spark_tuning.split_extra(cfg, ("num_warps", "num_stages"))
     return cfg["num_warps"], cfg["num_stages"], extra
 
 
 def _jit_launch_config_ok(hidden_size: int) -> bool:
-    from sglang.kernels.ops.muse_spark.norm_residual import _launch_config
+    from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import _launch_config
 
     try:
         _launch_config(hidden_size, 1)
@@ -447,7 +447,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
                 pre_norm_dtype=pre_norm_dtype,
             )
 
-        from sglang.kernels.ops.muse_spark.norm_residual import (
+        from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import (
             fused_norm_residual as _jit_fused_norm_residual,
         )
 

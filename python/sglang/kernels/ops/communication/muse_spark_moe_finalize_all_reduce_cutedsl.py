@@ -24,7 +24,7 @@ Algorithm for each token (1 block or DSMEM cluster per token):
   Convert the FP32 accumulator to the output dtype once.
 
 The public API is ``FusedPostExpertNormWeightedSumTRTLLM`` in
-``fused_post_expert_norm_weighted_sum_trtllm.py``.  This module exposes
+``muse_spark_moe_finalize_all_reduce.py``.  This module exposes
 the CuTeDSL kernel, compilation cache, and borrowed TP push workspace.
 """
 

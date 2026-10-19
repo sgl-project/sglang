@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.muse_spark import fused_op_tuning
+from sglang.kernels.ops.layernorm import _muse_spark_tuning
 from sglang.kernels.spec import CapabilityRequirement, KernelBackend
 
 
@@ -110,7 +110,7 @@ def _rms_norm_gate_config(
     op_name: str = "rms_norm_gate",
 ) -> tuple[int, int, dict]:
     """Resolve launch parameters for the exact norm-gate input layout."""
-    cfg = fused_op_tuning.resolve(
+    cfg = _muse_spark_tuning.resolve(
         op_name,
         {"block_m": 8, "num_warps": 4},
         device_index=device_index,
@@ -123,7 +123,7 @@ def _rms_norm_gate_config(
         has_gate=has_gate,
         has_weight=has_weight,
     )
-    extra = fused_op_tuning.split_extra(cfg, ("block_m", "num_warps"))
+    extra = _muse_spark_tuning.split_extra(cfg, ("block_m", "num_warps"))
     return cfg["block_m"], cfg["num_warps"], extra
 
 
@@ -155,7 +155,7 @@ class FusedRMSNormGate(BaseFusedOp):
     rank-grouped gates to the same zero-copy grouped view before execution.
     """
 
-    op = "muse_spark.rms_norm_gate"
+    op = "layernorm.muse_spark_norm_gate"
     priority = (KernelBackend.JIT, KernelBackend.HELION, KernelBackend.TRITON)
     capabilities = {
         KernelBackend.HELION: {CapabilityRequirement.CUDA},
@@ -229,7 +229,7 @@ class FusedRMSNormGate(BaseFusedOp):
         if x.numel() == 0:
             return self.forward_native(x, g)
 
-        from sglang.kernels.ops.muse_spark.norm_gate import (
+        from sglang.kernels.ops.layernorm.muse_spark_norm_gate_jit import (
             rms_norm_gate as _jit_rms_norm_gate,
         )
 
@@ -248,7 +248,7 @@ class FusedRMSNormGate(BaseFusedOp):
         x: torch.Tensor,
         g: torch.Tensor = None,
     ) -> bool:
-        from sglang.kernels.ops.muse_spark.helion_runtime import helion_supported
+        from sglang.kernels.jit.utils.helion_runtime import helion_supported
 
         if not helion_supported("rms_norm_gate", x):
             return False
@@ -278,12 +278,12 @@ class FusedRMSNormGate(BaseFusedOp):
     ) -> torch.Tensor:
         """Run Helion behind the existing fused operation boundary."""
         from sglang.kernels.jit.utils import is_arch_support_pdl
-        from sglang.kernels.ops.muse_spark.helion_norm_gate import (
+        from sglang.kernels.jit.utils.helion_runtime import (
+            run_pinned_helion,
+        )
+        from sglang.kernels.ops.layernorm.muse_spark_norm_gate_helion import (
             RMS_NORM_GATE_CONFIGS,
             _rms_norm_gate_helion_kernel,
-        )
-        from sglang.kernels.ops.muse_spark.helion_runtime import (
-            run_pinned_helion,
         )
 
         return run_pinned_helion(
