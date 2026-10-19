@@ -221,7 +221,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         return flash_mla_with_kvcache_torch(**kwargs)
 
     if backend == "tilelang":
-        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+        from sglang.kernels.ops.attention.dsv4.tilelang_fp8_attention import (
             dpsk_v4_fp8_attention_fwd,
         )
 

@@ -30,11 +30,9 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
-    cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
     fp8_dtype,
     gather_dequant_requant_fp8_paged,
-    q8kv8_padded_num_heads,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -4160,6 +4158,11 @@ class DeepseekV4AttnBackend(
         attn_sink: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+            cast_q_fp8_for_q8kv8_prefill,
+            q8kv8_padded_num_heads,
+        )
+
         num_tokens, num_heads, head_dim = q.shape
         padded_heads = q8kv8_padded_num_heads(num_heads)
 

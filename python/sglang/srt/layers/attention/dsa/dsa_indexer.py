@@ -183,7 +183,9 @@ if _is_cuda:
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
-    from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.kernels.ops.attention.dsa.indexer_q import (
+        fused_q_indexer_rope_first_quant,
+    )
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
