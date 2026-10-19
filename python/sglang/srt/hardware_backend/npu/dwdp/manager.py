@@ -32,11 +32,8 @@ def validate_dwdp_args(cfg):
     if cfg.nnodes != 1:
         raise ValueError("NPU DWDP requires a single host (--nnodes 1) for ACL IPC")
     # Validate loaded MoE kernels/layouts in setup, not the model-wide quant label.
-    if cfg.enable_lora or cfg.enable_memory_saver or cfg.cpu_offload_gb:
-        raise ValueError(
-            "NPU DWDP requires immutable device-resident weights; "
-            "LoRA, memory saver and CPU offload are not supported"
-        )
+    if cfg.enable_lora:
+        raise ValueError("NPU DWDP does not support LoRA")
     if cfg.enable_pdmux:
         raise ValueError("NPU DWDP does not support PDMux layer-split execution")
     graph_config = cfg.cuda_graph_config

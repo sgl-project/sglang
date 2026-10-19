@@ -281,9 +281,7 @@ def test_npu_dwdp(dtype, large):
     "kwargs, message",
     [
         ({"nnodes": 2}, "single host"),
-        ({"enable_lora": True}, "immutable device-resident"),
-        ({"enable_memory_saver": True}, "immutable device-resident"),
-        ({"cpu_offload_gb": 1}, "immutable device-resident"),
+        ({"enable_lora": True}, "LoRA"),
         ({"enable_pdmux": True}, "layer-split"),
         ({"cuda_graph_backend_decode": "full"}, "explicit graph capture"),
         (
@@ -301,6 +299,29 @@ def test_invalid_npu_dwdp_args(kwargs, message):
     )
     with pytest.raises(ValueError, match=message):
         handle_dwdp(args)
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"cpu_offload_gb": 1},
+        {"offload_group_size": 2},
+        {"enable_memory_saver": True},
+    ],
+)
+def test_dwdp_preserves_offload_and_memory_saver_settings(device, kwargs):
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.arg_groups.parallel_hook import handle_dwdp
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(
+        model_path="dummy", device=device, tp_size=2, dwdp_size=2, **kwargs
+    )
+    handle_dwdp(args)
+    cfg = resolving_view(args)
+    for name, value in kwargs.items():
+        assert getattr(cfg, name) == value
 
 
 @pytest.mark.parametrize("device", ["cuda", "npu"])
