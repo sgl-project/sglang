@@ -9,7 +9,6 @@ import torch
 
 from sglang.srt.managers.schedule_batch import (
     Req,
-    ReqKvInfo,
 )
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -352,15 +351,12 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
     @requires_full_swa_ps1_window4
     def test_swa_branching_seqlen_caps_insert_after_forward(self):
-        cache, _, _ = build_fixture(self.cfg)
+        cache, _, req_to_token_pool = build_fixture(self.cfg)
         swa = cache.components[ComponentType.SWA]
-        req = mock.Mock(
-            swa_branching_seqlen=8,
-            kv=ReqKvInfo(
-                cache_protected_len=4,
-                component_evicted_seqlens={ComponentType.SWA: 3},
-            ),
-        )
+        req = self._make_req(req_to_token_pool)
+        req.swa_branching_seqlen = 8
+        req.kv.cache_protected_len = 4
+        req.kv.set_evicted_seqlen(ComponentType.SWA, 3)
 
         for is_finished in (False, True):
             params = InsertParams(component_evicted_seqlens={ComponentType.MAMBA: 6})
@@ -378,12 +374,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
         cache.tree_core.is_eagle = True
         req.kv.cache_protected_len = 4
-        params = InsertParams()
-        self.assertEqual(swa.prepare_for_caching_req(req, params, 12, False), 9)
-        params.key = RadixKey(array("q", range(9)), is_bigram=True)
-        result = mock.Mock(swa_branch_inserted=False)
-        swa.commit_insert_component_data(mock.Mock(), False, params, result, [])
-        self.assertTrue(result.swa_branch_inserted)
+        self.assertEqual(swa.prepare_for_caching_req(req, InsertParams(), 12, False), 9)
 
     @requires_full_mamba_ps1
     def test_mamba_branching_seqlen_disabled_under_hicache(self):

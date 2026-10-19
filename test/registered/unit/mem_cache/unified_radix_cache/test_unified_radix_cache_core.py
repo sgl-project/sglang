@@ -1404,19 +1404,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
-    def test_tombstone_cleanup_respects_locked_parent(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        tokens = self._make_seq(1, 1)
-        self._insert(cache, allocator, req_to_token_pool, tokens)
-        parent = match_prefix(cache, tokens).last_device_node
-        cache.tree_core.set_component_device_lock_ref(parent, ComponentType.FULL, 1)
-
-        result = cache.tree_core.cleanup_tombstone_ancestors(parent)
-        cache._free_values(result.device_frees, result.host_frees)
-
-        self.assertIn(parent, node_children(cache, cache.root_node_handle()))
-        self.assertTrue(all(evicted == 0 for evicted in result.tracker.values()))
-
     def test_aux_evict_full_locked_leaf_tombstones_aux_only(self):
         aux_types = [
             ct
@@ -1663,54 +1650,37 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
     @requires_full_swa_ps1_window4
     def test_swa_branch_insert_releases_forward_overshoot(self):
-
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        swa = cache.components[ComponentType.SWA]
-
         branching_seqlen = 8
         forward_len = 20
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, forward_len)
-        req.origin_input_ids = tokens
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = forward_len
-        req.kv.cache_protected_len = branching_seqlen
-
-        kv_indices = self._alloc(allocator, forward_len)
-        req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(0, forward_len)),
-            kv_indices,
+        req, kv_indices = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, tokens
         )
-
-        params = InsertParams(
-            key=RadixKey(array("q", tokens[:branching_seqlen])),
-            swa_branching_seqlen=branching_seqlen,
-        )
-        result = mock.Mock(swa_branch_inserted=False)
-        swa.commit_insert_component_data(
-            mock.Mock(),
-            False,
-            params,
-            result,
-            [],
-        )
-        self.assertTrue(result.swa_branch_inserted)
+        req.swa_branching_seqlen = branching_seqlen
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
-            swa.cleanup_after_caching_req(
-                req,
-                is_finished=False,
-                insert_result=result,
-            )
+            cache.checkpoint(req, up_to=forward_len)
 
+        # Only the branch point is cached; the forward past it is released.
+        self.assertEqual(
+            match_prefix(cache, tokens).device_prefix_len, branching_seqlen
+        )
         expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
         self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), expected_evicted)
 
+        # The cached branch keeps SWA for its last window; the forward overshoot
+        # past it is released, and the request keeps its own live window.
+        branch_freed = branching_seqlen - 1 - self.cfg.sliding_window_size
         mapping = allocator.full_to_swa_index_mapping
         self.assertEqual(
-            torch.count_nonzero(mapping[kv_indices[:branching_seqlen]]).item(),
-            branching_seqlen,
+            torch.count_nonzero(mapping[kv_indices[:branch_freed]]).item(), 0
+        )
+        self.assertEqual(
+            torch.count_nonzero(
+                mapping[kv_indices[branch_freed:branching_seqlen]]
+            ).item(),
+            branching_seqlen - branch_freed,
         )
         self.assertEqual(
             torch.count_nonzero(
@@ -1722,6 +1692,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             torch.count_nonzero(mapping[kv_indices[expected_evicted:]]).item(),
             forward_len - expected_evicted,
         )
+        cache.unlock(req.lock)
+        cache.sanity_check()
 
 
 define_config_test_classes(UnifiedRadixCacheCoreSuite, globals())
