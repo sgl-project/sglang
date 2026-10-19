@@ -2,10 +2,13 @@
 
 from collections.abc import Iterable
 
+from sglang.srt.lora.utils import RoutedExpertLoRATargets
 from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 
 
-class Step5ForConditionalGeneration(Step3p7ForConditionalGeneration):
+class Step5ForConditionalGeneration(
+    Step3p7ForConditionalGeneration, RoutedExpertLoRATargets
+):
     """Open-source Step5 VL checkpoint (model_type "step5_vl").
 
     Same backbone and perception-encoder vision tower as Step3.7: reuses its

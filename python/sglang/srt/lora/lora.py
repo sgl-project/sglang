@@ -147,6 +147,14 @@ class LoRAAdapter(nn.Module):
             return False
         return self._moe_is_gated_by_layer.get(layer_id) is False
 
+    def routed_expert_weight_names(self) -> list[str]:
+        return sorted(
+            name
+            for layer in self.layers
+            for name in layer.weights
+            if _ROUTED_EXPERT_PATTERN.search(name)
+        )
+
     def initialize_weights(self):
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)

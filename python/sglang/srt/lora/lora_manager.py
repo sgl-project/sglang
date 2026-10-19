@@ -142,6 +142,9 @@ class LoRAManager:
                 f"LoRA backend {lora_backend!r} does not support DP attention"
             )
 
+        # Decided by init_lora_shapes; None while the startup adapters load.
+        self.adapts_routed_experts: Optional[bool] = None
+
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
             max_lora_rank=max_lora_rank,
@@ -726,6 +729,10 @@ class LoRAManager:
             base_model=self.base_model,
             target_modules=self.target_modules,
         )
+        for lora_id, lora_adapter in self.loras.items():
+            self._reject_unserved_routed_expert_weights(
+                lora_name=self.lora_refs[lora_id].lora_name, lora_adapter=lora_adapter
+            )
 
         if self._experts_shared_outer_override is not None:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
@@ -956,6 +963,9 @@ class LoRAManager:
             base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
+        self._reject_unserved_routed_expert_weights(
+            lora_name=lora_ref.lora_name, lora_adapter=lora_adapter
+        )
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,
@@ -964,6 +974,20 @@ class LoRAManager:
         )
 
         self.loras[lora_ref.lora_id] = lora_adapter
+
+    def _reject_unserved_routed_expert_weights(
+        self, *, lora_name: str, lora_adapter: LoRAAdapter
+    ) -> None:
+        # Without routed-expert buffers, these weights would load nowhere and never apply.
+        if self.adapts_routed_experts is not False:
+            return
+        names = lora_adapter.routed_expert_weight_names()
+        if names:
+            raise ValueError(
+                f"LoRA adapter {lora_name!r} has {len(names)} routed-expert weights "
+                f"(e.g. {names[0]}), but the routed experts take no LoRA in this "
+                "server; restart with a routed-expert target in --lora-target-modules."
+            )
 
     def load_lora_weights_from_tensors(
         self, lora_ref: LoRARef, tensors: Dict[str, torch.Tensor]
@@ -990,6 +1014,9 @@ class LoRAManager:
             keep_weights_on_device=self.lora_no_cpu_backup,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
+        self._reject_unserved_routed_expert_weights(
+            lora_name=lora_ref.lora_name, lora_adapter=lora_adapter
+        )
 
         warn_if_adapter_targets_embeddings(
             lora_name=lora_ref.lora_name,

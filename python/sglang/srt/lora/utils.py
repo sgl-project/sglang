@@ -153,17 +153,24 @@ def get_hidden_dim(
         )
 
 
-def lora_adapts_routed_experts(
-    model: torch.nn.Module, target_modules: Iterable[str]
-) -> bool:
-    """Whether the routed experts take LoRA, from the unnormalized target modules.
+class RoutedExpertLoRATargets:
+    """A model that decides from the full target names whether its routed experts take LoRA.
 
     gate_up_proj/down_proj normally adapt the routed experts together with the
     dense and shared-expert MLPs. A model whose leaf names cannot tell them apart
-    (Step5) decides from the full target names; when it says no, its FusedMoE
-    stays unwrapped and gets no expert buffers.
+    (Step5) implements this; when it says no, its FusedMoE stays unwrapped and
+    gets no expert buffers.
     """
-    if not hasattr(model, "lora_targets_routed_experts"):
+
+    def lora_targets_routed_experts(self, target_modules: Iterable[str]) -> bool:
+        raise NotImplementedError
+
+
+def lora_adapts_routed_experts(
+    model: torch.nn.Module, target_modules: Iterable[str]
+) -> bool:
+    """Whether the routed experts take LoRA, from the unnormalized target modules."""
+    if not isinstance(model, RoutedExpertLoRATargets):
         return True
     return model.lora_targets_routed_experts(target_modules)
 

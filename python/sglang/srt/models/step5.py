@@ -95,6 +95,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.utils import RoutedExpertLoRATargets
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -1526,7 +1527,7 @@ class Step5Model(nn.Module):
         return normalized, hidden_states.float()
 
 
-class Step5ForCausalLM(nn.Module):
+class Step5ForCausalLM(nn.Module, RoutedExpertLoRATargets):
     kv_cache_dtype_full_attention_only = True
 
     @classmethod
@@ -1619,9 +1620,10 @@ class Step5ForCausalLM(nn.Module):
 
     def lora_targets_routed_experts(self, target_modules: Iterable[str]) -> bool:
         """gate_up_proj/down_proj also name the dense MLPs and the shared expert, so
-        only a target under moe.experts, or all linear layers, adapts the routed experts."""
+        only a target under the routed experts (an `experts` path component, as in
+        `moe.experts.gate_proj` or `experts.down_proj`), or all linear layers, adapts them."""
         adapts = any(
-            target in ("all", "all-linear") or ".moe.experts." in f".{target}"
+            target in ("all", "all-linear") or "experts" in target.split(".")
             for target in target_modules
         )
         if adapts:

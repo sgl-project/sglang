@@ -15,6 +15,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.lora.lora import LoRAAdapter
+from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import lora_adapts_routed_experts
 from sglang.srt.models import step5 as step5_module
@@ -127,6 +128,20 @@ class TestStep5RoutedExpertDecision(unittest.TestCase):
             ):
                 self.assertTrue(lora_adapts_routed_experts(_step5(), targets))
 
+    def test_expert_targets_without_the_moe_prefix_adapt_them(self):
+        """`experts.<proj>` targets the same LoRA modules as `moe.experts.<proj>`;
+        it must not leave the routed experts silently frozen."""
+        with _runner("triton"):
+            self.assertTrue(
+                lora_adapts_routed_experts(
+                    _step5(),
+                    [
+                        f"experts.{leaf}"
+                        for leaf in ("gate_proj", "up_proj", "down_proj")
+                    ],
+                )
+            )
+
     def test_paths_bypassing_the_lora_hooks_are_refused(self):
         cases = (
             ("triton", dict(mega=True), "MegaMoE"),
@@ -147,6 +162,39 @@ class TestStep5RoutedExpertDecision(unittest.TestCase):
 
     def test_other_models_keep_routed_expert_lora(self):
         self.assertTrue(lora_adapts_routed_experts(torch.nn.Module(), ["gate_proj"]))
+
+
+class TestStep5AdapterWithoutRoutedExpertLoRA(unittest.TestCase):
+    def test_routed_expert_weights_are_refused(self):
+        """When startup left the routed experts without LoRA, a later adapter that
+        carries routed-expert weights is refused instead of loading weights that
+        never apply; shared-expert weights still load."""
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.adapts_routed_experts = False
+        manager.base_model = None
+        manager.base_hf_config = SimpleNamespace(num_hidden_layers=2)
+        manager.load_config = None
+        manager.lora_backend = None
+        manager.lora_no_cpu_backup = False
+        manager.speculative_algorithm = None
+        config = SimpleNamespace(
+            target_modules=["share_expert.down_proj", "experts.down_proj"],
+            hf_config={"peft_type": "lora"},
+            lora_alpha=4,
+            r=2,
+        )
+        ref = SimpleNamespace(lora_id="late", lora_name="late")
+        prefix = "base_model.model.model.layers.1."
+        shared = {
+            f"{prefix}share_expert.down_proj.lora_A.weight": torch.zeros(2, 3),
+        }
+        routed = {
+            f"{prefix}moe.experts.down_proj.lora_A.weight": torch.zeros(1, 2, 3),
+        }
+
+        with self.assertRaisesRegex(ValueError, "1 routed-expert weights"):
+            manager._create_lora_adapter_from_tensors(ref, config, shared | routed)
+        manager._create_lora_adapter_from_tensors(ref, config, shared)
 
 
 class TestStep5ExpertPool(unittest.TestCase):
