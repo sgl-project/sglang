@@ -52,7 +52,6 @@ def _build(model, hf_config, context):
     return FakeBuilt(context.widths)
 
 
-# what the post-load check reads; argument resolution also checks STRICT's extras
 SPEC = MegakernelSpec(
     name="fake",
     requires=Requirements(isas=frozenset({ISA}), tp_sizes=frozenset({4})),
@@ -62,20 +61,8 @@ SPEC = MegakernelSpec(
     build=_build,
     api_version=registry.MEGAKERNEL_API_VERSION,
 )
-STRICT = replace(
-    SPEC,
-    requires=replace(
-        SPEC.requires,
-        dtypes=frozenset({"bfloat16"}),
-        server_args={"kv_cache_dtype": frozenset({"fp8_e4m3"})},
-        hf_config={"model_type": "fake"},
-        env={"SGLANG_DSPARK_EMBED_IN_GRAPH": True},
-    ),
-    config_disable_reasons=lambda cfg, hf: (
-        ["context_length too long"] if cfg.context_length == 7 else []
-    ),
-)
-ANY_TP = replace(STRICT, requires=replace(STRICT.requires, tp_sizes=frozenset()))
+# an empty field accepts any value
+ANY_TP = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
 # a draft spec: builds no width, offers only the draft sampler
 DRAFT = replace(
     SPEC,

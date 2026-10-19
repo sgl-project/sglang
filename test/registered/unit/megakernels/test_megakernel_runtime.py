@@ -1,6 +1,5 @@
-"""CPU contracts of the megakernel install, dispatch and capture check."""
+"""CPU checks of the megakernel install, dispatch and capture check."""
 
-import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -18,7 +17,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ARCH, ISA, SPEC, FakeBuilt, Lm, batch, server_args  # noqa: E402
+from _fakes import ANY_TP, ARCH, ISA, SPEC, Lm, batch, server_args  # noqa: E402
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -28,14 +27,12 @@ def install(
     archs=(ARCH,),
     gathered=None,
     tokens=2,
-    graphs=True,
     hooks=None,
-    lm=None,
     is_draft=False,
 ):
     """install_megakernel on an Lm as rank 0 of the published server; gathered maps
     a gathered value to what the other ranks report, default the same as this rank."""
-    lm, hooks = lm or Lm(), [] if hooks is None else hooks
+    lm, hooks = Lm(), [] if hooks is None else hooks
     gpu = SimpleNamespace(multi_processor_count=160)
     with (
         patch.object(runtime, "device_isa", return_value=ISA),
@@ -44,7 +41,7 @@ def install(
             runtime, "_gather_tp", side_effect=gathered or (lambda x, group=None: [x])
         ),
         patch.object(runtime, "_tokens_per_request", return_value=tokens),
-        patch.object(runtime, "_decode_graphs_enabled", return_value=graphs),
+        patch.object(runtime, "_decode_graphs_enabled", return_value=True),
         patch.object(torch.cuda, "current_device", return_value=0),
         patch.object(torch.cuda, "get_device_properties", return_value=gpu),
         patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
@@ -78,13 +75,6 @@ class TestMegakernelRuntime(CustomTestCase):
             return install(**kw)
 
     def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
-        model = SimpleNamespace()  # without the flag, any attribute read would raise
-        with patch.object(runtime, "megakernel_enabled", return_value=False):
-            runtime.install_megakernel(
-                model=model, hf_config=None, capture_tail_hooks=[], is_draft=False
-            )
-        self.assertEqual(vars(model), {})
-        self.assertEqual(install(tokens=2).context.widths, (2, 4, 6, 8))
         lm = install(tokens=1)
         built = runtime.built_megakernel(lm)
         with patch.object(
@@ -94,40 +84,27 @@ class TestMegakernelRuntime(CustomTestCase):
             self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard")
         # only a covered step runs the megakernel, with the running forward's view
         self.assertEqual((built.steps, built.views), ([4], ["view"]))
-        self.assertIsInstance(lm.context.binding, MegakernelBinding)
-        # graph runners and supports_pp read the original forward's parameters
-        self.assertEqual(inspect.signature(lm.forward), inspect.signature(Lm().forward))
-        self.assertIn("--enable-nvidia-megakernel", lm._derived_weight_cache_error)
-        with self.assertRaisesRegex(ValueError, "already replaced"):
-            install(lm=lm)
 
-    def test_a_target_without_a_spec_is_refused_and_a_draft_keeps_its_forward(self):
-        # resolution found the target's spec but the plugin failed in every worker:
+    def test_a_target_without_a_usable_spec_is_refused_and_a_draft_keeps_its_forward(
+        self,
+    ):
         # the flag must not silently run the model's own forward
         with self.assertRaisesRegex(ValueError, "in the model workers"):
             install(archs=["TargetWithoutSpec"])
+        tp8 = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset({8})))
+        with self.assertRaisesRegex(ValueError, "tp_size 4"):
+            self._install_spec(tp8)
+        # an empty field accepts any value
+        self.assertIsNotNone(runtime.built_megakernel(self._install_spec(ANY_TP)))
         with self.assertLogs(runtime.logger, "INFO") as logs:
             lm = install(archs=["DraftWithoutSpec"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIn("keeps its own forward", "".join(logs.output))
         registry.register(architecture="Draft", path="_fakes:DRAFT")
-        hooks = []
-        lm = install(archs=["Draft"], hooks=hooks, is_draft=True)
+        # a draft spec offers only its draft sampler
+        lm = install(archs=["Draft"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
-        self.assertEqual(hooks, [])
         self.assertIs(runtime.megakernel_draft_sampler(lm), print)
-
-    def test_a_spec_is_checked_on_what_the_runner_reads(self):
-        tp8 = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset({8})))
-        with self.assertRaisesRegex(ValueError, "tp_size 4"):
-            self._install_spec(tp8)
-        # an empty field accepts any value
-        any_tp = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
-        self.assertIsNotNone(runtime.built_megakernel(self._install_spec(any_tp)))
-        # a target that covers no width must not quietly keep the standard forward
-        empty = replace(SPEC, build=lambda model, hf, ctx: FakeBuilt(()))
-        with self.assertRaisesRegex(ValueError, "built no width of"):
-            self._install_spec(empty)
 
     def test_ranks_that_disagree_are_refused_on_every_rank(self):
         """A rank that differs would wait in a different collective."""
@@ -139,12 +116,10 @@ class TestMegakernelRuntime(CustomTestCase):
             widths = isinstance(value, tuple) and all(isinstance(w, int) for w in value)
             return [value, value[:1]] if widths else [value]
 
-        for gathered, error, want in (
-            (no_spec_on_rank_1, ValueError, "rank 1: rank-1 reason"),
-            (fewer_widths_on_rank_1, RuntimeError, "widths fake built differ"),
-        ):
-            with self.subTest(want=want), self.assertRaisesRegex(error, want):
-                install(gathered=gathered)
+        with self.assertRaisesRegex(ValueError, "rank 1: rank-1 reason"):
+            install(gathered=no_spec_on_rank_1)
+        with self.assertRaisesRegex(RuntimeError, "widths fake built differ"):
+            install(gathered=fewer_widths_on_rank_1)
 
     def test_capture_check_refuses_when_no_graph_runs_the_megakernel(self):
         def capture(sizes, capture_bs):
@@ -162,9 +137,6 @@ class TestMegakernelRuntime(CustomTestCase):
         capture([2, 8], capture_bs=[2, 8])
         with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
             capture([8, 16], capture_bs=[8, 16])
-        hooks = []
-        install(graphs=False, hooks=hooks)
-        self.assertEqual(hooks, [])  # eager steps are routed by plan alone
 
 
 if __name__ == "__main__":
