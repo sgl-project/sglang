@@ -164,7 +164,7 @@ class TestRmsnormWithSinkhorn(CustomTestCase):
             hc_boundary_fused_deferred,
             rmsnorm_with_sinkhorn,
         )
-        from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+        from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
             rmsnorm_fake_quant_fp8,
         )
 

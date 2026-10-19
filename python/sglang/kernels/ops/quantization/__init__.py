@@ -109,6 +109,8 @@ _TRITON_KERNELS = [
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
     ("awq_triton", "awq_dequantize_triton"),
+    ("rocm_upscale", "upscale"),
+    ("rocm_upscale", "upscale_mxfp4"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
     ("mxfp8_swizzled_triton", "swiglu_oai_mxfp8"),
     ("mxfp8_swizzled_triton", "swiglu_oai_mxfp8_deepgemm"),
