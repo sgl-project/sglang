@@ -68,6 +68,14 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="communication.muse_spark_all_reduce_norm_residual",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual:all_reduce_norm_residual",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
 for _bk in ("torch", "cute_dsl", "helion"):
     register_kernel(
         KernelSpec(

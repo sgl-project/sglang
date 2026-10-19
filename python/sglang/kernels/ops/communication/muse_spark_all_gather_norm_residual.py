@@ -39,6 +39,8 @@ def _jit_module(
     post_norm_is_input_scale: bool,
     has_post_weight: bool,
     has_gate: bool,
+    reduce: bool = False,
+    has_router: bool = False,
 ) -> Module:
     cluster_size, num_threads, prefetch_weights = config
     args = make_cpp_args(
@@ -51,6 +53,8 @@ def _jit_module(
         prefetch_weights,
         has_post_weight,
         has_gate,
+        reduce,
+        has_router,
     )
     return load_jit(
         "muse_spark_all_gather_norm_residual",
@@ -126,6 +130,7 @@ def all_gather_norm_residual(
         stream,
         output,
         new_stream,
+        None,
         post_weight,
         pre_weight,
         alpha,
@@ -134,3 +139,52 @@ def all_gather_norm_residual(
         pre_eps,
     )
     return output, new_stream
+
+
+def all_reduce_norm_residual(
+    comm: CustomAllReduceV2,
+    partial: torch.Tensor,
+    stream: torch.Tensor,
+    post_eps: float,
+    pre_eps: float,
+    *,
+    want_router: bool = False,
+    post_norm_is_input_scale: bool = False,
+    post_weight: Optional[torch.Tensor] = None,
+    pre_weight: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
+    beta: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    num_tokens, hidden_size = stream.shape
+    config = norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)
+    output = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=stream.device
+    )
+    new_stream = torch.empty_like(stream)
+    router_out = torch.empty_like(stream) if want_router else None
+
+    module = _jit_module(
+        hidden_size,
+        comm.world_size,
+        config,
+        post_norm_is_input_scale,
+        post_weight is not None,
+        alpha is not None,
+        reduce=True,
+        has_router=want_router,
+    )
+    module.run(
+        comm.obj,
+        partial.contiguous(),
+        stream,
+        output,
+        new_stream,
+        router_out,
+        post_weight,
+        pre_weight,
+        alpha,
+        beta,
+        post_eps,
+        pre_eps,
+    )
+    return output, new_stream, router_out
