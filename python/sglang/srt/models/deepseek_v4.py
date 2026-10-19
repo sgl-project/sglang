@@ -1129,12 +1129,18 @@ class MqaAttentionBase(nn.Module):
         sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
             sink = self.attn_sink.new_zeros(sink_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
-            self._attn_sink_local = sink
             self._attn_sink_local_slice = slice(
                 rank * num_heads, (rank + 1) * num_heads
             )
+            sink[:num_heads] = self.attn_sink[self._attn_sink_local_slice]
+            self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
+
+    def refresh_attn_sink_cache(self) -> None:
+        if self._attn_sink_local is None:
+            return
+        src = self.attn_sink.data[self._attn_sink_local_slice]
+        self._attn_sink_local[: src.numel()].copy_(src)
 
     def _q_lora_quant_e8m0(self, with_indexer: bool) -> bool:
         """Whether the fused q_norm quant feeds wq_b (and the indexer's wq_b, which
@@ -1151,12 +1157,6 @@ class MqaAttentionBase(nn.Module):
             )
             self.__dict__[key] = cached
         return cached
-
-    def refresh_attn_sink_cache(self) -> None:
-        if self._attn_sink_local is None:
-            return
-        src = self.attn_sink.data[self._attn_sink_local_slice]
-        self._attn_sink_local[: src.numel()].copy_(src)
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
