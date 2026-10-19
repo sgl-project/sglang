@@ -238,15 +238,19 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
     cfg = resolving_view(server_args)
     if not cfg.enable_encoder_swa_bounded_replay:
         return
+    # A hit's first chunk also runs up to 128 replay rows and floors its extend to
+    # whole pages, so a smaller chunk leaves the hit no page and it never admits.
+    min_chunk = 128 + (cfg.page_size or 1)
     if (
         cfg.max_running_requests is None
         or cfg.max_running_requests <= 0
         or not cfg.chunked_prefill_size
-        or cfg.chunked_prefill_size < 128
+        or cfg.chunked_prefill_size < min_chunk
     ):
         raise ValueError(
             "encoder SWA replay requires --max-running-requests > 0 and at least "
-            "128 chunked prefill tokens per attention DP rank"
+            f"{min_chunk} chunked prefill tokens per attention DP rank (128 replay "
+            "tokens plus one page)"
         )
 
 
@@ -281,13 +285,29 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 ),
             ),
             (
-                "prefill CUDA graphs",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            # ROCm replays hits in a forward of their own, outside the graph.
+            (
+                "the prefill CUDA graph on ROCm",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and get_platform().is_hip,
             ),
             ("context parallelism", cfg.attn_cp_size > 1),
+            # ROCm replays hits in a forward of their own, which only the hitting
+            # attention-DP ranks would enter; CUDA folds them into the extend.
+            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
-            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            # Decode receives the last SWA window from prefill and never replays.
+            ("PD decode", cfg.disaggregation_mode == "decode"),
+            # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
+            (
+                "PD prefill on ROCm",
+                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
+            ),
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),
             ("radix sessions", cfg.enable_session_radix_cache),
@@ -409,8 +429,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
 
     enabled = (
         (get_platform().is_cuda or get_platform().is_hip)
-        and cfg.disaggregation_mode == "null"
+        # Both PD roles run it on CUDA; PD on ROCm has not been run with it.
+        and (cfg.disaggregation_mode == "null" or get_platform().is_cuda)
         and not (cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1)
+        # Returning every hidden state runs every prompt row: nothing to trim.
+        and not cfg.enable_return_hidden_states
         and not any(enabled for _, enabled in incompatible)
     )
     declare_resolution(

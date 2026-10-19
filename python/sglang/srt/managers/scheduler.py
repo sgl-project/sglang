@@ -590,6 +590,11 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
+            draft_swa_window=(
+                self.draft_worker.draft_swa_window
+                if self.draft_worker is not None
+                else 0
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -607,6 +612,9 @@ class Scheduler(
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
                 cache_controller.load_fence_stream = (
+                    self.tp_worker.model_runner.forward_stream
+                )
+                cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
                 if self.enable_unified_memory:
@@ -3906,7 +3914,6 @@ class Scheduler(
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.

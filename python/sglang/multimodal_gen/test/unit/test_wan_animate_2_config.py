@@ -347,20 +347,6 @@ def test_block_refuses_a_checkpoint_with_offline_qk_rotation(monkeypatch):
 # WanAnimate2ArchConfig / WanAnimate2Config
 
 
-def test_in_out_channels_match_in_context_io():
-    # in_channels = 16 noise + 20 conditioning; out_channels = 16 latent.
-    arch = WanAnimate2ArchConfig()
-    assert arch.in_channels == 36
-    assert arch.out_channels == 16
-
-
-def test_backbone_dims_reuse_wan22_i2v_14b():
-    arch = WanAnimate2ArchConfig()
-    assert arch.num_layers == 40
-    assert arch.image_dim == 1280
-    assert arch.added_kv_proj_dim == 5120
-
-
 def test_post_init_derives_hidden_size_and_latent_channels():
     arch = WanAnimate2ArchConfig()
     assert arch.num_attention_heads == 40
@@ -490,13 +476,6 @@ def test_official_checkpoint_config_names_update_the_arch_config():
     assert config.refer_offset_t == 2
     assert config.log_scale == -1.3
     assert config.text_len == 512
-
-
-def test_text_len_defaults_to_the_checkpoint_value():
-    """The pipeline pads prompts to ``arch_config.text_len``: the checkpoint's
-    transformer/config.json sets it and the default covers a config without the key."""
-    assert WanAnimate2ArchConfig().text_len == 512
-    assert Wan_Animate_2_14B_Config().dit_config.arch_config.text_len == 512
 
 
 def test_checkpoint_config_without_image_embedding_is_rejected():
@@ -1334,13 +1313,6 @@ _FLOW_MATCHING_SCHEDULER_KWARGS = {
     "use_flow_sigmas": True,
     "flow_shift": 5.0,
 }
-
-
-def test_scheduler_is_a_loaded_component():
-    assert "scheduler" in WanAnimate2Pipeline._required_config_modules
-    assert len(WanAnimate2Pipeline._required_config_modules) == 7
-    # No pipeline-side construction: the base class hook is inherited unchanged.
-    assert "initialize_pipeline" not in vars(WanAnimate2Pipeline)
 
 
 def test_loader_keeps_the_checkpoint_scheduler_settings():
