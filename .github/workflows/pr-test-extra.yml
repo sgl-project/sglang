@@ -101,7 +101,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') &&
+      (needs.call-gate.result == 'skipped' || (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true')) &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
@@ -121,7 +121,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true')
+      (needs.call-gate.result == 'skipped' || (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true'))
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04
@@ -132,7 +132,7 @@ jobs:
 
   simulator-test-cpu:
     needs: [check-changes, call-gate, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'skipped' || (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true')) }}
     uses: ./.github/workflows/_pr-test-simulator-cpu.yml
     with:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
@@ -145,7 +145,7 @@ jobs:
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'skipped' || (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true')) }}
     strategy:
       fail-fast: false
       matrix:

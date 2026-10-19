@@ -152,3 +152,14 @@ test('opted-in runs still pass the strict draft, label and cooldown gate', () =>
   assert.ok(!evaluate(gate.if, { needs: { labels: { outputs: { 'should-run': 'false' } } } }));
   assert.ok(evaluate(gate.if, { needs: { labels: { outputs: { 'should-run': 'true' } } } }));
 });
+
+
+test('scheduled CUDA extra runs still build and dispatch tests with a skipped PR gate', () => {
+  const ctx = context('schedule');
+  ctx.needs['call-gate'] = { result: 'skipped', outputs: {} };
+  ctx.needs['check-changes'] = { result: 'success', outputs: amdFlags(ctx) };
+  const jobs = workflow('pr-test-extra.yml').jobs;
+  for (const name of ['sgl-kernel-build-wheels', 'rust-ext-build', 'simulator-test-cpu', 'extra-test']) {
+    assert.ok(evaluate(jobs[name].if, ctx), `${name} must still run on schedule`);
+  }
+});
