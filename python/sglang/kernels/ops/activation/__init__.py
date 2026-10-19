@@ -154,3 +154,15 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# MXFP8-quantizing SwiGLU-OAI producers; registered for inventory.
+for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:{_fn}",
+        )
+    )
+del _fn

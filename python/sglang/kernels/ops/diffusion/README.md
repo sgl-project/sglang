@@ -206,7 +206,8 @@ tensor copy at each residual site.
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
-Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` and re-exported here.
+Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` (`silu_mul_mxfp8` in
+`sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`) and re-exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
