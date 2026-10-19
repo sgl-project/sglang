@@ -303,24 +303,27 @@ def test_invalid_npu_dwdp_args(kwargs, message):
         handle_dwdp(args)
 
 
-def test_npu_dwdp_resolution():
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+@pytest.mark.parametrize("shared_tp1", [False, True])
+@pytest.mark.parametrize("disable_fusion", [False, True])
+def test_dwdp_preserves_shared_expert_settings(device, shared_tp1, disable_fusion):
     from sglang.srt.arg_groups.overrides import resolving_view
     from sglang.srt.arg_groups.parallel_hook import handle_dwdp
     from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
-    with envs.SGLANG_SHARED_EXPERT_TP1.override(False):
+    with envs.SGLANG_SHARED_EXPERT_TP1.override(shared_tp1):
         args = ServerArgs(
             model_path="dummy",
-            device="npu",
+            device=device,
             tp_size=2,
             dwdp_size=2,
-            quantization="modelslim",
+            disable_shared_experts_fusion=disable_fusion,
         )
         handle_dwdp(args)
         cfg = resolving_view(args)
-        assert envs.SGLANG_SHARED_EXPERT_TP1.get()
-        assert cfg.disable_shared_experts_fusion
+        assert envs.SGLANG_SHARED_EXPERT_TP1.get() == shared_tp1
+        assert cfg.disable_shared_experts_fusion == disable_fusion
         assert cfg.attn_dp_size == cfg.ep_size == 2
         assert cfg.dp_size == 1
         assert cfg.moe_dense_tp_size == 1
@@ -358,9 +361,9 @@ def test_npu_dwdp_full_resolution(tmp_path):
         )
         args.resolve_once()
         cfg = resolved_view(args)
-        assert envs.SGLANG_SHARED_EXPERT_TP1.get()
+        assert not envs.SGLANG_SHARED_EXPERT_TP1.get()
         assert cfg.attn_dp_size == cfg.ep_size == 2
         assert cfg.dp_size == 1
-        assert cfg.disable_shared_experts_fusion
+        assert not cfg.disable_shared_experts_fusion
         assert cfg.cuda_graph_config.prefill.backend == "disabled"
         assert cfg.cuda_graph_config.decode.backend == "disabled"

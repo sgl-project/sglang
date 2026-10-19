@@ -101,8 +101,6 @@ class NPUDwdpManager(DwdpPrefetch):
         if len({li for li, _ in layers}) != len(layers):
             raise ValueError("NPU DWDP requires unique MoE layer IDs")
         for li, layer in layers:
-            if layer.num_fused_shared_experts:
-                raise ValueError("NPU DWDP requires --disable-shared-experts-fusion")
             if layer.moe_ep_size != self.dwdp_size or layer.moe_tp_size != 1:
                 raise ValueError("NPU DWDP requires EP=DWDP=TP and MoE TP=1")
             if layer.num_global_routed_experts % self.dwdp_size:
