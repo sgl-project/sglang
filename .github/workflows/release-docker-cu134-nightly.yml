@@ -4,11 +4,16 @@ name: Release Docker Images Nightly (CUDA 13.4 Rubin)
 # docker/Dockerfile.cu134, aarch64 only:
 #   - lmsysorg/sglang:nightly-cu134-{date}-{sha}
 #   - lmsysorg/sglang:nightly-cu134
+# With the `tag` input set, only lmsysorg/sglang:dev-{tag} is published.
 #
 
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: "Custom tag suffix, e.g. 'my-test' -> dev-my-test. When set, the nightly-cu134 tags are not pushed."
+        required: false
+        default: ""
       image_repo:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
@@ -57,8 +62,14 @@ jobs:
           commit_hash="$(git rev-parse --short=7 HEAD)"
           image_repo="${{ inputs.image_repo || 'lmsysorg/sglang' }}"
           echo "image_repo=${image_repo}"                                  >> "$GITHUB_OUTPUT"
-          echo "tag=nightly-cu134-${date_tag}-${commit_hash}"              >> "$GITHUB_OUTPUT"
-          echo "tag_rolling=nightly-cu134"                                 >> "$GITHUB_OUTPUT"
+          if [ -n "${{ inputs.tag }}" ]; then
+            # Custom builds publish one tag and leave the rolling nightly tag alone.
+            echo "tag=dev-${{ inputs.tag }}"                               >> "$GITHUB_OUTPUT"
+            echo "tag_rolling=dev-${{ inputs.tag }}"                       >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=nightly-cu134-${date_tag}-${commit_hash}"            >> "$GITHUB_OUTPUT"
+            echo "tag_rolling=nightly-cu134"                               >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Login to Docker Hub
         if: github.event_name == 'schedule' || !inputs.build_only
@@ -78,6 +89,9 @@ jobs:
             --build-arg BRANCH_TYPE=local \
             --build-arg BUILD_TYPE=all \
             --build-arg BUILD_JOBS="$(nproc)" \
+            --build-arg SGLANG_BUILD_COMMIT="$(git rev-parse HEAD)" \
+            --build-arg SGLANG_BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --build-arg SGLANG_IMAGE_TAG="${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
             -f docker/Dockerfile.cu134 \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" \
