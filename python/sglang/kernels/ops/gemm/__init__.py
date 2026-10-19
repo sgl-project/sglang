@@ -609,7 +609,7 @@ register_kernel(
     KernelSpec(
         op="gemm.fp8_block32_sm90",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.fp8_block32_sm90:fp8_block32_gemm_m1",
+        target="sglang.kernels.ops.gemm.fp8_block32_sm90:fp8_block32_gemm",
         capabilities=_SM90,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),

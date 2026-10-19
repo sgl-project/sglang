@@ -24,14 +24,14 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_fp8_block32_sm90_m1_module() -> Module:
+def _jit_fp8_block32_sm90_module() -> Module:
     if torch.cuda.get_device_capability()[0] != 9:
-        raise RuntimeError("fp8_block32_sm90_m1 requires an SM90 GPU")
+        raise RuntimeError("fp8_block32_sm90 requires an SM90 GPU")
     return load_jit(
-        "fp8_block32_sm90_m1",
-        cuda_files=["gemm/fp8_block32_sm90_m1.cuh"],
+        "fp8_block32_sm90",
+        cuda_files=["gemm/fp8_block32_sm90.cuh"],
         cuda_wrappers=[
-            ("run", "fp8_block32_sm90_m1"),
+            ("run", "fp8_block32_sm90"),
             ("run_large", "fp8_block32_sm90_large"),
         ],
         extra_cuda_cflags=[
@@ -124,12 +124,12 @@ def fp8_block32_gemm_large(
     m, _k = act.shape
     n = weight.shape[0]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=act.device)
-    module = _jit_fp8_block32_sm90_m1_module()
+    module = _jit_fp8_block32_sm90_module()
     module.run_large(act, weight, act_scale, weight_scale, out)
     return out
 
 
-def fp8_block32_gemm_m1(
+def fp8_block32_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
     act_scale: torch.Tensor,
@@ -163,12 +163,12 @@ def fp8_block32_gemm_m1(
         if split_k > 1
         else torch.empty(0, dtype=torch.float32, device=act.device)
     )
-    module = _jit_fp8_block32_sm90_m1_module()
+    module = _jit_fp8_block32_sm90_module()
     module.run(act, weight, act_scale, weight_scale, partial, out, split_k)
     return out
 
 
-def use_fp8_block32_gemm_m1(
+def use_fp8_block32_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
     act_scale: torch.Tensor,
