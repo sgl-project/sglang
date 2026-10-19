@@ -226,10 +226,6 @@ class Spec(msgspec.Struct):
         Optional[bool],
         Arg(no_cli=True),
     ] = None
-    speculative_skip_dp_mlp_sync: A[
-        bool,
-        "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
-    ] = False
     enable_multi_layer_eagle: A[
         bool,
         Arg(
