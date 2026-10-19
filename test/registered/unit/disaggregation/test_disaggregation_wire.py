@@ -819,25 +819,30 @@ class TestPollCollectives(CustomTestCase):
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
+        # Under CP-TP group sharing each CP rank owns its own linear-attention
+        # head shard, so no rank skips its state.
         cases = [
-            (1, 0, False, False),
-            (8, 0, False, False),
-            (8, 1, False, True),
-            (8, 7, False, True),
-            (8, 1, True, False),
+            (1, 0, False, False, False),
+            (8, 0, False, False, False),
+            (8, 1, False, False, True),
+            (8, 7, False, False, True),
+            (8, 1, True, False, False),
+            (8, 1, False, True, False),
         ]
 
-        for cp_size, cp_rank, layer_split, expected in cases:
+        for cp_size, cp_rank, layer_split, sharing, expected in cases:
             with self.subTest(
                 cp_size=cp_size,
                 cp_rank=cp_rank,
                 layer_split=layer_split,
+                sharing=sharing,
             ):
                 manager = object.__new__(CommonKVManager)
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
                 with get_context().override_server_args(
                     enable_dsa_cache_layer_split=layer_split,
+                    enable_cp_tp_group_sharing=sharing,
                 ):
                     self.assertEqual(
                         manager._should_skip_cp_replicated_state_transfer(),
@@ -1258,16 +1263,20 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
         prefill.agent = _MemcpyNixlAgent(memory)
-        handles = prefill.maybe_send_extra(
-            "decode",
-            [np.array(self.SRC_PAGES, dtype=np.int32)],
-            [dst_ptrs],
-            [self.DST_PAGES],
-            0,
-            "7_state_0",
-            decode_tp,
-            decode_tp_rank=dst_rank,
-            dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+        prefill._prepared_state_plans = {}
+        prefill._state_layout_rejections = {}
+        handles = list(
+            prefill.maybe_send_extra(
+                "decode",
+                [np.array(self.SRC_PAGES, dtype=np.int32)],
+                [dst_ptrs],
+                [self.DST_PAGES],
+                0,
+                "7_state_0",
+                decode_tp,
+                decode_tp_rank=dst_rank,
+                dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+            )
         )
         self.assertEqual(len(handles), 1)
 
@@ -1743,6 +1752,7 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
             cached_tokens_device=0,
             cached_tokens_host=0,
             cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
             multimodal_inputs=None,
             return_logprob=False,
             return_sampling_mask=sampling_mask is not None,
@@ -2300,9 +2310,10 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.swa_valid_from = swa_valid_from
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.swa_page_size = 256
@@ -2344,6 +2355,23 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 [[11], [12]],
             ),
         ]
+        mark = torch.zeros(3, dtype=torch.int64)
+        draft = _make_dsv4_draft(unified=False, mapping=mapping, swa_valid_from=mark)
+        expected_infos = draft.get_state_buf_infos()
+        kv_args = KVArgs()
+
+        setup_state_kv_args(
+            kv_args, _make_dsv4_target(unified=False, mapping=mapping), draft
+        )
+
+        # The draft's SWA valid-from follows its SWA as one item per request slot.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1], expected_infos[0])
+        self.assertEqual(kv_args.state_data_ptrs[2], [mark.data_ptr()])
+        self.assertEqual(kv_args.state_item_lens[2], [mark[0].nbytes])
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):

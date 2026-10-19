@@ -91,6 +91,9 @@ class _FakeReq:
     def finished(self):
         return self._finished
 
+    def get_mm_token_counts(self):
+        return self.mm_image_tokens, self.mm_audio_tokens, self.mm_video_tokens
+
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
 

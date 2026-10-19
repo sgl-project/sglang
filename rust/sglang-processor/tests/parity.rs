@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde_json::Value;
+use sglang_processor::dynamo_renderer::RenderedPrompt;
 use sglang_processor::dynamo_tokenizers::Tokenizer;
 use sglang_processor::{
-    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_model_file, select_chat_formatter,
+    ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_tokenizer_file,
+    select_chat_formatter,
 };
 use sha2::{Digest, Sha256};
 
@@ -83,8 +85,9 @@ fn check_case(
         };
     }
     let (prompt, prefix) = rendered.map_err(|error| error.to_string())?;
-    if prompt.clone() + &prefix != case["prompt"] {
-        return Err(format!("prompt differs: {prompt}{prefix}"));
+    let text = prompt.as_str().to_owned() + &prefix;
+    if text != case["prompt"] {
+        return Err(format!("prompt differs: {text}"));
     }
     let Some(tokenizer) = tokenizer else {
         return Ok(());
@@ -124,7 +127,7 @@ fn formatter(model: &str, fixture: &Value) -> ChatFormatter {
 
 /// The pinned tokenizer when it is in the HF cache; otherwise say token ids are skipped.
 fn cached_tokenizer(model: &str, revision: &str) -> Option<Tokenizer> {
-    let Some(file) = resolve_model_file(model, Some(revision), "tokenizer.json") else {
+    let Some(file) = resolve_tokenizer_file(model, Some(revision)) else {
         eprintln!("{model}@{revision} is not in the HF cache: token ids not checked");
         return None;
     };
@@ -132,10 +135,18 @@ fn cached_tokenizer(model: &str, revision: &str) -> Option<Tokenizer> {
 }
 
 /// `serving_chat._append_assistant_prefix_to_prompt_ids`: the continuation is
-/// encoded on its own, minus a leading BOS.
-fn encode(tokenizer: &Tokenizer, prompt: &str, prefix: &str, bos: &Value) -> Vec<u32> {
+/// encoded on its own, minus a leading BOS. Segmented prompts (Kimi K3) allow
+/// special tokens only where the checkpoint's encoder does.
+fn encode(tokenizer: &Tokenizer, prompt: &RenderedPrompt, prefix: &str, bos: &Value) -> Vec<u32> {
     let ids = |text: &str| tokenizer.encode(text).unwrap().token_ids().to_vec();
-    let mut out = ids(prompt);
+    let mut out = match prompt.encode_segments() {
+        Some(segments) => tokenizer
+            .encode_segments(&segments)
+            .unwrap()
+            .token_ids()
+            .to_vec(),
+        None => ids(prompt.as_str()),
+    };
     if !prefix.is_empty() {
         let suffix = ids(prefix);
         let skip = usize::from(suffix.first().is_some_and(|&id| *bos == id));

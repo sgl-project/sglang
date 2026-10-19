@@ -1,9 +1,9 @@
 //! GLM-4.5 through GLM-5.3 (`Glm45Detector` in `parser/reasoning_parser.py`):
 //! a `<tool_call>` anywhere also ends the reasoning.
 
-use crate::think::ThinkConfig;
+use crate::think::TagConfig;
 
-pub(super) const THINK: ThinkConfig = ThinkConfig {
+pub(super) const THINK: TagConfig = TagConfig {
     start: "<think>",
     end: "</think>",
     tool_start: Some("<tool_call>"),

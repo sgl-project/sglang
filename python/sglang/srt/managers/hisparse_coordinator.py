@@ -601,7 +601,14 @@ class HiSparseCoordinator:
                     "tensor-parallel size."
                 )
                 self.mem_pool_host = HiSparseMHATokenToKVPoolHost(
-                    device_pool=self.mem_pool_device,
+                    buffer_info=self.mem_pool_device.get_device_pool_infos()[
+                        0
+                    ].buffer_info,
+                    device_capacity_tokens=self.mem_pool_device.size
+                    if self.mem_pool_device.host_capacity_tokens is None
+                    else self.mem_pool_device.host_capacity_tokens,
+                    start_layer=self.mem_pool_device.start_layer,
+                    end_layer=self.mem_pool_device.end_layer,
                     host_to_device_ratio=host_to_device_ratio,
                     page_size=self.mem_pool_device.page_size,
                 )
@@ -609,7 +616,15 @@ class HiSparseCoordinator:
             else:
                 self.mem_pool_device: HiSparseDSATokenToKVPool = kvcache
                 self.mem_pool_host = MLATokenToKVPoolHost(
-                    device_pool=self.mem_pool_device,
+                    buffer_info=self.mem_pool_device.get_device_pool_infos()[
+                        0
+                    ].buffer_info,
+                    device_capacity_tokens=self.mem_pool_device.size
+                    if self.mem_pool_device.host_capacity_tokens is None
+                    else self.mem_pool_device.host_capacity_tokens,
+                    start_layer=self.mem_pool_device.start_layer,
+                    end_layer=self.mem_pool_device.end_layer,
+                    target_layer_num=self.mem_pool_device.layer_num,
                     host_to_device_ratio=host_to_device_ratio,
                     host_size=0,
                     page_size=self.mem_pool_device.page_size,
