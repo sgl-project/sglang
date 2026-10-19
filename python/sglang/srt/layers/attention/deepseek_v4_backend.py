@@ -308,9 +308,6 @@ def _low_ratio_source_projections(
         put("w", indexer.head_weights(x[:real]))
 
 
-_bcg_prefill_flat_indexer_fn = None
-
-
 def _prefill_graph_flat_indexer(layer, x, q_lora, pos):
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     return get_attn_backend()._prefill_graph_flat_indexer_break(
@@ -318,27 +315,8 @@ def _prefill_graph_flat_indexer(layer, x, q_lora, pos):
     )
 
 
-def _bcg_prefill_flat_indexer(*args):
-    global _bcg_prefill_flat_indexer_fn
-    if _bcg_prefill_flat_indexer_fn is None:
-        _bcg_prefill_flat_indexer_fn = eager_on_graph(True)(_prefill_graph_flat_indexer)
-    return _bcg_prefill_flat_indexer_fn(*args)
-
-
-def _bcg_low_ratio_source_projections(*args):
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-        eager_on_graph,
-    )
-
-    global _bcg_low_ratio_source_projections_fn
-    if _bcg_low_ratio_source_projections_fn is None:
-        _bcg_low_ratio_source_projections_fn = eager_on_graph(True)(
-            _low_ratio_source_projections
-        )
-    return _bcg_low_ratio_source_projections_fn(*args)
-
-
-_bcg_low_ratio_source_projections_fn = None
+_bcg_prefill_flat_indexer = eager_on_graph(True)(_prefill_graph_flat_indexer)
+_bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
 
 
 def _as_int_list(values) -> Optional[List[int]]:
@@ -1104,7 +1082,7 @@ class DSV4Metadata:
         self,
         static_metadata: DSV4Metadata,
         *,
-        low_ratio_index_captured: bool = True,
+        low_ratio_index_captured: bool,
     ):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
             static_metadata.core_attn_metadata
@@ -1305,6 +1283,10 @@ class DeepseekV4AttnBackend(
         self._bcg_tail_buffers: Optional[tuple] = None
         self._bcg_tail_metadata: Dict[int, DSV4Metadata] = {}
         self._bcg_tail_num_token_non_padded: Optional[torch.Tensor] = None
+        # Prefill CUDA graph buffers kept per ratio / layer; graphs captured on an
+        # older (smaller) allocation keep it alive themselves.
+        self._source_proj_bufs: Dict[int, list] = {}
+        self._candidate_table_bufs: Dict[int, list] = {}
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -3057,7 +3039,7 @@ class DeepseekV4AttnBackend(
     def _source_projection_buffers(self, num_tokens: int, ratio: int) -> dict:
         cfg = self.model_runner.model_config.hf_text_config
         heads, dim = int(cfg.index_n_heads), int(cfg.index_head_dim)
-        sets = getattr(self, "_source_proj_bufs", None) or {}
+        sets = self._source_proj_bufs
         have = sets.get(ratio)
         if have is None or have[0]["q"].shape[0] < num_tokens:
             latent = self.model_runner.model_config.head_dim
@@ -3077,7 +3059,6 @@ class DeepseekV4AttnBackend(
                 bufs["score"] = zeros(num_tokens, latent, dtype=torch.float32)
             # Keep the previous allocations alive: captured graphs still hold them.
             sets[ratio] = [bufs] + (have or [])
-            self._source_proj_bufs = sets
         bufs = sets[ratio][0]
         return {name: buf[:num_tokens] for name, buf in bufs.items()}
 
@@ -3295,7 +3276,7 @@ class DeepseekV4AttnBackend(
                     # Eager break: dense scoring over the live context; the
                     # candidate source hands its block table to the consumers.
                     out = _bcg_prefill_flat_indexer(layer, x, q_lora, pos)
-                    if layer.indexer.is_candidate_source and two_level:
+                    if layer.indexer.is_candidate_source:
                         self._prefill_graph_set_candidate_table(out)
             return
         if run_compressor and layer.compressor is not None:
@@ -3889,8 +3870,7 @@ class DeepseekV4AttnBackend(
             forward_batch,
             None,
         )
-        two_level = not self._prefill_graph_low_ratio_index_captured()
-        if not (indexer.is_candidate_source and two_level):
+        if not indexer.is_candidate_source:
             self.full_topk_indexer.topk_prefill(inputs)
             return ()
         published = self.prefill_candidates.publish_prefill(inputs)
@@ -3909,8 +3889,7 @@ class DeepseekV4AttnBackend(
         return out
 
     def _shared_candidate_table(self, layer_id: int, tensors) -> tuple:
-        sets = getattr(self, "_candidate_table_bufs", None) or {}
-        bufs = sets.setdefault(layer_id, [None] * len(tensors))
+        bufs = self._candidate_table_bufs.setdefault(layer_id, [None] * len(tensors))
         views = []
         for i, t in enumerate(tensors):
             buf = bufs[i]
@@ -3918,7 +3897,6 @@ class DeepseekV4AttnBackend(
                 # Graphs captured on a smaller buffer keep it alive themselves.
                 buf = bufs[i] = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
             views.append(buf[: t.numel()].view(t.shape).copy_(t))
-        self._candidate_table_bufs = sets
         return tuple(views)
 
     def _prefill_graph_set_candidate_table(self, table_tensors) -> None:
@@ -3934,12 +3912,7 @@ class DeepseekV4AttnBackend(
             valid_lens=valid_lens,
             ready=ready,
         )
-        tail_meta = self.tail_forward_metadata
-        tail = tail_meta.late_layer_tail if tail_meta is not None else None
-        if tail is not None and tail.scatter_indices is not None:
-            tail_meta.candidate_metadata = table
-        else:
-            self.forward_metadata.candidate_metadata = table
+        self.forward_metadata.candidate_metadata = table
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Idle always re-translates at store time: its metadata may be stale, and
