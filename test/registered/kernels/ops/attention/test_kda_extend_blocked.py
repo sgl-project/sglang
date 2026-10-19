@@ -773,7 +773,10 @@ class TestKdaExtendBlockedPlan(CustomTestCase, _Checks):
         # Chunk tables passed by the caller index the whole extend; a block
         # call must derive its own from its cu_seqlens.
         inputs = _int_inputs(SEQ_LENS, SLOT_INDICES)
-        tables = (torch.zeros(4, 2, dtype=torch.int32), torch.zeros(5, dtype=torch.int32))
+        tables = (
+            torch.zeros(4, 2, dtype=torch.int32),
+            torch.zeros(5, dtype=torch.int32),
+        )
         single = _FakeChunkKda()
         _run(0, inputs, kernel=single, chunk_tables=tables)
         self.assertIs(single.calls[0]["chunk_tables"][0], tables[0])
