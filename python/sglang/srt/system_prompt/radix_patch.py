@@ -59,7 +59,7 @@ def is_system_prefix_warm(
     shared boundary state can be (re-)captured and donated.
 
     Takes primitives rather than ``Req`` to stay free of import cycles; callers
-    pass ``req.system_prefix_boundary``, ``len(req.prefix_indices)`` and
+    pass ``req.system_prefix_boundary``, ``req.prefix_len`` and
     ``req.mamba_branching_seqlen``.
     """
     return (
@@ -123,7 +123,7 @@ def reseed_mamba_boundary_after_match(
       prefill tracks the boundary state.
 
     Takes primitives to stay free of import cycles; the caller passes
-    ``req.system_prefix_boundary``, ``len(req.prefix_indices)`` and the
+    ``req.system_prefix_boundary``, ``req.prefix_len`` and the
     match-returned ``mamba_branching_seqlen``.
     """
     if boundary is None or boundary <= 0:
