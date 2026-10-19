@@ -417,6 +417,7 @@ def _encoding_topk(*, width, calls):
         row_starts,
         out_rows,
         page_table_row_index,
+        topk_v2_plan=None,
     ):
         calls.append(
             {"page_table": page_table, "page_table_row_index": page_table_row_index}
