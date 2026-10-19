@@ -82,14 +82,6 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
 ]
 
 
-def get_tgv_cute_ext_tactic_num() -> int:
-    return len(_TGV_CUTE_EXT_TACTIC_CONFIGS)
-
-
-def get_tgv_cute_ext_default_tactic() -> int:
-    return _TGV_CUTE_EXT_DEFAULT_TACTIC
-
-
 class WorkTileInfo(NamedTuple):
     """Which output tile this CTA processes. Mirrors the original WorkTileInfo."""
 
