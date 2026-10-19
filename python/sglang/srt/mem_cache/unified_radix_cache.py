@@ -2325,6 +2325,23 @@ class UnifiedRadixCache(BasePrefixCache):
         self._handle_prefetch_result(operation)
         return True
 
+    def waiting_storage_span(
+        self, request: CacheRequestHandle
+    ) -> Optional[tuple[int, int]]:
+        if self.buffer_pipeline is None:
+            return None
+        info = self.ongoing_prefetch.get(request)
+        if info is not None:
+            if info.host_indices is None:
+                return None
+            # Scheduler-accepted logical span; worker progress can count pool rows.
+            op = info.operation
+            return op.storage_start, op.storage_start + op.storage_hit_count
+        staged = self.buffer_pipeline.staged_prefetches.get(request)
+        if staged is not None:
+            return staged.matched_len, staged.matched_len + staged.num_tokens
+        return None
+
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         if (
