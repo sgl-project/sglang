@@ -20,7 +20,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -220,7 +220,7 @@ class BaseGrammarBackend:
             )
         # <= 0 disables the bound (previous behaviour).
         self.cache_max_entries = cache_max_entries
-        self.cache: "OrderedDict[Tuple[str, str], BaseGrammarObject]" = OrderedDict()
+        self.cache: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
 
     def initialize_vocab_mask_buffer(
         self,
