@@ -1,15 +1,17 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_npu_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_npu_ci(est_time=20, suite="base-b-test-1-npu-a3")
 
 import unittest
 
 import torch
 
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.srt.utils import is_npu
 from sglang.test.test_utils import CustomTestCase
 
-DEVICE = torch.device("cuda")
+DEVICE = torch.device("npu" if is_npu() else "cuda")
 
 
 def _offset(value: int) -> torch.Tensor:

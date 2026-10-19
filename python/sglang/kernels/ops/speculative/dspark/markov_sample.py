@@ -11,7 +11,9 @@ import triton.language as tl
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import is_npu
 
-if is_npu():
+_IS_NPU: tl.constexpr = is_npu()
+
+if _IS_NPU:
     # Ascend does not map the generic libdevice stubs to CANN implementations.
     from triton.language.extra.cann import libdevice
 else:
@@ -126,6 +128,9 @@ def _select_block(
             PHILOX_ROUNDS,
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
+        if _IS_NPU:
+            # Ascend lacks uint32 -> FP32; widen without losing the high bit.
+            bits = bits.to(tl.int64)
         # Small words convert to FP32 exactly, so the winning small noise stays precise.
         uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
         exp_noise = -libdevice.log1p(-uniform)
