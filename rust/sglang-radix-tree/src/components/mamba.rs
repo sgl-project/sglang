@@ -392,7 +392,6 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if tree_core.enable_hicache
                 && tree_core.is_write_back
                 && !node.has_host_value(MAMBA)
-                && !node.backuped()
                 && node.has_device_value(FULL)
             {
                 // Keep the state live until the controller finishes D->H I/O.

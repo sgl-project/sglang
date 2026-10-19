@@ -1002,20 +1002,43 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
 
     tc.evict_device_start(MAMBA, 1);
     let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
-    tc.evict_device_end(MAMBA);
     assert_eq!(next, None);
-    assert_eq!(step.mamba_backup_node_id, None);
-    assert_eq!(
-        step.tracker.get(&MAMBA).copied().unwrap_or(0),
-        usize::from(!pin_ancestor)
-    );
     assert!(step.host_frees.is_empty());
     if pin_ancestor {
+        tc.evict_device_end(MAMBA);
+        assert_eq!(step.mamba_backup_node_id, None);
+        assert!(step.tracker.is_empty());
         assert!(step.device_frees.is_empty());
     } else {
+        // A's Full KV is on host but its restored state is device-only, so
+        // eviction asks for a state backup instead of dropping it.
+        assert_eq!(step.mamba_backup_node_id, Some(a_id));
+        assert!(step.tracker.is_empty());
+        assert!(step.device_frees.is_empty());
+        // The controller drains B's pending transfer before backing up A.
+        tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+        let (full, mut transfers) = tc.build_backup_spec(a_id).unwrap();
+        assert_eq!(full.numel(), 0);
+        assert!(
+            transfers[&MAMBA][0]
+                .device_indices
+                .as_ref()
+                .unwrap()
+                .equal(&Tensor::from_slice(&[201i64]))
+        );
+        for transfer in transfers.values_mut().flatten() {
+            transfer.host_indices = Some(transfer.device_indices.as_ref().unwrap() + 1000);
+        }
+        tc.commit_backup(a_id, full, transfers).unwrap();
+        tc.mark_write_through_pending(vec![a_id], a_id).unwrap();
+        tc.finish_write_through(vec![a_id], a_id).unwrap();
+        let step = tc.finish_mamba_state_eviction(a_id);
+        tc.evict_device_end(MAMBA);
+        assert_eq!(step.tracker[&MAMBA], 1);
         assert_eq!(step.device_frees.len(), 1);
-        assert_eq!(step.device_frees[&MAMBA].len(), 1);
         assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[201i64])));
+        assert!(step.host_frees.is_empty());
+        assert!(tc.arena.node(a).has_host_value(MAMBA));
     }
     assert!(
         tc.arena
@@ -1024,7 +1047,9 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
     );
     tc.sanity_check(&active, &[]);
 
-    tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+    if pin_ancestor {
+        tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+    }
     tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
     tc.evict_device_start(MAMBA, 1);
     let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
