@@ -52,6 +52,8 @@ class MiniMaxH3ReleaseMetadata:
     task_aliases: Mapping[str, str]
     video_sigma_shift: float
     audio_sigma_shift: float
+    # trained DMD rungs of a distilled release, unshifted; None keeps the uniform grid
+    dmd_denoising_steps: tuple[int, ...] | None = None
 
     @classmethod
     def from_model_index(
@@ -92,6 +94,21 @@ class MiniMaxH3ReleaseMetadata:
                 "model_index.json._minimax_h3.sigma_shift_scales requires numeric "
                 "video and audio values"
             ) from exc
+        dmd_steps = raw.get("dmd_denoising_steps")
+        if dmd_steps is not None:
+            if (
+                not isinstance(dmd_steps, list)
+                or not dmd_steps
+                or any(
+                    type(step) is not int or not 0 < step <= 1000 for step in dmd_steps
+                )
+                or any(left <= right for left, right in zip(dmd_steps, dmd_steps[1:]))
+            ):
+                raise ValueError(
+                    "model_index.json._minimax_h3.dmd_denoising_steps must be "
+                    "strictly decreasing integers in (0, 1000]"
+                )
+            dmd_steps = tuple(dmd_steps)
         metadata = cls(
             schema_version=1,
             partition=partition,
@@ -99,6 +116,7 @@ class MiniMaxH3ReleaseMetadata:
             task_aliases=dict(aliases),
             video_sigma_shift=video_sigma,
             audio_sigma_shift=audio_sigma,
+            dmd_denoising_steps=dmd_steps,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
@@ -154,20 +172,17 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         self.metadata.canonical_task(task)
         min_steps = MiniMaxH3SamplingParams.min_num_inference_steps
         if batch.num_inference_steps < min_steps:
-            raise ValueError(
-                f"MiniMax H3 requires num_inference_steps >= {min_steps} because "
-                "its video/audio sigma schedules include both interval endpoints"
-            )
+            raise ValueError(f"MiniMax H3 requires num_inference_steps >= {min_steps}")
         gpu_plans = envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
         if (
             server_args.minimax_h3_adaln_online
-            and batch.num_inference_steps - 1 > gpu_plans
+            and batch.num_inference_steps > gpu_plans
         ):
             # Fail here, before the encode stages spend GPU time on a request
             # whose AdaLN rebuild is guaranteed to overflow the slab.
             raise ValueError(
                 f"num_inference_steps={batch.num_inference_steps} needs up to "
-                f"{batch.num_inference_steps - 1} AdaLN plans but the online "
+                f"{batch.num_inference_steps} AdaLN plans but the online "
                 f"slab holds {gpu_plans}; raise "
                 "SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS"
             )
