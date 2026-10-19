@@ -967,7 +967,7 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Set this to 1 to stop sglang from clearing an inherited
     # ROCPROFILER_REGISTER_LIBRARY.
-    SGLANG_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
+    SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
     # Enable dual-stream MoE (shared experts vs routed experts) on the
@@ -2161,48 +2161,6 @@ def third_party_cache_defaults() -> Dict[str, str]:
         # is the base dir rather than the final cache dir.
         "FLASHINFER_WORKSPACE_BASE": base,
     }
-
-
-def _rocprofiler_sdk_already_loaded() -> bool:
-    """Check whether this process has already loaded a rocprofiler-sdk library.
-
-    A profiler that is really running has loaded its library into this process,
-    so the library shows up in the process memory map. If this function cannot
-    read that map, it returns True, and the caller then treats the process as
-    one where a profiler may be running and changes nothing.
-    """
-    try:
-        with open("/proc/self/maps") as f:
-            return "librocprofiler-sdk" in f.read()
-    except OSError:
-        return True
-
-
-def clear_inherited_rocprofiler_registration():
-    """Delete ROCPROFILER_REGISTER_LIBRARY if this process inherited it.
-
-    When a profiler registers, HIP writes the library path into the environment
-    variable ROCPROFILER_REGISTER_LIBRARY. A child process inherits that
-    variable, so the child thinks a profiler has already registered and refuses
-    to register its own. torch.profiler in the child then records CPU rows
-    only: it reports no GPU events and no error.
-
-    Only ROCm sets this variable, so this function returns right away on a CUDA
-    build. Only PyTorch 2.12 and newer hit the problem, because of
-    rocprofiler-sdk; PyTorch 2.11 and older use roctracer, so deleting the
-    variable changes nothing for them.
-
-    This function deletes the variable only when no profiler is running in this
-    process, so it never breaks a profiler that is really collecting data.
-    The process must call this function before it imports torch.
-    """
-    if os.environ.get("ROCPROFILER_REGISTER_LIBRARY") is None:
-        return
-    if envs.SGLANG_KEEP_INHERITED_ROCPROFILER_REGISTER.get():
-        return
-    if _rocprofiler_sdk_already_loaded():
-        return
-    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
 
 
 def redirect_third_party_caches():
