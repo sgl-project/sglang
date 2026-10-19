@@ -3,6 +3,24 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
+    fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
+)
+from sglang.kernels.ops.attention.kv_indices import (
+    kv_indices_num_token_blocks as kv_indices_num_token_blocks,
+)
 from sglang.kernels.ops.attention.pad import (
     pad_sequence_with_mask as pad_sequence_with_mask,
 )
@@ -35,24 +53,6 @@ from sglang.kernels.ops.kvcache.cache_ops import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
     reshape_and_cache_flash as reshape_and_cache_flash,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    create_flashinfer_kv_indices_triton as create_flashinfer_kv_indices_triton,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    create_flashmla_kv_indices_triton as create_flashmla_kv_indices_triton,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    get_num_kv_index_blocks_flashmla as get_num_kv_index_blocks_flashmla,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    get_num_page_per_block_flashmla as get_num_page_per_block_flashmla,
-)
-from sglang.kernels.ops.kvcache.kv_indices import (
-    kv_indices_num_token_blocks as kv_indices_num_token_blocks,
-)
-from sglang.kernels.ops.kvcache.rope_cache import (
-    fused_qk_rope_reshape_and_cache as fused_qk_rope_reshape_and_cache,
 )
 from sglang.srt.utils import is_cuda
 

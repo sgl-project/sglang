@@ -15,16 +15,16 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
+from sglang.kernels.ops.attention.aiter_unified_page_table import (
+    scatter_ragged_to_page_table_kernel,
+    scatter_req_to_token_to_page_table_kernel,
+)
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
     kv_indices_num_token_blocks,
-)
-from sglang.kernels.ops.kvcache.aiter_unified_attention import (
-    scatter_ragged_to_page_table_kernel,
-    scatter_req_to_token_to_page_table_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp

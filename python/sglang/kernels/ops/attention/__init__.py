@@ -47,6 +47,16 @@ _TRITON_KERNELS = [
     ("dsv4_attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4_attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4_attn_metadata_kernels", "build_causal_swa_page_indices"),
+    ("kv_indices", "create_flashinfer_kv_indices_triton"),
+    ("kv_indices", "create_flashmla_kv_indices_triton"),
+    ("kv_indices", "create_chunked_prefix_cache_kv_indices"),
+    ("kv_indices", "get_num_kv_index_blocks_flashmla"),
+    ("kv_indices", "get_num_page_per_block_flashmla"),
+    ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
+    ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("aiter_unified_page_table", "scatter_ragged_to_page_table_kernel"),
+    ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
+    ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
