@@ -366,6 +366,8 @@ class Envs:
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+    # Comma-separated peer IPs admitted by TCP-bound IPC sockets; empty admits all.
+    SGLANG_ZMQ_ALLOWED_PEERS = EnvTuple(tuple())
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
