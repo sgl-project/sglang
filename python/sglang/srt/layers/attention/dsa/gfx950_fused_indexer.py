@@ -247,6 +247,7 @@ class Gfx950FusedIndexer:
         row_ends_int32: torch.Tensor,
         page_table_64: torch.Tensor,
         rows: int,
+        share_pages: bool = False,
     ) -> torch.Tensor:
         gemv, qk, logits_mod, topk_mod = loader.modules()
         w_q_b, w_kw, norm_w, norm_b, cos2d, sin2d = self._constants()
@@ -309,6 +310,7 @@ class Gfx950FusedIndexer:
             logits,
             ws.ghist[:rows],
             loader.LOGITS_BLOCKS_PER_ROW,
+            share_pages,
         )
 
         # --- node 4: top-k(2048) + page transform, fused refinement ---------

@@ -12,6 +12,14 @@ logger = logging.getLogger(__name__)
 
 DSA_DENSE = "dense"
 DSA_SPARSE = "sparse"
+# Sparse, with the gfx950 indexer logits sharing KV pages across a request's
+# MTP verify rows (paged_mqa_logits.cuh, logits_hist_slot).
+DSA_SPARSE_SHARED_PAGES = "sparse_shared_pages"
+
+# MTP verify batches of at most this many rows whose longest request holds at
+# least this many tokens are faster with the shared-page logits kernel (MI355X).
+DSA_SHARED_PAGES_MAX_ROWS = 18
+_SHARED_PAGES_MIN_LEN = 98304
 
 
 class AttentionGraphVariants(Protocol):
@@ -23,27 +31,55 @@ class AttentionGraphVariants(Protocol):
         ...
 
 
+def dsa_max_kv_len(forward_batch: ForwardBatch) -> Optional[int]:
+    """The batch's longest sequence, or None when the batch carries no lengths."""
+    seq_lens_cpu = forward_batch.seq_lens_cpu
+    if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+        # Plain decode maintains this host mirror without a D2H sync.
+        return int(seq_lens_cpu.max().item())
+    if forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
+        # Fallback: a single scalar reduction d2h (cheap, per-step).
+        return int(forward_batch.seq_lens.max().item())
+    return None
+
+
+def dsa_share_logits_pages(rows: int, max_kv_len: int) -> bool:
+    """Whether a verify batch takes the shared-page indexer logits kernel."""
+    return rows <= DSA_SHARED_PAGES_MAX_ROWS and max_kv_len >= _SHARED_PAGES_MIN_LEN
+
+
 @dataclass(frozen=True)
 class DsaGraphVariants:
     index_topk: int
-    # Dense comes first: the sparse capture peak subsumes its shared-pool storage.
-    capture_labels: ClassVar[tuple[str, ...]] = (DSA_DENSE, DSA_SPARSE)
+    # Draft tokens per request when these are MTP verify graphs on gfx950, so
+    # the shared-page logits variant is captured too; 0 otherwise.
+    verify_rows_per_req: int = 0
+
+    @property
+    def capture_labels(self) -> tuple[str, ...]:
+        # Dense comes first: the sparse capture peak subsumes its shared-pool storage.
+        if self.verify_rows_per_req:
+            return (DSA_DENSE, DSA_SPARSE, DSA_SPARSE_SHARED_PAGES)
+        return (DSA_DENSE, DSA_SPARSE)
 
     def select(self, forward_batch: ForwardBatch) -> str:
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
-            # Plain decode maintains this host mirror without a D2H sync.
-            max_kv_len = int(seq_lens_cpu.max().item())
-        elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
-            # Fallback: a single scalar reduction d2h (cheap, per-step).
-            max_kv_len = int(forward_batch.seq_lens.max().item())
-        else:
+        max_kv_len = dsa_max_kv_len(forward_batch)
+        if max_kv_len is None:
             # No length info: be safe and use the correct-for-all sparse graph.
             return DSA_SPARSE
-        return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
+        if max_kv_len <= self.index_topk:
+            return DSA_DENSE
+        if self.verify_rows_per_req and dsa_share_logits_pages(
+            forward_batch.batch_size * self.verify_rows_per_req, max_kv_len
+        ):
+            return DSA_SPARSE_SHARED_PAGES
+        return DSA_SPARSE
 
 
-def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
+def create_attention_graph_variants(
+    hf_config, verify_rows_per_req: int = 0
+) -> Optional[AttentionGraphVariants]:
+    """`verify_rows_per_req`: draft tokens per request for MTP verify graphs."""
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         get_dsa_index_topk,
@@ -64,7 +100,14 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
             "dispatch on max_kv_len vs index_topk=%d.",
             index_topk,
         )
-        return DsaGraphVariants(index_topk)
+        from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
+            supported_hardware,
+        )
+
+        return DsaGraphVariants(
+            index_topk,
+            verify_rows_per_req if supported_hardware() else 0,
+        )
     return None
 
 
