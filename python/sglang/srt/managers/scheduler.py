@@ -657,6 +657,11 @@ class Scheduler(
         self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
 
+        # The Rust frontend snapshots local KV-event discovery metadata while it
+        # builds its typed server info, so the publisher must exist before the
+        # frontend starts.
+        self.init_kv_events_publisher()
+
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
 
@@ -712,8 +717,6 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
-
-        self.init_kv_events_publisher()
 
         self.init_load_publisher()
 

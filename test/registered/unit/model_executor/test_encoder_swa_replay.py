@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4AttnMetadata,
+    late_layer_whole_extend,
 )
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.schedule_batch import (
@@ -337,17 +338,18 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         replayed rows."""
         fx = _Fixture()
         fb = fx.folded.batch
-        token_indices, _, _ = late_layer_tail_layout(
+        token_indices, tail_lens, _ = late_layer_tail_layout(
             extend_lens_cpu=list(fb.extend_lens),
             seq_lens_cpu=fx.folded_seq_lens(),
             tail_len=SWA_WINDOW,
             device=torch.device("cpu"),
         )
+        self.assertEqual(tail_lens, [40, 128, 84])
         out = SimpleNamespace(
             hidden_states=fb.input_ids[token_indices][:, None].float(),
             hidden_states_token_indices=token_indices,
         )
-        drop_folded_rows(logits_output=out, folded=fx.folded)
+        drop_folded_rows(logits_output=out, folded=fx.folded, tail_lens=tail_lens)
 
         # Kept: all 40 miss rows, the hit's 30 new rows, the small hit's 20.
         expected = torch.cat(
@@ -356,6 +358,41 @@ class TestFoldWithDecoderSwaTail(CustomTestCase):
         torch.testing.assert_close(out.hidden_states_token_indices, expected)
         torch.testing.assert_close(
             out.hidden_states, fx.batch.input_ids[expected][:, None].float()
+        )
+
+    def test_prompt_logprob_reader_keeps_its_whole_tail(self):
+        """A prompt-logprob reader's tail is its whole folded extend, replay rows included."""
+        fx = _Fixture()
+        fx.batch.extend_logprob_start_lens = [40, 10, 5]
+        folded = _fold_batch(batch=fx.batch, runner=fx.runner, rows=HITS)
+        fb = folded.batch
+        whole = late_layer_whole_extend(
+            SimpleNamespace(
+                extend_seq_lens_cpu=list(fb.extend_lens),
+                extend_logprob_start_lens_cpu=fb.extend_logprob_start_lens,
+                return_logprob=True,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            ),
+            dspark=True,
+        )
+        self.assertEqual(whole, [False, True, True])
+        token_indices, tail_lens, _ = late_layer_tail_layout(
+            extend_lens_cpu=list(fb.extend_lens),
+            seq_lens_cpu=fx.folded_seq_lens(),
+            tail_len=SWA_WINDOW,
+            device=torch.device("cpu"),
+            whole_extend=whole,
+        )
+        self.assertEqual(tail_lens, [40, 158, 84])
+        out = SimpleNamespace(
+            hidden_states=fb.input_ids[token_indices][:, None].float(),
+            hidden_states_token_indices=token_indices,
+        )
+        drop_folded_rows(logits_output=out, folded=folded, tail_lens=tail_lens)
+
+        torch.testing.assert_close(out.hidden_states_token_indices, torch.arange(90))
+        torch.testing.assert_close(
+            out.hidden_states, fx.batch.input_ids[:, None].float()
         )
 
 

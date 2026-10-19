@@ -55,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_layout,
     get_qsa_pending_state_indices,
     is_aborted,
     is_mla_backend,
@@ -247,6 +248,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
+        kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )
