@@ -14,9 +14,10 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
+    kv_event_namespace_seed,
+    namespaced_block_hash,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.extension import bindings
@@ -56,9 +58,12 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
-from sglang.srt.mem_cache.utils import get_eviction_strategy
+from sglang.srt.mem_cache.utils import (
+    get_eviction_strategy,
+)
 from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 from sglang.srt.utils import assert_int64_array
 
@@ -95,22 +100,54 @@ def _radix_key_buffer(key: RadixKey) -> array:
     return token_ids
 
 
-def _kv_event_from_tagged(event: tuple):
-    """Build the Python KV cache event for one of the binding's tagged tuples."""
+def _kv_event_from_tagged(
+    event: tuple, lora_names: KvEventLoraNames, dynamo_format: bool = False
+):
+    """Build the Python KV cache event for one of the binding's tagged tuples.
+
+    Rust hashes are LoRA-agnostic; the trailing extra_key selects the LoRA
+    namespace, applied here as in KVCacheEventRecorder.
+    """
     tag = event[0]
     if tag == "block_stored":
+        lora_name = (
+            lora_names.resolve(event[8]) if dynamo_format else lora_names.get(event[8])
+        )
+        seed = (
+            kv_event_namespace_seed(extra_key=event[8], cache_salt=None)
+            if not dynamo_format and lora_name is not None
+            else None
+        )
+        parent = event[2]
         return BlockStored(
-            block_hashes=event[1],
-            parent_block_hash=event[2],
+            block_hashes=[
+                namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
+            ],
+            parent_block_hash=(
+                None
+                if parent is None
+                else namespaced_block_hash(parent, namespace_seed=seed)
+            ),
             token_ids=event[3],
             block_size=event[4],
             lora_id=None,
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
             session_id=event[7],
+            lora_name=lora_name,
         )
     if tag == "block_removed":
-        return BlockRemoved(block_hashes=event[1], medium=StorageMedium(event[2]))
+        seed = (
+            kv_event_namespace_seed(extra_key=event[3], cache_salt=None)
+            if not dynamo_format and lora_names.get(event[3]) is not None
+            else None
+        )
+        return BlockRemoved(
+            block_hashes=[
+                namespaced_block_hash(h, namespace_seed=seed) for h in event[1]
+            ],
+            medium=StorageMedium(event[2]),
+        )
     if tag == "all_blocks_cleared":
         return AllBlocksCleared()
     raise ValueError(f"unknown kv event tag: {tag}")
@@ -301,15 +338,27 @@ def _fill_evict_result(binding_result, result):
 class _RustKVCacheEventRecorder:
     """Expose the Rust event queue through the Python recorder interface."""
 
-    def __init__(self, binding, enabled: bool):
+    def __init__(
+        self,
+        binding,
+        enabled: bool,
+        lora_names: KvEventLoraNames,
+        dynamo_format: bool = False,
+    ):
         self._binding = binding
         self.enabled = enabled
+        self._lora_names = lora_names
+        self._dynamo_format = dynamo_format
 
     def record_all_cleared(self) -> None:
         self._binding.record_all_cleared_event()
 
     def take(self) -> list:
-        return [_kv_event_from_tagged(event) for event in self._binding.take_events()]
+        events = [
+            _kv_event_from_tagged(event, self._lora_names, self._dynamo_format)
+            for event in self._binding.take_events()
+        ]
+        return events
 
 
 class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -419,9 +468,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 enable_hicache=False,
                 write_through_threshold=256,
                 device=str(self.device),
-                swa_sliding_window_size=params.sliding_window_size,
-                swa_req_ring=is_swa_req_ring(self._allocator),
+                # Rust's tree window has the same cache-history contract as
+                # SWAComponent, including the fused draft's front rows.
+                swa_sliding_window_size=params.swa_retain_window,
+                swa_req_ring=not params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
+                dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
                     mamba_cache_chunk_size() if has_mamba else None
                 ),
@@ -434,7 +486,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             [int(component) for component in self.tree_components],
         )
         self.kv_events = _RustKVCacheEventRecorder(
-            self._binding, params.enable_kv_cache_events
+            self._binding,
+            enabled=params.enable_kv_cache_events,
+            lora_names=params.kv_event_lora_names,
+            dynamo_format=params.dynamo_kv_event_format,
         )
         # The default-root empty result, prebuilt once from the binding.
         self._empty_match_result = _match_result_from_binding(
@@ -466,8 +521,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
+        if component_type != ComponentType.SWA:
+            raise NotImplementedError("The Rust tree core supports one SWA window")
         return self._binding.swa_tombstone_ranges(
             self._bindings.MatchParamsBinding(
                 key=_radix_key_buffer(key),
@@ -484,7 +545,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
+        if component_type != ComponentType.SWA:
+            raise NotImplementedError("The Rust tree core supports one SWA window")
         return _cache_actions_from_tagged(
             self._binding.attach_swa_window(
                 self._bindings.MatchParamsBinding(
@@ -1126,6 +1190,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
         return self._binding.write_back_duplicate_reclaim_digest()
+
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
+    ) -> None:
+        self._binding.adjust_component_size(node_id, int(component_type), delta)
+
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = self._binding.collect_path_info(list(end_node_ids))
+        return tuple(tuple(TreePathNodeInfo(*node) for node in path) for path in paths)
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor

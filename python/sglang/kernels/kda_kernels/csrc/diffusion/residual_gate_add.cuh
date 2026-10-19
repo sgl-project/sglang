@@ -27,7 +27,7 @@ constexpr uint32_t kBroadcastColsPerBlock = 256;
 constexpr uint32_t kMaxGrid = 65535;
 constexpr uintptr_t kAlignment = 16;
 
-enum class GateMode : int { kFull, kBroadcastRow, kPerToken };
+enum class GateMode : int { kFull, kBroadcastRow, kPerToken, kBatchedRow };
 
 template <typename T>
 SGL_DEVICE T residual_gate_value(T residual, T update, T gate) {
@@ -73,7 +73,7 @@ __global__ void residual_gate_add_broadcast_kernel(
   }
 
   Vec gate_vec;
-  gate_vec.load(gate, column);
+  gate_vec.load(gate, static_cast<int64_t>(blockIdx.z) * row_vectors + column);
   const int64_t row_stride = static_cast<int64_t>(gridDim.y) * kBroadcastRowsPerBlock;
   for (int64_t row_base = static_cast<int64_t>(blockIdx.y) * kBroadcastRowsPerBlock; row_base < rows;
        row_base += row_stride) {
@@ -83,7 +83,7 @@ __global__ void residual_gate_add_broadcast_kernel(
       if (row >= rows) {
         continue;
       }
-      const int64_t vector = row * row_vectors + column;
+      const int64_t vector = (static_cast<int64_t>(blockIdx.z) * rows + row) * row_vectors + column;
       Vec residual_vec, update_vec, out_vec;
       residual_vec.load(residual, vector);
       update_vec.load(update, vector);
@@ -103,13 +103,21 @@ __global__ void residual_gate_add_scalar_kernel(
     const T* __restrict__ update,
     const T* __restrict__ gate,
     int64_t numel,
-    int64_t hidden_size) {
+    int64_t hidden_size,
+    int64_t batch_numel) {
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < numel; index += stride) {
-    const T gate_value = kGateMode == GateMode::kFull
-                             ? gate[index]
-                             : (kGateMode == GateMode::kPerToken ? SGLANG_LDG(gate + index / hidden_size)
-                                                                 : SGLANG_LDG(gate + index % hidden_size));
+    int64_t gate_index;
+    if constexpr (kGateMode == GateMode::kFull) {
+      gate_index = index;
+    } else if constexpr (kGateMode == GateMode::kPerToken) {
+      gate_index = index / hidden_size;
+    } else if constexpr (kGateMode == GateMode::kBatchedRow) {
+      gate_index = (index / batch_numel) * hidden_size + index % hidden_size;
+    } else {
+      gate_index = index % hidden_size;
+    }
+    const T gate_value = SGLANG_LDG(gate + gate_index);
     out[index] = residual_gate_value(residual[index], update[index], gate_value);
   }
 }
@@ -144,10 +152,18 @@ struct ResidualGateAddKernel {
 
     const int64_t numel = N.unwrap();
     CHECK_HOST(hidden_size > 0 && numel % hidden_size == 0) << "hidden size must be positive and divide the input size";
-    // gate_mode: 0 = full (numel), 1 = broadcast row (hidden_size), 2 = per-token (numel/hidden_size)
+    // 0 = full, 1 = shared row, 2 = per-token, 3 = one row per batch.
+    CHECK_HOST(gate_mode >= 0 && gate_mode <= 3) << "invalid gate mode";
     const int64_t rows = numel / hidden_size;
-    const int64_t expected_gate = gate_mode == 0 ? numel : (gate_mode == 1 ? hidden_size : rows);
-    CHECK_HOST(G.unwrap() == expected_gate) << "gate size does not match its mode";
+    int64_t batches = 1;
+    if (gate_mode == 3) {
+      CHECK_HOST(G.unwrap() > hidden_size && G.unwrap() % hidden_size == 0) << "invalid batched gate size";
+      batches = G.unwrap() / hidden_size;
+      CHECK_HOST(batches <= kMaxGrid && rows % batches == 0) << "invalid batched gate layout";
+    } else {
+      const int64_t expected_gate = gate_mode == 0 ? numel : (gate_mode == 1 ? hidden_size : rows);
+      CHECK_HOST(G.unwrap() == expected_gate) << "gate size does not match its mode";
+    }
     if (numel == 0) {
       return;
     }
@@ -184,24 +200,35 @@ struct ResidualGateAddKernel {
             update_ptr,
             gate_ptr,
             numel,
-            hidden_size);
+            hidden_size,
+            numel / batches);
         return;
       }
 
-      const int64_t rows = numel / hidden_size;
+      const int64_t rows = numel / hidden_size / batches;
       const int64_t row_vectors = hidden_size / kVec;
       const auto column_blocks =
           static_cast<uint32_t>(div_ceil(row_vectors, static_cast<int64_t>(kBroadcastColsPerBlock)));
       const int64_t row_tiles = div_ceil(rows, static_cast<int64_t>(kBroadcastRowsPerBlock));
       const auto row_blocks = static_cast<uint32_t>(std::min<int64_t>(row_tiles, kMaxGrid));
-      LaunchKernel(dim3(column_blocks, row_blocks), kBroadcastColsPerBlock, device.unwrap())(
+      LaunchKernel(dim3(column_blocks, row_blocks, batches), kBroadcastColsPerBlock, device.unwrap())(
           residual_gate_add_broadcast_kernel<T, kVec>, out_ptr, residual_ptr, update_ptr, gate_ptr, rows, row_vectors);
       return;
     }
 
     const auto blocks =
         static_cast<uint32_t>(std::min<int64_t>(div_ceil(numel, static_cast<int64_t>(kBlockSize)), kMaxGrid));
-    if (gate_mode == 2) {
+    if (gate_mode == 3) {
+      LaunchKernel(blocks, kBlockSize, device.unwrap())(
+          residual_gate_add_scalar_kernel<T, GateMode::kBatchedRow>,
+          out_ptr,
+          residual_ptr,
+          update_ptr,
+          gate_ptr,
+          numel,
+          hidden_size,
+          numel / batches);
+    } else if (gate_mode == 2) {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
           residual_gate_add_scalar_kernel<T, GateMode::kPerToken>,
           out_ptr,
@@ -209,7 +236,8 @@ struct ResidualGateAddKernel {
           update_ptr,
           gate_ptr,
           numel,
-          hidden_size);
+          hidden_size,
+          numel / batches);
     } else if (gate_mode == 1) {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
           residual_gate_add_scalar_kernel<T, GateMode::kBroadcastRow>,
@@ -218,7 +246,8 @@ struct ResidualGateAddKernel {
           update_ptr,
           gate_ptr,
           numel,
-          hidden_size);
+          hidden_size,
+          numel / batches);
     } else {
       LaunchKernel(blocks, kBlockSize, device.unwrap())(
           residual_gate_add_scalar_kernel<T, GateMode::kFull>,
@@ -227,7 +256,8 @@ struct ResidualGateAddKernel {
           update_ptr,
           gate_ptr,
           numel,
-          hidden_size);
+          hidden_size,
+          numel / batches);
     }
   }
 };

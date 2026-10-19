@@ -3,6 +3,7 @@ softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] 
 smallm_moe_gfx950 consumes. SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -18,6 +19,7 @@ MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is f
 _kernels: dict = {}
 _ws: dict = {}
 _disabled = False
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -67,7 +69,7 @@ def smallm_router(x, gate_weight, shared_gate_weight, scale=1.0):
             _check(_hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
             _kernels.update({r: _Kernel(mod, f"smallm_router_r{r}") for r in (1, 2)})
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
-            print(f"[smallm_router] disabled: {e}", flush=True)
+            logger.warning("smallm_router disabled: %s", e)
             _disabled = True
             return None
     tok = x.shape[0]
@@ -89,8 +91,8 @@ def qwen_moe_topk_output(block, hidden_states):
     from sglang.srt.layers.moe import get_moe_runner_backend
     from sglang.srt.layers.moe.topk import (
         StandardTopKOutput,
-        _eplb_remap_enabled,
         capture_routed_experts_if_allowed,
+        is_expert_remapping_enabled,
     )
     from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
         is_in_tc_piecewise_cuda_graph,
@@ -115,7 +117,7 @@ def qwen_moe_topk_output(block, hidden_states):
             and sw.is_contiguous()
             and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
             and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-            and not _eplb_remap_enabled()
+            and not is_expert_remapping_enabled()
         )
     if (
         not ok
