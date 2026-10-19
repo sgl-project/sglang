@@ -83,12 +83,9 @@ def _replay_tail_scope():
 
 
 def scattered_dp_counts(num_tokens: int, num_rows: int) -> Tuple[int, List[int]]:
-    """Under attention DP with a MoE that routes each rank's own rows, the largest
-    step token count and every rank's tail rows, gathered on the host: those
-    ranks' MoE kernels exchange tokens, so they must capture and replay together.
-    The pre-forward exchange skips such a MoE (its token counts are local), so
-    this gathers in the forward; it is only safe when every rank runs the step
-    eagerly."""
+    """The largest step token count and every rank's tail rows, gathered on the
+    host for a MoE that routes each rank's own rows, which the pre-forward
+    exchange skips. Safe only when every rank runs the step eagerly."""
     group = get_parallel().tp_group.cpu_group
     counts = torch.empty(
         2 * torch.distributed.get_world_size(group=group), dtype=torch.int64
@@ -235,11 +232,10 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> Optional[Tuple[int, List[int]]]:
-        """Under attention DP with a MoE that routes each rank's own rows, the
-        rank-uniform step tokens and every rank's tail rows; None elsewhere.
-        Every condition here is rank-uniform, since the gather is collective. Such
-        a MoE lets each rank pick a prefill graph or eager on its own, so the
-        tail graphs serve it only with the prefill graph disabled."""
+        """`scattered_dp_counts` for a MoE that routes each rank's own rows; None
+        elsewhere. Every condition is rank-uniform since the gather is collective;
+        such a MoE lets each rank pick a prefill graph or eager on its own, so it
+        needs the prefill graph disabled."""
         if (
             get_parallel().attn_dp_size == 1
             or get_moe_a2a_backend().is_none()
@@ -419,9 +415,8 @@ class DecoderReplayTail:
         capture_dspark: bool,
         dp_rows: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """The graphs' body run eagerly on the live rows, for a prefill-graph
-        step whose tail has no graph to replay; under DP attention in the DP
-        layout of every rank's real rows."""
+        """The graphs' body run eagerly on the live rows, for a prefill-graph step
+        whose tail has no graph to replay."""
         if forward_batch.forward_mode.is_idle():
             forward_batch = copy.copy(forward_batch)
             forward_batch.forward_mode = ForwardMode.EXTEND
@@ -611,8 +606,6 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
-    # A prefill-graph step's tail: the break reads the live batch, runs the tail
-    # graphs on its exact rows and bridges them back into the captured block.
     backend = get_attn_backend()
     saved, forward_batch = backend.enter_eager_tail_in_prefill_graph(
         get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id

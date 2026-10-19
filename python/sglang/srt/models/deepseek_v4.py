@@ -3910,8 +3910,8 @@ class DeepseekV4Model(nn.Module):
                             tail, num_tokens=input_ids.shape[0]
                         )
                     ):
-                        # The tail layers leave the captured block: one break
-                        # runs them on the live rows and bridges them back.
+                        # One break runs the tail layers on the live rows and
+                        # bridges them back into the captured block.
                         residual, pre, aux = (
                             self.decoder_replay_tail.run_in_prefill_graph(
                                 state=state,

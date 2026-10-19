@@ -39,9 +39,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 Body = Callable[[List[torch.Tensor], "ForwardBatch"], List[Optional[torch.Tensor]]]
-# Entered around a capture and around each replay with the batch the body reads
-# and the bucket's static inputs, e.g. to lay the batch out for a collective in
-# the body.
+# Wraps capture and each replay with the batch the body reads and the bucket's
+# static inputs, e.g. to lay the batch out for a collective in the body.
 BatchScope = Callable[["ForwardBatch", List[torch.Tensor]], ContextManager]
 
 

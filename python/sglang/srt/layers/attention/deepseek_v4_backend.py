@@ -913,9 +913,8 @@ class DSV4AttnMetadata:
 
 
 def _unpadded_batch(forward_batch: ForwardBatch) -> ForwardBatch:
-    """A view of a prefill-graph step's batch cut to its live requests and tokens:
-    the graph pads request and token rows (DP attention pads the live batch too),
-    while the per-request extend lengths stay exact."""
+    """The prefill-graph step's batch cut to its live requests and tokens; the
+    graph pads both, while the per-request extend lengths stay exact."""
     extend_lens = forward_batch.extend_seq_lens_cpu
     if extend_lens is None:
         return forward_batch
@@ -2082,12 +2081,9 @@ class DeepseekV4AttnBackend(
     def enter_eager_tail_in_prefill_graph(
         self, graph_batch: ForwardBatch, source_kv_layer_id: Optional[int]
     ) -> Tuple[tuple, ForwardBatch]:
-        """Inside a prefill-graph step's tail break: switch from the graph's
-        block-padded tail metadata onto exact-row tail metadata of the live batch,
-        which the decoder tail graphs' eager breaks read. The source layer's KV
-        was written by the captured segment before the switch. Returns the state
-        for exit_late_layer_tail and the batch the tail runs on (the capture
-        batch while the graph captures, whose rows are its own)."""
+        """Inside a prefill-graph step's tail break: switch onto exact-row tail
+        metadata of the live batch. Returns the state for exit_late_layer_tail and
+        the batch the tail runs on (the capture batch while the graph captures)."""
         forward_batch = _unpadded_batch(self.prefill_graph_replay_batch or graph_batch)
         held = self.tail_forward_metadata
         self.tail_forward_metadata = self._build_late_layer_tail_metadata(forward_batch)
