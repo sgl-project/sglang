@@ -172,8 +172,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
-                "is_unified_kv_triton",
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
                 return_value=True,
             ),
             mock.patch(

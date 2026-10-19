@@ -156,7 +156,7 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
 def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:
     """Per-pool fp8 layout; None follows SGLANG_DSV4_UNIFIED_KV_FP8. False keeps this
     pool bf16 while target fused-Q still keys off the global switch."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_fp8,
     )
 
@@ -1007,7 +1007,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )

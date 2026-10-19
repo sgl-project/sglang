@@ -967,7 +967,7 @@ class DeepseekV4HipRadixBackend(
         )
         if self.enable_decoder_swa_bounded_replay:
             # both read the store target off the full batch, not the tail metadata
-            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
                 is_unified_kv_triton,
             )
 
@@ -1424,7 +1424,7 @@ class DeepseekV4HipRadixBackend(
         """Whether the V4.1 DSpark draft block takes the block-window metadata; DSv4's
         draft keeps the causal verify indices, and unified_kv addresses its ring by
         (slot, position) and keeps its own path."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2415,7 +2415,7 @@ class DeepseekV4HipRadixBackend(
             self._refresh_fp4_prefill_workspace(forward_batch)
             assert isinstance(self.forward_metadata, DSV4Metadata)
             return self.forward_metadata
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2563,7 +2563,7 @@ class DeepseekV4HipRadixBackend(
         """fp8 unified_kv asm decode: per-stream KV bound for the split plan
         and, at init (outside capture, before warmup), the constant split
         table and the HCA persistent workspace."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
         )
 
@@ -2598,7 +2598,7 @@ class DeepseekV4HipRadixBackend(
     ) -> None:
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -2732,7 +2732,7 @@ class DeepseekV4HipRadixBackend(
         num_tokens: int,
         exact_num_tokens: bool = True,
     ) -> None:
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -3317,7 +3317,7 @@ class DeepseekV4HipRadixBackend(
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

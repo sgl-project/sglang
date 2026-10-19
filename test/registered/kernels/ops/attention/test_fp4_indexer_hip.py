@@ -55,7 +55,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     prepare_fp4_prefill_workspace,
     prepare_fp4_rowgroup_decode_workspace,
     prepare_fp4_rowgroup_prefill_workspace,
-    read_fp4_index_k_split,
     rowgroup_paged_mqa_logits,
     rowgroup_prefill_query_start_loc,
     rowgroup_table_columns,
@@ -86,6 +85,9 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.deepseek_v4.common import (
     ceil_ue8m0_exp_ref,
     fp4_e2m1_code_ref,
+)
+from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
+    read_fp4_index_k_split,
 )
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")

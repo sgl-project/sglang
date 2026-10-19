@@ -486,7 +486,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Off rather than fatal: without the fused path both phases share a format.
             self.use_gfx950_fused_indexer = hadamard_preserved(self)
         if self.use_gfx950_fused_indexer:
-            from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+            from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
                 Gfx950FusedIndexer,
                 prealloc_workspace,
             )
@@ -705,7 +705,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         """Per-call half of the gate plus the four launches. Returns the (rows,
         index_topk) physical-slot tensor, or None to mean this call is not served
         here -- forward_cuda then continues into the standard path unchanged."""
-        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+        from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
             CACHE_TOK_STRIDE,
             MAX_ROWS,
             PAGE_SIZE,

@@ -110,7 +110,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
 def gfx950_model_shape_supported(**kwargs) -> bool:
     """Static per-model half of the gate: shapes and dtypes that cannot change
     after load."""
-    from sglang.kernels.ops.attention.dsa.hip_gfx950 import model_shape_supported
+    from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
+        model_shape_supported,
+    )
 
     return model_shape_supported(**kwargs)
 

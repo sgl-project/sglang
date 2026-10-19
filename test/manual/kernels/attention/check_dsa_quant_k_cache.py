@@ -3,10 +3,10 @@ import triton
 
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     _quantize_k_cache_fast_wrapped,
-    _quantize_k_cache_ref,
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.test.kernels.dsa_k_cache_reference import _quantize_k_cache_ref
 
 if __name__ == "__main__":
     import dequant_k_cache
