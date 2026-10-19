@@ -113,14 +113,11 @@ permissions:
 
 jobs:
   # =============================================== PR Gate ====================================================
-  # Runtime live-fetch label gate (mirrors pr-test-extra.yml's call-gate):
-  # requires both `run-ci` and `run-ci-extra`. A failure here cascades to
-  # every test job via `needs`, so a PR without the labels ends in one red
-  # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
+  # Missing opt-in labels skip tests successfully; opted-in runs still pass
+  # the shared draft, label and cooldown gate before allocating AMD runners.
   call-gate:
-    uses: ./.github/workflows/pr-gate.yml
+    uses: ./.github/workflows/_pr-test-opt-in.yml
     with:
-      require-run-ci: true
       require-run-ci-extra: true
     secrets: inherit
 
@@ -133,7 +130,7 @@ jobs:
   extra-a-test-1-gpu-small-amd:
     name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -166,7 +163,7 @@ jobs:
   extra-a-test-1-gpu-large-amd:
     name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -196,7 +193,7 @@ jobs:
   extra-a-test-2-gpu-large-amd:
     name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code

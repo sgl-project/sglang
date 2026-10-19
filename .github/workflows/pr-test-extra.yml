@@ -75,14 +75,7 @@ permissions:
 
 jobs:
   # =============================================== check changes ====================================================
-  # The actual `run-ci` + `run-ci-extra` label gate now lives in the
-  # `call-gate` job below, which calls pr-gate.yml. pr-gate.yml live-fetches
-  # the PR's current labels at runtime, so a rerun (e.g. via
-  # /tag-and-rerun-ci extra, which adds labels via GITHUB_TOKEN — these
-  # don't cascade-trigger labeled events) picks up the new label set and
-  # passes. The previous workflow-level `if` checked the frozen event
-  # payload, which never updates on rerun and made the slash-add-label flow
-  # impossible to recover.
+  # Live opt-in checks let reruns observe labels added after the original event.
   check-changes:
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
@@ -93,16 +86,13 @@ jobs:
     secrets: inherit
 
   # =============================================== PR Gate ====================================================
-  # Runtime live-fetch gate. Mirrors pr-test.yml's call-gate, but additionally
-  # requires `run-ci-extra`. Failure here cascades down to every test job
-  # via `needs`, so the workflow ends with one red gate job (~30s) plus a
-  # row of skipped test jobs instead of consuming a runner.
+  # Missing opt-in labels skip tests successfully; opted-in runs still pass
+  # the shared draft, label and cooldown gate before allocating runners.
   call-gate:
     needs: check-changes
     if: github.event_name != 'schedule' && needs.check-changes.result == 'success'
-    uses: ./.github/workflows/pr-gate.yml
+    uses: ./.github/workflows/_pr-test-opt-in.yml
     with:
-      require-run-ci: true
       require-run-ci-extra: true
     secrets: inherit
 
@@ -111,7 +101,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
+      (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
@@ -131,7 +121,7 @@ jobs:
     if: |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+      (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true')
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04
@@ -142,7 +132,7 @@ jobs:
 
   simulator-test-cpu:
     needs: [check-changes, call-gate, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
     uses: ./.github/workflows/_pr-test-simulator-cpu.yml
     with:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
@@ -155,7 +145,7 @@ jobs:
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
     needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' && needs.call-gate.outputs.should-run == 'true') }}
     strategy:
       fail-fast: false
       matrix:

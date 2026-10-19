@@ -1,0 +1,58 @@
+name: CI Opt-In Tests
+
+on:
+  push:
+    paths:
+      - '.github/workflows/*opt-in*.yml'
+      - '.github/workflows/pr-gate.yml'
+      - '.github/workflows/pr-test-extra.yml'
+      - '.github/workflows/pr-test-amd*.yml'
+      - '.github/scripts/ci-opt-in.test.cjs'
+  pull_request:
+    paths:
+      - '.github/workflows/*opt-in*.yml'
+      - '.github/workflows/pr-gate.yml'
+      - '.github/workflows/pr-test-extra.yml'
+      - '.github/workflows/pr-test-amd*.yml'
+      - '.github/scripts/ci-opt-in.test.cjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Test live labels and downstream job gating
+        run: |
+          npm install --prefix "$RUNNER_TEMP/ci-opt-in" --no-package-lock --no-audit --no-fund yaml@2.8.1
+          NODE_PATH="$RUNNER_TEMP/ci-opt-in/node_modules" node --test .github/scripts/ci-opt-in.test.cjs
+
+  # Exercise reusable-workflow wiring on hosted runners without GPU jobs.
+  gate-base:
+    uses: ./.github/workflows/_pr-test-opt-in.yml
+  gate-extra:
+    uses: ./.github/workflows/_pr-test-opt-in.yml
+    with:
+      require-run-ci-extra: true
+
+  check-gates:
+    needs: [gate-base, gate-extra]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both reusable gates must succeed
+        env:
+          BASE_RESULT: ${{ needs.gate-base.result }}
+          EXTRA_RESULT: ${{ needs.gate-extra.result }}
+        run: |
+          test "$BASE_RESULT" = success
+          test "$EXTRA_RESULT" = success

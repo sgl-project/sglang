@@ -1,0 +1,53 @@
+name: PR Test Opt-In
+
+on:
+  workflow_call:
+    inputs:
+      require-run-ci-extra:
+        type: boolean
+        default: false
+    outputs:
+      should-run:
+        description: Whether this run opted into the test workflow
+        value: ${{ jobs.labels.outputs.should-run }}
+
+jobs:
+  labels:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.labels.outputs.should-run }}
+    steps:
+      # Read current labels rather than the event snapshot so a rerun can opt in.
+      # This job never checks out or executes PR code.
+      - name: Check live opt-in labels
+        id: labels
+        uses: actions/github-script@v8
+        env:
+          REQUIRE_EXTRA: ${{ inputs.require-run-ci-extra }}
+        with:
+          script: |
+            if (!['pull_request', 'pull_request_target'].includes(context.eventName)) {
+              core.setOutput('should-run', 'true');
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.issue.number,
+            });
+            const labels = new Set(pr.labels.map(label => label.name));
+            const required = ['run-ci'];
+            if (process.env.REQUIRE_EXTRA === 'true') required.push('run-ci-extra');
+            const missing = required.filter(label => !labels.has(label));
+            core.setOutput('should-run', String(missing.length === 0));
+            if (missing.length) {
+              core.notice(`Tests not opted in: missing ${missing.join(', ')}. Add the labels and rerun to opt in.`);
+            }
+
+  # Keep draft and cooldown checks, and recheck labels before allocating runners.
+  pr-gate:
+    needs: labels
+    if: needs.labels.outputs.should-run == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-run-ci-extra: ${{ inputs.require-run-ci-extra }}
+    secrets: inherit
