@@ -355,6 +355,7 @@ class GenerateReqInput:
 
     # For Unlimited-OCR
     images_config: Optional[dict] = None
+    mm_processor_kwargs: Optional[dict] = None
 
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
@@ -1009,6 +1010,7 @@ class GenerateReqInput:
                 if self.custom_logit_processor is not None
                 else None
             ),
+            mm_processor_kwargs=self.mm_processor_kwargs,
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
@@ -2304,10 +2306,12 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report asynchronous Elastic EP scale completion or failure."""
+    """Report scale completion in physical EP and logical DP-slot units."""
 
     success: bool
+    # Public Elastic EP state remains physical.
     effective_ep_size: int
+    # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
@@ -2388,7 +2392,7 @@ class ProfileReqOutput(BaseReq, kw_only=True):
 
 
 class FreezeGCReq(BaseReq, kw_only=True):
-    pass
+    gc_threshold: Optional[List[int]] = None
 
 
 class ShutdownReq(BaseReq, kw_only=True):

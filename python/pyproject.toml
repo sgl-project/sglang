@@ -39,7 +39,7 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn-4>=4.0.0b18",
-  "flashinfer_python[cu13]==0.7.1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_python[cu13]==0.7.2", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "humming-kernels[cu13]==0.1.12",
   "interegular",
@@ -77,8 +77,8 @@ dependencies = [
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
-  "sgl-deep-gemm==0.2.2",
-  "sglang-kernel==0.4.9",
+  "sgl-deep-gemm==0.2.3",
+  "sglang-kernel==0.4.10",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
@@ -188,7 +188,7 @@ test = [
   # Pinned: a bump moves scoring for every eval test at once, so re-baseline
   # MODEL_SCORE_THRESHOLDS in test/registered/eval/test_text_models_gsm8k_eval.py
   # and the mmlu thresholds of run_eval's other callers before changing it.
-  "sgl-eval==0.1.2",
+  "sgl-eval==0.1.3",
   "sglang[fastokens]",
   "tabulate",
 ]

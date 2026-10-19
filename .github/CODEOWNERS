@@ -80,7 +80,6 @@
 /rust/sglang-mm @sherlockwu @merrymercy
 /rust/sglang-processor @sagearc @sherlockwu
 /rust/sglang-radix-tree @Jialin @alphabetc1
-/rust/sglang-renderer @sagearc @rainj-me
 /rust/sglang-server @rainj-me @merrymercy
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
