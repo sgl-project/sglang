@@ -1,21 +1,18 @@
-"""MXFP8 producers against ``flashinfer.mxfp8_quantize`` of the bf16 tensor the
-unfused kernel stores: payload and the swizzled E8M0 scale buffer, padding
-included, byte for byte."""
+"""The swizzled MXFP8 quantizer against ``flashinfer.mxfp8_quantize``: payload and
+the swizzled E8M0 scale buffer, padding included, byte for byte."""
 
 import sys
 
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion import indexed_scale_shift_bf16_
 from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     can_use_mxfp8_swizzled,
-    indexed_scale_shift_mxfp8_,
     mxfp8_quantize_swizzled,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=3, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
 
@@ -36,21 +33,6 @@ def test_quantize_swizzled_is_byte_exact() -> None:
     x[0, :32] = 0  # an all-zero block takes the minimum exponent
     assert can_use_mxfp8_swizzled(x)
     _assert_matches_flashinfer(mxfp8_quantize_swizzled(x), x)
-
-
-@pytest.mark.parametrize("keep_bf16", [True, False])
-def test_indexed_scale_shift_mxfp8_is_byte_exact(keep_bf16: bool) -> None:
-    g = torch.Generator(device="cuda").manual_seed(3)
-    x = torch.randn((ROWS, HIDDEN), device="cuda", generator=g).to(torch.bfloat16)
-    shift = torch.randn((3, HIDDEN), device="cuda", generator=g).to(torch.bfloat16)
-    scale = torch.randn((3, HIDDEN), device="cuda", generator=g).to(torch.bfloat16)
-    indices = torch.randint(0, 3, (ROWS,), device="cuda", generator=g)
-    ref = indexed_scale_shift_bf16_(x.clone(), shift, scale, indices)
-    kept, q, s = indexed_scale_shift_mxfp8_(
-        x, shift, scale, indices, keep_bf16=keep_bf16
-    )
-    _assert_matches_flashinfer((q, s), ref)
-    assert (kept is x and torch.equal(x, ref)) if keep_bf16 else kept is None
 
 
 def test_predicates_reject_unsupported_input() -> None:

@@ -510,7 +510,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
         "diffusion.indexed_scale_shift_mxfp8_",
         KernelBackend.TRITON,
-        "sglang.kernels.ops.quantization.mxfp8_swizzled_triton:indexed_scale_shift_mxfp8_",
+        "modulate.indexed_scale_shift_mxfp8_triton:indexed_scale_shift_mxfp8_",
         _CUDA,
     ),
     (
@@ -787,7 +787,7 @@ _EXPORTS: dict[str, str] = {
     "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
     "can_use_mxfp8_swizzled": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
     "can_use_silu_mul_mxfp8": "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled",
-    "indexed_scale_shift_mxfp8_": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
+    "indexed_scale_shift_mxfp8_": "modulate.indexed_scale_shift_mxfp8_triton",
     "mxfp8_quantize_swizzled": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
     "silu_mul_mxfp8": "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
