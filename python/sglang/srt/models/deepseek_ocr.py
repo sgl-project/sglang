@@ -35,8 +35,8 @@ from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config, is_ocr2_config
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -1765,8 +1765,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         return inputs_embeds
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vision_embeddings = self._process_image_input(items)

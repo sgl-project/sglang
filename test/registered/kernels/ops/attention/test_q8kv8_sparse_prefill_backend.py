@@ -16,11 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
     sparse_mla_q8kv8_prefill_fwd,
 )
@@ -34,6 +30,10 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+    set_k_and_s_torch,
+)
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -130,7 +130,7 @@ def _make_v4_paged_kv_cache(
     k_bf16 = (torch.randn(total_slots, 512, device=device) * 0.25).to(torch.bfloat16)
     pack = quant_to_nope_fp8_rope_bf16_pack_triton(k_bf16)
     loc = torch.arange(total_slots, dtype=torch.int32, device=device)
-    SetKAndS.torch(_Pool(page_size), quant_k_cache, loc, pack)
+    set_k_and_s_torch(quant_k_cache, loc, pack, page_size)
     return quant_k_cache
 
 

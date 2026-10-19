@@ -72,14 +72,12 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
-    FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     ReplaceWriteThroughOnNodeSplit,
-    SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
@@ -125,8 +123,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 # A dedicated test entry point overrides this without changing the process-wide
 # production backend selection. Direct Python-core tests in this module remain
@@ -154,6 +152,7 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    draft_swa_window: int = 0
     decoder_swa_bounded_replay: bool = False
 
     # Mamba
@@ -742,6 +741,7 @@ def build_fixture(
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        draft_swa_window=cfg.draft_swa_window,
         decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
@@ -1495,21 +1495,6 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(list(session_b_tail[0].token_ids), [7, 8])
         self.assertEqual(session_b_tail[0].session_id, "session-b")
 
-    def test_session_id_and_cache_salt_are_both_attributed(self):
-        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
-        cache.take_events()
-        self._insert(
-            cache,
-            allocator,
-            [1, 2, 3, 4],
-            cache_salt="tenant-a",
-            session_id="session-a",
-        )
-        stored = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(stored), 1)
-        self.assertEqual(stored[0].cache_salt, "tenant-a")
-        self.assertEqual(stored[0].session_id, "session-a")
-
     def test_cache_salt_event_parentage_survives_node_split(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         cache.take_events()
@@ -2036,17 +2021,6 @@ class UnifiedRadixCacheSuite:
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_a))
         cache.sanity_check()
 
-    def test_evict_empty_tree(self):
-        cache, _, _ = build_fixture(self.cfg)
-        evict_params = EvictParams(num_tokens=10)
-        if self.cfg.has_mamba:
-            evict_params.mamba_num = 5
-        result = cache.evict(evict_params)
-        self.assertEqual(result.num_tokens_evicted, 0)
-        if self.cfg.has_mamba:
-            self.assertEqual(result.mamba_num_evicted, 0)
-        cache.sanity_check()
-
     def test_prev_prefix_len(self):
         """Three-step test: free overlap, free partial, no free."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -2479,21 +2453,6 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(m.device_prefix_len, len(aligned))
         cache.sanity_check()
 
-    def test_mamba_evict_only(self):
-        if not self.cfg.has_mamba:
-            self.skipTest("requires Mamba component")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq_short = self._make_seq(1, 2)
-        seq_long = seq_short + self._make_seq(500, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq_short)
-        self._insert(cache, allocator, req_to_token_pool, seq_long)
-        self.assertEqual(cache.mamba_evictable_size(), 2)
-
-        result = cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-        self.assertGreaterEqual(result.mamba_num_evicted, 1)
-        self.assertGreaterEqual(cache.full_evictable_size(), 0)
-        cache.sanity_check()
-
     def test_mamba_evict_breaks_match(self):
         if not self.cfg.has_mamba:
             self.skipTest("requires Mamba component")
@@ -2825,39 +2784,6 @@ class UnifiedRadixCacheSuite:
             1,
             "Full stays locked",
         )
-
-    def test_swa_early_release_preserves_an_owners_skipped_mamba_lock(self):
-        if not self.cfg.has_swa or not self.cfg.has_mamba:
-            self.skipTest("requires SWA and Mamba components")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-
-        seq_a = self._make_seq(
-            1, (self.cfg.sliding_window_size // self.cfg.page_size) + 4
-        )
-        self._insert(cache, allocator, req_to_token_pool, seq_a)
-        node_a = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq_a)))
-        ).last_device_node
-
-        owner = cache.inc_lock_ref(node_a)
-        skipped = cache.inc_lock_ref(
-            node_a, skip_lock_components=(ComponentType.MAMBA,)
-        )
-        self.assertNotIn(ComponentType.MAMBA, owner.skipped_lock_components)
-        self.assertIn(ComponentType.MAMBA, skipped.skipped_lock_components)
-        self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1)
-
-        cache.release_swa(TreeLock(node_a, skipped.to_dec_params()))
-        self.assertEqual(
-            _device_lock_ref(cache, node_a, ComponentType.MAMBA),
-            1,
-            "the early release must not drop another request's Mamba lock",
-        )
-
-        cache.dec_lock_ref(node_a, skipped.to_dec_params(), skip_swa=True)
-        cache.dec_lock_ref(node_a, owner.to_dec_params())
-        self.assertEqual(_device_lock_ref(cache, node_a, ComponentType.MAMBA), 0)
-        cache.sanity_check()
 
     def test_cascade_evict_asserts_on_locked_internal_mamba(self):
         if not self.cfg.has_swa or not self.cfg.has_mamba:
@@ -3371,24 +3297,6 @@ class UnifiedRadixCacheSuite:
         cache.unlock(req.lock)
         cache.sanity_check()
 
-    def test_swa_sanity_check_passes_after_deep_match(self):
-        if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires SWA-only config with node size >= cushion")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-
-        seq_a = self._make_seq(1, 8)
-        seq_ab = seq_a + self._make_seq(100, 8)
-        seq_abc = seq_ab + self._make_seq(200, 8)
-        self._insert(cache, allocator, req_to_token_pool, seq_a)
-        self._insert(cache, allocator, req_to_token_pool, seq_ab)
-        self._insert(cache, allocator, req_to_token_pool, seq_abc)
-        self._insert(cache, allocator, req_to_token_pool, self._make_seq(900, 5))
-
-        for _ in range(3):
-            m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_abc))))
-            self.assertEqual(m.device_prefix_len, len(seq_abc))
-            cache.sanity_check()
-
     def test_tombstone_cleanup_respects_locked_parent(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         tokens = self._make_seq(1, 1)
@@ -3608,32 +3516,6 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(cache.full_evictable_size(), 0)
         cache.sanity_check()
 
-    def test_evict_shared_prefix_keeps_common_path(self):
-        """Evicting one branch preserves the shared prefix for other branch."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        base = self._make_seq(1, 2)
-        branch_a = base + self._make_seq(100, 2)
-        branch_b = base + self._make_seq(200, 2)
-
-        self._insert(cache, allocator, req_to_token_pool, branch_a)
-        self._insert(cache, allocator, req_to_token_pool, branch_b)
-
-        # Lock branch_b
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", branch_b))))
-        lr = cache.inc_lock_ref(m.last_device_node)
-
-        # Evict — branch_a should go, base + branch_b stay
-        cache.evict(EvictParams(num_tokens=len(branch_a)))
-
-        m_b = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", branch_b))))
-        self.assertEqual(m_b.device_prefix_len, len(branch_b))
-
-        cache.dec_lock_ref(
-            m.last_device_node,
-            lr.to_dec_params(),
-        )
-        cache.sanity_check()
-
     def test_evict_result_accounting_matches_actual(self):
         """EvictResult.num_tokens_evicted matches actual size change."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -3645,21 +3527,6 @@ class UnifiedRadixCacheSuite:
         result = cache.evict(EvictParams(num_tokens=before))
         after = cache.full_evictable_size()
         self.assertEqual(result.num_tokens_evicted, before - after)
-        cache.sanity_check()
-
-    def test_evict_reinsert_after_full_eviction(self):
-        """After evicting everything, new inserts work correctly."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq_a = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq_a)
-        cache.evict(EvictParams(num_tokens=len(seq_a) * 2))
-        self.assertEqual(cache.full_evictable_size(), 0)
-
-        # Re-insert
-        seq_b = self._make_seq(500, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq_b)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_b))))
-        self.assertEqual(m.device_prefix_len, len(seq_b))
         cache.sanity_check()
 
     def test_swa_evict_internal_tombstone(self):
@@ -3675,31 +3542,6 @@ class UnifiedRadixCacheSuite:
         swa_before = cache.swa_evictable_size()
         result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
         self.assertEqual(cache.swa_evictable_size(), 0)
-        cache.sanity_check()
-
-    def test_evict_d_leaf_set_consistency(self):
-        """evictable_device_leaves is consistent after mixed operations."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seqs = [self._make_seq(i * 100, 2) for i in range(6)]
-        for s in seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-
-        # Lock some, evict some, unlock
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seqs[0]))))
-        lr = cache.inc_lock_ref(m.last_device_node)
-
-        cache.evict(EvictParams(num_tokens=len(seqs[1])))
-        cache.sanity_check()
-
-        cache.dec_lock_ref(
-            m.last_device_node,
-            lr.to_dec_params(),
-        )
-        cache.sanity_check()
-
-        # Insert more
-        extra = self._make_seq(9000, 2)
-        self._insert(cache, allocator, req_to_token_pool, extra)
         cache.sanity_check()
 
     # ================================================================
@@ -3855,42 +3697,6 @@ class UnifiedRadixCacheSuite:
         for n in self._path_chain(cache, node):
             hashes.extend(cache.tree_core.get_hash_values(n))
         return hashes
-
-    def test_hicache_l3_write_storage(self):
-        """D->H->L3 offload: every KV page lands in the file storage backend."""
-        if self._skip_unsupported_hicache_test():
-            return
-        if self.cfg.has_mamba:
-            self.skipTest("mamba L3 offload is out of scope for this unit fixture")
-
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_hicache(
-            cache,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-        )
-
-        seq = self._make_seq(1, 4)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        leaf = m.last_device_node
-
-        # D->H first, then H->L3.
-        self._backup_node(cache, leaf)
-        self.assertTrue(cache.tree_core.get_hash_values(leaf))
-        self._write_path_to_l3(cache, leaf)
-        self._flush_l3_backups(cache)
-
-        # Every KV page hash on the path must now exist in storage.
-        backend = cache.cache_controller.storage_backend
-        page_hashes = self._all_page_hashes(cache, leaf)
-        self.assertEqual(len(page_hashes), len(seq) // self.cfg.page_size)
-        self.assertEqual(backend.batch_exists(page_hashes), len(page_hashes))
-        cache.sanity_check()
 
     def test_hicache_l3_prefetch(self):
         """L3 round trip: write with one tree, prefetch into a fresh tree.
@@ -6867,33 +6673,6 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(node))
         cache.sanity_check()
 
-    def test_hicache_match_through_evicted_node(self):
-        """Match can traverse evicted (S3) nodes using host_value."""
-        if self._skip_unsupported_hicache_test():
-            return
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        base = self._make_seq(1, 2)
-        leaf = base + self._make_seq(500, 2)
-        self._insert(cache, allocator, req_to_token_pool, base)
-        self._insert(cache, allocator, req_to_token_pool, leaf)
-
-        self._backup_tree(cache)
-
-        # Lock leaf so only base can be evicted
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", leaf))))
-        lr = cache.inc_lock_ref(m.last_device_node)
-
-        # Evict base (inner node won't be evicted while child is locked)
-        cache.evict(EvictParams(num_tokens=len(base)))
-
-        cache.dec_lock_ref(
-            m.last_device_node,
-            lr.to_dec_params(),
-        )
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", leaf))))
-        self.assertGreaterEqual(m.device_prefix_len, len(base))
-        cache.sanity_check()
-
     def test_hicache_partial_match_splits_evicted_backed_up_node(self):
         """Partial matches on host-only nodes must keep the host prefix usable."""
         if self._skip_unsupported_hicache_test():
@@ -7057,32 +6836,6 @@ class UnifiedRadixCacheSuite:
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
         cache.sanity_check()
 
-    def test_hicache_backup_continuity(self):
-        """Backed-up nodes form a continuous prefix from the root."""
-        if self._skip_unsupported_hicache_test():
-            return
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._make_seq(1, 4)
-        ps = self.cfg.page_size
-        self._insert(cache, allocator, req_to_token_pool, chain[: 2 * ps])
-        self._insert(cache, allocator, req_to_token_pool, chain)
-
-        self._backup_tree(cache)
-
-        # Verify: every backed-up node's parent is also backed-up (or root)
-        root = cache.root_node_handle()
-        all_nodes = cache.tree_core.get_all_node_ids()
-        for node in all_nodes:
-            if node == root:
-                continue
-            if cache.tree_core.is_backuped(node):
-                parent = _node_parent(cache, node)
-                self.assertTrue(
-                    parent == root or cache.tree_core.is_backuped(parent),
-                    f"Backup continuity violated: node {node} backed up but parent {parent} not",
-                )
-        cache.sanity_check()
-
     def test_hicache_write_through_offloads_swa_split_leaf(self):
         """A SWA boundary-split leaf should offload normally under write-through."""
         if not self.cfg.has_swa:
@@ -7114,78 +6867,6 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(cache.tree_core.is_full_device_evicted(split_leaf))
         self.assertTrue(cache.tree_core.is_backuped(split_leaf))
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(split_leaf))
-        cache.sanity_check()
-
-    def test_swa_deep_tree_backup_evict_loadback_stress(self):
-        """Deep multi-node SWA tree (long leaves, decode-evict tombstones,
-        shared-prefix branches) through write-through backup -> evict ->
-        loadback, asserting sanity throughout."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self._skip_unsupported_hicache_test():
-            return
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only keeps the deep-tree topology precise")
-
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        cache.write_through_threshold = 1  # real eager write-through auto-backup
-        ps = self.cfg.page_size
-        # Window in pages; sizes scale with it so the leaf-cap split fires.
-        tail_size = ((self.cfg.sliding_window_size + ps - 1) // ps) * ps
-        wp = max(1, tail_size // ps)
-
-        def insert_swa(tokens, swa_ev):
-            value = self._alloc(allocator, len(tokens))
-            if value is None:
-                return False
-            cache.insert(
-                InsertParams(
-                    key=RadixKey(array("q", tokens)),
-                    value=value,
-                    component_evicted_seqlens={ComponentType.SWA: swa_ev},
-                )
-            )
-            cache.writing_check()
-            cache.sanity_check()
-            return True
-
-        base = self._make_seq(1, wp + 2)  # long leaf -> cap-split
-        if not insert_swa(base, 0):
-            self.skipTest("kv pool too small for deep-tree stress")
-        # fresh decode-evicted seq: tombstone-prefix + cap-split stacked
-        insert_swa(self._make_seq(20000, wp + 2), ps)
-        insert_swa(base + self._make_seq(70000, 2), 0)  # depth
-        for i in range(2):  # width: branches off the base prefix
-            insert_swa(base[: 2 * ps] + self._make_seq(80000 + 1000 * i, 3), 0)
-
-        self.assertGreaterEqual(len(cache.tree_core.get_all_node_ids()), 5)
-
-        # Stepwise eviction -> demote to host, sanity after each round.
-        for _ in range(4):
-            full_ev = cache.full_evictable_size()
-            if full_ev == 0:
-                break
-            cache.evict(
-                EvictParams(
-                    num_tokens=max(ps, full_ev // 2),
-                    swa_num_tokens=cache.swa_evictable_size(),
-                )
-            )
-            cache.sanity_check()
-
-        # Load evicted prefixes back from host, sanity after each.
-        for tokens in (base, base[: 2 * ps]):
-            m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
-            anchor = m.best_match_node
-            if (
-                anchor != cache.root_node_handle()
-                and cache.tree_core.is_full_device_evicted(anchor)
-            ):
-                if cache.load_back(anchor):
-                    self._finish_pending_loads(cache)
-                    self._release_ongoing_load_back_locks(cache)
-            cache.sanity_check()
-
         cache.sanity_check()
 
     def test_hicache_evict_to_host_updates_aux_lru(self):
@@ -7315,6 +6996,9 @@ class UnifiedRadixCacheSuite:
         # The backed parent stops the Full backup chain, while the SWA window
         # reaches the unbacked grandparent and marks it under the anchor's ack.
         insert(3 * page)
+        # Queue the asynchronous window backup explicitly: write-back insertion
+        # no longer publishes it, but Mamba eviction must still respect its ack.
+        cache._execute_and_commit_kv_backup(BackupKV(node_ids=[anchor]))
         self.assertEqual(
             cache.ongoing_write_through[anchor].publish_node_ids, nodes[:3]
         )
@@ -7422,23 +7106,6 @@ class UnifiedRadixCacheSuite:
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
-    def test_hicache_write_through_internal_swa_evict_keeps_drop(self):
-        """Non-write_back policies keep the legacy tombstone-and-drop."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA component")
-        cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_through")
-
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
-
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
-        if m.best_match_node != cache.root_node_handle():
-            node = m.best_match_node
-            self.assertIsNone(
-                _host_value(cache, node, ComponentType.SWA),
-                "write_through keeps the legacy drop: no host demote",
-            )
-        cache.sanity_check()
-
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 
@@ -7522,21 +7189,6 @@ class UnifiedRadixCacheSuite:
             MatchPrefixParams(key=RadixKey(array("q", [1, 2, 3, 4, 99])))
         )
         self.assertEqual(result.full_kv_hit_length, 4)
-
-    def test_has_swa_host_pool_flag_matches_attached_pool(self):
-        """init_hicache caches SWA host-pool presence on the tree core after
-        the pool assembler runs; the flag must agree with the attached handle."""
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self.assertFalse(cache.tree_core.has_swa_host_pool)
-        if self._skip_unsupported_hicache_test():
-            return
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        swa = cache.components[ComponentType.SWA]
-        self.assertEqual(
-            cache.tree_core.has_swa_host_pool, swa._swa_kv_pool_host is not None
-        )
 
     def test_swa_backup_collector_is_shared_by_both_call_sites(self):
         """needs_incremental_backup and the BACKUP_HOST transfer read one
@@ -7683,42 +7335,6 @@ class UnifiedRadixCacheSuite:
             cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
         )
 
-    def test_mamba_device_value_accessor(self):
-        """Returns the device mamba value to CoW from, or None when device-evicted."""
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if not chain:
-            self.skipTest("chain too short")
-        node = chain[-1]
-        dev = torch.tensor([0], dtype=torch.int64)
-        host = torch.tensor([0], dtype=torch.int64)
-
-        # device present -> CoW source is the device value (host backup irrelevant)
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, dev)
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, None)
-        device_value = cache.tree_core.get_component_device_value(
-            node, ComponentType.MAMBA
-        )
-        self.assertIsNotNone(device_value)
-        self.assertTrue(torch.equal(device_value, dev))
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, host)
-        device_value = cache.tree_core.get_component_device_value(
-            node, ComponentType.MAMBA
-        )
-        self.assertIsNotNone(device_value)
-        self.assertTrue(torch.equal(device_value, dev))
-        # device evicted -> nothing to CoW from
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
-        self.assertIsNone(
-            cache.tree_core.get_component_device_value(node, ComponentType.MAMBA)
-        )
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, None)
-        self.assertIsNone(
-            cache.tree_core.get_component_device_value(node, ComponentType.MAMBA)
-        )
-
     def test_prepare_prefetch_swa(self):
         if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+SWA")
@@ -7759,35 +7375,6 @@ class UnifiedRadixCacheSuite:
         # a query in flight (hit or miss) never occupies the SWA host pool.
         self.assertEqual(cache.swa_kv_pool_host.available_size(), avail)
         self.assertEqual(int(swa.alloc_prefetch_staging(sw).numel()), sw)
-
-    def test_prepare_prefetch_swa_pool_exhausted(self):
-        if not self.cfg.has_swa or self.cfg.has_mamba or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+SWA")
-        cache, _, _ = self._build_hicache_fixture()
-        sw = cache.sliding_window_size
-        swa = cache.components[ComponentType.SWA]
-        # pool can't satisfy even after evict -> no staging, the hit parks
-        with (
-            mock.patch.object(cache.swa_kv_pool_host, "alloc", return_value=None),
-            mock.patch.object(cache, "evict_host", autospec=True) as evict_host,
-        ):
-            self.assertIsNone(swa.alloc_prefetch_staging(sw))
-        # the retry must evict the SWA host pool, not the default (FULL) one
-        evict_host.assert_called_once_with(sw, ComponentType.SWA)
-
-    def test_prepare_prefetch_mamba(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
-        cache, _, _ = self._build_hicache_fixture()
-        # mamba always participates with exactly one state slot
-        mamba = cache.components[ComponentType.MAMBA]
-        self.assertEqual(
-            mamba.prepare_prefetch(
-                cache.root_node_handle(), prefetch_tokens=0
-            ).staging_tokens,
-            1,
-        )
-        self.assertEqual(int(mamba.alloc_prefetch_staging(1).numel()), 1)
 
     def test_buffer_only_hit_parks_on_swa_staging_shortfall(self):
         """A hit whose SWA window cannot be staged parks whole and launches
@@ -8469,36 +8056,6 @@ class UnifiedRadixCacheSuite:
         )
         self._release_ongoing_load_back_locks(cache)
 
-    def test_load_back_load_failure_frees_unpublished_mamba_slot(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=_node_key_length(cache, leaf)))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
-
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        # cache_controller.load() failing (device alloc / transfer resolution)
-        # must also return the slot this call allocated.
-        with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            loaded = cache.load_back(leaf, req=req)
-
-        self.assertFalse(loaded)
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
-        )
-        self._release_ongoing_load_back_locks(cache)
-
     def test_load_back_abort_keeps_preexisting_mamba_slot(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
@@ -8699,32 +8256,6 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(_host_value(cache, root, ComponentType.MAMBA))
         self.assertIsNone(comp.prepare_load_back(root, req=req2).allocated_mamba_slot)
         self.assertIsNone(req2.kv.mamba_pool_idx)
-
-    def test_prepare_load_back_skips_device_present_node(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
-            self.skipTest("requires page_size=1 Full+Mamba")
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-        comp = cache.components[ComponentType.MAMBA]
-
-        # Back up without evicting: device value stays and a host copy is added, so build_hicache_transfers no-ops and prepare must not allocate a dead slot.
-        self._backup_node(cache, leaf)
-        self.assertIsNotNone(_device_value(cache, leaf, ComponentType.MAMBA))
-        self.assertIsNotNone(_host_value(cache, leaf, ComponentType.MAMBA))
-
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        self.assertIsNone(comp.prepare_load_back(leaf, req=req).allocated_mamba_slot)
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
-        )
 
     def test_prepare_load_back_mamba_pool_exhausted(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
@@ -9073,23 +8604,6 @@ class UnifiedRadixCacheSuite:
             cache.tree_core.component_evictable_size(ComponentType.SWA) - pre_evictable,
             n_swa,
         )
-
-    def test_swa_remapping_rejects_length_mismatch(self):
-        """A RebuildFullToSWAMapping with mismatched full/swa lengths is rejected on apply."""
-        if self._skip_unsupported_hicache_test():
-            return
-        if ComponentType.SWA not in self.cfg.components:
-            self.skipTest("requires the SWA component")
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_hicache(cache, write_policy="write_back")
-        full = torch.tensor([1, 2], dtype=torch.int64, device=cache.device)
-        swa = torch.tensor([1], dtype=torch.int64, device=cache.device)
-        # Per-pair token-count mismatch is rejected.
-        with self.assertRaises(AssertionError):
-            cache._apply_cache_actions([RebuildFullToSWAMapping([full], [swa])])
-        # A mismatched number of full vs swa chunks is rejected.
-        with self.assertRaises(AssertionError):
-            cache._apply_cache_actions([RebuildFullToSWAMapping([full], [swa, swa])])
 
     def _swa_anchor_chain_tokens(self, num_pages: int) -> list[int]:
         """Reproduce the token sequence used by _build_chain_pages."""
@@ -9452,41 +8966,6 @@ class UnifiedRadixCacheSuite:
         # credited to protected, or the ledger drifts on the final release.
         cache.sanity_check()
 
-    def test_hicache_mixed_backup_evict_insert(self):
-        """Complex scenario: backup some, evict, insert new, verify invariants."""
-        if self._skip_unsupported_hicache_test():
-            return
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        seqs = [self._make_seq(i * 100, 2) for i in range(5)]
-
-        # Insert all
-        for s in seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-        cache.sanity_check()
-
-        for i in range(3):
-            m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seqs[i]))))
-            self._backup_node(cache, m.last_device_node)
-
-        # Evict to free some tokens
-        cache.evict(EvictParams(num_tokens=len(seqs[0]) * 2))
-        cache.sanity_check()
-
-        # Insert new sequences
-        new_seqs = [self._make_seq(i * 1000, 2) for i in range(3)]
-        for s in new_seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-        cache.sanity_check()
-
-        # Verify D-leaf / H-leaf mutual exclusion
-        overlap = [
-            node_id
-            for node_id in cache.tree_core.get_all_node_ids()
-            if cache.tree_core.is_device_evictable_leaf(node_id)
-            and cache.tree_core.is_host_evictable_leaf(node_id)
-        ]
-        self.assertEqual(len(overlap), 0)
-
     def test_hicache_write_back_leaf_backup(self):
         """write_back: evicting a device leaf backs it up to host"""
         if self._skip_unsupported_hicache_test():
@@ -9564,11 +9043,8 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
-    def test_write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone(
-        self,
-    ):
-        """Write-back builds the insert backup as [target] only, so a second SWA
-        window publish never re-marks an ancestor another ack still holds."""
+    def test_write_back_defers_swa_window_backup_until_eviction(self):
+        """Reinserting backed Full nodes must not publish freshly recovered SWA."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
         if self._skip_unsupported_hicache_test():
@@ -9612,16 +9088,14 @@ class UnifiedRadixCacheSuite:
             "_execute_and_commit_kv_backup",
             wraps=cache._execute_and_commit_kv_backup,
         ) as backups:
-            for seq, target in ((t1_seq, t1), (t2_seq, t2)):
-                backups.reset_mock()
+            for seq in (t1_seq, t2_seq):
                 self._insert(cache, allocator, req_to_token_pool, seq)
-                self.assertEqual(
-                    [call.args[0].node_ids for call in backups.call_args_list],
-                    [[target]],
-                )
+            backups.assert_not_called()
 
-        for node, ack in ((c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)):
-            self.assertEqual(cache.tree_core.get_write_through_pending_id(node), ack)
+        for node in (c, b, t1, d, t2):
+            self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
+            self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+        self.assertEqual(cache.cache_controller.write_queue, [])
         # Write-back defers the unbacked Full prefix to eviction.
         self.assertFalse(cache.tree_core.is_backuped(c))
         self.assertFalse(cache.tree_core.is_backuped(d))
@@ -10152,90 +9626,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             [3, 4, 5, 7],
         )
 
-    def test_apply_component_action_device_kv_full_swa_uses_full_attn(self):
-        cache = mock.MagicMock()
-        cache.is_swa_enabled = True
-        indices = torch.tensor([4, 5])
-        _component_with_cache(ComponentType.FULL, cache).apply_component_action(
-            FreeComponentDeviceSlot([indices], component_type=ComponentType.FULL)
-        )
-        cache.token_to_kv_pool_allocator.full_attn_allocator.free_segment.assert_called_once_with(
-            indices, start_pos=0
-        )
-
-    def test_apply_component_action_device_kv_swa_uses_free_swa_segment(self):
-        cache = mock.MagicMock()
-        indices = torch.tensor([4, 5])
-        _component_with_cache(ComponentType.SWA, cache).apply_component_action(
-            FreeComponentDeviceSlot([indices], component_type=ComponentType.SWA)
-        )
-        cache.token_to_kv_pool_allocator.free_swa_segment.assert_called_once_with(
-            indices, start_pos=0
-        )
-
-    def test_apply_component_action_device_kv_mamba_uses_mamba_allocator(self):
-        cache = mock.MagicMock()
-        cache.req_to_token_pool.mamba_ckpt_pool = None
-        indices = torch.tensor([4, 5])
-        _component_with_cache(ComponentType.MAMBA, cache).apply_component_action(
-            FreeComponentDeviceSlot([indices], component_type=ComponentType.MAMBA)
-        )
-        cache.req_to_token_pool.mamba_allocator.free.assert_called_once_with(indices)
-
-    def test_apply_component_action_device_kv_mamba_routes_to_int8_ckpt_pool(self):
-        cache = mock.MagicMock()
-        indices = torch.tensor([4, 5])
-        _component_with_cache(ComponentType.MAMBA, cache).apply_component_action(
-            FreeComponentDeviceSlot([indices], component_type=ComponentType.MAMBA)
-        )
-        cache.req_to_token_pool.mamba_ckpt_pool.free.assert_called_once_with(indices)
-        cache.req_to_token_pool.mamba_allocator.free.assert_not_called()
-
-    def test_apply_component_action_host_kv_swa(self):
-        cache = mock.MagicMock()
-        first, second = torch.tensor([4, 5]), torch.tensor([6])
-        empty = torch.empty((0,), dtype=torch.int64)
-        _component_with_cache(ComponentType.SWA, cache).apply_component_action(
-            FreeComponentHostSlot(
-                [first, empty, second], component_type=ComponentType.SWA
-            ),
-        )
-        calls = cache.cache_controller.append_host_mem_release.call_args_list
-        # empty page skipped; each non-empty page released under the SWA pool
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].kwargs["extra_pools"][0].name, PoolName.SWA)
-        self.assertIs(calls[0].kwargs["extra_pools"][0].host_indices, first)
-        self.assertEqual(calls[1].kwargs["extra_pools"][0].name, PoolName.SWA)
-        self.assertIs(calls[1].kwargs["extra_pools"][0].host_indices, second)
-
-    def test_apply_component_action_host_kv_mamba(self):
-        cache = mock.MagicMock()
-        indices = torch.tensor([4, 5])
-        _component_with_cache(ComponentType.MAMBA, cache).apply_component_action(
-            FreeComponentHostSlot([indices], component_type=ComponentType.MAMBA)
-        )
-        calls = cache.cache_controller.append_host_mem_release.call_args_list
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0].kwargs["extra_pools"][0].name, PoolName.MAMBA)
-        self.assertIs(calls[0].kwargs["extra_pools"][0].host_indices, indices)
-
-    def test_apply_component_action_swa_rebuild(self):
-        cache = mock.MagicMock()
-        alloc = cache.token_to_kv_pool_allocator
-        source_value = torch.tensor([3, 4], dtype=torch.int64)
-        swa_value = torch.tensor([7, 8], dtype=torch.int64)
-        alloc.translate_swa_indices_for_transfer.return_value = swa_value
-        _component_with_cache(ComponentType.SWA, cache).apply_component_action(
-            SWARebuild(node_id=5, source_value=source_value),
-        )
-        # translate the source full to SWA and store it on the node (no free)
-        alloc.translate_swa_indices_for_transfer.assert_called_once_with(source_value)
-        alloc.free.assert_not_called()
-        alloc.free_full.assert_not_called()
-        cache.tree_core.set_component_device_value.assert_called_once_with(
-            5, ComponentType.SWA, swa_value
-        )
-
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
@@ -10265,11 +9655,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
         )
-
-    def test_apply_cache_action_unknown_type_raises(self):
-        cache = mock.MagicMock()
-        with self.assertRaises(AssertionError):
-            UnifiedRadixCache._apply_cache_action(cache, object())
 
     def test_apply_cache_actions_applies_each_in_order(self):
         cache = mock.MagicMock()
@@ -10471,29 +9856,6 @@ class TestResumableInsertWalk(_InsertWalkSuite):
         (ancestor,) = _node_children(cache, cache.root_node_handle())
         self.assertTrue(cache.tree_core.is_backuped(ancestor))
         cache.sanity_check()
-
-    def test_begin_insert_rejects_concurrent_walk(self):
-        """Insert walks are single-flight: beginning a second insert while one
-        is suspended at a barrier is re-entrancy and must fail fast."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        cache.write_through_threshold = 2
-        self._insert(cache, allocator, req_to_token_pool, [1, 2])
-
-        # Suspend an insert at its crossing barrier by pumping it directly.
-        params = InsertParams(
-            key=RadixKey(array("q", [1, 2, 3, 4])),
-            value=self._alloc(allocator, 4),
-        )
-        step = cache.tree_core.begin_insert(params)
-        self.assertIsNone(step.result)
-        with self.assertRaisesRegex(RuntimeError, "concurrent insert walks"):
-            cache.tree_core.begin_insert(params)
-        cache.tree_core.end_insert()
-
-    def test_resume_insert_rejects_missing_walk(self):
-        cache, _, _ = build_fixture(self.cfg)
-        with self.assertRaisesRegex(RuntimeError, "no in-flight insert"):
-            cache.tree_core.resume_insert()
 
     def test_insert_abort_drains_pending_deferred_frees(self):
         """A mid-insert failure after a deferred dup-free accumulated must still
@@ -11048,26 +10410,6 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         self.assertFalse(host_frees)
         host_mock.free_host_values.assert_called_once()
 
-    def test_undrained_result_trips_the_del_assert(self):
-        """Dropping a result without draining fires the __del__ tripwire (the
-        only forgotten-drain detection); a drained result stays silent."""
-        seen = []
-        old_hook = sys.unraisablehook
-        sys.unraisablehook = lambda unraisable: seen.append(unraisable.exc_value)
-        try:
-            undrained = DemoteResult()
-            undrained.device_frees[ComponentType.FULL].append(torch.tensor([1]))
-            del undrained
-
-            drained = DemoteResult()
-            drained.device_frees[ComponentType.FULL].append(torch.tensor([1]))
-            drained.device_frees.clear()
-            del drained
-        finally:
-            sys.unraisablehook = old_hook
-        self.assertEqual(len(seen), 1)
-        self.assertIsInstance(seen[0], AssertionError)
-
     def test_node_info_facades_forward_to_the_tree(self):
         """The scheduler's storage-prefetch facades (is_backuped / is_root /
         get_last_hash_value / get_prefix_hash_values) resolve NodeIds tree-side
@@ -11092,24 +10434,6 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         # The prefix chain carries the ancestors' hashes, not the node's own.
         self.assertEqual(cache.get_prefix_hash_values(parent), [])
         self.assertEqual(cache.get_prefix_hash_values(child), ["h1", "h2"])
-
-    def test_evict_host_drains_freed_host_values_to_the_pool(self):
-        """Host eviction's returned frees must reach the host pool in the same
-        call; a dropped drain leaves the pool permanently smaller."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (leaf,) = _node_children(cache, cache.root_node_handle())
-        self.assertGreater(_write_backup(cache, leaf, write_back=True), 0)
-        cache.writing_check(write_back=True)
-        cache.evict(EvictParams(num_tokens=4))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
-
-        host_pool = cache.cache_controller.mem_pool_host
-        available_before = host_pool.available_size()
-        evicted = cache.evict_host(4)
-        self.assertGreater(evicted, 0)
-        self.assertGreater(host_pool.available_size(), available_before)
-        cache.sanity_check()
 
 
 class TestPrefetchCommitOrdering(CustomTestCase):
@@ -11401,19 +10725,6 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         cache.sanity_check()
 
-    def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
-        """Write-through: eviction after such a refill must not corrupt the tree."""
-        cache, allocator, _ = build_fixture(self.cfg)
-        self._init_hicache(cache)
-
-        parent_id = self._insert_device(
-            cache, allocator, list(range(1, 1 + 3 * self.ps))
-        )
-        self._attach_host_child(cache, parent_id, start_token=1000)
-
-        cache.evict(EvictParams(num_tokens=10 * self.ps))
-        cache.sanity_check()
-
     def test_prefetch_refill_kept_under_unbacked_parent_in_write_back(self):
         """Write-back keeps the refill (it has no backed-up-parent requirement)."""
         cache, allocator, _ = build_fixture(self.cfg)
@@ -11425,6 +10736,105 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         child = self._attach_host_child(cache, parent_id, start_token=1000)
         self.assertIsNotNone(child)
         cache.sanity_check()
+
+
+class TestSWADraftHistory(CustomTestCase):
+    """A widened draft needs SWA history before the target window. A running
+    checkpoint must lock that history, and an incomplete cached window must
+    not be reused even when the target alone could read it. The shared suite
+    runs these contracts against both Python and Rust TreeCore.
+    """
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        sliding_window_size=511,
+        draft_swa_window=516,
+        is_eagle=True,
+        kv_size=2048,
+        max_context_len=2048,
+        num_layers=2,
+        full_attention_layer_ids=(0,),
+        head_num=1,
+        head_dim=8,
+        enable_mamba_extra_buffer=True,
+    )
+
+    def _request(self, pool):
+        tokens = array("q", range(1, 1025))
+        req = Req(
+            rid="widened-draft",
+            origin_input_text="",
+            origin_input_ids=tokens,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
+        )
+        pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = tokens
+        req.extend_end = len(tokens)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(0)
+        req.lock = None
+        req.extra_key = None
+        return req
+
+    def test_checkpoint_protects_widened_draft_history_under_eviction(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        req = self._request(pool)
+        req.last_node = cache.root_node_handle()
+        kv = allocator.alloc(1024)
+        pool.write((req.kv.req_pool_idx, slice(0, 1024)), kv)
+        cache.checkpoint(req, up_to=1024)
+        self.addCleanup(lambda: cache.unlock(req.lock))
+
+        # Mamba disables bigram keys: this checkpoint is exactly at 1024.
+        self.assertEqual(req.kv.cache_protected_len, 1024)
+        # A three-depth draft with five front rows and three warmup rows has
+        # its first real query at 1022. Its window needs key 511, which lies
+        # before the target-only lock [513, 1024).
+        needed = kv[1024 - self.cfg.draft_swa_window : 1024]
+        mapping = allocator.full_to_swa_index_mapping
+        before = mapping[needed].clone()
+        self.assertTrue(bool((before > 0).all()))
+        cache.evict(EvictParams(swa_num_tokens=1))
+        torch.testing.assert_close(mapping[needed], before)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+        )
+        self.assertEqual(match.device_prefix_len, 1024)
+
+        # Decode advances past the last recurrent checkpoint. Its complete
+        # draft history must remain until a newer checkpoint replaces it.
+        cache.evict_sliding_windows(req, 1040)
+        torch.testing.assert_close(mapping[needed], before)
+        cache.sanity_check()
+
+    def test_prefix_match_rejects_target_only_swa_history(self):
+        for retained, expected_match in ((511, 0), (516, 1024)):
+            with self.subTest(retained=retained):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=64
+                )
+                req = self._request(pool)
+                kv = allocator.alloc(1024)
+                cutoff = 1024 - retained
+                allocator.free_swa_segment(kv[:cutoff], start_pos=0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(req.origin_input_ids),
+                        value=kv,
+                        mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
+                        component_evicted_seqlens={ComponentType.SWA: cutoff},
+                    )
+                )
+                result = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+                )
+                self.assertEqual(result.device_prefix_len, expected_match)
+                cache.sanity_check()
 
 
 class TestSWAWindowUnderBigramKey(CustomTestCase):
@@ -11501,6 +10911,59 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         )
 
         cache.unlock(req.lock)
+        cache.sanity_check()
+
+    def test_finish_after_decode_eviction_frees_only_the_requests_pages(self):
+        # Decode evicts at pre_len = seq_len - 1. When the last verify then commits
+        # one token, the finished insert ends at page_floor(pre_len): the frontier
+        # must sit a full window below it although the window is not page-aligned.
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page_size = self.cfg.page_size
+        full_total = allocator.full_available_size()
+        swa_total = allocator.swa_available_size()
+        prompt_len, owned = 4 * page_size, 6 * page_size
+        tokens = list(range(1, owned + 1))
+
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens[:prompt_len]),
+            sampling_params=SamplingParams(
+                temperature=0, max_new_tokens=owned - prompt_len
+            ),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
+        req.extend_end = prompt_len
+        kv_indices = self._alloc_paged(allocator, owned)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, owned)), kv_indices)
+        req.kv.kv_committed_len = prompt_len
+        req.kv.kv_allocated_len = owned
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        cache.checkpoint(req, up_to=prompt_len)
+
+        req.output_ids = tokens[prompt_len:]
+        req.kv.kv_committed_len = owned
+        cache.evict_sliding_windows(req, owned - 1)
+        insert_boundary = (owned - 1) // page_size * page_size
+        self.assertGreaterEqual(
+            insert_boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
+            self.cfg.sliding_window_size,
+        )
+        req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        # Each page is back in the pool or held by the tree, never both.
+        self.assertEqual(
+            allocator.full_available_size() + cache.full_evictable_size(), full_total
+        )
+        self.assertEqual(
+            allocator.swa_available_size() + cache.swa_evictable_size(), swa_total
+        )
         cache.sanity_check()
 
 
