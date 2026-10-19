@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -65,8 +66,7 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
     draft_block_ids: torch.Tensor
-    raw_hidden: torch.Tensor
-    draft_hidden_3d: torch.Tensor
+    hidden_states: torch.Tensor
     can_run_graph: bool
 
 
@@ -280,40 +280,66 @@ def draft_markov_block(
     return torch.stack(draft_tokens, dim=1), logits_out
 
 
-def sample_draft_block(
+class DraftProposalTensors(NamedTuple):
+    # [bs, gamma]
+    draft_tokens: torch.Tensor
+    # [bs, gamma, vocab]; None for a greedy draft.
+    step_logits: Optional[torch.Tensor]
+    # [bs, gamma]; None when the draft has no confidence head.
+    confidence: Optional[torch.Tensor]
+    confidence_raw: Optional[torch.Tensor]
+
+
+def run_draft_proposal(
     *,
-    base_logits: torch.Tensor,
+    model,
+    hidden_states: torch.Tensor,
     anchor_tokens: torch.Tensor,
-    draft_hidden: Optional[torch.Tensor],
-    sampling_info,
-    markov_head,
+    bs: int,
+    gamma: int,
+    step_temperatures: torch.Tensor,
     noise: DraftNoise,
-    device: torch.device,
     tp_sync: SpecTpSync,
     greedy_draft: bool,
-) -> DraftBlockResult:
-    params = resolve_draft_params(
-        sampling_info=sampling_info, bs=base_logits.shape[0], device=device
-    )
+    base_logits_context=None,
+    step_logits_out: Optional[torch.Tensor] = None,
+) -> DraftProposalTensors:
+    """Draft a block from the draft forward's hidden rows. The step logits go to
+    ``step_logits_out`` ([bs, gamma, vocab]) when given."""
+    if model.sample_from_anchor:
+        if hidden_states.shape[0] != bs * gamma:
+            raise RuntimeError(
+                f"DSpark draft returned {hidden_states.shape[0]} hidden rows, "
+                f"expected {bs * gamma}."
+            )
+        model_hidden = hidden_states
+        draft_hidden = hidden_states.view(bs, gamma, -1)
+    else:
+        model_hidden, draft_hidden = select_draft_hidden_without_anchor(
+            hidden_states, bs=bs, gamma=gamma
+        )
+    with base_logits_context or contextlib.nullcontext():
+        base_logits, confidence_features = model.compute_base_logits(model_hidden)
+        base_logits = base_logits.view(bs, gamma, -1)
     draft_tokens, step_logits = draft_markov_block(
-        markov_head=markov_head,
+        markov_head=model.markov_head,
         base_logits=base_logits,
         anchor_tokens=anchor_tokens,
         draft_hidden=draft_hidden,
-        step_temperatures=params.step_temperatures,
+        step_temperatures=step_temperatures,
         noise=noise,
         tp_sync=tp_sync,
+        logits_out=step_logits_out,
         greedy_draft=greedy_draft,
     )
-    return DraftBlockResult(
-        draft_tokens=draft_tokens,
-        corrected_logits=(
-            None if greedy_draft else expect(_DRAFT_STEP_LOGITS, step_logits)
-        ),
-        greedy_mask=params.greedy_mask,
-        temperatures=params.temperatures,
-        greedy_draft=greedy_draft,
-    )
+    confidence = confidence_raw = None
+    if model.confidence_head is not None:
+        confidence, confidence_raw = model.compute_confidence(
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            confidence_features=confidence_features,
+        )
+    return DraftProposalTensors(draft_tokens, step_logits, confidence, confidence_raw)
 
 
 class DraftBlockProposer:
@@ -345,7 +371,7 @@ class DraftBlockProposer:
                 1, dtype=torch.int64, device=self.draft_model_runner.device
             ),
         )
-        self._draft_sampler = None
+        self._graph_tail = None
         self._dp_moe_sync = dp_moe_sync
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
@@ -356,15 +382,24 @@ class DraftBlockProposer:
             else None
         )
 
-    @property
-    def noise(self) -> DraftNoise:
-        return self._noise
+    def build_graph_tail(self, *, max_bs: int, out: Optional[torch.Tensor] = None):
+        """The proposal as the draft cuda graph's tail, sharing this proposer's
+        noise; ``propose`` reads it after a replay."""
+        from sglang.srt.speculative.dspark_components.dspark_proposal_graph_tail import (
+            DraftProposalGraphTail,
+        )
 
-    def attach_draft_sampler(self, draft_sampler) -> None:
-        self._draft_sampler = draft_sampler
-
-    def _base_logits_context(self):
-        return draft_tp_context(self._dp_moe_sync)
+        self._graph_tail = DraftProposalGraphTail(
+            model=self.draft_model,
+            gamma=self.gamma,
+            max_bs=max_bs,
+            device=self.draft_model_runner.device,
+            noise=self._noise,
+            tp_sync=self._tp_sync,
+            greedy_draft=self._greedy_draft,
+            out=out,
+        )
+        return self._graph_tail
 
     def propose(
         self,
@@ -382,7 +417,7 @@ class DraftBlockProposer:
             if not self.sample_from_anchor
             else target_model.get_input_embeddings()
         )
-        draft_sampler = self._draft_sampler
+        graph_tail = self._graph_tail
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -390,54 +425,40 @@ class DraftBlockProposer:
             bs=bs,
             device=device,
             embed_module=embed_module,
-            draft_sampler=draft_sampler,
+            graph_tail=graph_tail,
             sampling_info=sampling_info,
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = None
-        folded = False
-        if (
-            envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
-            and draft_sampler is not None
-            and fwd.can_run_graph
-        ):
-            folded = True
-            draft_block = DraftBlockResult(
-                draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=(
-                    None if self._greedy_draft else draft_sampler.step_logits[:bs]
-                ),
-                greedy_mask=draft_sampler.params.greedy_mask[:bs],
-                temperatures=draft_sampler.params.temperatures[:bs],
-                greedy_draft=self._greedy_draft,
-            )
-            if draft_sampler.confidence_out is not None:
-                confidence = draft_sampler.confidence_out[:bs]
-                confidence_raw = draft_sampler.confidence_raw_out[:bs]
+        folded = graph_tail is not None and fwd.can_run_graph
+        if folded:
+            proposal, params = graph_tail.views(bs)
         else:
-            with self._base_logits_context():
-                base_logits, confidence_features = self.draft_model.compute_base_logits(
-                    fwd.raw_hidden
-                )
-                base_logits = base_logits.view(bs, self.gamma, -1)
-            draft_block = sample_draft_block(
-                base_logits=base_logits,
+            params = resolve_draft_params(
+                sampling_info=sampling_info, bs=bs, device=device
+            )
+            proposal = run_draft_proposal(
+                model=self.draft_model,
+                hidden_states=fwd.hidden_states,
                 anchor_tokens=draft_block_ids[:, 0],
-                draft_hidden=fwd.draft_hidden_3d,
-                sampling_info=sampling_info,
-                markov_head=self.draft_model.markov_head,
+                bs=bs,
+                gamma=self.gamma,
+                step_temperatures=params.step_temperatures,
                 noise=self._noise,
-                device=device,
                 tp_sync=self._tp_sync,
                 greedy_draft=self._greedy_draft,
+                base_logits_context=draft_tp_context(self._dp_moe_sync),
             )
-            if self.draft_model.confidence_head is not None:
-                confidence, confidence_raw = self.draft_model.compute_confidence(
-                    anchor_tokens=draft_block_ids[:, 0],
-                    draft_tokens=draft_block.draft_tokens,
-                    confidence_features=confidence_features,
-                )
+            proposal = proposal._replace(
+                step_logits=expect(_DRAFT_STEP_LOGITS, proposal.step_logits)
+            )
+        draft_block = DraftBlockResult(
+            draft_tokens=proposal.draft_tokens,
+            corrected_logits=proposal.step_logits,
+            greedy_mask=params.greedy_mask,
+            temperatures=params.temperatures,
+            greedy_draft=self._greedy_draft,
+        )
         proposal_block_ids = (
             draft_block_ids
             if self.sample_from_anchor
@@ -446,8 +467,8 @@ class DraftBlockProposer:
         return DraftProposal(
             draft_block_ids=proposal_block_ids,
             draft_block=draft_block,
-            confidence=confidence,
-            confidence_raw=confidence_raw,
+            confidence=proposal.confidence,
+            confidence_raw=proposal.confidence_raw,
             folded=folded,
         )
 
@@ -486,10 +507,9 @@ class DraftBlockProposer:
         bs: int,
         device: str,
         embed_module,
-        draft_sampler=None,
+        graph_tail=None,
         sampling_info=None,
     ) -> DraftForwardResult:
-        gamma = self.gamma
         query_token_num = self.query_token_num
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
@@ -555,36 +575,20 @@ class DraftBlockProposer:
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         if (
-            draft_sampler is not None
+            graph_tail is not None
             and graph_runner is not None
             and graph_runner.can_run_graph(draft_forward_batch)
         ):
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+            graph_tail.stage_sampling_params(bs=bs, sampling_info=sampling_info)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
-        raw_hidden = logits_output.hidden_states
-        if raw_hidden is None:
+        hidden_states = logits_output.hidden_states
+        if hidden_states is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        if self.sample_from_anchor:
-            expected_rows = bs * gamma
-            if raw_hidden.shape[0] != expected_rows:
-                raise RuntimeError(
-                    f"DSpark draft returned {raw_hidden.shape[0]} hidden rows, "
-                    f"expected {expected_rows}."
-                )
-            model_hidden = raw_hidden
-            draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
-        else:
-            model_hidden, draft_hidden_3d = select_draft_hidden_without_anchor(
-                raw_hidden,
-                bs=bs,
-                gamma=gamma,
-            )
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
-            raw_hidden=model_hidden,
-            draft_hidden_3d=draft_hidden_3d,
+            hidden_states=hidden_states,
             can_run_graph=draft_out.can_run_graph,
         )
 

@@ -11,7 +11,8 @@ from sglang.srt.models.dspark import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
-    sample_draft_block,
+    resolve_draft_params,
+    run_draft_proposal,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -26,18 +27,25 @@ def _draft(head, sampling_info, offset, greedy_draft=False):
     base = torch.randn(BS, GAMMA, VOCAB).to(torch.bfloat16)
     hidden = torch.randn(BS, GAMMA, HIDDEN).to(torch.bfloat16)
     anchor = torch.randint(0, VOCAB, (BS,))
-    block = sample_draft_block(
-        base_logits=base,
-        anchor_tokens=anchor,
-        draft_hidden=hidden,
-        sampling_info=sampling_info,
+    model = SimpleNamespace(
         markov_head=head,
+        confidence_head=None,
+        sample_from_anchor=True,
+        compute_base_logits=lambda h: (base.view(BS * GAMMA, -1), h),
+    )
+    params = resolve_draft_params(sampling_info=sampling_info, bs=BS, device="cpu")
+    proposal = run_draft_proposal(
+        model=model,
+        hidden_states=hidden.view(BS * GAMMA, HIDDEN),
+        anchor_tokens=anchor,
+        bs=BS,
+        gamma=GAMMA,
+        step_temperatures=params.step_temperatures,
         noise=DraftNoise(key=3, offset=offset),
-        device="cpu",
         tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
         greedy_draft=greedy_draft,
     )
-    return block, base, hidden, anchor
+    return proposal, params, base, hidden, anchor
 
 
 def _step_logits_along(head, base, hidden, anchor, tokens):
@@ -51,7 +59,7 @@ def _step_logits_along(head, base, hidden, anchor, tokens):
     return torch.stack(rows, dim=1)
 
 
-class TestSampleDraftBlock(CustomTestCase):
+class TestRunDraftProposal(CustomTestCase):
     def test_greedy_rows_take_the_argmax_and_keep_their_logits(self):
         for head in (
             VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK),
@@ -65,10 +73,10 @@ class TestSampleDraftBlock(CustomTestCase):
                 top_ks=torch.tensor([1, 50, 1, 50]),
             )
             offset = torch.zeros(1, dtype=torch.int64)
-            block, base, hidden, anchor = _draft(head, sampling_info, offset)
+            block, _, base, hidden, anchor = _draft(head, sampling_info, offset)
             logits = _step_logits_along(head, base, hidden, anchor, block.draft_tokens)
-            self.assertEqual(block.corrected_logits.dtype, logits.dtype)
-            self.assertTrue(torch.equal(block.corrected_logits, logits))
+            self.assertEqual(block.step_logits.dtype, logits.dtype)
+            self.assertTrue(torch.equal(block.step_logits, logits))
             greedy = torch.tensor([True, False, True, False])
             self.assertTrue(
                 torch.equal(
@@ -81,7 +89,6 @@ class TestSampleDraftBlock(CustomTestCase):
                     block.draft_tokens[~greedy], logits[~greedy].float().argmax(-1)
                 )
             )
-            self.assertEqual(block.greedy_mask.tolist(), greedy.tolist())
             self.assertEqual(offset.item(), 1)
 
     def test_greedy_draft_takes_every_argmax_and_keeps_no_logits(self):
@@ -93,13 +100,12 @@ class TestSampleDraftBlock(CustomTestCase):
             top_ks=torch.tensor([50, 50, 1, 50]),
         )
         offset = torch.zeros(1, dtype=torch.int64)
-        block, base, hidden, anchor = _draft(
+        block, _, base, hidden, anchor = _draft(
             head, sampling_info, offset, greedy_draft=True
         )
         logits = _step_logits_along(head, base, hidden, anchor, block.draft_tokens)
         self.assertTrue(torch.equal(block.draft_tokens, logits.float().argmax(-1)))
-        self.assertIsNone(block.corrected_logits)
-        self.assertTrue(block.greedy_draft)
+        self.assertIsNone(block.step_logits)
 
 
 class TestFusedGreedyEligibility(CustomTestCase):
