@@ -156,8 +156,8 @@ def mxfp8_skinny_gemm(
     (UE8M0, FlashInfer 128x4 swizzled). weight: E4M3 [N, K].
     weight_block_scale: FP32 power-of-two scales [ceil(N / 32), K / 32].
     counters: only for shapes that split K; a contiguous int32 tensor of at
-    least ceil(N / BN) zeros on the device of `a`, used by one stream at a
-    time; the kernel leaves them zero.
+    least ceil(N / BN) elements on the device of `a`, used by one stream at a
+    time. They must be zero on entry (not checked); the kernel leaves them zero.
     """
     m, k = a.shape
     n = weight.shape[0]
@@ -184,7 +184,7 @@ def mxfp8_skinny_gemm(
     ):
         raise ValueError(
             f"(N, K) = ({n}, {k}) splits K, so counters must be a contiguous int32 "
-            f"tensor of at least {tiles_n} zeros on {a.device}"
+            f"tensor of at least {tiles_n} entries on {a.device}"
         )
     out = torch.empty((m, n), dtype=out_dtype, device=a.device)
     ws = (
