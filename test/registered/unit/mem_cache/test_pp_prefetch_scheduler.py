@@ -1,12 +1,13 @@
 """Readiness-first PP gate with native queue ownership and CPU cache/pool doubles."""
 
 import logging
+import time
 import unittest
 from array import array
 from dataclasses import replace
 from enum import Enum, auto
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from pp_cache_test_support import (
     Allocator,
@@ -117,9 +118,8 @@ class GateTests(unittest.TestCase):
             req.reset_for_retract = Mock()
             req.skip_radix_cache_insert = True
             req.prefill_attempt_count = 1
-            req.time_stats = NS(
-                reset_prefill_retry_time=Mock(), set_wait_queue_entry_time=Mock()
-            )
+            req.time_stats.reset_prefill_retry_time = Mock()
+            req.time_stats.set_wait_queue_entry_time = Mock()
             requeue(s, req)
             self.assertEqual(s.waiting_queue, [req])
             self.assertFalse(gate.entries)
@@ -144,6 +144,36 @@ class GateTests(unittest.TestCase):
         _, batches = cycle(stages)
         self.assertEqual(batches, [(("r", 896, 1025),)] * 3)
         self.assert_released(stages)
+
+    def test_readiness_records_native_storage_wait_once(self):
+        gate = self.stages()[0]
+        stats = NS(storage_prefetch_wait_s=0.0, _storage_prefetch_wait_start=None)
+        observe = method(
+            "observability/req_time_stats.py",
+            "SchedulerReqTimeStats",
+            "observe_storage_prefetch_ready",
+            {"time": time},
+        )
+        stats.observe_storage_prefetch_ready = lambda ready: observe(stats, ready)
+        gate.s.waiting_queue[0].time_stats = stats
+        gate._watch_waiting()
+        gate.s.tree_cache.waiting.add("r")
+        with patch.object(time, "perf_counter", return_value=10.0) as clock:
+            gate._report_readiness()
+            clock.return_value = 11.0
+            gate._report_readiness()
+            gate.s.tree_cache.waiting.clear()
+            clock.return_value = 13.0
+            gate._report_readiness()
+            self.assertEqual(stats.storage_prefetch_wait_s, 3.0)
+            self.assertIsNone(stats._storage_prefetch_wait_start)
+            # Other PP stages are still pending; local stop permission ends
+            # this wait before finalize, prefix consensus or batch admission.
+            self.assertNotEqual(gate.entries["r"].ready_mask, gate.all_ready)
+            self.assertFalse(gate.s.tree_cache.finalized)
+            clock.return_value = 20.0
+            gate._report_readiness()
+            self.assertEqual(stats.storage_prefetch_wait_s, 3.0)
 
     def test_pending_only_reports_deltas_without_termination_or_reservation(self):
         stages = self.stages()

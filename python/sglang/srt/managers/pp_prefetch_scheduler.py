@@ -234,6 +234,9 @@ class PPAdmissionGate:
         )
         updates = dict(self.incoming.ready) if self.rank else {}
         for entry, ready in zip(pending, flags):
+            # End the observed wait at this stage's stop permission, excluding
+            # the subsequent PP consensus and capacity waits.
+            entry.req.time_stats.observe_storage_prefetch_ready(ready)
             if ready:
                 # Latched stop permission, not a prefix/capacity promise.
                 # Later policy changes affect requests not yet reported READY.

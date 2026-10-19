@@ -238,6 +238,7 @@ def request(rid):
         return_logprob=False,
         logprob_start_len=-1,
         sampling_params=NS(max_new_tokens=32),
+        time_stats=NS(observe_storage_prefetch_ready=lambda ready: None),
         grammar=None,
         beam_group=None,
         session=None,
