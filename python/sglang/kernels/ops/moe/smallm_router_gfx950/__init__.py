@@ -10,7 +10,7 @@ import tempfile
 
 import torch
 
-from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc, _Kernel
+from sglang.kernels.jit.utils.hipcc import _check, _hip_lib, _hipcc, _Kernel
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
