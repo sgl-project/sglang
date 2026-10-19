@@ -30,7 +30,10 @@ class TestRegisterToBootstrap(CustomTestCase):
         from itertools import product
 
         from sglang.srt.disaggregation.base.conn import KVPoll
-        from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+        from sglang.srt.disaggregation.common.conn import (
+            CommonKVManager,
+            CommonKVSender,
+        )
 
         for system_dp_size, attn_dp_size in ((4, 1), (1, 4)):
             for method, force_query, dp_rank, room, explicit_rank in product(
