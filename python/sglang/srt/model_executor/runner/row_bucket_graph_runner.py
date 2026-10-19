@@ -39,8 +39,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 Body = Callable[[List[torch.Tensor], "ForwardBatch"], List[Optional[torch.Tensor]]]
-# Wraps capture and each replay with the batch the body reads and the bucket's
-# static inputs, e.g. to lay the batch out for a collective in the body.
+# Wraps capture and replay with the body's batch and the bucket's static inputs.
 BatchScope = Callable[["ForwardBatch", List[torch.Tensor]], ContextManager]
 
 
@@ -103,13 +102,11 @@ class RowBucketGraphRunner:
         out_rows: Optional[int] = None,
     ) -> List[Optional[torch.Tensor]]:
         """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
-        it on first use. ``key`` names whatever besides row count and input shapes
-        changes what ``body`` records; ``context`` wraps capture and replay with
-        the batch the eager breaks read, ``batch_scope`` with the batch the body
-        reads. ``bucket_from`` picks the bucket from another row count, so ranks
-        whose body holds a collective replay the same bucket. Returns the outputs
-        cut to ``out_rows`` rows (default the live ones), as views of graph
-        buffers valid until the next replay."""
+        it on first use. ``key`` names what besides row count and input shapes
+        changes the recording; ``context`` and ``batch_scope`` wrap capture and
+        replay with the breaks' and the body's batch; ``bucket_from`` picks the
+        bucket from another row count. Returns views valid until the next replay,
+        cut to ``out_rows`` rows."""
         num_rows = live[0].shape[0]
         out_rows = num_rows if out_rows is None else out_rows
         rows = self.bucket_rows(num_rows if bucket_from is None else bucket_from)
@@ -180,8 +177,7 @@ class RowBucketGraphRunner:
                 start,
                 free_before,
             )
-            # The capture read device tensors the scope put on the batch by
-            # address; leaving it may drop them, so the graph keeps them.
+            # The graph reads device tensors the scope put on the batch.
             graph.batch += (dict(vars(capture_batch)),)
         return graph
 

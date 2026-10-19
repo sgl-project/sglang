@@ -3910,8 +3910,6 @@ class DeepseekV4Model(nn.Module):
                             tail, num_tokens=input_ids.shape[0]
                         )
                     ):
-                        # One break runs the tail layers on the live rows and
-                        # bridges them back into the captured block.
                         residual, pre, aux = (
                             self.decoder_replay_tail.run_in_prefill_graph(
                                 state=state,
@@ -3959,7 +3957,6 @@ class DeepseekV4Model(nn.Module):
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
             if use_tail_graph and tail is None and i == self.late_layer_start:
-                # An idle DP rank replays the same bucket with no rows of its own.
                 residual, pre, aux = self.decoder_replay_tail.run_idle(
                     state=state,
                     positions=positions,
