@@ -421,6 +421,32 @@ class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
         return encode_MediaRef(self)
 
 
+class ShutdownRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ShutdownRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ShutdownRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ShutdownRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ShutdownRequest(self)
+
+
+class ShutdownResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ShutdownResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ShutdownResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ShutdownResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ShutdownResponse(self)
+
+
 class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ListModelsRequest: JSON object (unknown keys ignored)."""
 
@@ -1814,6 +1840,26 @@ def encode_MediaInput(v: MediaInput) -> Any:
     if isinstance(v, list) and (v and isinstance(v[0], list)):
         return encode_MediaItemsList(v)
     return v
+
+
+def decode_ShutdownRequest(value: Any) -> ShutdownRequest:
+    m = _expect_map(value, expected="struct ShutdownRequest")
+    return ShutdownRequest()
+
+
+def encode_ShutdownRequest(v: ShutdownRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ShutdownResponse(value: Any) -> ShutdownResponse:
+    m = _expect_map(value, expected="struct ShutdownResponse")
+    return ShutdownResponse()
+
+
+def encode_ShutdownResponse(v: ShutdownResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
 
 
 def decode_ListModelsRequest(value: Any) -> ListModelsRequest:

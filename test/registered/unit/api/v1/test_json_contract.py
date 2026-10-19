@@ -23,6 +23,8 @@ from sglang.api.v1.api_types import (
     LogprobEntry,
     MediaRef,
     SamplingParams,
+    ShutdownRequest,
+    ShutdownResponse,
     decode_FinishReason,
     decode_MediaInput,
     decode_OptionalInt64OrList,
@@ -46,6 +48,14 @@ def compact(value) -> str:
 
 def sp(text: str) -> SamplingParams:
     return SamplingParams.from_json_value(json.loads(text))
+
+
+class TestShutdownContract(CustomTestCase):
+    def test_shutdown_messages_are_empty(self):
+        for message in (ShutdownRequest, ShutdownResponse):
+            with self.subTest(message=message.__name__):
+                self.assertEqual(message().to_json_value(), {})
+                self.assertEqual(message.from_json_value({}), message())
 
 
 class TestSamplingParams(CustomTestCase):

@@ -914,6 +914,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        # Admission and shutdown run on this loop. There is no await between
+        # this check and _init_req_state, so the watchdog sees every admitted
+        # request, including ones still tokenizing or waiting on a lock.
+        if self.gracefully_exit:
+            raise fastapi.HTTPException(
+                status_code=503, detail="Engine is shutting down"
+            )
+
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)

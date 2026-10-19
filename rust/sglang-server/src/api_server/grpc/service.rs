@@ -84,6 +84,20 @@ impl GrpcService {
 impl SglangService for GrpcService {
     type GenerateStream = ResponseStream<api::GenerateStreamItem>;
 
+    async fn shutdown(
+        &self,
+        _request: Request<api::ShutdownRequest>,
+    ) -> Result<Response<api::ShutdownResponse>, Status> {
+        // This frontend lives inside a scheduler process, without a Python
+        // TokenizerManager. CoreHandle has no engine-owner hook to drain all
+        // DP groups, coordinate the parent's subprocess watchdog, and exit
+        // every rank. Runtime::request_shutdown only stops frontend threads;
+        // enqueueing ShutdownReq locally would bypass that missing ownership.
+        Err(Status::unimplemented(
+            "native engine-owner shutdown is unavailable; use runtime.v1 on a Python-backed engine",
+        ))
+    }
+
     /// `/generate` over gRPC: one schema, one fan-out, one admission path. A
     /// body that fails normalization ends the RPC with INVALID_ARGUMENT before
     /// anything reaches the scheduler, as the HTTP 400 does.
@@ -226,6 +240,25 @@ mod tests {
     use crate::message::request::{GenerateRequest, Request as RuntimeRequest, RequestKind};
     use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink};
     use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
+
+    #[tokio::test]
+    async fn shutdown_without_engine_owner_is_unimplemented_and_has_no_side_effects() {
+        let harness = Harness::new(1, false, Duration::from_secs(1));
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                harness
+                    .service
+                    .shutdown(Request::new(api::ShutdownRequest {})),
+            )
+            .await
+            .expect("must not wait for a scheduler response");
+            assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
+        }
+        assert!(harness.intake_rx.is_empty());
+        assert!(harness.abort_rx.is_empty());
+        assert!(harness.service.core.is_ready());
+    }
 
     struct Harness {
         service: GrpcService,

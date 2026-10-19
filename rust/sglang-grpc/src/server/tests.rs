@@ -149,6 +149,7 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
         "HealthCheck",
         "FlushCache",
         "Abort",
+        "Shutdown",
     ] {
         client.ready().await.unwrap();
         let result: Result<tonic::Response<GetServerInfoResponse>, _> = client
@@ -176,4 +177,64 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
     .unwrap()
     .unwrap();
     assert!(std::net::TcpStream::connect(addr).is_err());
+}
+
+#[tokio::test]
+async fn engine_watch_emits_final_unhealthy_state_before_close() {
+    use sglang_api_types::runtime::v1::EngineStateSnapshot;
+    use tokio_stream::StreamExt;
+
+    for already_observed in [false, true] {
+        let (state_tx, state_rx) = tokio::sync::watch::channel(EngineStateSnapshot {
+            healthy: true,
+            revision: 1,
+            ..Default::default()
+        });
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut stream = super::engine_state_stream(state_rx, shutdown_rx);
+        assert!(stream.next().await.unwrap().unwrap().healthy);
+        state_tx.send_replace(EngineStateSnapshot {
+            healthy: false,
+            revision: 2,
+            ..Default::default()
+        });
+        if already_observed {
+            assert!(!stream.next().await.unwrap().unwrap().healthy);
+        }
+        // Both branches are ready when the client next polls.
+        shutdown_tx.send_replace(true);
+        if !already_observed {
+            let final_state = stream.next().await.unwrap().unwrap();
+            assert!(!final_state.healthy);
+            assert_eq!(final_state.revision, 2);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn engine_watch_shutdown_before_first_poll_preserves_final_state() {
+    use sglang_api_types::runtime::v1::EngineStateSnapshot;
+    use tokio_stream::StreamExt;
+
+    let (state_tx, state_rx) = tokio::sync::watch::channel(EngineStateSnapshot {
+        healthy: true,
+        revision: 1,
+        ..Default::default()
+    });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut stream = super::engine_state_stream(state_rx, shutdown_rx);
+    state_tx.send_replace(EngineStateSnapshot {
+        healthy: false,
+        revision: 2,
+        ..Default::default()
+    });
+    shutdown_tx.send_replace(true);
+    assert!(!stream.next().await.unwrap().unwrap().healthy);
+    assert!(stream.next().await.is_none());
 }

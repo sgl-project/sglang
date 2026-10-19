@@ -7,11 +7,13 @@ TokenizerManager's event loop.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from fastapi import HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
@@ -99,9 +101,15 @@ class RuntimeHandle:
             logger.warning("gRPC chunk_callback failed: %s", e)
             return None
 
-    def _send_native_error(self, chunk_callback, message: str):
+    def _send_native_error(self, chunk_callback, error: Exception):
         # ChunkCallback extracts the PyDict arg before reading error=.
-        return self._safe_callback(chunk_callback, {}, finished=True, error=message)
+        return self._safe_callback(
+            chunk_callback,
+            {},
+            finished=True,
+            error=str(error),
+            status_code=getattr(error, "status_code", None),
+        )
 
     _BACKPRESSURE_TIMEOUT_S = 300.0
 
@@ -273,6 +281,7 @@ class RuntimeHandle:
         chunk_callback,
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
+        self._ensure_accepting_requests()
         mock_request = (
             _GrpcRequest(is_disconnected_fn=is_disconnected_fn)
             if is_disconnected_fn is not None
@@ -345,7 +354,7 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC generate error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
+            self._send_native_error(chunk_callback, e)
         finally:
             if gen is not None:
                 await gen.aclose()
@@ -360,7 +369,44 @@ class RuntimeHandle:
             self._safe_callback(chunk_callback, {}, finished=True)
         except Exception as e:
             logger.error("gRPC embed error for rid=%s: %s", obj.rid, e)
-            self._send_native_error(chunk_callback, str(e))
+            self._send_native_error(chunk_callback, e)
+
+    def _ensure_accepting_requests(self) -> None:
+        if self.tokenizer_manager.gracefully_exit:
+            raise HTTPException(status_code=503, detail="Engine is shutting down")
+
+    _SHUTDOWN_TIMEOUT_S = 5.0
+
+    def shutdown(self) -> None:
+        """Accept shutdown on the owner loop; the existing watchdog does the rest.
+
+        Only the state transition is awaited, never draining or engine exit.
+        A timeout/disconnection does not cancel an already queued shutdown.
+        """
+        loop = self._tm_loop
+        if self.tokenizer_manager.gracefully_exit:
+            return
+        if loop.is_closed() or not loop.is_running():
+            raise RuntimeError("TokenizerManager event loop is not running")
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is loop:
+            self.tokenizer_manager.gracefully_exit = True
+            return
+
+        accepted = concurrent.futures.Future()
+
+        def accept():
+            try:
+                self.tokenizer_manager.gracefully_exit = True
+                accepted.set_result(None)
+            except Exception as error:
+                accepted.set_exception(error)
+
+        loop.call_soon_threadsafe(accept)
+        accepted.result(timeout=self._SHUTDOWN_TIMEOUT_S)
 
     # Bounded so a stuck TM loop can't deadlock the gRPC handler thread that
     # called abort. abort_request only enqueues a message on the ZMQ socket,
@@ -583,6 +629,7 @@ class RuntimeHandle:
         trace_headers: Optional[Dict[str, str]],
         is_disconnected_fn: Optional[Callable[[], bool]],
     ) -> None:
+        self._ensure_accepting_requests()
         self._submit_on_tm_loop(
             self._run_openai_request(
                 serving_key,
@@ -716,6 +763,7 @@ class RuntimeHandle:
         is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         try:
+            self._ensure_accepting_requests()
             serving = self._get_openai_serving()[serving_key]
 
             try:
@@ -820,7 +868,11 @@ class RuntimeHandle:
             error_body = json.dumps({"error": {"message": str(e)}}).encode("utf-8")
             if streaming:
                 self._safe_callback(
-                    chunk_callback, error_body, finished=True, error=str(e)
+                    chunk_callback,
+                    error_body,
+                    finished=True,
+                    error=str(e),
+                    status_code=getattr(e, "status_code", None),
                 )
             else:
                 self._safe_callback(

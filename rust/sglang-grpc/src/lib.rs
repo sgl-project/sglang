@@ -23,10 +23,14 @@ struct GrpcServerHandle {
 #[pymethods]
 impl GrpcServerHandle {
     /// Gracefully shut down the gRPC server.
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, py: Python<'_>) {
         self.shutdown.notify_one();
         if let Some(handle) = self.join_handle.take() {
-            let _ = handle.join();
+            // Runtime teardown waits for outstanding blocking bridge calls.
+            // They need the GIL to finish; holding it while joining deadlocks.
+            py.detach(move || {
+                let _ = handle.join();
+            });
         }
     }
 
