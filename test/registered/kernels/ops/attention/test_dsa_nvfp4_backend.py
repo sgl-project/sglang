@@ -60,6 +60,7 @@ def test_pool_prefill_and_fused_decode(has_prefix):
         backend.device_sm_major = 9
         backend.flashmla_kv_num_q_heads = 64
         backend.real_page_size = 64
+        backend.physical_page_size = 64
         backend.kv_cache_dim = 416
         backend._sink_pad_cache = {}
         layer = SimpleNamespace(

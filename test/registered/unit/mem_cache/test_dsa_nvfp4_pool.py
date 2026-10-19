@@ -361,10 +361,19 @@ def _flash_geometry(**kwargs):
 
 def test_glm5_next_fa3_contract():
     validate_dsa_nvfp4(
-        SimpleNamespace(dsa_prefill_backend="fa3", dsa_decode_backend="fa3"),
+        SimpleNamespace(
+            dsa_prefill_backend="fa3", dsa_decode_backend="fa3", page_size=256
+        ),
         _flash_geometry(),
         is_sm90=True,
     )
+
+
+def test_glm5_next_requires_logical_256_token_pages():
+    with pytest.raises(ValueError, match="page_size=256"):
+        validate_dsa_nvfp4(
+            SimpleNamespace(page_size=64), _flash_geometry(), is_sm90=True
+        )
 
 
 @pytest.mark.parametrize("field", ["dsa_prefill_backend", "dsa_decode_backend"])
@@ -400,8 +409,8 @@ def flash_pool():
     publish(ServerArgs(model_path="dummy"), role="test")
     try:
         yield HybridLinearKVPool(
-            size=128,
-            page_size=64,
+            size=512,
+            page_size=256,
             dtype=torch.float4_e2m1fn_x2,
             head_num=1,
             head_dim=512,
@@ -427,11 +436,11 @@ def test_hybrid_nvfp4_mapping_and_separate_indexer(flash_pool):
     assert pool.dsa_kv_cache_store_nvfp4
     assert not pool.dsa_kv_cache_store_fp8
     assert pool.kv_cache_dim == 288
-    assert pool.get_key_buffer(7).shape == (192, 1, 288)
+    assert pool.get_key_buffer(7).shape == (768, 1, 288)
     pool.full_kv_pool.mla_kv_global_scale[1] = 0.5
     assert pool.get_mla_kv_global_scale(7).item() == 0.5
     layer = SimpleNamespace(layer_id=7)
-    loc = torch.tensor([63, 64, 127])
+    loc = torch.tensor([255, 256, 511])
     latent = torch.full((3, 1, 512), 3.0, dtype=torch.bfloat16)
     pool.set_mla_kv_buffer(layer, loc, latent, None)
     restored, rope = pool.get_mla_kv_buffer(layer, loc.flip(0))
@@ -452,7 +461,7 @@ def test_hybrid_nvfp4_mapping_and_separate_indexer(flash_pool):
 @pytest.mark.parametrize("mode", ["extend", "decode"])
 @pytest.mark.parametrize("tail_tokens", [0, 1, 2, 3])
 def test_glm5_next_fa3_consumes_dequantized_rows_and_preserves_tail(
-    flash_pool, monkeypatch, mode, tail_tokens
+    flash_pool, mode, tail_tokens
 ):
     from sglang.srt.layers.attention import dsa_backend as module
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -549,4 +558,60 @@ def test_flash_capacity_uses_dsa_layers_and_288_byte_rows(flash_pool):
         == 288
     )
     planner = object.__new__(DefaultPoolConfigurator)
-    assert planner._compute_cell_size(kvc, num_layers=2) == 2 * (288 + 132)
+    assert planner._compute_cell_size(kvc, num_layers=2) == 2 * (288 + 132 // 4)
+
+
+def test_nvfp4_fa3_chunks_rebase_lengths_and_keep_query_order(flash_pool):
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+    backend = object.__new__(DeepseekSparseAttnBackend)
+    backend.token_to_kv_pool = flash_pool
+    n = 130
+    loc = torch.tensor([255, 256, 511])
+    layer = SimpleNamespace(layer_id=7)
+    flash_pool.set_mla_kv_buffer(
+        layer, loc, torch.full((3, 1, 512), 6.0, dtype=torch.bfloat16), None
+    )
+    # Use a narrow sparse table here; the tail-width tests exercise 2051
+    # columns separately. This test focuses on splitting independent queries.
+    indices = torch.full((n, 8), -1, dtype=torch.int32)
+    indices[:, :3] = loc.to(torch.int32)
+    queries = torch.arange(n, dtype=torch.bfloat16).view(n, 1, 1).expand(n, 8, 512)
+    lengths = torch.full((n,), 3, dtype=torch.int32)
+    cu_q = torch.arange(n + 1, dtype=torch.int32)
+    cu_k = cu_q * 3
+    seen = []
+
+    def attention(**kwargs):
+        rows = kwargs["q_nope"].shape[0]
+        seen.append(rows)
+        assert rows <= 64
+        assert kwargs["kv_cache"].shape == (rows * 8, 1, 512)
+        assert torch.equal(
+            kwargs["cu_seqlens_q"], torch.arange(rows + 1, dtype=torch.int32)
+        )
+        assert torch.equal(
+            kwargs["cu_seqlens_k"], torch.arange(rows + 1, dtype=torch.int32) * 3
+        )
+        physical = kwargs["page_table"][:, :3].long().reshape(-1)
+        assert (kwargs["kv_cache"][physical] == 6.0).all()
+        return kwargs["q_nope"].clone()
+
+    backend._forward_fa3 = attention
+    output = backend._forward_nvfp4_fa3(
+        layer_id=7,
+        kv_cache=flash_pool.get_key_buffer(7),
+        page_table=indices,
+        q_nope=queries,
+        q_rope=None,
+        cache_seqlens=lengths,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        v_head_dim=512,
+        max_seqlen_q=1,
+        sm_scale=256**-0.5,
+        logit_cap=0.0,
+        page_size=1,
+    )
+    assert seen == [64, 64, 2]
+    assert torch.equal(output, queries)

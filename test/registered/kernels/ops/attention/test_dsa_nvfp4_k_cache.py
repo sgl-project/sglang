@@ -127,6 +127,7 @@ def test_no_rope_cuda_scatter_and_graph_replay(num_tokens):
     # writer without touching a nonexistent RoPE field.
     quantize_nvfp4_k_cache_into(latent, None, compact, loc, scale)
     dequantize_nvfp4_k_cache_paged(compact, gather, scale)
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         quantize_nvfp4_k_cache_into(latent, None, compact, loc, scale)

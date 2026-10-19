@@ -2511,13 +2511,12 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "fa3":
+            fa3_forward = self._forward_fa3
+            extra_args = {}
             if self.dsa_kv_cache_store_nvfp4:
-                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
-                    kv_cache=kv_cache,
-                    page_table=page_table_1,
-                    layer_id=layer.layer_id,
-                )
-            return self._forward_fa3(
+                fa3_forward = self._forward_nvfp4_fa3
+                extra_args["layer_id"] = layer.layer_id
+            return fa3_forward(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
@@ -2530,6 +2529,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                **extra_args,
             )
         elif dsa_impl == "aiter":
             if q_rope is not None:
@@ -2716,13 +2716,12 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
             )
         elif dsa_impl == "fa3":
+            fa3_forward = self._forward_fa3
+            extra_args = {}
             if self.dsa_kv_cache_store_nvfp4:
-                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
-                    kv_cache=kv_cache,
-                    page_table=page_table_1,
-                    layer_id=layer.layer_id,
-                )
-            return self._forward_fa3(
+                fa3_forward = self._forward_nvfp4_fa3
+                extra_args["layer_id"] = layer.layer_id
+            return fa3_forward(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
                 v_head_dim=layer.v_head_dim,
@@ -2735,6 +2734,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                **extra_args,
             )
         elif dsa_impl == "aiter":
             if q_all is None or not _is_hip:
@@ -2827,6 +2827,59 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_nvfp4_fa3(
+        self,
+        *,
+        layer_id: int,
+        kv_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Bound selected-row BF16 materialization for the functional FA3 path.
+
+        DSA presents one independent FA3 sequence per query token. Rebase the
+        cumulative lengths for each chunk without changing selected history or
+        KPool tails. At 2051 picks and 512 BF16 values, 64 queries need about
+        128 MiB of temporary KV instead of O(entire prefill chunk * topk).
+        All loop bounds come from shapes, so capture needs no device-to-host sync.
+        """
+        num_queries = q_nope.shape[0]
+        if kwargs["max_seqlen_q"] != 1 or page_table.shape[0] != num_queries:
+            raise ValueError("NVFP4 FA3 requires one page-table row per query token")
+        if (
+            cache_seqlens.shape[0] < num_queries
+            or cu_seqlens_q.shape[0] < num_queries + 1
+            or cu_seqlens_k.shape[0] < num_queries + 1
+        ):
+            raise ValueError("NVFP4 FA3 metadata must cover every query token")
+        if num_queries == 0:
+            return q_nope.new_empty((0, q_nope.shape[1], kwargs["v_head_dim"]))
+        outputs = []
+        for start in range(0, num_queries, 64):
+            end = min(start + 64, num_queries)
+            selected_kv, selected_pages = self._prepare_nvfp4_paged_fallback(
+                kv_cache, page_table[start:end], layer_id
+            )
+            outputs.append(
+                self._forward_fa3(
+                    kv_cache=selected_kv,
+                    page_table=selected_pages,
+                    q_nope=q_nope[start:end],
+                    q_rope=q_rope[start:end] if q_rope is not None else None,
+                    cache_seqlens=cache_seqlens[start:end],
+                    cu_seqlens_q=cu_seqlens_q[start : end + 1] - cu_seqlens_q[start],
+                    cu_seqlens_k=cu_seqlens_k[start : end + 1] - cu_seqlens_k[start],
+                    **kwargs,
+                )
+            )
+            del selected_kv, selected_pages
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
     def _prepare_nvfp4_paged_fallback(
         self,

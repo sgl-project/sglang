@@ -66,5 +66,7 @@ def validate_dsa_nvfp4(cfg, hf_config, *, is_sm90: bool) -> None:
         raise ValueError("DSA NVFP4 speculative decoding is not yet validated")
     if getattr(cfg, "disaggregation_mode", None) not in (None, "null"):
         raise ValueError("DSA NVFP4 does not yet support prefill/decode disaggregation")
-    if getattr(cfg, "page_size", None) not in (None, 64):
-        raise ValueError("DSA NVFP4 requires page_size=64")
+    # KPool pages contain 64 pooled index entries and 64 * kpool main tokens.
+    page_size = 256 if is_glm5_next else 64
+    if getattr(cfg, "page_size", None) not in (None, page_size):
+        raise ValueError(f"DSA NVFP4 requires page_size={page_size}")
