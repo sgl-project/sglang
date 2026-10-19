@@ -6,10 +6,8 @@ The checkpoint is not a GQA ``DSparkDraftModel``: attention weights are
 ``q_a_proj`` / ``kv_a_proj_with_mqa`` / ``kv_b_proj``, and target features
 enter through ``context_proj`` + ``context_norm``.
 
-The draft KV pool is replicated under DCP (same as the GQA DSpark draft).
-This module writes the latent directly into that pool. The worker keeps the
-draft attention off the target's DCP-reduce kernel so the launch stays the
-non-DCP MLA persistent kernel.
+Under DCP the draft KV pool is sharded with the target: each rank stores
+``loc // attn_dcp_size`` for the ids it owns. GQA DSpark drafts stay replicated.
 """
 
 from __future__ import annotations
@@ -83,8 +81,15 @@ class K3DSparkBackbone(nn.Module):
                         prefix=add_prefix(f"layers.{i}", prefix),
                     )
                     for i in range(num_layers)
-                ]
-            )
+            ]
+        )
+        # aiter's bf16 GEMM page-faults when M is not a multiple of 32.
+        # 96 tokens capture; 90 and 48 do not. The MLA kernel itself accepts
+        # those batches, so the pad stays on these linears.
+        for layer in self.layers:
+            for child in layer.modules():
+                if hasattr(child, "quant_method"):
+                    child.gemm_m_align = 32
         self.context_proj = nn.Linear(
             self.num_context_features * hidden_size,
             hidden_size,
@@ -221,13 +226,17 @@ class K3DSparkBackbone(nn.Module):
             attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             attn.w_vc = w_vc.contiguous().transpose(1, 2)
 
-    def _mla_latent(self, attn, hidden: torch.Tensor, positions: torch.Tensor):
+    def _mla_latent_parts(self, attn, hidden: torch.Tensor, positions: torch.Tensor):
         fused = attn.fused_qkv_a_proj_with_mqa(hidden)[0]
         kv = fused[..., attn.q_lora_rank :]
         k_nope = attn.kv_a_layernorm(kv[..., : attn.kv_lora_rank]).unsqueeze(1)
         k_pe = kv[..., attn.kv_lora_rank :].unsqueeze(1)
         if attn.rotary_emb is not None:
             _, k_pe = attn.rotary_emb(positions, k_pe.new_empty(k_pe.shape), k_pe)
+        return k_nope, k_pe
+
+    def _mla_latent(self, attn, hidden: torch.Tensor, positions: torch.Tensor):
+        k_nope, k_pe = self._mla_latent_parts(attn, hidden, positions)
         return torch.cat((k_nope, k_pe), dim=-1)
 
     def write_target_hidden_kv(
@@ -259,19 +268,19 @@ class K3DSparkBackbone(nn.Module):
             loc = cache_loc
         if loc.numel() == 0:
             return
-        # The draft pool is replicated. Its locs are the widened DCP ids, and
-        # set_kv_buffer refuses that space while DCP is on. Drop DCP only for
-        # the store so the row is written whole, not owner-sharded.
+        # Locs are the allocator's widened ids. With DCP on, set_kv_buffer
+        # rejects them; the sharded MLA write keeps this rank's rows at
+        # loc // attn_dcp_size. DCP off writes the concatenated latent whole.
+        shard = get_parallel().attn_dcp_size > 1
         for layer in self.layers:
             attn = layer.self_attn
-            cache_k = self._mla_latent(attn, ctx_hidden, positions)
-            with get_parallel().override(dcp_enabled=False, attn_dcp_size=1):
-                pool.set_kv_buffer(
-                    attn.attn_mqa,
-                    KVWriteLoc(loc, physical=True),
-                    cache_k,
-                    cache_k,
-                )
+            k_nope, k_pe = self._mla_latent_parts(attn, ctx_hidden, positions)
+            loc_info = KVWriteLoc(loc, physical=True)
+            if shard:
+                pool.set_mla_kv_buffer(attn.attn_mqa, loc_info, k_nope, k_pe)
+            else:
+                cache_k = torch.cat((k_nope, k_pe), dim=-1)
+                pool.set_kv_buffer(attn.attn_mqa, loc_info, cache_k, cache_k)
 
 
 class K3DSparkModel(DSparkDraftMixin, K3DSparkBackbone):

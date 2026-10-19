@@ -368,8 +368,9 @@ class KVCacheConfigurator:
         # SWA allocators never widen under DCP.
         if self.is_hybrid_swa:
             return max_total_num_tokens
-        # Target rows widen into attn_dcp_size ids; draft sizes already carry
-        # loc_space_scale.
+        # Target rows widen into attn_dcp_size ids. A replicated draft's size
+        # already includes loc_space_scale. K3DSpark's scale is 1, so it widens
+        # like the target.
         return (
             max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
         )
@@ -472,14 +473,24 @@ class KVCacheConfigurator:
             unified_memory_pool=pools.unified_memory_pool,
         )
 
+    def _draft_replicates_kv(self) -> bool:
+        """GQA DSpark keeps a full KV copy per rank. K3DSpark shards like the target."""
+        if not self.is_draft_worker:
+            return False
+        model_config = getattr(self, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None) or []
+        return "K3DSparkModel" not in architectures
+
     # Note(kpham-sgl):
     # 1. A replicated draft indexes the allocator's virtual locs raw, so its pools
     #    span and page that space; the sharded target translates and stays per-rank.
+    #    K3DSpark is the exception: it joins the target DCP group and stores one shard.
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
         dcp_size = get_parallel().attn_dcp_size
-        return dcp_size if (self.is_draft_worker and dcp_size > 1) else 1
+        return dcp_size if (dcp_size > 1 and self._draft_replicates_kv()) else 1
 
     @property
     def pool_page_size(self) -> int:
@@ -494,8 +505,9 @@ class KVCacheConfigurator:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # Draft pools are replicated, not DCP-sharded, yet consume the shared
-        # allocator's virtual locs in [0, max_total * dcp_size) untranslated.
+        # A replicated draft consumes the shared allocator's virtual locs in
+        # [0, max_total * dcp_size) untranslated. K3DSpark's scale is 1, so its
+        # pool stays per-rank and the sharded write collapses those locs.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:

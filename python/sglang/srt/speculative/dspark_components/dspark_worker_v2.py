@@ -209,11 +209,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         load_group = get_pp_stage_load_group()
-        # K3DSpark is absorbed MLA, but its KV pool is replicated like the GQA
-        # DSpark draft. Attention and graph capture must not take the target's
-        # DCP-reduce kernel. Pool sizing stays outside this scope: the draft
-        # allocator still widens locs by attn_dcp_size.
-        self._draft_mla_no_dcp = _draft_config_is_k3_dspark(server_args)
+        # K3DSpark shares the target DCP group, so this scope must not clear
+        # attn_dcp_size. The flag only covers the persistent kernel and the
+        # draft query width, which the GQA draft does not need.
+        self._k3_dspark_draft = _draft_config_is_k3_dspark(server_args)
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -481,11 +480,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     @contextmanager
     def _draft_context(self):
         with draft_tp_context(self._draft_dp_context_enabled):
-            if getattr(self, "_draft_mla_no_dcp", False):
-                with get_parallel().override(dcp_enabled=False, attn_dcp_size=1):
-                    yield
-            else:
-                yield
+            yield
 
     def alloc_memory_pool(
         self,
@@ -505,12 +500,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
         # The c16 server leaves SGLANG_AITER_MLA_PERSIST=0 so the target stays
-        # on the DCP ASM kernel. The K3 draft is non-DCP MLA with qlen 3; the
+        # on the DCP ASM kernel. The K3 draft block is qlen 4; the
         # non-persistent qseqlen4 kernel reads a fourth query row and faults.
         # Turn persistent on only while this draft backend is built. Forwards
         # read the flag stored on that backend.
         persist_restore = None
-        if getattr(self, "_draft_mla_no_dcp", False):
+        if getattr(self, "_k3_dspark_draft", False):
             import sglang.srt.layers.attention.aiter_backend as _aiter_backend
 
             persist_restore = _aiter_backend._use_mla_ps_kernel
@@ -528,7 +523,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         # KV are query_token_num wide. Leaving the backend at the verify
         # width makes qo_indptr / the KV lookup one row longer than Q, and
         # mla_a8w8_qh16_qseqlen4 page-faults on that row.
-        if getattr(self, "_draft_mla_no_dcp", False):
+        if getattr(self, "_k3_dspark_draft", False):
             draft_backend = self.draft_model_runner.attn_backend
             query_width = int(self.query_token_num)
             if (

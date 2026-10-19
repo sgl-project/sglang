@@ -626,6 +626,29 @@ class AiterAttnBackend(AttentionBackend):
             self.mla_kernel_num_head_padded = (
                 16 if _gathered_num_head < 16 else _gathered_num_head
             )
+            # The K3 draft has 8 local heads. Repeating them to 16 selects
+            # qh16 v3. On gfx950, fp8 qlen 4 with the count left at 8 selects
+            # the qh32 tile (s_MQA=8). v1_0 folds 8 up to 16 and then faults
+            # against that launch, so this path's metadata uses v1_2.
+            self._draft_native_gqa8 = False
+            if (
+                self.is_draft_worker
+                and self.dcp_world_size <= 1
+                and self.head_pad_mode == "repeat"
+                and self.num_head == 8
+                and self.kv_cache_dtype == fp8_dtype
+                and is_gfx95_supported()
+            ):
+                self.num_head_padded = self.num_head
+                self.mla_kernel_num_head_padded = self.num_head
+                self.head_pad_mode = "none"
+                self.head_repeat_factor = 1
+                self._draft_native_gqa8 = True
+                logger.info(
+                    "aiter draft MLA keeps %d heads so gfx950 fp8 qlen 4 "
+                    "launches the qh32 tile",
+                    self.num_head,
+                )
 
             self.attn_dp_enabled = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -805,6 +828,9 @@ class AiterAttnBackend(AttentionBackend):
             if metadata_intra_batch_mode is None
             else metadata_intra_batch_mode
         )
+        if getattr(self, "_draft_native_gqa8", False):
+            metadata_fast_mode = True
+            metadata_intra_batch_mode = False
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -888,6 +914,9 @@ class AiterAttnBackend(AttentionBackend):
             if nhead_override is None
             else nhead_override
         )
+        if getattr(self, "_draft_native_gqa8", False):
+            fast_mode = True
+            intra_batch_mode = False
 
         meta = get_mla_metadata_v1(
             qo_indptr,
@@ -1455,6 +1484,8 @@ class AiterAttnBackend(AttentionBackend):
         q / o must already be shaped (..., num_head, head_dim).
         """
         num_head = layer.tp_q_head_num
+        if getattr(self, "_draft_native_gqa8", False):
+            kwargs["intra_batch_mode"] = False
         if (
             self.use_mla_ps_kernel
             and self.dcp_world_size <= 1
@@ -1731,7 +1762,10 @@ class AiterAttnBackend(AttentionBackend):
         """DCP target verify on the asm cp round-robin kernel: one masked pass."""
         fm = self.forward_metadata
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
-        kernel_heads = fm.cprr_kernel_heads or num_heads
+        # 64 gathered heads are native on the non-cprr persistent kernel. The
+        # cprr map has no 64-head row, so it would pad the draft to 96.
+        draft_local = self.is_draft_worker
+        kernel_heads = num_heads if draft_local else (fm.cprr_kernel_heads or num_heads)
         if not self._cprr_launch_logged:
             self._cprr_launch_logged = True
             logger.info(
@@ -1753,6 +1787,8 @@ class AiterAttnBackend(AttentionBackend):
             device=q.device,
         )
         kv_indices, kv_indptr = fm.cprr_kv_indices, fm.cprr_kv_indptr
+        # The draft block attends its whole local shard. Passing the global
+        # indptr would select the target's causal cprr kernel.
         q_in = (
             q.view(n_rows, -1).to(fp8_dtype).view(n_rows, num_heads, layer.qk_head_dim)
         )
@@ -1785,10 +1821,10 @@ class AiterAttnBackend(AttentionBackend):
             intra_batch_mode=self.cprr_intra_batch_mode,
             num_kv_splits=self._kernel_num_kv_splits(),
             return_lse=True,
-            g_kv_indptr=fm.global_kv_indptr,
-            cp_world_size=self.dcp_world_size,
-            cp_rank=get_parallel().attn_dcp_rank,
-            causal=True,
+            g_kv_indptr=None if draft_local else fm.global_kv_indptr,
+            cp_world_size=1 if draft_local else self.dcp_world_size,
+            cp_rank=0 if draft_local else get_parallel().attn_dcp_rank,
+            causal=not draft_local,
         )
         lse = lse.view(n_rows, kernel_heads)
         if kernel_heads != num_heads:
@@ -2389,9 +2425,17 @@ class AiterAttnBackend(AttentionBackend):
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     max_seqlen_qo = draft_num
-                    is_cp_round_robin = self.dcp_world_size > 1
+                    # Draft indices are already this rank's shard. The round-robin
+                    # flag is for the target cprr kernel, which remaps them.
+                    is_cp_round_robin = (
+                        self.dcp_world_size > 1 and not self.is_draft_worker
+                    )
                     metadata_heads = (
-                        self.cprr_kernel_heads if use_asm_cprr_verify else None
+                        None
+                        if self.is_draft_worker
+                        else (
+                            self.cprr_kernel_heads if use_asm_cprr_verify else None
+                        )
                     )
                     (
                         work_metadata,
@@ -2884,8 +2928,9 @@ class AiterAttnBackend(AttentionBackend):
                 (True, False) if self.use_mla_dcp_asm else (fast_mode, intra_batch_mode)
             )
 
-            graph_use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
-                self.num_draft_tokens
+            graph_use_asm_cprr_verify = (
+                self._asm_cprr_supports_verify_shape(self.num_draft_tokens)
+                and not self.is_draft_worker
             )
             (
                 self.work_metadata,
@@ -3251,7 +3296,11 @@ class AiterAttnBackend(AttentionBackend):
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     num_kv_splits = self.max_split_per_batch
-                    is_cp_round_robin = self.dcp_world_size > 1
+                    # Draft indices are already this rank's shard. The round-robin
+                    # flag is for the target cprr kernel, which remaps them.
+                    is_cp_round_robin = (
+                        self.dcp_world_size > 1 and not self.is_draft_worker
+                    )
 
                     self.make_mla_meta_data(
                         qo_indptr,
@@ -3275,7 +3324,11 @@ class AiterAttnBackend(AttentionBackend):
                         ),
                         is_cp_round_robin=is_cp_round_robin,
                         nhead_override=(
-                            self.cprr_kernel_heads if use_asm_cprr_verify else None
+                            None
+                            if self.is_draft_worker
+                            else (
+                                self.cprr_kernel_heads if use_asm_cprr_verify else None
+                            )
                         ),
                     )
 
