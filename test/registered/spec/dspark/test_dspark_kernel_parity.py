@@ -267,12 +267,22 @@ def _case_compact_layout(tc):
 def _case_swa_page_indices(tc):
     torch.manual_seed(11)
     block_size, num_q, max_reqs, n_full = 5, 320, 300, 50000
+    seq_lens_casual = _ri(1, 300, (num_q,), torch.int32)
+    req_pool_indices_repeated = _ri(0, max_reqs, (num_q,))
     _, gather = tc._parity(
         dspark_attn_metadata.ComputeDsparkWindowGather,
-        seq_lens_casual=_ri(1, 300, (num_q,), torch.int32),
-        req_pool_indices_repeated=_ri(0, max_reqs, (num_q,)),
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
         block_size=block_size,
         swa_window=128,
+    )
+    tc._parity(
+        dspark_attn_metadata.ComputeDsparkWindowGather,
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+        block_size=block_size,
+        swa_window=128,
+        valid_from=_ri(0, 300, (max_reqs,)),
     )
     tc._parity(
         dspark_attn_metadata.BuildDsparkSwaPageIndices,
