@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 
 import torch
@@ -83,3 +84,71 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
                 self._bcast_layer(
                     buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
                 )
+
+
+class LinkerLoadBroadcast:
+    """Broadcast each layer the source rank loads to its rank-replicated peers."""
+
+    def __init__(self, broadcaster: LinkerMLADedupBroadcaster, tp_group, num_layers):
+        self.broadcaster = broadcaster
+        self.tp_group = tp_group
+        self.num_layers = num_layers
+        # counter index -> (next layer to broadcast, prepared indices, ready event)
+        self.batches = {}
+
+    @classmethod
+    def build(cls, pool_group, tp_cache_group, attn_tp_cache_group, tp_group):
+        broadcaster = LinkerMLADedupBroadcaster.build(
+            pool_group, tp_cache_group, attn_tp_cache_group
+        )
+        return cls(broadcaster, tp_group, pool_group.num_layers)
+
+    @property
+    def is_src(self) -> bool:
+        return self.broadcaster.is_src
+
+    def plans_agree(self, pending) -> bool:
+        """Collective, run every batch: compare logical load order, not local slots."""
+        plan = [
+            (rid, [(t.name, list(t.keys)) for t in transfers])
+            for rid, transfers in pending.items()
+        ]
+        digest = hashlib.sha256(repr(plan).encode()).digest()
+        digests = [None] * torch.distributed.get_world_size(self.tp_group)
+        torch.distributed.all_gather_object(digests, digest, group=self.tp_group)
+        return all(other == digest for other in digests)
+
+    def begin(self, index: int, pending) -> None:
+        indices = {}
+        for transfers in pending.values():
+            for transfer in transfers:
+                indices.setdefault(transfer.name, []).append(transfer.host_indices)
+        prepared = self.broadcaster.prepare_broadcast(
+            {name: torch.cat(parts) for name, parts in indices.items()},
+            device_module.current_stream(),
+        )
+        ready_event = device_module.Event()
+        ready_event.record()
+        self.batches[index] = (0, prepared, ready_event)
+
+    def broadcast_until(self, index: int, threshold: int) -> None:
+        batch = self.batches.get(index)
+        if batch is None:
+            return
+        first, prepared, ready_event = batch
+        if first == 0:
+            device_module.current_stream().wait_event(ready_event)
+        # KV access may wait several times per layer, or skip sparse layers.
+        # Launch each broadcast exactly once, in order, on the forward stream.
+        for layer in range(first, threshold + 1):
+            self.broadcaster.broadcast_loaded_layer(layer, prepared)
+        if threshold == self.num_layers - 1:
+            del self.batches[index]
+        else:
+            self.batches[index] = (max(first, threshold + 1), prepared, ready_event)
+
+    def reset(self) -> None:
+        self.batches.clear()
+
+    def destroy(self) -> None:
+        self.broadcaster.destroy()

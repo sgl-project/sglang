@@ -65,9 +65,13 @@ class _FakeLinker(UnifiedCacheLinker):
         self.completed_offloads = []
         self.reset_count = 0
         self.closed = False
+        self.released_lookups = []
 
     def lookup(self, rid, transfers):
         return list(self.restorable)
+
+    def release_lookup(self, rid):
+        self.released_lookups.append(rid)
 
     def load(self, rid, transfers):
         self.queued_loads[rid] = list(transfers)
@@ -1129,6 +1133,7 @@ def test_release_request_cancels_queued_load():
     assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
     assert wrapper.private_load_indices == {}
+    assert linker.released_lookups == ["rid"]
 
 
 def test_failed_offload_rolls_back_split_fragments():

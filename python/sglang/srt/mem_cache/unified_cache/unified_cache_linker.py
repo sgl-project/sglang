@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -62,6 +63,26 @@ _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
         ComponentType.MAMBA,
     }
 )
+
+
+def apply_hit_policy(
+    valid_pages: list[int], page_exists: list[bool], transfer: PoolTransfer
+) -> list[int]:
+    present_prefix = [0]
+    for present in page_exists:
+        present_prefix.append(present_prefix[-1] + int(present))
+
+    if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+        return [end for end in valid_pages if present_prefix[end] == end]
+    if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+        trailing = max(1, len(transfer.keys or ()))
+        return [
+            end
+            for end in valid_pages
+            if present_prefix[end] - present_prefix[max(0, end - trailing)]
+            == end - max(0, end - trailing)
+        ]
+    raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
 
 
 class LayerWiseLoadCounter:
@@ -168,6 +189,9 @@ class UnifiedCacheLinker(ABC):
     @abstractmethod
     def cancel_queued_load(self, rid: str) -> bool:
         """Cancel a load that has not started yet."""
+
+    def release_lookup(self, rid: str) -> None:
+        """Drop what ``lookup`` reserved for ``rid``."""
 
     @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
@@ -578,6 +602,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self.cache_linker.release_lookup(rid)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
