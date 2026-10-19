@@ -2538,6 +2538,7 @@ def is_hybrid_swa_model(
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
     hybrid_swa_archs = {
+        "BeamForCausalLM",
         "Llama4ForConditionalGeneration",
         "DeepseekV4ForCausalLM",
         "DeepseekV4ForCausalLMNextN",
@@ -2562,6 +2563,10 @@ def is_hybrid_swa_model(
         "UnlimitedOCRForCausalLM",
     }
     if any(arch in hybrid_swa_archs for arch in model_architectures):
+        if "BeamForCausalLM" in model_architectures and hf_text_config is not None:
+            # Pure full-attention fixtures use an ordinary KV pool. The SWA
+            # pool also supports all-sliding schedules, with no full-layer pool.
+            return "sliding_attention" in hf_text_config.layer_types
         # Only treat Laguna as hybrid SWA when it actually has a sliding window.
         if (
             "LagunaForCausalLM" in model_architectures
@@ -2630,7 +2635,8 @@ def get_hybrid_layer_ids(
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
     elif (
-        "Gemma4ForCausalLM" in model_architectures
+        "BeamForCausalLM" in model_architectures
+        or "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
         or "EmbeddingGemma2Model" in model_architectures
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
