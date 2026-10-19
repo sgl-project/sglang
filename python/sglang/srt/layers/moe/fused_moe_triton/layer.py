@@ -147,6 +147,12 @@ def _maybe_copy_weight_view_before_h2d(
     return _copy_weight_view_before_h2d(loaded_weight)
 
 
+def _weight_layout_method(layer):
+    """The method whose weight layout the loaders follow: the method a wrapper loads for
+    (``weight_load_method``, set by paged experts) or the layer's own quant method."""
+    return getattr(layer, "weight_load_method", None) or layer.quant_method
+
+
 def _get_deepep_comm_group(a2a_backend):
     group = get_parallel().tp_group.device_group
 
@@ -764,7 +770,7 @@ class FusedMoE(torch.nn.Module):
         # w3, up_proj: Load into second logical weight of w13.
         # trtllm cutlass kernel assumes differently
         switch_w13 = getattr(
-            self.weight_load_method or self.quant_method,
+            _weight_layout_method(self),
             "load_up_proj_weight_first",
             False,
         )
@@ -1190,7 +1196,7 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.weight_load_method or self.quant_method
+        method = _weight_layout_method(self)
         if self.scheme is not None:
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
@@ -1425,7 +1431,7 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         # Mirror _weight_loader_impl: the trtllm bf16 prep reshapes expert weights
         # into block layout; hot weight updates must restore canonical shapes first.
-        method = self.weight_load_method or self.quant_method
+        method = _weight_layout_method(self)
         if isinstance(method, KTEPWrapperMethod):
             method = method.gpu_method
         if isinstance(method, UnquantizedFusedMoEMethod):
@@ -1454,7 +1460,7 @@ class FusedMoE(torch.nn.Module):
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO: check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
-        method = self.weight_load_method or self.quant_method
+        method = _weight_layout_method(self)
         if self.scheme is not None:
             method = self.scheme
         if isinstance(method, Fp8MoEMethod) and (
