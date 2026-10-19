@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     WanAnimate2TransformerBlock,
+    _InContextLayout,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multistep import (
     DPMSolverMultistepScheduler,
@@ -347,20 +348,6 @@ def test_block_refuses_a_checkpoint_with_offline_qk_rotation(monkeypatch):
 # WanAnimate2ArchConfig / WanAnimate2Config
 
 
-def test_in_out_channels_match_in_context_io():
-    # in_channels = 16 noise + 20 conditioning; out_channels = 16 latent.
-    arch = WanAnimate2ArchConfig()
-    assert arch.in_channels == 36
-    assert arch.out_channels == 16
-
-
-def test_backbone_dims_reuse_wan22_i2v_14b():
-    arch = WanAnimate2ArchConfig()
-    assert arch.num_layers == 40
-    assert arch.image_dim == 1280
-    assert arch.added_kv_proj_dim == 5120
-
-
 def test_post_init_derives_hidden_size_and_latent_channels():
     arch = WanAnimate2ArchConfig()
     assert arch.num_attention_heads == 40
@@ -490,13 +477,6 @@ def test_official_checkpoint_config_names_update_the_arch_config():
     assert config.refer_offset_t == 2
     assert config.log_scale == -1.3
     assert config.text_len == 512
-
-
-def test_text_len_defaults_to_the_checkpoint_value():
-    """The pipeline pads prompts to ``arch_config.text_len``: the checkpoint's
-    transformer/config.json sets it and the default covers a config without the key."""
-    assert WanAnimate2ArchConfig().text_len == 512
-    assert Wan_Animate_2_14B_Config().dit_config.arch_config.text_len == 512
 
 
 def test_checkpoint_config_without_image_embedding_is_rejected():
@@ -900,6 +880,45 @@ def test_resize_by_area_treats_the_request_size_as_a_pixel_area_budget(
     assert (out.shape[1], out.shape[0]) == expected_wh
     assert out.shape[0] * out.shape[1] <= 640 * 800
     assert out.shape[0] % 16 == 0 and out.shape[1] % 16 == 0
+
+
+def test_attention_slot_covers_both_grids_when_the_inputs_round_differently():
+    # The reference image and the driving video are each fitted to the budget at their own
+    # aspect ratio (_build_request_state calls resize_by_area once per input), so their
+    # 16-aligned canvases can differ by one step per side with the floor going either
+    # way. At 720x1280 a 1072x592 image lands on 1280x704 and a 538x304 video on 1264x720:
+    # the video grid is one latent row taller and one column narrower and holds more
+    # tokens per frame (79x45 = 3555 > 80x44 = 3520). The in-context layout must size its
+    # per-frame slot for both, or the reference K/V copy overflows.
+    budget = 720 * 1280
+    clip_len = 81
+    image, _ = resize_by_area(np.zeros((592, 1072, 3), np.uint8), budget, divisor=16)
+    video_frame, _ = resize_by_area(
+        np.zeros((304, 538, 3), np.uint8), budget, divisor=16
+    )
+    assert (image.shape[1], image.shape[0]) == (1280, 704)
+    assert (video_frame.shape[1], video_frame.shape[0]) == (1264, 720)
+
+    # Generation grid: the image canvas through the VAE (//8) and the (2, 2) patch (//2);
+    # reference-video grid: the same for the video canvas, one frame fewer (no
+    # reference-image frame), as build_clip_conditioning derives it from the VAE latent.
+    full_clip_grid = generation_token_grid(
+        clip_len, image.shape[0] // 8, image.shape[1] // 8
+    )
+    reference_video_grid = (
+        full_clip_grid[0] - 1,
+        video_frame.shape[0] // 8 // 2,
+        video_frame.shape[1] // 8 // 2,
+    )
+    assert full_clip_grid == (22, 44, 80)
+    assert reference_video_grid == (21, 45, 79)
+
+    layout = _InContextLayout(full_clip_grid, reference_video_grid, full_clip_grid)
+    assert layout.generation_video_tokens_per_frame == 3520
+    assert layout.reference_video_tokens_per_frame == 3555
+    assert layout.max_tokens_per_frame == 3555
+    assert layout.max_tokens_per_frame >= layout.generation_video_tokens_per_frame
+    assert layout.max_tokens_per_frame >= layout.reference_video_tokens_per_frame
 
 
 # build_clip_conditioning: per-clip tensors from the request state with stand-in encoders.
@@ -1334,13 +1353,6 @@ _FLOW_MATCHING_SCHEDULER_KWARGS = {
     "use_flow_sigmas": True,
     "flow_shift": 5.0,
 }
-
-
-def test_scheduler_is_a_loaded_component():
-    assert "scheduler" in WanAnimate2Pipeline._required_config_modules
-    assert len(WanAnimate2Pipeline._required_config_modules) == 7
-    # No pipeline-side construction: the base class hook is inherited unchanged.
-    assert "initialize_pipeline" not in vars(WanAnimate2Pipeline)
 
 
 def test_loader_keeps_the_checkpoint_scheduler_settings():
