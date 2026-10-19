@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import enum
 import functools
 import logging
@@ -911,6 +912,34 @@ class DSV4AttnMetadata:
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
+def _unpadded_batch(forward_batch: ForwardBatch) -> ForwardBatch:
+    """A view of a prefill-graph step's batch cut to its live requests and tokens:
+    the graph pads request and token rows (DP attention pads the live batch too),
+    while the per-request extend lengths stay exact."""
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    if extend_lens is None:
+        return forward_batch
+    bs, num_tokens = len(extend_lens), int(sum(extend_lens))
+    view = copy.copy(forward_batch)
+    view.batch_size = bs
+    for name in (
+        "req_pool_indices",
+        "seq_lens",
+        "seq_lens_cpu",
+        "extend_seq_lens",
+        "extend_prefix_lens",
+        "extend_start_loc",
+    ):
+        value = getattr(forward_batch, name, None)
+        if value is not None:
+            setattr(view, name, value[:bs])
+    for name in ("positions", "out_cache_loc", "input_ids"):
+        value = getattr(forward_batch, name, None)
+        if value is not None:
+            setattr(view, name, value[:num_tokens])
+    return view
+
+
 class LateLayerTail(msgspec.Struct, frozen=True):
     """Rows the layers from late_layer_start on run over under decoder SWA bounded
     replay: the last tail tokens of each request in the extend."""
@@ -1257,6 +1286,9 @@ class DeepseekV4AttnBackend(
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # Set by write_tail_source_kv until exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
+        # The live batch of the prefill-graph replay being prepared: the graph's
+        # own batch pads request rows, while a tail break needs the exact ones.
+        self.prefill_graph_replay_batch: Optional[ForwardBatch] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
         self._bcg_tail_capacity: Optional[int] = None
@@ -2046,6 +2078,25 @@ class DeepseekV4AttnBackend(
         forward_batch.global_num_token_non_padded = non_padded_gpu
         forward_batch.num_token_non_padded = local_non_padded
         self.tail_source_kv_layer_id = None
+
+    def enter_eager_tail_in_prefill_graph(
+        self, graph_batch: ForwardBatch, source_kv_layer_id: Optional[int]
+    ) -> Tuple[tuple, ForwardBatch]:
+        """Inside a prefill-graph step's tail break: switch from the graph's
+        block-padded tail metadata onto exact-row tail metadata of the live batch,
+        which the decoder tail graphs' eager breaks read. The source layer's KV
+        was written by the captured segment before the switch. Returns the state
+        for exit_late_layer_tail and the batch the tail runs on (the capture
+        batch while the graph captures, whose rows are its own)."""
+        forward_batch = _unpadded_batch(self.prefill_graph_replay_batch or graph_batch)
+        held = self.tail_forward_metadata
+        self.tail_forward_metadata = self._build_late_layer_tail_metadata(forward_batch)
+        try:
+            saved = self.enter_late_layer_tail(forward_batch)
+        finally:
+            self.tail_forward_metadata = held
+        self.tail_source_kv_layer_id = source_kv_layer_id
+        return saved, forward_batch
 
     # The prefill CUDA graph runs the tail switch as eager breaks: these two run
     # at capture and again at every replay (see deepseek_v4.bcg_enter/exit).
@@ -3052,6 +3103,7 @@ class DeepseekV4AttnBackend(
         )
         assert isinstance(capture_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
+        self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
         self.tail_forward_metadata = (
