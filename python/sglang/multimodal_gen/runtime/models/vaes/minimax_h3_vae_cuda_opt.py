@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     register_vae_fast_path_gate,
@@ -31,7 +32,6 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.attention im
     _sdpa_attention,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils import (
-    _env_flag,
     apply_rotary_pos_emb_qk,
     native_rope_cache,
 )
@@ -155,7 +155,7 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
     decoder = vae.decoder
     if type(decoder) is not ViT3DDecoder:
         return vae
-    if not _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
+    if not envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM:
         logger.info("MiniMax-H3 VAE: fp32 QK norm disabled; skipping fast path.")
         return vae
 
