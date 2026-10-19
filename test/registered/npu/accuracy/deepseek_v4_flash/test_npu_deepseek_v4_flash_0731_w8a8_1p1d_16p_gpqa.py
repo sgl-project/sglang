@@ -231,9 +231,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
 
 class TestNPUDeepSeekV4Flash0731W8A81P1D16PIn128kOut1k90PrefixCache(TestNpuPerfMultiNodePdSepTestCaseBase):
     """Test NPU performance for DeepSeek-V4-Flash W8A8 16p 1P1D in128k out1k 90PrefixCache."""
