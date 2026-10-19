@@ -256,28 +256,41 @@ class TestInklingOutputParser(unittest.TestCase):
                     )
 
     def test_leading_ignored_special_keeps_the_header_author(self):
-        """TMLv0 skips a special such as <|begin_of_text|> before a header; the
-        header after it still decides the author, so non-model text never streams."""
-        for role, expected in (
-            ("model", "echoed text"),
-            ("user", ""),
-            ("system", ""),
-            ("tool", ""),
-        ):
-            output_ids = _ids(
-                "<|begin_of_text|>",
-                f"<|message_{role}|>",
-                "<|content_text|>",
-                "echoed text",
-                "<|end_message|>",
-            )
-            for mode, parse in (("batch", _batch), ("stream", _stream)):
-                with self.subTest(role=role, mode=mode):
-                    parsed = parse(
-                        output_ids, separate_reasoning=True, parse_tool_calls=True
-                    )
-                    self.assertEqual(parsed.content, expected)
-                    self.assertEqual(parsed.reasoning, "")
+        """TMLv0 skips a special such as <|begin_of_text|>, and any text after it,
+        before a header; that header still decides the author, so non-model text
+        never streams."""
+        for prefix in (("<|begin_of_text|>",), ("<|begin_of_text|>", "noise")):
+            for role in ("model", "user", "system", "tool"):
+                output_ids = _ids(
+                    *prefix,
+                    f"<|message_{role}|>",
+                    "<|content_text|>",
+                    "echoed text",
+                    "<|end_message|>",
+                )
+                expected = "echoed text" if role == "model" else ""
+                for mode, parse in (("batch", _batch), ("stream", _stream)):
+                    with self.subTest(prefix=prefix, role=role, mode=mode):
+                        parsed = parse(
+                            output_ids,
+                            separate_reasoning=True,
+                            parse_tool_calls=True,
+                        )
+                        self.assertEqual(parsed.content, expected)
+                        self.assertEqual(parsed.reasoning, "")
+
+    def test_end_message_before_a_header_is_skipped(self):
+        """Before any header TMLv0 skips <|end_message|> too, so it closes nothing
+        and the text after it is still pre-header text, not headerless model output."""
+        output_ids = _ids(
+            "<|begin_of_text|>", "noise", "<|end_message|>", "echoed text"
+        )
+        for mode, parse in (("batch", _batch), ("stream", _stream)):
+            with self.subTest(mode=mode):
+                parsed = parse(
+                    output_ids, separate_reasoning=True, parse_tool_calls=True
+                )
+                self.assertEqual(parsed.content, "")
 
     def test_finish_flushes_once(self):
         """A finish_reason stays set on later stream chunks; finishing again must

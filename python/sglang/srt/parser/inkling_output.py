@@ -91,12 +91,7 @@ class InklingOutputParser:
         )
         self._end_message_id = tokenizer.encode_special("end_message")
         self._framing_ids = frozenset(
-            (
-                *self._header_ids,
-                *self._content_kind_ids,
-                self._end_sampling_id,
-                self._end_message_id,
-            )
+            (*self._header_ids, *self._content_kind_ids, self._end_sampling_id)
         )
         self._message_ids: list[int] = []
         self._kind_id: int | None = None
@@ -216,12 +211,9 @@ class InklingOutputParser:
         self._parse(token_id, delta)
 
     def _parse(self, token_id: int, delta: _DeltaBuilder) -> None:
-        # TMLv0 skips any other special before a message's header, so it leaves
-        # the author open.
-        if self._awaiting_author and (
-            token_id in self._framing_ids
-            or not self._tml.tokenizer.is_special_token(token_id)
-        ):
+        # TMLv0 skips every token, end_message included, before a message's header
+        # or content kind; unframed output gets its opener in _feed_token.
+        if self._awaiting_author and token_id in self._framing_ids:
             self._awaiting_author = False
             self._model_authored = self._header_ids.get(token_id, True)
             if token_id == self._end_sampling_id:
@@ -229,6 +221,8 @@ class InklingOutputParser:
                 return
         self._at_message_boundary = False
         self._message_ids.append(token_id)
+        if self._awaiting_author:
+            return
         if token_id == self._end_message_id:
             self._close_message(delta)
         elif self._kind_id is None:
