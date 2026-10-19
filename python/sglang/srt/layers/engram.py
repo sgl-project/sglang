@@ -30,6 +30,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_EXTEND,
     MODE_VERIFY,
     engram_commit_history,
+    engram_hash_extend_and_commit,
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
@@ -191,6 +192,15 @@ class EngramLayout(msgspec.Struct, frozen=True):
             head_dim=config.engram_head_dim,
         )
 
+    def column_bounds(self, hash_index: int) -> tuple[int, ...]:
+        """Prefix sums of one layer's column segments, in the hash's (n-gram
+        size, head) column order: hash column c owns rows [bounds[c], bounds[c + 1])."""
+        bounds = [0]
+        for per_ngram in self.primes[hash_index]:
+            for prime in per_ngram:
+                bounds.append(bounds[-1] + prime)
+        return tuple(bounds)
+
 
 def compute_engram_hash_ids(
     tokens: torch.Tensor,
@@ -263,6 +273,13 @@ class EngramHasher(nn.Module):
         )
         self.pad_row = num_req_slots
 
+    def history_row(self, ids: list[int]) -> list[int]:
+        """Left-pad up to n - 1 predecessors into a history row. The hash reads every
+        id at or above MM_PAD_SHIFT_VALUE as an image token, so multimodal pad ids
+        clamp to it and fit the int32 history."""
+        n1 = self.max_ngram_size - 1
+        return [0] * (n1 - len(ids)) + [min(t, MM_PAD_SHIFT_VALUE) for t in ids]
+
     @classmethod
     def from_config(
         cls, config, layout: EngramLayout, *, image_token_id: Optional[int] = None
@@ -298,6 +315,33 @@ class EngramHasher(nn.Module):
                 device=input_ids.device,
             )
         mode = forward_batch.forward_mode
+        if (
+            mode.is_extend()
+            and not mode.is_target_verify()
+            and envs.SGLANG_OPT_ENGRAM_EXTEND_HASH.get()
+            and _cuda_kernels(input_ids)
+            and forward_batch.extend_seq_lens_cpu is not None
+        ):
+            history = forward_batch.engram_history
+            return engram_hash_extend_and_commit(
+                input_ids,
+                forward_batch.positions,
+                history=self.history if history is None else history,
+                commit_history=self.history,
+                req_slots=forward_batch.req_pool_indices,
+                starts=forward_batch.extend_start_loc,
+                lengths=forward_batch.extend_seq_lens,
+                num_real=sum(forward_batch.extend_seq_lens_cpu),
+                history_via_slots=history is None,
+                out_cache_loc=forward_batch.out_cache_loc,
+                token_map=self.token_map,
+                multipliers=self.multipliers,
+                primes=self.primes,
+                offsets=self.offsets,
+                pad_id=self.pad_id,
+                image_token_id=self.image_token_id,
+                mm_pad_shift=MM_PAD_SHIFT_VALUE,
+            )
         req_slots = forward_batch.req_pool_indices
         bs = req_slots.shape[0]
         device = input_ids.device
@@ -717,22 +761,55 @@ class _HostTable:
             logger.info(msg)
 
 
+def shard_range(
+    num_embeddings: int,
+    column_bounds: tuple[int, ...],
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[int, int]:
+    """This rank's [start, end) rows: on the layer's hash-column boundaries when
+    the column count divides evenly, so a rank owns whole per-head subtables,
+    else the equal-row split. Exactly one rank owns each row either way, so the
+    zero-fill + all-reduce lookup is bitwise independent of the choice."""
+    assert column_bounds[-1] == num_embeddings, (
+        "the config's table size disagrees with its primes"
+    )
+    if (len(column_bounds) - 1) % tp_size == 0:
+        cols_per_rank = (len(column_bounds) - 1) // tp_size
+        return (
+            column_bounds[tp_rank * cols_per_rank],
+            column_bounds[(tp_rank + 1) * cols_per_rank],
+        )
+    return (
+        num_embeddings * tp_rank // tp_size,
+        num_embeddings * (tp_rank + 1) // tp_size,
+    )
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
-    Rows are sharded over the TP group in device memory; with
+    Rows are sharded over the TP group in device memory, aligned to the hash
+    columns where they divide evenly (`shard_range`); with
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE they live in host memory instead, as
     one shared copy or one shard per rank (see _HostTable). Loading is sharded
     in every layout: a rank writes only its own row range.
     """
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        column_bounds: tuple[int, ...],
+    ):
         super().__init__()
         self.dim = dim
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
-        self.row_start = num_embeddings * tp_rank // self.tp_size
-        row_end = num_embeddings * (tp_rank + 1) // self.tp_size
+        self.row_start, row_end = shard_range(
+            num_embeddings, column_bounds, tp_rank, self.tp_size
+        )
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
@@ -921,10 +998,11 @@ def engram_gate(
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy."""
+    # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
+    # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
         _cuda_kernels(x)
         and x.ndim == 3
-        and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype
         and x.dtype in (torch.bfloat16, torch.float32)
         and q_weight.dtype in (torch.bfloat16, torch.float32)
@@ -962,7 +1040,10 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
         self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            layout.num_embeddings[self.layer_hash_index],
+            layout.head_dim,
+            layer_id,
+            column_bounds=layout.column_bounds(self.layer_hash_index),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
