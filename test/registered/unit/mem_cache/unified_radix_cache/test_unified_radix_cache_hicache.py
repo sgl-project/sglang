@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
     requires,
@@ -38,7 +38,7 @@ from sglang.test.kits.unified_radix_cache_unittest.config import (
     requires_swa_and_mamba,
     requires_swa_only,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     match_prefix,
     node_children,
@@ -51,7 +51,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     node_token_ids,
     selected_tree_core_test_backend,
 )
-from sglang.test.kits.unified_radix_cache_unittest.hicache import (
+from sglang.test.kits.unified_radix_cache.hicache import (
     UnifiedRadixCacheHiCacheFixtures,
 )
 

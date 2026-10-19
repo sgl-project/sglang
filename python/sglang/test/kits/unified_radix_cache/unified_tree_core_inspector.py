@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
     NodeId,
 )
-from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspection_interface import (
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
 )
 

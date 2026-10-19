@@ -37,7 +37,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
     requires,
@@ -46,7 +46,7 @@ from sglang.test.kits.unified_radix_cache_unittest.config import (
     requires_hicache,
     requires_swa,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     match_prefix,
     node_device_value,
@@ -54,7 +54,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     node_key_length,
     node_parent,
 )
-from sglang.test.kits.unified_radix_cache_unittest.load_back import (
+from sglang.test.kits.unified_radix_cache.load_back import (
     UnifiedRadixCacheLoadBackFixtures,
     UnifiedTreeCoreLoadBackPendingFixtures,
 )

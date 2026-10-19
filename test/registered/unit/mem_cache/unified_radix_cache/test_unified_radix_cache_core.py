@@ -49,7 +49,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
     requires,
@@ -61,7 +61,7 @@ from sglang.test.kits.unified_radix_cache_unittest.config import (
     requires_swa_and_mamba,
     requires_swa_only,
 )
-from sglang.test.kits.unified_radix_cache_unittest.core import (
+from sglang.test.kits.unified_radix_cache.core import (
     DisabledUnifiedRadixCacheFixtures,
     FakeFullComponent,
     MambaCheckpointGridFixtures,
@@ -78,7 +78,7 @@ from sglang.test.kits.unified_radix_cache_unittest.core import (
     component_with_cache,
     session_radix_cache_test_values,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     match_prefix,
     node_children,
@@ -228,7 +228,7 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                     # Rust independently of the shared suite's default backend;
                     # session caches fall back to the Python TreeCore.
                     with mock.patch(
-                        "sglang.test.kits.unified_radix_cache_unittest.fixtures.TREE_CORE_TEST_BACKEND",
+                        "sglang.test.kits.unified_radix_cache.fixtures.TREE_CORE_TEST_BACKEND",
                         "rust",
                     ):
                         cache, first, second, leaf = self._build_internal_chain(

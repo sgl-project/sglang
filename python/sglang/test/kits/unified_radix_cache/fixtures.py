@@ -48,14 +48,14 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     supports_hicache,
 )
-from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspection_interface import (
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
 )
-from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspector import (
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
     UnifiedTreeCoreInspector,
 )
 
@@ -278,7 +278,7 @@ def build_fixture(
         return UnifiedTreeCoreInspector(params, components)
 
     def rust_inspector_factory(params, _components):
-        from sglang.test.kits.unified_radix_cache_unittest.rust_unified_tree_core_inspector import (
+        from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
             RustUnifiedTreeCoreInspector,
         )
 

@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     _OngoingPrefetch,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
     requires,
@@ -54,7 +54,7 @@ from sglang.test.kits.unified_radix_cache_unittest.config import (
     requires_swa,
     requires_swa_only,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,
@@ -65,7 +65,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     node_token_ids,
     write_backup,
 )
-from sglang.test.kits.unified_radix_cache_unittest.storage import (
+from sglang.test.kits.unified_radix_cache.storage import (
     AnchorLockOutcomePolicyFixtures,
     ExtraPoolFullComponent,
     UnifiedRadixCacheStorageAttachBackfillFixtures,

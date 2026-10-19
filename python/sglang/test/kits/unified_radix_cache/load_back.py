@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedTreeNode,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
 )
 

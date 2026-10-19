@@ -17,16 +17,16 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     node_children,
     node_token_ids,
     write_backup,
 )
-from sglang.test.kits.unified_radix_cache_unittest.kv_events import (
+from sglang.test.kits.unified_radix_cache.kv_events import (
     LoraReq,
     UnifiedRadixCacheKVEventsFixtures,
     make_lora_names,

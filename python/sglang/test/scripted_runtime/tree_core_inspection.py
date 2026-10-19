@@ -7,14 +7,14 @@ def install_tree_core_inspectors():
     )
 
     def python_inspector_factory(params, components):
-        from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspector import (
+        from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
             UnifiedTreeCoreInspector,
         )
 
         return UnifiedTreeCoreInspector(params, components)
 
     def rust_inspector_factory(params, _components):
-        from sglang.test.kits.unified_radix_cache_unittest.rust_unified_tree_core_inspector import (
+        from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
             RustUnifiedTreeCoreInspector,
         )
 

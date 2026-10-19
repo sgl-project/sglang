@@ -1,6 +1,6 @@
 """Fixtures for the UnifiedRadixCache hicache unit tests."""
 
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
     build_fixture,
 )

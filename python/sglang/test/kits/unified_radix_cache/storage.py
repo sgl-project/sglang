@@ -34,7 +34,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
     build_fixture,
     drop_hicache_atexit_pin,

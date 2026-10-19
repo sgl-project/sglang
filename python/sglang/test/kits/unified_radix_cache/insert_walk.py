@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,

@@ -14,7 +14,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspection_interface import (
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
 )
 

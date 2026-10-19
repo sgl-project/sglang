@@ -27,10 +27,10 @@ from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedTreeNode,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,

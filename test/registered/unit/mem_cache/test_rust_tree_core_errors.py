@@ -15,7 +15,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 @pytest.fixture(params=["production", "inspection"])
 def core_class(request):
     if request.param == "inspection":
-        from sglang.test.kits.unified_radix_cache_unittest.rust_unified_tree_core_inspector import (
+        from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
             RustUnifiedTreeCoreInspector,
         )
 
@@ -130,7 +130,7 @@ def test_python_argument_errors_pass_through_unchanged(core_class, error_type):
 
 
 def test_tlru_inspection_panic_is_runtime_error():
-    from sglang.test.kits.unified_radix_cache_unittest.rust_unified_tree_core_inspector import (
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
         RustUnifiedTreeCoreInspector,
     )
 

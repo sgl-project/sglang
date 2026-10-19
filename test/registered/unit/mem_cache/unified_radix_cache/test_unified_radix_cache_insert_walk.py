@@ -37,10 +37,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceNextNodeResult,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.config import (
+from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
 )
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache.fixtures import (
     UnifiedRadixCacheFixtures,
     build_fixture,
     match_prefix,
@@ -52,7 +52,7 @@ from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     node_token_ids,
     write_backup,
 )
-from sglang.test.kits.unified_radix_cache_unittest.insert_walk import (
+from sglang.test.kits.unified_radix_cache.insert_walk import (
     ResumableInsertWalkSWAFixtures,
     SegmentLockFuzzFixtures,
     SegmentLockProtocolFixtures,

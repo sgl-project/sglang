@@ -10,7 +10,7 @@ import test_unified_radix_cache_load_back
 import test_unified_radix_cache_storage
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest import fixtures
+from sglang.test.kits.unified_radix_cache import fixtures
 
 register_cuda_ci(est_time=80, stage="base-b", runner_config="1-gpu-small")
 
