@@ -114,6 +114,29 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     abort_request: Callable
 
+    @staticmethod
+    def _acknowledge_cache_only_rebootstrap(batch: ScheduleBatch, req: Req) -> bool:
+        """Commit recovery markers after the TP worker restores the boundary.
+
+        A PD true-rebootstrap recomputes the prefix without the last emitted
+        boundary token. Decode still runs the normal replay forward to rebuild
+        local state. The worker restores the boundary before token relay and
+        speculative bonus-state construction. Return whether callers should
+        skip accounting already performed before retraction.
+        """
+        cache_only_rebootstrap = bool(
+            getattr(batch, "dsv41_cache_only_replay", False)
+            and getattr(req, "pd_rebootstrap_in_progress", False)
+        )
+        replayed_boundary = bool(
+            cache_only_rebootstrap and req.pd_rebootstrap_forced_output_id is not None
+        )
+        if replayed_boundary:
+            req.pd_rebootstrap_forced_output_id = None
+        if cache_only_rebootstrap:
+            req.pd_rebootstrap_in_progress = False
+        return replayed_boundary
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -305,6 +328,7 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                replayed_boundary = False
                 should_commit_output = (
                     not req.finished()
                     and not req.is_retracted
@@ -361,11 +385,14 @@ class SchedulerBatchResultProcessor:
                             req, up_to_tick=batch.forward_iter
                         )
                     else:
+                        replayed_boundary = self._acknowledge_cache_only_rebootstrap(
+                            batch, req
+                        )
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
 
-                        self._maybe_update_reasoning_tokens(req, next_token_id)
-
+                        if not replayed_boundary:
+                            self._maybe_update_reasoning_tokens(req, next_token_id)
                         req.update_finish_state()
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
@@ -407,16 +434,18 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
-                            store=discard_finish_reason is None,
+                            store=(
+                                discard_finish_reason is None and not replayed_boundary
+                            ),
                         )
 
                     if discard_finish_reason is not None:
                         continue
 
-                    if req.return_sampling_mask:
+                    if req.return_sampling_mask and not replayed_boundary:
                         self.add_sampling_mask_return_values(i, req, logits_output)
 
-                    if req.grammar is not None:
+                    if req.grammar is not None and not replayed_boundary:
                         self._apply_prefill_grammar(
                             req=req,
                             next_token_id=next_token_id,

@@ -11,6 +11,9 @@ GPU_MEMORY_ALL_TYPES = [
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
 
+# Bounded SWA replay is validated against the official DeepSeek-V4.1 window.
+DSV41_REPLAY_WINDOW = 128
+
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
 # lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
