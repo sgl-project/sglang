@@ -463,6 +463,22 @@ class TestUnifiedRadixAllocationEvictionRealComponents(CustomTestCase):
 
 
 class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheFixtures):
+    def _swa_lru_order(self, cache):
+        return cache.tree_core.get_component_device_lru_node_ids(ComponentType.SWA)
+
+    def _swa_pinning_cfg_supported(self) -> bool:
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            return False
+        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        pages_per_node = 8
+        side_pages = 5
+        if pages_per_node * self.cfg.page_size < cushion:
+            return False
+        chain_inserts_pages = 4 * pages_per_node + side_pages
+        if self.cfg.kv_size < chain_inserts_pages * self.cfg.page_size:
+            return False
+        return True
+
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
