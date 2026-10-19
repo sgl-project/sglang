@@ -35,9 +35,11 @@ from typing import Any, Callable, Dict, Optional
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
+from sglang.srt.utils.hf_transformers.lilicorr_gguf import build_lilicorr_gguf_config
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,
+    "dflash": build_lilicorr_gguf_config,
 }
 
 
@@ -56,13 +58,25 @@ def read_gguf_architecture(gguf_path: str) -> Optional[str]:
         return None
 
 
+def _get_native_config_builder(gguf_path: str):
+    arch = read_gguf_architecture(gguf_path)
+    if arch == "dflash":
+        from gguf import GGUFReader
+
+        if "lilicorr.num_layers" not in GGUFReader(gguf_path).fields:
+            return None
+    return GGUF_NATIVE_CONFIG_BUILDERS.get(arch)
+
+
 def has_native_gguf_support(gguf_path: str) -> bool:
-    return read_gguf_architecture(gguf_path) in GGUF_NATIVE_CONFIG_BUILDERS
+    return _get_native_config_builder(gguf_path) is not None
 
 
 def build_gguf_config(gguf_path: str) -> PretrainedConfig:
-    arch = read_gguf_architecture(gguf_path)
-    return GGUF_NATIVE_CONFIG_BUILDERS[arch](gguf_path)
+    builder = _get_native_config_builder(gguf_path)
+    if builder is None:
+        raise ValueError(f"Unsupported native GGUF config: {gguf_path}")
+    return builder(gguf_path)
 
 
 _GPT4O_SPLIT_REGEX = (

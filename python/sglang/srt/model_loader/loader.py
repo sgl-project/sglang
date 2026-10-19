@@ -137,6 +137,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.srt.utils.common import temp_set_env
+from sglang.srt.utils.hf_transformers.common import check_gguf_file
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -3035,6 +3036,21 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         return model.eval()
 
 
+class LiLiCorrGGUFModelLoader(DefaultModelLoader):
+    """Load LiLiCorr GGUF weights through the existing ModelOpt NVFP4 methods."""
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        if not os.path.isfile(model_config.model_path):
+            raise ValueError("LiLiCorr GGUF loading requires a local file")
+
+    def _get_all_weights(self, model_config: ModelConfig, model: nn.Module):
+        from sglang.srt.utils.hf_transformers.lilicorr_gguf import lilicorr_gguf_weights
+
+        yield from lilicorr_gguf_weights(
+            model_config.model_path, model_config.hf_config
+        )
+
+
 class GGUFModelLoader(BaseModelLoader):
     """
     Model loader that can load GGUF files. This is useful for loading models
@@ -4193,6 +4209,14 @@ def get_model_loader(
     if model_config and model_config.quantization in ["auto-round-int8"]:
         logger.info("Using IncModelLoader due to AutoRound quantization config.")
         return IncModelLoader(load_config)
+
+    if (
+        model_config is not None
+        and load_config.load_format in (LoadFormat.AUTO, LoadFormat.GGUF)
+        and model_config.hf_config.architectures == ["LiLiCorrDraftModel"]
+        and check_gguf_file(model_config.model_path)
+    ):
+        return LiLiCorrGGUFModelLoader(load_config)
 
     modelopt_config = load_config.modelopt_config
     modelopt_workflow_requested = modelopt_config is not None and any(
