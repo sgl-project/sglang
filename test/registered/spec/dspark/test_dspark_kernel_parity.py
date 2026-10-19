@@ -28,6 +28,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels import dspark as dspark_kernels
 from sglang.test.test_utils import CustomTestCase, get_device
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
@@ -250,13 +251,13 @@ def _case_compact_layout(tc):
     total = int(verify_lens.sum().item())
     for padded_total in (total, bs * t):  # exact and bucket padding
         tc._parity(
-            dspark_verify_window.CompactRowIndex,
+            dspark_kernels.CompactRowIndex,
             verify_lens=verify_lens,
             padded_total=padded_total,
             device=DEVICE,
         )
         tc._parity(
-            dspark_verify_window.CompactVerifyIds,
+            dspark_kernels.CompactVerifyIds,
             draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             layout=_layout(verify_lens, padded_total),
@@ -267,12 +268,22 @@ def _case_compact_layout(tc):
 def _case_swa_page_indices(tc):
     torch.manual_seed(11)
     block_size, num_q, max_reqs, n_full = 5, 320, 300, 50000
+    seq_lens_casual = _ri(1, 300, (num_q,), torch.int32)
+    req_pool_indices_repeated = _ri(0, max_reqs, (num_q,))
     _, gather = tc._parity(
         dspark_attn_metadata.ComputeDsparkWindowGather,
-        seq_lens_casual=_ri(1, 300, (num_q,), torch.int32),
-        req_pool_indices_repeated=_ri(0, max_reqs, (num_q,)),
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
         block_size=block_size,
         swa_window=128,
+    )
+    tc._parity(
+        dspark_attn_metadata.ComputeDsparkWindowGather,
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+        block_size=block_size,
+        swa_window=128,
+        valid_from=_ri(0, 300, (max_reqs,)),
     )
     tc._parity(
         dspark_attn_metadata.BuildDsparkSwaPageIndices,

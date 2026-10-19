@@ -391,6 +391,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # Tokens back from the committed length a fused draft reads in the swa
+    # sub-pool (CacheInitParams.draft_swa_window); 0 when it reads none.
+    draft_swa_window: int = 0
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -505,14 +508,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
-        """Evict cache entries to cover allocator shortfalls.
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
+        """Evict for allocation using shortfalls or joint-reclaim quotas.
 
-        The default implementation preserves the component-count semantics of
-        :meth:`evict`. Multi-component caches backed by shared memory can
-        override this entry point to stop once collateral frees make the
-        requested allocation feasible.
+        Without ``allocation_reclaim_satisfied``, callers pass component
+        shortfalls in ``params``. The default implementation forwards these
+        counts to :meth:`evict`; multi-component caches may stop earlier when
+        collateral frees satisfy the requested allocation.
+
+        With ``allocation_reclaim_satisfied``, ``params`` instead contains
+        cumulative reclaim quotas. Supporting caches may stop at the pure
+        predicate before reaching those quotas. The allocator still owns
+        preparation and the actual capacity check after the walk.
         """
+        if allocation_reclaim_satisfied is not None:
+            raise NotImplementedError("This cache does not support joint reclaim")
         return self.evict(params)
 
     @abstractmethod
@@ -651,6 +666,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_auxiliary_swa(self) -> bool:
         return False
 
+    @property
+    def swa_retain_window(self) -> Optional[int]:
+        # What the frees and unlocks of a running request's SWA keep behind it;
+        # every other SWA rule uses sliding_window_size.
+        if self.sliding_window_size is None:
+            return None
+        return max(self.sliding_window_size, self.draft_swa_window)
+
     def evict_sliding_windows(
         self, req: Req, pre_len: int, *, eviction_interval: int = 1
     ) -> None:
@@ -660,7 +683,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         free_swa_out_of_window_slots(
             req,
             pre_len,
-            sliding_window_size=self.sliding_window_size,
+            sliding_window_size=self.swa_retain_window,
             page_size=self.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

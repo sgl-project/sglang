@@ -43,7 +43,6 @@ FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.j
 PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
-        "cache_salt",
         "conversation_id",
         "custom_labels",
         "custom_logit_processor",
@@ -57,7 +56,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "kv_hints",
         "log_metrics",
         "lora_id",
-        "lora_path",
         "max_dynamic_patch",
         "max_thinking_tokens",
         "min_dynamic_patch",
@@ -70,7 +68,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "num_items_assigned",
         "positional_embed_overrides",
         "received_time",
-        "require_reasoning",
         "return_bytes",
         "return_entropy",
         "return_flat_raw_output_top_logprobs",
@@ -84,7 +81,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "routing_key",
         "sampling_logprobs_mode",
         "session_id",
-        "session_params",
         "token_indices_to_pool",
         "use_audio_in_video",
         "video_config",
