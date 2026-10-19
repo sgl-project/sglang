@@ -133,7 +133,8 @@ def _score_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """One CTA per (token, row): scan H, output one scalar score."""
-    pid_t = tl.program_id(0)
+    # bank.stride(0) can be large enough for the row offset to overflow int32.
+    pid_t = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1)
     if j > NVB:
         return
@@ -174,7 +175,8 @@ def _combine_kernel(
     Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
     This gives full H-parallelism: 7 CTAs for H=7168/1024.
     """
-    pid_t = tl.program_id(0)
+    # Keep the bank row offset in int64, as in the score kernel above.
+    pid_t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
     h0 = pid_h * BLOCK_H
 
