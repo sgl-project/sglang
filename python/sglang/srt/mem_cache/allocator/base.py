@@ -76,6 +76,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        """Extra KV slots beyond prefill, including request-owned workspace.
+
+        ``prefill_tokens`` includes the cached prefix and selected extension.
+        """
+        return 0
+
     def max_new_tokens_for_memory(
         self,
         input_tokens: int,
@@ -131,6 +140,17 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return full_tokens <= full_budget_tokens and (
             swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
         )
+
+    def get_extend_allocation_demand(
+        self,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        *,
+        conservative_num_tokens: int,
+        shard_size: int,
+    ) -> int:
+        """Token demand for eviction before paged extend."""
+        return conservative_num_tokens
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve

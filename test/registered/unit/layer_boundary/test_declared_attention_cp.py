@@ -103,6 +103,7 @@ class TestAttentionCpBoundary(CustomTestCase):
             moe_tp_size=moe_tp_size,
             dwdp_size=1,
             enable_attn_tp_input_scattered=False,
+            disable_attn_tp_gather=False,
             tp_group=group("tp", range(tp_size)),
             attn_tp_group=group("attn_tp", range(tp_rank, tp_rank + attn_tp_size)),
             attn_cp_group=group("attn_cp", range(0, tp_size, attn_tp_size)),
@@ -124,6 +125,8 @@ class TestAttentionCpBoundary(CustomTestCase):
                 ((comm, "get_moe_cp_size"), lambda: CP_SIZE),
                 ((comm, "get_moe_cp_rank"), lambda: cp),
                 ((comm, "should_use_dp_reduce_scatterv"), lambda: False),
+                ((comm, "post_experts_sum_is_one_all_reduce"), lambda: False),
+                ((comm, "get_lora"), lambda: SimpleNamespace(enable_lora=False)),
                 (
                     (comm, "get_moe_a2a_backend"),
                     lambda: SimpleNamespace(is_none=lambda: True),

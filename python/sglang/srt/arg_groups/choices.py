@@ -4,6 +4,7 @@ LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
     "safetensors",
+    "instanttensor",
     "npcache",
     "dummy",
     "sharded_state",
@@ -79,6 +80,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "llada2_cfg_flashinfer",
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
@@ -128,7 +130,8 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
+BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
+SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",

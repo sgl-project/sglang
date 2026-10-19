@@ -164,7 +164,6 @@ class MellumAttention(Qwen3MoeAttention):
         self.hidden_size = hidden_size
         self.start_layer = start_layer
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.config = config
@@ -194,8 +193,7 @@ class MellumAttention(Qwen3MoeAttention):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -204,8 +202,7 @@ class MellumAttention(Qwen3MoeAttention):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -405,18 +402,8 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 f"{len(mlp_layer_types)} and {cfg.num_hidden_layers}"
             )
 
-        def _is_sparse(lid: int) -> bool:
-            if lid < 0 or lid >= cfg.num_hidden_layers:
-                return False
-            mlp_type = mlp_layer_types[lid]
-            if mlp_type not in ("sparse", "dense"):
-                raise ValueError(
-                    f"Unsupported mlp_layer_types[{lid}]={mlp_type}; "
-                    "expected 'sparse' or 'dense'"
-                )
-            return mlp_type == "sparse"
-
-        self.is_layer_sparse = _is_sparse(layer_id)
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             if num_experts <= 0:
@@ -439,19 +426,37 @@ class MellumDecoderLayer(Qwen3MoeDecoderLayer):
                 reduce_results=False,
             )
 
-        is_next_layer_sparse = _is_sparse(layer_id + 1)
-
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=rms_norm_eps)
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def _is_sparse(config: PretrainedConfig, lid: int) -> bool:
+        cfg = cast(Any, config)
+        if lid < 0 or lid >= cfg.num_hidden_layers:
+            return False
+        mlp_type = cfg.mlp_layer_types[lid]
+        if mlp_type not in ("sparse", "dense"):
+            raise ValueError(
+                f"Unsupported mlp_layer_types[{lid}]={mlp_type}; "
+                "expected 'sparse' or 'dense'"
+            )
+        return mlp_type == "sparse"
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages a Mellum layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_sparse(config, layer_id),
+                next_layer_sparse=cls._is_sparse(config, layer_id + 1),
             ),
         )
 
