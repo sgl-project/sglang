@@ -395,6 +395,7 @@ pub enum PoolName {
     Kv,
     Mamba,
     Swa,
+    AuxiliarySwa,
     Indexer,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
@@ -2074,10 +2075,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
         self.components.iter().any(|component| {
             let component_type = component.component_type();
-            // Write-back defers Full and Mamba to eviction; SWA still publishes
-            // its window here because out-of-window frees never reach eviction.
             component_type != BASE_COMPONENT_TYPE
-                && (!self.is_write_back || component_type == SWA)
                 && component.needs_incremental_backup(self, node_id)
         })
     }
@@ -2088,6 +2086,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state: &InsertWalkState<K>,
         target_node_id: NodeIdx_,
     ) -> bool {
+        if self.is_write_back {
+            return false;
+        }
         if state.is_new_leaf {
             // The new leaf runs to the end of the aligned key.
             return state.aligned_key_len > state.inserted_len
@@ -3256,13 +3257,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
-        if value && self.components_by_type[MAMBA.idx()].is_some() {
-            return Err(
-                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-                    component_type: MAMBA,
-                },
-            );
-        }
         self.enable_external_cache_linker = value;
         Ok(())
     }
@@ -3276,12 +3270,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 Some(KvCacheEvent::BlockRemoved {
                     block_hashes: tail_hashes,
                     medium: tail_medium,
+                    extra_key: tail_extra_key,
                 }),
                 KvCacheEvent::BlockRemoved {
                     mut block_hashes,
                     medium,
+                    extra_key,
                 },
-            ) if *tail_medium == medium => tail_hashes.append(&mut block_hashes),
+            ) if *tail_medium == medium && *tail_extra_key == extra_key => {
+                tail_hashes.append(&mut block_hashes)
+            }
             (
                 Some(KvCacheEvent::BlockStored {
                     block_hashes: tail_hashes,
@@ -3290,6 +3288,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium: tail_medium,
                     cache_salt: tail_cache_salt,
                     session_id: tail_session_id,
+                    extra_key: tail_extra_key,
                     ..
                 }),
                 KvCacheEvent::BlockStored {
@@ -3300,12 +3299,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt,
                     session_id,
-                    ..
+                    extra_key,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
                 && *tail_cache_salt == cache_salt
                 && *tail_session_id == session_id
+                && *tail_extra_key == extra_key
                 && !tail_hashes.is_empty()
                 && parent_block_hash == tail_hashes.last().copied() =>
             {
@@ -3386,11 +3386,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        // Python reads the LoRA adapter name from extra_key in the dynamo format.
-        let extra_key = self
-            .dynamo_kv_event_format
-            .then(|| self.arena.node(node_id).namespace.extra_key_arc())
-            .flatten();
+        let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
@@ -3491,9 +3487,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .map(|hash| namespaced_block_hash(namespace_seed.as_ref(), hash))
             .collect();
         if !block_hashes.is_empty() {
+            let extra_key = node.namespace.extra_key_arc();
             self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
+                extra_key,
             });
         }
     }
@@ -5927,13 +5925,13 @@ pub enum KvCacheEvent<A> {
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
         session_id: Option<Arc<str>>,
-        /// Set only in the dynamo format, and not published. Python uses it to
-        /// find the LoRA adapter name.
+        /// Not published; Python maps it to the LoRA name that namespaces the hashes.
         extra_key: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,
         medium: StorageMedium,
+        extra_key: Option<Arc<str>>,
     },
     AllBlocksCleared,
 }

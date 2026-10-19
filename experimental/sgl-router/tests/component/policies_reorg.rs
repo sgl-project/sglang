@@ -12,7 +12,8 @@ use sgl_router::policies_reorg::admission::{
     AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
 };
 use sgl_router::policies_reorg::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sgl_router::state::kv_events::CacheNamespace;
+use sgl_router::workers::{WireProtocol, Worker, WorkerRegistry};
 
 #[derive(Debug)]
 struct TestPolicy {
@@ -103,7 +104,10 @@ fn registry() -> Arc<WorkerRegistry> {
         ("p", Stage::Prefill, "pd"),
         ("d", Stage::Decode, "pd"),
     ] {
-        workers.add(spec(id, mode, model)).unwrap();
+        let cb = Some(Default::default());
+        workers
+            .add_with_cb(spec(id, mode, model), cb, WireProtocol::default())
+            .unwrap();
     }
     let unhealthy = workers.get(&WorkerId("unhealthy".into())).unwrap();
     for _ in 0..3 {
@@ -263,6 +267,7 @@ async fn selected_pd_bucket_owns_both_memberships_and_policies() {
         total_input_tokens: 10,
         expected_peak_tokens: Some(20),
         token_ids: None,
+        cache_namespace: CacheNamespace::NONE,
         session_key: None,
         routing_key: None,
         excluded: &[],
@@ -288,6 +293,7 @@ async fn excluded_engines_are_never_offered() {
         total_input_tokens: 10,
         expected_peak_tokens: None,
         token_ids: None,
+        cache_namespace: CacheNamespace::NONE,
         session_key: None,
         routing_key: None,
         excluded,
@@ -485,6 +491,7 @@ async fn bucket_scopes_plain_pick_and_preserves_request_facts() {
         total_input_tokens: 2,
         expected_peak_tokens: Some(12),
         token_ids: Some(&[7, 9]),
+        cache_namespace: CacheNamespace::NONE,
         session_key: Some("session"),
         routing_key: Some("routing"),
         excluded: &[],
