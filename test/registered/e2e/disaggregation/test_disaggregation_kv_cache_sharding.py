@@ -1,7 +1,7 @@
 """PD accuracy and per-rank KV footprint with logical-page KV cache sharding.
 
-Each prefill TP rank stores only its stripe of every KV page and sends only the
-pages it owns; decode pulls from both prefill ranks. A wrong owner, local page
+Each prefill TP rank owns a subset of logical KV pages and stores and sends only
+those pages; decode pulls from both prefill ranks. A wrong owner, local page
 id, or send position corrupts decode's KV and collapses GSM8K accuracy. A prompt
 whose KV is larger than one prefill rank's whole pool can only be served if no
 rank keeps a full copy.

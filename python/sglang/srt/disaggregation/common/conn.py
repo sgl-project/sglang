@@ -117,7 +117,7 @@ class PrefillServerInfo:
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     decode_allocation_policy: str = "early"
-    # Each prefill shard-group rank holds a disjoint stripe of every KV page.
+    # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -285,7 +285,7 @@ class CommonKVManager(BaseKVManager):
     dsv41_spec_layout: Optional[dict] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
-    # group that stripes every KV page.
+    # shard group. Each rank owns a subset of logical KV pages.
     kv_shard_rank: int = 0
     kv_shard_size: int = 1
 

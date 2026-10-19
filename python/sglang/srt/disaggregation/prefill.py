@@ -203,7 +203,7 @@ class PrefillBootstrapQueue:
         self.queue: List[Req] = []
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
-        # KV sharding stores 1/N of each page per rank, so capacity widens by N.
+        # Each rank owns a subset of logical KV pages, so capacity widens by N.
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
             * self.scheduler.kv_shard_widening
