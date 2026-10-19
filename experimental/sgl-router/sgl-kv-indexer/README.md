@@ -274,10 +274,124 @@ placements in a [Tair KVCache Manager](https://github.com/alibaba/tair-kvcache)
 (KVCM) `MetaService` instead of the server process, over the vendored
 `proto/tair_kvcache_meta_service.proto` (`kv_cache_manager.proto.meta.MetaService`).
 
+### Prerequisites and setup
+
+The backend is compiled into `kv-indexer-server`; a KVCM is required only under
+`KV_INDEXER_BACKEND=tair_kvcache_kvcm`, built from `main` at `5246532b` or
+later, the commit that added `GetHostCacheState`. An older manager answers
+`UNIMPLEMENTED`.
+
+Build and start a single-node manager
+([deploy](https://github.com/alibaba/tair-kvcache/blob/main/docs/deploy/README.md)):
+
+```bash
+git clone https://github.com/alibaba/tair-kvcache
+cd tair-kvcache
+bazelisk build //kv_cache_manager:kv_cache_manager_bin
+mkdir -p ~/kvcm
+./bazel-bin/kv_cache_manager/kv_cache_manager_bin \
+  --env=kvcm.service.rpc_port=50052 \
+  --env=kvcm.service.http_port=50053 \
+  --env=kvcm.service.admin_http_port=50054 \
+  --env=kvcm.registry_storage.uri=local://$HOME/kvcm/registry.json
+```
+
+`rpc_port` is the gRPC port `ENDPOINT` points at, `http_port` serves the
+`MetaService` HTTP endpoints used to verify below, and `admin_http_port` serves
+provisioning. `local://` keeps the registry in one JSON file whose parent
+directory must exist. A port already in use logs `bind port: ... Address already
+in use` and the manager runs on without it.
+
+Provision an event-report storage for each channel the backend reports on
+(`ST_EVENT_REPORT_L1P5` for the default `STORAGE_TYPE=l1p5`,
+`ST_EVENT_REPORT_L2` for `l2`):
+
+```bash
+curl -sS -X POST http://127.0.0.1:50054/api/addStorage -H 'Content-Type: application/json' -d '{
+  "trace_id": "indexer-setup",
+  "storage": {
+    "global_unique_name": "indexer_event_report_l1p5",
+    "storage_type": "ST_EVENT_REPORT_L1P5",
+    "event_report": {},
+    "check_storage_available_when_open": false
+  }
+}'
+```
+
+`event_report` is the oneof member that types the storage; without it the call
+fails `INVALID_ARGUMENT {storage_spec}`. `check_storage_available_when_open` is
+`false` because an event-report storage holds metadata and has no medium to open.
+
+Then an instance group whose `event_report_storage_candidates` lists that
+storage:
+
+```bash
+curl -sS -X POST http://127.0.0.1:50054/api/createInstanceGroup -H 'Content-Type: application/json' -d '{
+  "trace_id": "indexer-setup",
+  "instance_group": {
+    "name": "my-deployment-group",
+    "storage_candidates": ["data_plane_storage"],
+    "event_report_storage_candidates": ["indexer_event_report_l1p5"],
+    "global_quota_group_name": "default_quota_group",
+    "cache_config": {
+      "reclaim_strategy": {"storage_unique_name": "data_plane_storage"},
+      "data_storage_strategy": "CPS_PREFER_3FS",
+      "meta_indexer_config": {
+        "max_key_count": 1000000,
+        "mutex_shard_num": 16,
+        "meta_storage_backend_config": {"storage_type": "local"}
+      }
+    },
+    "version": 1
+  }
+}'
+```
+
+`storage_candidates` and `cache_config` describe the data-plane storage the group
+shares with the workers' connector: use the one your workers write to. When the
+group already exists, post the same body to `updateInstanceGroup` with
+`current_version` from `getInstanceGroup` and `version` one higher.
+
+Then the instance:
+
+```bash
+curl -sS -X POST http://127.0.0.1:50054/api/registerInstance -H 'Content-Type: application/json' -d '{
+  "trace_id": "indexer-setup",
+  "instance_group": "my-deployment-group",
+  "instance_id": "my-model-deployment",
+  "block_size": 128,
+  "model_deployment": {"model_name": "my-model", "dtype": "FP16"},
+  "location_spec_infos": [
+    {"name": "full", "size": 0},
+    {"name": "swa", "size": 0},
+    {"name": "mamba", "size": 0}
+  ],
+  "default_query_type": "QT_PREFIX_MATCH"
+}'
+```
+
+Skip this when the workers' connector registers the instance itself;
+`INSTANCE_ID` names that instance. With `AUTO_REGISTER=1` the server registers it
+instead.
+
+Verify the three objects:
+
+```bash
+curl -sS http://127.0.0.1:50054/api/healthy
+curl -sS -X POST http://127.0.0.1:50053/api/getInstanceInfo -H 'Content-Type: application/json' -d '{"trace_id":"verify","instance_id":"my-model-deployment"}'
+curl -sS -X POST http://127.0.0.1:50053/api/getHostCacheState -H 'Content-Type: application/json' -d '{"trace_id":"verify","instance_id":"my-model-deployment","storage_type":"ST_EVENT_REPORT_L1P5","query_type":"QT_PREFIX_MATCH","block_cache_keys":[0]}'
+```
+
+The first answers `OK`, the second echoes the group, the block size and the
+`full,swa,mamba` specs, and the third lists the reporter's `host_ip_port` once
+the server has reported.
+
+Then start the server against it:
+
 ```bash
 KV_INDEXER_BACKEND=tair_kvcache_kvcm \
 KV_INDEXER_LISTEN_ADDR=127.0.0.1:50051 \
-KV_INDEXER_TAIR_KVCACHE_KVCM_ENDPOINT=http://tair-kvcache:50052 \
+KV_INDEXER_TAIR_KVCACHE_KVCM_ENDPOINT=http://127.0.0.1:50052 \
 KV_INDEXER_TAIR_KVCACHE_KVCM_INSTANCE_ID=my-model-deployment \
   cargo run --release --bin kv-indexer-server
 ```
@@ -309,11 +423,8 @@ Configuration (all under `KV_INDEXER_TAIR_KVCACHE_KVCM_`):
 - `QUERY_TIMEOUT_MS` (default 50, half the Router-side deadline) and
   `APPLY_TIMEOUT_MS` (default 5000, one budget per batch, registration included).
 - `HEARTBEAT_INTERVAL_MS` (default 30000; `0` disables heartbeats). Keep it well
-  below the manager's EventReport liveness `heartbeat_timeout_ms`.
-
-The deployment needs an event-report storage listed in the instance group's
-`event_report_storage_candidates`, plus a registered instance — by the workers'
-own connector (the common case) or by `AUTO_REGISTER=1` for routing-only ones.
+  below the manager's EventReport liveness `heartbeat_timeout_ms`, which defaults
+  to 30s: with the default storage spec, set `HEARTBEAT_INTERVAL_MS=10000`.
 
 Semantics and limitations:
 
