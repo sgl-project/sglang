@@ -288,6 +288,15 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    # Check the requested backend before Waterfill's backend override. Waterfill
+    # currently supports DeepEP/MegaMOE only; otherwise the override below would
+    # hide an explicitly incompatible ascend_ops selection.
+    if cfg.enable_waterfill and cfg.moe_a2a_backend == "ascend_ops":
+        raise ValueError(
+            "--enable-waterfill is incompatible with "
+            "--moe-a2a-backend ascend_ops."
+        )
+
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
 
@@ -296,17 +305,24 @@ def handle_a2a_moe(server_args: Any):
     # invoked here at the legacy write slots.
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
 
-    a2a_backend = resolved_view(server_args).moe_a2a_backend
+    resolved = resolved_view(server_args)
+    a2a_backend = resolved.moe_a2a_backend
+    draft_a2a_backend = cfg.speculative_moe_a2a_backend
+    ascend_ops_selected = (
+        a2a_backend == "ascend_ops" or draft_a2a_backend == "ascend_ops"
+    )
     ascend_ops_config = cfg.ascend_ops_config
-    if ascend_ops_config is not None and a2a_backend != "ascend_ops":
+    if ascend_ops_config is not None and not ascend_ops_selected:
         raise ValueError(
-            "--ascend-ops-config requires --moe-a2a-backend ascend_ops; "
-            f"got {a2a_backend!r}."
+            "--ascend-ops-config requires the main or speculative MoE backend "
+            f"to be ascend_ops; got main={a2a_backend!r}, "
+            f"draft={draft_a2a_backend!r}."
         )
-    if a2a_backend == "ascend_ops":
+    if ascend_ops_selected:
         if not get_platform().is_npu:
             raise ValueError(
-                "--moe-a2a-backend ascend_ops is only supported on NPU."
+                "--moe-a2a-backend ascend_ops is only supported on NPU "
+                "for both the main and speculative draft model."
             )
         try:
             parsed_ascend_ops_config = AscendOpsConfig.from_json_str(
@@ -314,16 +330,14 @@ def handle_a2a_moe(server_args: Any):
             )
         except ValueError as exc:
             raise ValueError(
-                "Invalid --ascend-ops-config for moe-a2a-backend=ascend_ops: "
+                "Invalid --ascend-ops-config for ascend_ops MoE backend: "
                 f"{exc}"
             ) from exc
-        if cfg.enable_waterfill:
-            raise ValueError(
-                "--enable-waterfill is incompatible with "
-                "--moe-a2a-backend ascend_ops."
-            )
         logger.info(
-            "ascend_ops MoE backend enabled with prefill=%s, decode=%s.",
+            "ascend_ops MoE backend enabled for main=%s, draft=%s with "
+            "prefill=%s, decode=%s.",
+            a2a_backend == "ascend_ops",
+            draft_a2a_backend == "ascend_ops",
             parsed_ascend_ops_config.prefill,
             parsed_ascend_ops_config.decode,
         )
@@ -664,6 +678,22 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         raise ValueError(
             "DeepEP v2 MoE is not validated as a speculative draft backend. "
             "Select another --speculative-moe-a2a-backend."
+        )
+
+
+def validate_ascend_ops_speculative_draft(server_args: Any) -> None:
+    """Validate Ascend Ops when selected explicitly or inherited by the draft."""
+    view = resolved_view(server_args)
+    draft_backend = view.speculative_moe_a2a_backend
+    if draft_backend is None and view.speculative_algorithm:
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algorithm = SpeculativeAlgorithm.from_string(view.speculative_algorithm)
+        if not algorithm.is_ngram():
+            draft_backend = view.moe_a2a_backend
+    if draft_backend == "ascend_ops" and not get_platform().is_npu:
+        raise ValueError(
+            "--speculative-moe-a2a-backend ascend_ops is only supported on NPU."
         )
 
 

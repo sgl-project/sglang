@@ -907,7 +907,8 @@ class ExecMoe(msgspec.Struct):
     ascend_ops_config: A[
         Optional[str],
         (
-            "Configuration for the ascend_ops MoE backend as a JSON object, "
+            "Configuration for the ascend_ops MoE backend used by the main "
+            "model and/or speculative draft as a JSON object, "
             'for example {"prefill":"alltoallv","decode":"low_latency"}.'
         ),
     ] = None
