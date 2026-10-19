@@ -2,8 +2,17 @@
     "metadata": {
         "model": "Diffusion Server",
         "hardware": "CI H100 80GB pool",
-        "description": "Reference numbers tightened from NVIDIA multimodal_gen CI at source revision 2ee0d38a8553d186faad9c50893480e3c1d79270.",
-        "last_updated": "2026-08-16"
+        "description": "Reference numbers from source revision 2ee0d38a8553d186faad9c50893480e3c1d79270, with selected stable metrics tightened using calibration_runs.",
+        "last_updated": "2026-10-18",
+        "calibration_runs": [
+            38554777367,
+            38725436953,
+            38821753958,
+            38979902269,
+            39027561441,
+            39077836460
+        ],
+        "calibration_policy": "At least five comparable main CI runs per metric; timing references are the observed maximum plus 5%, allocated-memory references plus 1%. Existing tolerances remain unchanged."
     },
     "tolerances": {
         "long_term": {
@@ -544,12 +553,12 @@
             "denoise_step_ms": {
                 "0": 25.99,
                 "1": 12.61,
-                "2": 22.29,
-                "3": 57.75
+                "2": 12.16,
+                "3": 39.07
             },
             "expected_e2e_ms": 399.62,
-            "expected_avg_denoise_ms": 30.0,
-            "expected_median_denoise_ms": 24.14,
+            "expected_avg_denoise_ms": 21.49,
+            "expected_median_denoise_ms": 19.63,
             "load_peak_vram_mb": 8504.0,
             "runtime_peak_vram_mb": 13732.0,
             "load_peak_allocated_mb": 8498.0,
@@ -1317,7 +1326,7 @@
                 "DecodingStage": 361.6,
                 "InputValidationStage": 0.03,
                 "DenoisingStage": 7195.52,
-                "TextEncodingStage": 534.89,
+                "TextEncodingStage": 348.4,
                 "LatentPreparationStage": 0.09,
                 "TimestepPreparationStage": 2.07
             },
@@ -2593,7 +2602,7 @@
             "expected_load_ms": 30176.3,
             "stages_ms": {
                 "InputValidationStage": 0.05,
-                "TextEncodingStage": 534.56,
+                "TextEncodingStage": 360.21,
                 "LatentPreparationStage": 0.2,
                 "TimestepPreparationStage": 2.72,
                 "DenoisingStage": 7336.03,
@@ -2738,7 +2747,7 @@
                 "DecodingStage": 362.62,
                 "InputValidationStage": 0.04,
                 "DenoisingStage": 7238.94,
-                "TextEncodingStage": 534.42,
+                "TextEncodingStage": 347.67,
                 "LatentPreparationStage": 0.14,
                 "TimestepPreparationStage": 2.35
             },
@@ -2884,7 +2893,7 @@
                 "TimestepPreparationStage": 8.67,
                 "LTX2AVLatentPreparationStage": 0.14,
                 "LTX2ImageEncodingStage": 33.09,
-                "LTX2AVDenoisingStage": 16865.06,
+                "LTX2AVDenoisingStage": 9172.61,
                 "LTX2AVDecodingStage": 332.72
             },
             "denoise_step_ms": {
@@ -2894,34 +2903,34 @@
                 "3": 562.98,
                 "4": 557.91,
                 "5": 558.1,
-                "6": 560.08,
+                "6": 312.35,
                 "7": 558.2,
                 "8": 560.66,
                 "9": 557.22,
                 "10": 556.51,
                 "11": 560.84,
-                "12": 558.08,
+                "12": 299.59,
                 "13": 553.87,
                 "14": 555.03,
                 "15": 562.19,
                 "16": 561.89,
-                "17": 560.13,
+                "17": 293.64,
                 "18": 553.78,
                 "19": 562.13,
                 "20": 558.77,
                 "21": 556.56,
                 "22": 558.79,
-                "23": 556.63,
+                "23": 304.85,
                 "24": 558.15,
                 "25": 557.89,
                 "26": 555.4,
                 "27": 564.63,
                 "28": 559.4,
-                "29": 554.83
+                "29": 299.3
             },
-            "expected_e2e_ms": 18216.43,
-            "expected_avg_denoise_ms": 562.02,
-            "expected_median_denoise_ms": 556.39,
+            "expected_e2e_ms": 10160.35,
+            "expected_avg_denoise_ms": 305.63,
+            "expected_median_denoise_ms": 299.37,
             "load_peak_vram_mb": 46278.0,
             "runtime_peak_vram_mb": 49390.0,
             "load_peak_allocated_mb": 45460.0,
@@ -3111,16 +3120,16 @@
             "expected_load_ms": 32252.28,
             "stages_ms": {
                 "InputValidationStage": 23.02,
-                "LongLive2TextEncodingStage": 327.98,
+                "LongLive2TextEncodingStage": 135.69,
                 "LongLive2ImageVAEEncodingStage": 920.37,
                 "LongLive2LatentPreparationStage": 0.12,
-                "LongLive2CausalDenoisingStage": 4326.16,
+                "LongLive2CausalDenoisingStage": 1457.5,
                 "DecodingStage": 2548.02,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 9086.81,
-            "expected_avg_denoise_ms": 492.02,
+            "expected_e2e_ms": 5912.97,
+            "expected_avg_denoise_ms": 128.48,
             "expected_median_denoise_ms": 151.9,
             "load_peak_vram_mb": 34022.0,
             "runtime_peak_vram_mb": 62510.0,
@@ -3294,7 +3303,7 @@
                 "33": 22.65,
                 "34": 22.37
             },
-            "expected_e2e_ms": 1019.02,
+            "expected_e2e_ms": 812.05,
             "expected_avg_denoise_ms": 24.13,
             "expected_median_denoise_ms": 22.52,
             "estimated_full_test_time_s": 65.0
@@ -3316,7 +3325,7 @@
                 "2": 85.06,
                 "3": 58.08
             },
-            "expected_e2e_ms": 499.7,
+            "expected_e2e_ms": 369.27,
             "expected_avg_denoise_ms": 73.47,
             "expected_median_denoise_ms": 73.29,
             "estimated_full_test_time_s": 65.0
@@ -3359,7 +3368,7 @@
                 "MiniMaxH3LatentPreparationStage": 24.37,
                 "MiniMaxH3TimestepPreparationStage": 0.28,
                 "MiniMaxH3DenoisingStage": 55168.59,
-                "MiniMaxH3DecodingStage": 3183.0
+                "MiniMaxH3DecodingStage": 2758.73
             },
             "denoise_step_ms": {
                 "0": 1064.67,
@@ -3405,8 +3414,8 @@
             "expected_median_denoise_ms": 2332.99,
             "load_peak_vram_mb": 45428.0,
             "runtime_peak_vram_mb": 63312.0,
-            "load_peak_allocated_mb": 15139.0,
-            "runtime_peak_allocated_mb": 22887.0,
+            "load_peak_allocated_mb": 3330.01,
+            "runtime_peak_allocated_mb": 18182.98,
             "estimated_full_test_time_s": 235.0
         },
         "mova_360p_tp2": {
@@ -3528,23 +3537,23 @@
         "wan2_2_animate_2_14b_ref2v": {
             "stages_ms": {
                 "WanAnimate2BeforeDenoisingStage": 3783.78,
-                "WanAnimate2DenoisingStage": 94604.96,
+                "WanAnimate2DenoisingStage": 46049.96,
                 "WanAnimate2OutputStage": 0.06
             },
             "denoise_step_ms": {
                 "0": 25832.83,
-                "1": 7210.15,
+                "1": 4126.81,
                 "2": 11187.28,
-                "3": 8460.7,
-                "4": 8407.93,
+                "3": 5101.22,
+                "4": 4998.42,
                 "5": 8409.07,
-                "6": 8408.07,
-                "7": 8415.78
+                "6": 5000.29,
+                "7": 4999.26
             },
-            "expected_e2e_ms": 98402.77,
-            "expected_load_ms": 62901.15,
-            "expected_avg_denoise_ms": 10791.48,
-            "expected_median_denoise_ms": 8412.42,
+            "expected_e2e_ms": 48412.15,
+            "expected_load_ms": 43351.75,
+            "expected_avg_denoise_ms": 5004.67,
+            "expected_median_denoise_ms": 4999.09,
             "load_peak_vram_mb": 1776.0,
             "runtime_peak_vram_mb": 36322.0,
             "load_peak_allocated_mb": 1737.0,
