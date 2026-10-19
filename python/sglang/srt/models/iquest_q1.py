@@ -9,6 +9,18 @@ from transformers import PretrainedConfig
 from triton.language.extra import libdevice
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
+from sglang.srt.layers.layer_boundary import (
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    UNFUSED_NORM_READOUT,
+    UnfusedNormReadout,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -180,8 +192,10 @@ class IQuestQ1MoEBlock(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
+        self.reduce_results = reduce_results
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
@@ -215,7 +229,8 @@ class IQuestQ1MoEBlock(nn.Module):
         router_logits, _ = self.gate(hidden_states.float())
         topk_output = self.topk(hidden_states, router_logits)
         output = self.experts(hidden_states, topk_output)
-        output = post_experts_all_reduce(output)
+        if self.reduce_results:
+            output = post_experts_all_reduce(output)
         return output.reshape(original_shape)
 
 
@@ -225,6 +240,7 @@ class IQuestQ1DenseMLP(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -239,6 +255,7 @@ class IQuestQ1DenseMLP(nn.Module):
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
         )
         if config.hidden_act != "silu":
@@ -261,6 +278,7 @@ class IQuestQ1Attention(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ):
         super().__init__()
         parallel = get_parallel()
@@ -292,19 +310,24 @@ class IQuestQ1Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            kv_tp_rank=attn_tp_rank,
-            kv_tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
+        # The decoder boundary reduces partial attention outputs. Only a
+        # standalone attention that owns its TP reduction needs this guard.
+        if reduce_results:
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=attn_tp_size,
+                reduces_over_attn_tp=False,
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
+            reduce_results=reduce_results,
             prefix=add_prefix("o_proj", prefix),
         )
         self.q_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -399,6 +422,25 @@ class IQuestQ1Attention(nn.Module):
         return output
 
 
+class _NormReplacesResidualRead(UnfusedNormReadout):
+    """After the update, the norm of the stream is both the stage's input and
+    the new stream: IQuest-Q1 layers after the first add their attention
+    output to the normalized input."""
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        hidden_states, _ = super().read(
+            residual, norm, quant_format, post_residual_addition
+        )
+        return hidden_states, hidden_states
+
+
+_NORM_REPLACES_RESIDUAL = _NormReplacesResidualRead()
+
+
+def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
+    return layer_id not in (config.mlp_only_layers or [])
+
+
 class IQuestQ1DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -422,12 +464,14 @@ class IQuestQ1DecoderLayer(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
+            reduce_results=False,
         )
-        if layer_id in (config.mlp_only_layers or []):
+        if not _is_moe_layer(config, layer_id):
             self.mlp = IQuestQ1DenseMLP(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         else:
             self.mlp = IQuestQ1MoEBlock(
@@ -435,6 +479,7 @@ class IQuestQ1DecoderLayer(nn.Module):
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
+                reduce_results=False,
             )
         self.is_first_layer = layer_id == 0
         if self.is_first_layer:
@@ -446,6 +491,37 @@ class IQuestQ1DecoderLayer(nn.Module):
         else:
             self.attn_out_scale = config.attn_out_scale
             self.ffn_out_scale = config.ffn_out_scale
+        # Intentional: layer 0 adds the raw input and an FFN output norm, later layers
+        # add the normalized input without one; the MTP draft follows layer 0.
+        moe = _is_moe_layer(config, layer_id)
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (
+                declare_attn(
+                    read=UNFUSED_NORM_READOUT
+                    if self.is_first_layer
+                    else _NORM_REPLACES_RESIDUAL,
+                    output_transform=OutputTransform(self._attn_output),
+                ),
+                self.attention_norm,
+            ),
+            (
+                declare_ffn(
+                    sparse=moe,
+                    next_layer_sparse=_is_moe_layer(config, layer_id + 1),
+                    read=UNFUSED_NORM_READOUT,
+                    output_transform=OutputTransform(self._ffn_output),
+                ),
+                self.feed_forward_norm,
+            ),
+        )
+
+    def _attn_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        return self.attn_out_norm(attn_output) * self.attn_out_scale
+
+    def _ffn_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        if self.is_first_layer:
+            return self.ffn_out_norm(mlp_output) * self.ffn_out_scale
+        return mlp_output * self.ffn_out_scale
 
     def forward(
         self,
@@ -453,23 +529,12 @@ class IQuestQ1DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Intentional: layer 0 adds the raw input and an FFN output norm, later layers
-        # add the normalized input without one; the MTP draft follows layer 0.
-        if self.is_first_layer:
-            norm_hidden_states = self.attention_norm(hidden_states)
-            attn_output = self.self_attn(positions, norm_hidden_states, forward_batch)
-            hidden_states = hidden_states + self.attn_out_norm(attn_output) * (
-                self.attn_out_scale
-            )
-            mlp_output = self.mlp(self.feed_forward_norm(hidden_states))
-            return hidden_states + self.ffn_out_norm(mlp_output) * self.ffn_out_scale
-        norm_hidden_states = self.attention_norm(hidden_states)
-        attn_output = self.self_attn(positions, norm_hidden_states, forward_batch)
-        hidden_states = norm_hidden_states + self.attn_out_norm(attn_output) * (
-            self.attn_out_scale
-        )
-        mlp_output = self.mlp(self.feed_forward_norm(hidden_states))
-        return hidden_states + mlp_output * self.ffn_out_scale
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
+        attn_output = self.self_attn(positions, hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(attn_output, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        mlp_output = self.mlp(hidden_states)
+        return self.ffn_boundary.finish(mlp_output, forward_batch)
 
 
 class IQuestQ1Model(nn.Module):
@@ -509,9 +574,11 @@ class IQuestQ1Model(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+        residual_batch.start(forward_batch)
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states, forward_batch)
-        return self.norm(hidden_states)
+        hidden_states = residual_batch.fold(hidden_states, forward_batch)
+        return self.norm(residual_batch.take_output(hidden_states, forward_batch))
 
 
 _FUSED_SHARD_LAYOUT = (

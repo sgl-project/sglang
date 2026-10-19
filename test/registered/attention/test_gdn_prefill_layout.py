@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -11,6 +12,9 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkv_split_gdn_prefill,
     qwen3_5_gdn_prefill_projection_views,
 )
+from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=6, stage="base-b", runner_config="1-gpu-large")
@@ -22,6 +26,62 @@ class TestGdnPrefillLayout(unittest.TestCase):
     NUM_QK_HEADS = 2
     NUM_V_HEADS = 4
     HEAD_DIM = 128
+
+    def test_compact_prefill_conv_matches_rectangular_output_and_cache(self):
+        torch.manual_seed(0)
+        for seq_lens in ([65, 1, 0, 1, 1, 1, 1, 1], [8065] + [1] * 127):
+            with self.subTest(batch_size=len(seq_lens)):
+                dim, width = 768, 4
+                batch_size = len(seq_lens)
+                lengths = torch.tensor(seq_lens, device="cuda", dtype=torch.int32)
+                starts = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)]).int()
+                # Preserve the token-major projection view, including the unused Z.
+                qkv = torch.randn(
+                    sum(seq_lens), dim + 256, device="cuda", dtype=torch.bfloat16
+                )[:, :dim]
+                cache_indices = torch.randperm(batch_size + 2, device="cuda")[
+                    :batch_size
+                ]
+                cache_indices = cache_indices.int()
+                cache_indices[-1] = -1
+                states = torch.randn(
+                    batch_size + 2, dim, width - 1, device="cuda", dtype=qkv.dtype
+                )
+                expected_states = states.clone()
+                layer = SimpleNamespace(
+                    conv_weights=torch.randn(
+                        dim, width, device="cuda", dtype=qkv.dtype
+                    ),
+                    bias=torch.randn(dim, device="cuda", dtype=qkv.dtype),
+                    activation="silu",
+                )
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.MIXED,
+                    tbo_parent_token_range=None,
+                    extend_seq_lens_cpu=seq_lens,
+                    extend_prefix_lens=torch.ones(batch_size, device="cuda"),
+                )
+                batch.extend_prefix_lens[0] = 0
+                backend = object.__new__(GDNAttnBackend)
+                backend.device = "cuda"
+                backend.mis_metadata = None
+                backend.forward_metadata = ForwardMetadata(
+                    query_start_loc=starts, mamba_cache_indices=cache_indices
+                )
+                expected = backend._convolve_prefill(
+                    layer, batch, qkv, expected_states, cache_indices
+                )
+                backend._init_prefill_conv_block_table(batch)
+                self.assertIsNotNone(backend.forward_metadata.conv_block_table)
+                actual = backend._convolve_prefill(
+                    layer, batch, qkv, states, cache_indices
+                )
+                # Padded rows have no defined output; all cache slots must still match.
+                valid_tokens = sum(seq_lens[:-1])
+                torch.testing.assert_close(
+                    actual[:valid_tokens], expected[:valid_tokens], rtol=0, atol=0
+                )
+                torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
 
     def _projection_views(self, dtype):
         qkv_dim = (

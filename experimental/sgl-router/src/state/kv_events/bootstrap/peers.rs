@@ -2,7 +2,7 @@
 
 use parking_lot::Mutex;
 use rand::seq::SliceRandom;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Sibling replicas a snapshot may be pulled from. An empty set is conclusive
 /// only after a sync and only if siblings were never seen: before the first
@@ -39,7 +39,11 @@ impl PeerRegistry {
             changed
         };
         if let Some(peers) = changed {
-            info!(count = peers.len(), peers = ?peers, "kv-bootstrap: peer set updated");
+            // Count at info; the full URL list only at debug — on a large
+            // fleet every rolling update re-lists every sibling, and one log
+            // line per change carrying every URL gets loud.
+            info!(count = peers.len(), "kv-bootstrap: peer set updated");
+            debug!(peers = ?peers, "kv-bootstrap: peer set contents");
         }
     }
 
@@ -83,27 +87,40 @@ impl PeerRegistry {
 mod tests {
     use super::*;
 
+    /// An empty peer set is only conclusive if siblings were never seen.
     #[test]
-    fn a_transient_empty_peer_set_is_not_conclusive() {
-        let reg = PeerRegistry::new();
+    fn transient_empty_peer_set_is_not_conclusive() {
+        let r = PeerRegistry::new();
+        assert!(!r.known_to_have_no_peers(), "unsynced is never conclusive");
+
+        r.replace(vec![]);
         assert!(
-            !reg.known_to_have_no_peers(),
-            "before any sync, empty means the watch has not delivered",
+            r.known_to_have_no_peers(),
+            "synced + never any peers ⇒ genuinely alone",
         );
 
-        reg.replace(vec!["http://a:30000".into()]);
-        assert!(reg.synced());
-        assert!(!reg.known_to_have_no_peers());
-
-        // An EndpointSlice repack, or a rolling update with every sibling
-        // notReady, empties the set for an instant. Having once seen siblings
-        // is what keeps that from reading as "I am alone".
-        reg.replace(vec![]);
-        assert!(reg.is_empty());
+        r.replace(vec!["http://sibling:8090".into()]);
+        r.replace(vec![]);
         assert!(
-            !reg.known_to_have_no_peers(),
-            "a dip after siblings were seen is transient, not conclusive",
+            !r.known_to_have_no_peers(),
+            "once siblings have been seen, an empty set must be read as transient",
         );
+    }
+
+    #[test]
+    fn peer_registry_shuffles_without_losing_entries() {
+        let r = PeerRegistry::new();
+        assert!(r.is_empty());
+        let peers: Vec<String> = (0..16).map(|i| format!("http://r{i}")).collect();
+        r.replace(peers.clone());
+        assert_eq!(r.len(), 16);
+
+        let mut got = r.candidates();
+        assert_eq!(got.len(), 16);
+        got.sort();
+        let mut want = peers;
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -112,19 +129,5 @@ mod tests {
         reg.replace(vec![]);
         assert!(reg.synced());
         assert!(reg.known_to_have_no_peers());
-    }
-
-    #[test]
-    fn candidates_shuffle_without_losing_entries() {
-        let reg = PeerRegistry::new();
-        let peers: Vec<String> = (0..16).map(|i| format!("http://p{i}:30000")).collect();
-        reg.replace(peers.clone());
-
-        let mut got = reg.candidates();
-        assert_eq!(got.len(), peers.len());
-        got.sort();
-        let mut want = peers;
-        want.sort();
-        assert_eq!(got, want, "shuffling must not drop or duplicate a peer");
     }
 }

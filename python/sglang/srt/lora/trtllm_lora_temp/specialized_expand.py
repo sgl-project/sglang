@@ -5,7 +5,7 @@ It is rank-specialized: the ``R`` dimension (LoRA rank) is a Triton
 ``constexpr``, so each rank value used at runtime gets its own JIT-compiled
 specialization.
 
-Called from :mod:`sglang.kernels.ops.moe.virtual_experts` when
+Called from :mod:`sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts` when
 ``use_direct_expand_add=True``. Ranks above 64 are accumulated in multiple
 rank tiles.
 """

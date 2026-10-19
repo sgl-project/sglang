@@ -305,9 +305,10 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
-            disaggregation_decode_host_receive_threshold=0.0,
+            disaggregation_decode_host_receive_threshold=1.0,
             enable_pd_role_switch=True,
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             ep_size=1,
             moe_a2a_backend="none",
             pp_size=1,
@@ -316,7 +317,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             speculative_algorithm=None,
         )
         base.update(kw)
-        return SimpleNamespace(**base)
+        # Keep the production defaults for fields read by the shared PD hook.
+        return ServerArgs(model_path="dummy", **base)
 
     def _run(self, sa):
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -331,8 +333,8 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
 
     def test_reject_dp_attention(self):
         with self.assertRaises(ValueError) as ctx:
-            self._run(self._sa(enable_dp_attention=True))
-        self.assertIn("DP attention", str(ctx.exception))
+            self._run(self._sa(attn_dp_size=2))
+        self.assertIn("attention DP", str(ctx.exception))
 
     def test_reject_expert_parallelism(self):
         with self.assertRaises(ValueError) as ctx:
@@ -571,7 +573,7 @@ def _radix_scheduler(disable_radix_cache):
 @unittest.skipUnless(_HAS_ROLE_SWITCH, "role_switch not importable in this env")
 class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
     """The flip may run with radix cache ENABLED: teardown resets the tree cache
-    + KV pools when radix is on, and is a no-op on the historical chunk-cache path."""
+    + KV pools when radix is on, and is a no-op on the radix-disabled path."""
 
     def test_noop_when_radix_disabled(self):
         s = _radix_scheduler(disable_radix_cache=True)
@@ -593,6 +595,48 @@ class TestReleasePrefixCacheOnRoleSwitch(unittest.TestCase):
         teardown_disaggregation(s)
         self.assertIsNone(s.disagg_metadata_buffers)
         s.tree_cache.reset.assert_called_once_with()
+
+
+class TestStartupDecodeGraphReuse(unittest.TestCase):
+    def test_switch_reuses_startup_graph_or_captures_when_missing(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+        from sglang.srt.model_executor import model_runner as mr
+
+        for graph in (SimpleNamespace(capture_bs=[1, 2, 4]), None):
+            with self.subTest(captured_at_startup=graph is not None):
+                rc.reset_context()
+                try:
+                    rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+                    runner = mr.ModelRunner.__new__(mr.ModelRunner)
+                    runner.model = MagicMock()
+                    runner.decode_cuda_graph_captured = False
+                    runner.decode_cuda_graph_capture_bs = []
+                    runner.init_decode_cuda_graph = MagicMock()
+                    capture = SimpleNamespace(
+                        eager_runner=MagicMock(),
+                        prefill=SimpleNamespace(runner=None),
+                        decode=SimpleNamespace(runner=graph),
+                        memory_usage=None,
+                        time_usage=None,
+                    )
+                    with (
+                        patch.object(mr, "capture_cuda_graphs", return_value=capture),
+                        patch.object(mr, "prebuild_deepep_v2_buffer"),
+                    ):
+                        runner.init_cuda_graphs()
+                    worker = SimpleNamespace(model_runner=runner)
+                    self.assertEqual(
+                        TpModelWorker.get_decode_cuda_graph_bs(worker),
+                        [1, 2, 4] if graph is not None else [],
+                    )
+                    runner.ensure_decode_cuda_graphs()
+                    if graph is not None:
+                        runner.init_decode_cuda_graph.assert_not_called()
+                        self.assertIs(runner.decode_cuda_graph_runner, graph)
+                    else:
+                        runner.init_decode_cuda_graph.assert_called_once_with()
+                finally:
+                    rc.reset_context()
 
 
 if __name__ == "__main__":

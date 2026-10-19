@@ -27,6 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -109,27 +110,30 @@ class BailingMoEModelNextN(nn.Module):
         self.is_hybrid = (
             hasattr(config, "model_type") and config.model_type == "bailing_hybrid"
         )
-        if self.is_hybrid:
-            config.attention_type = 1
-            decoder_layer_cls = BailingMoELinearDecoderLayer
-            decoder_kwargs = {
-                "quant_config": quant_config,
-                "layer_id": 0,
-                "is_nextn": True,
-                "prefix": add_prefix(f"layers.{config.num_hidden_layers}", prefix),
-            }
-            if _is_bailing_moe_v3_config(config):
-                decoder_layer_cls = BailingMoeV3DecoderLayer
-                decoder_kwargs["num_fused_shared_experts"] = num_fused_shared_experts
-            self.decoder = decoder_layer_cls(config, **decoder_kwargs)
-        else:
-            self.decoder = BailingMoEBlock(
-                config,
-                0,
-                quant_config=quant_config,
-                prefix=add_prefix("decoder", prefix),
-                is_nextn=True,
-            )
+        with layer_stack():
+            if self.is_hybrid:
+                config.attention_type = 1
+                decoder_layer_cls = BailingMoELinearDecoderLayer
+                decoder_kwargs = {
+                    "quant_config": quant_config,
+                    "layer_id": 0,
+                    "is_nextn": True,
+                    "prefix": add_prefix(f"layers.{config.num_hidden_layers}", prefix),
+                }
+                if _is_bailing_moe_v3_config(config):
+                    decoder_layer_cls = BailingMoeV3DecoderLayer
+                    decoder_kwargs["num_fused_shared_experts"] = (
+                        num_fused_shared_experts
+                    )
+                self.decoder = decoder_layer_cls(config, **decoder_kwargs)
+            else:
+                self.decoder = BailingMoEBlock(
+                    config,
+                    0,
+                    quant_config=quant_config,
+                    prefix=add_prefix("decoder", prefix),
+                    is_nextn=True,
+                )
 
         self.shared_head = nn.Module()
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -183,7 +187,7 @@ class BailingMoEModelNextN(nn.Module):
 
         hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
         if not forward_batch.forward_mode.is_idle():
-            hidden_states = residual_batch.norm(
+            hidden_states = residual_batch.final_norm(
                 hidden_states, forward_batch, self.final_layernorm
             )
 
@@ -219,7 +223,6 @@ class BailingMoeForCausalLMNextN(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.num_fused_shared_experts = 0
         is_bailing_moe_v3 = _is_bailing_moe_v3_config(config)

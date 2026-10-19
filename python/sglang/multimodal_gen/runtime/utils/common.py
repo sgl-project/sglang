@@ -3,7 +3,6 @@
 import ipaddress
 import logging
 import os
-import platform
 import socket
 from functools import lru_cache
 from typing import Any
@@ -247,7 +246,7 @@ def get_zmq_socket(
                         # Last attempt failed
                         logger.error(
                             f"Failed to bind ZMQ socket after {max_bind_retries} attempts. "
-                            f"Original endpoint: {endpoint}, Last tried port: {original_port + attempt * 42}"
+                            f"Original endpoint: {endpoint}, last tried: {current_endpoint}"
                         )
                         raise
                     else:
@@ -266,19 +265,6 @@ def get_zmq_socket(
         return socket, endpoint
 
     return socket, endpoint
-
-
-# https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
-
-
-@lru_cache(maxsize=1)
-def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
 
 
 # cuda

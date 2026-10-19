@@ -322,12 +322,6 @@ class FlashAttentionMetadata:
 
 
 class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore
         self,
         raw_latent_shape=list,
@@ -386,7 +380,6 @@ class FlashAttentionImpl(AttentionImpl):
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )
-        self.attention_metadata = FlashAttentionMetadata()
 
     def _request_skip_softmax_threshold(self) -> tuple[bool, float | None]:
         params = get_request_skip_softmax_params()
