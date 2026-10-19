@@ -14,10 +14,7 @@ Modules, in dependency order (there are no cycles)::
     cache      build_key / deps_key, cache layout, publication
     sailify    CUDA -> PPU source conversion for hgcc builds
     loader     load_jit
-
-``sailify`` and ``cache`` reference each other lazily (the mirror digest uses
-the cache's file digests; the environment fingerprint uses the sailify
-version), so neither imports the other at module level.
+    parallel   parallel_compile: several builds at once
 """
 
 from sglang.kernels.jit.utils.compile.cpp_args import (
@@ -27,6 +24,7 @@ from sglang.kernels.jit.utils.compile.cpp_args import (
     make_cpp_args,
 )
 from sglang.kernels.jit.utils.compile.loader import load_jit
+from sglang.kernels.jit.utils.compile.parallel import parallel_compile
 from sglang.kernels.jit.utils.compile.paths import (
     DEFAULT_CFLAGS,
     DEFAULT_INCLUDE,
@@ -48,4 +46,5 @@ __all__ = [
     "cuda_stubs_dir",
     "load_jit",
     "make_cpp_args",
+    "parallel_compile",
 ]
