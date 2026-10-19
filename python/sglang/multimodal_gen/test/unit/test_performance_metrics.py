@@ -7,14 +7,27 @@ import torch
 
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
-from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    WarmupPhasePeak,
+import sglang.multimodal_gen.runtime.utils.perf_logger as perf_logger_module
+from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
+    _deserialize_request_metrics,
 )
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
+    LTX2RefinementStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
+    PerformanceLogger,
     RequestMetrics,
     RequestPerfRecord,
 )
@@ -26,6 +39,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
     ToleranceConfig,
 )
+from sglang.multimodal_gen.test.test_utils import read_perf_logs
 
 
 @pytest.fixture(autouse=True)
@@ -50,25 +64,123 @@ def _perf_record(memory_snapshots: dict[str, dict]) -> RequestPerfRecord:
     )
 
 
-def test_request_metrics_attributes_steps_and_iterations_to_active_stage():
+@pytest.mark.parametrize("is_output_rank", [False, True])
+@pytest.mark.parametrize("is_warmup", [False, True])
+def test_worker_perf_dump_has_one_writer_per_replica(
+    is_output_rank, is_warmup, monkeypatch, tmp_path
+):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.is_output_rank = is_output_rank
+    worker.server_args = SimpleNamespace(model_path="test-model")
+    worker._realtime_sessions = SimpleNamespace(attach=Mock())
+    worker._release_warmup_pool = Mock()
+    worker._materialize_output_transport = Mock()
+    worker._record_output_peak_memory = Mock()
+    worker._record_replica_peak_memory = Mock()
+    monkeypatch.setattr(current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    monkeypatch.setattr(PerformanceLogger, "log_request_summary", Mock())
+
+    path = tmp_path / "perf.json"
+    path.write_text('{"writer": "output-rank"}')
     metrics = RequestMetrics("request")
-    metrics.active_stage_name = "ShapeStage"
+    output = OutputBatch(metrics=metrics)
+    req = SimpleNamespace(
+        request_id="request",
+        is_warmup=is_warmup,
+        extra={},
+        suppress_logs=True,
+        perf_dump_path=str(path),
+    )
+    result = worker._execute_forward_common(
+        req,
+        forward_fn=lambda: output,
+        log_reqs=[],
+        return_req=False,
+        save_output_paths=Mock(),
+        error_context="test",
+    )
 
-    metrics.record_step(0.1)
-    metrics.record_stage_iterations(4, 50)
-    metrics.active_stage_name = "PaintStage"
-    metrics.record_step(0.2)
-    metrics.record_stage_iterations(4, 30)
+    assert result is output
+    assert result.error is None
+    report = json.loads(path.read_text())
+    if is_output_rank and not is_warmup:
+        assert report["request_id"] == "request"
+        assert report["tag"] == "server_perf_dump"
+        assert report["meta"] == {"model": "test-model"}
+    else:
+        assert report == {"writer": "output-rank"}
+    # non-output ranks must still participate in the replica's memory reduction
+    if is_warmup:
+        worker._record_replica_peak_memory.assert_not_called()
+    else:
+        worker._record_replica_peak_memory.assert_called_once_with([metrics])
 
-    assert metrics.steps == [100.0, 200.0]
-    assert metrics.steps_by_stage == {
-        "ShapeStage": [100.0],
-        "PaintStage": [200.0],
-    }
-    assert metrics.stage_iterations == {
-        "ShapeStage": (4, 50),
-        "PaintStage": (4, 30),
-    }
+
+@pytest.mark.parametrize("roundtrip", [False, True])
+@pytest.mark.parametrize(
+    "stage_class,profile_name,is_denoising",
+    [
+        (DenoisingStage, "DenoisingStage", True),
+        (MiniMaxH3DenoisingStage, "MiniMaxH3DenoisingStage", True),
+        (LTX2RefinementStage, "LTX2RefinementStage", True),
+        (LTX2RefinementStage, "custom_refinement", True),
+        (DenoisingStage, "BeforeDenoisingStage", True),
+        (TextEncodingStage, "BeforeDenoisingStage", False),
+        (TextEncodingStage, "TextEncodingStage", False),
+    ],
+)
+def test_stage_role_reaches_performance_guard(
+    stage_class, profile_name, is_denoising, roundtrip, monkeypatch, tmp_path
+):
+    # skip model construction and kernels, retaining the real stage role,
+    # call boundary, profiler, log writer/reader and threshold validator
+    stage = stage_class.__new__(stage_class)
+    stage.server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, comfyui_mode=False
+    )
+    stage.set_profile_stage_name(profile_name)
+    monkeypatch.setattr(stage, "forward", lambda batch, args: batch)
+    monkeypatch.setattr(
+        stage, "verify_input", PipelineStage.verify_input.__get__(stage)
+    )
+    monkeypatch.setattr(
+        stage, "verify_output", PipelineStage.verify_output.__get__(stage)
+    )
+    monkeypatch.setattr(current_platform, "get_available_gpu_memory", lambda **_: 100)
+    monkeypatch.setattr(current_platform, "is_hip", lambda: False)
+    monkeypatch.setenv("SGLANG_PERF_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(perf_logger_module, "get_is_main_process", lambda: True)
+    monkeypatch.setattr(perf_logger_module, "get_git_commit_hash", lambda: "test")
+    metrics = RequestMetrics("stage-role")
+    batch = SimpleNamespace(is_warmup=False, metrics=metrics, perf_dump_path="metrics")
+    with patch.object(perf_logger_module.time, "perf_counter", side_effect=[10, 11.5]):
+        assert stage(batch, stage.server_args) is batch
+    metrics.total_duration_ms = 1500
+    if roundtrip:
+        metrics = _deserialize_request_metrics(
+            json.loads(json.dumps(metrics.to_dict()))
+        )
+    PerformanceLogger.log_request_summary(metrics)
+    (record,) = read_perf_logs(tmp_path / "performance.log")
+    assert record.stages == [
+        {
+            "name": profile_name,
+            "execution_time_ms": 1500.0,
+            "is_denoising": is_denoising,
+        }
+    ]
+    validator = PerformanceValidator(
+        ScenarioConfig({profile_name: 1000}, {}, 1500, 1, 1),
+        ToleranceConfig(0.25, 0.25, 0.8, 0.3, 0.2),
+        (),
+    )
+    summary = validator.collect_metrics(record)
+    if is_denoising:
+        with pytest.raises(AssertionError, match="Stage '"):
+            validator._validate_stages(summary)
+    else:
+        validator._validate_stages(summary)
 
 
 def test_performance_summary_separates_load_and_runtime_peaks():
@@ -103,10 +215,19 @@ def test_worker_records_replica_load_and_runtime_peaks():
     worker._runtime_peak_allocated_mb = 0.0
     output = OutputBatch()
     metrics = RequestMetrics("request")
-    replica_group = Mock()
-    replica_group.all_reduce.return_value = torch.tensor(
-        [5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64
-    )
+    replica_group = SimpleNamespace(world_size=2, cpu_group=object())
+    reduced = []
+
+    def all_reduce(tensor, op, group):
+        # five host counters over the gloo group, never a device collective
+        assert tensor.device.type == "cpu"
+        assert op == torch.distributed.ReduceOp.MAX
+        assert group is replica_group.cpu_group
+        reduced.append(tensor.tolist())
+        tensor.copy_(
+            torch.tensor([5120.0, 3584.0, 6144.0, 3500.0, 2560.0], dtype=torch.float64)
+        )
+
     snapshots = [
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
         MemorySnapshot(0.0, 0.0, 2048.0, 3072.0),
@@ -122,6 +243,9 @@ def test_worker_records_replica_load_and_runtime_peaks():
         patch.object(
             gpu_worker_module, "get_replica_group", return_value=replica_group
         ),
+        patch.object(
+            gpu_worker_module.torch.distributed, "all_reduce", side_effect=all_reduce
+        ),
     ):
         worker._record_output_peak_memory(output)
         worker._record_replica_peak_memory([metrics])
@@ -135,6 +259,7 @@ def test_worker_records_replica_load_and_runtime_peaks():
     assert metrics.memory_snapshots["load_peak"].peak_allocated_mb == 3500.0
     assert metrics.memory_snapshots["runtime_peak"].peak_allocated_mb == 2560.0
     assert metrics.memory_snapshots["warmup_peak"].peak_reserved_mb == 6144.0
+    assert reduced == [[4096.0, 3072.0, 0.0, 3000.0, 2048.0]]
 
 
 def test_server_warmup_preserves_peak_after_managed_stage_timeline():
@@ -142,20 +267,11 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     worker._auto_residency_warmup_records = []
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+        "0:denoise:use:transformer": 8
     }
-    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(
-        width=64,
-        height=64,
-        num_frames=1,
-        num_inference_steps=1,
-        metrics=None,
-    )
-
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
         patch.object(
@@ -165,19 +281,14 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
         ),
     ):
         worker._record_server_warmup_memory(
-            req=req,
-            workload=(128, 96, 9, 2),
+            workload=(128, 96, 9),
             baseline_allocated_bytes=3,
             succeeded=True,
         )
 
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 9
-    assert record.peak_reserved_bytes == 12
     assert (record.width, record.height, record.num_frames) == (128, 96, 9)
-    assert record.num_inference_steps == 2
-    assert record.phase_peak_allocated_bytes["request:untracked"] == 9
-    assert record.phase_active_components["request:untracked"] == ("transformer",)
 
 
 def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
@@ -185,20 +296,11 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     worker._auto_residency_warmup_records = []
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
+        "0:denoise:use:transformer": 8
     }
-    residency_manager.current_device_components.return_value = ("transformer",)
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
     device_module.max_memory_reserved.return_value = 12
-    req = SimpleNamespace(
-        width=64,
-        height=64,
-        num_frames=1,
-        num_inference_steps=1,
-        metrics=None,
-    )
-
     with (
         patch.object(torch, "get_device_module", return_value=device_module),
         patch.object(
@@ -208,14 +310,13 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
         ),
     ):
         worker._record_server_warmup_memory(
-            req=req,
-            workload=(64, 64, 1, 1),
+            workload=(64, 64, 1),
             baseline_allocated_bytes=3,
             succeeded=True,
         )
 
     record = worker._auto_residency_warmup_records[0]
-    assert "request:untracked" not in record.phase_peak_allocated_bytes
+    assert record.peak_allocated_bytes == 8
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
@@ -261,6 +362,7 @@ def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
     assert scenario.runtime_peak_allocated_mb == 2000.5
     assert config.tolerances.load_peak_vram == 0.01
     assert config.tolerances.runtime_peak_vram == 0.02
+    assert config.tolerances.load is None
 
 
 def test_peak_vram_validation_uses_independent_tolerances():
@@ -437,65 +539,6 @@ def test_results_json_merges_retry_sessions(tmp_path):
 
     results = json.loads(path.read_text(encoding="utf-8"))
     assert {item["test_name"] for item in results} == {"first", "second"}
-
-
-def _warmup_batch_for_iterations(steps: int, target_steps: int):
-    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-
-    metrics = RequestMetrics(request_id="probe")
-    metrics.suppress_stage_breakdown = False
-    metrics.active_stage_name = "DenoisingStage"
-    return SimpleNamespace(
-        metrics=metrics,
-        num_inference_steps=steps,
-        extra={"warmup_target_num_inference_steps": target_steps},
-        is_warmup=True,
-    )
-
-
-def test_stage_formula_records_probe_and_default_iterations():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: steps - 1)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {"DenoisingStage": (3, 49)}
-
-
-def test_fixed_schedule_formula_records_the_same_count_twice():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: 8)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {"DenoisingStage": (8, 8)}
-
-
-def test_explicit_loop_record_wins_over_the_formula():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    batch.metrics.record_stage_iterations(12, 12)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: steps)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {"DenoisingStage": (12, 12)}
-
-
-def test_stage_without_a_formula_records_nothing():
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-        record_default_workload_iterations,
-    )
-
-    batch = _warmup_batch_for_iterations(steps=4, target_steps=50)
-    stage = SimpleNamespace(default_workload_iterations=lambda batch, steps: None)
-    record_default_workload_iterations(stage, batch)
-    assert batch.metrics.stage_iterations == {}
 
 
 def test_warmup_peak_stays_out_of_the_runtime_peak():

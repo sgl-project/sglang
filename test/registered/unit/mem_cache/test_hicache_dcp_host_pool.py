@@ -11,12 +11,12 @@ kernels.
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -28,24 +28,23 @@ PHYSICAL_PAGE = 64
 WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
 
 
-def _fake_mla_device_pool(size: int = 1024) -> SimpleNamespace:
-    return SimpleNamespace(
+def _fake_mla_device_pool(size: int = 1024) -> MLATokenToKVPool:
+    return MLATokenToKVPool(
         size=size,
-        store_dtype=torch.float16,
+        page_size=PHYSICAL_PAGE,
+        dtype=torch.float16,
         kv_lora_rank=8,
         qk_rope_head_dim=4,
         layer_num=2,
-        start_layer=0,
-        end_layer=1,
         device="cpu",
-        layers_to_capture=None,
-        layer_shard_enabled=False,
+        enable_memory_saver=False,
     )
 
 
 def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolHost:
+    device_pool = _fake_mla_device_pool(device_size)
     return MLATokenToKVPoolHost(
-        _fake_mla_device_pool(device_size),
+        device_pool.get_device_pool_infos()[0].buffer_info,
         host_to_device_ratio=2.0,
         host_size=0,
         page_size=WIDENED_PAGE,
@@ -54,6 +53,20 @@ def _make_host_pool(dcp_rank: int, device_size: int = 1024) -> MLATokenToKVPoolH
         device="cpu",
         dcp_size=DCP_SIZE,
         dcp_rank=dcp_rank,
+        device_capacity_tokens=(
+            device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens
+        ),
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        target_layer_num=(
+            (device_pool.layer_num + device_pool.layer_shard_size - 1)
+            // device_pool.layer_shard_size
+            if device_pool.layer_shard_enabled
+            else device_pool.layer_num
+        ),
+        layer_shard_enabled=device_pool.layer_shard_enabled,
     )
 
 
@@ -142,14 +155,29 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
 
     def test_non_dcp_pool_unchanged(self):
+        device_pool = _fake_mla_device_pool()
         pool = MLATokenToKVPoolHost(
-            _fake_mla_device_pool(),
+            device_pool.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=PHYSICAL_PAGE,
             layout="layer_first",
             pin_memory=False,
             device="cpu",
+            device_capacity_tokens=(
+                device_pool.size
+                if device_pool.host_capacity_tokens is None
+                else device_pool.host_capacity_tokens
+            ),
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=(
+                (device_pool.layer_num + device_pool.layer_shard_size - 1)
+                // device_pool.layer_shard_size
+                if device_pool.layer_shard_enabled
+                else device_pool.layer_num
+            ),
+            layer_shard_enabled=device_pool.layer_shard_enabled,
         )
         self.assertEqual(pool.page_size, PHYSICAL_PAGE)
         self.assertEqual(pool.logical_size, pool.size)
@@ -158,10 +186,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
 
 class TestTransferEntryPointsTranslate(CustomTestCase):
     def _run_backup(self, pool, host_indices, device_indices):
-        device_pool = SimpleNamespace(
-            data_ptrs=torch.zeros(2, dtype=torch.uint64),
-            kv_buffer=[torch.zeros(1)] * 2,
-        )
+        device_pool = None
         # create=True: mla.py imports the kernel only under `if _is_cuda or
         # _is_hip`, so the name is absent on the CPU runner this test targets.
         with mock.patch(
@@ -190,6 +215,115 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         pool = _make_host_pool(dcp_rank=0)
         with self.assertRaises(AssertionError):
             pool.get_data_page(0)
+
+
+class TestLayerShardedHostTransfers(CustomTestCase):
+    def test_layer_sharded_ascend_reports_unsupported_backend(self):
+        """Unsupported Ascend backup must report the backend, not a buffer error."""
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (0, 1)
+        host = MLATokenToKVPoolHost(
+            pool.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            PHYSICAL_PAGE,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            ),
+            layer_shard_enabled=pool.layer_shard_enabled,
+        )
+        self.addCleanup(host.destroy)
+        # Ascend has no CUDA-style per-layer KV buffers.
+        host.device_kv_buffers = ()
+        indices = torch.arange(PHYSICAL_PAGE)
+        with self.assertRaisesRegex(
+            ValueError,
+            "Layer-sharded HiCache backup does not support IO backend: kernel_ascend",
+        ):
+            host.backup_from_device_all_layer(
+                pool, indices, indices, io_backend="kernel_ascend"
+            )
+
+    def test_owned_device_layers_keep_their_original_positions(self):
+        # Rank 1 owns device layers 2/3, which occupy host layers 0/1.
+        pool = _fake_mla_device_pool(size=128)
+        pool.layer_num = 4
+        pool.end_layer = 4
+        pool.model_layer_ids = tuple(range(4))
+        pool.layer_shard_enabled = True
+        pool.layer_shard_size = 2
+        pool._owned_local_layer_range = lambda: (2, 4)
+        owned = [
+            torch.full((192, 1, 12), value, dtype=torch.float16) for value in (2, 3)
+        ]
+        pool.kv_buffer = [
+            torch.empty(0, 1, 12, dtype=torch.float16) for _ in range(2)
+        ] + owned
+        pool.data_ptrs = torch.tensor(
+            [b.data_ptr() for b in pool.kv_buffer], dtype=torch.uint64
+        )
+        host = MLATokenToKVPoolHost(
+            pool.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            PHYSICAL_PAGE,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=(
+                pool.size
+                if pool.host_capacity_tokens is None
+                else pool.host_capacity_tokens
+            ),
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=(
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            ),
+            layer_shard_enabled=pool.layer_shard_enabled,
+        )
+        self.addCleanup(host.destroy)
+        self.assertEqual(host.layer_num, 2)
+        source = torch.arange(64, 128)
+        destination = torch.arange(64)
+        host_indices = torch.arange(128, 192)
+
+        def copy_pages(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+            for src, dst in zip(src_layers, dst_layers, strict=True):
+                dst[dst_indices] = src[src_indices]
+
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_direct",
+            side_effect=copy_pages,
+            create=True,
+        ) as transfer:
+            host.backup_from_device_all_layer(pool, host_indices, source, "direct")
+            for buffer in owned:
+                buffer.zero_()
+            for layer in range(4):
+                host.load_to_device_per_layer(
+                    pool, host_indices, destination, layer, "direct"
+                )
+        self.assertEqual(transfer.call_count, 4)
+        for buffer, value in zip(owned, (2, 3), strict=True):
+            torch.testing.assert_close(
+                buffer[destination], torch.full((64, 1, 12), value, dtype=torch.float16)
+            )
+            self.assertEqual(torch.count_nonzero(buffer[64:]).item(), 0)
 
 
 if __name__ == "__main__":

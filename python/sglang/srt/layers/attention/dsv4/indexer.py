@@ -24,6 +24,7 @@ from sglang.kernels.ops.attention.dsv4 import (
     topk_transform_paged_v2,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    FP4RowgroupDecodeWorkspace,
     aiter_fp4_paged_mqa_logits,
     aiter_q_indexer_fp4,
     logits_rows_per_chunk,
@@ -61,7 +62,7 @@ from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
         CompressorBackendMixin,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -443,30 +444,23 @@ def topk_transform_flashinfer_fused(
     )
 
 
-def deep_gemm_fp4_paged_mqa_logits(
-    q_fp4: Tuple[torch.Tensor, torch.Tensor],
-    k_cache: torch.Tensor,
-    weights: torch.Tensor,
+def topk_transform_paged_bf16(
+    logits: torch.Tensor,
     seq_lens: torch.Tensor,
     page_table: torch.Tensor,
-    deep_gemm_metadata,
-    max_seq_len: int,
-) -> torch.Tensor:
-    """DeepGEMM paged fp4 logits; no hadamard, the reference does not apply one."""
-    from deep_gemm import fp8_fp4_paged_mqa_logits
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """DeepSelect paged top-k of bf16 logits: pool slots only, unordered."""
+    from sglang.kernels.ops.attention.deep_select import topk_page_transform
 
-    sl = seq_lens.to(torch.int32)
-    if sl.dim() == 1:
-        sl = sl.unsqueeze(-1)
-    return fp8_fp4_paged_mqa_logits(
-        q_fp4,
-        k_cache,
-        weights,
-        sl,
-        page_table,
-        deep_gemm_metadata,
-        max_seq_len,
-        False,
+    topk_page_transform(
+        logits,
+        out_page_indices.shape[1],
+        page_table=page_table,
+        page_size=page_size,
+        end=seq_lens.reshape(-1).to(torch.int32),
+        output_idx=out_page_indices,
     )
 
 
@@ -475,27 +469,50 @@ def topk_transform_paged_from_metadata(
     metadata,
     page_indices: torch.Tensor,
     raw_indices: Optional[torch.Tensor] = None,
+    *,
+    rows: Optional[slice] = None,
+    topk_metadata: Optional[torch.Tensor] = None,
 ) -> None:
     """Pool slots into ``page_indices`` (``-1`` past the valid count) and, when given,
     positions into ``raw_indices``; ``metadata`` is a ``PagedIndexerMetadata``."""
+    if rows is None:
+        seq_lens = metadata.compressed_seq_lens
+        page_table = metadata.page_table
+        out_page_indices = page_indices
+        out_raw_indices = raw_indices
+    else:
+        seq_lens = metadata.compressed_seq_lens[rows]
+        page_table = metadata.page_table[rows]
+        out_page_indices = page_indices[rows]
+        out_raw_indices = raw_indices[rows] if raw_indices is not None else None
+    if logits.dtype == torch.bfloat16:
+        assert out_raw_indices is None
+        topk_transform_paged_bf16(
+            logits,
+            seq_lens,
+            page_table,
+            out_page_indices,
+            metadata.compressed_page_size,
+        )
+        return
     if metadata.use_topk_v2:
         topk_transform_paged_v2(
             logits,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            page_indices,
+            seq_lens,
+            page_table,
+            out_page_indices,
             metadata.compressed_page_size,
-            metadata.topk_metadata,
-            raw_indices,
+            metadata.topk_metadata if topk_metadata is None else topk_metadata,
+            out_raw_indices,
         )
     else:
         topk_transform_paged(
             logits,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            page_indices,
+            seq_lens,
+            page_table,
+            out_page_indices,
             metadata.compressed_page_size,
-            raw_indices,
+            out_raw_indices,
         )
 
 
@@ -564,12 +581,13 @@ class C4IndexerBackendMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        q, weights = c4_indexer.compute_q(q_lora, positions, weights, q_lora_quant)
         if not skip_compressor:
             self.forward_indexer_compressor(
                 x=x,
@@ -763,6 +781,7 @@ class C4IndexerBackendMixin:
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -789,6 +808,7 @@ class C4IndexerBackendMixin:
             x = x[:num_queries]
         if q_lora.shape[0] != num_queries:
             q_lora = q_lora[:num_queries]
+            q_lora_quant = None
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
@@ -811,6 +831,7 @@ class C4IndexerBackendMixin:
                 positions=positions,
                 forward_batch=forward_batch,
                 skip_compressor=skip_compressor,
+                q_lora_quant=q_lora_quant,
             )
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
@@ -1002,6 +1023,14 @@ class C4IndexerBackendMixin:
         elif use_aiter_fp4:
             q_fp4, q_scale = q
             is_decode = forward_batch.forward_mode.is_decode()
+            if isinstance(
+                getattr(metadata, "fp4_decode_workspace", None),
+                FP4RowgroupDecodeWorkspace,
+            ) and (is_decode or forward_batch.forward_mode.is_target_verify()):
+                # The backend built a row-group workspace for this step: target-verify
+                # rows score like decode rows, one launch over the whole batch, a
+                # request's rows sharing each key load.
+                is_decode = True
             # Hoisted: these await this layer's KV transfer, which every chunk
             # would otherwise re-await.
             k_payload = token_to_kv_pool.get_index_k_fp4_payload_buffer(
@@ -1193,8 +1222,10 @@ class C4Indexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         weight: torch.Tensor,
+        q_lora_quant=None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
-        q, _ = self.wq_b(q_lora)
+        # q_lora_quant: fp8 group quant of this q_lora already made for the attention wq_b.
+        q, _ = self.wq_b(q_lora if q_lora_quant is None else q_lora_quant)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_fp4_indexer and is_hip():
             q_fp4, q_scale = aiter_q_indexer_fp4(
@@ -1227,7 +1258,11 @@ class C4Indexer(nn.Module):
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
+        q_lora_quant=None,
     ) -> None:
+        backend_kwargs = {}
+        if q_lora_quant is not None:
+            backend_kwargs["q_lora_quant"] = q_lora_quant
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -1237,4 +1272,5 @@ class C4Indexer(nn.Module):
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
             skip_compressor=skip_compressor,
+            **backend_kwargs,
         )

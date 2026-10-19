@@ -17,6 +17,7 @@
 # limitations under the License.
 """Inference-only Dots-VL model compatible with HuggingFace weights."""
 
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -25,8 +26,8 @@ from torch import nn
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -132,11 +133,10 @@ class DotsVLMForCausalLM(nn.Module):
     def get_model_config_for_expert_location(cls, config):
         return DeepseekV2ForCausalLM.get_model_config_for_expert_location(config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input_ids with multimodal tokens"""
         # Get image token ID for padding pattern
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        padded_input_ids = pattern.pad_input_tokens(input_ids, mm_inputs)
+        padded_input_ids = pad_mm_tokens(input_ids, mm_inputs)
         return padded_input_ids
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

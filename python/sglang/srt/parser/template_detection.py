@@ -29,6 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
+from sglang.srt.arg_groups.muse_spark_hook import muse_spark_chat_template_default
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
@@ -522,11 +523,20 @@ def _is_deepseek_r1_think_tags(ctx):
     return not _is_lfm2(ctx) and (ctx.has_text("<think>") or ctx.has_text("</think>"))
 
 
+def _is_gigachat35(ctx):
+    return ctx.has_text("<｜GCML｜tool_calls>")
+
+
+def _is_iquest_q1(ctx):
+    return ctx.has_text("<|iquest_assistant|>")
+
+
 # ---------------------------------------------------------------------------
 # Reasoning parser rules
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="iquest_q1", value="iquest_q1", predicate=_is_iquest_q1),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
@@ -556,6 +566,7 @@ REASONING_PARSER_RULES = (
     ),
     DetectionRule(name="deepseek_v4", value="deepseek-v4", predicate=_is_deepseek_v4),
     DetectionRule(name="deepseek_v3", value="deepseek-v3", predicate=_is_deepseek_v3),
+    DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(
         name="deepseek_r1_force", value="deepseek-r1", predicate=_is_deepseek_r1
     ),
@@ -571,6 +582,8 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="iquest_q1", value="iquest_q1", predicate=_is_iquest_q1),
+    DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
@@ -789,6 +802,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif arch == "IQuestQ1ForCausalLM":
+        reasoning_parser, tool_call_parser = "iquest_q1", "iquest_q1"
     elif arch in (
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -800,6 +815,13 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
         reasoning_parser, tool_call_parser = "deepseek-v4", "deepseekv4"
     elif "DeepseekV3" in arch:
         reasoning_parser, tool_call_parser = "deepseek-v3", "deepseekv32"
+    elif arch in (
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    ) or model_type in ("minimax_m3", "minimax_m3_vl"):
+        reasoning_parser, tool_call_parser = "minimax-m3", "minimax-m3"
+    elif arch == "MiniMaxM2ForCausalLM" or model_type == "minimax_m2":
+        reasoning_parser, tool_call_parser = "minimax", "minimax-m2"
     else:
         return {}
 
@@ -817,9 +839,39 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
     return resolved
 
 
+def _architecture_parser_defaults(server_args) -> Dict[str, str]:
+    """Parser defaults implied by an architecture when the caller omitted them."""
+    cfg = resolving_view(server_args)
+    missing = tuple(
+        attr
+        for attr in ("reasoning_parser", "tool_call_parser")
+        if getattr(cfg, attr) is None
+    )
+    if not missing:
+        return {}
+
+    model_config = getattr(server_args, "_model_config", None)
+    if model_config is None:
+        return {}
+    config = model_config.hf_config
+    architectures = getattr(config, "architectures", None) or []
+    arch = architectures[0] if architectures else ""
+    if arch != "MuseSparkForConditionalGeneration":
+        return {}
+
+    defaults = {attr: "muse" for attr in missing}
+    for attr, value in defaults.items():
+        logger.info(
+            "Defaulting --%s to '%s' for model architecture '%s'",
+            attr.replace("_", "-"),
+            value,
+            arch,
+        )
+    return defaults
+
+
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, before anything publishes ``server_args``.
+    """Resolve architecture defaults and explicit ``auto`` parser requests.
 
     Performs a lightweight tokenizer load, so it runs once in engine init. The
     decision goes to this instance's declaration stash, so every holder of it
@@ -827,6 +879,22 @@ def resolve_auto_parsers(server_args) -> None:
     workers it is serialized for -- and each publishes bags projected from it.
     The fields stay what the operator passed.
     """
+    architecture_defaults = _architecture_parser_defaults(server_args)
+    if architecture_defaults:
+        declare_resolution(
+            server_args,
+            "architecture-parser-defaults",
+            **architecture_defaults,
+        )
+
+    chat_template_default = muse_spark_chat_template_default(server_args)
+    if chat_template_default is not None:
+        declare_resolution(
+            server_args,
+            "architecture-chat-template-default",
+            chat_template=chat_template_default,
+        )
+
     cfg = resolving_view(server_args)
     needs = tuple(
         attr

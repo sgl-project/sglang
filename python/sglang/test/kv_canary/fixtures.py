@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from unittest.mock import MagicMock
 
 import torch
 
@@ -13,10 +14,22 @@ from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patcher.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patcher.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patcher.api import register_pool_attacher
-from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.unified_cache.components import (
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import get_device
 
-DEFAULT_DEVICE: torch.device = torch.device("cuda")
+# Resolve the active accelerator (cuda/xpu/...) instead of hardcoding cuda: a torch
+# build without CUDA cannot allocate cuda tensors or call torch.cuda.*. Tests that
+# need the runtime API (synchronize, streams, ...) go through DEFAULT_DEVICE_MODULE
+# rather than torch.cuda.
+DEFAULT_DEVICE: torch.device = torch.device(get_device())
+DEFAULT_DEVICE_MODULE = torch.get_device_module(DEFAULT_DEVICE)
 
 
 @dataclass
@@ -262,28 +275,55 @@ def make_buffer_group(
     )
 
 
-def make_radix_cache(
-    slot_lists: List[List[int]], device: torch.device = DEFAULT_DEVICE
-):
-    cache = RadixCache.__new__(RadixCache)
-    cache.device = device
-    cache.page_size = 1
-    cache.disable = False
-
-    root = TreeNode()
-    root.value = torch.tensor(
-        slot_lists[0] if slot_lists else [], dtype=torch.int32, device=device
+def make_unified_radix_cache(
+    tree_components: Tuple[ComponentType, ...] = (ComponentType.FULL,),
+) -> UnifiedRadixCache:
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_components = tree_components
+    cache.components = {ct: None for ct in tree_components}
+    cache.is_swa_enabled = ComponentType.SWA in tree_components
+    cache.tree_core = UnifiedTreeCore(
+        CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+        ),
+        {ct: MagicMock() for ct in tree_components},
     )
-    cache.root_node = root
+    return cache
 
-    current = root
-    for child_slots in slot_lists[1:]:
-        child = TreeNode()
-        child.value = torch.tensor(child_slots, dtype=torch.int32, device=device)
-        child.parent = current
-        current.children[child.id] = child
-        current = child
 
+def add_unified_child(
+    cache: UnifiedRadixCache,
+    slots: List[int],
+    *,
+    parent: Optional[UnifiedTreeNode] = None,
+    lock_ref: int = 0,
+    swa_value: Optional[List[int]] = None,
+    device: torch.device = DEFAULT_DEVICE,
+) -> UnifiedTreeNode:
+    parent = cache.root_node if parent is None else parent
+    child = UnifiedTreeNode(cache.tree_components)
+    child.parent = parent
+    base = child.component_data[BASE_COMPONENT_TYPE]
+    base.value = torch.tensor(slots, dtype=torch.int32, device=device)
+    base.lock_ref = lock_ref
+    if swa_value is not None:
+        child.component_data[ComponentType.SWA].value = torch.tensor(
+            swa_value, dtype=torch.int32, device=device
+        )
+    parent.children[child.id] = child
+    return child
+
+
+def make_unified_radix_chain(
+    chain: List[List[int]], device: torch.device = DEFAULT_DEVICE
+) -> UnifiedRadixCache:
+    cache = make_unified_radix_cache()
+    parent = None
+    for slots in chain:
+        parent = add_unified_child(cache, slots, parent=parent, device=device)
     return cache
 
 
