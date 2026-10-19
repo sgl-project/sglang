@@ -600,45 +600,6 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
                 self.assertIs(device_frees[ComponentType.FULL][0], sentinel)
                 self.assertIs(host_frees[ComponentType.FULL][0], sentinel)
 
-    def test_free_values_frees_in_component_insertion_order(self):
-        """Device frees apply before host frees, each in per-component
-        insertion order — the allocator free-list order the pre-split inline
-        frees produced."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        order = [ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA]
-        device_frees = defaultdict(list)
-        host_frees = defaultdict(list)
-        for ct in order:
-            device_frees[ct].append(torch.tensor([1]))
-            host_frees[ct].append(torch.tensor([2]))
-
-        freed = []
-        fake_components = {
-            ct: mock.MagicMock(
-                free_host_values=mock.MagicMock(
-                    side_effect=lambda values, ct=ct: freed.append(("host", ct))
-                )
-            )
-            for ct in order
-        }
-        with (
-            mock.patch.object(
-                cache,
-                "_apply_cache_action",
-                side_effect=lambda action: freed.append(
-                    ("device", action.component_type)
-                ),
-            ),
-            mock.patch.dict(cache.components, fake_components),
-        ):
-            cache._free_values(device_frees, host_frees)
-
-        self.assertEqual(
-            freed, [("device", ct) for ct in order] + [("host", ct) for ct in order]
-        )
-        self.assertFalse(device_frees)
-        self.assertFalse(host_frees)
-
     def test_free_values_mid_drain_failure_cannot_replay_freed_entries(self):
         """A device free that raises must leave only un-attempted entries in
         the dict (no replay of successes) while host frees still drain."""

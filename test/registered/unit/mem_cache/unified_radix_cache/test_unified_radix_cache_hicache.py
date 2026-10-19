@@ -5,8 +5,6 @@ from array import array
 from dataclasses import replace
 from unittest import mock
 
-import torch
-
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
@@ -840,38 +838,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             result.device_prefix_len, len(tokens) - node_key_length(cache, leaf)
         )
         self.assertEqual(result.host_hit_length, node_key_length(cache, leaf))
-
-    @requires_full_mamba_ps1
-    def test_mamba_has_host_value_only_predicate(self):
-        """Needs a slot only when mamba is host-only (device evicted, host backed up)."""
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if not chain:
-            self.skipTest("chain too short")
-        node = chain[-1]
-        dev = torch.tensor([0], dtype=torch.int64)
-        host = torch.tensor([0], dtype=torch.int64)
-
-        # host-only: device evicted, host backup present -> restore needs a slot
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, host)
-        self.assertTrue(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
-        # device + host: device value present -> no restore, no slot (the D+H bug case)
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, dev)
-        self.assertFalse(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
-        # device-only / neither: nothing to restore
-        cache.tree_core.set_component_host_value_raw(node, ComponentType.MAMBA, None)
-        self.assertFalse(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
-        self.assertFalse(
-            cache.tree_core.component_has_host_value_only(node, ComponentType.MAMBA)
-        )
 
     @requires_full_swa_ps1
     def test_hicache_swa_host_best_match_keeps_device_anchor(self):

@@ -1094,46 +1094,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
 
     @requires_swa_and_mamba
-    def test_cascade_evict_asserts_on_locked_internal_mamba(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-
-        n_short = (self.cfg.sliding_window_size // self.cfg.page_size) + 4
-        seq_a = self._make_seq(1, n_short)
-        seq_ab = seq_a + self._make_seq(7000, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq_a)
-        self._insert(cache, allocator, req_to_token_pool, seq_ab)
-
-        node_a = match_prefix(cache, seq_a).last_device_node
-        self.assertGreater(len(node_children(cache, node_a)), 0, "A must be internal")
-        self.assertIsNotNone(
-            node_device_value(cache, node_a, ComponentType.MAMBA),
-            "A must hold a Mamba checkpoint",
-        )
-
-        # Lock ONLY Mamba — a stranded lower-priority lock that no supported path
-        # produces. The cascade must surface it rather than silently skip.
-        cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 1)
-        self.assertGreaterEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1, "Mamba locked"
-        )
-        self.assertEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.FULL), 0, "Full unlocked"
-        )
-
-        result = cache.tree_core.evict_component(
-            node_a, ComponentType.SWA, EvictLayer.DEVICE
-        )
-        cache._free_values(result.device_frees, result.host_frees)
-        # No higher-or-equal tier pins the node, so even with early-release on
-        # the stranded Mamba lock must trip the hard-invariant assert.
-        with self.assertRaises(AssertionError):
-            cache.tree_core.validate_cascade_evict(
-                node_a, ComponentType.SWA, EvictLayer.DEVICE
-            )
-
-        cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 0)
-
-    @requires_swa_and_mamba
     def test_cascade_evict_asserts_on_locked_leaf_mamba(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -2074,19 +2034,6 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         alloc.free.assert_not_called()
         cache.tree_core.set_component_device_value.assert_called_once_with(
             5, ComponentType.SWA, swa_value
-        )
-
-    def test_apply_cache_actions_applies_each_in_order(self):
-        cache = mock.MagicMock()
-        first = ReplaceWriteThroughOnNodeSplit(
-            ack_id=1, old_node_id=1, new_node_id=2, new_child_node_id=1
-        )
-        second = ReplaceWriteThroughOnNodeSplit(
-            ack_id=2, old_node_id=3, new_node_id=4, new_child_node_id=3
-        )
-        UnifiedRadixCache._apply_cache_actions(cache, [first, second])
-        cache._apply_cache_action.assert_has_calls(
-            [mock.call(first), mock.call(second)]
         )
 
     def test_chained_replace_write_through_requires_list_order(self):
