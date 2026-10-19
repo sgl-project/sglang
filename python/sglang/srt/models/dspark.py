@@ -677,6 +677,9 @@ class DSparkDraftMixin:
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Startup requires a complete checkpoint; online updates can send one
+        # parameter bucket at a time after the vocabulary modules are attached.
+        initial_load = not self._vocab_attached
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
@@ -766,10 +769,6 @@ class DSparkDraftMixin:
                     )
             else:
                 self.draft_id_to_target_id = mapping
-        elif self._vocab_attached and self.draft_id_to_target_id is not None:
-            raise ValueError(
-                "DSpark reloaded checkpoint is missing required d2t offsets."
-            )
 
         # W1's predecessor domain can exclude an input-only mask row. Read its
         # row count from the checkpoint; attach_shared_modules later checks it
@@ -837,7 +836,7 @@ class DSparkDraftMixin:
             loaded_vocab_names.add(name)
 
         for module_name in ("embed_tokens", "lm_head"):
-            if not getattr(self, f"has_own_{module_name}"):
+            if not initial_load or not getattr(self, f"has_own_{module_name}"):
                 continue
             missing_vocab = {
                 f"{module_name}.{name}"
@@ -850,7 +849,9 @@ class DSparkDraftMixin:
 
         params_dict = dict(self.named_parameters())
 
-        if getattr(self.config, "_sglang_speculators_dspark_normalized", False):
+        if initial_load and getattr(
+            self.config, "_sglang_speculators_dspark_normalized", False
+        ):
             backbone_names = {
                 name.removeprefix("model.") for name, _ in backbone_weights
             }
@@ -911,7 +912,7 @@ class DSparkDraftMixin:
         missing_markov = {
             name for name in params_dict if name.startswith("markov_head.")
         } - loaded_names
-        if missing_markov:
+        if initial_load and missing_markov:
             raise ValueError(
                 f"DSpark checkpoint is missing required Markov weights: {sorted(missing_markov)}."
             )
@@ -919,6 +920,10 @@ class DSparkDraftMixin:
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        if markov_weights:
+            self.post_weight_update()
+
+    def post_weight_update(self) -> None:
         candidate_sampler = getattr(self, "markov_candidate_sampler", None)
         if candidate_sampler is not None:
             # The model-loader caller must pause serving before replacing weights;
@@ -954,7 +959,7 @@ class DSparkDraftMixin:
             name for name in params_dict if name.startswith("confidence_head.")
         }
         missing = confidence_param_names - loaded_names
-        if missing:
+        if missing and not self._vocab_attached:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "

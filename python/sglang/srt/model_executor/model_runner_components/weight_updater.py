@@ -318,6 +318,11 @@ class WeightUpdater:
         DefaultModelLoader.postprocess_weights(
             self.get_model(), torch.device(self.device)
         )
+        # Refresh opt-in caches even when direct/P2P writes bypassed load_weights;
+        # post_load_weights can repack weights and must not run twice.
+        post_weight_update = getattr(self.get_model(), "post_weight_update", None)
+        if post_weight_update is not None:
+            post_weight_update()
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]

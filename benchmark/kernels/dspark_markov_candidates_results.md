@@ -19,35 +19,17 @@ verification path retain their existing representation.
 
 ## Correctness
 
-Run from the repository root in a complete SGLang environment:
+End-to-end serving benchmarks were run on a GPU server. Commands and performance
+results are recorded in [PR #40513](https://github.com/sgl-project/sglang/pull/40513).
+
+Run the existing DSpark kernel parity and block-verification regressions from the
+repository root in a complete SGLang environment:
 
 ```bash
 PYTHONPATH=python python -m pytest -q \
-  test/registered/unit/spec/test_dspark_checkpoint.py \
-  test/registered/kernels/ops/speculative/test_dspark_markov_candidates.py \
-  test/registered/e2e/spec/test_dspark_candidate_runtime.py \
+  test/registered/kernels/ops/speculative/test_block_verification.py \
   test/registered/spec/dspark/test_dspark_kernel_parity.py
 ```
-
-The tests cover checkpoint configuration and vocabulary mappings, independent
-proposal oracles, actual GPU proposal/rejection distributions, on-demand versus
-dense-probability rejection parity, cache reuse,
-weight refresh, and CUDA Graph input/RNG updates. Statistical failures must be
-investigated, not rerun until passing. CUDA skips do not establish correctness.
-
-For local target/draft checkpoints, run the existing serving smoke explicitly:
-
-```bash
-SGLANG_TEST_DSPARK_USER_CHECKPOINT=1 \
-SGLANG_TEST_DSPARK_TARGET_PATH=/path/to/target \
-SGLANG_TEST_DSPARK_DRAFT_PATH=/path/to/draft \
-PYTHONPATH=python python -m pytest -q -s \
-  test/registered/core/test_basic_sanity_dspark.py::TestDSparkUserCheckpointCandidates
-```
-
-This checks TP1/DP1 greedy token parity against target-only serving, mixed
-requests, and eager/graph execution with K32/M128. It requires candidate dispatch
-in startup logs. It does not establish task accuracy, DP8 behavior or speedup.
 
 ## Performance
 
@@ -72,4 +54,4 @@ checkpoint, dataset, sampling parameters and request-length policy. Start with D
 then repeat with DP8; alternate baseline/candidate runs. Record output tokens/s,
 TPOT/ITL, accepted length, memory and task accuracy at temperatures 0 and 1.
 Attach the exact commit, GPU/driver/runtime versions, launch commands and raw
-results to the PR. No measured H200 result is recorded here yet.
+results to the PR.
