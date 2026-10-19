@@ -95,28 +95,61 @@ class CpDecodeAttnTpContext:
         logical = unshuffle_aiter_fp8_weight(tensor)
         return shuffle_weight(self._slice(logical, 1), layout=(16, 16))
 
+    def _slice_sf_swizzled_scale(
+        self, tensor: torch.Tensor, dim: int, weight_shape: torch.Size
+    ) -> torch.Tensor:
+        """Slice a FlashInfer 128x4-swizzled MXFP8 scale along whole SF tiles."""
+        n, k = weight_shape
+        # Each 512-byte tile holds 128 rows x 4 scale columns (4 * 32 elements of K).
+        tile = 128
+        split = n if dim == 0 else k
+        assert split % (self.decode_tp_size * tile) == 0, (
+            f"CP decode attn TP: swizzled scale of weight {tuple(weight_shape)} "
+            f"cannot be split {self.decode_tp_size} ways along dim {dim}"
+        )
+        n_tiles = -(-n // tile)
+        k_tiles = -(-k // tile)
+        assert tensor.numel() == n_tiles * k_tiles * 512, (
+            f"CP decode attn TP: swizzled scale numel={tensor.numel()} does not "
+            f"match weight {tuple(weight_shape)}"
+        )
+        tiles = tensor.reshape(n_tiles, k_tiles, 512)
+        return self._slice(tiles, dim).reshape(-1).contiguous()
+
     # ==================== Unified activate/restore ====================
 
-    def _activate(self, obj, attr_name: str, dim: int):
-        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None."""
+    def _activate(
+        self,
+        obj,
+        attr_name: str,
+        dim: int,
+        sf_weight_shape: Optional[torch.Size] = None,
+    ):
+        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None.
+
+        sf_weight_shape marks a FlashInfer-swizzled scale of a weight of that shape.
+        """
         tensor = getattr(obj, attr_name, None)
         if tensor is None:
             return
         is_param = isinstance(tensor, torch.nn.Parameter)
         raw = tensor.data if is_param else tensor
-        assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
-            f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
-            f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
-        )
-        assert raw.shape[dim] % self.decode_tp_size == 0, (
-            f"CP decode attn TP: {type(obj).__name__}.{attr_name}.shape[{dim}]={raw.shape[dim]} "
-            f"not divisible by decode_tp_size={self.decode_tp_size}"
-        )
+        if sf_weight_shape is None:
+            assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
+                f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
+                f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
+            )
+            assert raw.shape[dim] % self.decode_tp_size == 0, (
+                f"CP decode attn TP: {type(obj).__name__}.{attr_name}.shape[{dim}]={raw.shape[dim]} "
+                f"not divisible by decode_tp_size={self.decode_tp_size}"
+            )
 
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
-            if (
+            if sf_weight_shape is not None:
+                sliced = self._slice_sf_swizzled_scale(raw, dim, sf_weight_shape)
+            elif (
                 attr_name == "weight"
                 and dim == 1
                 and getattr(obj, "aiter_bpreshuffled", False)
@@ -156,10 +189,23 @@ class CpDecodeAttnTpContext:
         else:
             return []
 
-        attrs = [(linear_instance, "weight", dim)]
+        attrs = [(linear_instance, "weight", dim, None)]
         for scale_name in ("weight_scale_inv", "weight_scale"):
             if getattr(linear_instance, scale_name, None) is not None:
-                attrs.append((linear_instance, scale_name, dim))
+                attrs.append((linear_instance, scale_name, dim, None))
+        # The Hopper group32 FP8 path runs larger GEMMs on this BF16 expansion.
+        if getattr(linear_instance, "_block_fp8_bf16_weight", None) is not None:
+            attrs.append((linear_instance, "_block_fp8_bf16_weight", dim, None))
+        # The FlashInfer MXFP8 GEMM reads this copy, not weight_scale_inv.
+        if getattr(linear_instance, "weight_scale_inv_swizzled", None) is not None:
+            attrs.append(
+                (
+                    linear_instance,
+                    "weight_scale_inv_swizzled",
+                    dim,
+                    linear_instance.weight.shape,
+                )
+            )
         return attrs
 
     # ==================== Context manager ====================
@@ -191,8 +237,8 @@ class CpDecodeAttnTpContext:
         orig_tp_q_head_num = None
         try:
             for linear in modules:
-                for obj, attr_name, dim in self._get_linear_attrs(linear):
-                    self._activate(obj, attr_name, dim)
+                for obj, attr_name, dim, sf_shape in self._get_linear_attrs(linear):
+                    self._activate(obj, attr_name, dim, sf_shape)
                     all_attrs.append((obj, attr_name))
                 from sglang.srt.layers.linear import RowParallelLinear
 
