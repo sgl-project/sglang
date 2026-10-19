@@ -80,6 +80,7 @@ class _Harness(deepseek_v4.MQALayer):
         self.dsa_enable_prefill_cp = False
         self.use_fused_wo_a = False
         self.use_npu_arch35_mxfp8_wo_a = False
+        self.wo_a_fp8_weight = None
         self.compressor = object()
         self.wo_a = SimpleNamespace(
             weight=torch.ones(
