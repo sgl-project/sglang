@@ -58,7 +58,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261016",
   },
 
   github: {
@@ -358,6 +358,8 @@ export const config = {
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
         "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
+        "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
+        "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -367,9 +369,9 @@ export const config = {
         "--mem-fraction-static 0.85",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
-        // Fuses the shared expert into the routed MoE launch, which is worth more
-        // at TP2 than TP4: the same fused GEMM covers twice the experts per rank.
-        "--enforce-shared-experts-fusion",
+        // AMD monokernel path: shared-expert fusion must stay off.
+        "--monokernel-backend amd",
+        "--disable-shared-experts-fusion",
         // The one backend worth naming on gfx950: aiter's fp8 GEMM beats what the
         // automatic selection resolves to for this model's 32-wide ue8m0 blocks.
         "--fp8-gemm-backend aiter",
@@ -395,6 +397,8 @@ export const config = {
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
         "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
+        "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
+        "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
       ],
       flags: [
         "--trust-remote-code",

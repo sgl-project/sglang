@@ -1,9 +1,9 @@
-"""Decoder SWA bounded replay: requests that read prompt rows (prompt logprobs,
-every hidden state) run their whole extend through the late layers. CPU only."""
+"""Decoder SWA bounded replay: the rows the late layers run (whole extends for
+requests that read prompt rows) and how DP ranks learn each other's. CPU only."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -16,8 +16,19 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     late_layer_whole_extend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor import forward_batch_info
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.models.deepseek_common import decoder_swa_bounded_replay
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    late_layer_dp_counts,
+)
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -171,6 +182,93 @@ class TestTailReadersCheck(CustomTestCase):
             self._check(_batch([300], starts=[0]), [128])
         with self.assertRaises(ValueError):
             self._check(_batch([300], capture=CaptureHiddenMode.FULL), [128])
+
+
+class TestLateLayerRowsUnderDpAttention(CustomTestCase):
+    """A rank replaying the prefill graph never runs the model's late-layer code,
+    so its eager peers learn its late-layer rows before the forward."""
+
+    def setUp(self):
+        override = get_context().override_server_args(
+            tp_size=2,
+            dp_size=2,
+            enable_dp_attention=True,
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _dp_rank(self, rank):
+        return get_parallel().override(
+            attn_tp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=rank,
+            tp_group=SimpleNamespace(cpu_group=None),
+        )
+
+    def test_rows_are_exchanged_before_the_forward(self):
+        # Rank 0 prefills 300 rows; rank 1 is idle.
+        n = 300
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(n),
+            req_pool_indices=torch.tensor([1]),
+            seq_lens=torch.tensor([n]),
+            out_cache_loc=torch.arange(n),
+            seq_lens_sum=n,
+            positions=torch.arange(n),
+            seq_lens_cpu=torch.tensor([n]),
+            extend_num_tokens=n,
+            extend_seq_lens=torch.tensor([n]),
+            extend_seq_lens_cpu=[n],
+            extend_prefix_lens_cpu=[0],
+            is_extend_in_batch=True,
+        )
+        fb.init_mlp_sync_metadata(
+            SimpleNamespace(
+                global_num_tokens=[n, 0],
+                global_num_tokens_for_logprob=[1, 0],
+                dp_spec_prefill_coordination_applied=False,
+                draft_global_num_tokens=None,
+                can_run_decode_cuda_graph=False,
+                can_run_dp_draft_cuda_graph=False,
+            ),
+            CPU,
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.enable_decoder_swa_bounded_replay = True
+        backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
+        backend.get_cpu_graph_seq_len_fill_value = lambda: 1
+        runner = MagicMock(attn_backend=backend, is_draft_worker=False)
+        runner.attn_tp_sequence_sharded.return_value = False
+
+        def idle_peer(out, local, group):
+            out.copy_(torch.cat([local, local.new_zeros(1)]))
+
+        with (
+            self._dp_rank(0),
+            # CPU runners have no driver to pin the synced token counts with.
+            patch.object(forward_batch_info, "_is_cpu", True),
+            patch.object(
+                forward_batch_info, "all_gather_single", side_effect=idle_peer
+            ),
+        ):
+            fb.prepare_mlp_sync_batch(runner)
+        self.assertEqual(fb.global_late_layer_num_tokens_cpu, [SWA_WINDOW, 0])
+
+        for rank, local_rows in ((0, SWA_WINDOW), (1, 0)):
+            with (
+                self.subTest(rank=rank),
+                self._dp_rank(rank),
+                patch.object(
+                    decoder_swa_bounded_replay,
+                    "all_gather_single",
+                    side_effect=AssertionError("a collective inside the forward"),
+                ),
+            ):
+                counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
+            self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
 if __name__ == "__main__":
