@@ -79,6 +79,10 @@ class Spec(msgspec.Struct):
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
     ] = None
+    speculative_dspark_markov_topk: A[
+        int,
+        "DSPARK only. Top-K budget for both base-logit and static Markov candidates. Set to 0 to score the full vocabulary.",
+    ] = 0
     speculative_dspark_sps_table_path: A[
         Optional[str],
         "DSPARK only. Path to a pre-profiled SPS cost table (JSON) built offline with "

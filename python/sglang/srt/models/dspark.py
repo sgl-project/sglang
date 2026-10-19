@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
@@ -14,6 +15,10 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -98,16 +103,127 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
 
 
 class VanillaMarkov(BaseDSparkMarkovHead):
-    def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        draft_vocab_size: Optional[int] = None,
+        logit_scale: float = 1.0,
+    ) -> None:
         super().__init__()
         self.vocab_size = int(vocab_size)
+        self.draft_vocab_size = int(
+            vocab_size if draft_vocab_size is None else draft_vocab_size
+        )
+        if self.vocab_size <= 0 or self.draft_vocab_size <= 0:
+            raise ValueError(
+                "DSpark input and draft vocabulary sizes must be positive."
+            )
+        self.target_vocab_size = self.draft_vocab_size
+        self.logit_scale = float(logit_scale)
+        self.register_buffer("draft_id_to_target_id", None, persistent=False)
+        self.register_buffer("_target_token_ids", None, persistent=False)
+        self.register_buffer("candidate_ids", None, persistent=False)
+        self.candidate_topk = 0
         self.markov_rank = int(markov_rank)
         if self.markov_rank <= 0:
             raise ValueError(
                 f"VanillaMarkov requires markov_rank > 0, got {self.markov_rank}."
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
-        self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self.markov_w2 = nn.Linear(self.markov_rank, self.draft_vocab_size, bias=False)
+
+    def configure_target_vocab(self, target_vocab_size: int, offsets) -> None:
+        self.target_vocab_size = int(target_vocab_size)
+        self.draft_id_to_target_id = offsets
+        self._target_token_ids = (
+            None
+            if offsets is None
+            else torch.arange(offsets.numel(), device=offsets.device) + offsets
+        )
+
+    def to_target_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Dense fallback samples in target space, including reduced-vocab drafts."""
+        if self._target_token_ids is None:
+            return logits
+        out = logits.new_full((*logits.shape[:-1], self.target_vocab_size), -torch.inf)
+        return out.index_copy_(-1, self._target_token_ids, logits)
+
+    @torch.no_grad()
+    def configure_candidates(self, topk: int) -> None:
+        """Use one K for the base-logit and Markov-bias candidate sets."""
+        if topk < 0:
+            raise ValueError("DSpark candidate topk must be nonnegative.")
+        self.candidate_topk = topk if 0 < topk < self.draft_vocab_size else 0
+        if not self.candidate_topk:
+            self.candidate_ids = None
+            return
+        self.candidate_ids = torch.empty(
+            (self.markov_w1.num_embeddings, topk),
+            dtype=torch.int64,
+            device=self.markov_w1.weight.device,
+        )
+        self.refresh_candidates()
+
+    @torch.no_grad()
+    def refresh_candidates(self) -> None:
+        """Rebuild IDs in place so captured graphs retain the same table."""
+        if getattr(self, "candidate_ids", None) is None:
+            return
+        if self.logit_scale == 0:
+            self.candidate_ids.copy_(
+                torch.arange(self.candidate_topk, device=self.candidate_ids.device)
+            )
+            return
+        w2 = self.markov_w2.weight.float().T
+        # Bound the projection workspace; never materialize [Vprev, Vdraft].
+        chunk = max(1, min(128, (64 << 20) // (self.draft_vocab_size * 4)))
+        for start in range(0, self.markov_w1.num_embeddings, chunk):
+            stop = start + chunk
+            bias = self.markov_w1.weight[start:stop].float() @ w2
+            ids = bias.topk(
+                self.candidate_topk, dim=-1, largest=self.logit_scale > 0
+            ).indices
+            self.candidate_ids[start:stop].copy_(ids)
+
+    def candidate_logits(
+        self, prev_tokens: torch.Tensor, base_logits: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Return the candidate proposal in target vocabulary, before temperature."""
+        if getattr(self, "candidate_ids", None) is None:
+            return None
+        base_ids = base_logits.topk(self.candidate_topk, dim=-1, sorted=False).indices
+        static_ids = self.candidate_ids[prev_tokens]
+        ids = torch.cat((base_ids, static_ids), dim=-1)
+        scores = base_logits.gather(-1, ids).float()
+        if self.logit_scale != 0:
+            prev = self.get_prev_embeddings(prev_tokens).float()
+            weights = self.markov_w2.weight[ids].float()
+            bias = (weights * prev[:, None, :]).sum(dim=-1)
+            scores = scores + self.logit_scale * bias
+        target_ids = ids
+        if self.draft_id_to_target_id is not None:
+            target_ids = ids + self.draft_id_to_target_id[ids]
+        finite = torch.isfinite(scores).any(dim=-1, keepdim=True)
+        scores = torch.where(finite, scores, -torch.inf)
+        logits = torch.full(
+            (base_logits.shape[0], self.target_vocab_size),
+            -torch.inf,
+            dtype=torch.float32,
+            device=base_logits.device,
+        )
+        # Each set has unique IDs. Separate writes give their overlap one score,
+        # instead of treating a duplicated candidate as extra probability mass.
+        k = self.candidate_topk
+        logits.scatter_(-1, target_ids[:, :k], scores[:, :k])
+        logits.scatter_(-1, target_ids[:, k:], scores[:, k:])
+        # A row without finite candidates is a point mass at its lowest target ID.
+        fallback = target_ids.amin(dim=-1, keepdim=True)
+        logits.scatter_(
+            -1, fallback, torch.where(finite, logits.gather(-1, fallback), 0.0)
+        )
+        return logits
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -116,6 +232,8 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         return self.markov_w2(latent_states)
 
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
+        if getattr(self, "candidate_ids", None) is not None:
+            return torch.float32
         # The bias comes out in the embedding's dtype.
         return torch.promote_types(base_dtype, self.markov_w1.weight.dtype)
 
@@ -130,6 +248,12 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         return self.project_bias(self.get_prev_embeddings(prev_tokens)), state
 
     def greedy_w2_weight(self) -> Optional[torch.Tensor]:
+        if (
+            self.logit_scale != 1.0
+            or self.draft_id_to_target_id is not None
+            or getattr(self, "candidate_ids", None) is not None
+        ):
+            return None
         return self.markov_w2.weight if self._bias_is_w2_gemv() else None
 
     def _bias_is_w2_gemv(self) -> bool:
@@ -155,6 +279,11 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
     ) -> None:
         nn.Module.__init__(self)
         self.vocab_size = int(vocab_size)
+        self.draft_vocab_size = self.vocab_size
+        self.target_vocab_size = self.vocab_size
+        self.logit_scale = 1.0
+        self.register_buffer("draft_id_to_target_id", None, persistent=False)
+        self.register_buffer("_target_token_ids", None, persistent=False)
         self.markov_rank = int(markov_rank)
         if self.markov_rank <= 0:
             raise ValueError(
@@ -176,8 +305,21 @@ class Nemotron35VanillaMarkov(VanillaMarkov):
 
 
 class GatedMarkovHead(VanillaMarkov):
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        draft_vocab_size: Optional[int] = None,
+        logit_scale: float = 1.0,
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+            logit_scale=logit_scale,
+        )
         self.gate_proj = nn.Linear(int(hidden_size) + markov_rank, markov_rank)
 
     def compute_gate(
@@ -206,8 +348,21 @@ class GatedMarkovHead(VanillaMarkov):
 
 
 class RNNHead(VanillaMarkov):
-    def __init__(self, *, vocab_size: int, markov_rank: int, hidden_size: int) -> None:
-        super().__init__(vocab_size=vocab_size, markov_rank=markov_rank)
+    def __init__(
+        self,
+        *,
+        vocab_size: int,
+        markov_rank: int,
+        hidden_size: int,
+        draft_vocab_size: Optional[int] = None,
+        logit_scale: float = 1.0,
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size,
+            markov_rank=markov_rank,
+            draft_vocab_size=draft_vocab_size,
+            logit_scale=logit_scale,
+        )
         self.hidden_size = int(hidden_size)
         self.state_size = markov_rank
         self.joint_proj = nn.Linear(2 * markov_rank + self.hidden_size, 3 * markov_rank)
@@ -260,16 +415,21 @@ def build_markov_head(config) -> Optional[nn.Module]:
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
     vocab_size = int(config.vocab_size)
     hidden_size = int(config.hidden_size)
+    draft_vocab_size = getattr(config, "draft_vocab_size", None)
+    vocab_kwargs = dict(
+        vocab_size=vocab_size,
+        markov_rank=markov_rank,
+        draft_vocab_size=int(
+            vocab_size if draft_vocab_size is None else draft_vocab_size
+        ),
+        logit_scale=float(getattr(config, "logit_scale", 1.0)),
+    )
     if markov_head_type == "vanilla":
-        return VanillaMarkov(vocab_size=vocab_size, markov_rank=markov_rank)
+        return VanillaMarkov(**vocab_kwargs)
     if markov_head_type == "gated":
-        return GatedMarkovHead(
-            vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
-        )
+        return GatedMarkovHead(**vocab_kwargs, hidden_size=hidden_size)
     if markov_head_type == "rnn":
-        return RNNHead(
-            vocab_size=vocab_size, markov_rank=markov_rank, hidden_size=hidden_size
-        )
+        return RNNHead(**vocab_kwargs, hidden_size=hidden_size)
     raise ValueError(f"Unsupported DSpark markov_head_type={markov_head_type!r}.")
 
 
@@ -353,7 +513,10 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if (
+        read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+        or getattr(config, "enable_confidence_head", True) is False
+    ):
         return None
     if not hasattr(config, "enable_confidence_head"):
         logger.warning(
@@ -375,7 +538,29 @@ def build_confidence_head(config) -> Optional[nn.Module]:
     )
 
 
-_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
+_DSPARK_SKIPPED_WEIGHT_PREFIXES = ("rotary_emb.",)
+
+
+def validate_dspark_d2t(
+    offsets: torch.Tensor, *, draft_vocab_size: int, target_vocab_size: int
+) -> None:
+    """Validate a checkpoint mapping once, before any capture or GPU lookup."""
+    if offsets.dtype not in (torch.int32, torch.int64) or tuple(offsets.shape) != (
+        draft_vocab_size,
+    ):
+        raise ValueError(
+            f"DSpark d2t must be an integer offset vector of shape ({draft_vocab_size},), "
+            f"got {tuple(offsets.shape)} / {offsets.dtype}."
+        )
+    mapped = offsets.to(device="cpu", dtype=torch.int64) + torch.arange(
+        draft_vocab_size
+    )
+    if bool(((mapped < 0) | (mapped >= target_vocab_size)).any()):
+        raise ValueError("DSpark d2t maps a draft token outside the target vocabulary.")
+    if torch.unique(mapped).numel() != draft_vocab_size:
+        raise ValueError(
+            "DSpark d2t must be injective; duplicate target token IDs are unsupported."
+        )
 
 
 class DSparkDraftMixin:
@@ -383,6 +568,19 @@ class DSparkDraftMixin:
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        target_hidden_size = int(
+            getattr(config, "target_hidden_size", None) or config.hidden_size
+        )
+        if target_hidden_size != int(config.hidden_size):
+            if self.is_nemotron_35_draft:
+                raise ValueError(
+                    "Nemotron DSpark requires matching target/draft hidden sizes."
+                )
+            self.fc = nn.Linear(
+                self.num_context_features * target_hidden_size,
+                int(config.hidden_size),
+                bias=False,
+            )
         self._fused_kv_write_cache = None
         self.logits_mup_width_multiplier = None
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
@@ -401,6 +599,20 @@ class DSparkDraftMixin:
             self.markov_head = build_markov_head(config)
         self.confidence_head = build_confidence_head(config)
         self.lm_head: Optional[nn.Module] = None
+        self.input_vocab_size = int(config.vocab_size)
+        self.draft_vocab_size = self.markov_head.draft_vocab_size
+        # The authoritative target size is supplied by attach_shared_modules.
+        self.target_vocab_size = int(
+            getattr(config, "target_vocab_size", None) or self.draft_vocab_size
+        )
+        self.logit_scale = float(getattr(config, "logit_scale", 1.0))
+        if not math.isfinite(self.logit_scale):
+            raise ValueError("DSpark logit_scale must be finite.")
+        self.markov_head.logit_scale = self.logit_scale
+        self.has_own_embed_tokens = self.is_nemotron_35_draft
+        self.has_own_lm_head = False
+        self._vocab_attached = False
+        self.register_buffer("draft_id_to_target_id", None)
         # Expose the draft's own layer count so the draft ModelRunner sizes the
         # draft KV pool correctly. Some DSpark draft checkpoints inherit the
         # target's ``num_nextn_predict_layers`` (>0) on the config; without this
@@ -414,9 +626,75 @@ class DSparkDraftMixin:
     def attach_shared_modules(
         self, *, embed_tokens: nn.Module, lm_head: nn.Module
     ) -> None:
-        if not self.is_nemotron_35_draft:
+        target_vocab_size = int(lm_head.org_vocab_size)
+        if self.markov_head.markov_w1.weight.shape[0] < target_vocab_size:
+            raise ValueError(
+                "DSpark Markov W1 must cover every target predecessor token: "
+                f"got {self.markov_head.markov_w1.weight.shape[0]} rows, "
+                f"target vocab={target_vocab_size}."
+            )
+        if not self.has_own_embed_tokens:
+            if int(embed_tokens.embedding_dim) != int(self.config.hidden_size):
+                raise ValueError(
+                    "DSpark with a different draft hidden size requires checkpoint embed_tokens weights."
+                )
+            input_rows = int(getattr(embed_tokens, "num_embeddings", target_vocab_size))
+            mask_id = parse_dspark_draft_config(
+                draft_hf_config=self.config
+            ).mask_token_id
+            if mask_id is None:
+                raise ValueError("DSpark requires mask_token_id in the draft config.")
+            expanded_speculators_vocab = (
+                getattr(self.config, "_sglang_speculators_dspark_normalized", False)
+                and self.input_vocab_size > target_vocab_size
+            )
+            if (
+                self.input_vocab_size > input_rows
+                or not 0 <= mask_id < input_rows
+                or expanded_speculators_vocab
+            ):
+                raise ValueError(
+                    "DSpark expanded input vocabulary requires checkpoint embed_tokens weights."
+                )
             self.embed_tokens = embed_tokens
-        self.lm_head = lm_head
+        if self.draft_vocab_size != target_vocab_size:
+            if not self.has_own_lm_head:
+                raise ValueError(
+                    "DSpark reduced vocabulary requires checkpoint lm_head weights."
+                )
+            if self.draft_id_to_target_id is None:
+                raise ValueError(
+                    "DSpark reduced vocabulary requires checkpoint d2t offsets."
+                )
+        if self.draft_id_to_target_id is not None:
+            validate_dspark_d2t(
+                self.draft_id_to_target_id,
+                draft_vocab_size=self.draft_vocab_size,
+                target_vocab_size=target_vocab_size,
+            )
+        self.target_vocab_size = target_vocab_size
+        self.markov_head.configure_target_vocab(
+            target_vocab_size, self.draft_id_to_target_id
+        )
+        if not self.has_own_lm_head:
+            if int(lm_head.embedding_dim) != int(self.config.hidden_size):
+                raise ValueError(
+                    "DSpark with a different draft hidden size requires checkpoint lm_head weights."
+                )
+            self.lm_head = lm_head
+        self._vocab_attached = True
+        logger.info(
+            "DSpark vocabulary: input=%s target=%s draft=%s rank=%s own_embed=%s "
+            "own_head=%s d2t=%s logit_scale=%s",
+            self.input_vocab_size,
+            self.target_vocab_size,
+            self.draft_vocab_size,
+            self.markov_head.markov_rank,
+            self.has_own_embed_tokens,
+            self.has_own_lm_head,
+            self.draft_id_to_target_id is not None,
+            self.logit_scale,
+        )
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
@@ -443,10 +721,12 @@ class DSparkDraftMixin:
                 "(call attach_shared_modules first)."
             )
         confidence_features = hidden
-        if self.logits_mup_width_multiplier:
+        if self.logits_mup_width_multiplier and not self.has_own_lm_head:
             hidden = hidden / self.logits_mup_width_multiplier
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
+        if self.logit_scale != 1.0:
+            base_logits = base_logits * self.logit_scale
         return base_logits, confidence_features
 
     def compute_confidence(
@@ -464,28 +744,217 @@ class DSparkDraftMixin:
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Startup requires a complete checkpoint; online updates can send one
+        # parameter bucket at a time after the vocabulary modules are attached.
+        initial_load = not self._vocab_attached
         markov_weights = []
         confidence_weights = []
         backbone_weights = []
-        params_dict = dict(self.named_parameters())
+        vocab_weights = []
+        loaded_names = set()
+        loaded_vocab_names = set()
+        mapping_weight = None
         for name, loaded_weight in weights:
             normalized_name = name.removeprefix("model.")
+            if normalized_name.startswith("midlayer."):
+                normalized_name = "layers.0." + normalized_name.removeprefix(
+                    "midlayer."
+                )
             if any(
                 normalized_name.startswith(p) for p in _DSPARK_SKIPPED_WEIGHT_PREFIXES
             ):
                 continue
-            if normalized_name.startswith("embed_tokens.") and not (
-                self.is_nemotron_35_draft
-            ):
+            if normalized_name in ("t2d", "mask_embedding", "mask_embedding.weight"):
+                # Speculators' mask_embedding is a training placeholder; DSpark
+                # uses the configured mask row of embed_tokens at inference.
                 continue
-            if name.startswith("confidence_head."):
+            if normalized_name in ("d2t", "draft_id_to_target_id"):
+                mapping_weight = loaded_weight
+                continue
+            if normalized_name.startswith(("embed_tokens.", "lm_head.")):
+                vocab_weights.append((normalized_name, loaded_weight))
+            elif normalized_name.startswith("confidence_head."):
                 if self.confidence_head is None:
                     continue
-                confidence_weights.append((name, loaded_weight))
-            elif name.startswith("markov_head."):
-                markov_weights.append((name, loaded_weight))
+                confidence_weights.append((normalized_name, loaded_weight))
+            elif normalized_name.startswith("markov_head."):
+                markov_weights.append((normalized_name, loaded_weight))
             else:
-                backbone_weights.append((name, loaded_weight))
+                backbone_weights.append((normalized_name, loaded_weight))
+
+        if getattr(self.config, "draft_vocab_size", None) is None and isinstance(
+            self.markov_head.markov_w2, nn.Linear
+        ):
+            for name, weight in markov_weights:
+                if name != "markov_head.markov_w2.weight":
+                    continue
+                if (
+                    weight.ndim != 2
+                    or weight.shape[1] != self.markov_head.markov_rank
+                    or weight.shape[0] <= 0
+                ):
+                    raise ValueError(
+                        "DSpark Markov W2 must have shape [Vd, markov_rank]."
+                    )
+                output_rows = int(weight.shape[0])
+                if output_rows != self.draft_vocab_size:
+                    if self._vocab_attached:
+                        raise ValueError(
+                            "Changing DSpark draft vocabulary requires restart/recapture."
+                        )
+                    previous = self.markov_head.markov_w2
+                    self.markov_head.markov_w2 = nn.Linear(
+                        self.markov_head.markov_rank,
+                        output_rows,
+                        bias=False,
+                        device=previous.weight.device,
+                        dtype=previous.weight.dtype,
+                    )
+                    self.draft_vocab_size = self.markov_head.draft_vocab_size = (
+                        output_rows
+                    )
+                    logger.info(
+                        "DSpark inferred draft output vocabulary Vd=%s from checkpoint W2 (input V=%s).",
+                        output_rows,
+                        self.input_vocab_size,
+                    )
+
+        if mapping_weight is not None:
+            if mapping_weight.dtype not in (torch.int32, torch.int64):
+                raise ValueError("DSpark d2t offsets must have integer dtype.")
+            if tuple(mapping_weight.shape) != (self.draft_vocab_size,):
+                raise ValueError("DSpark d2t shape does not match draft_vocab_size.")
+            mapping = mapping_weight.to(
+                device=self.markov_head.markov_w1.weight.device, dtype=torch.int64
+            )
+            if self._vocab_attached:
+                if self.draft_id_to_target_id is None or not torch.equal(
+                    mapping, self.draft_id_to_target_id
+                ):
+                    raise ValueError(
+                        "Changing DSpark d2t mapping requires restart/recapture."
+                    )
+            else:
+                self.draft_id_to_target_id = mapping
+
+        # W1's predecessor domain can exclude an input-only mask row. Read its
+        # row count from the checkpoint; attach_shared_modules later checks it
+        # against the authoritative target output vocabulary before sampling.
+        for name, loaded_weight in markov_weights:
+            if name != "markov_head.markov_w1.weight":
+                continue
+            if (
+                loaded_weight.ndim != 2
+                or loaded_weight.shape[0] <= 0
+                or loaded_weight.shape[1] != self.markov_head.markov_rank
+            ):
+                raise ValueError(
+                    "DSpark Markov W1 must have shape [Vprev, markov_rank]."
+                )
+            prev_rows = int(loaded_weight.shape[0])
+            previous = self.markov_head.markov_w1
+            if prev_rows != previous.num_embeddings:
+                if self._vocab_attached:
+                    raise ValueError(
+                        "Changing DSpark predecessor vocabulary requires restart/recapture."
+                    )
+                self.markov_head.markov_w1 = nn.Embedding(
+                    prev_rows,
+                    self.markov_head.markov_rank,
+                    device=previous.weight.device,
+                    dtype=previous.weight.dtype,
+                )
+                self.markov_head.vocab_size = prev_rows
+
+        for name, loaded_weight in vocab_weights:
+            module_name, _, leaf = name.partition(".")
+            own_flag = f"has_own_{module_name}"
+            if self._vocab_attached and not getattr(self, own_flag):
+                raise ValueError(
+                    f"Changing DSpark {module_name} from shared to checkpoint-owned "
+                    "requires restart/recapture."
+                )
+            if module_name == "embed_tokens":
+                rows = self.input_vocab_size
+                cls = VocabParallelEmbedding
+            else:
+                rows = self.draft_vocab_size
+                cls = ParallelLMHead
+            if getattr(self, module_name) is None:
+                module = cls(rows, int(self.config.hidden_size)).to(
+                    device=self.markov_head.markov_w1.weight.device,
+                    dtype=self.markov_head.markov_w1.weight.dtype,
+                )
+                setattr(self, module_name, module)
+            module = getattr(self, module_name)
+            module_params = dict(module.named_parameters())
+            if leaf not in module_params:
+                raise ValueError(f"DSpark unexpected vocabulary weight {name!r}.")
+            param = module_params[leaf]
+            if leaf == "weight" and not self.is_nemotron_35_draft:
+                expected = (rows, int(self.config.hidden_size))
+                if tuple(loaded_weight.shape) != expected:
+                    raise ValueError(
+                        f"DSpark {name} shape mismatch: expected {expected}, got {tuple(loaded_weight.shape)}."
+                    )
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            setattr(self, own_flag, True)
+            loaded_vocab_names.add(name)
+
+        for module_name in ("embed_tokens", "lm_head"):
+            if not initial_load or not getattr(self, f"has_own_{module_name}"):
+                continue
+            missing_vocab = {
+                f"{module_name}.{name}"
+                for name, _ in getattr(self, module_name).named_parameters()
+            } - loaded_vocab_names
+            if missing_vocab:
+                raise ValueError(
+                    f"DSpark checkpoint is missing required vocabulary weights: {sorted(missing_vocab)}."
+                )
+
+        params_dict = dict(self.named_parameters())
+
+        if initial_load and getattr(
+            self.config, "_sglang_speculators_dspark_normalized", False
+        ):
+            backbone_names = {
+                name.removeprefix("model.") for name, _ in backbone_weights
+            }
+            for old, new in (
+                ("encoder.fc.weight", "fc.weight"),
+                ("encoder.output_norm_enc.weight", "hidden_norm.weight"),
+            ):
+                if old in backbone_names:
+                    backbone_names.add(new)
+            missing = []
+            for name in params_dict:
+                if name.startswith(
+                    ("markov_head.", "confidence_head.", "embed_tokens.", "lm_head.")
+                ):
+                    continue
+                if name in backbone_names:
+                    continue
+                shards = None
+                if ".qkv_proj." in name:
+                    shards = [
+                        name.replace(".qkv_proj.", f".{part}_proj.")
+                        for part in ("q", "k", "v")
+                    ]
+                elif ".gate_up_proj." in name:
+                    shards = [
+                        name.replace(".gate_up_proj.", f".{part}_proj.")
+                        for part in ("gate", "up")
+                    ]
+                if shards is None or not all(
+                    shard in backbone_names for shard in shards
+                ):
+                    missing.append(name)
+            if missing:
+                raise ValueError(
+                    f"DSpark Speculators checkpoint is missing required backbone weights: {sorted(missing)}."
+                )
 
         super().load_weights(backbone_weights)
 
@@ -497,11 +966,33 @@ class DSparkDraftMixin:
                 )
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if isinstance(self.markov_head.markov_w2, nn.Linear) and tuple(
+                param.shape
+            ) != tuple(loaded_weight.shape):
+                raise ValueError(
+                    f"DSpark {name} shape mismatch: expected {tuple(param.shape)}, "
+                    f"got {tuple(loaded_weight.shape)}."
+                )
             weight_loader(param, loaded_weight)
+            loaded_names.add(name)
+
+        missing_markov = {
+            name for name in params_dict if name.startswith("markov_head.")
+        } - loaded_names
+        if initial_load and missing_markov:
+            raise ValueError(
+                f"DSpark checkpoint is missing required Markov weights: {sorted(missing_markov)}."
+            )
 
         self._load_confidence_weights(
             confidence_weights=confidence_weights, params_dict=params_dict
         )
+        if markov_weights:
+            self.post_weight_update()
+
+    def post_weight_update(self) -> None:
+        if isinstance(self.markov_head, VanillaMarkov):
+            self.markov_head.refresh_candidates()
 
     def _load_confidence_weights(
         self,
@@ -527,7 +1018,7 @@ class DSparkDraftMixin:
             name for name in params_dict if name.startswith("confidence_head.")
         }
         missing = confidence_param_names - loaded_names
-        if missing:
+        if missing and not self._vocab_attached:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "

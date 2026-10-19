@@ -86,6 +86,7 @@ def resolve_runtime_config(
     draft_hf_config: Any,
     speculative_num_draft_tokens: Optional[int],
     target_vocab_size: int,
+    input_vocab_size: Optional[int] = None,
 ) -> DSparkRuntimeConfig:
     """Resolve and validate the worker-facing DSpark runtime knobs (gamma,
     verify window, mask token) from the draft checkpoint config, with
@@ -121,10 +122,13 @@ def resolve_runtime_config(
             "DSpark requires mask_token_id to be set in the draft model config."
         )
     mask_token_id = int(draft_config.mask_token_id)
-    if mask_token_id >= target_vocab_size:
+    input_vocab_size = (
+        target_vocab_size if input_vocab_size is None else input_vocab_size
+    )
+    if not 0 <= mask_token_id < input_vocab_size:
         raise ValueError(
-            f"DSpark mask_token_id={mask_token_id} is outside the target "
-            f"vocab size {target_vocab_size}."
+            f"DSpark mask_token_id={mask_token_id} is outside the input "
+            f"embedding vocab size {input_vocab_size}."
         )
 
     return DSparkRuntimeConfig(

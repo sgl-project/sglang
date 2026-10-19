@@ -119,6 +119,13 @@ def _resolve_speculative_algorithm_alias(
 
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    markov_topk = cfg.speculative_dspark_markov_topk
+    if markov_topk < 0:
+        raise ValueError("--speculative-dspark-markov-topk must be non-negative.")
+    if markov_topk and str(cfg.speculative_algorithm).upper() != "DSPARK":
+        raise ValueError(
+            "--speculative-dspark-markov-topk requires --speculative-algorithm DSPARK."
+        )
     if (
         cfg.speculative_draft_model_path is not None
         and cfg.speculative_draft_model_revision is None
@@ -728,7 +735,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     draft_config = None
     try:
         draft_config = read_draft_checkpoint_config(server_args=server_args)
-    except Exception as e:
+    except (OSError, ConnectionError) as e:
         logger.warning(
             "Failed to read DSpark draft config; preserving explicit/default "
             "gamma resolution. Error: %s",

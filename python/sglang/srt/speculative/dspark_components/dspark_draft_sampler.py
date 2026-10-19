@@ -73,6 +73,11 @@ class DsparkDraftSampler:
         # [max_bs, gamma, vocab] step logits for the sampling accept, sized on
         # the first call; a greedy draft keeps none.
         self.step_logits: Optional[torch.Tensor] = None
+        self.num_valid = None
+        if getattr(self.markov_head, "candidate_ids", None) is not None:
+            self.num_valid = torch.full(
+                (), self.max_bs, dtype=torch.int32, device=device
+            )
 
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
@@ -88,6 +93,8 @@ class DsparkDraftSampler:
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Must run before the draft graph replay that reads these buffers."""
         resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
+        if self.num_valid is not None:
+            self.num_valid.fill_(bs)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.query_token_num
@@ -116,6 +123,7 @@ class DsparkDraftSampler:
             if self.greedy_draft
             else self._step_logits(base_logits)[:bs],
             greedy_draft=self.greedy_draft,
+            num_valid=self.num_valid,
         )
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.confidence_out is not None:

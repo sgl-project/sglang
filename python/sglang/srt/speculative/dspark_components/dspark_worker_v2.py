@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_position,
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
+from sglang.srt.models.dspark import VanillaMarkov
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -225,6 +226,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
             target_vocab_size=int(target_embed_rows),
+            input_vocab_size=(
+                int(self.draft_model.input_vocab_size)
+                if getattr(self.draft_model, "has_own_embed_tokens", False)
+                else int(target_embed_rows)
+            ),
         )
         self.gamma = runtime_config.gamma
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
@@ -263,7 +269,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.query_token_num), device=self.device
         )
 
-        if getattr(self.draft_model, "uses_own_vocab_modules", False):
+        if getattr(self.draft_model, "uses_own_vocab_modules", False) and not hasattr(
+            self.draft_model, "has_own_embed_tokens"
+        ):
             if get_parallel().tp_rank == 0:
                 logger.info(
                     "DSpark draft uses its checkpoint-local embedding and LM head."
@@ -280,6 +288,26 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self._resolve_target_embed_tokens(target_model)
                 ),
                 lm_head=lm_head,
+            )
+
+        topk = get_spec().speculative_dspark_markov_topk
+        if not self._is_pd_prefill and topk > 0:
+            head = self.draft_model.markov_head
+            supported = (
+                type(head) is VanillaMarkov
+                and parallel.tp_size == 1
+                and is_cuda()
+                and head.markov_w1.weight.is_floating_point()
+                and head.markov_w2.weight.is_floating_point()
+            )
+            if supported:
+                # Build the persistent ID table before KV pools probe free memory.
+                head.configure_candidates(topk)
+            logger.info(
+                "DSpark Markov requested K=%d effective K=%d; candidates require "
+                "an unquantized VanillaMarkov head on NVIDIA CUDA with TP=1",
+                topk,
+                head.candidate_topk if supported else 0,
             )
         self._target_hidden_projection_enabled = False
 

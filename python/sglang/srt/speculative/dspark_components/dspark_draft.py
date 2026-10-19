@@ -181,7 +181,9 @@ class DraftNoise(msgspec.Struct, frozen=True):
 
 def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int:
     # Kept step logits are gathered whole over a sharded vocab.
-    return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
+    if markov_head.vocab_shard is None:
+        return int(getattr(markov_head, "target_vocab_size", base_width))
+    return markov_head.vocab_size
 
 
 def _draft_step(
@@ -196,20 +198,30 @@ def _draft_step(
     step: int,
     logits_out: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if logits_out is None and len(prev_tokens) == 1:
-        # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
-        w2_weight = markov_head.greedy_w2_weight()
-        # The kernel reads one w2 row per base-logit column.
-        if w2_weight is not None and w2_weight.shape[0] == base_logits.shape[-1]:
-            tokens = MarkovGreedyStep.execute(
-                base_logits=base_logits,
-                prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
-                w2_weight=w2_weight,
-            )
-            return tokens, state
-    bias, state = markov_head.step_bias(
-        prev_tokens, hidden_states=hidden_states, state=state
-    )
+    if getattr(markov_head, "candidate_ids", None) is not None:
+        base_logits = markov_head.candidate_logits(prev_tokens, base_logits)
+        bias = torch.zeros_like(base_logits[:1]).expand_as(base_logits)
+    else:
+        if logits_out is None and len(prev_tokens) == 1:
+            # One greedy row, no logits kept: one kernel does the GEMV, add and argmax.
+            w2_weight = markov_head.greedy_w2_weight()
+            # The kernel reads one w2 row per base-logit column.
+            if w2_weight is not None and w2_weight.shape[0] == base_logits.shape[-1]:
+                tokens = MarkovGreedyStep.execute(
+                    base_logits=base_logits,
+                    prev_embeds=markov_head.get_prev_embeddings(prev_tokens),
+                    w2_weight=w2_weight,
+                )
+                return tokens, state
+        bias, state = markov_head.step_bias(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
+        logit_scale = getattr(markov_head, "logit_scale", 1.0)
+        if logit_scale != 1.0:
+            bias = bias * logit_scale
+        if getattr(markov_head, "draft_id_to_target_id", None) is not None:
+            base_logits = markov_head.to_target_logits(base_logits + bias)
+            bias = torch.zeros_like(base_logits)
     shard = markov_head.vocab_shard
     sharded = (
         {}
@@ -247,6 +259,7 @@ def draft_markov_block(
     tp_sync: SpecTpSync,
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
+    num_valid: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
     written to ``logits_out`` or allocated here; a greedy draft keeps none."""
@@ -259,6 +272,10 @@ def draft_markov_block(
         )
     state = markov_head.init_state(draft_hidden)
     prev_tokens = anchor_tokens.long()
+    if num_valid is not None:
+        # Padded graph rows must not index the predecessor table with stale IDs.
+        active = torch.arange(bs, device=base_logits.device) < num_valid
+        prev_tokens = torch.where(active, prev_tokens, 0)
     draft_tokens = []
     for step in range(gamma):
         prev_tokens, state = _draft_step(
@@ -379,7 +396,8 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
-            if not self.sample_from_anchor
+            if getattr(self.draft_model, "has_own_embed_tokens", False)
+            or not self.sample_from_anchor
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler
