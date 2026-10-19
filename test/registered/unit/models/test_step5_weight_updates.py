@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 
 from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration
 from sglang.srt.models.step5 import Step5ForCausalLM, _step5_bf16_trtllm_supported
+from sglang.srt.models.step5_mtp import Step5MTP
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -217,6 +218,80 @@ class TestStep5WeightUpdates(CustomTestCase):
                 model.load_weights(
                     [("model.norm.weight", norm), ("model.norm.weight", 2 * norm)]
                 )
+
+
+_MTP = "model.layers.92."
+
+
+class _FakeStep5MTP:
+    """The attributes Step5MTP.load_weights reads, around one MTP block norm."""
+
+    def __init__(self, checkpoint_path):
+        self.calls = []
+        self.params = {
+            name: _RecordingParam(torch.bfloat16, self.calls)
+            for name in (
+                "model.embed_tokens.weight",
+                "model.enorm.weight",
+                "model.hnorm.weight",
+                "model.eh_proj.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+                "model.mtp_block.input_layernorm.weight",
+            )
+        }
+        self.config = SimpleNamespace(num_hidden_layers=92, num_nextn_predict_layers=3)
+        self.layer_selection = SimpleNamespace(start_layer=92)
+        self.checkpoint_path = checkpoint_path
+
+    def named_parameters(self):
+        return list(self.params.items())
+
+    def load_weights(self, weights):
+        return Step5MTP.load_weights(self, weights)
+
+
+class TestStep5DraftCheckpointLoad(CustomTestCase):
+    def test_loads_the_indexed_copy_of_a_duplicated_tensor(self):
+        """The MTP draft loads through the target's duplicate-owner resolution: a tensor
+        stored in two shards loads once, from the shard the index names."""
+        names = (
+            "model.embed_tokens.weight",
+            *(
+                _MTP + local
+                for local in (
+                    "hnorm.weight",
+                    "eh_proj.weight",
+                    "transformer.shared_head.norm.weight",
+                    "transformer.shared_head.output.weight",
+                    "input_layernorm.weight",
+                )
+            ),
+        )
+        weights = {name: torch.zeros(2, dtype=torch.bfloat16) for name in names}
+        stale = {_MTP + "enorm.weight": torch.full((2,), 7.0, dtype=torch.bfloat16)}
+        indexed = torch.full((2,), 3.0, dtype=torch.bfloat16)
+        with tempfile.TemporaryDirectory() as root:
+            save_file({**weights, **stale}, f"{root}/model-00001.safetensors")
+            save_file(
+                {_MTP + "enorm.weight": indexed}, f"{root}/model-00002.safetensors"
+            )
+            owners = {name: "model-00001.safetensors" for name in weights}
+            owners[_MTP + "enorm.weight"] = "model-00002.safetensors"
+            with open(f"{root}/model.safetensors.index.json", "w") as index:
+                json.dump({"weight_map": owners}, index)
+            model = _FakeStep5MTP(root)
+
+            # Native iterators stream every shard, so both copies arrive.
+            model.load_weights(
+                [*weights.items(), *stale.items(), (_MTP + "enorm.weight", indexed)]
+            )
+
+        enorm = [
+            w for p, w, _, _ in model.calls if p is model.params["model.enorm.weight"]
+        ]
+        self.assertEqual(len(enorm), 1)
+        self.assertTrue(torch.equal(enorm[0], indexed))
 
 
 class _FakeStep5VL:
