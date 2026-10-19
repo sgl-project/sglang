@@ -1266,28 +1266,6 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    if _is_npu:
-                        experts = self.get_submodule(name.rsplit(".", 1)[0])
-                        if experts.moe_ep_size > 1:
-                            # Normal checkpoints pack all experts; NPU EP/DWDP
-                            # loading needs only this rank's weights and biases.
-                            local_experts = experts.num_local_experts
-                            if (
-                                loaded_weight.shape[0]
-                                == experts.num_global_routed_experts
-                            ):
-                                loaded_weight = loaded_weight.narrow(
-                                    0,
-                                    experts._expert_storage_rank * local_experts,
-                                    local_experts,
-                                )
-                            elif loaded_weight.shape[0] != local_experts:
-                                raise ValueError(
-                                    f"Unexpected expert count for {name}: "
-                                    f"{loaded_weight.shape[0]}; expected "
-                                    f"{experts.num_global_routed_experts} global "
-                                    f"or {local_experts} local experts"
-                                )
                     if "bias" not in name:
                         loaded_weight = loaded_weight.transpose(-2, -1)
                     if "w2_weight_bias" in name:

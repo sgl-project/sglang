@@ -382,9 +382,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.sparse_kv_manager,
             )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
-        self._is_ascend950 = torch.npu.get_device_name(self.device).startswith(
-            "Ascend950"
-        )
         self.use_fias_v2_bsnd = (
             get_bool_env_var("SGLANG_NPU_USE_FIAS_V2_BSND", "False")
             and model_runner.spec_algorithm.is_dspark()
@@ -455,56 +452,6 @@ class AscendAttnBackend(AttentionBackend):
         d = layer.qk_head_dim
         v = layer.v_head_dim
         return (d == v and d in (128, 192, 256)) or (d == 192 and v == 128)
-
-    def _fia_with_sink(
-        self, query, key, value, *, input_layout, learnable_sink=None, **kwargs
-    ):
-        restore_bsnd = False
-        kv_heads = kwargs["num_key_value_heads"]
-        if (
-            self._is_ascend950
-            and learnable_sink is not None
-            and query.dtype
-            == key.dtype
-            == value.dtype
-            == learnable_sink.dtype
-            == torch.bfloat16
-            and query.shape[-1] == 64
-            and key.shape[-1] == value.shape[-1] == kv_heads * 64
-            and kwargs["num_query_heads"] == kv_heads * 8
-        ):
-            max_q_len = 0
-            if input_layout == "BSND":
-                max_q_len = query.shape[1]
-            elif input_layout == "TND":
-                lengths = kwargs["actual_seq_qlen"]
-                max_q_len = max(
-                    (
-                        int(end) - int(start)
-                        for start, end in zip([0, *lengths[:-1]], lengths)
-                    ),
-                    default=0,
-                )
-            if 0 < max_q_len < 8:
-                # Transpose layouts avoid Ascend950's failing short-Q sink
-                # GS-merge path without changing tokens, KV pages or masks.
-                if input_layout == "BSND":
-                    input_layout = "BSND_BNSD"
-                    restore_bsnd = True
-                elif input_layout == "TND":
-                    query = query.transpose(0, 1).contiguous()
-                    input_layout = "NTD_TND"
-        output, lse = torch_npu.npu_fused_infer_attention_score_v2(
-            query=query,
-            key=key,
-            value=value,
-            input_layout=input_layout,
-            learnable_sink=learnable_sink,
-            **kwargs,
-        )
-        if restore_bsnd:
-            output = output.transpose(1, 2).contiguous()
-        return output, lse
 
     def _get_kv_lens_and_block_tables(
         self,
@@ -1672,7 +1619,7 @@ class AscendAttnBackend(AttentionBackend):
                             ]
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                         block_size = self.page_size
-                        attn_out, _ = self._fia_with_sink(
+                        attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                             query=q,
                             key=k_cache.view(
                                 -1,
@@ -1740,7 +1687,7 @@ class AscendAttnBackend(AttentionBackend):
                             if q_len == 0:
                                 continue
                             total_kv_len = seq_lens_cpu[seq_idx]
-                            result, _ = self._fia_with_sink(
+                            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
                                 query=q[None, q_len_offset : q_len_offset + q_len],
                                 key=k_cache.view(
                                     -1,
@@ -1760,19 +1707,10 @@ class AscendAttnBackend(AttentionBackend):
                                 actual_seq_qlen=[q_len],
                                 actual_seq_kvlen=[total_kv_len],
                                 atten_mask=self.fia_mask.unsqueeze(0),
-                                sparse_mode=4 if layer.sliding_window_size != -1 else 3,
+                                sparse_mode=4,
                                 softmax_scale=layer.scaling,
-                                pre_tokens=(
-                                    layer.sliding_window_size
-                                    if layer.sliding_window_size != -1
-                                    else FULL_ATTENTION_WINDOW
-                                ),
-                                next_tokens=(
-                                    0
-                                    if layer.sliding_window_size != -1
-                                    else FULL_ATTENTION_WINDOW
-                                ),
-                                learnable_sink=sinks,
+                                pre_tokens=layer.sliding_window_size,
+                                next_tokens=0,
                             )
                             attn_out[q_len_offset : q_len_offset + q_len] = result[0]
                             q_len_offset += q_len
@@ -2493,7 +2431,7 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode = 4 if is_swa_layer else 3
 
             if self.is_hybrid_swa:
-                attn_output, _ = self._fia_with_sink(
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
                     v_cache,
@@ -2818,7 +2756,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                attn_output, _ = self._fia_with_sink(
+                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
                     v_cache,
@@ -3126,7 +3064,7 @@ class AscendAttnBackend(AttentionBackend):
                             layer.sliding_window_size,
                         )
 
-                    attn_out, _ = self._fia_with_sink(
+                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
                         q.view(
                             forward_batch.batch_size,
                             -1,
