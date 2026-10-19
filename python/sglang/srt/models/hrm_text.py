@@ -24,8 +24,8 @@ count ``num_layers_per_stack * H_cycles * (L_cycles + 1)`` equals the HF config
 ``ModelConfig`` as ``num_attention_layers``.
 
 PrefixLM (prompt bidirectional at prefill, causal at decode) uses
-``AttentionType.DECODER_BIDIRECTIONAL``, which only the Triton backend honors
-and only with cuda graph / chunked prefill / radix cache off --
+``AttentionType.DECODER_BIDIRECTIONAL``, which the Triton and FlashInfer
+backends honor only with cuda graph / chunked prefill / radix cache off --
 ``ModelRunner.model_specific_adjustment`` forces those for this model.
 
 On-disk ``attn.gqkv_proj.weight`` is fused ``[gate | q | k | v]`` rows and
