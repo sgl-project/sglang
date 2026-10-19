@@ -1,6 +1,6 @@
 ---
-title: Qwen-Image 2.1
-description: "Run Qwen-Image 2.1 text-to-image and image-conditioned generation with SGLang Diffusion."
+title: Qwen-Image 2.1 and Turbo
+description: "Run Qwen-Image 2.1 and its eight-step Turbo variant with SGLang Diffusion: text-to-image, reference-image editing, and transparent RGBA output."
 tag: NEW
 ---
 
@@ -14,9 +14,10 @@ import { config } from '/src/snippets/configs/Qwen/qwen-image-2.1.jsx';
 
 Use a nightly Docker image containing this integration, or install from source,
 following the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-Run the commands below inside that environment. The picker uses `Qwen/Qwen-Image-2.1`;
-you can also set a local checkpoint directory under **Variables**. The recipes
-target NVIDIA CUDA on Linux; the picker marks which single-GPU workloads have
+Run the commands below inside that environment. Select **Checkpoint weights** for
+`Qwen/Qwen-Image-2.1` or `Qwen/Qwen-Image-2.1-Turbo`; you can also set a local
+checkpoint directory under **Variables**. The recipes
+target NVIDIA CUDA on Linux; the picker marks which workloads have
 been verified with the full checkpoint.
 
 <Deployment config={config} />
@@ -63,7 +64,7 @@ batch size one. Explicit placement and attention overrides preserve each recipe.
 | RTX 4090 24GB | DiT and VAE resident, encoder layerwise offload / FlashAttention | 18.68 s | 21.68 s | 22.7 GiB |
 | DGX Spark 128GB unified | Resident / Torch SDPA | 35.36 s | 42.23 s | — (unified) |
 
-Measured on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
+Measured with the original checkpoint on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
 request. Times are median HTTP latency after warmup, including PNG serialization
 and excluding startup; VRAM is the sampled request-phase peak. Prompts and
 software versions affect both latency and memory use.
@@ -111,10 +112,43 @@ output pixels, even with the same seed. See
 [Inference batching](/docs/sglang-diffusion/dynamic_batching) for admission rules
 and metrics.
 
+### Turbo sampling
+
+Select **Qwen-Image 2.1 Turbo** under **Setup → Checkpoint weights** and restart
+with the generated Server command. Requests use the checkpoint's preset eight-step
+sigma grid automatically; omit `num_inference_steps`. Setting that field to 8
+on the original checkpoint does not reproduce Turbo.
+
+For offline generation:
+
+```bash Command
+sglang generate --model-path Qwen/Qwen-Image-2.1-Turbo \
+  --prompt "A ceramic teapot on a wooden table in soft morning light"
+```
+
+The preset comes from `sample_sigmas` in `model_index.json`, with scheduler
+settings loaded from `scheduler/scheduler_config.json`. Preserve both when copying
+or exporting the checkpoint. Changing only `num_inference_steps` does not override
+the preset. Custom grids are experimental and can reduce quality; the picker keeps
+Turbo on its published schedule. The default CFG scale is 1 for both checkpoints.
+See the [Turbo model card](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo).
+
+Turbo was verified at 1024×1024 with native precision and eager execution on
+H200: single-GPU generation, editing, transparent generation and editing,
+multi-image editing, and two outputs; TP×2 generation and editing also passed.
+The picker distinguishes these from untested Turbo hardware and combinations.
+
+The hardware latency table above describes the original 40-step checkpoint.
+Turbo has the same architecture and weight-memory footprint; fewer denoising steps
+do not eliminate encoder or VAE costs. Existing quantization and acceleration
+results for the base checkpoint do not establish Turbo quality or speed.
+
 ## 2. Model capabilities
 
 Qwen-Image 2.1 supports text-to-image generation, single- and multi-image editing,
-and RGBA output. Use one checkpoint for all modes.
+and RGBA output. Both the original and eight-step Turbo checkpoints support all
+these modes. Choose Turbo for shorter denoising runs; compare the two checkpoints
+on your prompts when fidelity is the priority.
 
 For multi-round editing, send the previous output as the next reference image.
 The server does not retain conversation state. Repeated prompts and reference
@@ -149,7 +183,8 @@ including partly transparent edges, without thresholding or background removal.
 
 ## 4. Offline requests
 
-Defaults are 1024×1024, 40 steps, CFG 1, and seed 42; output saving is enabled.
+Defaults are 1024×1024, CFG 1, and seed 42; output saving is enabled.
+The original checkpoint defaults to 40 steps; Turbo uses its preset 8-step grid.
 For GPUs that need offload, also pass the placement flags from the picker.
 
 ### Text-to-image
@@ -177,7 +212,8 @@ noise seeds and independent prefix caches.
 
 ## 5. Runtime features
 
-The default is 40 Euler flow-matching steps with CFG disabled. For CFG, provide
+Both checkpoints use Euler flow matching with CFG disabled by default: 40 steps
+for the original, or the preset 8-step grid for Turbo. For CFG, provide
 `--negative-prompt` and `--guidance-scale` greater than one. The API requires a
 text prompt; precomputed embeddings alone are insufficient.
 
@@ -204,6 +240,8 @@ for shared runtime options.
 
 The picker marks exact tested HTTP deployments, not every combination of the
 features below. Functional checks do not establish quality for lossy settings.
+The feature checks below cover the original checkpoint; see
+[Turbo sampling](#turbo-sampling) for the Turbo validation scope.
 
 - **Parallelism and offload:** H200/B200 full-checkpoint checks cover TP,
   Ulysses, Ring with FlashAttention, CFG parallelism, encoder folding, and

@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -31,6 +31,7 @@ class _RecordingLayer:
 
     def __init__(self, is_gated: bool):
         self.moe_runner_config = MoeRunnerConfig(is_gated=is_gated)
+        self.moe_tp_size = 1
         self.params = {}
 
     def register_parameter(self, name, param):
@@ -47,20 +48,18 @@ def _create_weights(is_gated: bool, block_quant: bool):
         is_checkpoint_fp8_serialized=False,
     )
 
-    with patch.object(fp8_quant, "get_parallel") as parallel:
-        parallel.return_value.tp_size = 1
-        fp8_quant.Fp8MoEMethod.create_fp8_moe_weight_(
-            layer=layer,
-            num_experts=NUM_EXPERTS,
-            hidden_size=HIDDEN,
-            intermediate_size_per_partition=INTERMEDIATE,
-            block_quant=block_quant,
-            quant_config=quant_config,
-            use_mxfp8=False,
-            is_checkpoint_fp8_serialized=False,
-            is_fp4_expert=False,
-            params_dtype=torch.bfloat16,
-        )
+    fp8_quant.Fp8MoEMethod.create_fp8_moe_weight_(
+        layer=layer,
+        num_experts=NUM_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size_per_partition=INTERMEDIATE,
+        block_quant=block_quant,
+        quant_config=quant_config,
+        use_mxfp8=False,
+        is_checkpoint_fp8_serialized=False,
+        is_fp4_expert=False,
+        params_dtype=torch.bfloat16,
+    )
     return layer.params
 
 
