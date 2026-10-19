@@ -13,6 +13,8 @@ from sglang.srt.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
+    maybe_remap_kv_scale_name,
+    pad_loaded_weight,
 )
 from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -218,6 +220,70 @@ class TestInitializeDummyWeights(CustomTestCase):
         self.assertTrue(torch.equal(model.w13_weight_scale_2, torch.ones(4, 2)))
         self.assertTrue(torch.equal(model.w2_weight_scale_2, torch.ones(4)))
         self.assertTrue(torch.all((model.weight >= 0.25) & (model.weight <= 0.75)))
+
+
+class TestMaybeRemapKvScaleName(CustomTestCase):
+    def test_already_canonical_scale_name_is_preserved(self):
+        params_dict = {
+            "model.layers.0.self_attn.attn.k_scale": torch.ones(1),
+            "model.layers.0.self_attn.attn.v_scale": torch.ones(1),
+        }
+        self.assertEqual(
+            maybe_remap_kv_scale_name(
+                "model.layers.0.self_attn.attn.k_scale", params_dict
+            ),
+            "model.layers.0.self_attn.attn.k_scale",
+        )
+        self.assertEqual(
+            maybe_remap_kv_scale_name(
+                "model.layers.0.self_attn.attn.v_scale", params_dict
+            ),
+            "model.layers.0.self_attn.attn.v_scale",
+        )
+
+    def test_quark_prob_output_scale_and_missing_scale_handling(self):
+        params_dict = {
+            "model.layers.0.self_attn.attn.k_scale": torch.ones(1),
+            "model.layers.0.self_attn.attn.v_scale": torch.ones(1),
+            "model.layers.0.self_attn.attn.prob_scale": torch.ones(1),
+        }
+        self.assertEqual(
+            maybe_remap_kv_scale_name(
+                "model.layers.0.self_attn.prob_output_scale", params_dict
+            ),
+            "model.layers.0.self_attn.attn.prob_scale",
+        )
+        # When q_scale is not registered in params_dict, return None instead of
+        # an unmapped name that would raise KeyError in load_weights.
+        self.assertIsNone(
+            maybe_remap_kv_scale_name(
+                "model.layers.0.self_attn.q_proj.output_scale", params_dict
+            )
+        )
+
+
+class TestPadLoadedWeight(CustomTestCase):
+    def test_pad_loaded_weight_preserves_device_and_exact_integer_split(self):
+        # 1 / 49 * 49 in IEEE-754 float64 is 0.9999999999999999, which int(...)
+        # truncates to 0 unless integer division is used.
+        output_sizes = [2, 96]  # sum = 98 = 2 * 49
+        raw_weight = torch.arange(49 * 4, dtype=torch.bfloat16).reshape(49, 4)
+        padded = pad_loaded_weight(raw_weight, output_dim=0, output_sizes=output_sizes)
+        self.assertEqual(padded.shape, (98, 4))
+        self.assertEqual(padded.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(padded[:1], raw_weight[:1]))
+        self.assertTrue(torch.equal(padded[1:2], torch.zeros(1, 4, dtype=torch.bfloat16)))
+        self.assertTrue(torch.equal(padded[2:50], raw_weight[1:]))
+        self.assertTrue(torch.equal(padded[50:], torch.zeros(48, 4, dtype=torch.bfloat16)))
+
+        # Verify non-CPU device preservation using meta tensor.
+        meta_weight = torch.empty((6, 4), dtype=torch.float16, device="meta")
+        meta_padded = pad_loaded_weight(
+            meta_weight, output_dim=0, output_sizes=[4, 4, 4]
+        )
+        self.assertEqual(meta_padded.device.type, "meta")
+        self.assertEqual(meta_padded.dtype, torch.float16)
+        self.assertEqual(meta_padded.shape, (12, 4))
 
 
 if __name__ == "__main__":
