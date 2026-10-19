@@ -5,6 +5,7 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import bf16_dequant_blockscaled_linear
 from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
     mxfp8_gemv,
     mxfp8_native_blockscaled_linear,
@@ -13,7 +14,6 @@ from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
-    bf16_dequant_blockscaled_linear,
     dequant_block_fp8_weight_to_bf16,
     fake_quant_fp8_activation,
     fp8_grid_quantize,

@@ -27,8 +27,10 @@ if not is_hip():
 if not torch.cuda.is_available():
     pytest.skip("Requires a GPU.", allow_module_level=True)
 
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_dot_scaled_linear,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (  # noqa: E402
     _mxfp8_e4m3_quantize_torch,
     _mxfp8_e4m3_quantize_triton,
     dequant_mxfp8_to_bf16,

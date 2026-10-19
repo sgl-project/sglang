@@ -932,7 +932,7 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
         )
     if backend.is_gfx95_dot_scaled():
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
@@ -993,7 +993,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
         dot_scaled_mxfp8_blockscaled_linear,
     )
 
