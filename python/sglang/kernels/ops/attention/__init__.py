@@ -3,7 +3,7 @@
 The Triton kernels migrated here live in this package
 (``sglang.kernels.ops.attention.<module>``); import them from there. Their
 ``KernelSpec`` metadata is registered below for inventory (backend = Triton).
-KV-cache index/write kernels went to the ``kvcache`` group instead.
+KV-cache write kernels went to the ``kvcache`` group instead.
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ _TRITON_KERNELS = [
     ("aiter_unified_page_table", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
+    ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -199,8 +200,6 @@ del _mod, _fn
 # Generic attention kernels migrated in Phase 2.5 (RFC #29630).
 for _mod, _fn in [
     ("utils", "mla_quantize_and_rope_for_fp8"),
-    ("utils", "launch_reshape_and_cache_flash"),
-    ("utils", "launch_reshape_and_cache_shuffle_5d"),
     ("flash_mla_sm120", "flash_mla_with_kvcache_sm120"),
     ("dcp_kernels", "create_dcp_kv_indices"),
     ("dcp_kernels", "correct_attn_out"),
