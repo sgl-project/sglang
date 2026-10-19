@@ -4360,6 +4360,31 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestRustServerDpAttentionControlBroadcast(unittest.TestCase):
+    """Under the Rust server every attention-DP leader hosts its own listener;
+    a control request (abort, server info) sent to a leader other than rank 0
+    must reach its scheduler instead of being overwritten by rank 0's
+    broadcast."""
+
+    def test_rust_server_broadcasts_control_within_each_dp_group(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            attn_dp_size=2,
+            tp_size=2,
+            chunked_prefill_size=8192,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        with envs.SGLANG_RUST_SERVER.override(True):
+            parallel_hook.handle_data_parallelism(server_args)
+        self.assertTrue(
+            resolution_result(
+                server_args, "enable_dp_attention_local_control_broadcast", False
+            )
+        )
+
+
 class TestTpLmHeadAllToAllNcclGraphRegister(unittest.TestCase):
     """The graph-captured TP LM-head all-to-all must not run with NCCL's
     graph buffer registration: registered graph-pool temporaries deadlock the
