@@ -2622,7 +2622,6 @@ class DeepseekV4HipRadixBackend(
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
-            is_unified_kv_fp8,
             is_unified_kv_triton,
         )
 
@@ -2639,9 +2638,10 @@ class DeepseekV4HipRadixBackend(
             self._attach_dspark_draft_block_streams(core, state_slot, num_draft)
             return
         swa_len = core.swa_topk_lengths
-        if core.low_ratios and not (self.has_c4 or self.has_c128) and num_draft == 0:
+        if core.low_ratios and not (self.has_c4 or self.has_c128):
             # DeepSeek-V4.1 (compressed layers all ratio 1 / 2): no c4 / c128
-            # streams to build, and the rest fits in two launches
+            # streams to build, and the rest fits in two launches; a verify row is
+            # a decode row at its own position
             u = core.unified
             meta = runtime.build_v41_decode_meta(
                 state_slot=state_slot,
@@ -2656,9 +2656,7 @@ class DeepseekV4HipRadixBackend(
             u.swa_indices, u.swa_indptr = meta["swa_indices"], meta["swa_indptr"]
             u.hca_indices = u.hca_indptr = u.csa_indices = u.csa_indptr = None
             u.gasm_indices = u.gasm_kv_indptr = u.gasm_qo_indptr = None
-            u.grp_qo_indptr = None
-            u.grp_hca_indices = u.grp_hca_indptr = u.grp_hca_bounds = None
-            u.grp_swa_indices = u.grp_swa_indptr = u.grp_swa_bounds = None
+            self._attach_grouped_verify_streams(core, state_slot, num_draft)
             u.low_ratio_streams = {}
             for ratio in core.low_ratios:
                 setattr(u, f"c{ratio}_indices", None)
@@ -2729,42 +2727,9 @@ class DeepseekV4HipRadixBackend(
                 block_q=_GROUPED_ASM_BLOCK_Q,
             )
 
-        u = core.unified
-        u.grp_qo_indptr = None
-        u.grp_hca_indices = u.grp_hca_indptr = u.grp_hca_bounds = None
-        u.grp_swa_indices = u.grp_swa_indptr = u.grp_swa_bounds = None
-        num_reqs = N // num_draft if num_draft > 1 and N % num_draft == 0 else 0
-        if self.is_dspark and num_reqs and is_unified_kv_fp8():
-            grouped = functools.partial(
-                runtime.build_grouped_verify_streams,
-                state_slot,
-                core.positions_casual,
-                num_draft=num_draft,
-                win=pool.unified_swa_window,
-                ring_stride=pool.unified_swa_ring_size,
-                swa_pages=pool.unified_swa_pages,
-            )
-            pays = functools.partial(
-                runtime.flydsl_grouped_verify_pays,
-                self._fp8_decode_num_heads,
-                num_draft,
-                num_reqs,
-                epi=self._fp8_verify_epi,
-            )
-            if self.has_c128 and pays(128):
-                (
-                    u.grp_hca_indices,
-                    u.grp_hca_indptr,
-                    u.grp_qo_indptr,
-                    u.grp_hca_bounds,
-                ) = grouped(hca_len, hca_page_indices)
-            if pays(0):
-                (
-                    u.grp_swa_indices,
-                    u.grp_swa_indptr,
-                    u.grp_qo_indptr,
-                    u.grp_swa_bounds,
-                ) = grouped(None, None)
+        self._attach_grouped_verify_streams(
+            core, state_slot, num_draft, hca_len, hca_page_indices
+        )
 
         # The streams themselves are per layer (each has its own compressed-row
         # base) and depend on the top-k, so _unified_low_ratio_stream builds them
@@ -2797,6 +2762,61 @@ class DeepseekV4HipRadixBackend(
         # Per-token req-slot map for the target-verify SWA ring store; plain
         # decode's store reads req_pool_indices instead.
         core.unified.verify_store_state_slot = state_slot
+
+    def _attach_grouped_verify_streams(
+        self,
+        core: DSV4AttnMetadata,
+        state_slot: torch.Tensor,
+        num_draft: int,
+        hca_len: Optional[torch.Tensor] = None,
+        hca_page_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        """DSpark fp8 target verify: one shared stream per request for the HCA /
+        SWA-only layers where FlyDSL's grouped verify pays, else none."""
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_fp8,
+        )
+
+        pool = self.token_to_kv_pool
+        N = state_slot.shape[0]
+        u = core.unified
+        u.grp_qo_indptr = None
+        u.grp_hca_indices = u.grp_hca_indptr = u.grp_hca_bounds = None
+        u.grp_swa_indices = u.grp_swa_indptr = u.grp_swa_bounds = None
+        num_reqs = N // num_draft if num_draft > 1 and N % num_draft == 0 else 0
+        if not (self.is_dspark and num_reqs and is_unified_kv_fp8()):
+            return
+        grouped = functools.partial(
+            runtime.build_grouped_verify_streams,
+            state_slot,
+            core.positions_casual,
+            num_draft=num_draft,
+            win=pool.unified_swa_window,
+            ring_stride=pool.unified_swa_ring_size,
+            swa_pages=pool.unified_swa_pages,
+        )
+        pays = functools.partial(
+            runtime.flydsl_grouped_verify_pays,
+            self._fp8_decode_num_heads,
+            num_draft,
+            num_reqs,
+            epi=self._fp8_verify_epi,
+        )
+        if self.has_c128 and pays(128):
+            (
+                u.grp_hca_indices,
+                u.grp_hca_indptr,
+                u.grp_qo_indptr,
+                u.grp_hca_bounds,
+            ) = grouped(hca_len, hca_page_indices)
+        if pays(0):
+            (
+                u.grp_swa_indices,
+                u.grp_swa_indptr,
+                u.grp_qo_indptr,
+                u.grp_swa_bounds,
+            ) = grouped(None, None)
 
     def _attach_dspark_draft_block_streams(
         self, core: DSV4AttnMetadata, state_slot: torch.Tensor, block_size: int
