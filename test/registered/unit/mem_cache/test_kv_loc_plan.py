@@ -55,8 +55,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _PS = 2
@@ -126,7 +127,7 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
-class TestKVLocPlan(unittest.TestCase):
+class TestKVLocPlan(CustomTestCase):
     def setUp(self):
         # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
@@ -161,8 +162,8 @@ class TestKVLocPlan(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
             page_size=_PS,
-            fused_draft=FusedDraftPlacement(
-                region=full_spec.draft_region, runner_lane_counts=(1,)
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"full": [1]}, regions={"full": full_spec.draft_region}
             ),
         )
         kvcache = _FakeUnifiedSWAKVPool(pool)
@@ -228,6 +229,29 @@ class TestKVLocPlan(unittest.TestCase):
         # A private draft pool indexes virtual ids.
         self.assertIs(plan.write_ids(self.private_draft), self.window)
         self.assertTrue(torch.equal(self.window, window))  # never mutated
+
+    def test_precomputed_writes_seed_each_space_independently(self):
+        expected = {
+            kind: self.target.space(kind).write(self.window) for kind in (_FULL, _SWA)
+        }
+        for kinds in ((_FULL,), (_SWA,), (_FULL, _SWA)):
+            with self.subTest(precomputed=kinds):
+                supplied = {kind: expected[kind] for kind in kinds}
+                plan = self.target.plan(
+                    req_pool_indices=self.rpi,
+                    seq_lens=self.seq_lens,
+                    seq_lens_cpu=self.seq_lens.clone(),
+                    write_virtual=self.window,
+                    translated_writes=supplied,
+                )
+                for kind in (_FULL, _SWA):
+                    ids = plan.write_ids(self.target, kind=kind)
+                    torch.testing.assert_close(ids, expected[kind])
+                    self.assertIs(plan.write_ids(self.target, kind=kind), ids)
+                    if kind in supplied:
+                        self.assertIs(ids, supplied[kind])
+                self.assertIs(plan.write_ids(self.fused_draft), plan.write_physical)
+                self.assertIs(plan.write_ids(self.private_draft), self.window)
 
     def test_cols_slice_names_a_split_batch_s_tokens(self):
         """Two-batch overlap splits a forward's tokens; each half writes its
