@@ -62,6 +62,9 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     out_raw_indices: torch.Tensor
     out_page_indices: Optional[torch.Tensor]
 
+    # None uses the fixed cap.
+    score_budget_bytes: Optional[int] = None
+
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)
         if self.out_page_indices is not None:
