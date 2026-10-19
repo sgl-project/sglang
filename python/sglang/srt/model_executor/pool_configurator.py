@@ -1064,6 +1064,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _trtllm_uniform_fp8 = False
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1083,6 +1084,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
+        self._trtllm_uniform_fp8 = (
+            not self._unified
+            and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        )
         # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would
         # under-count that ring (640 vs 1024). MTP keeps the old inflation.
         self._dspark_draft_on_bf16 = bool(
@@ -1095,7 +1100,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self._unified:
             # Unified_kv stores the whole latent: one bf16 row, or fp8 nope + bf16 rope.
             self.kv_bytes = self._unified_row_bytes
-        elif get_exec().kernel.dsv4_attn_backend == "trtllm":
+        elif self._trtllm_uniform_fp8:
             self.kv_bytes = self.attn_head_dim
         else:
             # One FlashMLA-layout latent slot, in bytes.
@@ -1340,7 +1345,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def _get_paged_kv_bytes_per_token(self, compress_ratio: int = 0) -> float:
         # Unified rings, the NPU pool and the trtllm uniform-FP8 pool do not go
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
-        if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
+        if self._unified or _is_npu or self._trtllm_uniform_fp8:
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1378,13 +1383,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
         compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
         if ratio in (1, 2):
-            main_kv_bytes = get_dsv4_main_kv_physical_bytes_per_slot(
-                ratio=ratio,
-                full_page_size=self.page_size,
-                kv_layout=self._dsv4_kv_layout,
-                compressed_kv_layout=self._dsv4_compressed_kv_layout,
-                packed_specs=self._dsv41_main_kv_layout_specs,
-            )
+            if self._trtllm_uniform_fp8:
+                main_kv_bytes = self.kv_bytes
+            else:
+                main_kv_bytes = get_dsv4_main_kv_physical_bytes_per_slot(
+                    ratio=ratio,
+                    full_page_size=self.page_size,
+                    kv_layout=self._dsv4_kv_layout,
+                    compressed_kv_layout=self._dsv4_compressed_kv_layout,
+                    packed_specs=self._dsv41_main_kv_layout_specs,
+                )
             return (main_kv_bytes + self.low_ratio_index_bytes) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)

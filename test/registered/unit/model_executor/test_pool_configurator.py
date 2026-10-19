@@ -1436,21 +1436,39 @@ class TestSWAPoolFloor(CustomTestCase):
             budget,
         )
 
-    def test_dsv4_trtllm_kv_bytes(self):
+    def test_dsv4_trtllm_uniform_fp8_sizing(self):
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4UniformFP8KVPool,
+        )
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
-        kvc = _make_model_runner(self, num_layers=1, page_size=256)
+        kvc = _make_model_runner(self, num_layers=2, page_size=256)
         _publish_config(self, dsv4_attn_backend="trtllm", page_size=256)
         kvc.kv_cache_dtype_str = "fp8_e4m3"
         cfg = kvc.model_config
         cfg.qk_nope_head_dim = 448
         cfg.index_head_dim = 128
-        cfg.compress_ratios = [0]
+        cfg.compress_ratios = [1, 2]
         cfg.window_size = 128
-        cfg.hf_config.kv_source_layer_ids = []
+        cfg.hf_config.kv_source_layer_ids = [0, 1]
+
+        uniform_pool = object.__new__(DeepSeekV4UniformFP8KVPool)
+        uniform_pool.qk_nope_head_dim = cfg.qk_nope_head_dim
+        uniform_pool.qk_rope_head_dim = cfg.qk_rope_head_dim
+        uniform_fp8_bytes = uniform_pool.get_bytes_per_token()
+
         planner = DSV4PoolConfigurator(kvc)
-        self.assertEqual(planner.kv_bytes, 512)
-        self.assertEqual(planner.bytes_per_swa_token, 512)
+        self.assertIs(planner._dsv4_kv_layout, KVLayout.V4)
+        self.assertEqual(uniform_fp8_bytes, 512)
+        self.assertEqual(planner.kv_bytes, uniform_fp8_bytes)
+        self.assertEqual(planner.bytes_per_swa_token, 2 * uniform_fp8_bytes)
+        for ratio in (1, 2):
+            with self.subTest(ratio=ratio):
+                self.assertEqual(
+                    planner._compressed_bytes_per_full_token(ratio),
+                    (uniform_fp8_bytes + planner.low_ratio_index_bytes) / ratio,
+                )
 
     def test_dsv4_unified_c4_state_not_token_scaled(self):
         # Unified-KV sizes the c4 state ring from max_running_requests in
