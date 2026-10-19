@@ -24,16 +24,34 @@ def _scheduler_for_typed_config():
             get_default_sampling_params=lambda: {},
         ),
         rust_server_tokenizer_path=lambda: "tokenizer",
+        tokenizer=None,
         max_total_num_tokens=1024,
+        load_snapshot_writer=None,
     )
 
 
 @pytest.mark.parametrize(
-    "legacy_args,expected",
-    [({}, 50051), ({"smg_grpc_mode": True}, None), ({"grpc_mode": True}, None)],
-    ids=["native", "legacy-smg", "deprecated-legacy-smg"],
+    "overrides,kwarg,expected",
+    [
+        ({}, "grpc_port", 50051),
+        ({"smg_grpc_mode": True}, "grpc_port", None),
+        ({"grpc_mode": True}, "grpc_port", None),
+        ({"default_priority_value": 5}, "default_priority_value", None),
+        (
+            {"enable_priority_scheduling": True, "default_priority_value": 5},
+            "default_priority_value",
+            5,
+        ),
+    ],
+    ids=[
+        "native-grpc",
+        "legacy-smg",
+        "deprecated-legacy-smg",
+        "priority-off",
+        "priority-on",
+    ],
 )
-def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
+def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
     extension = SimpleNamespace(
         DisaggregationMode=SimpleNamespace(
             Null="null", Prefill="prefill", Decode="decode"
@@ -43,16 +61,17 @@ def test_typed_config_only_forwards_native_grpc_port(legacy_args, expected):
         ServerArgs=MagicMock(return_value="server-args"),
     )
     with (
-        get_context().override_server_args(grpc_port=50051, **legacy_args),
+        get_context().override_server_args(grpc_port=50051, **overrides),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
         assert (
             rust_config._build_server_args(_scheduler_for_typed_config())
             == "server-args"
         )
 
-    assert extension.ServerArgs.call_args.kwargs["grpc_port"] == expected
+    assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
 
 
 @pytest.mark.parametrize("enable_metrics", [False, True])
@@ -63,6 +82,7 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
         patch.object(rust_extensions, "load_rust_extension", return_value=extension),
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
         rust_config._build_server_args(_scheduler_for_typed_config())
 
@@ -72,6 +92,21 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         assert metrics is extension.MetricsConfig.return_value
     else:
         assert metrics is None
+
+
+@pytest.mark.parametrize(
+    "tokenizer,expected",
+    [
+        (None, -1),
+        (SimpleNamespace(), -1),
+        (SimpleNamespace(model_max_length=4096), 4096),
+        # HF's unset sentinel, int(1e30), is not a 64-bit integer.
+        (SimpleNamespace(model_max_length=int(1e30)), 2048),
+    ],
+    ids=["no-tokenizer", "no-attribute", "configured", "unset-sentinel"],
+)
+def test_tokenizer_model_max_length_matches_python_tokenize(tokenizer, expected):
+    assert rust_config._tokenizer_model_max_length(tokenizer, 2048) == expected
 
 
 @pytest.mark.parametrize(

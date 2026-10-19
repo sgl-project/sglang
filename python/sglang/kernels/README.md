@@ -4,8 +4,8 @@ This package is the public in-tree import surface for callable kernels, per
 [RFC #29630](https://github.com/sgl-project/sglang/issues/29630).
 
 ```python
-from sglang.kernels.ops.layernorm import rmsnorm
 from sglang.kernels.ops.activation import silu_and_mul
+from sglang.kernels.ops.gemm import fp8_scaled_mm
 from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 ```
 
@@ -13,8 +13,8 @@ from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 
 ```
 sglang/kernels/
-  spec.py        # KernelSpec, KernelBackend, FormatSignature,
-                 # CapabilityRequirement, PlatformInfo
+  spec.py        # KernelSpec, KernelBackend, CapabilityRequirement,
+                 # PlatformInfo
   registry.py    # process-wide KernelRegistry + register_kernel()
   selector.py    # heuristic select_kernel() and cached get_kernel()
   fused_op.py    # BaseFusedOp: per-operator multi-backend contract
@@ -94,7 +94,7 @@ explicitly, e.g.:
 
 ```python
 from sglang.kernels import select_kernel, KernelBackend
-jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
+jit_moe_align = select_kernel("moe.moe_align_block_size", backend=KernelBackend.JIT).load()
 ```
 
 ## `BaseFusedOp` — the unified operator contract
@@ -111,6 +111,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
+    `forward_helion` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared
@@ -127,8 +128,11 @@ Dispatch priority, highest first: explicit `forward(..., backend=...)` →
 global forced backend (`SGLANG_FORCE_FUSED_OP_BACKEND`) → OOT platform
 override → declared optimized kernel backends by `priority` (filtered by
 `backend_eligible()`, a `CapabilityRequirement`-vs-`PlatformInfo` check
-extensible with per-call shape/dtype gates) → platform-specific forward →
-`forward_native`. The static part of the decision is resolved once and cached
+extensible with per-call applicability gates) → platform-specific forward →
+`forward_native`. A gate only answers whether the kernel covers these operands,
+so that falling through is a correct way to compute the same result; operands
+that violate the op's contract (mismatched shapes or devices) are a caller bug
+that the backend's launcher must raise, not a reason to fall back. The static part of the decision is resolved once and cached
 on the instance, so the hot path stays a single indirect call.
 
 `BaseFusedOp` also owns the torch.compile mode protocol
@@ -147,7 +151,7 @@ What this buys (see the
 
 - **Unified correctness testing** — a generic harness enumerates
   `available_backends()` and asserts each one matches `forward_native`
-  (`test/registered/kernels/ops/layernorm/test_fused_op_gpu_parity.py`); new
+  (`test/registered/kernels/ops/activation/test_fused_op_gpu_parity.py`); new
   backends are picked up automatically.
 - **One-switch debugging** — `SGLANG_FORCE_FUSED_OP_BACKEND=torch` (or
   `set_fused_op_backend(KernelBackend.TORCH)`) flips *every* fused op to its

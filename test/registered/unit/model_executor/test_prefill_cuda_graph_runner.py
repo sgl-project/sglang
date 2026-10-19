@@ -1,5 +1,6 @@
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,6 +19,9 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
 )
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -684,6 +688,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                     self.assertEqual(
                         _local_prefill_cuda_graph_vote(
                             local_batch=schedule_batch,
+                            num_tokens=4,
                             prefill_graph_runner=runner,
                             coordinated_prefill=True,
                             breakable_prefill=backend == Backend.BREAKABLE,
@@ -749,6 +754,50 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+
+class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
+    @staticmethod
+    def _runner(counter, is_full_backend=True):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = is_full_backend
+        runner.model_runner = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+        )
+        return runner
+
+    def test_replay_waits_for_every_layer_of_an_inflight_load(self):
+        """Replay skips per-layer waits, so it must not start while the batch's
+        layer-wise load is still writing its last layer."""
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        counter.complete(0, 1)
+        waiter = threading.Thread(
+            target=self._runner(counter)._wait_for_layer_loads,
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        counter.complete(0, 2)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+    def test_replay_without_a_layer_transfer_counter(self):
+        self._runner(None)._wait_for_layer_loads()
+
+    def test_breakable_replay_keeps_per_layer_load_overlap(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        waiter = threading.Thread(
+            target=self._runner(counter, is_full_backend=False)._wait_for_layer_loads,
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
 
 
 if __name__ == "__main__":
