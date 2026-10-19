@@ -15,7 +15,7 @@ from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _make_req(

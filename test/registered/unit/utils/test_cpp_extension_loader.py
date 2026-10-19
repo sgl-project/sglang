@@ -7,7 +7,7 @@ import pytest
 from sglang.srt.utils.cpp_extension_loader import load_extension_with_recovery
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 def test_stale_torch_lock_is_removed_before_loading(tmp_path: Path):

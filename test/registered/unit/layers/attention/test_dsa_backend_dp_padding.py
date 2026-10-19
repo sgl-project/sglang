@@ -13,7 +13,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDSABackendDPPadding(unittest.TestCase):

@@ -22,7 +22,7 @@ from sglang.srt.rust_server.multimodal import (  # noqa: E402
     RustMmSpec,
 )
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestWrapEncoded(CustomTestCase):
