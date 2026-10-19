@@ -1,5 +1,6 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from functools import lru_cache
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -122,8 +123,118 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         )
 
 
+class _INT8Activation(NamedTuple):
+    data: torch.Tensor
+    scale: torch.Tensor
+    source_dtype: torch.dtype
+
+
+@lru_cache(maxsize=None)
+def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) -> bool:
+    try:
+        op = torch.ops.npu.npu_dequant_swiglu_quant
+        probe = torch.zeros((1, width), device=device, dtype=dtype)
+        data, scale = op(probe, quant_mode=1, activate_left=True)
+        return (
+            data.dtype == torch.int8
+            and data.shape == (1, width // 2)
+            and scale.dtype == torch.float32
+            and scale.shape == (1,)
+        )
+    except torch.OutOfMemoryError:
+        raise
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return False
+
+
+@lru_cache(maxsize=None)
+def _supports_add_rmsnorm_int8(device: torch.device, dtype: torch.dtype, width: int):
+    try:
+        x = torch.zeros((1, width), device=device, dtype=dtype)
+        weight = torch.ones(width, device=device, dtype=dtype)
+        data, _, residual, scale, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+            x, x, weight, epsilon=1e-6
+        )
+        return (
+            data.dtype == torch.int8
+            and data.shape == x.shape
+            and residual.dtype == dtype
+            and residual.shape == x.shape
+            and scale.dtype == torch.float32
+            and scale.shape == (1,)
+        )
+    except torch.OutOfMemoryError:
+        raise
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return False
+
+
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+        *,
+        online_weights: bool = False,
+    ):
+        super().__init__(quant_config)
+        self.online_weights = online_weights
+
+    def quantize_add_rmsnorm(
+        self, x: torch.Tensor, residual: torch.Tensor, norm: torch.nn.RMSNorm
+    ):
+        if (
+            x.device.type != "npu"
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or x.ndim != 2
+            or x.numel() == 0
+            or residual.shape != x.shape
+            or residual.dtype != x.dtype
+            or residual.device != x.device
+            or norm.weight is None
+            or norm.weight.shape != (x.shape[-1],)
+            or norm.weight.dtype != x.dtype
+            or norm.weight.device != x.device
+        ):
+            return None
+        if not _supports_add_rmsnorm_int8(x.device, x.dtype, x.shape[-1]):
+            return None
+        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
+        data, _, residual_out, scales, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+            x, residual, norm.weight, epsilon=eps
+        )
+        return _INT8Activation(data, scales, x.dtype), residual_out
+
+    def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
+        if (
+            x.device.type != "npu"
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or x.ndim != 2
+            or x.shape[0] == 0
+            or x.shape[1] == 0
+            or x.shape[1] % 2
+            or not x.is_contiguous()
+        ):
+            return None
+        if not _supports_swiglu_int8(x.device, x.dtype, x.shape[1]):
+            return None
+        data, scale = torch.ops.npu.npu_dequant_swiglu_quant(
+            x, quant_mode=1, activate_left=True
+        )
+        return _INT8Activation(data, scale, x.dtype)
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self.online_weights:
+            weight = layer.weight.data
+            if weight.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"Online W8A8 requires FP16 or BF16 weights, got {weight.dtype}"
+                )
+            if not weight.is_npu:
+                weight = weight.to(f"npu:{torch.npu.current_device()}")
+            quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight)
+            layer.weight = Parameter(quantized_weight, requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
 
@@ -135,12 +246,13 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | _INT8Activation | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        if isinstance(x, tuple):
-            """dynamic_scale is calculated in malprolog kernel"""
+        if isinstance(x, _INT8Activation):
+            quant_out, dynamic_scale, original_dtype = x
+        elif isinstance(x, tuple):
+            # MLAProlog supplies quantized activations with BF16 output.
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
         else:

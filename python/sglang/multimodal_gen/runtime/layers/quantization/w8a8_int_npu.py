@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 import torch
-from torch.nn.parameter import Parameter
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase, LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -16,54 +14,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
-from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+    NPUW8A8Int8DynamicLinearMethod,
+    _INT8Activation,
+)
 from sglang.srt.layers.quantization.utils import _module_path_match, is_layer_skipped
-
-
-class _INT8Activation(NamedTuple):
-    data: torch.Tensor
-    scale: torch.Tensor
-    source_dtype: torch.dtype
-
-
-@lru_cache(maxsize=None)
-def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) -> bool:
-    try:
-        op = torch.ops.npu.npu_dequant_swiglu_quant
-        probe = torch.zeros((1, width), device=device, dtype=dtype)
-        data, scale = op(probe, quant_mode=1, activate_left=True)
-        return (
-            data.dtype == torch.int8
-            and data.shape == (1, width // 2)
-            and scale.dtype == torch.float32
-            and scale.shape == (1,)
-        )
-    except torch.OutOfMemoryError:
-        raise
-    except (AttributeError, NotImplementedError, RuntimeError):
-        return False
-
-
-@lru_cache(maxsize=None)
-def _supports_add_rmsnorm_int8(device: torch.device, dtype: torch.dtype, width: int):
-    try:
-        x = torch.zeros((1, width), device=device, dtype=dtype)
-        weight = torch.ones(width, device=device, dtype=dtype)
-        data, _, residual, scale, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
-            x, x, weight, epsilon=1e-6
-        )
-        return (
-            data.dtype == torch.int8
-            and data.shape == x.shape
-            and residual.dtype == dtype
-            and residual.shape == x.shape
-            and scale.dtype == torch.float32
-            and scale.shape == (1,)
-        )
-    except torch.OutOfMemoryError:
-        raise
-    except (AttributeError, NotImplementedError, RuntimeError):
-        return False
 
 
 class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
@@ -128,49 +83,15 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
 class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: NPUOnlineW8A8DiffusionConfig) -> None:
         self.quant_config = quant_config
+        self.kernel = NPUW8A8Int8DynamicLinearMethod(online_weights=True)
 
     def quantize_add_rmsnorm(
         self, x: torch.Tensor, residual: torch.Tensor, norm: torch.nn.RMSNorm
     ):
-        if (
-            x.device.type != "npu"
-            or x.dtype not in (torch.float16, torch.bfloat16)
-            or x.ndim != 2
-            or x.numel() == 0
-            or residual.shape != x.shape
-            or residual.dtype != x.dtype
-            or residual.device != x.device
-            or norm.weight is None
-            or norm.weight.shape != (x.shape[-1],)
-            or norm.weight.dtype != x.dtype
-            or norm.weight.device != x.device
-        ):
-            return None
-        if not _supports_add_rmsnorm_int8(x.device, x.dtype, x.shape[-1]):
-            return None
-        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
-        data, _, residual_out, scales, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
-            x, residual, norm.weight, epsilon=eps
-        )
-        return _INT8Activation(data, scales, x.dtype), residual_out
+        return self.kernel.quantize_add_rmsnorm(x, residual, norm)
 
     def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
-        if (
-            x.device.type != "npu"
-            or x.dtype not in (torch.float16, torch.bfloat16)
-            or x.ndim != 2
-            or x.shape[0] == 0
-            or x.shape[1] == 0
-            or x.shape[1] % 2
-            or not x.is_contiguous()
-        ):
-            return None
-        if not _supports_swiglu_int8(x.device, x.dtype, x.shape[1]):
-            return None
-        data, scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            x, quant_mode=1, activate_left=True
-        )
-        return _INT8Activation(data, scale, x.dtype)
+        return self.kernel.quantize_swiglu(x)
 
     def create_weights(
         self,
@@ -201,19 +122,8 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
                 "w8a8_int diffusion quantization requires FP16 or BF16 "
                 f"weights, got {weight.dtype}"
             )
-        if not weight.is_npu:
-            weight = weight.to(f"npu:{torch.npu.current_device()}")
-        quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight)
-        weight = Parameter(
-            npu_format_cast(quantized_weight.transpose(-2, -1).contiguous()),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.weight = weight
-        layer.weight_scale = Parameter(
-            weight_scale.flatten(),
-            requires_grad=False,
-        )
+        self.kernel.process_weights_after_loading(layer)
+        set_weight_attrs(layer.weight, {"input_dim": 1, "output_dim": 0})
         # Convert GEMM bias once instead of on every denoising step.
         if layer.bias is not None and not layer.skip_bias_add:
             layer.bias.data = layer.bias.data.to(torch.float32)
@@ -225,8 +135,8 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(x, _INT8Activation):
-            quantized_x, dynamic_scale, output_dtype = x
-            input_shape = quantized_x.shape
+            input_shape = x.data.shape
+            output_dtype = x.source_dtype
         else:
             input_shape = x.shape
             output_dtype = x.dtype
@@ -236,16 +146,6 @@ class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
                 f"activations, got {output_dtype}"
             )
         if not isinstance(x, _INT8Activation):
-            quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_quant(
-                x.reshape(-1, x.shape[-1]),
-                dst_type=torch.int8,
-            )
-        output = torch.ops.npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.weight_scale,
-            pertoken_scale=dynamic_scale.flatten(),
-            bias=bias,
-            output_dtype=output_dtype,
-        )
+            x = x.reshape(-1, x.shape[-1])
+        output = self.kernel.apply(layer, x, bias)
         return output.reshape(*input_shape[:-1], output.shape[-1])
