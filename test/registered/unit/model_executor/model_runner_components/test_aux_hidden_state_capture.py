@@ -1,5 +1,6 @@
 """Unit tests for --enable-return-aux-hidden-states (aux capture without a draft)."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -165,9 +166,6 @@ def test_capture_keeps_an_explicit_return_hidden_states_mode():
 
 
 # --- aux capture config ------------------------------------------------------
-# published_topology publishes raw fields without running the resolution
-# pipeline, so these tests set aux_hidden_state_capture, the resolved form of
-# --enable-return-aux-hidden-states plus --speculative-algorithm, directly.
 
 
 def test_disabled_by_default():
@@ -180,7 +178,9 @@ def test_disabled_by_default():
 
 def test_eagle3_capture_without_draft():
     with published_topology(
-        aux_hidden_state_capture="eagle3", return_aux_hidden_state_layer_ids=[1, 5]
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="EAGLE3",
+        return_aux_hidden_state_layer_ids=[1, 5],
     ):
         config = _resolve()
     assert config.eagle_use_aux_hidden_state
@@ -194,7 +194,9 @@ def test_eagle3_capture_without_draft():
 @pytest.mark.parametrize("method,is_dspark", [("dflash", False), ("dspark", True)])
 def test_dflash_family_capture_without_draft(method, is_dspark):
     with published_topology(
-        aux_hidden_state_capture=method, return_aux_hidden_state_layer_ids=[1, 16, 31]
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm=method.upper(),
+        return_aux_hidden_state_layer_ids=[1, 16, 31],
     ):
         config = _resolve()
     assert config.dflash_use_aux_hidden_state
@@ -206,7 +208,9 @@ def test_dflash_family_capture_without_draft(method, is_dspark):
 
 def test_draft_runner_never_captures():
     with published_topology(
-        aux_hidden_state_capture="dflash", return_aux_hidden_state_layer_ids=[1]
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="DFLASH",
+        return_aux_hidden_state_layer_ids=[1],
     ):
         config = _resolve(is_draft_worker=True)
     assert not config.dflash_use_aux_hidden_state
@@ -214,7 +218,9 @@ def test_draft_runner_never_captures():
 
 def test_layer_id_beyond_target_depth_is_rejected():
     with published_topology(
-        aux_hidden_state_capture="dflash", return_aux_hidden_state_layer_ids=[1, 8]
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="DFLASH",
+        return_aux_hidden_state_layer_ids=[1, 8],
     ):
         with pytest.raises(ValueError, match="out of range"):
             _resolve(num_layers=8)
@@ -222,7 +228,9 @@ def test_layer_id_beyond_target_depth_is_rejected():
 
 def test_loop_models_span_num_hidden_layers_times_num_loops():
     with published_topology(
-        aux_hidden_state_capture="dflash", return_aux_hidden_state_layer_ids=[1, 12]
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="DFLASH",
+        return_aux_hidden_state_layer_ids=[1, 12],
     ):
         config = _resolve(num_layers=8, num_loops=2)
     assert config.dflash_target_layer_ids == [1, 12]
@@ -328,7 +336,8 @@ def _run_logits_processor(capture_hidden_mode, *, with_aux=True, **server_fields
 def test_full_capture_keeps_last_hidden_next_to_aux():
     output, hidden_states, aux = _run_logits_processor(
         CaptureHiddenMode.FULL,
-        aux_hidden_state_capture="dflash",
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="DFLASH",
         return_aux_hidden_state_layer_ids=[0, 1, 2],
     )
     torch.testing.assert_close(output.hidden_states, torch.cat(aux, dim=-1))
@@ -339,7 +348,8 @@ def test_fewer_captured_layers_than_requested_fails_fast():
     with pytest.raises(ValueError, match="captured 3 aux hidden states"):
         _run_logits_processor(
             CaptureHiddenMode.FULL,
-            aux_hidden_state_capture="dflash",
+            enable_return_aux_hidden_states=True,
+            speculative_algorithm="DFLASH",
             return_aux_hidden_state_layer_ids=[0, 1, 2, 3],
         )
 
@@ -349,7 +359,8 @@ def test_missing_aux_in_capture_only_mode_fails_fast():
         _run_logits_processor(
             CaptureHiddenMode.NULL,
             with_aux=False,
-            aux_hidden_state_capture="dflash",
+            enable_return_aux_hidden_states=True,
+            speculative_algorithm="DFLASH",
             return_aux_hidden_state_layer_ids=[0, 1, 2],
         )
 
@@ -373,6 +384,11 @@ def test_last_hidden_only_under_full_aux_capture(capture_hidden_mode, with_aux):
     output, _, _ = _run_logits_processor(
         capture_hidden_mode,
         with_aux=with_aux,
-        aux_hidden_state_capture="eagle3",
+        enable_return_aux_hidden_states=True,
+        speculative_algorithm="EAGLE3",
     )
     assert output.last_hidden_states is None
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
