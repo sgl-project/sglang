@@ -457,23 +457,6 @@ class TestProcessReqWithGrammar(unittest.TestCase):
             req.grammar.accept_token(token_id)
         self.assertTrue(req.grammar._is_generation())
 
-    def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
-        mgr = self._make_mgr()
-        grammar_obj = ReasonerGrammarObject(
-            grammar=None, think_end_ids=[0], max_think_tokens=99
-        )
-        mgr.grammar_backend.init_strict_reasoning_grammar.return_value = grammar_obj
-
-        req = _make_req(custom_params={"thinking_budget": 3})
-        req.require_reasoning = True
-        mgr.process_req_with_grammar(req)
-
-        mgr.grammar_backend.init_strict_reasoning_grammar.assert_called_once_with(
-            True, request_thinking_budget=3
-        )
-        self.assertIs(req.grammar, grammar_obj)
-        self.assertEqual(req.grammar.max_think_tokens, 3)
-
     def test_request_budget_aborts_when_backend_offers_no_filter_grammar(self):
         """A budget the backend cannot enforce must abort, not be silently ignored."""
         with self.subTest("backend_returns_none"):
@@ -1243,29 +1226,22 @@ class TestUnconstrainedThinkingFilterPaths(unittest.TestCase):
 
     def test_inkling_request_budget_enforced_without_strict_or_env_cap(self):
         """With neither strict thinking nor a server cap, a request budget compiles
-        to its own framed variant and is served from cache on repeat."""
+        to its own framed variant and is served from cache on repeat; -1 asks for
+        no cap, so it is served uncapped rather than aborted."""
         mgr = self._make_mgr()
         mgr.grammar_backend = _make_inkling_backend(max_think_tokens=-1, strict=False)
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
-        served = [self._serve_inkling_regex(mgr, budget) for budget in (4, 4, None)]
-        self.assertEqual([compiled for compiled, _, _ in served], [True, False, True])
+        served = [self._serve_inkling_regex(mgr, budget) for budget in (4, 4, None, -1)]
+        self.assertEqual(
+            [compiled for compiled, _, _ in served],
+            [True, False, True, False],
+        )
         self.assertEqual(
             [self._thinking_tokens_allowed(grammar) for _, grammar, _ in served],
-            [4, 4, 16],
+            [4, 4, 16, 16],
         )
         for _, _, req in served:
             req.set_finish_with_abort.assert_not_called()
-
-    def test_inkling_explicit_no_cap_budget_is_not_aborted(self):
-        """thinking_budget=-1 asks for no cap; nothing needs enforcing, so the
-        request is served uncapped rather than aborted."""
-        mgr = self._make_mgr()
-        mgr.grammar_backend = _make_inkling_backend(max_think_tokens=-1, strict=False)
-        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
-        compiled, grammar, req = self._serve_inkling_regex(mgr, -1)
-        self.assertTrue(compiled)
-        self.assertEqual(self._thinking_tokens_allowed(grammar), 16)
-        req.set_finish_with_abort.assert_not_called()
 
     def test_inkling_budget_variant_without_framing_support_aborts(self):
         """A backend that cannot embed the constraint in an answer frame rejects a

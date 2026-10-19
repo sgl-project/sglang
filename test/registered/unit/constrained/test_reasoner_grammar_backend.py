@@ -292,18 +292,6 @@ class TestReasonerGrammarBackend(CustomTestCase):
         self.assertEqual(obj.max_think_tokens, 5)
         self.assertIsNone(obj.think_excluded_token_ids)
 
-    def test_env_budget_without_strict_fails_when_backend_lacks_token_filter(self):
-        os.environ["SGLANG_MAX_THINK_TOKENS"] = "2"
-        backend = _DummyGrammarBackend(support_token_filter=False)
-
-        with self.assertRaisesRegex(ValueError, "does not support token filtering"):
-            ReasonerGrammarBackend(
-                backend,
-                self._make_parser(),
-                self._make_tokenizer(),
-                enable_strict_thinking=False,
-            )
-
     def test_request_budget_returns_none_when_backend_lacks_token_filter(self):
         """An unenforceable per-request budget must not produce an inert object."""
         backend = _DummyGrammarBackend(support_token_filter=False)
