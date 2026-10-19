@@ -28,14 +28,14 @@ def reference_sigmoid_gate_mul(x, gate):
     ],
 )
 def test_sigmoid_gate_mul_correctness(shape, dtype):
-    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import sigmoid_gate_mul
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
     torch.manual_seed(42)
     x = torch.randn(shape, dtype=dtype, device=DEVICE)
     gate = torch.randn(shape, dtype=dtype, device=DEVICE)
 
     ref = reference_sigmoid_gate_mul(x, gate)
-    out = sigmoid_gate_mul(x, gate)
+    out = fused_sigmoid_mul(x, gate)
 
     rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
     atol = 2e-2 if dtype == torch.bfloat16 else 1e-3
@@ -44,7 +44,7 @@ def test_sigmoid_gate_mul_correctness(shape, dtype):
 
 @pytest.mark.parametrize("shape", [(4, 4096), (1, 128)])
 def test_sigmoid_gate_mul_does_not_modify_inputs(shape):
-    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import sigmoid_gate_mul
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
     torch.manual_seed(42)
     x = torch.randn(shape, dtype=torch.bfloat16, device=DEVICE)
@@ -52,28 +52,28 @@ def test_sigmoid_gate_mul_does_not_modify_inputs(shape):
     x_orig = x.clone()
     gate_orig = gate.clone()
 
-    sigmoid_gate_mul(x, gate)
+    fused_sigmoid_mul(x, gate)
 
     torch.testing.assert_close(x, x_orig, rtol=0, atol=0)
     torch.testing.assert_close(gate, gate_orig, rtol=0, atol=0)
 
 
 def test_sigmoid_gate_mul_output_dtype():
-    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import sigmoid_gate_mul
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
     for dtype in [torch.bfloat16, torch.float16, torch.float32]:
         x = torch.randn(4, 4096, dtype=dtype, device=DEVICE)
         gate = torch.randn(4, 4096, dtype=dtype, device=DEVICE)
-        out = sigmoid_gate_mul(x, gate)
+        out = fused_sigmoid_mul(x, gate)
         assert out.dtype == dtype, f"Expected {dtype}, got {out.dtype}"
 
 
 def test_sigmoid_gate_mul_contiguous_output():
-    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import sigmoid_gate_mul
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
     x = torch.randn(4, 4096, dtype=torch.bfloat16, device=DEVICE)
     gate = torch.randn(4, 4096, dtype=torch.bfloat16, device=DEVICE)
-    out = sigmoid_gate_mul(x, gate)
+    out = fused_sigmoid_mul(x, gate)
     assert out.is_contiguous()
 
 

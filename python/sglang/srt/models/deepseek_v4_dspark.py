@@ -929,9 +929,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import hc_combine
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            x = hc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
+            x = mhc_combine(x.flatten(1).float(), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:

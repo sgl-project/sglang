@@ -2007,7 +2007,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
-            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )

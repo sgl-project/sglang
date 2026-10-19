@@ -58,6 +58,7 @@ def _get_tactic(m: int, n: int, k: int):
     return tactic
 
 
+# Not fused_hc_mix: fixed split-K order vs its device-scope atomics, so the bits differ.
 def hc_mix(
     hyper_input_normed: torch.Tensor,
     w_down: torch.Tensor,

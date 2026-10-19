@@ -156,6 +156,7 @@ def _swiglu_oai_mxfp8_quant_kernel(
     )
 
 
+# Not swiglu_oai_mxfp8: no bf16 rounding before the quant, and plain [M, I // 32] scales.
 def swiglu_oai_mxfp8_quant(
     gate_up: torch.Tensor,
     alpha: float,

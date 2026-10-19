@@ -45,6 +45,7 @@ def covered(x: torch.Tensor, gate: torch.Tensor) -> bool:
     )
 
 
+# Not fused_sigmoid_mul: this rounds sigmoid(gate) to bf16 before the multiply.
 def kimi_k3_mla_output_gate(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """out = bf16(x * bf16(sigmoid(gate))); double rounding matches the
     unfused torch.sigmoid + mul pair bit-for-bit. Caller checks covered()."""

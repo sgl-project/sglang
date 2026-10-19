@@ -2,7 +2,7 @@
 
 Home for cross-cutting pointwise kernels that do not belong to a single
 functional group: the fused-pointwise Triton collection (``elementwise``:
-sigmoid-mul, gated-activation and fused-rmsnorm variants shared across models)
+sigmoid-mul variants shared across models)
 and the ``add_constant`` JIT reference kernel used by the developer guide.
 Individual functions register (or are imported) under the functional op id
 they logically belong to.
@@ -60,6 +60,20 @@ register_kernel(
         op="elementwise.row_sum",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.elementwise.row_sum:row_sum",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="elementwise.apply_log_scaling_tau",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.elementwise.row_scale:apply_log_scaling_tau",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="elementwise.kimi_k3_mla_output_gate",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.mla_output_gate:kimi_k3_mla_output_gate",
         capabilities=CUDA_ONLY,
     )
 )

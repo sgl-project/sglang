@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.mla_output_gate import (
+from sglang.kernels.ops.elementwise.mla_output_gate import (
     covered,
     kimi_k3_mla_output_gate,
 )

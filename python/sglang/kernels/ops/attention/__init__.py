@@ -245,12 +245,6 @@ for _mod, _fn, _backend, _device in [
     ),
     ("attn_res_hip", "attn_res_hip", KernelBackend.TRITON, CapabilityRequirement.HIP),
     (
-        "mla_output_gate",
-        "kimi_k3_mla_output_gate",
-        KernelBackend.JIT,
-        CapabilityRequirement.CUDA,
-    ),
-    (
         "kda_decode_mtp",
         "fused_kda_decode_mtp_dspark",
         KernelBackend.CUTE_DSL,

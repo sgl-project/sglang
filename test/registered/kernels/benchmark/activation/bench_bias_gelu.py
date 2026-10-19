@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.jit.benchmark import marker
-from sglang.kernels.ops.elementwise.bias_gelu import bias_gelu_tanh
+from sglang.kernels.ops.activation.bias_gelu import bias_gelu_tanh
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

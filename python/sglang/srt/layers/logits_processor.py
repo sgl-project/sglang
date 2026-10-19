@@ -30,9 +30,9 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.kernels.ops.activation.softcap import (
-    softcap_row_argmax,
     softcap_to_float32_logits,
 )
+from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs

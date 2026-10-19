@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
     can_use_silu_mul_mxfp8,
     swiglu_oai_mxfp8,
     swiglu_oai_mxfp8_deepgemm,
