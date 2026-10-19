@@ -684,6 +684,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             DeepseekV4AttnBackend,
             DSV4Metadata,
         )
+        from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+            DenseBlocksBackend,
+        )
 
         capture_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
@@ -695,6 +698,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         )
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        backend.prefill_candidates = object.__new__(DenseBlocksBackend)
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        backend.low_ratios = ()
         calls = []
 
         def fake_build_forward_metadata(
