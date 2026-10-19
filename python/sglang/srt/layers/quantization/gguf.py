@@ -18,6 +18,9 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+    moe_align_block_size,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -41,7 +44,7 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -53,7 +56,7 @@ if _is_cuda:
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -277,8 +280,9 @@ def fused_moe_gguf(
             1,
             num_tokens * top_k,
         )
+        valid_weights = topk_weights.masked_fill(topk_ids < 0, 0.0)
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
+            valid_weights.view(num_tokens, top_k, 1)
         )
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
         moe_sum(out, out_hidden_states)
@@ -293,8 +297,9 @@ def fused_moe_gguf(
         out = ggml_moe_a8_vec(
             out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
         )
+        valid_weights = topk_weights.masked_fill(topk_ids < 0, 0.0)
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
+            valid_weights.view(num_tokens, top_k, 1)
         )
         moe_sum(out, out_hidden_states)
     else:
@@ -305,8 +310,10 @@ def fused_moe_gguf(
         )
         for tok, (w, idx) in enumerate(zip(topk_weights, topk_ids)):
             inp = x[tok].reshape((1,) + x.shape[1:])
-            current_hidden_state = None
+            current_hidden_state = torch.zeros_like(inp)
             for ww, ii in zip(w, idx):
+                if ii < 0:
+                    continue
                 expert_up = w1[ii]
 
                 out = fused_mul_mat_gguf(inp, expert_up, qweight_type)
@@ -316,10 +323,7 @@ def fused_moe_gguf(
                 current_state = fused_mul_mat_gguf(
                     out, expert_down, qweight_type2
                 ).mul_(ww)
-                if current_hidden_state is None:
-                    current_hidden_state = current_state
-                else:
-                    current_hidden_state.add_(current_state)
+                current_hidden_state.add_(current_state)
             out_hidden_states[tok] = current_hidden_state
     return out_hidden_states
 
@@ -565,8 +569,6 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.fused_experts is None
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert self.moe_runner_config.activation == "silu", (

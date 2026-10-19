@@ -305,15 +305,15 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Marlin skips masked expert rows, so their shared cache must start at zero.
+    # Skipped routes need zero outputs in both disjoint projection views.
     intermediate_cache13 = torch.zeros(
-        (M * topk_ids.shape[1] * max(gemm1_n, K),),
+        (M * topk * (gemm1_n + K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
     intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
-    intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
+    intermediate_cache3 = intermediate_cache13[M * topk * gemm1_n :]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
@@ -380,9 +380,6 @@ def fused_marlin_moe(
         intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
-
-    if expert_map is not None:
-        intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
