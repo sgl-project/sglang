@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -140,8 +140,10 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-        is_dummy: bool = False,
+        is_dummy: Optional[bool] = None,
     ):
+        if is_dummy is None:
+            is_dummy = getattr(anchor_host, "_is_dummy", False) is True
         self._is_dummy = is_dummy
         self._destroyed = False
         self.decl = decl

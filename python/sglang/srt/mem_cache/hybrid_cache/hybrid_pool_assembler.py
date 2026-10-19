@@ -24,6 +24,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupContext,
+    maybe_create_mla_host_dedup_context,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
@@ -32,7 +36,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -165,6 +169,7 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    is_dummy: bool = False,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -206,6 +211,25 @@ def build_kv_host_pool(
                 else kv_pool.layer_num
             ),
         )
+        if is_dummy:
+            # Peer ranks keep the same allocation geometry without retaining
+            # target or packed draft device buffers in the host pool.
+            row_width = override_kv_cache_dim or (
+                host_input.kv_lora_rank + host_input.qk_rope_head_dim
+            )
+            draft_layer_num = len(mtp_draft_device_pools)
+            host_input = MLAHostAllocation(
+                dtype=host_input.dtype,
+                kv_lora_rank=host_input.kv_lora_rank,
+                qk_rope_head_dim=host_input.qk_rope_head_dim,
+                kv_cache_dim=row_width,
+                size_per_token=row_width
+                * host_input.dtype.itemsize
+                * (kwargs["target_layer_num"] + draft_layer_num),
+                draft_layer_num=draft_layer_num,
+                packed_fp8=host_input.packed_fp8,
+            )
+            kwargs["draft_buffer_infos"] = ()
     else:
         kwargs.update(mha_kwargs)
     parallel = get_parallel()
@@ -283,6 +307,7 @@ def build_kv_only_group(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    is_dummy: bool = False,
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_id_max = len(full_layer_mapping)
@@ -293,6 +318,7 @@ def build_kv_only_group(
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=is_dummy,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = with_packed_draft_layer_mapping(
@@ -526,6 +552,8 @@ def build_kv_only_stack(
     model_name: Optional[str] = None,
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
+    is_dummy: bool = False,
+    mla_dedup_context: Optional[MLAHostDedupContext] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = len(full_layer_mapping)
     host_pool_group = build_kv_only_group(
@@ -535,6 +563,7 @@ def build_kv_only_stack(
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=params.mtp_draft_device_pools,
+        is_dummy=is_dummy,
     )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -554,6 +583,7 @@ def build_kv_only_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup_context,
     )
     return host_pool_group, cache_controller
 
@@ -1514,6 +1544,7 @@ def build_hybrid_mamba_swa_stack(
 def build_host_pool_group(
     *,
     config: HostPoolGroupConfig,
+    is_dummy: bool = False,
 ) -> HostPoolGroup:
     """Allocate host pools and transfer entries from prepared configs."""
     root = config.pools[0]
@@ -1521,6 +1552,7 @@ def build_host_pool_group(
         kv_pool=root.decl.device_pool,
         page_size=config.transfer_page_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        is_dummy=is_dummy,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
@@ -2249,19 +2281,38 @@ class _PlainKvStrategy(StackStrategy):
 
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
-        full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
-        host_pool_group, cache_controller = build_kv_only_stack(
-            params=params,
-            kv_pool=full_kv_pool,
-            full_layer_mapping=full_layer_mapping,
-            load_cache_event=load_cache_event,
-            storage_backend=storage_backend,
-            use_mla=use_mla,
-            prefetch_threshold=prefetch_threshold,
-            model_name=model_name,
-            storage_backend_extra_config=storage_backend_extra_config,
-            enable_storage_metrics=enable_storage_metrics,
+        mla_dedup_context = maybe_create_mla_host_dedup_context(
+            kvcache,
+            params.tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            storage_backend,
+            getattr(get_memory(), "enable_mla_hicache_host_dedup", False),
+            pp_group=params.pp_cache_group,
         )
+        mla_is_dummy = (
+            mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
+        )
+        full_layer_mapping = {i: i for i in range(full_kv_pool.layer_num)}
+        try:
+            host_pool_group, cache_controller = build_kv_only_stack(
+                params=params,
+                kv_pool=full_kv_pool,
+                full_layer_mapping=full_layer_mapping,
+                load_cache_event=load_cache_event,
+                storage_backend=storage_backend,
+                use_mla=use_mla,
+                prefetch_threshold=prefetch_threshold,
+                model_name=model_name,
+                storage_backend_extra_config=storage_backend_extra_config,
+                enable_storage_metrics=enable_storage_metrics,
+                is_dummy=mla_is_dummy,
+                mla_dedup_context=mla_dedup_context,
+            )
+        except Exception:
+            if mla_dedup_context is not None:
+                mla_dedup_context.destroy()
+            raise
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
@@ -2310,27 +2361,47 @@ class _DsaStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
-        cache_controller = HybridCacheController(
-            params.token_to_kv_pool_allocator,
-            host_pool_group,
-            config.transfer_page_size,
+        mla_dedup_context = maybe_create_mla_host_dedup_context(
+            kvcache,
             params.tp_cache_group,
-            load_cache_event=load_cache_event,
-            attn_cp_group=params.attn_cp_cache_group,
-            attn_tp_group=params.attn_tp_cache_group,
+            params.attn_cp_cache_group,
+            params.attn_tp_cache_group,
+            storage_backend,
+            getattr(get_memory(), "enable_mla_hicache_host_dedup", False),
             pp_group=params.pp_cache_group,
-            write_policy=get_memory().hicache_write_policy,
-            io_backend=get_memory().hicache_io_backend,
-            storage_backend=storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=model_name,
-            storage_backend_extra_config=storage_backend_extra_config,
-            # The controller adds packed draft transfers after target layers.
-            transfer_layer_id_max=kvcache.layer_num,
-            enable_storage_metrics=enable_storage_metrics,
-            host_memory_mode=get_memory().hicache_host_memory_mode,
         )
+        mla_is_dummy = (
+            mla_dedup_context.is_dummy_rank if mla_dedup_context is not None else False
+        )
+        try:
+            host_pool_group = build_host_pool_group(
+                config=config, is_dummy=mla_is_dummy
+            )
+            cache_controller = HybridCacheController(
+                params.token_to_kv_pool_allocator,
+                host_pool_group,
+                config.transfer_page_size,
+                params.tp_cache_group,
+                load_cache_event=load_cache_event,
+                attn_cp_group=params.attn_cp_cache_group,
+                attn_tp_group=params.attn_tp_cache_group,
+                pp_group=params.pp_cache_group,
+                write_policy=get_memory().hicache_write_policy,
+                io_backend=get_memory().hicache_io_backend,
+                storage_backend=storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=model_name,
+                storage_backend_extra_config=storage_backend_extra_config,
+                # The controller adds packed draft transfers after target layers.
+                transfer_layer_id_max=kvcache.layer_num,
+                enable_storage_metrics=enable_storage_metrics,
+                host_memory_mode=get_memory().hicache_host_memory_mode,
+                mla_dedup_context=mla_dedup_context,
+            )
+        except Exception:
+            if mla_dedup_context is not None:
+                mla_dedup_context.destroy()
+            raise
         return StackBuildResult(
             host_pool_group=host_pool_group,
             cache_controller=cache_controller,
