@@ -3719,6 +3719,12 @@ class DeepseekV4AttnBackend(
                 inputs, self.forward_metadata.candidate_metadata
             )
             return
+        if indexer.uses_candidates or indexer.is_candidate_source:
+            # Inside the window every block is a candidate: the full top-k applies.
+            width = metadata.max_compressed_seq_len
+            assert (
+                width <= indexer.candidate_topk_blocks * indexer.candidate_block_size
+            ), f"prefill graph indexer width {width} exceeds the candidate window"
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
     def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
