@@ -602,7 +602,10 @@ class DeepseekSparseAttnBackend(
             # Keep original head count if it exceeds current padded variants.
             self.flashmla_kv_num_q_heads = self.num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
-        if self.dsa_kv_cache_store_nvfp4:
+        if self.dsa_kv_cache_store_nvfp4 and "flashmla_kv" in (
+            self.dsa_prefill_impl,
+            self.dsa_decode_impl,
+        ):
             _require_native_nvfp4_flashmla()
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Keep graph-captured buffers alive per stream.
@@ -2713,6 +2716,12 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
             )
         elif dsa_impl == "fa3":
+            if self.dsa_kv_cache_store_nvfp4:
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,

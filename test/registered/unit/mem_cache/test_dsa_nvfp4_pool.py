@@ -267,7 +267,8 @@ def test_prefill_consumes_bf16_but_keeps_persistent_cache_packed(
     assert torch.equal(captured["page_table_1"], topk)
 
 
-def test_server_hooks_select_sparse_prefill_and_nvfp4_decode(monkeypatch):
+@pytest.mark.parametrize("glm5_next", [False, True])
+def test_server_hooks_select_nvfp4_consumers(monkeypatch, glm5_next):
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_kv4_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
@@ -285,7 +286,11 @@ def test_server_hooks_select_sparse_prefill_and_nvfp4_decode(monkeypatch):
 
     args = ServerArgs(model_path="dummy", kv_cache_dtype="nvfp4", dtype="bfloat16")
     args._model_config = SimpleNamespace(
-        hf_config=_geometry(architectures=["GlmMoeDsaForCausalLM"]),
+        hf_config=(
+            _flash_geometry()
+            if glm5_next
+            else _geometry(architectures=["GlmMoeDsaForCausalLM"])
+        ),
         attention_arch=AttentionArch.MLA,
     )
     with override_platform(
@@ -301,7 +306,8 @@ def test_server_hooks_select_sparse_prefill_and_nvfp4_decode(monkeypatch):
         assert _dsa_kv_cache_dtype_default(ResolvedView(args)) == {}
         backends = _dsa_split_backend_resolution(ResolvedView(args))
         assert backends == dict(
-            dsa_prefill_backend="flashmla_sparse", dsa_decode_backend="flashmla_kv"
+            dsa_prefill_backend="fa3" if glm5_next else "flashmla_sparse",
+            dsa_decode_backend="fa3" if glm5_next else "flashmla_kv",
         )
         declare_resolution(args, "test_dsa", **backends)
         handle_nvfp4_prefill_kv_dequant_dtype(args)
@@ -339,3 +345,208 @@ def test_capacity_estimator_counts_packed_rows_once_and_only_full_indexers(pool)
     per_token = planner._compute_cell_size(kvc, num_layers=3)
     assert per_token == 3 * 416 + 2 * 132
     assert per_token * (pool.size + pool.page_size) + 3 * 4 == pool.get_kv_size_bytes()
+
+
+def _flash_geometry(**kwargs):
+    values = dict(
+        architectures=["Glm5NextForConditionalGeneration"],
+        qk_rope_head_dim=0,
+        index_kpool=4,
+        index_kpool_compress=True,
+        index_kpool_always_select_tail=True,
+    )
+    values.update(kwargs)
+    return _geometry(**values)
+
+
+def test_glm5_next_fa3_contract():
+    validate_dsa_nvfp4(
+        SimpleNamespace(dsa_prefill_backend="fa3", dsa_decode_backend="fa3"),
+        _flash_geometry(),
+        is_sm90=True,
+    )
+
+
+@pytest.mark.parametrize("field", ["dsa_prefill_backend", "dsa_decode_backend"])
+@pytest.mark.parametrize("backend", ["flashmla_sparse", "flashmla_kv", "tilelang"])
+def test_glm5_next_rejects_consumers_of_other_cache_layouts(field, backend):
+    with pytest.raises(ValueError, match="requires.*fa3"):
+        validate_dsa_nvfp4(
+            SimpleNamespace(**{field: backend}), _flash_geometry(), is_sm90=True
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"index_kpool": 1},
+        {"index_kpool_compress": False},
+        {"index_kpool_always_select_tail": False},
+        {"qk_rope_head_dim": 64},
+    ],
+)
+def test_glm5_next_rejects_unsupported_indexer_or_geometry(changes):
+    with pytest.raises(ValueError):
+        validate_dsa_nvfp4(SimpleNamespace(), _flash_geometry(**changes), is_sm90=True)
+
+
+@pytest.fixture
+def flash_pool():
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.runtime_context import publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="test")
+    try:
+        yield HybridLinearKVPool(
+            size=128,
+            page_size=64,
+            dtype=torch.float4_e2m1fn_x2,
+            head_num=1,
+            head_dim=512,
+            full_attention_layer_ids=[3, 7],
+            device="cpu",
+            mamba_pool=SimpleNamespace(),
+            use_mla=True,
+            use_dsa=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=0,
+            index_head_dim=128,
+            kv_cache_dim=288,
+            index_kpool=4,
+            index_kpool_compress=True,
+            max_running_requests=2,
+        )
+    finally:
+        reset_context()
+
+
+def test_hybrid_nvfp4_mapping_and_separate_indexer(flash_pool):
+    pool = flash_pool
+    assert pool.dsa_kv_cache_store_nvfp4
+    assert not pool.dsa_kv_cache_store_fp8
+    assert pool.kv_cache_dim == 288
+    assert pool.get_key_buffer(7).shape == (192, 1, 288)
+    pool.full_kv_pool.mla_kv_global_scale[1] = 0.5
+    assert pool.get_mla_kv_global_scale(7).item() == 0.5
+    layer = SimpleNamespace(layer_id=7)
+    loc = torch.tensor([63, 64, 127])
+    latent = torch.full((3, 1, 512), 3.0, dtype=torch.bfloat16)
+    pool.set_mla_kv_buffer(layer, loc, latent, None)
+    restored, rope = pool.get_mla_kv_buffer(layer, loc.flip(0))
+    assert layer.layer_id == 7
+    assert rope is None
+    assert torch.equal(restored, latent.flip(0))
+    assert not pool.get_key_buffer(3).any()
+    index = pool.get_index_k_with_scale_buffer(7)
+    assert index.dtype == torch.uint8 and index.shape == (3, 64 * 132)
+    assert not index.any()
+    for tail in pool.get_compress_tail_buffers(7):
+        assert tail.dtype == torch.bfloat16
+        assert not tail.any()
+    with pytest.raises(ValueError, match="not in full attention layers"):
+        pool.get_mla_kv_global_scale(0)
+
+
+@pytest.mark.parametrize("mode", ["extend", "decode"])
+@pytest.mark.parametrize("tail_tokens", [0, 1, 2, 3])
+def test_glm5_next_fa3_consumes_dequantized_rows_and_preserves_tail(
+    flash_pool, monkeypatch, mode, tail_tokens
+):
+    from sglang.srt.layers.attention import dsa_backend as module
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    backend = object.__new__(module.DeepseekSparseAttnBackend)
+    backend.token_to_kv_pool = flash_pool
+    backend.dsa_kv_cache_store_nvfp4 = True
+    backend.dsa_kv_cache_store_fp8 = False
+    backend.dsa_index_kpool = 4
+    backend.dsa_prefill_impl = backend.dsa_decode_impl = "fa3"
+    backend.use_mha = False
+    backend.use_fused_topk = True
+    backend.hisparse_coordinator = None
+    # Keep writer, hybrid layer mapping, backend dispatch and gather real;
+    # supply already-transformed physical indices and stub only attention.
+    backend._get_fused_topk_page_table = lambda indices: indices
+    backend._pad_topk_indices = lambda indices, rows: indices
+    n = 4 + tail_tokens
+    lengths = torch.tensor([n], dtype=torch.int32)
+    backend.forward_metadata = SimpleNamespace(
+        dsa_cache_seqlens_int32=lengths,
+        dsa_cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        dsa_cu_seqlens_k=torch.tensor([0, n], dtype=torch.int32),
+        dsa_max_seqlen_q=1,
+    )
+    layer = SimpleNamespace(
+        layer_id=7,
+        is_cross_attention=False,
+        tp_q_head_num=8,
+        head_dim=512,
+        v_head_dim=512,
+        scaling=256**-0.5,
+        logit_cap=0.0,
+    )
+    loc = torch.arange(61, 61 + n)
+    latent = torch.arange(1, n + 1).reshape(n, 1, 1).expand(n, 1, 512).bfloat16()
+    flash_pool.set_mla_kv_buffer(layer, loc[:-1], latent[:-1], None)
+    indices = torch.full((1, 2051), -1, dtype=torch.int32)
+    indices[0, :n] = loc.to(torch.int32)
+    captured = {}
+
+    def attention(**kwargs):
+        captured.update(kwargs)
+        return torch.zeros(1, 8, 512, dtype=torch.bfloat16)
+
+    backend._forward_fa3 = attention
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND if mode == "extend" else ForwardMode.DECODE,
+        out_cache_loc=loc[-1:],
+    )
+    forward = backend.forward_extend if mode == "extend" else backend.forward_decode
+    forward(
+        torch.zeros(1, 8, 512, dtype=torch.bfloat16),
+        latent[-1:],
+        latent[-1:],
+        layer,
+        batch,
+        k_rope=None,
+        topk_indices=indices,
+    )
+    restored, _ = flash_pool.get_mla_kv_buffer(layer, loc)
+    assert captured["kv_cache"].shape == (2051, 1, 512)
+    assert captured["kv_cache"].dtype == torch.bfloat16
+    assert torch.equal(captured["kv_cache"][:n], restored)
+    assert not captured["kv_cache"][n:].any()
+    assert torch.equal(
+        captured["page_table"][0, :n], torch.arange(n, dtype=torch.int32)
+    )
+    assert (captured["page_table"][0, n:] == -1).all()
+    assert torch.equal(captured["cache_seqlens"], lengths)
+    assert flash_pool.get_key_buffer(7).dtype == torch.uint8
+    assert not flash_pool.get_key_buffer(3).any()
+
+
+def test_flash_capacity_uses_dsa_layers_and_288_byte_rows(flash_pool):
+    from sglang.srt.mem_cache.kv_cache_configurator import calculate_mla_kv_cache_dim
+    from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+    hf = _flash_geometry(index_head_dim=128, indexer_types=["full"] * 8)
+    model = SimpleNamespace(hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=0)
+    kvc = SimpleNamespace(
+        model_config=model,
+        kv_cache_dtype=torch.float4_e2m1fn_x2,
+        use_mla_backend=True,
+        is_draft_worker=False,
+        server_args=SimpleNamespace(enable_hisparse=False),
+        mambaish_config=SimpleNamespace(full_attention_layer_ids=[3, 7]),
+        layer_info=SimpleNamespace(start_layer=0, end_layer=8),
+    )
+    assert (
+        calculate_mla_kv_cache_dim(
+            model_config=model, kv_cache_dtype=kvc.kv_cache_dtype
+        )
+        == 288
+    )
+    planner = object.__new__(DefaultPoolConfigurator)
+    assert planner._compute_cell_size(kvc, num_layers=2) == 2 * (288 + 132)

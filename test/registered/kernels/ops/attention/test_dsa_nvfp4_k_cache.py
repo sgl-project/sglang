@@ -7,6 +7,7 @@ from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     NVFP4_BLOCK_SIZE,
     NVFP4_BYTES_PER_TOKEN,
     NVFP4_LATENT_DIM,
+    NVFP4_NO_ROPE_BYTES_PER_TOKEN,
     NVFP4_PACKED_LATENT_BYTES,
     NVFP4_ROPE_BYTES,
     NVFP4_ROPE_DIM,
@@ -72,10 +73,69 @@ def test_dsa_nvfp4_layout_constants() -> None:
     assert NVFP4_SCALE_BYTES == 32
     assert NVFP4_ROPE_BYTES == 128
     assert NVFP4_BYTES_PER_TOKEN == 416
+    assert NVFP4_NO_ROPE_BYTES_PER_TOKEN == 288
     assert (
         NVFP4_PACKED_LATENT_BYTES + NVFP4_SCALE_BYTES + NVFP4_ROPE_BYTES
         == NVFP4_BYTES_PER_TOKEN
     )
+
+
+@pytest.mark.parametrize("empty_rope_tensor", [False, True])
+def test_no_rope_layout_preserves_latent_encoding_and_invalid_rows(empty_rope_tensor):
+    latent, rope = _exact_quant_inputs(3, torch.bfloat16, torch.device("cpu"))
+    loc = torch.tensor([3, 0, 5], dtype=torch.int32)
+    no_rope = latent[:, :0] if empty_rope_tensor else None
+    compact = torch.full((6, 1, 288), 0xA5, dtype=torch.uint8)
+    standard = torch.full((6, 1, 416), 0xA5, dtype=torch.uint8)
+    quantize_nvfp4_k_cache_into(latent, no_rope, compact, loc, 0.5)
+    quantize_nvfp4_k_cache_into(latent, rope, standard, loc, 0.5)
+    # Dropping RoPE changes neither E2M1 rounding nor any stored block scale.
+    assert torch.equal(compact, standard[..., :288])
+    assert (compact[1] == 0xA5).all()
+    indices = torch.tensor([5, -1, 0, 6, 3], dtype=torch.int32)
+    restored = dequantize_nvfp4_k_cache_paged(compact, indices, 0.5)
+    assert restored.shape == (5, 1, 512)
+    assert torch.equal(restored[[0, 2, 4], 0], latent[[2, 1, 0]])
+    assert not restored[[1, 3]].any()
+
+
+def test_codec_rejects_rope_layout_mismatch():
+    latent, rope = _exact_quant_inputs(1, torch.bfloat16, torch.device("cpu"))
+    loc = torch.tensor([0])
+    with pytest.raises(ValueError, match="RoPE tensor"):
+        quantize_nvfp4_k_cache_into(
+            latent, None, torch.zeros(1, 1, 416, dtype=torch.uint8), loc, 1.0
+        )
+    with pytest.raises(ValueError, match="k_rope"):
+        quantize_nvfp4_k_cache_into(
+            latent, rope, torch.zeros(1, 1, 288, dtype=torch.uint8), loc, 1.0
+        )
+
+
+@pytest.mark.skipif(not _cuda_nvfp4_available(), reason="requires CUDA SM90+")
+@pytest.mark.parametrize("num_tokens", [1, 65])
+def test_no_rope_cuda_scatter_and_graph_replay(num_tokens):
+    device = torch.device("cuda")
+    latent, _ = _exact_quant_inputs(num_tokens, torch.bfloat16, device)
+    loc = torch.arange(num_tokens, dtype=torch.int32, device=device) + 2
+    compact = torch.zeros(num_tokens + 4, 1, 288, dtype=torch.uint8, device=device)
+    scale = torch.tensor([0.5], device=device)
+    gather = torch.cat([loc.flip(0), loc.new_tensor([-1, num_tokens + 4])])
+    reference = torch.zeros_like(compact)
+    _quantize_nvfp4_k_cache_into_reference(latent, None, reference, loc, scale)
+    # Warm up compilation before capture; every replay must use the compact
+    # writer without touching a nonexistent RoPE field.
+    quantize_nvfp4_k_cache_into(latent, None, compact, loc, scale)
+    dequantize_nvfp4_k_cache_paged(compact, gather, scale)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        quantize_nvfp4_k_cache_into(latent, None, compact, loc, scale)
+        restored = dequantize_nvfp4_k_cache_paged(compact, gather, scale)
+    graph.replay()
+    assert torch.equal(compact, reference)
+    assert torch.equal(restored[:-2, 0], latent.flip(0))
+    assert not restored[-2:].any()
+    assert not compact[:2].any() and not compact[num_tokens + 2 :].any()
 
 
 def test_dsa_nvfp4_cpu_scatter_rne_and_minus_one_gather() -> None:

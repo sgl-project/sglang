@@ -1,10 +1,11 @@
 """NVFP4 codec for the mixed-format NSA key cache.
 
-Each token occupies one 416-byte row::
+Standard DSA tokens occupy a 416-byte row::
 
     [ E2M1 latent (256 B) | E4M3 scales (32 B) | BF16 RoPE (128 B) ]
 
-Only the 512-dimensional latent vector is quantized.  The 64-dimensional
+GLM5Next omits the RoPE tail, producing a 288-byte row. Only the
+512-dimensional latent vector is quantized. When present, the 64-dimensional
 RoPE vector stays in bfloat16, matching the existing NSA FP8 cache policy.
 The CUDA path uses Triton and scatters directly into the destination cache;
 the PyTorch implementations are kept as executable references and CPU
@@ -27,6 +28,7 @@ NVFP4_PACKED_LATENT_BYTES = 256
 NVFP4_SCALE_BYTES = 32
 NVFP4_ROPE_BYTES = 128
 NVFP4_BYTES_PER_TOKEN = 416
+NVFP4_NO_ROPE_BYTES_PER_TOKEN = NVFP4_PACKED_LATENT_BYTES + NVFP4_SCALE_BYTES
 
 _E2M1_MAX = 6.0
 _E4M3_MAX = 448.0
@@ -73,14 +75,21 @@ def _as_feature_matrix(x: torch.Tensor, dim: int, name: str) -> torch.Tensor:
 def _as_cache_rows(kv_buffer: torch.Tensor) -> torch.Tensor:
     if kv_buffer.dtype != torch.uint8:
         raise TypeError(f"kv_buffer must be uint8, got {kv_buffer.dtype}")
-    if kv_buffer.ndim < 2 or kv_buffer.shape[-1] != NVFP4_BYTES_PER_TOKEN:
+    if kv_buffer.ndim < 2 or kv_buffer.shape[-1] not in (
+        NVFP4_NO_ROPE_BYTES_PER_TOKEN,
+        NVFP4_BYTES_PER_TOKEN,
+    ):
         raise ValueError(
-            "kv_buffer must have shape [..., "
-            f"{NVFP4_BYTES_PER_TOKEN}], got {tuple(kv_buffer.shape)}"
+            "kv_buffer must have shape [..., 288] or [..., 416], "
+            f"got {tuple(kv_buffer.shape)}"
         )
     if not kv_buffer.is_contiguous():
         raise ValueError("kv_buffer must be contiguous")
-    return kv_buffer.view(-1, NVFP4_BYTES_PER_TOKEN)
+    return kv_buffer.view(-1, kv_buffer.shape[-1])
+
+
+def _rope_dim(rows: torch.Tensor) -> int:
+    return (rows.shape[-1] - NVFP4_NO_ROPE_BYTES_PER_TOKEN) // 2
 
 
 def _as_global_scale(
@@ -113,13 +122,22 @@ def _as_global_scale(
 
 def _validate_common_quant_inputs(
     k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_rope: torch.Tensor | None,
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     k_nope = _as_feature_matrix(k_nope, NVFP4_LATENT_DIM, "k_nope")
-    k_rope = _as_feature_matrix(k_rope, NVFP4_ROPE_DIM, "k_rope")
     rows = _as_cache_rows(kv_buffer)
+    rope_dim = _rope_dim(rows)
+    if k_rope is None:
+        if rope_dim:
+            raise ValueError(
+                "The 416-byte NVFP4 layout requires a 64-dimensional RoPE tensor"
+            )
+        # An empty view is allocation-free and keeps the Triton pointer on the
+        # same device. The ROPE_DIM=0 specialization never dereferences it.
+        k_rope = k_nope[:, :0]
+    k_rope = _as_feature_matrix(k_rope, rope_dim, "k_rope")
     loc = loc.reshape(-1)
 
     if k_nope.shape[0] != k_rope.shape[0] or k_nope.shape[0] != loc.numel():
@@ -191,7 +209,7 @@ def _decode_e2m1_torch(code: torch.Tensor) -> torch.Tensor:
 
 def _quantize_nvfp4_k_cache_into_reference(
     k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_rope: torch.Tensor | None,
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     global_scale: torch.Tensor | Real,
@@ -216,7 +234,6 @@ def _quantize_nvfp4_k_cache_into_reference(
     denominator = rounded_scale.unsqueeze(-1) * g
     codes = _e2m1_rne_scaled_torch(blocks, denominator).reshape(-1, NVFP4_LATENT_DIM)
     packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
-    rope_bytes = k_rope.to(torch.bfloat16).contiguous().view(torch.uint8)
 
     valid = (loc >= 0) & (loc < rows.shape[0])
     if not bool(valid.any()):
@@ -227,7 +244,9 @@ def _quantize_nvfp4_k_cache_into_reference(
         dst,
         NVFP4_PACKED_LATENT_BYTES : NVFP4_PACKED_LATENT_BYTES + NVFP4_SCALE_BYTES,
     ] = scale_fp8[valid].contiguous().view(torch.uint8)
-    rows[dst, -NVFP4_ROPE_BYTES:] = rope_bytes[valid]
+    if _rope_dim(rows):
+        rope_bytes = k_rope.to(torch.bfloat16).contiguous().view(torch.uint8)
+        rows[dst, NVFP4_NO_ROPE_BYTES_PER_TOKEN:] = rope_bytes[valid]
 
 
 def _dequantize_nvfp4_k_cache_paged_reference(
@@ -250,8 +269,9 @@ def _dequantize_nvfp4_k_cache_paged_reference(
         raise ValueError("page_indices and kv_buffer must be on one device")
 
     num_tokens = page_indices.numel()
+    rope_dim = _rope_dim(rows)
     output = torch.zeros(
-        (num_tokens, 1, NVFP4_LATENT_DIM + NVFP4_ROPE_DIM),
+        (num_tokens, 1, NVFP4_LATENT_DIM + rope_dim),
         dtype=dtype,
         device=rows.device,
     )
@@ -285,14 +305,15 @@ def _dequantize_nvfp4_k_cache_paged_reference(
         * scales.unsqueeze(-1)
         * g
     ).reshape(-1, NVFP4_LATENT_DIM)
-    rope = (
-        selected[:, -NVFP4_ROPE_BYTES:]
-        .contiguous()
-        .view(torch.bfloat16)
-        .reshape(-1, NVFP4_ROPE_DIM)
-    )
     output[valid, 0, :NVFP4_LATENT_DIM] = latent.to(dtype)
-    output[valid, 0, NVFP4_LATENT_DIM:] = rope.to(dtype)
+    if rope_dim:
+        rope = (
+            selected[:, NVFP4_NO_ROPE_BYTES_PER_TOKEN:]
+            .contiguous()
+            .view(torch.bfloat16)
+            .reshape(-1, rope_dim)
+        )
+        output[valid, 0, NVFP4_LATENT_DIM:] = rope.to(dtype)
     return output
 
 
@@ -364,6 +385,7 @@ def _quantize_nvfp4_k_cache_into_kernel(
     rope_stride_0: tl.constexpr,
     NUM_LATENT_BLOCKS: tl.constexpr,
     BLOCKS_PER_PROGRAM: tl.constexpr,
+    ROPE_DIM: tl.constexpr = 64,
 ):
     token_id = tl.program_id(0)
     part_id = tl.program_id(1)
@@ -408,19 +430,20 @@ def _quantize_nvfp4_k_cache_into_kernel(
         mask=valid_dst & valid_block,
     )
 
-    num_parts = tl.cdiv(NUM_LATENT_BLOCKS, BLOCKS_PER_PROGRAM)
-    if part_id == num_parts - 1:
-        rope_offsets = tl.arange(0, 64)
-        rope = tl.load(
-            k_rope_ptr + token_id * k_rope_stride_0 + rope_offsets,
-            mask=valid_dst,
-            other=0.0,
-        )
-        tl.store(
-            rope_ptr + safe_dst_row * rope_stride_0 + rope_offsets,
-            rope,
-            mask=valid_dst,
-        )
+    if ROPE_DIM:
+        num_parts = tl.cdiv(NUM_LATENT_BLOCKS, BLOCKS_PER_PROGRAM)
+        if part_id == num_parts - 1:
+            rope_offsets = tl.arange(0, ROPE_DIM)
+            rope = tl.load(
+                k_rope_ptr + token_id * k_rope_stride_0 + rope_offsets,
+                mask=valid_dst,
+                other=0.0,
+            )
+            tl.store(
+                rope_ptr + safe_dst_row * rope_stride_0 + rope_offsets,
+                rope,
+                mask=valid_dst,
+            )
 
 
 @triton.jit
@@ -438,6 +461,7 @@ def _dequantize_nvfp4_k_cache_paged_kernel(
     output_stride_0: tl.constexpr,
     NUM_LATENT_BLOCKS: tl.constexpr,
     LATENT_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr = 64,
 ):
     token_id = tl.program_id(0)
     src_row = tl.load(page_indices_ptr + token_id).to(tl.int64)
@@ -477,26 +501,29 @@ def _dequantize_nvfp4_k_cache_paged_kernel(
         mask=latent_offsets < LATENT_DIM,
     )
 
-    rope_offsets = tl.arange(0, 64)
-    rope = tl.load(
-        rope_ptr + src_row * rope_stride_0 + rope_offsets,
-        mask=valid_src,
-        other=0.0,
-    )
-    tl.store(
-        output_ptr + token_id * output_stride_0 + LATENT_DIM + rope_offsets,
-        rope,
-    )
+    if ROPE_DIM:
+        rope_offsets = tl.arange(0, ROPE_DIM)
+        rope = tl.load(
+            rope_ptr + src_row * rope_stride_0 + rope_offsets,
+            mask=valid_src,
+            other=0.0,
+        )
+        tl.store(
+            output_ptr + token_id * output_stride_0 + LATENT_DIM + rope_offsets,
+            rope,
+        )
 
 
 def quantize_nvfp4_k_cache_into(
     k_nope: torch.Tensor,
-    k_rope: torch.Tensor,
+    k_rope: torch.Tensor | None,
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     global_scale: torch.Tensor | Real,
 ) -> None:
-    """Quantize and scatter NSA keys directly into a mixed NVFP4 cache.
+    """Quantize and scatter NSA keys into a 288- or 416-byte NVFP4 cache.
+
+    The 288-byte layout accepts either None or an empty tensor for k_rope.
 
     ``loc`` contains flattened token-row indices. Entries outside the cache
     capacity are ignored, which is useful for padded graph batches. Duplicate
@@ -522,7 +549,7 @@ def quantize_nvfp4_k_cache_into(
         :,
         NVFP4_PACKED_LATENT_BYTES : NVFP4_PACKED_LATENT_BYTES + NVFP4_SCALE_BYTES,
     ].view(torch.float8_e4m3fn)
-    rope_rows = rows[:, -NVFP4_ROPE_BYTES:].view(torch.bfloat16)
+    rope_rows = rows[:, NVFP4_NO_ROPE_BYTES_PER_TOKEN:].view(torch.bfloat16)
     blocks_per_program, num_warps = _quantize_nvfp4_launch_config(loc.numel())
     num_parts = triton.cdiv(_NUM_LATENT_BLOCKS, blocks_per_program)
     _quantize_nvfp4_k_cache_into_kernel[(loc.numel(), num_parts)](
@@ -541,6 +568,7 @@ def quantize_nvfp4_k_cache_into(
         rope_rows.stride(0),
         NUM_LATENT_BLOCKS=_NUM_LATENT_BLOCKS,
         BLOCKS_PER_PROGRAM=blocks_per_program,
+        ROPE_DIM=_rope_dim(rows),
         num_warps=num_warps,
     )
 
@@ -553,7 +581,8 @@ def dequantize_nvfp4_k_cache_paged(
 ) -> torch.Tensor:
     """Gather and dequantize selected NSA cache rows.
 
-    The output has shape ``[page_indices.numel(), 1, 576]``. An index outside
+    The output has shape ``[page_indices.numel(), 1, 512 + rope_dim]``, with
+    rope_dim inferred from the physical row width (0 or 64). An index outside
     ``[0, cache_capacity)`` produces one all-zero row and never dereferences
     the cache. A tensor ``global_scale`` follows the same finite-positive
     invariant as the quantization entry point.
@@ -577,8 +606,9 @@ def dequantize_nvfp4_k_cache_paged(
         )
 
     global_scale_tensor = _as_global_scale(global_scale, rows.device)
+    rope_dim = _rope_dim(rows)
     output = torch.empty(
-        (page_indices.numel(), 1, NVFP4_LATENT_DIM + NVFP4_ROPE_DIM),
+        (page_indices.numel(), 1, NVFP4_LATENT_DIM + rope_dim),
         dtype=dtype,
         device=rows.device,
     )
@@ -590,8 +620,8 @@ def dequantize_nvfp4_k_cache_paged(
         :,
         NVFP4_PACKED_LATENT_BYTES : NVFP4_PACKED_LATENT_BYTES + NVFP4_SCALE_BYTES,
     ].view(torch.float8_e4m3fn)
-    rope_rows = rows[:, -NVFP4_ROPE_BYTES:].view(torch.bfloat16)
-    output_2d = output.view(-1, NVFP4_LATENT_DIM + NVFP4_ROPE_DIM)
+    rope_rows = rows[:, NVFP4_NO_ROPE_BYTES_PER_TOKEN:].view(torch.bfloat16)
+    output_2d = output.view(-1, NVFP4_LATENT_DIM + rope_dim)
     _dequantize_nvfp4_k_cache_paged_kernel[(page_indices.numel(),)](
         packed_rows,
         scale_rows,
@@ -606,6 +636,7 @@ def dequantize_nvfp4_k_cache_paged(
         output_2d.stride(0),
         NUM_LATENT_BLOCKS=_NUM_LATENT_BLOCKS,
         LATENT_DIM=NVFP4_LATENT_DIM,
+        ROPE_DIM=rope_dim,
         num_warps=4,
     )
     return output
@@ -619,6 +650,7 @@ __all__ = [
     "NVFP4_SCALE_BYTES",
     "NVFP4_ROPE_BYTES",
     "NVFP4_BYTES_PER_TOKEN",
+    "NVFP4_NO_ROPE_BYTES_PER_TOKEN",
     "quantize_nvfp4_k_cache_into",
     "dequantize_nvfp4_k_cache_paged",
 ]

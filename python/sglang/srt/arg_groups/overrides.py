@@ -708,10 +708,18 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return declared
 
     if kv_cache_dtype == "nvfp4":
+        from sglang.srt.layers.attention.dsa.nvfp4_config import is_glm5_next_nvfp4
+
+        # GLM5Next has no RoPE and uses KPool. Its initial NVFP4 consumer
+        # materializes selected BF16 rows for FA3, rather than the 576-dim
+        # native FlashMLA specialization used by standard GLM DSA models.
+        is_glm5_next = is_glm5_next_nvfp4(hf_config)
         if not user_set_prefill:
-            declared["dsa_prefill_backend"] = "flashmla_sparse"
+            declared["dsa_prefill_backend"] = (
+                "fa3" if is_glm5_next else "flashmla_sparse"
+            )
         if not user_set_decode:
-            declared["dsa_decode_backend"] = "flashmla_kv"
+            declared["dsa_decode_backend"] = "fa3" if is_glm5_next else "flashmla_kv"
     elif get_platform().is_hip:
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "triton"

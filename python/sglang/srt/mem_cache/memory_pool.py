@@ -4390,6 +4390,16 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
 
     @property
+    def dsa_kv_cache_store_nvfp4(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_nvfp4", False)
+
+    def get_mla_kv_global_scale(self, layer_id: int) -> torch.Tensor:
+        self._wait_for_layer(layer_id)
+        return self.full_kv_pool.get_mla_kv_global_scale(
+            self._transfer_full_attention_id(layer_id)
+        )
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
@@ -4799,8 +4809,9 @@ class MLATokenToKVPool(KVCache):
             torch, "float4_e2m1fn_x2", None
         )
         if self.dsa_kv_cache_store_nvfp4:
-            if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
-                raise ValueError("DSA NVFP4 requires latent/RoPE dimensions (512, 64)")
+            from sglang.srt.layers.attention.dsa.nvfp4_config import dsa_nvfp4_cache_dim
+
+            expected_nvfp4_dim = dsa_nvfp4_cache_dim(kv_lora_rank, qk_rope_head_dim)
             self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
@@ -4816,8 +4827,10 @@ class MLATokenToKVPool(KVCache):
         self.kv_scale_buffer = None
 
         if self.dsa_kv_cache_store_nvfp4:
-            if self.kv_cache_dim != 416:
-                raise ValueError("DSA NVFP4 requires 416-byte cache rows")
+            if self.kv_cache_dim != expected_nvfp4_dim:
+                raise ValueError(
+                    f"DSA NVFP4 requires {expected_nvfp4_dim}-byte cache rows"
+                )
             # Fixed per-layer outer scale; block scales are computed on each write.
             # Keep this outside discardable cache memory and stable during graph replay.
             self.mla_kv_global_scale = torch.ones(
@@ -5121,7 +5134,9 @@ class MLATokenToKVPool(KVCache):
                 self.get_mla_kv_global_scale(layer_id),
                 dtype=dst_dtype or torch.bfloat16,
             )
-            return restored[..., :512], restored[..., 512:]
+            return restored[..., :512], (
+                restored[..., 512:] if self.qk_rope_head_dim else None
+            )
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
