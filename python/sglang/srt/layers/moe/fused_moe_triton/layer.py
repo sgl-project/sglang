@@ -24,6 +24,7 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
+    get_ascend_ops_config,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -36,6 +37,7 @@ from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.ascend_ops import AscendOpsDispatcher
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
@@ -164,7 +166,9 @@ def create_moe_dispatcher(
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
+    if a2a_backend.is_ascend_ops():
+        return AscendOpsDispatcher(moe_runner_config, get_ascend_ops_config())
+    elif a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
