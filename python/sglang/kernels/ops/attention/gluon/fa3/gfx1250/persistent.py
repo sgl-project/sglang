@@ -6,9 +6,7 @@
 """Persistent short-KV BF16/D128 attention specialization for AMD gfx1250.
 
 The kernel caches up to 512 K/V tokens in LDS and balances multiple query
-tiles across persistent workgroups. It is derived from Triton's CDNA5
-FlashAttention example:
-https://github.com/triton-lang/triton/blob/b63e34c521dfc55a5f9e419cfeaa64df8263891f/third_party/amd/python/examples/gluon/f16_fa_cdna5.py
+tiles across persistent workgroups.
 """
 
 from __future__ import annotations
@@ -19,8 +17,8 @@ import torch
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
-from sglang.kernels.ops.attention.gluon_fav3_gfx1250 import _AttentionConfig
-from sglang.kernels.ops.attention.gluon_fav3_gfx1250_policy import (
+from sglang.kernels.ops.attention.gluon.fa3.gfx1250.config import _AttentionConfig
+from sglang.kernels.ops.attention.gluon.fa3.gfx1250.policy import (
     _get_persistent_query_groups,
     get_num_cus,
 )
@@ -972,7 +970,7 @@ def _persistent_short_kv_kernel(
     output_shared._keep_alive()
 
 
-def gluon_fav3_persistent_attention(
+def persistent_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -1062,4 +1060,4 @@ def gluon_fav3_persistent_attention(
     return output
 
 
-__all__ = ["gluon_fav3_persistent_attention"]
+__all__ = ["persistent_attention"]

@@ -29,11 +29,6 @@ dimensions 64, 128, and 256. BF16/D128 retains the specialized guarded and
 persistent schedules. Unsupported contracts are handled by the diffusion backend
 before this module is imported.
 
-This is adapted from Triton's ``f16_fa_cdna5.py`` example:
-https://github.com/triton-lang/triton/blob/b63e34c521dfc55a5f9e419cfeaa64df8263891f/third_party/amd/python/examples/gluon/f16_fa_cdna5.py
-
-It carries the gfx1250 launch, scheduler, softmax-stage, and TDM-output tuning
-validated by the TokenSpeed/Triton optimization work.
 """
 
 from __future__ import annotations
@@ -44,18 +39,19 @@ import torch
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 
-from sglang.kernels.ops.attention.gluon_fav3_gfx1250_policy import (
-    FAv3Guard,
-    FAv3LaunchConfig,
-    FAv3NumericalMode,
-    resolve_fav3_execution_policy,
-    select_fav3_launch_config,
+from sglang.kernels.ops.attention.gluon.fa3.gfx1250.config import _AttentionConfig
+from sglang.kernels.ops.attention.gluon.fa3.gfx1250.policy import (
+    GuardFlag,
+    LaunchConfig,
+    NumericalMode,
+    resolve_execution_policy,
+    select_launch_config,
 )
 
 # Keep flag values usable by both host tests and Gluon without reading GPU data
 # on the host. NORM_UNSAFE covers Q/K norms and the V product/sum bounds.
-_NORM_UNSAFE = gl.constexpr(FAv3Guard.NORM_UNSAFE.value)
-_FUSED_EXP_UNSAFE = gl.constexpr(FAv3Guard.FUSED_EXP_UNSAFE.value)
+_NORM_UNSAFE = gl.constexpr(GuardFlag.NORM_UNSAFE.value)
+_FUSED_EXP_UNSAFE = gl.constexpr(GuardFlag.FUSED_EXP_UNSAFE.value)
 _ROUTE_NORM = gl.constexpr(0)
 _ROUTE_FUSED_EXP = gl.constexpr(1)
 _ROUTE_STABLE = gl.constexpr(2)
@@ -93,94 +89,6 @@ def _round_norm_probabilities(probabilities):
         is_pure=True,
         pack=8,
     )
-
-
-@gluon.aggregate
-class _AttentionConfig:
-    SEQLEN_Q: gl.constexpr
-    SEQLEN_K: gl.constexpr
-    HEAD_SIZE: gl.constexpr
-    BLOCK_M: gl.constexpr
-    BLOCK_N: gl.constexpr
-    NUM_BUFFERS: gl.constexpr
-    FAST_EXP: gl.constexpr
-    NORM_EXP: gl.constexpr
-    FULL_TDM_WAIT: gl.constexpr
-    query_axis: gl.constexpr
-
-    qk_layout: gl.constexpr
-    pv_layout: gl.constexpr
-    k_smem_layout: gl.constexpr
-    v_smem_layout: gl.constexpr
-    q_layout: gl.constexpr
-    k_layout: gl.constexpr
-    v_layout: gl.constexpr
-    p_layout: gl.constexpr
-
-    @gluon.constexpr_function
-    def __init__(
-        self,
-        seqlen_q,
-        seqlen_k,
-        head_size,
-        block_m,
-        block_n,
-        num_buffers,
-        num_warps,
-        fast_exp=False,
-        norm_exp=False,
-        full_tdm_wait=False,
-    ):
-        self.SEQLEN_Q = gl.constexpr(seqlen_q)
-        self.SEQLEN_K = gl.constexpr(seqlen_k)
-        self.HEAD_SIZE = gl.constexpr(head_size)
-        self.BLOCK_M = gl.constexpr(block_m)
-        self.BLOCK_N = gl.constexpr(block_n)
-        self.NUM_BUFFERS = gl.constexpr(num_buffers)
-        self.FAST_EXP = gl.constexpr(fast_exp)
-        self.NORM_EXP = gl.constexpr(norm_exp)
-        self.FULL_TDM_WAIT = gl.constexpr(full_tdm_wait)
-        # Keep nearby long-sequence query tiles on the same head to improve
-        # K/V cache reuse across workgroups.
-        self.query_axis = gl.constexpr(
-            0 if block_m == 256 and seqlen_k >= 16_384 else 2
-        )
-
-        assert num_warps == 4 or num_warps == 8
-        warp_bases = [[1, 0], [2, 0]]
-        if num_warps == 8:
-            warp_bases.append([4, 0])
-
-        self.qk_layout = gl.constexpr(
-            gl.amd.AMDWMMALayout(
-                3,
-                transposed=True,
-                warp_bases=warp_bases,
-                instr_shape=[16, 16, 32],
-            )
-        )
-        self.pv_layout = gl.constexpr(
-            gl.amd.AMDWMMALayout(
-                3,
-                transposed=True,
-                warp_bases=warp_bases,
-                instr_shape=[16, 16, 32],
-            )
-        )
-        self.k_smem_layout = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[head_size, 8]], [block_n, head_size], [1, 0]
-            )
-        )
-        self.v_smem_layout = gl.constexpr(
-            gl.PaddedSharedLayout.with_identity_for(
-                [[head_size, 16]], [block_n, head_size], [1, 0]
-            )
-        )
-        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, self.qk_layout, 8))
-        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, self.qk_layout, 8))
-        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, 8))
-        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, 8))
 
 
 @gluon.aggregate
@@ -1250,13 +1158,13 @@ def _launch_norm_guarded_attention(query, key, value, output, invalid, softmax_s
         )
 
 
-def gluon_fav3_attention(
+def flash_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     *,
     softmax_scale: float | None = None,
-    launch_config: FAv3LaunchConfig | None = None,
+    launch_config: LaunchConfig | None = None,
 ) -> torch.Tensor:
     """Run non-causal BF16/FP16 MHA on gfx1250.
 
@@ -1300,19 +1208,17 @@ def gluon_fav3_attention(
             f"Gluon FAv3 requires gfx1250, found {arch or 'unknown GPU'}"
         )
 
-    policy = resolve_fav3_execution_policy(
+    policy = resolve_execution_policy(
         query, key, value, softmax_scale=softmax_scale, launch_config=launch_config
     )
     config = policy.launch_config
     softmax_scale = policy.softmax_scale
     if config.schedule == "persistent":
-        from sglang.kernels.ops.attention.gluon_fav3_persistent_gfx1250 import (
-            gluon_fav3_persistent_attention,
+        from sglang.kernels.ops.attention.gluon.fa3.gfx1250.persistent import (
+            persistent_attention,
         )
 
-        return gluon_fav3_persistent_attention(
-            query, key, value, softmax_scale=softmax_scale
-        )
+        return persistent_attention(query, key, value, softmax_scale=softmax_scale)
     kernel = (
         _attention_forward_pingpong
         if config.schedule == "pingpong"
@@ -1334,7 +1240,7 @@ def gluon_fav3_attention(
         else (batch, num_heads, query_tiles)
     )
     with torch.cuda.device(query.device):
-        if policy.numerical_mode == FAv3NumericalMode.GUARDED:
+        if policy.numerical_mode == NumericalMode.GUARDED:
             invalid = torch.empty((), dtype=torch.int32, device=query.device)
             _launch_norm_guarded_attention(
                 query, key, value, output, invalid, softmax_scale
@@ -1379,8 +1285,8 @@ def gluon_fav3_attention(
 
 
 __all__ = [
-    "FAv3LaunchConfig",
-    "gluon_fav3_attention",
-    "resolve_fav3_execution_policy",
-    "select_fav3_launch_config",
+    "LaunchConfig",
+    "flash_attention",
+    "resolve_execution_policy",
+    "select_launch_config",
 ]
