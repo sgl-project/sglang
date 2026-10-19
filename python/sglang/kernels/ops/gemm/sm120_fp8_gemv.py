@@ -50,9 +50,8 @@ def _jit_sm120_fp8_gemv_module(n: int, k: int) -> Module:
 
 
 def use_sm120_fp8_gemv(m: int, n: int, k: int) -> bool:
-    # kUnroll == 1 streams 16B per lane-step with an in-loop k < K guard, so
-    # K only needs 16B alignment; keep 128 for conservative vector alignment
-    # (covers the K=5376 shared-expert down_proj).
+    # kUnroll==1 guards k < K in-loop, so K needs only 16B alignment;
+    # 128 keeps margin and still admits K=5376.
     return (
         m == 1
         and k % 128 == 0

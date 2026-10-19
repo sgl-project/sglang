@@ -57,11 +57,8 @@ def _jit_hopper_bf16_gemv_module(n: int, k: int) -> Module:
 
 def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
     if _is_sm12x():
-        # SM120 (GDDR7): kUnroll==1 needs only 16B-aligned K (128 kept for
-        # vector-alignment margin). cuBLAS M=1 bf16 trails the streaming GEMV
-        # on small/odd N and very wide N; the 12288..32768 window (e.g. the
-        # 18560-row bf16 in_proj) already runs at the DRAM ceiling under
-        # cuBLAS, so leave it there.
+        # SM12x: kUnroll==1 needs only 16B-aligned K (128 for margin);
+        # 12288 <= N < 32768 stays on cuBLAS, which already saturates DRAM there.
         if not (
             m == 1
             and k % 128 == 0

@@ -37,10 +37,8 @@ class Nvfp4LayoutCycle:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("NVFP4 workspace must be prepared before graph capture")
-        # Use runtime workspace headroom, like graph/kernel scratch allocations.
-        # Allocating this before Mamba/KV pool sizing incorrectly charges it as
-        # persistent checkpoint storage and can round the state pool below one
-        # request. The normal graph warmup prepares stable pointers before use.
+        # Allocate from runtime headroom, not before Mamba/KV pool sizing, where it
+        # would count as weights and could leave the state pool under one request.
         self.scratch = torch.empty_like(self.original[0])
         self.pair = tuple(
             weight.view(512, 1344, 1024)
