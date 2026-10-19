@@ -723,15 +723,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             if placed:
                 # Pinned copies and a device gather: a list index or a pageable
                 # copy here would wait for the whole target forward.
+                placed_rows = async_h2d(placed, dtype=torch.int64, device=device)
+                valid_from = async_h2d(
+                    [batch.prefix_lens[i] for i in placed],
+                    dtype=torch.int64,
+                    device=device,
+                )
                 draft_pool.set_swa_valid_from(
-                    batch.req_pool_indices.index_select(
-                        0, async_h2d(placed, dtype=torch.int64, device=device)
-                    ),
-                    async_h2d(
-                        [batch.prefix_lens[i] for i in placed],
-                        dtype=torch.int64,
-                        device=device,
-                    ),
+                    batch.req_pool_indices.index_select(0, placed_rows), valid_from
                 )
         # The draft KV goes to the slots the target prefill just wrote.
         cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
