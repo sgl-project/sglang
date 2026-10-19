@@ -186,6 +186,16 @@ class SRTPlatform(DeviceMixin):
         """Return a platform implementation for speculative KV-cache locations."""
         return None
 
+    def get_speculative_worker_cls(self, algorithm: str) -> Optional[type]:
+        """Return a worker class replacing the built-in one, or None to keep it.
+
+        Consulted for every speculative algorithm on out-of-tree platforms. The
+        class is constructed with the built-in worker's keyword arguments, must
+        expose the same scheduler-facing interface, and must reject flags it
+        cannot serve (for example multi-layer EAGLE).
+        """
+        return None
+
     def get_quantization_config(
         self, quantization: str
     ) -> Optional[Type[QuantizationConfig]]:

@@ -611,6 +611,11 @@ field defaults to the conservative answer.
       <td>Graph Runner class</td>
     </tr>
     <tr>
+      <td><code>get_speculative_worker_cls(algorithm)</code></td>
+      <td><code>return None</code></td>
+      <td>Worker class that replaces the built-in speculative worker, for any algorithm. It is constructed with the built-in worker&#39;s keyword arguments, must expose the same scheduler-facing interface, and must reject flags it cannot serve (such as multi-layer EAGLE). <code>--speculative-adaptive</code> falls back to static parameters with a platform worker, since only the built-in worker implements it. EAGLE, EAGLE3, NEXTN (asked as <code>"EAGLE"</code>) and STANDALONE also require <code>supports_speculative_algorithm(algorithm)</code> to return True.</td>
+    </tr>
+    <tr>
       <td><code>get_kv_pool_cls(kind=...)</code></td>
       <td><code>return None</code></td>
       <td>Return this platform&#39;s KV pool class for <code>kind</code> in <code>"mha"</code> / <code>"mla"</code> / <code>"dsa"</code>, or <code>None</code> for the in-tree class. The class must subclass <code>MHATokenToKVPool</code> / <code>MLATokenToKVPool</code> / <code>DSATokenToKVPool</code>; core constructs it with exactly the keyword arguments the in-tree class receives, at every site the in-tree class is built (standalone, inside the SWA composite, as the hybrid-linear full-attention leaf). Override <code>_create_buffers</code> to change how the backing storage is carved -- addressing, index translation and PD registration stay core&#39;s. If you override <code>_create_buffers</code> entirely you also own <code>_kv_buffer_descs</code> (PD transfer and post-capture backing read it); override <code>_create_buffers_normal</code> or <code>_kv_buffer_shapes</code> instead to keep the base descriptors, which require the leading buffer axis to be tokens or pages. The in-tree pool allocates on <code>device</code> and is correct on any torch device, so most platforms return <code>None</code>.</td>
