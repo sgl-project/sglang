@@ -90,12 +90,21 @@ class InklingOutputParser:
             tokenizer.encode_special("content_text"),
         )
         self._end_message_id = tokenizer.encode_special("end_message")
+        self._framing_ids = frozenset(
+            (
+                *self._header_ids,
+                *self._content_kind_ids,
+                self._end_sampling_id,
+                self._end_message_id,
+            )
+        )
         self._message_ids: list[int] = []
         self._kind_id: int | None = None
         self._text_decoder = codecs.getincrementaldecoder("utf-8")("replace")
         self._streamed = ""
         self._held_reasoning = ""
         self._model_authored = True
+        self._awaiting_author = True
         self._at_message_boundary = True
         self._in_unframed_text = False
         self._num_tool_calls = 0
@@ -207,9 +216,16 @@ class InklingOutputParser:
         self._parse(token_id, delta)
 
     def _parse(self, token_id: int, delta: _DeltaBuilder) -> None:
-        if self._at_message_boundary:
+        # TMLv0 skips any other special before a message's header, so it leaves
+        # the author open.
+        if self._awaiting_author and (
+            token_id in self._framing_ids
+            or not self._tml.tokenizer.is_special_token(token_id)
+        ):
+            self._awaiting_author = False
             self._model_authored = self._header_ids.get(token_id, True)
             if token_id == self._end_sampling_id:
+                self._reset_message()
                 return
         self._at_message_boundary = False
         self._message_ids.append(token_id)
@@ -247,6 +263,7 @@ class InklingOutputParser:
         self._kind_id = None
         self._text_decoder.reset()
         self._streamed = ""
+        self._awaiting_author = True
         self._at_message_boundary = True
 
     def _complete_message(self, message: Any, delta: _DeltaBuilder) -> None:

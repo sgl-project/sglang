@@ -255,6 +255,30 @@ class TestInklingOutputParser(unittest.TestCase):
                         [call.arguments for call in parsed.tool_calls], [expected]
                     )
 
+    def test_leading_ignored_special_keeps_the_header_author(self):
+        """TMLv0 skips a special such as <|begin_of_text|> before a header; the
+        header after it still decides the author, so non-model text never streams."""
+        for role, expected in (
+            ("model", "echoed text"),
+            ("user", ""),
+            ("system", ""),
+            ("tool", ""),
+        ):
+            output_ids = _ids(
+                "<|begin_of_text|>",
+                f"<|message_{role}|>",
+                "<|content_text|>",
+                "echoed text",
+                "<|end_message|>",
+            )
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(role=role, mode=mode):
+                    parsed = parse(
+                        output_ids, separate_reasoning=True, parse_tool_calls=True
+                    )
+                    self.assertEqual(parsed.content, expected)
+                    self.assertEqual(parsed.reasoning, "")
+
     def test_finish_flushes_once(self):
         """A finish_reason stays set on later stream chunks; finishing again must
         not re-emit a truncated message's payload."""
