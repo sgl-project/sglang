@@ -161,6 +161,9 @@ class _TinyModel(nn.Module):
         self.register_buffer("rotary_emb_cos_cache", torch.full((8,), 1.62))
         self.register_buffer("rotary_emb_sin_cache", torch.full((8,), 0.58))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
+        self.register_buffer(
+            "rotary_emb_axis_map", torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64)
+        )
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
 
 
@@ -557,6 +560,7 @@ class TestSnapshot(_WeightCheckerTestBase):
             "rotary_emb_cos_cache",
             "rotary_emb_sin_cache",
             "rotary_emb_freqs_cis",
+            "rotary_emb_axis_map",
             "gate_proj_weight_fp32_cache",
         }
         self.assertEqual(keys, expected)
@@ -609,6 +613,11 @@ class TestResetTensors(_WeightCheckerTestBase):
         before = self.model.rotary_emb_freqs_cis.clone()
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.rotary_emb_freqs_cis, before)
+
+    def test_skips_axis_map(self):
+        before = self.model.rotary_emb_axis_map.clone()
+        self.checker._reset_tensors()
+        torch.testing.assert_close(self.model.rotary_emb_axis_map, before)
 
     def test_poisons_weight_fp32_cache(self):
         before = self.model.gate_proj_weight_fp32_cache.clone()
@@ -706,6 +715,9 @@ class TestIsNonPersistentBufferName(CustomTestCase):
     def test_matches_freqs_cis_substring(self):
         self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.freqs_cis"))
 
+    def test_matches_axis_map_substring(self):
+        self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.axis_map"))
+
     def test_does_not_match_normal_param_names(self):
         self.assertFalse(_is_non_persistent_buffer_name("model.layers.0.mlp.weight"))
         self.assertFalse(_is_non_persistent_buffer_name("model.embed_tokens.weight"))
@@ -786,6 +798,7 @@ class TestComputeChecksum(_ChecksumTestBase):
         # Non-persistent buffer patterns are filtered out.
         self.assertNotIn("rotary_emb_cos_sin_cache", names)
         self.assertNotIn("rotary_emb_freqs_cis", names)
+        self.assertNotIn("rotary_emb_axis_map", names)
 
     def test_hashes_are_hex_strings(self):
         out = self.checker._compute_checksum(role="target")
