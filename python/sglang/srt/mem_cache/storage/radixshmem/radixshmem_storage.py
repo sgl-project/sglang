@@ -238,6 +238,7 @@ class RadixShmemStorage(HiCacheStorage):
         self.endpoint = cfg.get("radixshmem_endpoint")
         self.max_outstanding = int(cfg.get("radixshmem_max_outstanding", 256))
         self.ready_timeout_s = float(cfg.get("radixshmem_timeout_s", 300))
+        self.init_timeout_s = float(cfg.get("radixshmem_init_timeout_s", 30))
         self.pull_timeout_ms = int(cfg.get("radixshmem_pull_timeout_ms", 30000))
         self.retry_s = float(cfg.get("radixshmem_retry_s", 30))
         self.full = radixshmem.ComponentType.FULL
@@ -592,6 +593,16 @@ class RadixShmemStorage(HiCacheStorage):
                 )
                 self._down_since = None
             return True
+
+    def connect(self) -> bool:
+        self._plan()
+        if self.index is not None:
+            return True
+        timeout, self.ready_timeout_s = self.ready_timeout_s, self.init_timeout_s
+        try:
+            return self._ready()
+        finally:
+            self.ready_timeout_s = timeout
 
     def _connect(self) -> None:
         swa_kind, _ = self.components[PoolName.SWA]
