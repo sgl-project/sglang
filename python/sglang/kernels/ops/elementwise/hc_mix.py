@@ -10,17 +10,6 @@ def pad_lowrank(lowrank: int) -> int:
     return (lowrank + _KPAD_ALIGN - 1) // _KPAD_ALIGN * _KPAD_ALIGN
 
 
-def hc_mix_shape_ok(hc_count: int, hidden_size: int, lowrank: int) -> bool:
-    k = hc_count * hidden_size
-    return (
-        hidden_size % 8 == 0
-        and lowrank > 0
-        and lowrank % 8 == 0
-        and k % _KPAD_ALIGN == 0
-        and k % 128 == 0
-    )
-
-
 def permute_pad_up_weight(w_up: torch.Tensor, hc_count: int) -> torch.Tensor:
     k, lowrank = w_up.shape
     hidden_size = k // hc_count

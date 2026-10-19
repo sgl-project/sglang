@@ -573,8 +573,12 @@ def _get_chunked_prefill_embedding(
         if extend_seq_len <= 0:
             continue
 
-        # Skip if all items already prefilled.
-        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
+        # Multi-span items (e.g. videos) use the full encoder path below.
+        # Do not encode them for chunks before, after, or between their spans.
+        if not any(
+            end >= extend_prefix_len and start < extend_prefix_len + extend_seq_len
+            for start, end in items_offset
+        ):
             continue
 
         req_info = PerImageRequestInfo(

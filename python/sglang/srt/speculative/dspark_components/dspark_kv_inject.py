@@ -2,12 +2,10 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import swa_ring_rows
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
-    build_unified_commit_inject_layout,
+    build_ring_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
@@ -31,6 +29,13 @@ class TargetHiddenKvInjector:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._block_pos_offsets = block_pos_offsets
+
+    @property
+    def swa_ring_size(self) -> Optional[int]:
+        """The ring length when the draft's SWA KV is a per-request ring."""
+        return getattr(
+            self.draft_model_runner.token_to_kv_pool, "swa_req_ring_size", None
+        )
 
     def ids_for(self, plan: KVLocPlan, *, cols: Optional[Cols] = None) -> torch.Tensor:
         """The plan's write ids as the draft pool indexes them: the target's
@@ -118,8 +123,8 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
     ) -> None:
-        if is_unified_kv_triton():
-            swa_loc = self._unified_inject_loc(
+        if pool.swa_req_ring_size is not None:
+            swa_loc = self._ring_inject_loc(
                 pool=pool,
                 positions=positions,
                 cache_loc_2d=cache_loc_2d,
@@ -165,7 +170,7 @@ class TargetHiddenKvInjector:
                 pool=pool,
             )
 
-    def _unified_inject_loc(
+    def _ring_inject_loc(
         self,
         *,
         pool,
@@ -175,9 +180,9 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor],
         final_pos: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Ring row for target-hidden injection under unified_kv.
+        """Ring row for target-hidden injection into a per-request SWA ring.
 
-        loc = state_slot * ring + pos % ring, with two skip (-1) rules:
+        loc = swa_ring_rows(state_slot, pos, ring), with two skip (-1) rules:
           * SWA window: only the last ``win`` tokens per req land in the ring;
             older tokens share a ring slot (pos % ring) and would race, so drop
             them (needed for long prefill chunks).
@@ -185,13 +190,13 @@ class TargetHiddenKvInjector:
         """
         if state_slot is None:
             raise RuntimeError(
-                "unified_kv target-hidden injection requires state_slot "
+                "SWA ring target-hidden injection requires state_slot "
                 "(per-token draft req_pool_indices)."
             )
-        ring = pool.unified_swa_ring_size
-        win = pool.unified_swa_window
+        ring = pool.swa_req_ring_size
+        win = pool.sliding_window
         pos = positions.to(torch.int64)
-        loc = state_slot.to(torch.int64) * ring + pos % ring
+        loc = swa_ring_rows(state_slot, pos, ring)
         if final_pos is not None:
             keep = pos > (final_pos.to(torch.int64) - win)
             loc = torch.where(keep, loc, torch.full_like(loc, -1))
@@ -220,14 +225,14 @@ class TargetHiddenKvInjector:
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if hidden_strided.numel() == 0:
                 return
-            if is_unified_kv_triton():
-                inject_layout = build_unified_commit_inject_layout(
+            if pool.swa_req_ring_size is not None:
+                inject_layout = build_ring_commit_inject_layout(
                     req_pool_indices=batch.req_pool_indices,
                     prefix_lens=prefix_lens,
                     block_pos_offsets=self._block_pos_offsets[:stride],
                     commit_lens=commit_lens,
                     stride=stride,
-                    ring_stride=pool.unified_swa_ring_size,
+                    ring_stride=pool.swa_req_ring_size,
                 )
             else:
                 inject_layout = BuildCommitInjectLayout.execute(
