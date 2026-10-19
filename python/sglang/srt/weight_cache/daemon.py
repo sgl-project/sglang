@@ -59,6 +59,15 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
+from .expert_layout import (
+    ATTACH,
+    LAYOUT_REFUSED,
+    OK,
+    REQUEST_TYPES,
+    ExpertLayoutPresence,
+    ExpertLayoutRegistry,
+    handle_expert_layout_request,
+)
 from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
@@ -188,6 +197,10 @@ class WeightCacheDaemon:
         self.state_entries: Dict[str, Dict[str, Any]] = {}
         self.preloaded_weights_bytes = 0
         self.transport_backend = None
+        # Where the routed experts of the served weights are (see
+        # expert_layout.py); tracked once load() builds the EPLB layout.
+        self.expert_layout = ExpertLayoutRegistry(None)
+        self.expert_layout_presence: Optional[ExpertLayoutPresence] = None
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -324,6 +337,7 @@ class WeightCacheDaemon:
         # avoids maintaining a second copy of the model-parallel hierarchy.
         self._init_distributed(server_args, model_config)
         self._initialize_eplb_expert_location_metadata(model_config)
+        self._track_expert_layout()
         moe_dp_rank = get_parallel().moe_dp_rank
         moe_ep_rank = get_parallel().moe_ep_rank
         self.config = CacheConfig(
@@ -488,6 +502,18 @@ class WeightCacheDaemon:
             )
         )
 
+    def _track_expert_layout(self) -> None:
+        """Keep the record of the EPLB layout built above. An EPLB rebalance in
+        an engine moves experts in these weights and reports it here."""
+        if not get_exec().moe.enable_eplb:
+            return
+
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        self.expert_layout = ExpertLayoutRegistry.from_metadata(
+            get_global_expert_location_metadata()
+        )
+
     def serve(self):
         """Block and serve IPC handles over Unix socket."""
         # Do NOT unlink an existing socket here: stale-file cleanup is the launch
@@ -523,6 +549,9 @@ class WeightCacheDaemon:
         signal.signal(signal.SIGTERM, _signal_handler)
         signal.signal(signal.SIGINT, _signal_handler)
 
+        self.expert_layout_presence = ExpertLayoutPresence(self.expert_layout)
+        self.expert_layout_presence.start()
+
         try:
             while self._running:
                 try:
@@ -533,19 +562,11 @@ class WeightCacheDaemon:
                     # (or dies mid-send) would block recv_msg forever and stall
                     # every other engine rank. Bound each exchange instead.
                     conn.settimeout(CLIENT_CONNECTION_TIMEOUT)
-                    try:
-                        self._handle_connection(conn)
-                    except Exception as e:
-                        logger.error(
-                            f"[WeightCacheDaemon gpu={self.gpu_id}] "
-                            f"Error handling connection: {e}",
-                            exc_info=True,
-                        )
-                    finally:
-                        conn.close()
+                    self._serve_connection(conn)
                 except socket.timeout:
                     continue
         finally:
+            self.expert_layout_presence.stop()
             sock.close()
             if os.path.exists(self.socket_path):
                 os.unlink(self.socket_path)
@@ -553,8 +574,24 @@ class WeightCacheDaemon:
                 os.unlink(self.ready_path)
             logger.info(f"[WeightCacheDaemon gpu={self.gpu_id}] Shutdown complete")
 
-    def _handle_connection(self, conn: socket.socket):
-        """Handle a single client connection."""
+    def _serve_connection(self, conn: socket.socket) -> None:
+        """Handle one accepted connection, then close it unless it became an
+        engine's expert layout attach connection."""
+        keep_open = False
+        try:
+            keep_open = self._handle_connection(conn)
+        except Exception as e:
+            logger.error(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] Error handling connection: {e}",
+                exc_info=True,
+            )
+        finally:
+            if not keep_open:
+                conn.close()
+
+    def _handle_connection(self, conn: socket.socket) -> bool:
+        """Handle a single client connection. Returns True when the connection
+        must stay open: an engine's expert layout attach connection."""
         req = recv_msg(conn)
 
         if req.get("type") == "query_config":
@@ -580,7 +617,17 @@ class WeightCacheDaemon:
                 send_msg(
                     conn, {"status": "mismatch", "daemon_config": self.config.to_dict()}
                 )
-                return
+                return False
+
+            # The engine must route with the expert layout these weights are in.
+            refusal = self.expert_layout.check_fetch(req.get("expert_layout"))
+            if refusal is not None:
+                logger.warning(
+                    f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                    f"Refusing to serve the weights: {refusal}"
+                )
+                send_msg(conn, {"status": LAYOUT_REFUSED, "message": refusal})
+                return False
 
             logger.info(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] "
@@ -601,6 +648,9 @@ class WeightCacheDaemon:
         elif req.get("type") == "ping":
             send_msg(conn, {"status": "ok"})
 
+        elif req.get("type") in REQUEST_TYPES:
+            return self._handle_expert_layout_request(conn, req)
+
         else:
             send_msg(
                 conn,
@@ -609,6 +659,21 @@ class WeightCacheDaemon:
                     "message": f"Unknown request type: {req.get('type')}",
                 },
             )
+        return False
+
+    def _handle_expert_layout_request(self, conn: socket.socket, req) -> bool:
+        reply = handle_expert_layout_request(self.expert_layout, req)
+        if req["type"] != ATTACH or reply.get("status") != OK:
+            send_msg(conn, reply)
+            return False
+        # Attached: the connection now tells whether the engine is alive.
+        try:
+            send_msg(conn, reply)
+        except BaseException:
+            self.expert_layout.detach(req["engine_id"])
+            raise
+        self.expert_layout_presence.watch(conn, req["engine_id"])
+        return True
 
     def shutdown(self):
         """Release GPU memory and clean up."""
