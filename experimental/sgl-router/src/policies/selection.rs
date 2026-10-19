@@ -32,6 +32,7 @@ use crate::policies::admission::{
     CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::{BucketRequest, BucketSelector};
+use crate::policies::cache_aware::estimate_matched_prefix_tokens;
 use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
@@ -79,6 +80,8 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub saturation_queue_floor: Option<u64>,
     /// `--min-load-choices`: sample size for the min-load capacity fallback.
     pub min_load_choices: usize,
+    /// `--route-by-uncached-tokens`.
+    pub route_by_uncached_tokens: bool,
 }
 
 /// The queue-gate blind warn is sampled: it fires on a per-request path, and
@@ -146,9 +149,43 @@ pub(crate) fn select_prefill_worker(
         },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
         cache_gate_audit: None,
+        // E: the input beyond the longest prefix any prefill worker can reuse.
+        // None (cold) when nothing is reusable.
+        uncached_tokens: inputs
+            .route_by_uncached_tokens
+            .then(|| best_reusable_tokens(inputs))
+            .filter(|&reusable| reusable > 0)
+            .map(|reusable| inputs.request_sequence_tokens.saturating_sub(reusable)),
     };
     let selected = selector.run();
     selected.ok_or(selector.failure_reason)
+}
+
+/// Longest prefix, in tokens, that any of the request's prefill workers can reuse.
+fn best_reusable_tokens(inputs: &PrefillSelectionInputs<'_>) -> u64 {
+    let Some(signal) = inputs.external_prefix else {
+        return 0;
+    };
+    let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
+        return 0;
+    };
+    matches
+        .iter()
+        .filter(|entry| {
+            inputs
+                .workers
+                .iter()
+                .any(|worker| worker.url == entry.address)
+        })
+        .map(|entry| {
+            estimate_matched_prefix_tokens(
+                inputs.request_input_tokens,
+                signal.query_blocks,
+                entry.matched_prefix_blocks,
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Carries the per-request bucket request and the failure reason across rungs.
@@ -165,6 +202,8 @@ struct Selector<'a> {
     /// resolution at all — no load snapshot, or no candidate proposal — which
     /// reads as a plain miss because nothing was gated out.
     cache_gate_audit: Option<(u64, u64, bool, u32)>,
+    /// `--route-by-uncached-tokens`: E for a request with a reusable prefix.
+    uncached_tokens: Option<u64>,
 }
 
 impl<'a> Selector<'a> {
@@ -181,6 +220,10 @@ impl<'a> Selector<'a> {
         let use_global_affinity_probe = inputs.bucket_selector.is_enabled()
             && inputs.policy.is_bucket_affinity_policy()
             && session_affinity_mode != SessionAffinityMode::Bucket;
+
+        // By uncached tokens, a cold request uses every prefill worker.
+        let cold = inputs.route_by_uncached_tokens && self.uncached_tokens.is_none();
+        let uncached_tokens = self.uncached_tokens;
 
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
         let cache_winner = self.cache_winner();
@@ -218,10 +261,16 @@ impl<'a> Selector<'a> {
         let selected = cache_winner.or_else(|| {
             // Materializing the normal domains clones the member list of every
             // Bucket, so build them only on the rung that actually reads them.
-            let prefill_domains = || {
-                inputs
+            let prefill_domains = || match uncached_tokens {
+                Some(extend) => inputs.bucket_selector.prefill_domains_for_extend(
+                    inputs.workers,
+                    bucket_request,
+                    extend,
+                ),
+                None if cold => vec![CandidateDomain::global_prefill(inputs.workers)],
+                None => inputs
                     .bucket_selector
-                    .prefill_domains(inputs.workers, bucket_request)
+                    .prefill_domains(inputs.workers, bucket_request),
             };
             if inputs.policy_kind == PolicyKind::CacheAware {
                 // Cache miss or failure retries ordered domains with ordinary P2.
@@ -266,7 +315,31 @@ impl<'a> Selector<'a> {
                 .metrics
                 .record_cache_aware_decision(&inputs.model_id.0, decision);
         }
+        if let (true, Some(worker)) = (inputs.route_by_uncached_tokens, &selected) {
+            tracing::debug!(
+                model = %inputs.model_id,
+                input_tokens = bucket_request.input_tokens,
+                uncached_tokens = ?uncached_tokens,
+                route = if cold { "cold" } else { "warm" },
+                selected = %worker.url,
+                "prefill route by uncached tokens",
+            );
+        }
         selected
+    }
+
+    /// Workers of the buckets holding E, when routing by uncached tokens.
+    fn extend_bucket_workers(&self) -> Option<Vec<Arc<Worker>>> {
+        let extend = self.uncached_tokens?;
+        let inputs = self.inputs;
+        Some(
+            inputs
+                .bucket_selector
+                .prefill_domains_for_extend(inputs.workers, self.bucket_request, extend)
+                .into_iter()
+                .flat_map(|domain| domain.workers)
+                .collect(),
+        )
     }
 
     /// The per-request `SelectionContext` every rung starts from.
@@ -293,12 +366,22 @@ impl<'a> Selector<'a> {
             .base_context(global_range.id)
             .with_load_snapshot(snapshot)
             .with_prefill_cache_bucket(inputs.bucket_selector, bucket_request);
-        let PrefillProposal::CacheCandidates(proposal) = inputs
+        let PrefillProposal::CacheCandidates(mut proposal) = inputs
             .policy
             .propose_prefill(global_range.workers, &cache_ctx)?
         else {
             return None;
         };
+        if let Some(members) = self.extend_bucket_workers() {
+            proposal.candidates.retain(|candidate| {
+                members
+                    .iter()
+                    .any(|worker| worker.id == candidate.worker.id)
+            });
+            if proposal.candidates.is_empty() {
+                return None;
+            }
+        }
         let bounded_candidate_count = proposal.candidates.len();
         // The queue gate reads the engine-published load sample and fails open
         // per worker. When NO worker has a fresh sample the gate is inert
@@ -846,6 +929,7 @@ mod tests {
             worker_queue_limit: None,
             saturation_queue_floor: None,
             min_load_choices: 2,
+            route_by_uncached_tokens: false,
             ttft_slo_ms: None,
             tps_slo: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
@@ -1281,5 +1365,63 @@ mod tests {
             cache_aware_fallback_decision(2, 2, true),
             CacheAwareDecision::AllQueued
         ));
+    }
+
+    /// `short` takes up to 8192 uncached tokens, `long` the rest.
+    fn short_long_buckets() -> BucketSelector {
+        let config: crate::config::BucketConfig = serde_json::from_value(serde_json::json!({
+            "buckets": [
+                {"id": "short", "stage": "prefill", "rank": 10, "worker_ids": ["short"],
+                 "max_extend_tokens": 8192},
+                {"id": "long", "stage": "prefill", "rank": 20, "worker_ids": ["long"],
+                 "min_extend_tokens": 8193}
+            ]
+        }))
+        .unwrap();
+        BucketSelector::new(Some(config))
+    }
+
+    /// The worker picked for a 20,000-token prompt with and without
+    /// `--route-by-uncached-tokens`.
+    fn route_both_ways(
+        workers: &[Arc<Worker>],
+        loads: &EngineReportedLoadSnapshot,
+        signal: Option<&PrefixLookupResult>,
+    ) -> [String; 2] {
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+        let buckets = short_long_buckets();
+        let metrics = MetricsRegistry::new();
+        let model = ModelId("model".into());
+        [true, false].map(|route_by_uncached_tokens| {
+            let mut inputs = prefill_inputs(
+                &policy,
+                &buckets,
+                &metrics,
+                &model,
+                workers,
+                Some(loads),
+                20_000,
+            );
+            inputs.policy_kind = PolicyKind::CacheAware;
+            inputs.external_prefix = signal;
+            inputs.route_by_uncached_tokens = route_by_uncached_tokens;
+            select_prefill_worker(&inputs).unwrap().id.0.clone()
+        })
+    }
+
+    #[test]
+    fn routes_prefill_buckets_by_uncached_tokens() {
+        let (short, long) = (worker("short"), worker("long"));
+        let workers = [Arc::clone(&short), Arc::clone(&long)];
+        // Cold: the less loaded worker, whatever the input-length bucket.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 3, 900_000, 1_000_000)]);
+        assert_eq!(route_both_ways(&workers, &loads, None), ["short", "long"]);
+        // Warm: 15 of 20 blocks reusable on `long` leave E = 5,000, `short`'s bucket.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 0, 10, 1_000_000)]);
+        let signal = prefix_signal(&[(&long, 15)], 20);
+        assert_eq!(
+            route_both_ways(&workers, &loads, Some(&signal)),
+            ["short", "long"]
+        );
     }
 }

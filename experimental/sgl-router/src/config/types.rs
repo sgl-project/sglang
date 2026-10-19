@@ -652,6 +652,10 @@ pub struct AffinityConfig {
     /// size chooses the exact minimum with random ties; 1 draws uniformly without
     /// a backup for admission or pressure guards. Separate from cache-owner limits.
     pub min_load_choices: usize,
+    /// Match prefill buckets on uncached tokens E instead of the input length. A
+    /// request with a reusable prefix uses E's buckets; a request without one
+    /// uses every prefill worker.
+    pub route_by_uncached_tokens: bool,
 }
 
 impl Default for AffinityConfig {
@@ -680,6 +684,7 @@ impl Default for AffinityConfig {
             worker_queue_limit: None,
             saturation_queue_floor: None,
             min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
+            route_by_uncached_tokens: false,
         }
     }
 }

@@ -461,6 +461,10 @@ pub struct AffinityArgs {
     #[arg(long)]
     pub disable_pressure_guard: bool,
 
+    /// Match prefill buckets on uncached tokens (--policy cache_aware with --bucket-config).
+    #[arg(long)]
+    pub route_by_uncached_tokens: bool,
+
     /// Pressure-guard token gap (session_aware or cache_aware). Defaults to 1024.
     #[arg(long)]
     pub pressure_abs_threshold_tokens: Option<u64>,
@@ -1090,6 +1094,7 @@ impl AffinityArgs {
                 .saturation_queue_floor
                 .or(defaults.saturation_queue_floor),
             min_load_choices: cache.min_load_choices.unwrap_or(defaults.min_load_choices),
+            route_by_uncached_tokens: self.route_by_uncached_tokens,
         }))
     }
 
