@@ -101,6 +101,7 @@ def _call_derived_weight_hook(model: torch.nn.Module, name: str) -> None:
             weakref.ref(m)
             for m in model.modules()
             if hasattr(m, "invalidate_derived_weights")
+            and hasattr(m, "refresh_derived_weights")
         ]
         _DERIVED_WEIGHT_MODULES[model] = refs
     for ref in refs:
