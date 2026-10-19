@@ -544,15 +544,20 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _is_xpu:
-        verify_tree_greedy_triton(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
+        xpu_verify_tree_greedy = verify_tree_greedy_triton
+        if envs.SGLANG_ENABLE_SPEC_OPTIMIZED.get():
+            from sgl_kernel import verify_tree_greedy as xpu_verify_tree_greedy
+
+        # Positional: the sgl_kernel op spells these args `retrive_*`.
+        xpu_verify_tree_greedy(
+            predicts,  # mutable
+            accept_index,  # mutable
+            accept_token_num,  # mutable
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
         )
     else:
         reject_out_of_tree_path(

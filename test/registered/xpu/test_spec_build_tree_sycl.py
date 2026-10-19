@@ -1,5 +1,5 @@
-"""SGLANG_ENABLE_SPEC_OPTIMIZED routes XPU EAGLE tree building to the
-sgl-kernel-xpu SYCL kernel, which must stay bit-identical to the Triton kernel."""
+"""SGLANG_ENABLE_SPEC_OPTIMIZED routes XPU EAGLE tree building and greedy tree
+verify to the sgl-kernel-xpu SYCL kernels, which must stay bit-identical to Triton."""
 
 import itertools
 import unittest
@@ -14,27 +14,34 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
     organize_draft_results,
+    verify_tree_greedy_func,
 )
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=40, suite="stage-b-test-1-gpu-xpu")
 
 DEVICE = "xpu"
 
 
 def _draft_tree(bs, topk, steps, num_verify, gen):
-    """Random draft outputs laid out like EagleWorker.draft_forward produces them."""
-    score_list = [torch.rand(bs, 1, topk, generator=gen)]
+    """Random draft outputs laid out like select_top_k_tokens produces them.
+
+    Scores are cumulative path probabilities (child = beam * p), so every selected
+    node's parent is selected too and the tree is connected.
+    """
+    beam_scores = torch.rand(bs, topk, generator=gen)
+    score_list = [beam_scores.unsqueeze(1)]
     token_list = [torch.randint(0, 32000, (bs, topk), generator=gen)]
     parents_list = [torch.arange(-1, topk).repeat(bs, 1)]
     for i in range(1, steps):
-        score_list.append(torch.rand(bs, topk, topk, generator=gen))
-        token_list.append(torch.randint(0, 32000, (bs, topk * topk), generator=gen))
-        # Same offset as select_top_k_tokens: topk_cs_index + topk^2*(i-1) + topk.
-        topk_cs_index = torch.stack(
-            [torch.randperm(topk * topk, generator=gen)[:topk] for _ in range(bs)]
+        expand_scores = beam_scores.unsqueeze(2) * torch.rand(
+            bs, topk, topk, generator=gen
         )
+        score_list.append(expand_scores)
+        token_list.append(torch.randint(0, 32000, (bs, topk * topk), generator=gen))
+        beam_scores, topk_cs_index = expand_scores.flatten(1).topk(topk, dim=-1)
+        # Same offset as select_top_k_tokens: topk_cs_index + topk^2*(i-1) + topk.
         parents_list.append(topk_cs_index + (topk * topk * (i - 1) + topk))
     parents_list.append(torch.zeros(bs, topk, dtype=torch.long))
 
@@ -68,6 +75,53 @@ def _build(use_sycl, tree, topk, steps, num_verify, mode, tree_mask_buf=None):
             tree_mask_mode=mode,
             tree_mask_buf=tree_mask_buf,
         )
+
+
+def _target_predict(candidates, retrieve_next_token, retrieve_next_sibling, gen):
+    """Per node, predict a random child's draft token 70% of the time, so verify
+    walks accept chains, sibling hops and early stops."""
+    bs, num_verify = candidates.shape
+    cand, nxt, sib = (
+        candidates.cpu(),
+        retrieve_next_token.cpu(),
+        retrieve_next_sibling.cpu(),
+    )
+    target = torch.randint(0, 32000, (bs, num_verify), generator=gen)
+    for b, j in itertools.product(range(bs), range(num_verify)):
+        children, k = [], int(nxt[b, j])
+        while k != -1:
+            children.append(k)
+            k = int(sib[b, k])
+        if children and torch.rand(1, generator=gen).item() < 0.7:
+            pick = int(torch.randint(len(children), (1,), generator=gen))
+            target[b, j] = cand[b, children[pick]]
+    return target.to(DEVICE)
+
+
+def _verify(use_sycl, candidates, retrieve, target_predict, depth):
+    bs, num_verify = candidates.shape
+    retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve
+    with envs.SGLANG_ENABLE_SPEC_OPTIMIZED.override(use_sycl):
+        return verify_tree_greedy_func(
+            predicts=torch.zeros(bs * num_verify, dtype=torch.int32, device=DEVICE),
+            accept_index=torch.full((bs, depth), -1, dtype=torch.int32, device=DEVICE),
+            accept_token_num=torch.empty((bs,), dtype=torch.int32, device=DEVICE),
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+
+
+def _verify_inputs(topk, steps, num_verify, bs, gen):
+    tree = _draft_tree(bs, topk, steps, num_verify, gen)
+    _, _, *retrieve, draft_tokens = _build(
+        False, tree, topk, steps, num_verify, TreeMaskMode.FULL_MASK
+    )
+    candidates = draft_tokens.reshape(bs, num_verify)
+    target_predict = _target_predict(candidates, retrieve[1], retrieve[2], gen)
+    return candidates, retrieve, target_predict
 
 
 class TestSpecBuildTreeSycl(CustomTestCase):
@@ -133,8 +187,31 @@ class TestSpecBuildTreeSycl(CustomTestCase):
         for ref, out in zip(*outs):
             self.assertTrue(torch.equal(ref, out))
 
+    def test_sycl_verify_matches_triton(self):
+        gen = torch.Generator().manual_seed(3)
+        for topk, steps, num_verify, bs in self.CONFIGS:
+            with self.subTest(topk=topk, steps=steps, bs=bs):
+                candidates, retrieve, target_predict = _verify_inputs(
+                    topk, steps, num_verify, bs, gen
+                )
+                # verify_input.max_tree_depth is spec_steps + 1.
+                triton_out = _verify(
+                    False, candidates, retrieve, target_predict, steps + 1
+                )
+                sycl_out = _verify(
+                    True, candidates, retrieve, target_predict, steps + 1
+                )
+                for name, ref, out in zip(
+                    ("predicts", "accept_index", "accept_token_num"),
+                    triton_out,
+                    sycl_out,
+                ):
+                    self.assertTrue(torch.equal(ref, out), name)
+
     def test_flag_selects_kernel(self):
-        tree = _draft_tree(2, 2, 3, 6, torch.Generator().manual_seed(1))
+        gen = torch.Generator().manual_seed(1)
+        tree = _draft_tree(2, 2, 3, 6, gen)
+        candidates, retrieve, target_predict = _verify_inputs(2, 3, 6, 2, gen)
         for use_sycl in (False, True):
             with (
                 self.subTest(use_sycl=use_sycl),
@@ -142,10 +219,17 @@ class TestSpecBuildTreeSycl(CustomTestCase):
                     sgl_kernel,
                     "build_tree_kernel_efficient",
                     wraps=sgl_kernel.build_tree_kernel_efficient,
-                ) as sycl_kernel,
+                ) as sycl_build_tree,
+                mock.patch.object(
+                    sgl_kernel,
+                    "verify_tree_greedy",
+                    wraps=sgl_kernel.verify_tree_greedy,
+                ) as sycl_verify,
             ):
                 _build(use_sycl, tree, 2, 3, 6, TreeMaskMode.FULL_MASK)
-                self.assertEqual(sycl_kernel.called, use_sycl)
+                _verify(use_sycl, candidates, retrieve, target_predict, 4)
+                self.assertEqual(sycl_build_tree.called, use_sycl)
+                self.assertEqual(sycl_verify.called, use_sycl)
 
 
 if __name__ == "__main__":
