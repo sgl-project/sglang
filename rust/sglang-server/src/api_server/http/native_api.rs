@@ -17,6 +17,8 @@ use crate::api_server::core::{
 };
 #[cfg(test)]
 use crate::message::ids::Rid;
+#[cfg(test)]
+use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
 use crate::message::wire::merge_preferred_sampling;
 use crate::utils::{
@@ -211,7 +213,7 @@ async fn generate(
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (payloads, is_batch) = match into_requests(body) {
+    let (payloads, is_batch) = match into_requests(body, &state.generation_policy) {
         Ok(v) => v,
         // Request normalization only returns validation failures.
         Err(e) => {
@@ -571,6 +573,7 @@ mod tests {
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
         });
 
@@ -609,6 +612,7 @@ mod tests {
                     metadata: crate::api_server::core::CoreMetadata::default(),
                 },
             ),
+            generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
         });
@@ -648,6 +652,7 @@ mod tests {
         let state = Arc::new(AppState {
             core,
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
         });
 
