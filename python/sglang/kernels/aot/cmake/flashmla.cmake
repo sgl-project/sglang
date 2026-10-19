@@ -24,6 +24,7 @@ set(FLASHMLA_CUDA_FLAGS
     "-Xcudafe=--diag_suppress=177"   # variable was declared but never referenced
 )
 
+option(SGLANG_FLASHMLA_SM90_ONLY "Build only Hopper FlashMLA for local validation" OFF)
 set(FLASHMLA_ENABLE_SM100 OFF)
 
 # The FlashMLA kernels only work on hopper and require CUDA 12.4 or later.
@@ -34,14 +35,14 @@ if(${CUDA_VERSION} VERSION_GREATER 12.4)
         "-gencode=arch=compute_90a,code=sm_90a"
     )
 endif()
-if(${CUDA_VERSION} VERSION_GREATER 12.8)
+if(${CUDA_VERSION} VERSION_GREATER 12.8 AND NOT SGLANG_FLASHMLA_SM90_ONLY)
     # sm_100f is compatible with all sm_10x
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_100f,code=sm_100f"
     )
     set(FLASHMLA_ENABLE_SM100 ON)
 endif()
-if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
+if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0" AND NOT SGLANG_FLASHMLA_SM90_ONLY)
     # B300 is sm_103; sm_100f is family-compatible so it runs there, but ptxas emits
     # better SASS for the native arch. FlashMLA's setup.py picks sm_100a + sm_103a
     # over sm_100f for the same reason. The cutlass patch below is what lets a TU
@@ -86,6 +87,21 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
 endif()
 
 
+set(FLASHMLA_SPARSE_DECODE_API ${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_decode.cpp)
+set(FLASHMLA_SPARSE_PREFILL_API ${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_prefill.cpp)
+if(SGLANG_FLASHMLA_SM90_ONLY)
+    # Upstream's API dispatches at runtime and otherwise retains references to
+    # SM100 kernels even when their translation units are excluded. Generate
+    # local SM90-only API copies; do not modify the pinned dependency sources.
+    foreach(api sparse_decode sparse_prefill)
+        file(READ ${repo-flashmla_SOURCE_DIR}/csrc/api/${api}.cpp api_source)
+        string(REPLACE "arch.is_sm100f()" "false /* SM90-only build */" api_source "${api_source}")
+        file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/sm90_${api}.cpp CONTENT "${api_source}")
+    endforeach()
+    set(FLASHMLA_SPARSE_DECODE_API ${CMAKE_CURRENT_BINARY_DIR}/sm90_sparse_decode.cpp)
+    set(FLASHMLA_SPARSE_PREFILL_API ${CMAKE_CURRENT_BINARY_DIR}/sm90_sparse_prefill.cpp)
+endif()
+
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"
 
@@ -95,8 +111,8 @@ set(FlashMLA_SOURCES
     # Attention entry points (the pybind registrations in these files are
     # compiled out by FLASH_MLA_LIBTORCH_ONLY).
     ${repo-flashmla_SOURCE_DIR}/csrc/api/dense_decode.cpp
-    ${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_decode.cpp
-    ${repo-flashmla_SOURCE_DIR}/csrc/api/sparse_prefill.cpp
+    ${FLASHMLA_SPARSE_DECODE_API}
+    ${FLASHMLA_SPARSE_PREFILL_API}
 
     # Decode metadata/combine kernels.
     ${repo-flashmla_SOURCE_DIR}/csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
@@ -174,7 +190,21 @@ if(FLASHMLA_ENABLE_SM100)
     )
 endif()
 
+if(CUDA_VERSION VERSION_GREATER 12.4)
+    list(APPEND FlashMLA_SOURCES
+        "csrc/flashmla_nvfp4_api.cpp"
+        "csrc/flashmla/sm90/sparse_nvfp4/splitkv_mla.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/splitkv_mla.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/model1_persistent_h64.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/model1_persistent_h128.cu"
+        "csrc/flashmla/sm90/sparse_nvfp4_dsv4/instantiations/v32_persistent_h64.cu"
+    )
+endif()
+
 Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FlashMLA_SOURCES})
+if(CUDA_VERSION VERSION_GREATER 12.4)
+    target_compile_definitions(flashmla_ops PRIVATE FLASHMLA_ENABLE_SM90_NVFP4)
+endif()
 target_compile_options(flashmla_ops PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-std=c++20>
     $<$<COMPILE_LANGUAGE:CUDA>:-std=c++20>
@@ -194,7 +224,9 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
               ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}/cccl)
 endif()
 target_include_directories(flashmla_ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc
+    ${repo-flashmla_SOURCE_DIR}/csrc/api
     ${repo-flashmla_SOURCE_DIR}/csrc/kerutils/include
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
