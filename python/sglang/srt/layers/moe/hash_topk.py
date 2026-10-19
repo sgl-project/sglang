@@ -266,12 +266,12 @@ class HashTopK(nn.Module):
 
         recorder_topk_ids = None
         if has_per_rank_fused_shared_slots(num_fused_shared_experts):
-            shared_cols = topk_ids[:, -num_fused_shared_experts:]
-            routed_cols = topk_ids[:, :-num_fused_shared_experts]
+            # The trailing columns are placeholders; the remap appends the real ones.
             routed_cols = topk_ids_logical_to_physical(
-                routed_cols, expert_location_dispatch_info, log2phy_prob
+                topk_ids[:, :-num_fused_shared_experts],
+                expert_location_dispatch_info,
+                log2phy_prob,
             )
-            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
             recorder_topk_ids = routed_cols
 
             num_physical_routed_experts = (
@@ -280,8 +280,8 @@ class HashTopK(nn.Module):
                 else self.num_experts
             )
             topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
-                topk_ids,
-                topk_weights,
+                routed_cols,
+                topk_weights[:, :-num_fused_shared_experts],
                 num_fused_shared_experts,
                 num_physical_routed_experts,
                 TopKConfig(

@@ -35,12 +35,10 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     UNBIASED_ROUTING = {"use_grouped_topk": True, "correction_bias": None}
 
     def _run_remap(self, *, use_aiter, folded_in_topk=False):
-        # Layout: [routed, routed, routed, shared]; the trailing column is the
-        # fused shared expert. The shared weight starts at a sentinel to prove
-        # the function overwrites it.
-        topk_ids = torch.tensor([[5, 40, 100, 999]], dtype=torch.int32)
+        # The remap appends the fused shared column after the routed ones.
+        topk_ids = torch.tensor([[5, 40, 100]], dtype=torch.int32)
         routed_weights = torch.tensor([1.0, 0.5, 0.25], dtype=torch.float32)
-        topk_weights = torch.tensor([[1.0, 0.5, 0.25, -123.0]], dtype=torch.float32)
+        topk_weights = routed_weights.unsqueeze(0)
 
         topk_config = TopKConfig(
             top_k=4,
@@ -441,8 +439,8 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     def test_shared_expert_ids_route_to_home_rank(self):
         # Sanity: the shared slot id is placed at this rank's interleaved
         # position (ep_rank * num_local_experts + num_local_routed).
-        topk_ids = torch.tensor([[5, 40, 100, 999]], dtype=torch.int32)
-        topk_weights = torch.tensor([[1.0, 0.5, 0.25, 0.0]], dtype=torch.float32)
+        topk_ids = torch.tensor([[5, 40, 100]], dtype=torch.int32)
+        topk_weights = torch.tensor([[1.0, 0.5, 0.25]], dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
             num_fused_shared_experts=1,
@@ -469,6 +467,61 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         num_local_experts = num_local_routed + 1  # 33
         expected_shared_id = self.EP_RANK * num_local_experts + num_local_routed
         self.assertEqual(out_ids[0, -1].item(), expected_shared_id)
+
+    def _route_with_per_rank_slots(self, *, num_fused_shared_experts, logits, bias):
+        topk_config = TopKConfig(
+            top_k=8 + num_fused_shared_experts,
+            num_fused_shared_experts=num_fused_shared_experts,
+            renormalize=True,
+            correction_bias=bias,
+            torch_native=True,
+            scoring_func="sigmoid",
+            routed_scaling_factor=self.ROUTED_SCALING_FACTOR,
+            allow_routed_experts_capture=False,
+        )
+        with (
+            patch.object(topk_module, "_use_aiter", False),
+            patch.object(
+                topk_module,
+                "has_per_rank_fused_shared_slots",
+                side_effect=lambda num_fused: num_fused > 0,
+            ),
+            get_parallel().override(moe_ep_size=self.EP_SIZE, moe_ep_rank=self.EP_RANK),
+        ):
+            out = topk_module.select_experts(
+                torch.empty(logits.shape[0], 1), logits, topk_config
+            )
+        return out.topk_ids, out.topk_weights
+
+    def test_per_rank_slot_routes_like_no_fusion(self):
+        """With per-rank shared slots the router must pick and renormalize the
+        routed experts alone. Asked for top_k with the shared slot counted, it
+        renormalized over one routed expert too many, which the shared column
+        then overwrote, so the kept routed weights summed to about 0.9."""
+        torch.manual_seed(0)
+        logits = torch.randn(16, self.NUM_PHYSICAL_ROUTED)
+        bias = 0.1 * torch.randn(self.NUM_PHYSICAL_ROUTED)
+        ref_ids, ref_weights = self._route_with_per_rank_slots(
+            num_fused_shared_experts=0, logits=logits, bias=bias
+        )
+        ids, weights = self._route_with_per_rank_slots(
+            num_fused_shared_experts=1, logits=logits, bias=bias
+        )
+
+        self.assertEqual(ids.shape, (16, 9))
+        torch.testing.assert_close(weights[:, :8].sum(-1), torch.ones(16))
+        # Rank r's routed block starts at r * (num_local_routed + 1).
+        num_local_routed = self.NUM_PHYSICAL_ROUTED // self.EP_SIZE
+        expected_ids = ref_ids + ref_ids // num_local_routed
+        order, ref_order = ids[:, :8].argsort(-1), expected_ids.argsort(-1)
+        self.assertTrue(
+            torch.equal(
+                ids[:, :8].gather(-1, order), expected_ids.gather(-1, ref_order)
+            )
+        )
+        torch.testing.assert_close(
+            weights[:, :8].gather(-1, order), ref_weights.gather(-1, ref_order)
+        )
 
     def test_glm53_idle_rank_preserves_routed_topk_contract(self):
         """An idle rank must return the pre-append top-8 shape; returning top-9

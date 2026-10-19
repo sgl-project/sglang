@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -11,6 +12,7 @@ from sglang.srt.layers.moe.topk import (
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -273,6 +275,58 @@ class TestSelectExpertsCustomRoutingPadMask(CustomTestCase):
         # ...and real rows untouched (in-range, no -1 leakage).
         self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
         self.assertTrue(torch.all(out.topk_ids[:n_valid] < num_experts))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
+@unittest.skipIf(_IS_HIP, "HIP marks padded rows with zero weights instead")
+class TestSelectExpertsPerRankSharedSlotPadMask(CustomTestCase):
+    """With per-rank fused shared slots, padded rows must leave select_experts
+    fully -1, the appended shared column included. Masking only before the
+    append left them routed ids of -1 - S and a live home-rank shared slot."""
+
+    DEVICE = "cuda"
+
+    def test_padded_tail_masked_after_shared_append(self):
+        num_tokens, num_experts, top_k, n_valid = 12, 256, 8, 9
+        # EP8 rank 3: 32 routed slots per rank, then the rank's shared slot.
+        home_shared_id = 3 * 33 + 32
+        # Grouped sigmoid is masked after routing, sqrtsoftplus by its router.
+        for scoring_func, num_expert_group in (("sigmoid", 8), ("sqrtsoftplus", None)):
+            with self.subTest(scoring_func=scoring_func):
+                g = torch.Generator(device="cpu").manual_seed(0)
+                logits = torch.randn(num_tokens, num_experts, generator=g)
+                bias = 0.1 * torch.randn(num_experts, generator=g)
+                topk_config = TopKConfig(
+                    top_k=top_k + 1,
+                    use_grouped_topk=num_expert_group is not None,
+                    num_expert_group=num_expert_group,
+                    topk_group=4 if num_expert_group else None,
+                    num_fused_shared_experts=1,
+                    correction_bias=bias.to(self.DEVICE),
+                    scoring_func=scoring_func,
+                    routed_scaling_factor=2.5,
+                    allow_routed_experts_capture=False,
+                )
+                with (
+                    patch.object(
+                        topk_mod,
+                        "has_per_rank_fused_shared_slots",
+                        side_effect=lambda num_fused: num_fused > 0,
+                    ),
+                    get_parallel().override(moe_ep_size=8, moe_ep_rank=3),
+                ):
+                    out = topk_mod.select_experts(
+                        hidden_states=torch.empty(num_tokens, 16, device=self.DEVICE),
+                        router_logits=logits.to(self.DEVICE),
+                        topk_config=topk_config,
+                        layer_id=0,
+                        num_token_non_padded=torch.tensor(
+                            n_valid, device=self.DEVICE, dtype=torch.int32
+                        ),
+                    )
+                self.assertTrue(torch.all(out.topk_ids[n_valid:] == -1))
+                self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
+                self.assertTrue(torch.all(out.topk_ids[:n_valid, -1] == home_shared_id))
 
 
 if __name__ == "__main__":
