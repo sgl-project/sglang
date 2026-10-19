@@ -519,6 +519,8 @@ def _fused_norm_rope_kernel(
     )
 
 
+# Not bit-exact with the JIT dsv4 fused_norm_rope_inplace (outputs differ by up to
+# 1 bf16 ulp), so the two are kept separate.
 def fused_norm_rope_inplace_triton(
     kv: torch.Tensor,
     weight: Optional[torch.Tensor],

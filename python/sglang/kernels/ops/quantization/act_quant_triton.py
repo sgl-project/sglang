@@ -83,6 +83,8 @@ def _act_quant_kernel(
     tl.store(s_ptrs, scale, mask=s_mask)
 
 
+# Not bit-exact with per_token_group_quant (1e-4 vs 1e-10 amax floor, x / scale vs
+# x * (448 / amax)), so it is not merged into that op.
 def act_quant(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
