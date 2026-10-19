@@ -163,6 +163,30 @@ def test_extra_cache_schedule(b: int, topk: int, extra_topk: int):
     assert torch.equal(lse.view(torch.int32), ref_lse.view(torch.int32))
 
 
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+def test_schedule_at_shared_memory_boundary(offset):
+    parts = torch.cuda.get_device_properties(0).multi_processor_count
+    b = (48 * 1024 // 4 - 1 - parts * 8) // 5 - offset
+    meta = torch.empty((parts, 8), dtype=torch.int32, device="cuda")
+    splits = torch.empty((b + 1,), dtype=torch.int32, device="cuda")
+    lengths = torch.full((b,), 128, dtype=torch.int32, device="cuda")
+    meta, splits = _ours(meta, splits, lengths, 128)
+    torch.cuda.synchronize()
+    # Each request costs two KV blocks plus five overhead blocks. At these
+    # shapes every partition fits whole requests, so no request is split.
+    payload = (7 * b + parts - 1) // parts + 5
+    assert payload % 7 <= 5
+    per_part = payload // 7
+    expected = []
+    for i in range(parts):
+        begin, end = min(i * per_part, b), min((i + 1) * per_part, b)
+        expected.append([begin, end - 1, int(begin == b), 2, 0, 0, 0])
+    torch.testing.assert_close(
+        meta[:, DEFINED].cpu(), torch.tensor(expected, dtype=torch.int32)
+    )
+    torch.testing.assert_close(splits.cpu(), torch.arange(b + 1, dtype=torch.int32))
+
+
 def test_precompute_skips_oversized_schedule(monkeypatch):
     from types import SimpleNamespace
 

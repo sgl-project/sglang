@@ -63,7 +63,7 @@ The [XPU image tags](https://hub.docker.com/r/lmsysorg/sglang/tags?name=xpu) end
 The image pulling command is like:
 
 ```bash Command
-docker pull lmsysorg/sglang:v0.5.20-xpu
+docker pull lmsysorg/sglang:v0.5.22-xpu
 ```
 
 #### Build from Dockerfile
