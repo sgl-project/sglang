@@ -1,4 +1,5 @@
 import concurrent.futures
+import ctypes
 import struct
 import threading
 import unittest
@@ -10,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
@@ -2400,30 +2402,131 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         ) = target.get_encoder_only_transfer_buf_infos()
         kv_args.kv_layer_ids = target.get_encoder_only_transfer_layer_ids()
 
-    def test_encoder_only_layout_matches_with_dspark_only_on_decode(self):
-        mapping = torch.arange(16)
-        target = _make_dsv4_target(unified=False, mapping=mapping)
+    def test_encoder_only_state_transfer_with_dspark_only_on_decode(self):
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
 
-        prefill_args = KVArgs()
-        decode_args = KVArgs()
+        def make_pool(end):
+            return DeepSeekV4TokenToKVPool(
+                max_num_reqs=4,
+                swa_size=512,
+                c4_size=0,
+                c128_size=0,
+                c4_state_pool_size=0,
+                c128_state_pool_size=0,
+                page_size=256,
+                swa_page_size=256,
+                dtype=torch.float8_e4m3fn,
+                c4_state_dtype=torch.float32,
+                c128_state_dtype=torch.float32,
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                indexer_head_dim=128,
+                layer_num=end,
+                start_layer=0,
+                end_layer=end,
+                device="cpu",
+                enable_memory_saver=False,
+                full_size=512,
+                compression_ratios=[0, 0] + [2] * 18 + [1] * 20,
+                kv_source_layers=[2, 8, 14, 20],
+                kv_layout=KVLayout.V41,
+            )
+
+        prefill_args, decode_args = KVArgs(), KVArgs()
         with get_context().override_server_args(
             dsv41_encoder_only_prefill=True,
             speculative_algorithm=None,
         ):
-            setup_state_kv_args(prefill_args, target, main_kv_only=True)
-            self._fill_transfer_layout(prefill_args, target)
+            prefill = make_pool(21)
+            setup_state_kv_args(prefill_args, prefill, encoder_only=True)
+            self._fill_transfer_layout(prefill_args, prefill)
             prefill_layout = get_dsv41_spec_layout(prefill_args)
         with get_context().override_server_args(
             dsv41_encoder_only_prefill=True,
             speculative_algorithm="DSPARK",
+            speculative_num_draft_tokens=6,
         ):
-            setup_state_kv_args(decode_args, target, main_kv_only=True)
-            self._fill_transfer_layout(decode_args, target)
+            decode = make_pool(40)
+            setup_state_kv_args(decode_args, decode, encoder_only=True)
+            self._fill_transfer_layout(decode_args, decode)
             decode_layout = get_dsv41_spec_layout(decode_args)
-
         self.assertEqual(prefill_layout, decode_layout)
-        self.assertTrue(prefill_layout["encoder_only"])
-        self.assertEqual(prefill_layout["state_types"], [])
+        self.assertEqual(prefill_layout["state_types"], ["swa", "c128_state"])
+        self.assertEqual(
+            prefill_layout["state_layer_ids"], [list(range(20)), [2, 8, 14]]
+        )
+        self.assertNotEqual(
+            prefill.compress_state_pools[2].ring_size,
+            decode.compress_state_pools[2].ring_size,
+        )
+        for i, buf in enumerate(prefill.swa_kv_pool.kv_buffer):
+            buf.fill_(i + 1)
+        for buf in decode.swa_kv_pool.kv_buffer:
+            buf.fill_(0xA5)
+        for i in (2, 8, 14):
+            prefill.compress_state_pools[i].kv_score_buffer.kv_score.fill_(i + 1)
+            decode.compress_state_pools[i].kv_score_buffer.kv_score.fill_(-901)
+
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = prefill_args
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = manager.attn_tp_size = 1
+        manager.state_strides_validated = set()
+        manager.enable_custom_mem_pool = False
+        manager.max_transfer_batch_indices = 0
+        manager.request_status = {7: KVPoll.Transferring}
+
+        def copy_blocks(session_id, blocks):
+            # Replace only the external transport; production code pairs layers,
+            # translates page indices to byte offsets and builds every descriptor.
+            for src, dst, size in blocks:
+                ctypes.memmove(dst, src, size)
+            return 0
+
+        manager._transfer_data = copy_blocks
+        peer = SimpleNamespace(
+            dst_state_data_ptrs=decode_args.state_data_ptrs,
+            dst_state_item_lens=decode_args.state_item_lens,
+            dst_state_dim_per_tensor=decode_args.state_dim_per_tensor,
+            dst_state_layer_ids=decode_args.state_layer_ids,
+            dst_attn_tp_size=1,
+            dst_tp_rank=0,
+        )
+        for coverage in (0, 128, 129, 257):
+            with self.subTest(coverage=coverage):
+                src_pair = prefill.encoder_only_pair_state_transfer_indices(1, coverage)
+                dst_pair = decode.encoder_only_pair_state_transfer_indices(2, coverage)
+                pages = (
+                    np.array([1], dtype=np.int32)
+                    if coverage
+                    else np.empty(0, dtype=np.int32)
+                )
+                dst_pages = pages + 1
+                req = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    room=7,
+                    dst_state_indices=[dst_pages, dst_pair],
+                )
+                with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                    self.assertEqual(
+                        manager.maybe_send_extra(
+                            req, [pages, src_pair], executor, peer
+                        ),
+                        0,
+                    )
+                for i, buf in enumerate(decode.swa_kv_pool.kv_buffer):
+                    expected = i + 1 if i < 20 and coverage else 0xA5
+                    self.assertTrue(torch.all(buf[2] == expected))
+                if len(dst_pair):
+                    for i in (2, 8, 14):
+                        state = decode.compress_state_pools[i]
+                        pending = state.kv_score_buffer.kv_score[
+                            int(dst_pair[0]) * 2 : int(dst_pair[0]) * 2 + 2
+                        ]
+                        self.assertTrue(torch.all(pending == i + 1))
 
     def test_ordinary_dspark_layout_still_requires_transferred_draft_state(self):
         mapping = torch.arange(16)

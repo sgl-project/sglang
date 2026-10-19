@@ -2963,15 +2963,6 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=True,
-                swa_replay_start=(
-                    torch.repeat_interleave(
-                        forward_batch.extend_prefix_lens,
-                        extend_seq_lens.to(torch.int64),
-                        output_size=sum(extend_seq_lens_cpu),
-                    )
-                    if forward_batch.dsv41_cache_only_replay
-                    else None
-                ),
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
                 forward_batch=forward_batch,
             )
@@ -3219,15 +3210,8 @@ class DeepseekV4AttnBackend(
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
             return
-        state_only_replay = forward_batch.dsv41_cache_only_replay
         if forward_batch.encoder_swa_replay:
-            # The transferred ratio-1/2 Main-KV and Indexer-K rows are
-            # authoritative.  Ratio-2 nevertheless has a request-local pending
-            # pair which must be reconstructed by the bounded tail replay for
-            # the next decode token.
-            # Keep the existing non-PD encoder replay read-only. Only the
-            # asymmetric handoff needs to reconstruct the ratio-2 pending pair.
-            run_compressor = state_only_replay and layer.compress_ratio == 2
+            run_compressor = False
         if layer.layer_id == self.tail_source_kv_layer_id:
             run_compressor = False
         meta = self.forward_metadata
@@ -3258,7 +3242,6 @@ class DeepseekV4AttnBackend(
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
-            and not state_only_replay
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
             two_level = self._prefill_graph_two_level()
@@ -3295,7 +3278,6 @@ class DeepseekV4AttnBackend(
                 req,
                 pos,
                 forward_batch,
-                state_only=state_only_replay,
             )
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
@@ -3336,14 +3318,8 @@ class DeepseekV4AttnBackend(
                 rows_per_request=q_lens_cpu,
             )
 
-    def _low_ratio_compress(
-        self, layer, x, req, pos, forward_batch, *, state_only=False
-    ) -> None:
-        if state_only:
-            # Fused compression also publishes Main-KV/Indexer-K. During
-            # cache-only replay those transferred rows must remain untouched.
-            self._low_ratio_compress_torch(layer, x, req, pos, state_only=True)
-        elif forward_batch.forward_mode.is_decode():
+    def _low_ratio_compress(self, layer, x, req, pos, forward_batch) -> None:
+        if forward_batch.forward_mode.is_decode():
             self._low_ratio_compress_decode(layer, x, req, pos)
         elif (
             forward_batch.forward_mode.is_target_verify()
@@ -3387,7 +3363,6 @@ class DeepseekV4AttnBackend(
                     forward_batch.forward_mode.is_target_verify()
                     and layer.compressor.use_fused_compress
                 ),
-                state_only=state_only,
             )
 
     def _low_ratio_in_prefill_graph(self) -> bool:
@@ -3564,7 +3539,6 @@ class DeepseekV4AttnBackend(
         projected=None,
         *,
         fuse_index_store=False,
-        state_only=False,
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]
@@ -3572,8 +3546,6 @@ class DeepseekV4AttnBackend(
         if not num_tokens:
             return
         if layer.compress_ratio == 1:
-            if state_only:
-                return
             self._low_ratio_write_group(
                 layer,
                 kv,
@@ -3591,8 +3563,6 @@ class DeepseekV4AttnBackend(
             pos=pos,
             pad=core.raw_out_loc[:num_tokens] == 0,
         )
-        if state_only:
-            return
         pooled = layer.compressor.pool_pairs(
             torch.stack([partner_kv, kv], dim=1),
             torch.stack([partner_score, score], dim=1),

@@ -303,19 +303,26 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertIsNone(decode_req.kv_receiver)
         self.assertFalse(req.dsv41_cache_only_replay)
 
-    def test_cache_only_handoff_commits_explicit_full_coverage(self):
-        for generated in ([], [10, 11]):
-            with self.subTest(generated=generated):
+    def test_cache_only_handoff_commits_explicit_prefix_coverage(self):
+        for prompt_len, generated in (
+            (3, []),
+            (3, [10, 11]),
+            (257, []),
+            (257, [10, 11]),
+        ):
+            with self.subTest(prompt_len=prompt_len, generated=generated):
                 req = _make_req(terminate_after=99)
+                req.origin_input_ids = list(range(prompt_len))
                 req.output_ids.extend(generated)
-                coverage = len(req.origin_input_ids) + len(generated)
+                input_len = len(req.origin_input_ids) + len(generated)
+                coverage = max(0, input_len - 128)
                 decode_req = _commit_disagg_handoff(
                     req,
                     _make_processor(),
                     0,
                     cache_only=True,
                     coverage=coverage,
-                    expected_coverage=coverage,
+                    expected_coverage=input_len,
                 )
                 self.assertIsNone(decode_req.kv_receiver)
                 self.assertTrue(req.dsv41_cache_only_replay)
@@ -328,7 +335,9 @@ class TestReasoningTokenAccounting(CustomTestCase):
         req.pd_rebootstrap_in_progress = True
         req.pd_rebootstrap_forced_output_id = 12
         req.dsv41_cache_only_replay = True
-        req.dsv41_cache_only_coverage = len(req.origin_input_ids) + len(req.output_ids)
+        req.dsv41_cache_only_coverage = max(
+            0, len(req.origin_input_ids) + len(req.output_ids) - 128
+        )
         req.inflight_middle_chunks = 0
         req.is_retracted = False
         req.beam_group = None

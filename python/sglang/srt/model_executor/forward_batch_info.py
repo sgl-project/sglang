@@ -1093,7 +1093,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
             dsv41_cache_only_replay=batch.dsv41_cache_only_replay,
-            encoder_swa_replay=batch.dsv41_cache_only_replay,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,

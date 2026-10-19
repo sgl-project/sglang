@@ -148,7 +148,7 @@ class TestDSV41EncoderOnlyPrefill(PDDisaggregationServerBase):
         return final
 
     def test_first_handoff_boundaries_and_cold_cache_accounting(self):
-        for prompt_len in (127, 128, 129, 8192):
+        for prompt_len in (127, 128, 129, 255, 256, 257, 8192, 8193):
             with self.subTest(prompt_len=prompt_len):
                 for url in (self.prefill_url, self.decode_url):
                     requests.post(url + "/flush_cache", timeout=30).raise_for_status()

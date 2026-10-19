@@ -382,9 +382,9 @@ def alloc_for_extend(
     if the pool can't satisfy the batch (fail-loud — see its docstring).
     """
     if batch.dsv41_cache_only_replay:
-        # Decode preallocation already owns every prompt slot.  Replay the tail
-        # in place so SWA/request-local state is rebuilt without allocating or
-        # rewriting the req-to-token row.
+        # Decode preallocation owns both transferred prefix and unwritten tail
+        # slots. Extend the tail normally without allocating a second set of
+        # slots or changing the req-to-token row.
         if not all(r.kv.req_pool_idx is not None for r in batch.reqs):
             raise RuntimeError("cache-only replay requires preallocated request slots")
         pin_memory = is_pin_memory_available(batch.device)

@@ -163,6 +163,12 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         swa_start = 895 - tail_len
         radix_key_len = (895 // 64) * 64
         self.assertGreaterEqual(radix_key_len - swa_start, 127)
+        with get_context().override_server_args(
+            dsv41_encoder_only_prefill=True,
+            disaggregation_decode_enable_radix_cache=True,
+        ):
+            # Incoming encoder history precedes the 128 tokens D will extend.
+            self.assertEqual(queue._swa_tail_len(895), 319)
 
     def test_swa_admission_counts_evictable_capacity(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

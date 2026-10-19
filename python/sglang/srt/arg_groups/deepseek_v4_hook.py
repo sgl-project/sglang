@@ -345,6 +345,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("radix sessions", cfg.enable_session_radix_cache),
+            ("KV checksum", cfg.disaggregation_enable_kv_checksum),
             (
                 "speculative decoding except Decode-local DSpark",
                 cfg.speculative_algorithm is not None

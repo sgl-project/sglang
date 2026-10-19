@@ -1098,7 +1098,7 @@ def build_kv_layer_ids(
     draft_token_to_kv_pool,
     num_draft_entries: int,
     num_hidden_layers: int,
-    main_kv_only: bool = False,
+    encoder_only: bool = False,
 ) -> List[int]:
     """Global layer id for every entry in ``kv_args.kv_data_ptrs``.
 
@@ -1115,7 +1115,7 @@ def build_kv_layer_ids(
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if main_kv_only:
+    if encoder_only:
         if draft_token_to_kv_pool is not None or num_draft_entries:
             raise RuntimeError("encoder-only transfer cannot include draft KV")
         if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
@@ -1442,11 +1442,11 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
-def get_kv_transfer_buf_infos(pool, *, main_kv_only: bool = False):
+def get_kv_transfer_buf_infos(pool, *, encoder_only: bool = False):
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
-    if main_kv_only:
+    if encoder_only:
         if not isinstance(pool, DeepSeekV4TokenToKVPool):
             raise RuntimeError(
                 "encoder-only prefill requires a DeepSeek-V4 token-to-KV pool"
@@ -1463,7 +1463,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
-    main_kv_only: bool = False,
+    encoder_only: bool = False,
 ) -> None:
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
@@ -1495,7 +1495,19 @@ def setup_state_kv_args(
         if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         else None
     )
-    if main_kv_only:
+    if encoder_only:
+        if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            raise RuntimeError(
+                "encoder-only state transfer requires a DeepSeek-V4 pool"
+            )
+        swa, pairs = token_to_kv_pool.get_encoder_only_state_buf_infos()
+        for state_type, (ptrs, lens, items, layer_ids) in (
+            (StateType.SWA, swa),
+            (StateType.DSV4_REQUEST_STATE, pairs),
+        ):
+            append_state_component(
+                kv_args, state_type, ptrs, lens, items, layer_ids=layer_ids
+            )
         return
 
     def append_dsa_tail(pool) -> None:
@@ -1894,7 +1906,7 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    expected_swa_components = 0 if encoder_only else 2
+    expected_swa_components = 1 if encoder_only else 2
     if kv_args.state_types.count(StateType.SWA) != expected_swa_components:
         raise RuntimeError(
             "DeepSeek-V4.1 DSpark PD state layout mismatch: "
@@ -1911,7 +1923,9 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
-    if not encoder_only:
+    if encoder_only:
+        layout["state_layer_ids"] = [list(ids) for ids in kv_args.state_layer_ids]
+    else:
         # Ordinary DSpark PD transfers draft state, so its block width is part
         # of the wire contract. Encoder-only PD reconstructs draft state on D
         # and deliberately allows P to run without any speculative worker.

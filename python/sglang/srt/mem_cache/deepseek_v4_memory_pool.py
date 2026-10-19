@@ -1473,6 +1473,48 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
         return infos
 
+    def get_encoder_only_state_buf_infos(self):
+        """Encoder SWA and source pending-pair rings, with global layer ids.
+
+        The last source is a minimal producer on P: its compressor state is
+        needed on D, but its SWA (and every decoder layer's SWA) is unwritten.
+        Both peers register exactly the same subset, independent of draft state.
+        """
+        self._validate_encoder_only_transfer_profile()
+        boundary = max(self.kv_source_layers)
+        swa = ([], [], [], [])
+        pairs = ([], [], [], [])
+        pool = self.swa_kv_pool
+        pages_per_item = self.swa_page_size // pool.page_size
+        for local_id, buf in enumerate(pool.kv_buffer):
+            layer_id = self._stage_start + local_id
+            if layer_id >= boundary:
+                continue
+            swa[0].append(buf.data_ptr())
+            swa[1].append(buf.nbytes)
+            swa[2].append(buf[0].nbytes * pages_per_item)
+            swa[3].append(layer_id)
+        for layer_id in self.sources_by_ratio.get(2, ()):
+            state = self.compress_state_pools[layer_id]
+            buf = state.kv_score_buffer.kv_score
+            pairs[0].append(buf.data_ptr())
+            pairs[1].append(buf.nbytes)
+            # Transfer a single two-token pair, so P and a DSpark D may use
+            # different ring widths without changing the wire stride.
+            pairs[2].append(buf[0].nbytes * 2)
+            pairs[3].append(layer_id)
+        return swa, pairs
+
+    def encoder_only_pair_state_transfer_indices(self, req_pool_idx: int, seq_len: int):
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+            request_scoped_state_transfer_indices,
+        )
+
+        state = self.compress_state_pools[self.sources_by_ratio[2][0]]
+        return request_scoped_state_transfer_indices(
+            req_pool_idx, seq_len, ratio=2, online=False, ring_size=state.ring_size
+        )
+
     def get_encoder_only_transfer_layer_ids(self) -> List[int]:
         """Layer ids aligned with :meth:`get_encoder_only_transfer_buf_infos`."""
         self._validate_encoder_only_transfer_profile()

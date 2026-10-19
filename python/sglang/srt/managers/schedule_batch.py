@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.constants import DSV41_REPLAY_WINDOW
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -1047,6 +1048,18 @@ class ReqKvInfo:
         self.component_evicted_seqlens.clear()
 
 
+def prefill_input_len(req: Req) -> int:
+    """Scheduled input end; encoder-only P leaves the final window for D.
+
+    Keep the original tokens intact for bootstrap, accounting and Engram history.
+    On rebootstrap, P receives the effective prompt including emitted tokens.
+    """
+    disagg = get_disagg()
+    if disagg.dsv41_encoder_only_prefill and disagg.disaggregation_mode == "prefill":
+        return max(0, len(req.origin_input_ids) - DSV41_REPLAY_WINDOW)
+    return len(req.full_untruncated_fill_ids)
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -1119,8 +1132,8 @@ class Req(ReqDllmMixin):
         # transfers cache without a sampled handoff token.
         self.dsv41_cache_only_replay = False
         # Explicit number of prompt tokens covered by the P-side global cache.
-        # The initial contract requires full-prompt coverage, but keeping H on
-        # the wire prevents D from inferring it from the request length.
+        # P covers [0, N - window); D checks this boundary before extending.
+        # Keep it explicit on the wire rather than inferring a successful transfer.
         self.dsv41_cache_only_coverage = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by refresh_fill_ids; admission only updates
@@ -1722,7 +1735,7 @@ class Req(ReqDllmMixin):
         else:
             self.refresh_fill_ids()
 
-        input_len = len(self.full_untruncated_fill_ids)
+        input_len = prefill_input_len(self)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.

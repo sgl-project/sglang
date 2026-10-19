@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     compute_dspark_window_gather,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Compressor
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
@@ -397,7 +398,7 @@ class TestDSV41CacheOnlyReplayAllocation(CustomTestCase):
 
 
 class TestReplayPairStateIsolation(CustomTestCase):
-    def test_cache_only_metadata_floors_each_request_at_replay_start(self):
+    def test_handoff_metadata_keeps_encoder_history_visible(self):
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.req_to_token = torch.empty(0)
         backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
@@ -423,21 +424,16 @@ class TestReplayPairStateIsolation(CustomTestCase):
         for cache_only in (False, True):
             with self.subTest(cache_only=cache_only):
                 batch.dsv41_cache_only_replay = cache_only
-                batch.encoder_swa_replay = cache_only
+                batch.encoder_swa_replay = False
                 metadata = backend._build_forward_metadata(batch)
-                floor = metadata["swa_replay_start"]
-                if cache_only:
-                    self.assertEqual(floor.tolist(), [129] * 128 + [384] * 128)
-                else:
-                    self.assertIsNone(floor)
+                self.assertIsNone(metadata.get("swa_replay_start"))
 
-    def test_only_cache_only_replay_rebuilds_pending_pair(self):
-        """Non-PD replay stays read-only; cache-only replay never rewrites global KV."""
-        override = get_context().override_server_args()
-        override.install()
-        self.addCleanup(override.restore)
-        for cache_only, ratio, fused in product((False, True), (1, 2), (False, True)):
-            with self.subTest(cache_only=cache_only, ratio=ratio, fused=fused):
+    def test_tail_compression_continues_transferred_pending_pair(self):
+        """A split at an odd prefix length must consume P's pending even token."""
+        with get_context().override_server_args():
+            x = torch.arange(2 * 385, dtype=torch.float32).reshape(385, 2)
+
+            def make_backend():
                 state = CompressStatePool(
                     size=4,
                     ring_size=2,
@@ -450,60 +446,84 @@ class TestReplayPairStateIsolation(CustomTestCase):
                     request_scoped=True,
                 )
                 state.kv_score_buffer.clear()
-                before = state.kv_score_buffer.clone()
                 backend = object.__new__(DeepseekV4AttnBackend)
                 backend.low_ratios = ()
                 backend.tail_source_kv_layer_id = None
-                backend.forward_metadata = SimpleNamespace(
-                    low_ratio_req_indices=torch.tensor([0]),
-                    low_ratio_pos_i64=torch.tensor([126]),
-                    core_metadata=SimpleNamespace(raw_out_loc=torch.tensor([1])),
-                )
                 backend.token_to_kv_pool = SimpleNamespace(
                     get_attention_compress_states=lambda _: state
                 )
-                # A global-store dispatch is forbidden even when fused compress
-                # is enabled. These mocks fail before any GPU kernel can run.
-                backend._low_ratio_compress_fused = MagicMock(
-                    side_effect=AssertionError("global fused store")
-                )
-                backend._low_ratio_write_group = MagicMock(
-                    side_effect=AssertionError("global KV store")
-                )
-                layer = SimpleNamespace(
-                    layer_id=2,
-                    compress_ratio=ratio,
-                    indexer=None,
-                    compressor=SimpleNamespace(
-                        use_fused_compress=fused,
-                        project=lambda x: (x, torch.ones_like(x)),
+                written = {}
+
+                def store(layer, kv, slots, pos, **kwargs):
+                    for slot, row in zip(slots.tolist(), kv):
+                        if slot > 0:
+                            written[slot] = row.clone()
+
+                backend._low_ratio_write_group = store
+                return backend, state, written
+
+            layer = SimpleNamespace(
+                layer_id=20,
+                compress_ratio=2,
+                indexer=None,
+                compressor=SimpleNamespace(
+                    use_fused_compress=False,
+                    project=lambda rows: (rows, torch.ones_like(rows)),
+                    pool_pairs=DeepseekV41Compressor.pool_pairs,
+                ),
+            )
+
+            def run(backend, start, end, *, replay=False):
+                pos = torch.arange(start, end)
+                backend.forward_metadata = SimpleNamespace(
+                    low_ratio_req_indices=torch.zeros_like(pos),
+                    low_ratio_pos_i64=pos,
+                    core_metadata=SimpleNamespace(
+                        raw_out_loc=pos + 1,
+                        c2_out_loc=torch.where(pos % 2 == 1, pos // 2 + 1, -1),
                     ),
                 )
                 fb = SimpleNamespace(
                     forward_mode=ForwardMode.EXTEND,
-                    encoder_swa_replay=True,
-                    dsv41_cache_only_replay=cache_only,
+                    encoder_swa_replay=replay,
+                    dsv41_cache_only_replay=not replay,
                     attn_cp_metadata=None,
                     extend_start_loc=torch.tensor([0]),
-                    extend_seq_lens=torch.tensor([1]),
+                    extend_seq_lens=torch.tensor([end - start]),
                 )
-                x = torch.tensor([[3.0, 4.0]])
                 backend.forward_low_ratio_sources(
                     layer=layer,
-                    x=x,
+                    x=x[start:end],
                     q_lora=None,
-                    positions=torch.tensor([126]),
+                    positions=pos,
                     forward_batch=fb,
                     run_indexer=False,
                 )
-                if cache_only and ratio == 2:
-                    pending = state.get_state_by_state_loc(torch.tensor([0]))
-                    self.assertTrue(torch.equal(pending.kv, x))
-                    self.assertTrue(torch.equal(pending.score, torch.ones_like(x)))
-                else:
-                    self.assertTrue(
-                        torch.equal(state.kv_score_buffer.kv_score, before.kv_score)
+
+            reference, ref_state, expected = make_backend()
+            run(reference, 0, len(x))
+            for boundary in (1, 2, 127, 128, 129, 257):
+                with self.subTest(boundary=boundary):
+                    prefill, p_state, prefix = make_backend()
+                    run(prefill, 0, boundary)
+                    decode, d_state, actual = make_backend()
+                    # Production transfer copies the request-scoped ring verbatim.
+                    d_state.kv_score_buffer.kv_score.copy_(
+                        p_state.kv_score_buffer.kv_score
                     )
+                    actual.update(prefix)
+                    run(decode, boundary, len(x))
+                    self.assertEqual(actual.keys(), expected.keys())
+                    for slot in expected:
+                        torch.testing.assert_close(actual[slot], expected[slot])
+                    torch.testing.assert_close(
+                        d_state.kv_score_buffer.kv_score,
+                        ref_state.kv_score_buffer.kv_score,
+                    )
+                    # Ordinary encoder replay remains read-only.
+                    before = d_state.kv_score_buffer.kv_score.clone()
+                    run(decode, boundary, len(x), replay=True)
+                    torch.testing.assert_close(d_state.kv_score_buffer.kv_score, before)
 
 
 HEAD_DIM = 512

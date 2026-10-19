@@ -551,6 +551,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return max(seq_len, 0)
 
         window_size = self.scheduler.sliding_window_size
+        if get_disagg().dsv41_encoder_only_prefill and window_size:
+            # Retain encoder history before S as well as the tail D will write.
+            window_size += DSV41_REPLAY_WINDOW
         if window_size is None or window_size <= 0:
             return seq_len
 
@@ -592,7 +595,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
-        main_kv_only = get_disagg().dsv41_encoder_only_prefill
+        encoder_only = get_disagg().dsv41_encoder_only_prefill
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -611,7 +614,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else self.token_to_kv_pool
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(
-            transfer_kv_pool, main_kv_only=main_kv_only
+            transfer_kv_pool, encoder_only=encoder_only
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
@@ -630,7 +633,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None and not main_kv_only:
+        if self.draft_token_to_kv_pool is not None and not encoder_only:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -649,11 +652,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
             draft_token_to_kv_pool=(
-                None if main_kv_only else self.draft_token_to_kv_pool
+                None if encoder_only else self.draft_token_to_kv_pool
             ),
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
-            main_kv_only=main_kv_only,
+            encoder_only=encoder_only,
         )
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
@@ -666,10 +669,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            None if main_kv_only else self.draft_token_to_kv_pool,
+            None if encoder_only else self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
-            main_kv_only=main_kv_only,
+            encoder_only=encoder_only,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1623,9 +1626,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
+            transfer_end = (
+                max(0, origin_input_len - DSV41_REPLAY_WINDOW)
+                if get_disagg().dsv41_encoder_only_prefill
+                else origin_input_len
+            )
             raw_kv_indices = self.req_to_token_pool.req_to_token[
                 decode_req.req.kv.req_pool_idx
-            ][total_prefix_len:origin_input_len]
+            ][total_prefix_len:transfer_end]
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
@@ -1643,7 +1651,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     )
                 )
 
-            seq_len = origin_input_len
+            seq_len = transfer_end
 
             def _mamba_payload():
                 return [
@@ -1714,6 +1722,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return ring_rows.astype(np.int32)
 
             def _request_state_payload():
+                if get_disagg().dsv41_encoder_only_prefill:
+                    return (
+                        self.token_to_kv_pool.encoder_only_pair_state_transfer_indices(
+                            int(decode_req.req.kv.req_pool_idx), seq_len
+                        )
+                    )
                 return self.token_to_kv_pool.request_state_transfer_indices(
                     int(decode_req.req.kv.req_pool_idx), seq_len
                 )
@@ -2628,7 +2642,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_token_counts_ready = True
         if cache_only:
             coverage = int(cached_tokens[CACHE_ONLY_COVERAGE_SLOT].item())
-            expected_coverage = decode_req.req.kv.kv_committed_len
+            input_end = decode_req.req.kv.kv_committed_len
+            expected_coverage = (
+                max(0, input_end - DSV41_REPLAY_WINDOW)
+                if input_end is not None
+                else None
+            )
             if (
                 expected_coverage is None
                 or coverage < 0
@@ -2638,7 +2657,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     "Invalid DeepSeek-V4.1 cache-only coverage: "
                     f"request={decode_req.req.rid} coverage={coverage} "
                     f"expected_coverage={expected_coverage}; the current handoff "
-                    "requires full preallocated-sequence coverage"
+                    "requires prefix coverage ending one window before the input end"
                 )
                 logger.error(error_msg)
                 prepare_abort(
@@ -3417,21 +3436,21 @@ class SchedulerDisaggregationDecodeMixin:
                 can_run_list.append(req)
                 if cache_only_batch:
                     coverage = req.dsv41_cache_only_coverage
-                    expected_coverage = req.kv.kv_committed_len
+                    end = req.kv.kv_committed_len
+                    expected_coverage = max(0, end - DSV41_REPLAY_WINDOW)
                     if coverage != expected_coverage:
                         raise RuntimeError(
-                            "cache-only replay requires explicit full-sequence "
+                            "cache-only handoff requires explicit prefix "
                             f"coverage: request={req.rid} coverage={coverage} "
                             f"expected_coverage={expected_coverage}"
                         )
-                    end = coverage
                     if len(req.full_untruncated_fill_ids) < end:
                         raise RuntimeError(
                             "cache-only replay input is shorter than coverage: "
                             f"request={req.rid} fill_len="
                             f"{len(req.full_untruncated_fill_ids)} coverage={coverage}"
                         )
-                    start = max(0, coverage - DSV41_REPLAY_WINDOW)
+                    start = coverage
                     row = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx]
                     req.prefix_indices = row[:start].clone()
                     req.prefix_len = start

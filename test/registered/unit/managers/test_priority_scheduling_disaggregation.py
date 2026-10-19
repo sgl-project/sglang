@@ -1136,7 +1136,7 @@ class TestDecodePrebuilt(CustomTestCase):
             (129, 0, 0),
             (8192, 0, 0),
             (8192, 0, 4096),
-            (8192, 0, 8192),
+            (8192, 0, 7936),
             (200, 20, 0),
         ):
             with self.subTest(
@@ -1158,7 +1158,7 @@ class TestDecodePrebuilt(CustomTestCase):
                     kv_committed_len=coverage,
                 )
                 req.dsv41_cache_only_replay = True
-                req.dsv41_cache_only_coverage = coverage
+                req.dsv41_cache_only_coverage = max(0, coverage - 128)
                 req.cached_tokens = req.already_computed = p_cached
                 req.cached_tokens_device = p_cached // 2
                 req.cached_tokens_host = p_cached - req.cached_tokens_device
