@@ -20,13 +20,13 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::{AppContext, ChatRouting};
 use sgl_router::state::kv_events::KvEventIndex;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
+use sgl_router::workers::{DecodeGate, EngineProfile, WireProtocol, WorkerRegistry};
 use sglang_api_types::runtime::v1 as proto;
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::body::Body as GrpcBody;
 use tonic::server::{Grpc, NamedService, ServerStreamingService, UnaryService};
@@ -461,6 +461,42 @@ async fn pd_legs_share_one_bootstrap_room() {
             p.rid.is_some() && p.rid == d.rid,
             "both legs carry the router's rid"
         );
+    }
+}
+
+#[tokio::test]
+async fn decode_dispatch_limit_gates_decode_as_over_http() {
+    let prefill = MockEngine::default()
+        .stream("ChatComplete", |_: proto::OpenAiRequest| {
+            stream::once(async {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                Ok(chunk("{}", true, None))
+            })
+            .boxed()
+        })
+        .start()
+        .await;
+    let reply = vec![chunk("{}", true, None)];
+    let decode = MockEngine::default()
+        .stream("ChatComplete", openai_rpc(&Seen::new(), reply))
+        .start()
+        .await;
+    for (streaming, waits) in [(false, true), (true, false)] {
+        let mut ctx = router_ctx(&[
+            (WorkerMode::Prefill, "http://127.0.0.1:1", Some(prefill)),
+            (WorkerMode::Decode, "http://127.0.0.1:2", Some(decode)),
+        ]);
+        Arc::get_mut(&mut ctx).unwrap().decode_gate = DecodeGate::new(std::num::NonZeroU32::new(1));
+        let client = serve_grpc(ctx).await;
+        let call = |mut client: SglangServiceClient<Channel>| async move {
+            collect(client.chat_complete(openai(chat(streaming))).await)
+                .await
+                .unwrap()
+        };
+        let start = Instant::now();
+        futures::future::join(call(client.clone()), call(client)).await;
+        let waited = start.elapsed() >= Duration::from_millis(700);
+        assert_eq!(waited, waits, "streaming={streaming}");
     }
 }
 
