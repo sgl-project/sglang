@@ -971,6 +971,8 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
+    SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
@@ -1022,6 +1024,10 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
+    SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
+    # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
+    SGLANG_MLA_HCA_KV_SPLITS = EnvInt(4)
 
     # ===================================================================
     # Apple Silicon and MLX
@@ -1080,7 +1086,6 @@ class Envs:
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
-    SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
@@ -1268,7 +1273,6 @@ class Envs:
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
-    SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
@@ -1333,10 +1337,6 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
-    # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
-    # by the model-specific dispatcher configuration; all other paths retain
-    # their existing behavior.
-    SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default

@@ -30,6 +30,9 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
+    # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
+    # DSpark draft's SWA valid-from.
+    REQUEST_ROW = "request_row"
     # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
     # K/V, one component per sub-pool so each carries the index payload of the
     # KV it describes (whole sequence for full attention, window for SWA).

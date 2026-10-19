@@ -1,21 +1,18 @@
-"""Triton sparse MLA decode kernel with FP8 and BF16 KV cache support.
+"""Triton sparse MLA decode with FP8 and BF16 KV cache support.
 
-Adapted from aiter's unified_attention_sparse_mla kernel for DSA shapes:
+Decode-tuned launcher for the fused / split-K kernels of ``triton_sparse_mla``
+on DSA shapes:
   q:       [bs, H, DIM]     fp8/bf16 (DIM=576 = D_V+D_TAIL)
   kv:      [num_pages, 1, DIM]  fp8/bf16
   indices: [bs, 1, topk]    int32
   output:  [1, bs, H, D_V]  bf16
-
-Two variants:
-  1. Base: single-pass per-token kernel (adapted from aiter)
-  2. Split-K: adaptive split-K with fused fast path (adapted from DSv4)
 """
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+    _FP8_MAX,
+    _LOG2E,
     _PREFERRED_BLOCK_K,
     _cu_count,
     _gfx950_sparse_mla_kv_splits,
@@ -28,14 +25,11 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _reduce_d_chunk,
     _row_strides,
     _sparse_mla_block_k,
+    _sparse_mla_fused_kernel,
     _sparse_mla_reduce_kernel,
+    _sparse_mla_split_k_kernel,
     _validate_input_dtypes,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-
-_IS_FNUZ = is_fp8_fnuz()
-_FP8_MAX = 240.0 if _IS_FNUZ else 448.0
-_G = tl.constexpr(128)
 
 _SplitKWorkspace = list[tuple[torch.Tensor, torch.Tensor]]
 _splitk_bufs: dict[tuple[torch.device, int], _SplitKWorkspace] = {}
@@ -85,9 +79,6 @@ def _get_splitk_bufs(
 # ---------------------------------------------------------------------------
 # Split-K kernel (adapted from DSv4 paged_decode.py)
 # ---------------------------------------------------------------------------
-
-LOG2E = 1.4426950408889634
-
 
 @triton.jit
 def _sparse_mla_decode_fused_kernel(
@@ -606,7 +597,7 @@ def triton_sparse_mla_decode_splitk(
     else:
         kv_splits = min(kv_splits, max_kv_splits)
 
-    qk_scale = float(sm_scale) * LOG2E
+    qk_scale = float(sm_scale) * _LOG2E
     lse = (
         torch.empty(bs, H, device=q_nope.device, dtype=torch.float32)
         if return_lse
@@ -619,10 +610,11 @@ def triton_sparse_mla_decode_splitk(
             fused_num_warps = _gfx950_sparse_mla_num_warps(base_ctas, 1, num_cu)
         out = torch.empty(bs, H, d_v, device=q_nope.device, dtype=torch.bfloat16)
         with _no_async_copy():
-            _sparse_mla_decode_fused_kernel[(bs, n_head_blocks)](
+            _sparse_mla_fused_kernel[(bs, n_head_blocks)](
                 q_nope,
                 q_rope,
                 kv,
+                idx_flat,
                 idx_flat,
                 out,
                 qk_scale,
@@ -638,6 +630,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_T=stride_qr_t,
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
+                USE_TOPK_LENGTH=False,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (
@@ -674,7 +667,7 @@ def triton_sparse_mla_decode_splitk(
 
     grid_split = (bs, n_head_blocks, kv_splits)
     with _no_async_copy():
-        _sparse_mla_decode_split_kernel[grid_split](
+        _sparse_mla_split_k_kernel[grid_split](
             q_nope,
             q_rope,
             kv,
