@@ -520,21 +520,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
-        req = self._make_req(req_to_token_pool)
         input_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 1)
-        req.origin_input_ids = array("q", input_ids)
-        req.output_ids = array("q", output_ids)
-        kv_len = len(input_ids) + len(output_ids)
-        kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv.kv_committed_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
-        req.full_untruncated_fill_ids = array("q", input_ids + output_ids)
-        req.extend_end = len(req.full_untruncated_fill_ids)
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, input_ids, output_ids
+        )
+        kv_len = req.extend_end
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -570,22 +561,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
 
-        req = self._make_req(req_to_token_pool)
         prompt_ids = self._make_seq(1, 3)
         output_ids = self._make_seq(2000, 7)
-        req.origin_input_ids = array("q", prompt_ids)
-        req.output_ids = array("q", output_ids)
-        req.full_untruncated_fill_ids = array("q", prompt_ids + output_ids)
-        req.extend_end = len(req.full_untruncated_fill_ids)
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, prompt_ids, output_ids, allocated=True
+        )
         kv_len = req.extend_end
-        kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv.kv_committed_len = kv_len
-        req.kv.kv_allocated_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
             if self.cfg.enable_mamba_extra_buffer:
@@ -633,21 +614,11 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
     def test_release_without_insert(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 2)
-        req.origin_input_ids = array("q", tokens)
-        req.output_ids = array("q")
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, tokens, allocated=True
+        )
         kv_len = len(tokens)
-        kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv.kv_committed_len = kv_len
-        req.kv.kv_allocated_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
 
         avail_before = allocator.available_size()
         release_kv_cache(req, cache, checkpoint=False)
@@ -660,20 +631,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
     def test_checkpoint_mid_flight(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 3)
-        req.origin_input_ids = array("q", tokens)
-        req.output_ids = array("q")
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
         kv_len = len(tokens)
-        kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv.kv_committed_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -697,23 +657,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         full_avail = allocator.full_attn_allocator.available_size()
         swa_avail = allocator.swa_attn_allocator.available_size()
 
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 8)
         # Live SWA is [6, 8): two tokens, below the window of four.
         evicted_len = 6
-        req.origin_input_ids = array("q", tokens)
-        req.output_ids = array("q")
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
-        kv_indices = self._alloc(allocator, len(tokens))
-        req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        req, kv_indices = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, tokens
         )
-        req.kv.kv_committed_len = len(tokens)
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
         # The window already slid past [0, 6): those SWA slots are freed.
         allocator.free_swa(kv_indices[:evicted_len])
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
@@ -750,22 +699,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
     def test_swa_unfinished_req_preserves_existing_eviction_boundary(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, 8)
         evicted_len = 4
-        req.origin_input_ids = array("q", tokens)
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
-        kv_indices = self._alloc(allocator, len(tokens))
-        req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
-        )
-        req.kv.kv_committed_len = len(tokens)
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
         req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
 
         cache.checkpoint(req, up_to=req.extend_end)
@@ -850,19 +786,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         tail_extra = ps // 2
         input_ids = self._make_seq(1, 1) + list(range(8000, 8000 + tail_extra))
-        req = self._make_req(req_to_token_pool)
-        req.origin_input_ids = array("q", input_ids)
-        req.output_ids = array("q")
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, input_ids)
         kv_len = len(input_ids)
-        kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv.kv_committed_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
-        req.full_untruncated_fill_ids = array("q", input_ids)
-        req.extend_end = len(req.full_untruncated_fill_ids)
         if self.cfg.has_mamba:
             req.kv.mamba_last_track_seqlen = kv_len
 
@@ -947,19 +872,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNone(node_device_value(cache, last_device_node, ComponentType.SWA))
 
         lock_result = cache.inc_lock_ref(last_device_node)
-        req = self._make_req(req_to_token_pool)
-        req.origin_input_ids = array("q", tokens)
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
-        kv_len = len(tokens)
-        fresh_value = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), fresh_value)
-        req.kv.kv_committed_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
         req.kv.set_evicted_seqlen(ComponentType.SWA, 0)
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
@@ -1464,19 +1377,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         pre_len = 20
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, pre_len)
-        req.origin_input_ids = tokens
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
-        kv_indices = self._alloc(allocator, pre_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
-        req.kv.kv_committed_len = pre_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
 
         swa_avail_before = allocator.swa_attn_allocator.available_size()
 
@@ -1548,19 +1450,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         cushion = self.cfg.sliding_window_size + self.cfg.page_size  # = 5
         pre_len = cushion  # exactly at the boundary, nothing slid out
-        req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, pre_len)
-        req.origin_input_ids = tokens
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
-        kv_indices = self._alloc(allocator, pre_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, pre_len)), kv_indices)
-        req.kv.kv_committed_len = pre_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
+        req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.checkpoint(req, up_to=req.extend_end)

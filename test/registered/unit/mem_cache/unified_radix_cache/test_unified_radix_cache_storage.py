@@ -1119,22 +1119,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._init_buffer_hicache(cache, storage_dir)
         cache.tree_core.write_through_threshold = 1  # the write_through trigger
 
-        req = self._make_req(req_to_token_pool)
         prompt = self._make_seq(1, 6)
         output = self._make_seq(3000, 4)
-        req.origin_input_ids = array("q", prompt)
-        req.output_ids = array("q", output)
-        req.full_untruncated_fill_ids = array("q", prompt + output)
-        req.extend_end = len(prompt) + len(output)
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, prompt, output, allocated=True
+        )
         kv_len = req.extend_end
-        kv_indices = self._alloc(allocator, kv_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
-        req.kv.kv_committed_len = kv_len
-        req.kv.kv_allocated_len = kv_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
         finish_req(cache, req, kv_len)
 
         leaf = match_prefix(cache, prompt + output).last_device_node

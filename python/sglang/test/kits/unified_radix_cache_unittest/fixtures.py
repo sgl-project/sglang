@@ -351,6 +351,36 @@ class UnifiedRadixCacheFixtures:
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
 
+    def _make_inflight_req(
+        self,
+        cache,
+        allocator,
+        req_to_token_pool,
+        input_ids,
+        output_ids=(),
+        *,
+        allocated=False,
+    ):
+        """A request whose input and output KV sits in its own slots, committed
+        but not yet in the tree. Returns the request and those slots."""
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", input_ids)
+        req.output_ids = array("q", output_ids)
+        req.full_untruncated_fill_ids = array("q", [*input_ids, *output_ids])
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        kv_indices = self._alloc(allocator, req.extend_end)
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, req.extend_end)), kv_indices
+        )
+        req.kv.kv_committed_len = req.extend_end
+        if allocated:
+            req.kv.kv_allocated_len = req.extend_end
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        return req, kv_indices
+
     def _insert(
         self,
         cache,
