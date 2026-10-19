@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -40,6 +41,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     ASCEND_TP = "ascend_tp"
+    ASCEND_OPS = "ascend_ops"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
     DEEPEP_V2 = "deepep_v2"
@@ -77,6 +79,9 @@ class MoeA2ABackend(Enum):
     def is_ascend_tp(self):
         return self == MoeA2ABackend.ASCEND_TP
 
+    def is_ascend_ops(self):
+        return self == MoeA2ABackend.ASCEND_OPS
+
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
@@ -105,6 +110,64 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MOONCAKE,
             MoeA2ABackend.NIXL,
             MoeA2ABackend.MORI,
+        )
+
+
+@dataclass
+class AscendOpsConfig:
+    """Configuration for the ``ascend_ops`` MoE A2A backend.
+
+    Selects the prefill and decode execution paths:
+    - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
+      or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
+    - ``decode``: ``low_latency`` (discrete init_routing -> gmm -> activation ->
+      gmm -> finalize_routing) or ``fused_op`` (single dispatch_ffn_combine).
+    """
+
+    PREFILL_CHOICES = ("allgather", "alltoallv")
+    DECODE_CHOICES = ("low_latency", "fused_op")
+
+    prefill: str = "alltoallv"
+    decode: str = "low_latency"
+
+    def __post_init__(self) -> None:
+        if self.prefill not in self.PREFILL_CHOICES:
+            raise ValueError(
+                f"invalid ascend-ops-config prefill mode {self.prefill!r}; "
+                f"expected one of {self.PREFILL_CHOICES}"
+            )
+        if self.decode not in self.DECODE_CHOICES:
+            raise ValueError(
+                f"invalid ascend-ops-config decode mode {self.decode!r}; "
+                f"expected one of {self.DECODE_CHOICES}"
+            )
+
+    @classmethod
+    def from_json_str(cls, s: Optional[str]) -> "AscendOpsConfig":
+        """Parse ``--ascend-ops-config`` JSON into a validated config.
+
+        ``None`` or an empty string returns the defaults. Unknown keys or an
+        invalid mode raise ``ValueError``.
+        """
+        if s is None or not s.strip():
+            return cls()
+        try:
+            data = json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"ascend-ops-config is not valid JSON: {s!r}") from exc
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"ascend-ops-config must be a JSON object, got {type(data).__name__}"
+            )
+        unknown = set(data) - {"prefill", "decode"}
+        if unknown:
+            raise ValueError(
+                f"ascend-ops-config has unknown keys {sorted(unknown)}; "
+                f"only 'prefill' and 'decode' are supported"
+            )
+        return cls(
+            prefill=data.get("prefill", cls.prefill),
+            decode=data.get("decode", cls.decode),
         )
 
 
@@ -490,6 +553,7 @@ def initialize_moe_config():
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
+    moe.ascend_ops_config = AscendOpsConfig.from_json_str(exec_moe.ascend_ops_config)
     moe.tbo_enabled = overlap.enable_two_batch_overlap
     moe.sbo_enabled = overlap.enable_single_batch_overlap
     if moe.sbo_enabled and is_cuda():
@@ -661,6 +725,14 @@ def get_deepep_config() -> str:
         logger.warning("DEEPEP_CONFIG is not initialized, using default config")
         moe.deepep_config = ""
     return moe.deepep_config
+
+
+def get_ascend_ops_config() -> AscendOpsConfig:
+    """Return the validated ``ascend_ops`` configuration for the active scope."""
+    moe = get_flags().moe
+    if moe.ascend_ops_config is None:
+        moe.ascend_ops_config = AscendOpsConfig()
+    return moe.ascend_ops_config
 
 
 def is_tbo_enabled() -> bool:

@@ -1,11 +1,13 @@
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
+    AscendOpsConfig,
     DeepEPMode,
     MoeA2ABackend,
     MoeRunnerBackend,
     can_merge_post_experts_all_reduce,
     deferred_post_experts_all_reduce,
     get_deepep_config,
+    get_ascend_ops_config,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -26,6 +28,7 @@ from sglang.srt.layers.moe.utils import (
 
 __all__ = [
     "DeepEPMode",
+    "AscendOpsConfig",
     "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
@@ -49,4 +52,5 @@ __all__ = [
     "is_tbo_enabled",
     "get_tbo_token_distribution_threshold",
     "get_deepep_config",
+    "get_ascend_ops_config",
 ]
