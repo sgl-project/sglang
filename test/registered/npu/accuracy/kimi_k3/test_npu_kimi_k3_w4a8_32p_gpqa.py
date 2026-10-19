@@ -4,7 +4,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
     TestNpuAccuracyMultiNodePdMixTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME, check_role
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
@@ -141,19 +141,13 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     }
     timeout = 10000
     seed = 42
-    # Perf baselines read by assert_metrics; this accuracy case sets none.
-    tpot = None
-    output_token_throughput = None
-    ttft = None
-    mean_e2e_latency = None
-    # L2 (host) hit-rate threshold (%) checked by assert_metrics.
+    tpot = ttft = mean_e2e_latency = output_token_throughput = None
     host_hit_rate = 10
 
     def test_npu_kimi_k3_w4a8_32p_gpqa(self):
         """Run NPU accuracy test for Kimi-K3-w4a8 32p four nodes on gpqa_diamond"""
         self.run_accuracy()
 
-    @check_role(allowed_roles=["master"])
     def test_npu_kimi_k3_w4a8_32p_l2_host_hit_rate(self):
         """Run the 64k GSP bench; assert_metrics checks the host hit rate"""
         # 3 groups x 32 prompts share a 57600-token prefix (64k * 0.9), which
