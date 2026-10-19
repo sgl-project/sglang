@@ -147,10 +147,13 @@ jobs:
             printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
           } >> "$GITHUB_ENV"
 
-      - name: Checkout the pinned source revision
+      # Same ref as check-changes. build_and_test.sh rejects any HEAD other than
+      # PPU_CI_SOURCE_SHA, so a workflow_call branch that moves after
+      # check-changes fails the run instead of building different code.
+      - name: Checkout the triggering source revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.check-changes.outputs.source-sha }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
       - name: Build native SAIL wheels
@@ -208,11 +211,13 @@ jobs:
             printf 'PPU_CI_ARTIFACT_DIR=%s\n' "$work/artifacts"
           } >> "$GITHUB_ENV"
 
-      - name: Checkout the pinned source revision
+      # Same ref as check-changes; run_test.sh rejects any HEAD other than
+      # PPU_CI_SOURCE_SHA.
+      - name: Checkout the triggering source revision
         timeout-minutes: 10
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.check-changes.outputs.source-sha }}
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
 
       - name: Download the matching PPU wheel artifact

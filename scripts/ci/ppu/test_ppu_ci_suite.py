@@ -166,6 +166,28 @@ class TestPPUCIWorkflow(CustomTestCase):
         runtime = RUNNER.parent.parent / "scripts/ci/ppu/build_and_test.sh"
         self.assertNotIn("--hw cpu", runtime.read_text())
 
+    def test_jobs_check_out_the_triggering_ref_and_verify_the_pinned_sha(self):
+        # Device jobs check out the triggering ref like the other PR test
+        # workflows; the scripts' HEAD == PPU_CI_SOURCE_SHA checks are covered by
+        # test_build_rejects_wrong_revision_and_uncommitted_inputs below and by
+        # test_source_identity_includes_untracked_and_ignored_inputs in
+        # test_ppu_ci_docker.py.
+        expected = self.jobs["check-changes"]["steps"][0]["with"]["ref"]
+        self.assertEqual(expected, "${{ inputs.ref || github.sha }}")
+        for name in ("ppu-build", "ppu-sanity"):
+            with self.subTest(job=name):
+                job = self.jobs[name]
+                checkout = next(
+                    step
+                    for step in job["steps"]
+                    if step.get("uses", "").startswith("actions/checkout@")
+                )
+                self.assertEqual(checkout["with"]["ref"], expected)
+                self.assertEqual(
+                    job["env"]["PPU_CI_SOURCE_SHA"],
+                    "${{ needs.check-changes.outputs.source-sha }}",
+                )
+
     def test_sanity_runs_on_every_ppu_generation_with_distinct_artifacts(self):
         sanity = self.jobs["ppu-sanity"]
         self.assertEqual(sanity["runs-on"], "${{ matrix.runner }}")
