@@ -168,6 +168,7 @@ class Glm4MoeDetector(BaseFormatDetector):
     _STREAMING_PARTIAL_PATTERN = re.compile(
         r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
     )
+    _TOOL_CALL_END_PATTERN = re.compile(r"</tool_call>|$")
 
     def __init__(self):
         super().__init__()
@@ -185,7 +186,30 @@ class Glm4MoeDetector(BaseFormatDetector):
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
+        self._open_call: Optional[Tuple[str, int]] = None
+        self._end_scan_pos = 0
         self._reset_streaming_state()
+
+    def _match_tool_call(self, text: str) -> Optional[Tuple[str, str, str, int]]:
+        """Same groups 1-3 and end(3) as `_STREAMING_PARTIAL_PATTERN.search(text)`.
+
+        While the call is open, text only grows at the end, so the name and args
+        start stay put and only the new tail needs scanning for the closer.
+        Rescanning the whole buffer every chunk is O(n^2) for a long arg.
+        """
+        if self._open_call is None:
+            match = self._STREAMING_PARTIAL_PATTERN.search(text)
+            if match is None:
+                return None
+            self._open_call = match.group(1), match.start(2)
+            self._end_scan_pos = match.start(2)
+        func_name_raw, args_start = self._open_call
+        end = self._TOOL_CALL_END_PATTERN.search(text, self._end_scan_pos)
+        if end.group():
+            self._open_call = None
+        else:
+            self._end_scan_pos = max(args_start, len(text) - len(self.eot_token) + 1)
+        return func_name_raw, text[args_start : end.start()], end.group(), end.end()
 
     def _reset_streaming_state(self) -> None:
         """Reset the streaming state machine for a new tool call."""
@@ -481,11 +505,9 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
+            partial_match = self._match_tool_call(current_text)
             if partial_match:
-                func_name_raw = partial_match.group(1)
-                func_args_raw = partial_match.group(2)
-                is_tool_end = partial_match.group(3)
+                func_name_raw, func_args_raw, is_tool_end, match_end = partial_match
 
                 # Only proceed if we have a non-empty function name
                 if func_name_raw is None or not func_name_raw.strip():
@@ -606,7 +628,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                             )
 
                         # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
+                        self._buffer = current_text[match_end:]
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
