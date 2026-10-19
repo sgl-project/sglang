@@ -66,7 +66,6 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _as_int_list,
-    _prefill_graph_max_seq_len,
     _tail_rows,
     late_layer_num_tokens,
     late_layer_whole_extend,
@@ -890,6 +889,13 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
+    prefill_cuda_graph_default_max_seq_len = (
+        DeepseekV4AttnBackend.prefill_cuda_graph_default_max_seq_len
+    )
+    _prefill_graph_replays_any_context = (
+        DeepseekV4AttnBackend._prefill_graph_replays_any_context
+    )
+    _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
     _low_ratio_compress_decode = DeepseekV4AttnBackend._low_ratio_compress_decode
@@ -2392,14 +2398,13 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
         )
 
-    @staticmethod
-    def _graph_metadata_max_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
+    def _graph_metadata_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """
         Capture and replay build the metadata at this fixed context length, so a
         replay's metadata is never larger than the captured one. Longer contexts run
         eager.
         """
-        return forward_batch.max_seq_len_override or _prefill_graph_max_seq_len()
+        return forward_batch.max_seq_len_override or self._prefill_graph_seq_limit()
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
