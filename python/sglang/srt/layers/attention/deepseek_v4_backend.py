@@ -3007,13 +3007,10 @@ class DeepseekV4AttnBackend(
         """The context width of the prefill graph's metadata, for the full rows and
         the late-layer tail alike: the live context when any context replays, else
         the captured width bounded by the graph's context limit."""
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        if (
-            self.prefill_cuda_graph_context_unbounded
-            and seq_lens_cpu is not None
-            and len(seq_lens_cpu) > 0
-        ):
-            return int(seq_lens_cpu.max().item())
+        if self.prefill_cuda_graph_context_unbounded:
+            seq_lens_cpu = forward_batch.seq_lens_cpu
+            if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                return int(seq_lens_cpu.max().item())
         max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
         if self.low_ratios == (1, 2):
             graph_context_limit = _prefill_graph_max_seq_len()
