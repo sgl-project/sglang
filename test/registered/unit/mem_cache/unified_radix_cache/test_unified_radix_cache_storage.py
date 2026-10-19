@@ -371,10 +371,6 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
 
 class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
-    # ================================================================
-    # HiCache Unit Tests (real cache_controller D<->H backup/load)
-    # ================================================================
-
     def test_hicache_l3_prefetch(self):
         """L3 round trip: write with one tree, prefetch into a fresh tree.
 
