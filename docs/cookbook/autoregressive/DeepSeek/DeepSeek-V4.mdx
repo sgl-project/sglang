@@ -51,11 +51,11 @@ docker run --gpus all \
 AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 7.2 version.
 
 For example:
-- **MI355X** → `lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261007`
-- **MI300X** → `lmsysorg/sglang-rocm:v0.5.21-rocm720-mi30x-20261007`
+- **MI355X** → `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261016`
+- **MI300X** → `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261016`
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.21-rocm720-{mi35x,mi30x}-20261007
+docker pull lmsysorg/sglang-rocm:v0.5.22-rocm720-{mi35x,mi30x}-20261016
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -65,7 +65,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.21-rocm720-{mi35x,mi30x}-20261007 \
+    lmsysorg/sglang-rocm:v0.5.22-rocm720-{mi35x,mi30x}-20261016 \
     sglang serve <use args below>
 ```
 
@@ -773,13 +773,14 @@ Four adjustments are not in the commands below. Add them when they apply:
 - `--cuda-graph-backend-prefill breakable` at concurrency 1–4.
 - `--enable-prefill-cp --cp-strategy interleave --enable-cp-decode-attn-tp` on the TP-only commands at concurrency 16 and above. Prefill context parallelism splits each prompt across all eight ranks (CP size = TP size).
 - `SGLANG_DSV4_GROUPED_ASM=1` on the TP-only commands at concurrency 16 and above — the kernel needs at least 16 requests per draft token.
-- `--prefill-decode-interval 15` on the MegaMoE command at concurrency 384, replacing the `20` it ships with.
+- At concurrency 384 on the MegaMoE command: `--prefill-decode-interval 20`, `SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR=1024`, and `AITER_MEGA_FIXED_SLOT_MAX_MTPR=2047`.
 
 **TP8, concurrency 1–16:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
@@ -821,6 +822,7 @@ python3 -m sglang.launch_server \
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
@@ -851,7 +853,7 @@ python3 -m sglang.launch_server \
   --kv-cache-dtype fp8_e4m3 \
   --enforce-shared-experts-fusion \
   --mem-fraction-static 0.92 \
-  --chunked-prefill-size 65536 \
+  --chunked-prefill-size 131072 \
   --tool-call-parser deepseekv4 \
   --reasoning-parser deepseek-v4 \
   --speculative-algorithm DSPARK \
@@ -864,13 +866,14 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 65536 keeps 8192 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well.
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 131072 keeps 16384 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well.
 
 **DP8 EP8 MegaMoE, concurrency 128–384:**
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
+SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
@@ -878,12 +881,15 @@ AITER_BF16_FP8_MOE_BOUND=0 \
 SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
 SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
-SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192 \
+SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=16384 \
+SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR=512 \
+AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023 \
 SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
 MORI_SHMEM_HEAP_SIZE=17179869184 \
 SGLANG_AITER_MEGA_RANK_SYNC=1 \
 SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY=1 \
 SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD=1 \
+SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7 \
 SGLANG_DP_USE_REDUCE_SCATTER=0 \
 GPU_MAX_HW_QUEUES=5 \
 python3 -m sglang.launch_server \
@@ -897,7 +903,7 @@ python3 -m sglang.launch_server \
   --enable-dp-attention-local-control-broadcast \
   --tokenizer-worker-num 8 \
   --stream-interval 20 \
-  --prefill-decode-interval 20 \
+  --prefill-decode-interval 40 \
   --prefill-delayer-token-usage-low-watermark 0.7 \
   --load-balance-method total_requests \
   --attention-backend dsv4 \
@@ -912,7 +918,7 @@ python3 -m sglang.launch_server \
   --eplb-rebalance-num-iterations 200 \
   --expert-distribution-recorder-mode stat \
   --mem-fraction-static 0.85 \
-  --chunked-prefill-size 65536 \
+  --chunked-prefill-size 131072 \
   --tool-call-parser deepseekv4 \
   --reasoning-parser deepseek-v4 \
   --speculative-algorithm DSPARK \
@@ -925,7 +931,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only.
+This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
 
 ### 3.7 PD Disaggregation on MI355X (MORI-IO)
 
