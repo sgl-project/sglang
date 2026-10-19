@@ -141,3 +141,9 @@ def test_fp8_triton_fallback_reaches_the_dispatcher(cutlass_pin):
 
     dispatcher = create_moe_dispatcher(_config(), method)
     assert not dispatcher.skip_local_expert_mapping
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
