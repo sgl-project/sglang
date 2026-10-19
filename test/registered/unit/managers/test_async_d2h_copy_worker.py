@@ -19,6 +19,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.async_d2h_copy_worker import AsyncD2HCopyWorker, HostCopyDone
 from sglang.srt.utils.common import (
+    DynamicGradMode,
     async_d2h,
     is_confidential_compute,
     is_pin_memory_available,
@@ -98,6 +99,41 @@ class TestAsyncD2HCopyWorker(CustomTestCase):
         self.assertIsNotNone(done.error, "failed copy must record its error")
         with self.assertRaises(RuntimeError):
             done.synchronize()
+
+    def test_base_exception_is_reported_and_later_copies_complete(self):
+        """A callback exit must not look successful or strand subsequent copies."""
+        failure = SystemExit("injected copy exit")
+
+        def boom():
+            raise failure
+
+        done = self.worker.submit(boom)
+        self.assertTrue(done._done.wait(timeout=30), "worker did not signal completion")
+        with self.assertRaises(RuntimeError) as raised:
+            done.synchronize()
+        self.assertIs(raised.exception.__cause__, failure)
+        self._run_one(4)
+
+    def test_copy_uses_scheduler_grad_mode(self):
+        """The new thread must not attach autograd history to host readbacks."""
+        src = torch.ones(4, device="cuda", requires_grad=True)
+        out = {}
+        with DynamicGradMode():
+            expected_inference_mode = torch.is_inference_mode_enabled()
+
+        def copy_fn():
+            out["grad_enabled"] = torch.is_grad_enabled()
+            out["inference_mode"] = torch.is_inference_mode_enabled()
+            out["cpu"] = src.to("cpu", non_blocking=True)
+
+        done = self.worker.submit(copy_fn)
+        self.assertTrue(done._done.wait(timeout=30), "worker did not signal completion")
+        done.synchronize()
+        self.assertFalse(out["grad_enabled"])
+        self.assertEqual(out["inference_mode"], expected_inference_mode)
+        self.assertFalse(out["cpu"].requires_grad)
+        self.assertIsNone(out["cpu"].grad_fn)
+        self.assertTrue(torch.equal(out["cpu"], torch.ones(4)))
 
 
 class TestConfidentialComputeDetection(CustomTestCase):

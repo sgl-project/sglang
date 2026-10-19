@@ -5,6 +5,8 @@ import queue
 import threading
 from typing import Callable, Optional
 
+from sglang.srt.utils.common import DynamicGradMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -88,10 +90,11 @@ class AsyncD2HCopyWorker:
                 # Event-sync, not a stream wait: a stream wait would re-expose
                 # the caller's thread to the blocking copy.
                 src_ready.synchronize()
-                with self.device_module.stream(self.d2h_copy_stream):
+                # Grad mode is thread-local; use the scheduler's policy here too.
+                with DynamicGradMode(), self.device_module.stream(self.d2h_copy_stream):
                     copy_fn()
                 self.d2h_copy_stream.synchronize()
-            except Exception as e:
+            except BaseException as e:
                 logger.exception("AsyncD2HCopyWorker copy failed")
                 error = e
             finally:
