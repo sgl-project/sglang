@@ -13,6 +13,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
+from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -284,6 +285,11 @@ class MlxModelRunnerStub(ModelRunner):
         self.is_hybrid_swa = False
 
         # Create minimal pools
+        # Requests are bounded by the flat KV pool; retain decode headroom.
+        max_context_len = min(
+            self.model_config.context_len,
+            self.max_total_num_tokens + get_req_to_token_extra_context_len(),
+        )
         if mambaish_config(self.model_config) is not None:
             auxiliary_state_size = self._explicit_aux_state_size_per_worker()
             if auxiliary_state_size is None:
@@ -292,7 +298,7 @@ class MlxModelRunnerStub(ModelRunner):
                 )
             self.req_to_token_pool = MlxAuxiliaryStateReqToTokenPool(
                 size=self.max_running_requests,
-                max_context_len=self.model_config.context_len,
+                max_context_len=max_context_len,
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
@@ -300,7 +306,7 @@ class MlxModelRunnerStub(ModelRunner):
         else:
             self.req_to_token_pool = ReqToTokenPool(
                 size=self.max_running_requests,
-                max_context_len=self.model_config.context_len,
+                max_context_len=max_context_len,
                 device="cpu",
                 enable_memory_saver=False,
             )

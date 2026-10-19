@@ -67,6 +67,7 @@ def _published(stub):
         max_running_requests=stub._max_running_requests,
         max_mamba_cache_size=stub._max_mamba_cache_size,
         disable_radix_cache=stub._disable_radix_cache,
+        page_size=1,
     )
 
 
@@ -205,6 +206,44 @@ class TestMlxHybridAuxStateBound(CustomTestCase):
             ),
             8,
         )
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMlxRequestMappingCapacity(CustomTestCase):
+    def test_request_mapping_does_not_reserve_unreachable_context(self):
+        """Long contexts must not reserve rows beyond KV capacity and headroom."""
+        for hybrid in (False, True):
+            for capacity, context, expected_width in (
+                (32, 128, 36),
+                (32, 34, 34),
+                (128, 32, 32),
+                (None, 64, 64),
+            ):
+                with self.subTest(hybrid=hybrid, capacity=capacity, context=context):
+                    stub = _hybrid_stub_for_initialize(
+                        max_running_requests=2,
+                        max_mamba_cache_size=None,
+                        pool=capacity,
+                    )
+                    stub.model_config.context_len = context
+                    with _arch(hybrid), _published(stub):
+                        stub.initialize()
+
+                    self.assertEqual(
+                        stub.req_to_token_pool.req_to_token.shape,
+                        (3, expected_width),
+                    )
+                    self.assertEqual(stub.model_config.context_len, context)
+                    self.assertEqual(
+                        stub.max_total_num_tokens,
+                        context if capacity is None else capacity,
+                    )
+                    self.assertEqual(stub.max_running_requests, 2)
+                    if hybrid:
+                        self.assertEqual(
+                            stub.req_to_token_pool.auxiliary_state_pool.size,
+                            2 * RATIO,
+                        )
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
