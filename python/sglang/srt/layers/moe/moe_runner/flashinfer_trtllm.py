@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generator, Optional, cast
+from typing import TYPE_CHECKING, Callable, Generator, List, Optional, cast
 
 import torch
 from torch.nn import Module
@@ -77,6 +77,26 @@ def flashinfer_trtllm_deferred_finalize_context(
 
 def is_deferred_finalize_enabled() -> bool:
     return _deferred_finalize_enabled.get()
+
+
+# Runs the logits-routed FP4 MoE from routing it computes itself, given the stock call's kwargs;
+# returns None to keep the stock call.
+FlashInferTrtllmFp4FromTables = Callable[[dict], Optional[List[torch.Tensor]]]
+
+_fp4_from_tables: contextvars.ContextVar[Optional[FlashInferTrtllmFp4FromTables]] = (
+    contextvars.ContextVar("flashinfer_trtllm_fp4_from_tables", default=None)
+)
+
+
+@contextmanager
+def flashinfer_trtllm_fp4_from_tables_context(
+    run: FlashInferTrtllmFp4FromTables,
+) -> Generator[None, None, None]:
+    token = _fp4_from_tables.set(run)
+    try:
+        yield
+    finally:
+        _fp4_from_tables.reset(token)
 
 
 def finalize_flashinfer_trtllm_deferred_output(
@@ -1560,7 +1580,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
 
-        result = trtllm_fp4_block_scale_moe(**moe_kwargs)
+        from_tables = _fp4_from_tables.get()
+        result = from_tables(moe_kwargs) if from_tables is not None else None
+        if result is None:
+            result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
         else:

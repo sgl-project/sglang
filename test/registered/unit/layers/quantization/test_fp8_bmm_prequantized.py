@@ -3,7 +3,9 @@
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 
@@ -84,6 +86,41 @@ class TestPrequantizedBmm(CustomTestCase):
                 )
                 self.assertEqual(actual.dtype, expected.dtype)
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_modelopt_bmm_linear_takes_prequantized_input(self):
+        # GDN_PREFILL_NORM_FP8 hands out_proj E4M3 bytes at its static input scale; the
+        # ModelOpt FlashInfer bmm path must pass them through and return the layer dtype.
+        from sglang.srt.layers.quantization import fp8_utils
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+
+        def bmm(a, b, scale_a, scale_b, out_dtype):
+            return ((a.float() * scale_a) @ (b.float() * scale_b)).to(out_dtype)
+
+        def requantize(*args, **kwargs):
+            raise AssertionError("the pre-quantized input was quantized again")
+
+        method = object.__new__(ModelOptFp8LinearMethod)
+        method.use_marlin = method.use_sm120_fp8 = False
+        weight = torch.arange(-10, 10, dtype=torch.float32).reshape(4, 5)
+        layer = SimpleNamespace(
+            use_flashinfer_bmm=True,
+            weight=weight.to(torch.float8_e4m3fn),
+            weight_scale=torch.tensor([0.5]),
+            input_scale=torch.tensor([0.25]),
+            orig_dtype=torch.bfloat16,
+        )
+        x = torch.arange(-12, 12, dtype=torch.float32).reshape(6, 4)
+        x = x.to(torch.float8_e4m3fn)
+        with (
+            patch.object(fp8_utils, "flashinfer_bmm_fp8", bmm, create=True),
+            patch.object(fp8_utils, "static_quant_fp8", requantize),
+        ):
+            actual = method.apply(layer, x)
+        expected = ((x.float() * 0.25) @ (weight * 0.5)).to(torch.bfloat16)
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

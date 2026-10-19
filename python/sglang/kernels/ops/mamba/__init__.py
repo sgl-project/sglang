@@ -96,7 +96,57 @@ def causal_conv1d_update(
     )
 
 
-__all__ = ["causal_conv1d_fwd", "causal_conv1d_update"]
+register_kernel(
+    KernelSpec(
+        op="mamba.causal_conv1d_prefill_vectorized",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.causal_conv1d_prefill:causal_conv1d_prefill_vectorized",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            supported_dtypes=("bfloat16",),
+            description="four-tap variable-length convolution with continuation state",
+        ),
+    )
+)
+
+
+def causal_conv1d_prefill_vectorized(
+    x,
+    weight,
+    bias,
+    conv_states,
+    query_start_loc,
+    seq_lens_cpu,
+    cache_indices=None,
+    has_initial_state=None,
+    activation="silu",
+    pad_slot_id=-1,
+    block_table=None,
+    block_m=64,
+):
+    """Vectorized prefill convolution; state is updated in place."""
+    return get_kernel("mamba.causal_conv1d_prefill_vectorized", KernelBackend.TRITON)(
+        x,
+        weight,
+        bias,
+        conv_states,
+        query_start_loc,
+        seq_lens_cpu,
+        cache_indices,
+        has_initial_state,
+        activation,
+        pad_slot_id,
+        block_table,
+        block_m,
+    )
+
+
+__all__ = [
+    "causal_conv1d_fwd",
+    "causal_conv1d_prefill_vectorized",
+    "causal_conv1d_update",
+]
 
 
 # Vendored mamba_ssm-derived kernels relocated in Phase 2.5 (RFC #29630).

@@ -705,9 +705,107 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _sample_on_vocab_shards(
+    *,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    verify_input: EagleVerifyInput,
+    batch: ScheduleBatch,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    grammar_mask: Optional[GrammarMask],
+    watermark_state: Optional[WatermarkState],
+    use_rejection_sampling: bool,
+    uno_target_max_top_k: Optional[int],
+    device,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    """Verify on shard-local logits: (argmax [bs, draft_token_num], sampled) when the batch
+    allows it (sampled batches also get predict / accept_index / num_correct_drafts
+    written), (None, False) when the caller must gather and take the stock path."""
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative import sharded_verify_sampling
+
+    sampler = sharded_verify_sampling.get_sampler()
+    from sglang.srt.speculative.post_verify_graph import PostVerifySamplingView
+
+    # Graph-capture helpers pass a namespace stand-in for the batch sampling info; the
+    # post-verify graph's PostVerifySamplingView carries every field the sharded sampler reads.
+    if not isinstance(sampling_info, (SamplingBatchInfo, PostVerifySamplingView)):
+        sampler.count("gathered", candidates.shape[0])
+        return None, False
+    reason = sampler.eligible_reason(
+        logits=logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        batch=batch,
+        grammar_mask=grammar_mask,
+        watermark_state=watermark_state,
+        use_rejection_sampling=use_rejection_sampling,
+        uno_target_max_top_k=uno_target_max_top_k,
+    )
+    if reason is not None:
+        sampler.count("gathered", candidates.shape[0])
+        return None, False
+    greedy = sampling_info.is_all_greedy
+    coins = (
+        None
+        if greedy
+        else _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+    )
+    argmax = sampler.run(
+        logits=logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        candidates=candidates,
+        predict=predict,
+        accept_index=accept_index,
+        num_correct_drafts=num_correct_drafts,
+        coins=coins,
+    )
+    sampler.count("greedy" if greedy else "sampled", candidates.shape[0])
+    return argmax.reshape(candidates.shape), not greedy
+
+
 _PACKED_VERIFY_BCAST = (
     os.environ.get("SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST", "0") == "1"
 )
+_LOCAL_VERIFY_SAMPLING = envs.SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING.get()
+
+
+def _can_use_local_chain_sampling(
+    *,
+    logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    verify_input: EagleVerifyInput,
+    use_rejection_sampling: bool,
+    uno_target_max_top_k: Optional[int],
+) -> bool:
+    """Dense sampled verify of a topk-1 chain that the one-rank chunked sampler can take."""
+    spec = get_spec()
+    return (
+        _LOCAL_VERIFY_SAMPLING
+        and _is_cuda
+        and not use_rejection_sampling
+        and verify_input.tree_topk == 1
+        and verify_input.draft_probs is None
+        and uno_target_max_top_k is None
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and not sampling_info.need_min_p_sampling
+        and spec.speculative_accept_threshold_single == 1.0
+        and spec.speculative_accept_threshold_acc == 1.0
+        and logits.dtype == torch.float32
+        and logits.dim() == 2
+        and logits.stride(-1) == 1
+    )
 
 
 def _verify_uses_greedy(
@@ -885,6 +983,30 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    sharded_argmax, sharded_sampled = None, False
+    from sglang.srt.layers.logits_processor import verify_logits_on_shards
+
+    if verify_logits_on_shards(next_token_logits):
+        sharded_argmax, sharded_sampled = _sample_on_vocab_shards(
+            logits=next_token_logits,
+            sampling_info=sampling_info,
+            verify_input=verify_input,
+            batch=batch,
+            candidates=candidates,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            grammar_mask=grammar_mask,
+            watermark_state=watermark_state,
+            use_rejection_sampling=use_rejection_sampling,
+            uno_target_max_top_k=uno_target_max_top_k,
+            device=device,
+        )
+        if sharded_argmax is None:
+            from sglang.srt.layers.logits_processor import gather_verify_logits
+
+            next_token_logits = gather_verify_logits(next_token_logits)
+            logits_output.next_token_logits = next_token_logits
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
@@ -892,8 +1014,11 @@ def eagle_sample(
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
     ):
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        if sharded_argmax is not None:
+            target_predict = sharded_argmax
+        else:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -917,6 +1042,50 @@ def eagle_sample(
                 else get_parallel().tp_group
             )
             if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
+    elif sharded_sampled:
+        target_predict = sharded_argmax
+    elif _can_use_local_chain_sampling(
+        logits=next_token_logits,
+        sampling_info=sampling_info,
+        verify_input=verify_input,
+        use_rejection_sampling=use_rejection_sampling,
+        uno_target_max_top_k=uno_target_max_top_k,
+    ):
+        from sglang.srt.speculative.sharded_verify_sampling import (
+            sample_chain_full_vocab,
+        )
+
+        # Same coin draws as the stock branch below; the argmax also serves as the
+        # synthetic bonus under SGLANG_SIMULATE_ACC_LEN.
+        coins = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+        target_predict = sample_chain_full_vocab(
+            logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            coins=coins,
+        ).reshape(bs, verify_input.draft_token_num)
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_parallel().tp_group
+        )
+        if tp_group.world_size > 1:
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)

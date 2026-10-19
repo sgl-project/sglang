@@ -559,17 +559,87 @@ class Envs:
     SGLANG_Q35MF_DRAFT_MOE_GEMV = EnvBool(False)
     # With the draft MoE GEMV path: also fuse the router GEMV, softmax and top-k.
     SGLANG_Q35MF_DRAFT_MOE_ROUTER = EnvBool(False)
+    # With the draft MoE GEMV path: router, top-k and both GEMV passes as one
+    # launch, bitwise equal to the fused router + GEMV path.
+    SGLANG_Q35MF_MKD_MOE1 = EnvBool(False)
     # Greedy draft steps select the token on vocab shards and exchange one packed
     # row (argmax + embedding) instead of all-gathering the logits.
     SGLANG_Q35MF_DRAFT_ARGMAX_EXCHANGE = EnvBool(False)
+    # Largest draft-step batch (rows) the exchange serves, 1..8; larger batches gather the logits.
+    # Unset follows SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS.
+    SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS = EnvInt(None)
     # Same exchange for the greedy token after the draft extend (torch.argmax NaN rule).
     SGLANG_Q35MF_DRAFT_EXTEND_EXCHANGE = EnvBool(False)
+    # Target verify of topk-1 chains keeps the logits on vocab shards and samples there
+    # (argmax for greedy batches); other batches gather and take the stock path.
+    SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING = EnvBool(False)
+    # Sampled target verify of topk-1 chains on full-vocab logits (no top-k / top-p) runs
+    # the chunked chain sampler of the sharded path on one rank instead of softmax +
+    # tree_speculative_sampling_target_only.
+    SGLANG_Q35MF_K4_LOCAL_VERIFY_SAMPLING = EnvBool(False)
+    # Largest draft-extend batch (rows) that uses the vocab exchange, and the draft-step
+    # limit while SGLANG_Q35MF_DRAFT_EXCHANGE_STEP_ROWS is unset.
+    SGLANG_Q35MF_DRAFT_VOCAB_EXCHANGE_MAX_ROWS = EnvInt(2)
+    # With the post-verify graph: sample shard-local verify logits inside the graph (the sharded
+    # sampler above) instead of gathering them; batches that return logprobs keep the eager chain.
+    SGLANG_Q35MF_D2R_PVG_SHARDED = EnvBool(False)
     # Row-split MTP fc for draft-width batches: each rank multiplies its input-column
     # slice (one normalized half); fp32 partials are gathered and summed in rank order.
     SGLANG_Q35MF_DRAFT_FC_SPLIT = EnvBool(False)
     # With the fc split, draft steps (1-2 rows) run the pre-fc norm and the slice GEMV
     # as one kernel instead of the norm plus a cuBLAS fp32 GEMM.
     SGLANG_Q35MF_DRAFT_FC_GEMV = EnvBool(False)
+    # With the draft argmax exchange and the fc split: single-token draft steps exchange the
+    # candidate row and the hidden-half fc partials in one multicast launch, and each rank
+    # finishes the fc from the exchanged data (bitwise equal to the split fc).
+    SGLANG_Q35MF_MKD_XCHG = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: candidates carry a load-time memo of their embedding-half
+    # fc partials (summed in rank order) instead of the embedding row.
+    SGLANG_Q35MF_MKD_TTABLE = EnvBool(False)
+    # MB of the draft lm_head shard prefetched into L2 while single-token draft steps wait on
+    # the all-reduce after the MoE (0 = off); a cache hint, values unchanged.
+    SGLANG_Q35MF_MKD_L2PF_MB = EnvInt(0)
+    # MB of the draft qkv projection weight prefetched into L2 beside the draft-step exchange (0 = off).
+    SGLANG_Q35MF_MKD_L2PF_QKV_MB = EnvInt(0)
+    # Diagnostic: the draft-step exchange stamps per-phase %globaltimer into pinned host memory
+    # and a thread logs percentiles every 20 s (slows the kernel; diagnostic only).
+    SGLANG_Q35MF_MKD_TRACE = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_TTABLE: the draft extend's exchange also finishes the fc of the next
+    # draft's first step, which then skips its embedding and fc (stock fill when no extend ran).
+    SGLANG_Q35MF_MKD_EXTEND_FC = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_XCHG: one-row draft steps compute the draft lm_head with mkd_draft_head
+    # (fp32 accumulation, bf16 logits; only the summation order differs from the served GEMM) and
+    # the exchange reads its per-CTA maxima instead of scanning the logits.
+    SGLANG_Q35MF_MKD_HEAD = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HEAD: also run the served GEMM every step and log how often
+    # the argmax differs and by how much the served logits separate the two picks.
+    SGLANG_Q35MF_MKD_HEAD_CHECK = EnvBool(False)
+    # With SGLANG_Q35MF_MKH_HOP: one-row draft steps run the attention-output and MoE-output
+    # all-reduce + residual + norm as q35 hops, bit-identical to the kernels they replace.
+    SGLANG_Q35MF_MKD_HOP = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP: the single-launch draft MoE pushes its output into the hop itself,
+    # so the MoE-output hop only consumes.
+    SGLANG_Q35MF_MKD_HOP_PUSH = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP: the attention-output hop releases the single-launch draft MoE at entry,
+    # so its weight prefetch overlaps the hop.
+    SGLANG_Q35MF_MKD_HOP_EARLY = EnvBool(False)
+    # With SGLANG_Q35MF_MKD_HOP_EARLY: the final hop releases the draft head at entry too (slower at TP8:
+    # the head's one-per-SM CTAs then launch while the draft MoE drains).
+    SGLANG_Q35MF_MKD_HOP_EARLY_HEAD = EnvBool(False)
+    # Diagnostic for SGLANG_Q35MF_MKD_HOP: hold every draft hop's output stores this many ns (delay probe).
+    SGLANG_Q35MF_MKD_HOP_DELAY_NS = EnvInt(0)
+    # One-row draft steps run the draft layer's o_proj as mkd_draft_gemv (fp32 accumulation; only the
+    # summation order differs from the served GEMM), pushing it into the draft hop when that runs.
+    SGLANG_Q35MF_MKD_GEMV = EnvBool(False)
+    # TP2 with the fc split: each rank stores its fp32 fc partial into the peer's symmetric
+    # buffer and sums the pair in the same kernel (no all-gather; same bf16 result).
+    SGLANG_Q35MF_KDENSE_DRAFT_FC_XCHG = EnvBool(False)
+    # TP2 with the vocab exchange: shard argmax, packed-row exchange through the peer's
+    # symmetric buffer and selection in one kernel (no all-gather; same token and row).
+    SGLANG_Q35MF_KDENSE_DRAFT_ARGMAX_XCHG = EnvBool(False)
+    # Draft decode / draft extend graphs capture the TRT-LLM MHA metadata rebuild on a side
+    # stream from the graph's start and join it before the first attention kernel.
+    SGLANG_Q35MF_KDENSE_DRAFT_META_BRANCH = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -697,6 +767,9 @@ class Envs:
     # Run PP tensor communication on a dedicated stream so asynchronous sends
     # do not fence the next forward through the scheduler stream.
     SGLANG_PP_COMM_OVERLAP = EnvBool(False)
+    # PD-prefill PP loop without host waits on the in-flight forward: PP comm on its own
+    # stream, early-send readback and GDN prefill metadata off the forward stream.
+    SGLANG_Q35MF_PPO = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
@@ -1029,6 +1102,25 @@ class Envs:
     SGLANG_Q35MF_ATTN_GATE_QUANT = EnvBool(False)
     SGLANG_Q35MF_ATTN_FRONT = EnvBool(False)
     SGLANG_Q35MF_ATTN_SPLIT_KV = EnvBool(False)
+    SGLANG_Q35MF_LL1_K1B = EnvBool(False)
+    SGLANG_Q35MF_LL1_K1B_VERIFY = EnvBool(True)
+    SGLANG_Q35MF_LL1_K1B_EXTEND = EnvBool(True)
+    SGLANG_Q35MF_LL1_K1B_DRAFT = EnvBool(True)
+    # Fused full-attention prologue / epilogue kernels for TP8 bs1 MTP verify (Qwen3.5 FP8 projections).
+    SGLANG_Q35MF_MKA_FUSED = EnvBool(False)
+    # Warp-specialized split-KV producer with the stock split-KV rounding, used where ATTN_SPLIT_KV runs;
+    # _DRAFT=0 keeps the draft-model extend on the stock kernel.
+    SGLANG_Q35MF_MKA_SKV2 = EnvBool(False)
+    SGLANG_Q35MF_MKA_SKV2_DRAFT = EnvBool(True)
+    # With SGLANG_Q35MF_MKA_FUSED and SGLANG_Q35MF_MKH_HOP: the fused o_proj pushes its partial into the
+    # q35 hop mailbox, so the attention output hop only consumes.
+    SGLANG_Q35MF_MKA_PUSH = EnvBool(False)
+    # KV length from which target verify uses the split-KV producer (trtllm-gen below); the crossover depends on
+    # the TP size (tunable).
+    SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH = EnvInt(32768)
+    # Draft-model q1 decode with trtllm-gen's KV split and rounding plus a separate merge, from this KV length.
+    SGLANG_Q35MF_MKA_Q1 = EnvBool(False)
+    SGLANG_Q35MF_MKA_Q1_MIN_LENGTH = EnvInt(16384)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
 
     # ===================================================================
@@ -1176,6 +1268,60 @@ class Envs:
     # CuTe DSL MoE behind the FlashInfer all-to-all writes its output straight into
     # the a2a combine payload buffer (dispatcher and runner sides read the same switch).
     SGLANG_Q35MF_EXPERT_ENABLE_A2A_DIRECT_OUTPUT = EnvBool(False)
+    # Qwen MoE blocks on the trtllm NVFP4 runner with deferred finalize at <= 7 tokens (TP8 shapes):
+    # top-10 routing, FC1, SwiGLU and FC2 in one fused launch after router_gemm_quant.
+    SGLANG_Q35MF_MKM_FUSED = EnvBool(False)
+    # With SGLANG_Q35MF_MKM_FUSED at TP4: also take 8..16 tokens (two requests of 7) through the fused engine.
+    SGLANG_Q35MF_MKM_FUSED_M16 = EnvBool(False)
+    # With SGLANG_Q35MF_MKM_FUSED at TP4: also take 17..21 tokens (three requests of 7) through the fused engine.
+    SGLANG_Q35MF_MKM_FUSED_M21 = EnvBool(False)
+    # On the trtllm runner above the fused launch's 16 tokens (up to 64): the runner's NVFP4 input
+    # quantization on the side stream, in parallel with the router GEMM (same outputs).
+    SGLANG_Q35MF_ROUTE_PARQ = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE_PARQ: issue that quantization on its own stream instead of the MoE
+    # block's side stream, so the shared expert does not queue behind it (same kernels and outputs).
+    SGLANG_Q35MF_K4_PARQ_STREAM = EnvBool(False)
+    # Dual-stream deferred-finalize MoE: run the shared expert's sigmoid-gate kernel on a top-priority
+    # stream after the rest of the shared expert (same kernels and outputs; only scheduling changes).
+    SGLANG_Q35MF_K4_GATE_PRIO = EnvBool(False)
+    # Upper token count of the ROUTE_PARQ front and of SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS (at most 128).
+    SGLANG_Q35MF_K4_PARQ_MAX_TOKENS = EnvInt(64)
+    # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off): the whole shared expert
+    # on a top-priority side stream (same kernels and outputs; only scheduling changes).
+    SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS = EnvInt(0)
+    # Dual-stream deferred-finalize MoE at up to this many tokens (0 = off, at most 128): the FP8 shared expert and
+    # its sigmoid gate as three launches (static quant, gate_up + SiLU*mul + quant, down + gate) on 16-48 CTAs.
+    SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS = EnvInt(0)
+    # Lower token bound of the SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS range (1 = from one token).
+    SGLANG_Q35MF_KTP2_SHARED_FUSED_MIN_TOKENS = EnvInt(1)
+    # With SGLANG_Q35MF_ROUTE_PARQ, from 17 tokens up to this many (at most 64; 0 = off): top-k and the
+    # trtllm-gen routing tables from one kernel, and FlashInfer's FP4 MoE body run from those tables
+    # with the stock call's tactic, so FlashInfer's routing kernels are skipped (same outputs).
+    SGLANG_Q35MF_ROUTE_TABLES_MAX_TOKENS = EnvInt(0)
+    # On the trtllm runner at up to 16 tokens (the fused router launch): top-k and the trtllm-gen routing
+    # tables from one single-CTA kernel instead of FlashInfer's routing kernel, and FlashInfer's FP4 MoE body
+    # run from those tables with the stock call's tactic (same table entries and outputs).
+    SGLANG_Q35MF_ROUTE2_SMALL_TABLES = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE2_SMALL_TABLES: the tables kernel lets FC1 launch as soon as the router logits are
+    # ready instead of after the tables are written (FC1 still waits for the tables before reading them).
+    SGLANG_Q35MF_ROUTE2_EARLY_TRIGGER = EnvBool(False)
+    # With SGLANG_Q35MF_ROUTE2_SMALL_TABLES: the smallest token count the tables kernel takes over (stock routing
+    # below it); 1 = all. Measured: at TP2 a single verify request (7 tokens) ran slower with the tables kernel.
+    SGLANG_Q35MF_ROUTE2_SMALL_TABLES_MIN_TOKENS = EnvInt(1)
+    # Target-model FlashInfer a2a combine transfers E4M3 partials (unscaled cast,
+    # FP32 accumulate, BF16 output); draft MoE layers keep the BF16 combine.
+    SGLANG_Q35MF_MIDQ_FP8_COMBINE = EnvBool(False)
+    # > 1: FlashInfer a2a built from token_dispatcher/midq_csrc, whose combine splits each
+    # token row over this many CTAs (bit-identical output, target and draft).
+    SGLANG_Q35MF_MIDQ_COMBINE_SPLIT = EnvInt(0)
+    # Check every combine against the stock FlashInfer kernel bit for bit (eager or graphs).
+    SGLANG_Q35MF_MIDQ_COMBINE_PROOF = EnvBool(False)
+    # EAGLE topk-1 draft calls on the vocab-parallel TP head (attention DP) pick their
+    # tokens on the vocab shards: multimem row gather + (value, id) gather, no logits a2a.
+    SGLANG_Q35MF_K75P_LMHEAD = EnvBool(False)
+    # With K75P engaged, also run the stock LM-head path on every K75P call and count
+    # token mismatches per kind (decode / extend); a thread logs the counters every 30 s.
+    SGLANG_Q35MF_K75P_PROOF = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1507,6 +1653,36 @@ class Envs:
     # With --flashinfer-allreduce-fusion-backend cutedsl, build and capture the draft
     # with the auto (mnnvl) FlashInfer all-reduce fusion instead of a plain all-reduce.
     SGLANG_Q35MF_DRAFT_MNNVL_AR = EnvBool(False)
+    # With --flashinfer-allreduce-fusion-backend cutedsl, run the M <= 15 all-reduce and
+    # MoE-finalize hops on srt/layers/q35_hop.py (bit-identical outputs; the attention-input
+    # hop also hands its FP8 to the next linear).
+    SGLANG_Q35MF_MKH_HOP = EnvBool(False)
+    # With SGLANG_Q35MF_MKH_HOP: the GatedDeltaNet out_proj (static FP8, M <= 8) runs as a q35 hop
+    # launch that pushes its partial straight into the hop mailbox, so its all-reduce only consumes.
+    SGLANG_Q35MF_MKH_OPROJ = EnvBool(False)
+    # Breakable prefill CUDA graphs capture the GDN extend on per-bucket static tables
+    # instead of breaking the graph at every GDN layer (bit-identical outputs).
+    SGLANG_Q35MF_MKH_PF_GRAPH = EnvBool(False)
+    # Reduction warps the MNNVL CuTe DSL HT presets prefer when re-targeted to an unshipped
+    # shape (0 = the preset's own); they only split the work, outputs are bit-identical.
+    SGLANG_Q35MF_MKH_HT_REDUCTION_WARPS = EnvInt(0)
+    # Prefill batch prep issues its index / scalar writes as stream-ordered GPU ops instead of
+    # blocking ones, so the scheduler stops waiting for the in-flight decode round (same values).
+    SGLANG_Q35MF_MKH_PREP_NOSYNC = EnvBool(False)
+    # Verify input staging, bit-identical: reuse last round's mamba track indices while their
+    # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
+    # same-stream pre-planned load_batch already made.
+    SGLANG_Q35MF_MKH_N3B = EnvBool(False)
+    # The post-verify graph's per-round input load as one small_field_copy launch that also
+    # reads the injected acceptance length from its pinned host slot (bit-identical).
+    SGLANG_Q35MF_MKH_N3C = EnvBool(False)
+    # CuTe DSL fusion on a shape FlashInfer ships no profile for (e.g. TP2 hidden 4096):
+    # serve token counts up to this value with the LL protocol in both fused patterns.
+    # 0 keeps the re-targeted GB300 crossovers.
+    SGLANG_Q35MF_CUTEDSL_LL_MAX_M = EnvInt(0)
+    # JSON file {"N,K,M": cuBLASLt algo index} pinning the algorithm of FlashInfer's
+    # per-tensor FP8 bmm for the listed shapes; empty keeps the autotuned choice.
+    SGLANG_Q35MF_FP8_BMM_TACTICS = EnvStr("")
 
     # ===================================================================
     # Multimodal processing
@@ -1557,6 +1733,18 @@ class Envs:
     # GDN prefill conv runs once per q / k / v channel group when qkv_dim is above the
     # fused split limit (TP1), so the chunk kernels' input guard copies nothing.
     SGLANG_Q35MF_GDN_PREFILL_SPLIT_CONV = EnvBool(False)
+    # Larger tiles for the GDN prefill output and w / u kernels (tuned for GB300).
+    SGLANG_Q35MF_GDN_PREFILL_TILES = EnvBool(False)
+    # The intra-chunk solve writes the zero upper blocks of A itself instead of a memset.
+    SGLANG_Q35MF_GDN_PREFILL_NO_A_MEMSET = EnvBool(False)
+    # Vectorized long-T prefill conv (kernels/ops/mamba/causal_conv1d_prefill.py).
+    SGLANG_Q35MF_GDN_PREFILL_CONV_VEC = EnvBool(False)
+    # Prefill gated RMSNorm writes the static-FP8 input of the GDN out_proj directly.
+    SGLANG_Q35MF_GDN_PREFILL_NORM_FP8 = EnvBool(False)
+    SGLANG_Q35MF_K4_CONV_WINDOW_STORES = EnvBool(False)
+    # Run the scheduler's device-side MLP sync gather on its own stream, so it does not
+    # queue behind the schedule stream's WAR barrier on the in-flight forward.
+    SGLANG_Q35MF_K4_MLP_SYNC_SIDE_STREAM = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -1611,6 +1799,14 @@ class Envs:
     SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT = EnvBool(False)
     # The fused draft input copies (DRAFT_COPY) reuse one descriptor per input layout.
     SGLANG_Q35MF_ARRIVE_COPY_PLAN = EnvBool(False)
+    # The draft-decode graph rebuilds every draft step's attention metadata in one launch.
+    SGLANG_Q35MF_BK_DRAFT_META = EnvBool(False)
+    # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
+    SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
+    # The overlap relay stash writes bonus tokens, top-k and hidden states with one scatter launch.
+    SGLANG_Q35MF_BK_STASH_SCATTER = EnvBool(False)
+    # Draft extend picks its top-1 token with the split argmax the draft steps use.
+    SGLANG_Q35MF_BK_EXTEND_ARGMAX = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
@@ -1963,10 +2159,23 @@ class Envs:
     SGLANG_Q35MF_GDN_LAZY_VALID = EnvBool(False)
     SGLANG_Q35MF_GDN_CONV_TILE = EnvBool(False)
     SGLANG_Q35MF_GDN_TILED_VERIFY = EnvBool(False)
+    SGLANG_Q35MF_GDN_VERIFY_BV64 = EnvBool(False)
+    SGLANG_Q35MF_KGDN_VERIFY_REG168 = EnvBool(False)
     SGLANG_Q35MF_GDN_PDL = EnvBool(False)
     SGLANG_Q35MF_GDN_DIRECT_SOLVE = EnvBool(False)
     SGLANG_Q35MF_GDN_EMPTY_HISTORY = EnvBool(False)
     SGLANG_Q35MF_GDN_NORM_FP8 = EnvBool(False)
+    SGLANG_Q35MF_MKG_FUSED = EnvBool(False)
+    SGLANG_Q35MF_MKG_TP4_MIDDLE = EnvBool(False)
+    SGLANG_Q35MF_MKG_BA_TC = EnvBool(False)
+    SGLANG_Q35MF_MKM_GDN_FRONT = EnvBool(False)
+    # Text-only extend batches take their M-RoPE rows from the device positions
+    # instead of a host arange copied from pageable memory (that copy waits for
+    # the forward stream to drain).
+    SGLANG_Q35MF_K4_MROPE_GPU = EnvBool(False)
+    # FlashInfer GDN prefill writes state checkpoints only on the grid that holds
+    # the tracked states (gcd of their chunk-aligned lengths) instead of every chunk.
+    SGLANG_Q35MF_K4_FI_CKPT_SPARSE = EnvBool(False)
 
     # ===================================================================
     # Plugin system

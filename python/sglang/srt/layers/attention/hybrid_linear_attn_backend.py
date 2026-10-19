@@ -438,6 +438,11 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
+        if envs.SGLANG_Q35MF_PPO.get():
+            # Tensor bounds keep the clamp on the device;
+            # an int min with a tensor max reads the max back.
+            last = query_start_loc[-1] - 1
+            return torch.clamp(indices, min=torch.zeros_like(last), max=last)
         return indices.clamp(0, query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(

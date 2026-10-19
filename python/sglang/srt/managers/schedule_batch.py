@@ -3017,21 +3017,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             self.mamba_prefill_track_mask_cpu = mamba_track_mask_cpu
             self.mamba_track_seqlens_cpu = mamba_track_seqlens_cpu
-            self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
-            self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
-            )
-            self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
-            )
+            if envs.SGLANG_Q35MF_MKH_PREP_NOSYNC.get():
+                # The track slots stay on the device (0-d views of each ping-pong buffer);
+                # blocking copies here would wait for the in-flight decode round.
+                self.mamba_track_indices = torch.stack(mamba_track_indices_cpu)
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
+                ).to(self.device, non_blocking=True)
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
+                ).to(self.device, non_blocking=True)
+            else:
+                self.mamba_track_indices = torch.tensor(
+                    mamba_track_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.mamba_track_mask = torch.tensor(
+                    mamba_track_mask_cpu,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                self.mamba_track_seqlens = torch.tensor(
+                    mamba_track_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
@@ -3103,9 +3114,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (tracked_len // checkpoint_grid) * checkpoint_grid
             )
-        track_index = req.kv.mamba_ping_pong_track_buffer[
-            req.kv.mamba_next_track_idx
-        ].item()
+        track_index = req.kv.mamba_ping_pong_track_buffer[req.kv.mamba_next_track_idx]
+        if not envs.SGLANG_Q35MF_MKH_PREP_NOSYNC.get():
+            track_index = track_index.item()
         mamba_track_seqlen = -1
         if mask:
             # mamba_track_seqlen is used to calculate the indices to track in

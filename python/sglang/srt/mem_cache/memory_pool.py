@@ -89,6 +89,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_pin_memory_available,
     is_xpu,
     next_power_of_2,
 )
@@ -146,6 +147,13 @@ def conv_window_dedup_enabled(
         and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
+
+
+def _device_rows(rows: List[int], device) -> torch.Tensor:
+    # A Python-list index makes torch copy it to the device with a blocking H2D copy.
+    return torch.tensor(
+        rows, dtype=torch.int64, pin_memory=is_pin_memory_available(device)
+    ).to(device, non_blocking=True)
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1152,7 +1160,17 @@ class MambaPool:
             fused_clear_conv_slots(self._conv_slot_desc, indices)
             temporal = self.mamba_cache.temporal
             if temporal.numel() > 0:
-                temporal[:, indices] = 0
+                if envs.SGLANG_Q35MF_MKH_PREP_NOSYNC.get():
+                    # Device zeros as in the non-fused branch: a Python scalar is a blocking copy.
+                    temporal[:, indices] = torch.zeros(
+                        1, dtype=temporal.dtype, device=temporal.device
+                    ).expand(temporal.shape[0], len(indices), *temporal.shape[2:])
+                elif envs.SGLANG_Q35MF_PPO.get():
+                    # A scalar index_put copies the 0 to the device and syncs;
+                    # index_fill_ does not.
+                    temporal.index_fill_(1, indices.to(torch.int64), 0)
+                else:
+                    temporal[:, indices] = 0
             return
         if not _is_npu:
             need_size = len(indices)
@@ -1594,7 +1612,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
             fresh_indices = [
                 idx for idx, fresh in zip(select_index, fresh_req_rows) if fresh
             ]
-            if fresh_indices:
+            if fresh_indices and envs.SGLANG_Q35MF_MKH_PREP_NOSYNC.get():
+                fresh_rows = _device_rows(fresh_indices, spec_write_pos.device)
+                spec_write_pos.index_fill_(0, fresh_rows, 0)
+                self.mamba_pool.replayssm_cache_base.index_fill_(0, fresh_rows, 0)
+                self.mamba_pool.replayssm_is_flush.index_fill_(0, fresh_rows, 0)
+            elif fresh_indices:
                 spec_write_pos[fresh_indices] = 0
                 self.mamba_pool.replayssm_cache_base[fresh_indices] = 0
                 self.mamba_pool.replayssm_is_flush[fresh_indices] = 0
@@ -1631,11 +1654,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
             assert len(select_index) == len(mamba_ping_pong_track_buffers), (
                 "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
             )
+        rows = (
+            _device_rows(select_index, self.device)
+            if envs.SGLANG_Q35MF_MKH_PREP_NOSYNC.get()
+            else select_index
+        )
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        self.req_index_to_mamba_index_mapping[rows] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
             ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers)
-            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[rows] = (
                 ping_pong_tensor
             )
         return select_index

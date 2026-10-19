@@ -63,8 +63,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
-from sglang.srt.layers.moe import qwen_router_front
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    qwen_router_front,
+    reduce_moe_output,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.single_token_draft_moe import SingleTokenDraftMoe
@@ -254,6 +257,19 @@ class Qwen2MoeMLP(nn.Module):
         return x
 
 
+_K4_GATE_STREAM: Optional[torch.cuda.Stream] = None
+
+
+def _k4_gate_stream() -> torch.cuda.Stream:
+    """One top-priority stream for the shared expert's gate kernel, shared by all MoE blocks."""
+    global _K4_GATE_STREAM
+    if _K4_GATE_STREAM is None:
+        _K4_GATE_STREAM = torch.cuda.Stream(
+            priority=torch.cuda.Stream.priority_range()[1]
+        )
+    return _K4_GATE_STREAM
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -433,6 +449,29 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self._route_sh_event = (
             torch.cuda.Event() if self._route_front_static_ok is None else None
         )
+        if envs.SGLANG_Q35MF_K4_PARQ_STREAM.get() and self.alt_stream is not None:
+            get_stream("moe_input_quant")  # created before graph capture
+        self._k4_gate_stream = (
+            _k4_gate_stream()
+            if envs.SGLANG_Q35MF_K4_GATE_PRIO.get() and self.alt_stream is not None
+            else None
+        )
+        self._k4_side_prio_max_tokens = (
+            envs.SGLANG_Q35MF_K4_SIDE_PRIO_MAX_TOKENS.get()
+            if self.alt_stream is not None
+            else 0
+        )
+        if self._k4_side_prio_max_tokens:
+            _k4_gate_stream()  # created before graph capture
+        self._ktp2_shared_fused_max_tokens = (
+            min(envs.SGLANG_Q35MF_KTP2_SHARED_FUSED_MAX_TOKENS.get(), 128)
+            if self.alt_stream is not None
+            else 0
+        )
+        self._ktp2_shared_fused_min_tokens = (
+            envs.SGLANG_Q35MF_KTP2_SHARED_FUSED_MIN_TOKENS.get()
+        )
+        self._ktp2_shared_fused_ok: Optional[bool] = None
 
     def get_moe_weights(self):
         return [
@@ -741,6 +780,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
+    def single_token_draft_single_launch(self, num_tokens: int) -> bool:
+        """Whether the batch runs the single-launch draft MoE kernel (draft_moe_fused)."""
+        return (
+            self.single_token_draft_ready(num_tokens)
+            and self._single_token_draft_moe.single_launch_ready
+        )
+
+    def single_token_draft_ready(self, num_tokens: int) -> bool:
+        """Whether the single-token draft MoE, already set up, runs a batch of this many tokens."""
+        draft_moe = self._single_token_draft_moe
+        return (
+            draft_moe is not None
+            and not self.reduce_results
+            and draft_moe.ready(num_tokens)
+        )
+
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
@@ -765,6 +820,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        if defer_finalize and qwen_router_front.mkm_wide_supported(self, hidden_states):
+            return qwen_router_front.forward_mkm_wide(
+                self, hidden_states, router_logits
+            )
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -796,6 +855,63 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             shared_output,
         )
 
+    def _ktp2_shared_fused_supported(self) -> bool:
+        """The FP8 static per-tensor shared expert and BF16 sigmoid gate that qwen_shared_fused reproduces."""
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+
+        mlp, gate = self.shared_expert, self.shared_expert_gate
+        if not isinstance(mlp, Qwen2MoeMLP) or not isinstance(gate, torch.nn.Linear):
+            return False
+        gu, dp = mlp.gate_up_proj, mlp.down_proj
+        return (
+            all(
+                isinstance(p.quant_method, ModelOptFp8LinearMethod)
+                and p.use_flashinfer_bmm
+                and p.bias is None
+                and p.weight.dtype == torch.float8_e4m3fn
+                and p.weight.t().is_contiguous()
+                and p.weight_scale.numel() == 1
+                and p.input_scale.numel() == 1
+                for p in (gu, dp)
+            )
+            and isinstance(mlp.act_fn, SiluAndMul)
+            and tuple(gu.weight.shape) == (4096, 1024)
+            and tuple(dp.weight.shape) == (512, 4096)
+            and gate.bias is None
+            and tuple(gate.weight.shape) == (1, 4096)
+            and gate.weight.dtype == torch.bfloat16
+        )
+
+    def _use_ktp2_shared_fused(self, m: int) -> bool:
+        # The fused router front already produced this call's gate/up; keep the served tail for it.
+        if (
+            not self._ktp2_shared_fused_min_tokens
+            <= m
+            <= self._ktp2_shared_fused_max_tokens
+            or self._route_sh_gate_up is not None
+        ):
+            return False
+        if self._ktp2_shared_fused_ok is None:
+            self._ktp2_shared_fused_ok = self._ktp2_shared_fused_supported()
+        return self._ktp2_shared_fused_ok
+
+    def _ktp2_shared_fused(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.moe.qwen_shared_fused import shared_expert_fused
+
+        gu, dp = self.shared_expert.gate_up_proj, self.shared_expert.down_proj
+        return shared_expert_fused(
+            hidden_states.contiguous(),
+            w1_nk=gu.weight.t(),
+            w2_nk=dp.weight.t(),
+            gate_weight=self.shared_expert_gate.weight.view(-1),
+            in_scale1=gu.input_scale.reshape(1),
+            w_scale1=gu.weight_scale.reshape(1),
+            in_scale2=dp.input_scale.reshape(1),
+            w_scale2=dp.weight_scale.reshape(1),
+        )
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -807,19 +923,39 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if defer_finalize:
             # Keep routed FC2 on the current stream as finalize's PDL dependency;
             # the shared branch reads the same input and writes a separate output.
-            self.alt_stream.wait_stream(current_stream)
+            side = self.alt_stream
+            if (
+                self._k4_side_prio_max_tokens
+                and hidden_states.shape[0] <= self._k4_side_prio_max_tokens
+            ):
+                # Small M: the routed path is short and FC1 / FC2 hold the SMs with
+                # early-exit CTAs, so the shared expert gets a top-priority stream.
+                side = _k4_gate_stream()
+            side.wait_stream(current_stream)
             router_output = self._forward_router_experts(
                 hidden_states, defer_finalize=True
             )
-            with torch.cuda.stream(self.alt_stream):
+            if self._use_ktp2_shared_fused(hidden_states.shape[0]):
+                # Gate included; the chain holds 16-48 CTAs instead of the cuBLASLt GEMMs' 128.
+                with torch.cuda.stream(side):
+                    shared_output = self._ktp2_shared_fused(hidden_states)
+                current_stream.wait_stream(side)
+                return router_output, shared_output
+            with torch.cuda.stream(side):
                 shared_output = self._forward_shared_experts(
                     hidden_states, apply_gate=False
                 )
+            # The gate kernel is tiny but the last one finalize waits for: on a top-priority
+            # stream it takes an SM while FC2 runs instead of queueing behind all of FC2.
+            gate_stream = self._k4_gate_stream or side
+            if gate_stream is not side:
+                gate_stream.wait_stream(side)
+            with torch.cuda.stream(gate_stream):
                 if shared_output is not None:
                     shared_output = self._gate_shared_output_out_of_place(
                         hidden_states, shared_output
                     )
-            current_stream.wait_stream(self.alt_stream)
+            current_stream.wait_stream(gate_stream)
             return router_output, shared_output
 
         self.alt_stream.wait_stream(current_stream)
@@ -878,7 +1014,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             current_stream.wait_stream(self.alt_stream)
             return router_output, shared_output
-        shared_output = self._forward_shared_experts(hidden_states, apply_gate=apply_gate)
+        shared_output = self._forward_shared_experts(
+            hidden_states, apply_gate=apply_gate
+        )
         return qwen_router_front.forward_routed(self, hidden_states), shared_output
 
     def forward(
@@ -898,10 +1036,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and draft_moe.active
             and 0 < num_tokens <= draft_moe.MAX_TOKENS
         ):
-            if not defer_finalize and not self.reduce_results:
-                out = draft_moe.forward(self, hidden_states)
+            if not self.reduce_results:
+                # Only the draft step hop defers here (single_token_draft_ready).
+                from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+                    DraftMoePartial,
+                    moe_push_target,
+                )
+
+                out = draft_moe.forward(
+                    self,
+                    hidden_states,
+                    push_hop=moe_push_target() if defer_finalize else None,
+                )
                 if out is not None:
-                    return out.view(num_tokens, hidden_dim)
+                    out = out.view(num_tokens, hidden_dim)
+                    if defer_finalize:
+                        return DraftMoePartial(
+                            partial=out, reduce=sum_post_experts_output
+                        )
+                    return out
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)

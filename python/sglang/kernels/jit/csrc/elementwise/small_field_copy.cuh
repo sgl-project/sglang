@@ -82,8 +82,76 @@ __global__ void small_field_copy_kernel(const __grid_constant__ SmallFieldCopyPa
   }
 }
 
+/// Internal kind of the vectorized launch: a raw field moved in 16-byte units.
+constexpr int32_t kCopy128 = 6;
+
+struct SmallFieldCopyVecParams {
+  const void* src[kSmallFieldCopyMaxFields];
+  void* dst[kSmallFieldCopyMaxFields];
+  int64_t rows[kSmallFieldCopyMaxFields];
+  int64_t cols[kSmallFieldCopyMaxFields];
+  int64_t src_row_stride[kSmallFieldCopyMaxFields];
+  int64_t dst_row_stride[kSmallFieldCopyMaxFields];
+  int32_t kind[kSmallFieldCopyMaxFields];
+  int32_t block_start[kSmallFieldCopyMaxFields + 1];
+  int32_t num_fields;
+};
+
+/// \brief Same copies as small_field_copy_kernel, with each field owning its own block range
+///        (sized to the field) and aligned raw fields moved in 16-byte units.
+__global__ void small_field_copy_vec_kernel(const __grid_constant__ SmallFieldCopyVecParams params) {
+  const int32_t block = static_cast<int32_t>(blockIdx.x);
+  int32_t field = 0;
+  while (field + 1 < params.num_fields && block >= params.block_start[field + 1]) {
+    ++field;
+  }
+  const int64_t rows = params.rows[field];
+  const int64_t cols = params.cols[field];
+  const int64_t n = rows * cols;
+  const int64_t src_stride = params.src_row_stride[field];
+  const int64_t dst_stride = params.dst_row_stride[field];
+  const int32_t kind = params.kind[field];
+  const int64_t stride = static_cast<int64_t>(params.block_start[field + 1] - params.block_start[field]) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(block - params.block_start[field]) * blockDim.x + threadIdx.x; i < n;
+       i += stride) {
+    const int64_t row = rows == 1 ? 0 : i / cols;
+    const int64_t col = i - row * cols;
+    const int64_t s = row * src_stride + col;
+    const int64_t d = row * dst_stride + col;
+    switch (kind) {
+      case kCopy8:
+        static_cast<uint8_t*>(params.dst[field])[d] = static_cast<const uint8_t*>(params.src[field])[s];
+        break;
+      case kCopy16:
+        static_cast<uint16_t*>(params.dst[field])[d] = static_cast<const uint16_t*>(params.src[field])[s];
+        break;
+      case kCopy32:
+        static_cast<uint32_t*>(params.dst[field])[d] = static_cast<const uint32_t*>(params.src[field])[s];
+        break;
+      case kCopy64:
+        static_cast<uint64_t*>(params.dst[field])[d] = static_cast<const uint64_t*>(params.src[field])[s];
+        break;
+      case kInt32ToInt64:
+        static_cast<int64_t*>(params.dst[field])[d] =
+            static_cast<int64_t>(static_cast<const int32_t*>(params.src[field])[s]);
+        break;
+      case kInt64ToInt32:
+        static_cast<int32_t*>(params.dst[field])[d] =
+            static_cast<int32_t>(static_cast<const int64_t*>(params.src[field])[s]);
+        break;
+      case kCopy128:
+        static_cast<uint4*>(params.dst[field])[d] = static_cast<const uint4*>(params.src[field])[s];
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 constexpr int64_t kSmallFieldCopyBlock = 256;
 constexpr int64_t kSmallFieldCopyMaxBlocks = 32;
+// Per-field block cap of the vectorized launch; arbitrary, sized for ~0.5 MB fields in one pass.
+constexpr int64_t kSmallFieldCopyVecMaxBlocks = 128;
 
 struct SmallFieldCopy {
   /// \brief Copies every field described in `desc` with one launch on the current stream.
@@ -102,22 +170,67 @@ struct SmallFieldCopy {
     for (int64_t i = 0; i < num_entries; ++i) {
       entries[i] = desc[i];
     }
-    return launch(anchor, entries, num_entries);
+    return launch(anchor, entries, num_entries, false);
   }
 
   /// \brief Same as `run`, with the descriptor in a host int64 tensor of 7 entries per field.
   static int64_t run_host_desc(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
+    return launch(anchor, host_desc(desc), desc.size(0), false);
+  }
+
+  /// \brief `run` through small_field_copy_vec_kernel: same bytes, same refusals.
+  static int64_t run_vec(tvm::ffi::TensorView anchor, tvm::ffi::Array<int64_t> desc) {
+    using namespace host;
+
+    const int64_t num_entries = static_cast<int64_t>(desc.size());
+    CHECK_HOST(num_entries <= kSmallFieldCopyMaxFields * kSmallFieldCopyEntries)
+        << "too many fields " << num_entries / kSmallFieldCopyEntries;
+    int64_t entries[kSmallFieldCopyMaxFields * kSmallFieldCopyEntries];
+    for (int64_t i = 0; i < num_entries; ++i) {
+      entries[i] = desc[i];
+    }
+    return launch(anchor, entries, num_entries, true);
+  }
+
+  /// \brief `run_host_desc` through small_field_copy_vec_kernel.
+  static int64_t run_host_desc_vec(tvm::ffi::TensorView anchor, tvm::ffi::TensorView desc) {
+    return launch(anchor, host_desc(desc), desc.size(0), true);
+  }
+
+ private:
+  static const int64_t* host_desc(tvm::ffi::TensorView desc) {
     using namespace host;
 
     CHECK_HOST(
         desc.device().device_type == kDLCPU && is_type<int64_t>(desc.dtype()) && desc.ndim() == 1 &&
         (desc.size(0) <= 1 || desc.stride(0) == 1))
         << "descriptor must be a contiguous host int64 vector";
-    return launch(anchor, static_cast<const int64_t*>(desc.data_ptr()), desc.size(0));
+    return static_cast<const int64_t*>(desc.data_ptr());
   }
 
- private:
-  static int64_t launch(tvm::ffi::TensorView anchor, const int64_t* desc, int64_t num_entries) {
+  /// Moves a validated field to the vectorized layout: a contiguous field becomes one row, and
+  /// a raw field whose rows, strides and base addresses are 16-byte aligned moves in uint4 units.
+  static void vectorize(SmallFieldCopyVecParams& p, int32_t i, int64_t elem_size) {
+    if (p.rows[i] > 1 && p.src_row_stride[i] == p.cols[i] && p.dst_row_stride[i] == p.cols[i]) {
+      p.cols[i] *= p.rows[i];
+      p.rows[i] = 1;
+      p.src_row_stride[i] = p.dst_row_stride[i] = p.cols[i];
+    }
+    if (p.kind[i] > kCopy64) return;
+    const int64_t row_bytes = p.cols[i] * elem_size;
+    const int64_t src_bytes = p.src_row_stride[i] * elem_size;
+    const int64_t dst_bytes = p.dst_row_stride[i] * elem_size;
+    const bool aligned = row_bytes % 16 == 0 && reinterpret_cast<uintptr_t>(p.src[i]) % 16 == 0 &&
+                         reinterpret_cast<uintptr_t>(p.dst[i]) % 16 == 0 &&
+                         (p.rows[i] == 1 || (src_bytes % 16 == 0 && dst_bytes % 16 == 0));
+    if (!aligned) return;
+    p.kind[i] = kCopy128;
+    p.cols[i] = row_bytes / 16;
+    p.src_row_stride[i] = p.rows[i] == 1 ? p.cols[i] : src_bytes / 16;
+    p.dst_row_stride[i] = p.rows[i] == 1 ? p.cols[i] : dst_bytes / 16;
+  }
+
+  static int64_t launch(tvm::ffi::TensorView anchor, const int64_t* desc, int64_t num_entries, bool vec) {
     using namespace host;
 
     SymbolicDevice device_;
@@ -173,6 +286,31 @@ struct SmallFieldCopy {
       if (dst_begin[i] < src_end[i] && src_begin[i] < dst_end[i]) return 1;
     }
     if (num_fields == 0) return 0;
+
+    if (vec) {
+      SmallFieldCopyVecParams vp{};
+      vp.num_fields = num_fields;
+      for (int32_t i = 0; i < num_fields; ++i) {
+        vp.src[i] = params.src[i];
+        vp.dst[i] = params.dst[i];
+        vp.rows[i] = params.rows[i];
+        vp.cols[i] = params.cols[i];
+        vp.src_row_stride[i] = params.src_row_stride[i];
+        vp.dst_row_stride[i] = params.dst_row_stride[i];
+        vp.kind[i] = params.kind[i];
+        vectorize(vp, i, params.kind[i] <= kCopy64 ? (int64_t{1} << params.kind[i]) : 0);
+        const int64_t units = vp.rows[i] * vp.cols[i];
+        const int64_t blocks = div_ceil(units, kSmallFieldCopyBlock);
+        vp.block_start[i + 1] =
+            vp.block_start[i] +
+            static_cast<int32_t>(blocks < kSmallFieldCopyVecMaxBlocks ? blocks : kSmallFieldCopyVecMaxBlocks);
+      }
+      LaunchKernel(
+          dim3(static_cast<uint32_t>(vp.block_start[num_fields])),
+          static_cast<uint32_t>(kSmallFieldCopyBlock),
+          device_.unwrap())(small_field_copy_vec_kernel, vp);
+      return 0;
+    }
 
     // Every field gets the same block count; the grid-stride loop covers larger fields, so a
     // small cap keeps the idle blocks of the small fields cheap. Tunable, not measured.

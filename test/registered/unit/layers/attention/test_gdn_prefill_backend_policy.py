@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import (
@@ -407,6 +408,34 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                     nominal_capability.assert_called_once_with(None)
                 else:
                     nominal_capability.assert_not_called()
+
+    def test_verify_pdl_options(self):
+        # TP4 / TP8 shapes follow GDN_PDL or the caller's override at every batch; the TP2
+        # shape (8 / 32 heads, 7 tokens) only at batches 4, 6 and 10; only MKG waits for gates.
+        pdl, pdl_wait = dict(pdl=True), dict(pdl=True, wait_for_gate_producer=True)
+        cases = (
+            (None, True, False, (4, 16), 8, pdl),
+            (None, True, False, (8, 32), 8, {}),
+            (None, True, False, (8, 32), 10, pdl),
+            (None, False, False, (4, 16), 8, {}),
+            (True, False, True, (4, 16), 1, pdl_wait),
+            (False, True, True, (4, 16), 1, {}),
+        )
+        for verify_pdl, gdn_pdl, mkg, heads, batch, expected in cases:
+            with (
+                self.subTest(case=(verify_pdl, gdn_pdl, mkg, heads, batch)),
+                envs.SGLANG_Q35MF_GDN_PDL.override(gdn_pdl),
+                envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.override(mkg),
+                envs.SGLANG_Q35MF_MKG_FUSED.override(False),
+            ):
+                options = gdn_backend._verify_pdl_options(
+                    verify_pdl=verify_pdl,
+                    num_k_heads=heads[0],
+                    num_v_heads=heads[1],
+                    draft_token_num=7,
+                    batch_size=batch,
+                )
+                self.assertEqual(options, expected)
 
     def test_helion_backend_reports_kda_only(self):
         cases = (

@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.quantization import fp8_handoff
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.utils import (
     ceil_align,
@@ -922,6 +923,10 @@ def static_quant_fp8(
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
 
+    if not repeat_scale:
+        handed = fp8_handoff.take(x, x_s)
+        if handed is not None:
+            return handed, x_s
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]
     N = x.shape[-1]

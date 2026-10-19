@@ -221,3 +221,92 @@ def update_trtllm_mha_graph_metadata(
         BS_BLOCK=triton.next_power_of_2(bs),
         SKIP_PAGE_TABLE=1 if skip_page_table else 0,
     )
+
+
+@triton.jit
+def update_trtllm_mha_graph_metadata_multistep_kernel(
+    req_pool_indices_ptr,  # [bs] int
+    seq_lens_ptr,  # [bs] int
+    req_to_token_ptr,  # [pool_size, req_to_token_stride] int32
+    addr_ptr,  # [num_steps, 3] int64: cache_seqlens, cu_seqlens_k, page_table of each step
+    bs,
+    first_offset,  # seqlen offset of step 0; step s uses first_offset + s
+    max_seq_pages,
+    req_to_token_stride,
+    page_table_stride,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
+    BS_BLOCK: tl.constexpr,
+    SKIP_PAGE_TABLE: tl.constexpr,
+):
+    """update_trtllm_mha_graph_metadata_kernel (no SWA, preset cu_seqlens_q) for
+    every draft step at once: axis 1 is the step, each step writing its own buffers."""
+    pid = tl.program_id(axis=0)
+    step = tl.program_id(axis=1)
+    seqlen_offset = first_offset + step
+    cache_seqlens_ptr = tl.load(addr_ptr + step * 3).to(tl.pointer_type(tl.int32))
+    cu_seqlens_k_ptr = tl.load(addr_ptr + step * 3 + 1).to(tl.pointer_type(tl.int32))
+    if pid < bs:
+        seqlen = (tl.load(seq_lens_ptr + pid) + seqlen_offset).to(tl.int32)
+        tl.store(cache_seqlens_ptr + pid, seqlen)
+        if not SKIP_PAGE_TABLE:
+            page_table_ptr = tl.load(addr_ptr + step * 3 + 2).to(
+                tl.pointer_type(tl.int32)
+            )
+            req_pool_index = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+            row_in = req_to_token_ptr + req_pool_index * req_to_token_stride
+            row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride
+            num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
+            for i in range(tl.cdiv(num_live_pages, PAGE_BLOCK)):
+                page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
+                mask = page_idx < num_live_pages
+                token = tl.load(
+                    row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
+                )
+                tl.store(row_out + page_idx, token // PAGE_SIZE, mask=mask)
+    else:
+        offs = tl.arange(0, BS_BLOCK)
+        mask = offs < bs
+        seqlens = (tl.load(seq_lens_ptr + offs, mask=mask, other=0)).to(tl.int32)
+        seqlens = tl.where(mask, seqlens + seqlen_offset, 0)
+        tl.store(cu_seqlens_k_ptr + 1 + offs, tl.cumsum(seqlens, axis=0), mask=mask)
+
+
+def update_trtllm_mha_graph_metadata_multistep(
+    *,
+    req_pool_indices,
+    seq_lens,
+    req_to_token,
+    addr_table,
+    num_steps: int,
+    bs: int,
+    first_offset: int,
+    max_seq_pages: int,
+    page_size: int,
+    page_table_stride: int,
+    skip_page_table: bool = False,
+):
+    """One launch of the draft-decode metadata rebuild for ``num_steps`` steps.
+
+    ``addr_table`` ([num_steps, 3] int64 on device) holds each step's
+    cache_seqlens / cu_seqlens_k / page_table addresses; the per-step results are
+    the same bytes ``update_trtllm_mha_graph_metadata`` writes with
+    seqlen_offset = first_offset + step (no SWA tables, cu_seqlens_q untouched).
+    """
+    if bs == 0:
+        return
+    update_trtllm_mha_graph_metadata_multistep_kernel[(bs + 1, num_steps)](
+        req_pool_indices,
+        seq_lens,
+        req_to_token,
+        addr_table,
+        bs,
+        first_offset,
+        max_seq_pages,
+        req_to_token.stride(0),
+        page_table_stride,
+        PAGE_SIZE=page_size,
+        PAGE_BLOCK=512,
+        BS_BLOCK=triton.next_power_of_2(bs),
+        SKIP_PAGE_TABLE=1 if skip_page_table else 0,
+    )

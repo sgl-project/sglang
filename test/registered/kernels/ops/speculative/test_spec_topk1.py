@@ -188,6 +188,35 @@ class TestSpecTopk1Triton(CustomTestCase):
             positions, torch.ones_like(positions), rtol=0, atol=0
         )
 
+    def test_without_positions_matches_torch_argmax(self):
+        # Draft extend calls it with positions=None in place of torch.argmax + ones_like:
+        # the picks must be identical, ties and -inf rows included.
+        g = torch.Generator(device=self.device).manual_seed(3)
+        for batch_size, vocab_size, dtype in (
+            (1, 248320, torch.float32),
+            (8, 248320, torch.float32),
+            (17, 151666, torch.bfloat16),
+            (4, 8193, torch.float16),
+        ):
+            with self.subTest(
+                batch_size=batch_size, vocab_size=vocab_size, dtype=dtype
+            ):
+                logits = torch.randn(
+                    (batch_size, vocab_size), device=self.device, generator=g
+                ).to(dtype)
+                # Coarse values give many tied maxima, across split boundaries too.
+                logits[: batch_size // 2] = logits[: batch_size // 2].mul(2).round()
+                logits[-1, :] = -float("inf")
+                topk_p, topk_index = draft_topk1_postprocess(logits, None)
+                expected = torch.argmax(logits, dim=-1, keepdim=True)
+                torch.testing.assert_close(topk_index, expected, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    topk_p,
+                    torch.ones_like(expected, dtype=torch.float32),
+                    rtol=0,
+                    atol=0,
+                )
+
     def test_empty_batch(self):
         logits = torch.empty((0, 1024), dtype=torch.float32, device=self.device)
         positions = torch.empty((0,), dtype=torch.long, device=self.device)

@@ -1444,11 +1444,27 @@ class SchedulerDisaggregationPrefillMixin:
         # be writing these prefix pages on forward_stream. Record a completion
         # event now so the transfer worker can wait on those writes before the
         # RDMA read, instead of racing them.
-        if self.enable_overlap:
+        ppo = envs.SGLANG_Q35MF_PPO.get()
+        if self.enable_overlap or ppo:
             ev = torch.cuda.Event()
             ev.record(self.forward_stream)
             req.disagg_kv_sender._early_send_wait_event = ev
+        if ppo and self.pp_group.world_size > 1:
+            # Sent by flush_deferred_prefix_sends once the forward is enqueued;
+            # the page-index readback here would hold the launch.
+            self.deferred_prefix_sends.append((req, cached_end))
+            return
         self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+
+    def flush_deferred_prefix_sends(self: Scheduler) -> None:
+        """Early-sends deferred past the forward launch (PP prefill overlap)."""
+        if not self.deferred_prefix_sends:
+            return
+        sends, self.deferred_prefix_sends = self.deferred_prefix_sends, []
+        # The schedule stream wrote req_to_token; the forward stream is busy.
+        with self.device_module.stream(self.schedule_stream):
+            for req, cached_end in sends:
+                self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
 
     def send_kv_chunk(
         self,

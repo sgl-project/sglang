@@ -14,6 +14,7 @@ from typing import Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     DeferredFinalize,
@@ -173,6 +174,7 @@ class CuteDSLWorkspace:
         handoff: MoeDeferredFinalize,
         residual: torch.Tensor,
         gamma: torch.Tensor,
+        fp8_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._workspace is not None
         return self._workspace.moe_finalize_all_reduce_rms_norm(
@@ -182,6 +184,7 @@ class CuteDSLWorkspace:
             gated_shared_output=handoff.gated_shared_output,
             residual=residual,
             gamma=gamma,
+            fp8_scale=fp8_scale,
         )
 
     def all_reduce_residual_rms_norm(
@@ -189,12 +192,14 @@ class CuteDSLWorkspace:
         local_contribution: torch.Tensor,
         residual: torch.Tensor,
         gamma: torch.Tensor,
+        fp8_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._workspace is not None
         return self._workspace.all_reduce_residual_rms_norm(
             local_contribution=local_contribution,
             residual=residual,
             gamma=gamma,
+            fp8_scale=fp8_scale,
         )
 
 
@@ -215,6 +220,9 @@ class CuteDSLFusion:
         # Producer capabilities; consumer kernel selection is independent.
         self.defers_finalize = False
         self.terminal_finalize = False
+        # The static-FP8 linear that reads this layer's input norm, when the attention-input
+        # hop can hand it a ready FP8 activation (SGLANG_Q35MF_MKH_HOP).
+        self.input_fp8_linear: torch.nn.Module | None = None
 
     def install(
         self,
@@ -267,7 +275,12 @@ class CuteDSLFusion:
         if post_residual_addition is not None:
             residual = residual + post_residual_addition
         assert self.service is not None
-        return self.service.finalize(handoff=owed, residual=residual, gamma=gamma)
+        return self.service.finalize(
+            handoff=owed,
+            residual=residual,
+            gamma=gamma,
+            fp8_scale=self._input_fp8_scale(),
+        )
 
     def _all_reduce_add_norm(
         self, plan, owed, residual, forward_batch, post_residual_addition
@@ -285,13 +298,27 @@ class CuteDSLFusion:
             local_contribution=owed.partial,
             residual=residual,
             gamma=_fused_norm_gamma(plan.norm),
+            fp8_scale=self._input_fp8_scale(),
         )
+
+    def _input_fp8_scale(self) -> torch.Tensor | None:
+        # Read at call time: weight loading replaces the input_scale parameter.
+        if self.input_fp8_linear is None:
+            return None
+        return self.input_fp8_linear.input_scale
 
     def _ffn_input_all_reduce_add_norm(
         self, plan, hidden_states, residual, forward_batch
     ):
         """The attention output's all-reduce with the residual add and the
         post-attention norm."""
+        if self.service is not None and _q35_hop_pushed(hidden_states):
+            # The producer already pushed this partial; only the consume half is left.
+            return self.service.all_reduce_residual_rms_norm(
+                local_contribution=hidden_states,
+                residual=residual,
+                gamma=_fused_norm_gamma(plan.norm),
+            )
         if not (
             self._eligible(plan, forward_batch, int(hidden_states.shape[0]))
             and residual is not None
@@ -355,6 +382,15 @@ class CuteDSLFusion:
             # The FFN runs on the full rows, not each rank's own slice.
             and TokenAxis.ATTN_TP not in plan.fused_input_rows(forward_batch).sharded
         )
+
+
+def _q35_hop_pushed(partial: torch.Tensor) -> bool:
+    if not (envs.SGLANG_Q35MF_MKH_OPROJ.get() or envs.SGLANG_Q35MF_MKA_PUSH.get()):
+        return False
+    from sglang.srt.layers.q35_hop import active
+
+    hop = active()
+    return hop is not None and hop.has_pushed(partial)
 
 
 def _fusion_of(layer: torch.nn.Module) -> CuteDSLFusion | None:
@@ -421,6 +457,10 @@ def install_cutedsl_fusion(
             defers_finalize=defers_finalize,
             terminal_finalize=terminal_finalize,
         )
+        if envs.SGLANG_Q35MF_MKH_HOP.get():
+            from sglang.srt.layers.q35_hop import input_fp8_linear
+
+            fusion.input_fp8_linear = input_fp8_linear(layer)
     logger.info(
         "Installed one %s FlashInfer MNNVL CuTe DSL fusion handle for %d of %d layers "
         "(%d can defer the MoE finalize)",
@@ -465,6 +505,12 @@ def prepare_cutedsl_fusion(
     max_m = _resolve_max_m(max_running_requests=max_running_requests)
     for service in services.values():
         service.prepare(max_m=max_m)
+    if envs.SGLANG_Q35MF_MKH_HOP.get() and envs.SGLANG_Q35MF_MKH_OPROJ.get():
+        from sglang.srt.layers.q35_hop import prepare_out_proj
+
+        logger.info(
+            "Packed %d out_proj weights for the q35 hop push", prepare_out_proj(model)
+        )
     logger.info(
         "Prepared the FlashInfer MNNVL CuTe DSL fusion workspace for M_max=%d "
         "(%d fused layers)",

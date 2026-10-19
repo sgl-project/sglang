@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
@@ -53,6 +54,19 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_MLP_SYNC_SIDE_STREAM = envs.SGLANG_Q35MF_K4_MLP_SYNC_SIDE_STREAM.get()
+_mlp_sync_streams: dict = {}
+
+
+def _mlp_sync_stream_context(device):
+    # The gather reads and writes only its own fresh tensors, so it has no WAR hazard with the
+    # forward and can skip the schedule stream's barrier; the host still blocks on its D2H read.
+    if not _MLP_SYNC_SIDE_STREAM or torch.device(device).type != "cuda":
+        return contextlib.nullcontext()
+    stream = _mlp_sync_streams.get(device)
+    if stream is None:
+        stream = _mlp_sync_streams[device] = torch.cuda.Stream(device=device)
+    return torch.cuda.stream(stream)
 
 
 def _spec_input_cuda_graph_compatible(
@@ -203,6 +217,15 @@ class MLPSyncBatchInfo:
         device,
         group: torch.distributed.ProcessGroup,
         use_all_reduce: bool = False,
+    ):
+        with _mlp_sync_stream_context(device):
+            self._all_gather(device=device, group=group, use_all_reduce=use_all_reduce)
+
+    def _all_gather(
+        self,
+        device,
+        group: torch.distributed.ProcessGroup,
+        use_all_reduce: bool,
     ):
         sync_start = time.perf_counter()
         local_info_tensor = self._get_local_tensor(device=device)

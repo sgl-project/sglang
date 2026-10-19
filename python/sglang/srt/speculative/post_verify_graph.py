@@ -12,7 +12,8 @@ as before and enters the graph as a device scalar, so real and injected
 acceptance replay the same graph. Two graphs per key alternate so that one
 round's outputs stay valid until the host has consumed them.
 
-Enabled by SGLANG_Q35MF_EDGE_POST_VERIFY_GRAPH=1 (default off).
+Enabled by SGLANG_Q35MF_EDGE_POST_VERIFY_GRAPH=1 (default off), for batches of up to
+SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS requests (default 2).
 """
 
 from __future__ import annotations
@@ -25,15 +26,23 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_spec, mamba_track_grid
 
 logger = logging.getLogger(__name__)
 
 _NUM_WARMUP = 2
-_MAX_BS = 2
+# Largest batch replayed from the graph; larger batches keep the eager chain.
+_MAX_BS = int(os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS", "2"))
 # Arbitrary bound on captured graph sets (key x verify logits buffer).
-_MAX_STATES = 16
+_MAX_STATES = max(16, 8 * _MAX_BS)
+# With the side-stream commit: largest batch whose commit runs on the side stream; larger
+# batches commit inside the main graph (the side commit slows the overlapping draft extend).
+_SIDE_MAX_BS = int(
+    os.environ.get("SGLANG_Q35MF_EDGE_POST_VERIFY_SIDE_MAX_BS", str(_MAX_BS))
+)
 
 
 def post_verify_graph_enabled() -> bool:
@@ -42,6 +51,27 @@ def post_verify_graph_enabled() -> bool:
 
 _SPARSE_VERIFY = os.environ.get("SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING", "0") == "1"
 _SIDE_STREAM_COMMIT = os.environ.get("SGLANG_Q35MF_EDGE_SIDE_STREAM_COMMIT", "0") == "1"
+_ONE_LAUNCH_LOAD = envs.SGLANG_Q35MF_MKH_N3C.get()
+_SHARDED_IN_GRAPH = envs.SGLANG_Q35MF_D2R_PVG_SHARDED.get()
+
+
+def _check_sharded_sampling_config() -> None:
+    # Without the in-graph sharded sampler, graphed rounds above batch 2 would gather the
+    # shard-local verify logits; that combination is slower and was never validated.
+    if (
+        _MAX_BS > 2
+        and envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
+        and not _SHARDED_IN_GRAPH
+    ):
+        raise ValueError(
+            "SGLANG_Q35MF_EDGE_POST_VERIFY_MAX_BS > 2 with "
+            "SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING=1 requires "
+            "SGLANG_Q35MF_D2R_PVG_SHARDED=1"
+        )
+
+
+class PostVerifySamplingView(SimpleNamespace):
+    """Batch sampling info inside the post-verify graph that the sharded verify sampler accepts."""
 
 
 def sparse_verify_max_top_k(batch) -> Optional[int]:
@@ -62,25 +92,40 @@ def _count_acceptance_calls():
     # eagle_sample resolves both kernels through these module attributes at call time.
     from sglang.kernels.ops.speculative import sampling as sampling_ops
     from sglang.srt.speculative import eagle_utils
+    from sglang.srt.speculative.sharded_verify_sampling import ShardedVerifySampler
 
-    calls = [0]
+    # [acceptance calls, of which sharded sampler runs]
+    calls = [0, 0]
     greedy_fn = eagle_utils.verify_tree_greedy_func
     tree_fn = sampling_ops.tree_speculative_sampling_target_only
+    sharded_fn = ShardedVerifySampler.run
 
-    def counted(fn):
+    def counted(fn, sharded=False):
         def call(*args, **kwargs):
             calls[0] += 1
+            calls[1] += int(sharded)
             return fn(*args, **kwargs)
 
         return call
 
     eagle_utils.verify_tree_greedy_func = counted(greedy_fn)
     sampling_ops.tree_speculative_sampling_target_only = counted(tree_fn)
+    if eagle_utils._LOCAL_VERIFY_SAMPLING:
+        # The one-rank chunked sampler is the acceptance kernel on that path.
+        from sglang.srt.speculative import sharded_verify_sampling as local_ops
+
+        local_fn = local_ops.sample_chain_full_vocab
+        local_ops.sample_chain_full_vocab = counted(local_fn)
+    # The sharded sampler decides acceptance inside its own kernels.
+    ShardedVerifySampler.run = counted(sharded_fn, sharded=True)
     try:
         yield calls
     finally:
         eagle_utils.verify_tree_greedy_func = greedy_fn
         sampling_ops.tree_speculative_sampling_target_only = tree_fn
+        if eagle_utils._LOCAL_VERIFY_SAMPLING:
+            local_ops.sample_chain_full_vocab = local_fn
+        ShardedVerifySampler.run = sharded_fn
 
 
 class _Slot:
@@ -89,6 +134,9 @@ class _Slot:
         self.commit_graph: Optional[torch.cuda.CUDAGraph] = None
         self.inputs: Dict[str, torch.Tensor] = {}
         self.outputs: Optional[Tuple] = None
+        self.load_plan = (
+            SmallFieldCopyPlan(allow_pinned_src=True) if _ONE_LAUNCH_LOAD else None
+        )
 
 
 class _KeyState:
@@ -100,6 +148,7 @@ class _KeyState:
 
 class PostVerifyGraph:
     def __init__(self, *, device: torch.device, target_worker: Any):
+        _check_sharded_sampling_config()
         self.device = device
         self.target_worker = target_worker
         self.disabled = False
@@ -127,6 +176,7 @@ class PostVerifyGraph:
         self._stock_rounds = 0
         self._checked = 0
         self._mismatch = 0
+        self._load_mismatch = 0
 
     def try_run(
         self,
@@ -222,6 +272,7 @@ class PostVerifyGraph:
         topk,
         token_to_kv_pool_allocator,
     ):
+        from sglang.srt.layers.logits_processor import verify_logits_on_shards
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
         info = batch.sampling_info
@@ -252,6 +303,10 @@ class PostVerifyGraph:
             )
             is not None
             or not logits_output.next_token_logits.is_cuda
+            or (
+                (batch.return_logprob or info.has_custom_logit_processor)
+                and verify_logits_on_shards(logits_output.next_token_logits)
+            )
         ):
             return None
         return (
@@ -279,6 +334,9 @@ class PostVerifyGraph:
             x["temperatures"] = info.temperatures
             x["top_ks"] = info.top_ks
             x["top_ps"] = info.top_ps
+        elif _SHARDED_IN_GRAPH:
+            # The sharded sampler reads a temperature for every row, greedy batches included.
+            x["temperatures"] = info.temperatures
         if batch.mamba_track_indices is not None:
             x["mamba_track_indices"] = batch.mamba_track_indices
         return x
@@ -341,6 +399,8 @@ class PostVerifyGraph:
             )
         else:
             self._load(slot, inputs, sim_len)
+        if self._check:
+            self._check_load(slot, inputs, sim_len)
         slot.graph.replay()
         if slot.commit_graph is not None:
             self._main_done.record()
@@ -352,6 +412,18 @@ class PostVerifyGraph:
         if self._check:
             self._compare(slot, batch, verify_input, logits_output, num_draft_tokens)
         return slot.outputs[:6]
+
+    def _check_load(self, slot: _Slot, inputs: Dict[str, torch.Tensor], sim_len):
+        # Debug only (host syncs): the slot must hold exactly this round's sources.
+        same = all(torch.equal(slot.inputs[k], v) for k, v in inputs.items())
+        if sim_len is not None:
+            same = same and torch.equal(slot.inputs["sim_len"].cpu(), sim_len)
+        if not same:
+            self._load_mismatch += 1
+            logger.error(
+                "post-verify graph: slot inputs differ from their sources (%d so far)",
+                self._load_mismatch,
+            )
 
     def _compare(
         self, slot: _Slot, batch, verify_input, logits_output, num_draft_tokens
@@ -386,12 +458,23 @@ class PostVerifyGraph:
         self._mismatch += 0 if same else 1
         if not same or self._checked % 1000 == 0:
             logger.info(
-                "post-verify graph check: %d rounds, %d mismatches",
+                "post-verify graph check: %d rounds, %d mismatches, %d load mismatches",
                 self._checked,
                 self._mismatch,
+                self._load_mismatch,
             )
 
     def _load(self, slot: _Slot, inputs: Dict[str, torch.Tensor], sim_len):
+        if slot.load_plan is not None:
+            dsts = [slot.inputs[name] for name in inputs]
+            srcs = list(inputs.values())
+            if sim_len is not None:
+                dsts.append(slot.inputs["sim_len"])
+                srcs.append(sim_len)
+            if slot.load_plan(dsts, srcs):
+                if sim_len is not None:
+                    self._record_sim_len_done()
+                return
         # One multi-tensor copy per dtype; one memcpy per input costs ~4 us of GPU time each.
         groups: Dict[torch.dtype, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         for name, src in inputs.items():
@@ -404,10 +487,13 @@ class PostVerifyGraph:
             torch._foreach_copy_(dsts, srcs, non_blocking=True)
         if sim_len is not None:
             slot.inputs["sim_len"].copy_(sim_len, non_blocking=True)
-            done = self._sim_len_done[self._sim_len_slot]
-            if done is None:
-                done = self._sim_len_done[self._sim_len_slot] = torch.cuda.Event()
-            done.record()
+            self._record_sim_len_done()
+
+    def _record_sim_len_done(self) -> None:
+        done = self._sim_len_done[self._sim_len_slot]
+        if done is None:
+            done = self._sim_len_done[self._sim_len_slot] = torch.cuda.Event()
+        done.record()
 
     def _capture(
         self,
@@ -424,6 +510,7 @@ class PostVerifyGraph:
             self._pool = torch.cuda.graph_pool_handle()
         stream = torch.cuda.current_stream()
         graph = torch.cuda.CUDAGraph()
+        side = self._side_stream is not None and len(batch.seq_lens) <= _SIDE_MAX_BS
         with _count_acceptance_calls() as acceptance_calls:
             with graph_capture(stream=stream) as ctx:
                 with torch.cuda.graph(
@@ -438,14 +525,14 @@ class PostVerifyGraph:
                         verify_input,
                         logits_output,
                         num_draft_tokens,
-                        commit=self._side_stream is None,
+                        commit=not side,
                     )
         # Injected acceptance only overrides the result; the real acceptance kernel must be in the graph.
         if acceptance_calls[0] == 0:
             raise RuntimeError(
                 "post-verify graph captured without the acceptance kernel"
             )
-        if self._side_stream is not None:
+        if side:
             # Captured after the main graph in the same pool and replayed after it every round.
             commit_graph = torch.cuda.CUDAGraph()
             self._side_stream.wait_stream(torch.cuda.current_stream())
@@ -463,10 +550,11 @@ class PostVerifyGraph:
         slot.graph = graph
         slot.outputs = outputs
         logger.info(
-            "Captured post-verify graph for bs=%d key=%s side_commit=%s",
+            "Captured post-verify graph for bs=%d key=%s side_commit=%s sharded_sampler=%s",
             len(batch.seq_lens),
             key,
             slot.commit_graph is not None,
+            acceptance_calls[1] > 0,
         )
 
     def _body(
@@ -528,7 +616,7 @@ class PostVerifyGraph:
     @staticmethod
     def _views(x, batch, verify_input):
         info = batch.sampling_info
-        info_view = SimpleNamespace(
+        view_fields = dict(
             acc_additive_penalties=None,
             acc_scaling_penalties=None,
             logit_bias=None,
@@ -542,6 +630,14 @@ class PostVerifyGraph:
             need_min_p_sampling=False,
             sampling_seed=None,
         )
+        if _SHARDED_IN_GRAPH:
+            info_view = PostVerifySamplingView(
+                vocab_size=info.vocab_size,
+                has_custom_logit_processor=info.has_custom_logit_processor,
+                **view_fields,
+            )
+        else:
+            info_view = SimpleNamespace(**view_fields)
         batch_view = SimpleNamespace(
             device=batch.device,
             forward_mode=batch.forward_mode,

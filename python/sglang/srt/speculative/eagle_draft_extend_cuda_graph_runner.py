@@ -13,7 +13,10 @@ from sglang.kernels.ops.memory.small_field_copy import (
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.layers.attention.graph_variants import create_split_kv_graph_variants
+from sglang.srt.layers.attention.graph_variants import (
+    create_paged_fp8_graph_variants,
+    create_split_kv_graph_variants,
+)
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -161,7 +164,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
-        self.attention_graph_variants = create_split_kv_graph_variants(
+        self.attention_graph_variants = create_paged_fp8_graph_variants(
+            self.capture_forward_mode,
+            self.captured_req_width,
+            enabled=envs.SGLANG_Q35MF_LL1_K1B_EXTEND.get(),
+        ) or create_split_kv_graph_variants(
             self.capture_forward_mode, self.captured_req_width
         )
         self.max_bs = max(self.capture_bs)
@@ -549,7 +556,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(bs, attention_variant=attention_variant)
+                shape_key = self._make_graph_key(
+                    bs, attention_variant=attention_variant
+                )
                 post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -879,10 +888,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self._kv_writes_done_event(shared_read_ends)
             )
 
+        next_token_ids = out.next_token_ids
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
+            next_token_logits=(
+                out.next_token_logits[:raw_bs] if next_token_ids is None else None
+            ),
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
             hidden_states=out.hidden_states[:raw_bs].clone(),
+            next_token_ids=(
+                next_token_ids[:raw_bs].clone() if next_token_ids is not None else None
+            ),
         )
         return out

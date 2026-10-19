@@ -17,6 +17,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     Q_MODE_NONE,
     Q_MODE_STRIDED,
     update_trtllm_mha_graph_metadata,
+    update_trtllm_mha_graph_metadata_multistep,
 )
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -242,9 +243,11 @@ def test_native_nvfp4_output_capacity_includes_unchunked_batch(
 
 
 def _make_backend_for_hook_test(speculative_num_draft_tokens=None):
+    from sglang.srt.layers.attention.trtllm_mha_decode_groups import DecodeGroupPlans
     from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 
     backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+    backend._decode_group_plans = DecodeGroupPlans()
     backend.device = torch.device("cpu")
     backend.max_context_len = 1024
     backend.page_size = PAGE_SIZE
@@ -365,6 +368,46 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["q_mode"] == Q_MODE_STRIDED
     assert calls[0]["q_stride"] == 4
+
+
+@pytest.mark.parametrize("meta_branch", [False, True])
+def test_in_graph_metadata_resets_plans_then_launches_once(monkeypatch, meta_branch):
+    """The decode length-group plans (PDDEC_SPLIT_HOIST) are reset before the metadata
+    launch, which runs once: on the side branch for a captured draft extend under
+    KDENSE_DRAFT_META_BRANCH, inline otherwise."""
+    events = []
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "update_trtllm_mha_graph_metadata",
+        lambda **kwargs: events.append("update"),
+    )
+    monkeypatch.setattr(trtllm_mha_backend, "_KDENSE_META_BRANCH", meta_branch)
+    monkeypatch.setattr(
+        trtllm_mha_backend,
+        "fork_metadata",
+        lambda launch: (events.append("fork"), launch()),
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
+    fb = SimpleNamespace(
+        batch_size=2,
+        req_pool_indices=torch.arange(2, dtype=torch.int64),
+        seq_lens=torch.ones(2, dtype=torch.int32),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        spec_info=SimpleNamespace(num_tokens_per_req=4),
+        positions=torch.arange(8, dtype=torch.int64),
+        out_cache_loc=torch.arange(8, dtype=torch.int64),
+    )
+    backend.init_forward_metadata_out_graph(fb, in_capture=True)
+    monkeypatch.setattr(
+        backend._decode_group_plans, "reset", lambda: events.append("reset")
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    backend.init_forward_metadata_in_graph(fb)
+
+    assert events == (
+        ["reset", "fork", "update"] if meta_branch else ["reset", "update"]
+    )
 
 
 def test_hybrid_wrappers_forward_in_graph_hook():
@@ -878,3 +921,76 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v", "-s"]))
+
+
+@pytest.mark.parametrize("bs", [1, 3, 8, 17])
+@pytest.mark.parametrize("num_steps", [1, 5, 7])
+@pytest.mark.parametrize("skip_page_table", [False, True])
+def test_multistep_matches_per_step_bytes(bs, num_steps, skip_page_table):
+    """One multi-step launch writes the same bytes as num_steps single-step launches
+    (seqlen_offset = 1 + step), stale page-table tails included."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    seed = 4321 + bs * 13 + num_steps * 101 + int(skip_page_table)
+    pool_size, max_num_pages = 64, 16
+    req_to_token, req_pool_indices, seq_lens, _, _ = _build_inputs(
+        bs,
+        pool_size,
+        max_num_pages,
+        None,
+        (max_num_pages - 2) * PAGE_SIZE - num_steps,
+        seed,
+    )
+    # Rows that cross a page boundary between steps.
+    seq_lens[: max(1, bs // 2)] = PAGE_SIZE * 3 - 2
+    g = torch.Generator(device="cpu").manual_seed(seed + 7)
+
+    def garbage(*shape):
+        return torch.randint(
+            -(2**31), 2**31 - 1, shape, generator=g, dtype=torch.int32
+        ).to(DEVICE)
+
+    ref = [
+        (garbage(bs), garbage(bs + 1), garbage(bs, max_num_pages))
+        for _ in range(num_steps)
+    ]
+    out = [tuple(t.clone() for t in r) for r in ref]
+    for s, (cs, cu, pt) in enumerate(ref):
+        update_trtllm_mha_graph_metadata(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            req_to_token=req_to_token,
+            cache_seqlens=cs,
+            cu_seqlens_k=cu,
+            page_table=None if skip_page_table else pt,
+            bs=bs,
+            seqlen_offset=1 + s,
+            max_seq_pages=max_num_pages,
+            page_size=PAGE_SIZE,
+            skip_page_table=skip_page_table,
+        )
+    addr = torch.tensor(
+        [
+            [cs.data_ptr(), cu.data_ptr(), 0 if skip_page_table else pt.data_ptr()]
+            for cs, cu, pt in out
+        ],
+        dtype=torch.int64,
+        device=DEVICE,
+    )
+    update_trtllm_mha_graph_metadata_multistep(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        addr_table=addr,
+        num_steps=num_steps,
+        bs=bs,
+        first_offset=1,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+        page_table_stride=out[0][2].stride(0),
+        skip_page_table=skip_page_table,
+    )
+    torch.cuda.synchronize()
+    for r, o in zip(ref, out):
+        for a, b in zip(r, o):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))

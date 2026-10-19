@@ -51,6 +51,7 @@ from sglang.srt.layers.attention.graph_variants import (
     AttentionGraphVariants,
     create_attention_graph_variants,
     create_dsv41_candidate_graph_variants,
+    create_paged_fp8_graph_variants,
     create_split_kv_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
@@ -321,6 +322,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )
+            or create_paged_fp8_graph_variants(
+                self.capture_forward_mode,
+                self.captured_req_width,
+                enabled=envs.SGLANG_Q35MF_LL1_K1B_VERIFY.get(),
+            )
             or create_split_kv_graph_variants(
                 self.capture_forward_mode, self.captured_req_width
             )
@@ -509,6 +515,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+        # (forward_batch, input_ids, version, positions, version, stream) of the last full
+        # load_batch, so the pre-planned replay load can skip copies it already made.
+        self._staged_inputs = None
+        self._skip_restage = envs.SGLANG_Q35MF_MKH_N3B.get()
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1424,8 +1434,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            staged, self._staged_inputs = self._staged_inputs, None
+            if not self._restage_is_redundant(staged, forward_batch):
+                self.buffers.input_ids[: self.raw_num_token].copy_(
+                    forward_batch.input_ids
+                )
+                self.buffers.positions[: self.raw_num_token].copy_(
+                    forward_batch.positions
+                )
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1500,6 +1516,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self._skip_restage:
+            self._staged_inputs = self._staged_signature(forward_batch)
 
         if (
             not is_ragged
@@ -1592,6 +1610,31 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
+        )
+
+    @staticmethod
+    def _staged_signature(forward_batch: ForwardBatch):
+        input_ids, positions = forward_batch.input_ids, forward_batch.positions
+        if input_ids is None or positions is None:
+            return None
+        return (
+            forward_batch,
+            input_ids,
+            positions,
+            (input_ids._version, positions._version, torch.cuda.current_stream()),
+        )
+
+    def _restage_is_redundant(self, staged, forward_batch: ForwardBatch) -> bool:
+        # The full load_batch already copied these exact tensors on this stream; a plan-stream
+        # load runs on another stream, before the draft writes them, and is never skipped.
+        now = self._staged_signature(forward_batch)
+        return (
+            staged is not None
+            and now is not None
+            and staged[0] is now[0]
+            and staged[1] is now[1]
+            and staged[2] is now[2]
+            and staged[3] == now[3]
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:

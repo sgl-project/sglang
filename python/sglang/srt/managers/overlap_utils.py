@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import (
+    gather_spec_extras,
+    scatter_spec_extras,
+)
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
@@ -86,6 +89,7 @@ def _assert_nonneg_and_invalidate(
 
 _SKIP_SAME_BATCH_REGATHER = envs.SGLANG_Q35MF_ARRIVE_SKIP_REGATHER.get()
 _SEQ_LENS_INDEX_SELECT = envs.SGLANG_Q35MF_ARRIVE_SEQ_LENS_SELECT.get()
+_STASH_SCATTER = envs.SGLANG_Q35MF_BK_STASH_SCATTER.get()
 # Decode relay recorded by the scheduler: (future_indices, draft_input) of the last stash.
 _last_relay: Optional[tuple] = None
 
@@ -674,22 +678,37 @@ class FutureMap:
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
-        self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
-        )
-
         # Staging transitions refresh only the bonus token. Preserve top-k and
         # hidden state already published by the preceding target forward.
-        if self.need_topk and payload.topk_p is not None:
-            assert payload.topk_index is not None
-            self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
-            self.topk_index_buf[indices] = payload.topk_index.to(
-                self.topk_index_buf.dtype
+        with_topk = self.need_topk and payload.topk_p is not None
+        with_hidden = self.need_hidden_states and payload.hidden_states is not None
+        if not (
+            _STASH_SCATTER
+            and scatter_spec_extras(
+                indices,
+                payload.bonus_tokens,
+                self.output_tokens_buf,
+                payload.topk_p if with_topk else None,
+                self.topk_p_buf,
+                payload.topk_index if with_topk else None,
+                self.topk_index_buf,
+                payload.hidden_states if with_hidden else None,
+                self.hidden_states_buf,
             )
-        if self.need_hidden_states and payload.hidden_states is not None:
-            self.hidden_states_buf[indices] = payload.hidden_states.to(
-                self.hidden_states_buf.dtype
+        ):
+            self.output_tokens_buf[indices] = payload.bonus_tokens.to(
+                self.output_tokens_buf.dtype
             )
+            if with_topk:
+                assert payload.topk_index is not None
+                self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
+                self.topk_index_buf[indices] = payload.topk_index.to(
+                    self.topk_index_buf.dtype
+                )
+            if with_hidden:
+                self.hidden_states_buf[indices] = payload.hidden_states.to(
+                    self.hidden_states_buf.dtype
+                )
         if self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (

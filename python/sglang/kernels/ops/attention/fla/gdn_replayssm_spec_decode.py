@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified by NVIDIA: add an optional forward substitution for verify deltas.
+# Modified by NVIDIA: wait for an optional dependent gate producer before gate reads.
 """ReplaySSM speculative-decode verify kernel for GDN (Gated DeltaNet).
 
 Ported from the vLLM ReplaySSM reference implementation
@@ -111,6 +112,7 @@ def gdn_replayssm_spec_circular_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
+    WAIT_FOR_GATE_PRODUCER: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -186,6 +188,8 @@ def gdn_replayssm_spec_circular_kernel(
     # ------------------------------------------------------------------
     A_log_val = tl.load(A_log + i_hv).to(tl.float32)
     dt_bias_val = tl.load(dt_bias + i_hv).to(tl.float32)
+    if USE_GDC and WAIT_FOR_GATE_PRODUCER:
+        tl.extra.cuda.gdc_wait()
     a_s = tl.load(a + (bos + o_s_safe) * stride_a_t + i_hv, mask=mask_s, other=0.0).to(
         tl.float32
     )
@@ -231,7 +235,7 @@ def gdn_replayssm_spec_circular_kernel(
             b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
 
     # PTX griddepcontrol: consume convolution output only after the prerequisite.
-    if USE_GDC:
+    if USE_GDC and not WAIT_FOR_GATE_PRODUCER:
         tl.extra.cuda.gdc_wait()
 
     if USE_QK_L2NORM_IN_KERNEL:
@@ -1100,6 +1104,8 @@ def _launch_gdn_spec(
     direct_solve=False,
     history_stats=None,
     pdl=False,
+    wait_for_gate_producer=False,
+    maxnreg=None,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1146,6 +1152,10 @@ def _launch_gdn_spec(
         )
     if pdl:
         solve_options.update(USE_GDC=True, launch_pdl=True)
+        if wait_for_gate_producer and kernel is gdn_replayssm_spec_circular_kernel:
+            solve_options["WAIT_FOR_GATE_PRODUCER"] = True
+    if maxnreg is not None:
+        solve_options["maxnreg"] = maxnreg
     grid = (triton.cdiv(V, BV), B, HV)
     kernel[grid](
         q,
@@ -1315,6 +1325,8 @@ def gdn_replayssm_spec_decode(
     direct_solve: bool = False,
     history_stats: torch.Tensor | None = None,
     pdl: bool = False,
+    wait_for_gate_producer: bool = False,
+    maxnreg: int | None = None,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1328,8 +1340,11 @@ def gdn_replayssm_spec_decode(
          checkpoint (statically empty history).
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
-    PDL overlaps a convolution that writes q/k/v only; gates, metadata, and
-    compact history must already be ready when the verify grid starts.
+    By default PDL overlaps a convolution that writes q/k/v only; gates,
+    metadata, and compact history must already be ready when verify starts.
+    If the same prerequisite also produces a/b, set ``wait_for_gate_producer``
+    to consume those gates after the dependency wait. Immutable gate weights
+    and request metadata may still be prefetched before that wait.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -1407,6 +1422,8 @@ def gdn_replayssm_spec_decode(
             direct_solve,
             history_stats,
             pdl,
+            wait_for_gate_producer,
+            maxnreg,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1446,6 +1463,7 @@ def gdn_replayssm_spec_decode(
             direct_solve,
             history_stats,
             pdl,
+            wait_for_gate_producer,
         )
     return out
 

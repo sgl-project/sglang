@@ -68,7 +68,11 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    is_pin_memory_available,
+    print_info_once,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1070,9 +1074,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             attention_kv_len_lower_bound=(
-                batch.reqs[0].kv.kv_committed_len
-                if envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get() and len(batch.reqs) == 1
-                else None
+                min(req.kv.kv_committed_len for req in batch.reqs)
+                if envs.SGLANG_Q35MF_LL1_K1B.get() and batch.reqs
+                else (
+                    batch.reqs[0].kv.kv_committed_len
+                    if envs.SGLANG_Q35MF_ATTN_SPLIT_KV.get() and len(batch.reqs) == 1
+                    else None
+                )
             ),
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)
@@ -1605,6 +1613,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
 
+        if (
+            envs.SGLANG_Q35MF_K4_MROPE_GPU.get()
+            and self.positions is not None
+            and all(mm_input is None for mm_input in mm_inputs)
+        ):
+            # Text-only rows equal the per-request arange already in positions.
+            self.mrope_positions = (
+                self.positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
+            )
+            print_info_once("M-RoPE extend positions from device engaged")
+            return
+
         # Optimize text-only branch with torch.arange
         mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
@@ -1647,10 +1667,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
-            mrope_positions_list,
-            dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        mrope_positions = torch.cat(mrope_positions_list, dim=1)
+        if envs.SGLANG_Q35MF_PPO.get() and is_pin_memory_available(model_runner.device):
+            # A pageable copy this size blocks the host until the forward stream drains.
+            mrope_positions = mrope_positions.to(torch.int64).pin_memory()
+        self.mrope_positions = mrope_positions.to(
+            dtype=torch.int64, device=model_runner.device, non_blocking=True
+        )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:

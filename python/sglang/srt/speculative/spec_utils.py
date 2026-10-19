@@ -891,6 +891,34 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+_REUSE_VERIFY_TRACK_INDICES = envs.SGLANG_Q35MF_MKH_N3B.get()
+# (req_pool_indices, mapping, (their versions, ping-pong positions), track indices) of the last
+# verify; holding both tensors keeps their addresses from being reused by new tensors.
+_last_verify_track = None
+
+
+def _set_track_indices_reusing_last(batch: ScheduleBatch) -> None:
+    """set_mamba_track_indices_from_reqs, minus the gather / H2D / scatter when every input
+    is the same tensor at the same version and the ping-pong positions are unchanged."""
+    global _last_verify_track
+    req_pool_indices = batch.req_pool_indices
+    mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+    positions = tuple(req.kv.mamba_next_track_idx for req in batch.reqs)
+    key = (req_pool_indices._version, mapping._version, positions)
+    last = _last_verify_track
+    if (
+        last is not None
+        and last[0] is req_pool_indices
+        and last[1] is mapping
+        and last[2] == key
+    ):
+        batch.mamba_track_buffer_indices = [0 if p is None else p for p in positions]
+        batch.mamba_track_indices = last[3]
+        return
+    set_mamba_track_indices_from_reqs(batch)
+    _last_verify_track = (req_pool_indices, mapping, key, batch.mamba_track_indices)
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
@@ -914,7 +942,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
             "lazy spec verify without a track plan: mamba_lazy_spec_prepare "
             "must run in prepare_for_decode for every spec decode iteration"
         )
-    set_mamba_track_indices_from_reqs(batch, track_positions)
+    if track_positions is None and _REUSE_VERIFY_TRACK_INDICES:
+        _set_track_indices_reusing_last(batch)
+    else:
+        set_mamba_track_indices_from_reqs(batch, track_positions)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
     batch.mamba_prefill_track_mask_cpu = None

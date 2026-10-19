@@ -3,9 +3,13 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
+from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -312,6 +316,60 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
                 self._check_shape(
                     B=B, T_per_seq=T_per_seq, H=16, K=128, V=128, pool_size=32
                 )
+
+    @unittest.skipIf(is_hip(), "Tiles are tuned for CUDA")
+    def test_prefill_tiles_are_bitwise(self):
+        """The larger prefill tiles must give the same output and state bits as the default tiles."""
+        device = get_device()
+        torch.manual_seed(0)
+        B, T_per_seq, Hg, H, K, V, pool_size = 2, 1040, 4, 16, 128, 128, 8
+        T = B * T_per_seq
+        cache_indices = torch.tensor([5, 2], dtype=torch.int32, device=device)
+        pool_init = (
+            torch.randn(pool_size, H, V, K, dtype=torch.float32, device=device) * 0.1
+        )
+        cu_seqlens = torch.tensor([0, T_per_seq, T], dtype=torch.long, device=device)
+        q = torch.randn(1, T, Hg, K, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, T, Hg, K, dtype=torch.bfloat16, device=device)
+        v = torch.randn(1, T, H, V, dtype=torch.bfloat16, device=device)
+        g = torch.nn.functional.logsigmoid(
+            torch.randn(1, T, H, dtype=torch.float32, device=device)
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=torch.bfloat16, device=device))
+        runs = {}
+        for tiles in (False, True):
+            with envs.SGLANG_Q35MF_GDN_PREFILL_TILES.override(tiles):
+                runs[tiles] = self._run_chunk(
+                    pool_init, cache_indices, q, k, v, g, beta, cu_seqlens
+                )
+        self.assertTrue(torch.equal(runs[False][0], runs[True][0]))
+        self.assertTrue(torch.equal(runs[False][1], runs[True][1]))
+
+    @unittest.skipIf(is_hip(), "Tested on the CUDA Triton path")
+    def test_prefill_no_a_memset_is_bitwise(self):
+        """Without the memset the solve must still write zero upper blocks: A, w and u match bitwise."""
+        device = get_device()
+        torch.manual_seed(0)
+        T, Hg, H, K, V = 2 * 1040, 4, 16, 128, 128
+        cu_seqlens = torch.tensor([0, 1040, T], dtype=torch.long, device=device)
+        k = l2norm_fwd(torch.randn(1, T, Hg, K, dtype=torch.bfloat16, device=device))
+        v = torch.randn(1, T, H, V, dtype=torch.bfloat16, device=device)
+        g = chunk_local_cumsum(
+            torch.nn.functional.logsigmoid(torch.randn(1, T, H, device=device)),
+            chunk_size=64,
+            cu_seqlens=cu_seqlens,
+        )
+        beta = torch.sigmoid(torch.randn(1, T, H, dtype=torch.bfloat16, device=device))
+        runs = {}
+        for no_memset in (False, True):
+            # Leave NaN in the allocator's free block that A reuses, so a missed store shows.
+            torch.full((1, T, H, 64), float("nan"), dtype=torch.bfloat16, device=device)
+            with envs.SGLANG_Q35MF_GDN_PREFILL_NO_A_MEMSET.override(no_memset):
+                runs[no_memset] = chunk_gated_delta_rule_fwd_intra(
+                    k=k, v=v, g=g, beta=beta, cu_seqlens=cu_seqlens
+                )
+        for expected, actual in zip(runs[False], runs[True]):
+            self.assertTrue(torch.equal(expected, actual))
 
     # ------------------------------------------------------------------
     # Combined stress

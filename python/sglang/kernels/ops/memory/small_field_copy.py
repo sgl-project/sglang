@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -23,6 +24,8 @@ _ENTRIES = 7
 _RAW_KIND = {1: 0, 2: 1, 4: 2, 8: 3}
 # (dst dtype, src dtype) -> width-cast kind
 _CAST_KIND = {(torch.int64, torch.int32): 4, (torch.int32, torch.int64): 5}
+# Read once: the launch path is fixed per process.
+_VEC = envs.SGLANG_Q35MF_BK_VEC_COPY.get()
 
 
 @cache_once
@@ -33,12 +36,16 @@ def _jit_small_field_copy_module() -> Module:
         cuda_wrappers=[
             ("small_field_copy", "SmallFieldCopy::run"),
             ("small_field_copy_host_desc", "SmallFieldCopy::run_host_desc"),
+            ("small_field_copy_vec", "SmallFieldCopy::run_vec"),
+            ("small_field_copy_host_desc_vec", "SmallFieldCopy::run_host_desc_vec"),
         ],
     )
 
 
 def _describe(
-    dsts: List[torch.Tensor], srcs: List[torch.Tensor]
+    dsts: List[torch.Tensor],
+    srcs: List[torch.Tensor],
+    allow_pinned_src: bool = False,
 ) -> Optional[List[int]]:
     """Per field: src_ptr, dst_ptr, rows, cols, src_stride, dst_stride, kind; None
     when a field is not supported."""
@@ -51,11 +58,11 @@ def _describe(
     desc: List[int] = []
     for dst, src in zip(dsts, srcs):
         shape = dst.shape
-        if (
-            src.shape != shape
-            or src.get_device() != device
-            or dst.get_device() != device
-        ):
+        src_device = src.get_device()
+        if allow_pinned_src and src_device < 0 and src.is_pinned():
+            # Page-locked host memory from cudaHostAlloc is mapped; kernels read it by its host pointer.
+            src_device = device
+        if src.shape != shape or src_device != device or dst.get_device() != device:
             return None
         ndim = len(shape)
         if ndim == 1:
@@ -99,7 +106,9 @@ def small_field_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool
     desc = _describe(dsts, srcs)
     if desc is None:
         return False
-    return _jit_small_field_copy_module().small_field_copy(dsts[0], desc) == 0
+    module = _jit_small_field_copy_module()
+    run = module.small_field_copy_vec if _VEC else module.small_field_copy
+    return run(dsts[0], desc) == 0
 
 
 class SmallFieldCopyPlan:
@@ -111,10 +120,12 @@ class SmallFieldCopyPlan:
     against the first call, refresh the source pointers and hand the descriptor
     over as one tensor. The C++ overlap check still runs on every call."""
 
-    def __init__(self):
+    def __init__(self, allow_pinned_src: bool = False):
         self._sigs = None
         self._desc = None
         self._desc_view = None
+        # Sources may also be page-locked host tensors; later calls must pass pinned ones there too.
+        self._allow_pinned_src = allow_pinned_src
 
     def __call__(self, dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
         sigs = self._sigs
@@ -133,17 +144,25 @@ class SmallFieldCopyPlan:
                     break
                 view[_ENTRIES * i] = src.data_ptr()
             else:
-                module = _jit_small_field_copy_module()
-                return module.small_field_copy_host_desc(dsts[0], self._desc) == 0
-        desc = _describe(dsts, srcs)
+                return _run_host_desc(dsts[0], self._desc)
+        desc = _describe(dsts, srcs, self._allow_pinned_src)
         if desc is None:
             self._sigs = None
             return False
         self._desc = torch.tensor(desc, dtype=torch.int64)
         self._desc_view = self._desc.numpy()
         self._sigs = [(s.dtype, s.shape, s.stride(), s.get_device()) for s in srcs]
-        module = _jit_small_field_copy_module()
-        return module.small_field_copy_host_desc(dsts[0], self._desc) == 0
+        return _run_host_desc(dsts[0], self._desc)
+
+
+def _run_host_desc(anchor: torch.Tensor, desc: torch.Tensor) -> bool:
+    module = _jit_small_field_copy_module()
+    run = (
+        module.small_field_copy_host_desc_vec
+        if _VEC
+        else module.small_field_copy_host_desc
+    )
+    return run(anchor, desc) == 0
 
 
 __all__ = ["SmallFieldCopyPlan", "small_field_copy"]

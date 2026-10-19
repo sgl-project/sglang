@@ -502,6 +502,7 @@ __all__ = [
     "fused_add_rmsnorm",
     "gemma_rmsnorm",
     "gemma_fused_add_rmsnorm",
+    "gated_rmsnorm_static_fp8",
 ]
 
 
@@ -595,3 +596,25 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.gated_rmsnorm_static_fp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.gated_rmsnorm_fp8:gated_rmsnorm_static_fp8",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="Gated RMSNorm with BF16 rounding and static FP8 output",
+        ),
+    )
+)
+
+
+def gated_rmsnorm_static_fp8(x, z, weight, input_scale, eps=1e-6, out=None):
+    """Gated RMSNorm with static e4m3fn output and unchanged checkpoint scale."""
+    from sglang.kernels.selector import get_kernel
+
+    return get_kernel("layernorm.gated_rmsnorm_static_fp8", KernelBackend.TRITON)(
+        x, z, weight, input_scale, eps, out
+    )

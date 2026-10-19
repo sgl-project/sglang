@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -108,6 +108,131 @@ def draft_moe_gemv(
     else:
         module.up(x, w13, w13_shared, shared_gate_w, topk_ids, act, gate)
         module.down(act, w2, w2_shared, topk_ids, topk_weights, gate, out)
+    return out
+
+
+# Ring stages (16 KB each) of the fused kernel; at least topk, since every routed
+# down slice holds a stage until the end.
+_FUSED_STAGES = 11
+
+
+# Routed pairs a CTA keeps in flight (tunable): 4 at I = 128, the full ring at I = 256.
+def _fused_window(inter: int) -> int:
+    return 4 if inter <= 128 else _FUSED_STAGES
+
+
+@cache_once
+def _draft_moe_fused_module(
+    hidden: int,
+    inter: int,
+    experts: int,
+    topk: int,
+    cols: int,
+    stages: int,
+    window: int,
+    trace: bool,
+    push: bool,
+) -> Module:
+    args = make_cpp_args(
+        hidden,
+        inter,
+        experts,
+        topk,
+        cols,
+        stages,
+        window,
+        trace,
+        is_arch_support_pdl(),
+        push,
+    )
+    return load_jit(
+        "draft_moe_fused",
+        *args,
+        cuda_files=["speculative/draft_moe_fused.cuh"],
+        cuda_wrappers=[("run", f"DraftMoeFused<{args}>::run")],
+        extra_cuda_cflags=["--use_fast_math"],
+    )
+
+
+@cache_once
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+# Copies of every tagged handoff word (kFusedReplicas in draft_moe_fused.cuh).
+_FUSED_REPLICAS = 152
+
+
+def draft_moe_fused_scratch(
+    experts: int, topk: int, inter: int, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zeroed scratch of draft_moe_fused, reused across calls: tagged logits and
+    gate, tagged act values (both replicated), and the call epoch."""
+    logit_words = (experts + 1 + 15) // 16 * 16
+    return (
+        torch.zeros(_FUSED_REPLICAS * logit_words, dtype=torch.int64, device=device),
+        torch.zeros(
+            _FUSED_REPLICAS * (topk + 1) * inter, dtype=torch.int32, device=device
+        ),
+        torch.zeros(1, dtype=torch.int32, device=device),
+    )
+
+
+def draft_moe_fused(
+    x: torch.Tensor,
+    router_w: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_shared: torch.Tensor,
+    w2_shared: torch.Tensor,
+    shared_gate_w: torch.Tensor,
+    scratch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    out: torch.Tensor,
+    trace: Optional[torch.Tensor] = None,
+    stages: int = _FUSED_STAGES,
+    window: Optional[int] = None,
+    hop_site: Optional[torch.Tensor] = None,
+    hop_token: int = 0,
+) -> torch.Tensor:
+    """draft_router_topk + draft_moe_gemv as one launch, bitwise equal in ids,
+    weights and output. Shapes as in those two; scratch from
+    draft_moe_fused_scratch. trace: int64 [grid * 16] globaltimer stamps, or None.
+    hop_site: host int64 [7] from Q35Hop.site_fields(); the output is then also pushed
+    into that hop as row hop_token, and its all-reduce only consumes."""
+    hidden, inter = x.shape[-1], w2.shape[-1]
+    cols = -(-hidden // _sm_count(x.device.index))
+    module = _draft_moe_fused_module(
+        hidden,
+        inter,
+        router_w.shape[0],
+        topk_ids.shape[-1],
+        cols,
+        stages,
+        _fused_window(inter) if window is None else window,
+        trace is not None,
+        hop_site is not None,
+    )
+    logit_buf, act_buf, epoch = scratch
+    module.run(
+        x,
+        router_w,
+        w13,
+        w2,
+        w13_shared,
+        w2_shared,
+        shared_gate_w,
+        logit_buf,
+        act_buf,
+        epoch,
+        topk_weights,
+        topk_ids,
+        out,
+        epoch if trace is None else trace,
+        epoch if hop_site is None else hop_site,
+        hop_token,
+    )
     return out
 
 

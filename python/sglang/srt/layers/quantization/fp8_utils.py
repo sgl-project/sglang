@@ -441,6 +441,43 @@ def flashinfer_per_tensor_fp8_supported() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
+def _pinned_fp8_bmm_tactics() -> dict:
+    """{(n, k, m): cuBLASLt algo index} from SGLANG_Q35MF_FP8_BMM_TACTICS."""
+    path = envs.SGLANG_Q35MF_FP8_BMM_TACTICS.get()
+    if not path:
+        return {}
+    import json
+
+    with open(path) as f:
+        table = json.load(f)
+    return {tuple(int(v) for v in key.split(",")): int(t) for key, t in table.items()}
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_cublas_fp8_runner():
+    from flashinfer.gemm.gemm_base import get_gemm_module
+
+    return get_gemm_module().cublas_fp8_gemm_runner()
+
+
+def _pinned_flashinfer_bmm_fp8(
+    q_input, weight, x_scale, weight_scale, out_dtype, tactic
+):
+    # The algo index refers to the cuBLASLt heuristic list for this exact (M, N, K) and
+    # FlashInfer's bmm_fp8 workspace; the runner falls back to the default when out of range.
+    from flashinfer.gemm.gemm_base import DEFAULT_WORKSPACE_SIZE, _get_cache_buf
+
+    a, b = q_input.unsqueeze(0), weight.unsqueeze(0)
+    out = torch.empty((1, a.shape[1], b.shape[2]), device=a.device, dtype=out_dtype)
+    workspace = _get_cache_buf("bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device)
+    _flashinfer_cublas_fp8_runner().forward(
+        [a, b, x_scale.reshape(1), weight_scale.reshape(1), out, workspace],
+        tactic=tactic,
+    )
+    return out
+
+
 if flashinfer_per_tensor_fp8_supported():
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
 
@@ -459,6 +496,11 @@ if flashinfer_per_tensor_fp8_supported():
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
         m, n = q_input.shape[0], weight.shape[1]
+        tactic = _pinned_fp8_bmm_tactics().get((n, weight.shape[0], m))
+        if tactic is not None:
+            return _pinned_flashinfer_bmm_fp8(
+                q_input, weight, x_scale, weight_scale, out_dtype, tactic
+            ).view(m, n)
         return _raw_flashinfer_bmm_fp8(
             q_input.unsqueeze(0),
             weight.unsqueeze(0),

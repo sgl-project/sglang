@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified by NVIDIA: add opt-in clustered linear-attention verification.
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
@@ -32,6 +33,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.layernorm import gated_rmsnorm_static_fp8
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -154,6 +156,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.common import print_info_once
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
@@ -251,6 +254,12 @@ def _layer_fusions(config: Qwen3_5TextConfig, is_nextn: bool):
         from sglang.srt.layers.layer_boundary.fusions.cutedsl import CuteDSLFusion
 
         return CuteDSLFusion()
+    if is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_HOP.get():
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        return DraftHopFusion()
     return None
 
 
@@ -312,6 +321,19 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
         getattr(quant_method, "block_quant", False)
         or getattr(quant_method, "use_mxfp8", False)
+    )
+
+
+def _static_fp8_input_linear(linear: nn.Module) -> bool:
+    """Whether ``linear`` consumes a static per-tensor FP8 input without re-quantizing it."""
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8LinearMethod
+
+    method = linear.quant_method
+    return (
+        isinstance(method, ModelOptFp8LinearMethod)
+        and not method.use_marlin
+        and not method.use_sm120_fp8
+        and linear.input_scale.numel() == 1
     )
 
 
@@ -513,6 +535,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 else {}
             ),
         )
+        # The fused kernel implements norm-before-gate SiLU over whole 128-wide heads.
+        self.prefill_norm_fp8 = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_GDN_PREFILL_NORM_FP8.get()
+            and self.head_v_dim == 128
+            and self.norm.activation in ("silu", "swish")
+        )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -524,6 +553,47 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        self._fused_verify_enabled = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_MKG_FUSED.get()
+            and self.attn_tp_size == 8
+            and get_parallel().pp_size == 1
+        )
+        self._fused_verify_buffers = None
+        self._middle_verify_enabled = (
+            _is_cuda
+            and envs.SGLANG_Q35MF_MKG_TP4_MIDDLE.get()
+            and self.attn_tp_size == 4
+            and get_parallel().pp_size == 1
+        )
+        self._middle_verify_buffers = None
+        self._fused_verify_ba_enabled = (
+            self._fused_verify_enabled and envs.SGLANG_Q35MF_MKG_BA_TC.get()
+        )
+        self._fused_verify_mkm_front = (
+            self._fused_verify_ba_enabled and envs.SGLANG_Q35MF_MKM_GDN_FRONT.get()
+        )
+        if self._fused_verify_enabled:
+            from sglang.kernels.ops.attention.gdn_pdl_front import ensure_built
+
+            ensure_built()
+            if self._fused_verify_ba_enabled:
+                from sglang.kernels.ops.attention.gdn_pdl_front_ba import (
+                    ensure_built as ensure_ba_built,
+                )
+
+                ensure_ba_built()
+            if self._fused_verify_mkm_front:
+                from sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm import (
+                    ensure_built as ensure_mkm_front_built,
+                )
+
+                ensure_mkm_front_built()
+            self._derived_weight_cache_error = (
+                "Online weight updates are unsupported with the packed GDN "
+                "projection cache. Restart the worker to reload projection weights."
+            )
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -973,6 +1043,317 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _middle_verify_backend(
+        self, hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
+    ):
+        """Select the stock-front verify path with an early gated-norm tail."""
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or not isinstance(hidden_states, torch.Tensor)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.shape != (7, 4096)
+            or not isinstance(projected_states_qkvz, torch.Tensor)
+            or projected_states_qkvz.dtype != torch.bfloat16
+            or projected_states_qkvz.shape != (7, 5120)
+            or not isinstance(projected_states_ba, torch.Tensor)
+            or projected_states_ba.dtype != torch.bfloat16
+            or projected_states_ba.shape != (7, 32)
+            or (self.attn.num_k_heads, self.attn.num_v_heads) != (4, 16)
+            or (self.head_k_dim, self.head_v_dim) != (128, 128)
+            or self.conv_kernel_size != 4
+            or self.activation not in ("silu", "swish")
+            or self.norm.activation not in ("silu", "swish")
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.group_size is not None
+            or self.attn.bias is not None
+            or forward_batch.spec_info.draft_token_num != 7
+            or forward_batch.spec_info.ragged_verify_layout is not None
+            or not envs.SGLANG_Q35MF_GDN_VIEWS.get()
+            or not envs.SGLANG_Q35MF_GDN_CONV_TILE.get()
+            or not envs.SGLANG_Q35MF_GDN_NORM_FP8.get()
+        ):
+            return None
+
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not isinstance(backend, GDNAttnBackend) or backend.mis_metadata is not None:
+            return None
+        if _gdn_decode_fused_proj_conv and getattr(
+            backend, "supports_packed_verify", False
+        ):
+            return None
+        metadata = backend.forward_metadata
+        if (
+            metadata.query_start_loc.numel() != 2
+            or metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None
+        ):
+            return None
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        pool = backend.req_to_token_pool.mamba_pool
+        if (
+            not isinstance(cache, MambaPool.SpeculativeState)
+            or cache.temporal.dtype != torch.bfloat16
+            or cache.replayssm_d is None
+            or cache.replayssm_d.shape[-2] != 16
+            or getattr(pool, "replayssm_cache_base", None) is None
+            or getattr(pool, "replayssm_spec_fold", False)
+            or getattr(pool, "replayssm_is_kda", False)
+        ):
+            return None
+        method = self.out_proj.quant_method
+        if (
+            not isinstance(method, ModelOptFp8LinearMethod)
+            or method.use_marlin
+            or method.use_sm120_fp8
+            or self.out_proj.input_scale.numel() != 1
+            or self.out_proj.input_scale.dtype != torch.float32
+        ):
+            return None
+        if self._middle_verify_buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("GDN gated norm must be prepared before capture")
+            self._middle_verify_buffers = (
+                torch.empty(
+                    (112, 128), device=hidden_states.device, dtype=torch.float8_e4m3fn
+                ),
+                torch.empty((112,), device=hidden_states.device, dtype=torch.float32),
+            )
+        return backend
+
+    def _try_fused_verify(self, hidden_states, forward_batch):
+        """Use the clustered projection/Conv1D path for its supported layout."""
+        if (
+            not forward_batch.forward_mode.is_target_verify()
+            or not isinstance(hidden_states, torch.Tensor)
+            or hidden_states.dtype != torch.bfloat16
+            or hidden_states.shape != (7, 4096)
+            or not hidden_states.is_contiguous()
+            or self.attn_tp_size != 8
+            or (self.attn.num_k_heads, self.attn.num_v_heads) != (2, 8)
+            or (self.head_k_dim, self.head_v_dim) != (128, 128)
+            or self.conv_kernel_size != 4
+            or self.activation not in ("silu", "swish")
+            or self.norm.activation not in ("silu", "swish")
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.group_size is not None
+            or self.attn.bias is not None
+            or forward_batch.spec_info.draft_token_num != 7
+            or forward_batch.spec_info.ragged_verify_layout is not None
+        ):
+            return None
+
+        from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptFp8LinearMethod,
+        )
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        if not isinstance(backend, GDNAttnBackend) or backend.mis_metadata is not None:
+            return None
+        metadata = backend.forward_metadata
+        if (
+            metadata.query_start_loc.numel() != 2
+            or metadata.retrieve_next_token is not None
+            or metadata.retrieve_next_sibling is not None
+            or metadata.retrieve_parent_token is not None
+        ):
+            return None
+        cache = backend.req_to_token_pool.mamba2_layer_cache(self.layer_id)
+        if not isinstance(cache, MambaPool.SpeculativeState):
+            return None
+        mamba_pool = backend.req_to_token_pool.mamba_pool
+        if (
+            cache.temporal.dtype != torch.bfloat16
+            or cache.replayssm_d is None
+            or getattr(mamba_pool, "replayssm_cache_base", None) is None
+            or getattr(mamba_pool, "replayssm_spec_fold", False)
+            or getattr(mamba_pool, "replayssm_is_kda", False)
+        ):
+            return None
+        windows = cache.intermediate_conv_window[0]
+        if (
+            cache.conv[0].dtype != torch.bfloat16
+            or cache.conv[0].shape[1:] != (1536, 3)
+            or windows is None
+            or windows.dtype != torch.bfloat16
+            or windows.shape[1:] != (7, 1536, 3)
+            or windows.stride()[1:] != (1, 9, 1)
+            or windows.stride(0) < 1536 * 9
+            or self.attn.conv_weights.shape != (1536, 4)
+            or self.attn.conv_weights.dtype != torch.bfloat16
+            or not self.attn.conv_weights.is_contiguous()
+        ):
+            return None
+        for projection, weight_shape in (
+            (self.in_proj_qkvz, (4096, 2560)),
+            (self.out_proj, (1024, 4096)),
+        ):
+            method = projection.quant_method
+            if (
+                not isinstance(method, ModelOptFp8LinearMethod)
+                or method.use_marlin
+                or method.use_sm120_fp8
+                or projection.weight.dtype != torch.float8_e4m3fn
+                or projection.weight.shape != weight_shape
+                or projection.input_scale.numel() != 1
+                or projection.weight_scale.numel() != 1
+                or projection.input_scale.dtype != torch.float32
+                or projection.weight_scale.dtype != torch.float32
+            ):
+                return None
+
+        from sglang.kernels.ops.attention.gdn_pdl_front import front, pack
+        from sglang.kernels.ops.attention.gdn_pdl_norm import norm
+
+        use_fused_ba = (
+            self._fused_verify_ba_enabled
+            and isinstance(self.in_proj_ba.quant_method, UnquantizedLinearMethod)
+            and self.in_proj_ba.bias is None
+            and self.in_proj_ba.weight.dtype == torch.bfloat16
+            and self.in_proj_ba.weight.shape == (16, 4096)
+            and self.in_proj_ba.weight.is_contiguous()
+        )
+        if use_fused_ba:
+            from sglang.kernels.ops.attention.gdn_pdl_front_ba import front
+        use_mkm_front = use_fused_ba and self._fused_verify_mkm_front
+        if use_mkm_front:
+            from sglang.kernels.ops.attention.gdn_pdl_front_ba_mkm import front
+
+        source = self.in_proj_qkvz.weight.data_ptr()
+        buffers = self._fused_verify_buffers
+        if buffers is None or buffers["source"] != source:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Fused GDN weights must be prepared before capture")
+            buffers = {
+                "source": source,
+                "checked": False,
+                "weight": pack(self.in_proj_qkvz.weight.t()),
+                "projected": hidden_states.new_empty((7, 2560)),
+                "conv": hidden_states.new_empty((7, 1536)),
+                "quant": torch.empty(
+                    (56, 128), device=hidden_states.device, dtype=torch.float8_e4m3fn
+                ),
+                "rstd": torch.empty(
+                    (56,), device=hidden_states.device, dtype=torch.float32
+                ),
+                "error": torch.zeros(
+                    (1,), device=hidden_states.device, dtype=torch.int32
+                ),
+            }
+            self._fused_verify_buffers = buffers
+            logger.info(
+                "Fused GDN projection/Conv1D enabled for layer %s", self.layer_id
+            )
+        if use_fused_ba and "ba" not in buffers:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Fused GDN b/a output must be prepared before capture"
+                )
+            buffers["ba"] = hidden_states.new_empty((7, 16))
+            logger.info("Fused GDN BF16 b/a enabled for layer %s", self.layer_id)
+
+        def projection_conv(conv_states, windows, state_indices, replay_indices):
+            current_stream = torch.cuda.current_stream()
+            if self.alt_stream is not None and not use_fused_ba:
+                self.alt_stream.wait_stream(current_stream)
+            ba_args = (
+                {
+                    "original_bf16": hidden_states,
+                    "ba_weight": self.in_proj_ba.weight,
+                    "ba_out": buffers["ba"],
+                }
+                if use_fused_ba
+                else {}
+            )
+            if use_mkm_front:
+                # L2 prefetch hint for the verify core's checkpoint (physical slot) and history ring
+                # (request slot), the same tensors and indices the backend passes to the core.
+                ba_args.update(
+                    checkpoint=cache.temporal,
+                    history_d=cache.replayssm_d,
+                    history_k=cache.replayssm_k,
+                    history_g=cache.replayssm_g,
+                    ring_indices=forward_batch.req_pool_indices[:1],
+                )
+            front(
+                hidden_states,
+                buffers["weight"],
+                self.in_proj_qkvz.input_scale,
+                self.in_proj_qkvz.weight_scale,
+                self.attn.conv_weights,
+                conv_states,
+                windows,
+                state_indices[:1],
+                replay_indices[:1],
+                buffers["projected"],
+                buffers["conv"],
+                buffers["error"],
+                pad_slot=backend.pad_slot_id,
+                **ba_args,
+            )
+            if use_fused_ba:
+                ba = buffers["ba"]
+            elif self.alt_stream is not None:
+                with torch.cuda.stream(self.alt_stream):
+                    ba = self.in_proj_ba(hidden_states)[0]
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                ba = self.in_proj_ba(hidden_states)[0]
+            return buffers["conv"], ba[:, 8:], ba[:, :8]
+
+        core = backend.forward_extend(
+            layer=self.attn,
+            forward_batch=forward_batch,
+            mixed_qkv=buffers["conv"],
+            a=None,
+            b=None,
+            projection_conv=projection_conv,
+            wait_for_gate_producer=True,
+        )
+        if not buffers["checked"]:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Fused GDN must pass its eager warmup before capture"
+                )
+            if int(buffers["error"].item()):
+                raise RuntimeError("Fused GDN projection reported a sticky error")
+            buffers["checked"] = True
+        z = buffers["projected"][:, 1536:].view(7, 8, 128)
+        norm(
+            core.reshape(56, 128),
+            z,
+            self.norm.weight,
+            self.out_proj.input_scale,
+            buffers["quant"],
+            buffers["rstd"],
+            self.norm.eps,
+        )
+        x_fp8 = buffers["quant"].view(7, 1024)
+        # With the out_proj hop push active, this early return must feed the hop mailbox too.
+        hop = self._q35_push_hop(7)
+        if hop is not None:
+            return hop.out_proj_push(
+                x_fp8=x_fp8,
+                packed_w=self.out_proj.q35_packed,
+                input_scale=self.out_proj.input_scale,
+                weight_scale=self.out_proj.weight_scale,
+            )
+        return self.out_proj(x_fp8)[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -984,8 +1365,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        if self._fused_verify_enabled:
+            fused_output = self._try_fused_verify(hidden_states, forward_batch)
+            if fused_output is not None:
+                return fused_output
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
+        )
+        middle_backend = (
+            self._middle_verify_backend(
+                hidden_states, projected_states_qkvz, projected_states_ba, forward_batch
+            )
+            if self._middle_verify_enabled
+            else None
         )
 
         if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
@@ -1061,12 +1453,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
-        attn_result = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
+        if middle_backend is not None:
+            attn_result = middle_backend.forward_extend(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                verify_pdl=True,
+                wait_for_gate_producer=True,
+            )
+        else:
+            attn_result = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+            )
         if use_fused_proj_conv:
             if not isinstance(attn_result, tuple) or len(attn_result) != 2:
                 raise RuntimeError(
@@ -1092,7 +1495,47 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        if (
+            use_strided_prefill_z
+            and self.prefill_norm_fp8
+            and core_attn_out.dtype == torch.bfloat16
+            and _static_fp8_input_linear(self.out_proj)
+        ):
+            print_info_once("GDN prefill: fused gated RMSNorm + static FP8 engaged")
+            fp8 = gated_rmsnorm_static_fp8(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.out_proj.input_scale,
+                self.norm.eps,
+            )
+            return self.out_proj(fp8)[0]
+
         nv = self.num_v_heads // self.attn_tp_size
+        if middle_backend is not None:
+            from sglang.kernels.ops.attention.gdn_pdl_norm import norm
+
+            quant, rstd = self._middle_verify_buffers
+            norm(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                self.out_proj.input_scale,
+                quant,
+                rstd,
+                self.norm.eps,
+            )
+            x_fp8 = quant.view(7, 2048)
+            # With the out_proj hop push active, this early return must feed the hop mailbox too.
+            hop = self._q35_push_hop(7)
+            if hop is not None:
+                return hop.out_proj_push(
+                    x_fp8=x_fp8,
+                    packed_w=self.out_proj.q35_packed,
+                    input_scale=self.out_proj.input_scale,
+                    weight_scale=self.out_proj.weight_scale,
+                )
+            return self.out_proj(x_fp8)[0]
         if (
             _is_cuda
             and forward_batch.forward_mode.is_target_verify()
@@ -1110,6 +1553,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and self.out_proj.input_scale.numel() == 1
                 and core_attn_out.dtype == torch.bfloat16
             ):
+                hop = self._q35_push_hop(core_attn_out.shape[0] // nv)
                 (fp8, _), _, _ = _layer_norm_fwd(
                     core_attn_out,
                     self.norm.weight,
@@ -1119,8 +1563,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     is_rms_norm=True,
                     activation=self.norm.activation,
                     static_quant_scale=self.out_proj.input_scale,
+                    # The push launch waits on this grid before reading fp8; let it load its weights now.
+                    early_dependents=hop is not None,
                 )
                 fp8 = fp8.reshape(-1, nv * self.head_v_dim)
+                if hop is not None:
+                    return hop.out_proj_push(
+                        x_fp8=fp8,
+                        packed_w=self.out_proj.q35_packed,
+                        input_scale=self.out_proj.input_scale,
+                        weight_scale=self.out_proj.weight_scale,
+                    )
                 return self.out_proj(fp8)[0]
             print_warning_once(
                 "GDN static FP8 norm is unsupported; using the original path"
@@ -1147,6 +1600,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _q35_push_hop(self, m: int):
+        if not (envs.SGLANG_Q35MF_MKH_OPROJ.get() and m <= 8):
+            return None
+        from sglang.srt.layers.q35_hop import active
+
+        hop = active()
+        return hop if hop is not None and self.out_proj.q35_packed is not None else None
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
@@ -1319,6 +1780,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             _is_cuda and envs.SGLANG_Q35MF_ATTN_GATE_QUANT.get()
         )
         self._attn_front_requested = _is_cuda and envs.SGLANG_Q35MF_ATTN_FRONT.get()
+        self._mka_requested = _is_cuda and envs.SGLANG_Q35MF_MKA_FUSED.get()
+        self._mkd_gemv = is_nextn and _is_cuda and envs.SGLANG_Q35MF_MKD_GEMV.get()
+        # Host int64 site fields of the hop the draft o_proj pushes into, built on first use.
+        self._mkd_hop_site = None
+        # Packed (qkv, o_proj) weights; built on the first eager verify forward, after weight loading.
+        self._mka_weights = None
+        self._mka_static_ok = None
+        if self._mka_requested:
+            from sglang.kernels.ops.attention import mka_fused
+
+            mka_fused.ensure_built()
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -1633,6 +2105,144 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
 
+    def _mka_static_eligible(self) -> bool:
+        def per_tensor_fp8(linear) -> bool:
+            method = linear.quant_method
+            return (
+                type(method).__name__ == "ModelOptFp8LinearMethod"
+                and not method.use_marlin
+                and linear.weight.dtype == torch.float8_e4m3fn
+                and linear.input_scale is not None
+                and linear.input_scale.numel() == 1
+                and linear.weight_scale.numel() == 1
+            )
+
+        return (
+            self.attn_output_gate
+            and self.num_heads in (4, 8)
+            and self.num_kv_heads == 1
+            and self.head_dim == 256
+            and self.hidden_size == 4096
+            and self.rotary_emb.rotary_dim == 64
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and per_tensor_fp8(self.qkv_proj)
+            and per_tensor_fp8(self.o_proj)
+        )
+
+    def _mka_eligible(
+        self, positions, hidden_states, forward_batch: ForwardBatch, backend
+    ) -> bool:
+        if not (
+            isinstance(hidden_states, torch.Tensor)
+            and hidden_states.dtype == torch.bfloat16
+            and 0 < hidden_states.shape[0] <= 8
+            and forward_batch.forward_mode.is_target_verify()
+            and positions.dim() == 2
+        ):
+            return False
+        if self._mka_static_ok is None:
+            self._mka_static_ok = self._mka_static_eligible()
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        if not (
+            self._mka_static_ok
+            and type(backend).__name__ == "TRTLLMHAAttnBackend"
+            and backend.data_type == torch.float8_e4m3fn
+            and not backend.is_xqa_impl
+            and not backend.use_sliding_window_kv_pool
+            and not is_cp_active(forward_batch)
+        ):
+            return False
+        if self._mka_weights is None:
+            if torch.cuda.is_current_stream_capturing():
+                logger.warning_once(
+                    "MKA fused attention weights not packed before capture; using stock."
+                )
+                return False
+            from sglang.kernels.ops.attention import mka_fused
+
+            self._mka_weights = (
+                mka_fused.pack_qkv(self.qkv_proj.weight.t(), self.num_heads),
+                mka_fused.pack_o(self.o_proj.weight.t()),
+            )
+            logger.warning_once(
+                "MKA fused attention prologue/epilogue enabled for target verify."
+            )
+        return True
+
+    def _mka_self_attention(
+        self, positions, hidden_states, forward_batch: ForwardBatch, backend
+    ):
+        from sglang.kernels.ops.attention import mka_fused
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            use_symmetric_memory,
+        )
+        from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
+        m = hidden_states.shape[0]
+        width = self.num_heads * self.head_dim
+        device = hidden_states.device
+        q = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=device)
+        gate = torch.empty((m, width), dtype=torch.bfloat16, device=device)
+        k_cache, v_cache = backend.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
+        w_qkv, w_o = self._mka_weights
+        mka_fused.prologue(
+            x=hidden_states.contiguous(),
+            w_packed=w_qkv,
+            sx=self.qkv_proj.input_scale,
+            sw=self.qkv_proj.weight_scale,
+            q_norm_w=self.q_norm.weight.data,
+            k_norm_w=self.k_norm.weight.data,
+            cos_sin=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            axis_map=self.rotary_emb.axis_map,
+            cache_loc=backend._get_layer_cache_loc(self.attn, forward_batch),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_scale=self.attn.k_scale
+            if self.attn.k_scale is not None
+            else backend._default_kv_scale,
+            v_scale=self.attn.v_scale
+            if self.attn.v_scale is not None
+            else backend._default_kv_scale,
+            q_out=q,
+            gate_out=gate,
+            nq=self.num_heads,
+            eps=self.q_norm.variance_epsilon,
+        )
+        attn_output = (
+            self.attn(q, None, None, forward_batch).reshape(m, width).contiguous()
+        )
+        # Same allocation as RowParallelLinear's output, which the layer boundary all-reduces.
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            out = torch.empty(
+                (m, self.hidden_size), dtype=torch.bfloat16, device=device
+            )
+        hop = self._mka_push_hop(m)
+        mka_fused.epilogue(
+            attn=attn_output,
+            gate=gate,
+            w_packed=w_o,
+            sx=self.o_proj.input_scale,
+            sw=self.o_proj.weight_scale,
+            out=out,
+            nq=self.num_heads,
+            site=None if hop is None else hop.site_fields(),
+        )
+        if hop is not None:
+            hop.mark_pushed(out)
+        return out
+
+    def _mka_push_hop(self, m: int):
+        if not (envs.SGLANG_Q35MF_MKA_PUSH.get() and envs.SGLANG_Q35MF_MKH_HOP.get()):
+            return None
+        from sglang.srt.layers.q35_hop import active
+
+        hop = active()
+        return hop if hop is not None and hop.supports(m) else None
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -1640,6 +2250,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        if self._mka_requested:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "full_attn_backend", backend)
+            if self._mka_eligible(positions, hidden_states, forward_batch, backend):
+                return self._mka_self_attention(
+                    positions, hidden_states, forward_batch, backend
+                )
         q, k, v, gate = self._prepare_qkv_gate(
             positions=positions,
             hidden_states=hidden_states,
@@ -1673,8 +2292,36 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
 
+        if (
+            self._mkd_gemv
+            and attn_output.shape[0] == 1
+            and self.o_proj.weight.dtype == torch.bfloat16
+        ):
+            return self._draft_o_proj(attn_output)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _draft_o_proj(self, attn_output: torch.Tensor) -> torch.Tensor:
+        """The one-row draft o_proj partial as mkd_draft_gemv, pushed into the FFN input's hop when
+        that hop runs (it then only consumes)."""
+        from sglang.kernels.ops.speculative.mkd_draft_gemv import mkd_draft_gemv
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        weight = self.o_proj.weight
+        out = torch.empty(
+            1, weight.shape[0], dtype=torch.bfloat16, device=weight.device
+        )
+        fusion = self.ffn_boundary.fusions
+        hop = fusion.attn_push_target(1) if isinstance(fusion, DraftHopFusion) else None
+        if hop is None:
+            return mkd_draft_gemv(attn_output, weight, out)
+        if self._mkd_hop_site is None:
+            self._mkd_hop_site = torch.tensor(hop.site_fields(), dtype=torch.int64)
+        mkd_draft_gemv(attn_output, weight, out, hop_site=self._mkd_hop_site)
+        hop.mark_pushed(out)
+        return out
 
     def forward(
         self,
@@ -1890,8 +2537,31 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        # The adapter the final norm hands a deferred terminal output to.
+        self._final_norm_handoff = self.flashinfer_mnnvl_cutedsl_fusion
+        # The draft layer's step hops (SGLANG_Q35MF_MKD_HOP), or None.
+        self.draft_hop = None
+        if is_nextn and self.pp_group.is_last_rank:
+            self._install_draft_hop()
 
         self.layers_to_capture = []
+
+    def _install_draft_hop(self) -> None:
+        from sglang.srt.layers.layer_boundary.fusions.q35_draft_hop import (
+            DraftHopFusion,
+        )
+
+        last = self.layers[self.end_layer - 1]
+        fusion = last.ffn_boundary.fusions
+        if not isinstance(fusion, DraftHopFusion) or not isinstance(
+            last.mlp, Qwen2MoeSparseMoeBlock
+        ):
+            return
+        fusion.final_norm = self.norm
+        fusion.moe_ready = last.mlp.single_token_draft_ready
+        fusion.moe_single_launch = last.mlp.single_token_draft_single_launch
+        self._final_norm_handoff = fusion
+        self.draft_hop = fusion
 
     def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
         """Embedding sharding hook for models reusing this backbone."""
@@ -2005,7 +2675,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states,
             forward_batch,
             self.norm,
-            finalize_norm=self.flashinfer_mnnvl_cutedsl_fusion,
+            finalize_norm=self._final_norm_handoff,
             skip_empty=True,
         )
 

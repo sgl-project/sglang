@@ -100,6 +100,7 @@ struct VocabArgmaxPackParams {
   uint32_t* part_key;                // [kBlocks]
   int32_t* part_idx;                 // [kBlocks]
   uint32_t* counter;                 // [M], zero between launches
+  const int64_t* token_map;          // [V_local] vocabulary id of each local row, or null for vocab_start + row
   int32_t vocab;                     // V_local, multiple of 8
   int32_t vocab_start;               // global id of local row 0
   uint32_t nan_key;                  // key given to NaN logits
@@ -189,7 +190,7 @@ __global__ void __launch_bounds__(kThreads) vocab_argmax_pack_kernel(const Vocab
   if (threadIdx.x == 0) {
     auto* meta = reinterpret_cast<uint32_t*>(payload + kH);
     meta[0] = v;
-    meta[1] = static_cast<uint32_t>(p.vocab_start + i);
+    meta[1] = static_cast<uint32_t>(p.token_map != nullptr ? p.token_map[i] : p.vocab_start + i);
     meta[2] = 0u;
     meta[3] = 0u;
     *counter = 0u;
@@ -221,7 +222,8 @@ __global__ void __launch_bounds__(kThreads)
   }
   const auto* row = reinterpret_cast<const uint4*>(gathered + win * kRow);
   auto* dst = reinterpret_cast<uint4*>(p.next_embeds + m * kH);
-  for (int c = static_cast<int>(threadIdx.x); c < kH / 8; c += kThreads) dst[c] = row[c];
+  for (int c = static_cast<int>(threadIdx.x); c < kH / 8; c += kThreads)
+    dst[c] = row[c];
   if (threadIdx.x == 0) {
     p.topk_index[m] = bi;
     p.topk_p[m] = 1.0f;
@@ -229,7 +231,8 @@ __global__ void __launch_bounds__(kThreads)
     if (p.positions != nullptr) p.positions[m] = p.positions[m] + 1;
     if (p.mrope != nullptr) {
 #pragma unroll
-      for (int d = 0; d < 3; ++d) p.mrope[d * p.mrope_stride + m] += 1;
+      for (int d = 0; d < 3; ++d)
+        p.mrope[d * p.mrope_stride + m] += 1;
     }
   }
 }
@@ -237,26 +240,25 @@ __global__ void __launch_bounds__(kThreads)
 namespace vocab_argmax {
 
 SGL_DEVICE void bulk_g2s(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
-          device::ptx::to_shared(smem_dst)),
-      "l"(gmem_src),
-      "r"(bytes),
-      "r"(device::ptx::to_shared(bar))
-      : "memory");
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                   device::ptx::to_shared(smem_dst)),
+               "l"(gmem_src),
+               "r"(bytes),
+               "r"(device::ptx::to_shared(bar))
+               : "memory");
 }
 
 }  // namespace vocab_argmax
 
 struct LmHeadArgmaxParams {
-  const bf16_t* x;                    // [H] lm_head input, written by an earlier grid
-  const bf16_t* __restrict__ w;       // [V_local, H] lm_head shard
-  const bf16_t* __restrict__ embed;   // [V_local, H] embedding shard
-  bf16_t* payload;                    // [H + 8]
-  uint32_t* part_key;                 // [grid]
-  int32_t* part_idx;                  // [grid]
-  uint32_t* counter;                  // [1], zero between launches
-  int32_t vocab;                      // V_local
+  const bf16_t* x;                   // [H] lm_head input, written by an earlier grid
+  const bf16_t* __restrict__ w;      // [V_local, H] lm_head shard
+  const bf16_t* __restrict__ embed;  // [V_local, H] embedding shard
+  bf16_t* payload;                   // [H + 8]
+  uint32_t* part_key;                // [grid]
+  int32_t* part_idx;                 // [grid]
+  uint32_t* counter;                 // [1], zero between launches
+  int32_t vocab;                     // V_local
   int32_t vocab_start;
   uint32_t nan_key;
 };
@@ -329,7 +331,8 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
     PDLWaitPrimary<kUsePDL>();
     cvec_t xr[kChunks];
 #pragma unroll
-    for (int k = 0; k < kChunks; ++k) xr[k].load(p.x, k * kWarpThreads + lane);
+    for (int k = 0; k < kChunks; ++k)
+      xr[k].load(p.x, k * kWarpThreads + lane);
     uint32_t best = 0u;
     int32_t bidx = 0x7fffffff;
     int stage = 0;
@@ -345,7 +348,8 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
           cvec_t w;
           w.load(row, k * kWarpThreads + lane);
 #pragma unroll
-          for (int j = 0; j < 8; ++j) acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
+          for (int j = 0; j < 8; ++j)
+            acc = fmaf(cast<fp32_t>(w[j]), cast<fp32_t>(xr[k][j]), acc);
         }
         acc = warp::reduce_sum(acc);
         const uint32_t key = vocab_argmax::value_key(cast<fp32_t>(cast<bf16_t>(acc)), p.nan_key);
@@ -420,8 +424,8 @@ __global__ void __launch_bounds__((kRows + 1) * 32, kCtasPerSm)
 
 template <int kH, int kRows, int kStages, int kCtasPerSm, bool kUsePDL>
 struct LmHeadArgmax {
-  static void run(
-      const tvm::ffi::TensorView x,
+  static void
+  run(const tvm::ffi::TensorView x,
       const tvm::ffi::TensorView w,
       const tvm::ffi::TensorView embed,
       const tvm::ffi::TensorView payload,
@@ -484,6 +488,7 @@ struct DraftVocabArgmax {
       const tvm::ffi::TensorView part_key,
       const tvm::ffi::TensorView part_idx,
       const tvm::ffi::TensorView counter,
+      const tvm::ffi::TensorView token_map,
       int64_t vocab_start,
       int64_t nan_key) {
     using namespace host;
@@ -503,6 +508,11 @@ struct DraftVocabArgmax {
     TensorMatcher({M}).with_dtype<int32_t>().with_device(device).verify(counter);
     const int64_t vocab = V.unwrap();
     CHECK_HOST(vocab % 8 == 0) << "local vocab " << vocab << " must be a multiple of 8";
+    const int64_t* map = nullptr;
+    if (token_map.numel() > 0) {
+      TensorMatcher({V}).with_dtype<int64_t>().with_device(device).verify(token_map);
+      map = static_cast<const int64_t*>(token_map.data_ptr());
+    }
     const auto params = VocabArgmaxPackParams{
         .logits = static_cast<const bf16_t*>(logits.data_ptr()),
         .embed = static_cast<const bf16_t*>(embed.data_ptr()),
@@ -510,6 +520,7 @@ struct DraftVocabArgmax {
         .part_key = static_cast<uint32_t*>(part_key.data_ptr()),
         .part_idx = static_cast<int32_t*>(part_idx.data_ptr()),
         .counter = static_cast<uint32_t*>(counter.data_ptr()),
+        .token_map = map,
         .vocab = static_cast<int32_t>(vocab),
         .vocab_start = static_cast<int32_t>(vocab_start),
         .nan_key = static_cast<uint32_t>(nan_key),

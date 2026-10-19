@@ -1,8 +1,10 @@
 import itertools
 import unittest
+from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.memory import small_field_copy as small_field_copy_module
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
 from sglang.kernels.ops.memory.small_field_copy import (
     SmallFieldCopyPlan,
@@ -249,6 +251,121 @@ class TestSmallFieldCopy(CustomTestCase):
         self.assertTrue(torch.equal(d0, before0) and torch.equal(d1, before1))
         self.assertTrue(plan([d0, d1], [s0, s1]))
         self.assertTrue(torch.equal(d0, s0.long()))
+
+    def test_vec_launch_matches_default_bytes(self):
+        """The vectorized launch writes the same bytes as the default one, including
+        misaligned, strided and width-cast fields, and leaves row padding untouched."""
+        gen = torch.Generator(device="cuda").manual_seed(0)
+
+        def field(dtype, rows, cols, src_pad, dst_pad, offset, cast):
+            size = torch.empty((), dtype=dtype).element_size()
+            numel = offset + rows * (cols + src_pad)
+            src = torch.randint(
+                0, 256, (numel * size,), device="cuda", dtype=torch.uint8, generator=gen
+            ).view(dtype)[offset:]
+            src = src.view(rows, cols + src_pad)[:, :cols]
+            dst_dtype = (
+                {torch.int32: torch.int64, torch.int64: torch.int32}.get(dtype)
+                if cast
+                else dtype
+            )
+            backing = torch.randint(
+                0,
+                256,
+                ((rows * (cols + dst_pad) + offset) * 8,),
+                device="cuda",
+                dtype=torch.uint8,
+                generator=gen,
+            )
+            return src, backing, dst_dtype, offset
+
+        def views(backing, dst_dtype, offset, rows, cols, dst_pad):
+            numel = rows * (cols + dst_pad) + offset
+            flat = backing[
+                : numel * torch.empty((), dtype=dst_dtype).element_size()
+            ].view(dst_dtype)
+            dst = flat[offset:].view(rows, cols + dst_pad)[:, :cols]
+            return dst if rows > 1 else dst.reshape(cols)
+
+        cases = [
+            # (dtype, rows, cols, src_pad, dst_pad, offset, cast)
+            [
+                (torch.bfloat16, 56, 4096, 0, 0, 0, False),
+                (torch.int64, 1, 8, 0, 0, 0, False),
+                (torch.int32, 1, 8, 0, 0, 0, True),
+                (torch.int32, 1, 9, 0, 0, 0, False),
+                (torch.int64, 1, 56, 0, 0, 0, False),
+                (torch.int64, 3, 8, 0, 0, 0, False),
+            ],
+            [
+                (torch.bfloat16, 8, 4096, 0, 0, 1, False),
+                (torch.float32, 8, 1, 0, 0, 0, False),
+                (torch.int64, 1, 64, 0, 0, 1, True),
+                (torch.uint8, 5, 33, 3, 7, 0, False),
+            ],
+            [
+                (torch.bfloat16, 7, 4096, 8, 16, 0, False),
+                (torch.float16, 4, 24, 8, 8, 0, False),
+                (torch.float64, 3, 2, 2, 0, 0, False),
+                (torch.int16, 2, 16, 0, 8, 0, False),
+                (torch.bool, 1, 100, 0, 0, 0, False),
+                (torch.int32, 2, 6, 2, 2, 0, True),
+            ],
+            [
+                (torch.bfloat16, 512, 4096, 0, 0, 0, False),
+                (torch.int8, 1, 1, 0, 0, 0, False),
+            ],
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                built = [(spec, field(*spec)) for spec in case]
+                outs = []
+                for vec in (False, True):
+                    dsts, srcs, backings = [], [], []
+                    for (dtype, rows, cols, _, dst_pad, _, _), (
+                        src,
+                        backing,
+                        dst_dtype,
+                        offset,
+                    ) in built:
+                        b = backing.clone()
+                        dsts.append(views(b, dst_dtype, offset, rows, cols, dst_pad))
+                        srcs.append(src if rows > 1 else src.reshape(cols))
+                        backings.append(b)
+                    with mock.patch.object(small_field_copy_module, "_VEC", vec):
+                        self.assertTrue(small_field_copy(dsts, srcs))
+                        plan = SmallFieldCopyPlan()
+                        self.assertTrue(plan(dsts, srcs))
+                        self.assertTrue(plan(dsts, srcs))
+                    outs.append(backings)
+                for ref, got in zip(*outs):
+                    self.assertTrue(torch.equal(ref, got))
+
+    def test_vec_launch_refusals_and_graph_replay(self):
+        with mock.patch.object(small_field_copy_module, "_VEC", True):
+            x = torch.arange(17, device="cuda")
+            y = torch.full_like(x, -1)
+            self.assertFalse(small_field_copy([x[1:], y[:16]], [x[:-1], x[:16]]))
+            self.assertFalse(small_field_copy([x, y], [y, x]))
+            self.assertTrue(torch.equal(x, torch.arange(17, device="cuda")))
+            self.assertTrue(bool((y == -1).all()))
+            src = torch.randn(56, 4096, device="cuda").bfloat16()
+            idx = torch.arange(8, device="cuda", dtype=torch.int32)
+            dst = torch.empty_like(src)
+            dst_idx = torch.empty(8, device="cuda", dtype=torch.int64)
+            plan = SmallFieldCopyPlan()
+            self.assertTrue(plan([dst, dst_idx], [src, idx]))
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self.assertTrue(plan([dst, dst_idx], [src, idx]))
+            for _ in range(3):
+                src.add_(1)
+                idx.add_(3)
+                graph.replay()
+                self.assertTrue(
+                    torch.equal(dst.view(torch.int16), src.view(torch.int16))
+                )
+                self.assertTrue(torch.equal(dst_idx, idx.long()))
 
 
 if __name__ == "__main__":

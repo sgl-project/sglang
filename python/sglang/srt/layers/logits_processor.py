@@ -44,6 +44,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
+from sglang.srt.layers.k75p_lm_head import K75PDraftSelect, K75PProof
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     LogprobStage,
@@ -281,6 +282,10 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # Greedy draft token ids [#seq, 1] picked on the vocab shards (vocab-shard select);
+    # next_token_logits is None when this is set.
+    next_token_ids: Optional[torch.Tensor] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
@@ -443,6 +448,23 @@ class LogitsMetadata:
         )
 
 
+# The processor whose target-verify logits were last returned on the vocab shards.
+_VERIFY_SHARD_SOURCE: Optional["LogitsProcessor"] = None
+
+
+def verify_logits_on_shards(logits: torch.Tensor) -> bool:
+    """Whether these target-verify logits came back shard-local (narrower than the vocab)."""
+    return (
+        _VERIFY_SHARD_SOURCE is not None
+        and logits.shape[-1] < _VERIFY_SHARD_SOURCE.vocab_size
+    )
+
+
+def gather_verify_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Undo the shard-local return of target-verify logits for the stock paths."""
+    return _VERIFY_SHARD_SOURCE.gather_verify_logits(logits)
+
+
 class LogitsProcessor(nn.Module):
     def __init__(
         self,
@@ -486,6 +508,18 @@ class LogitsProcessor(nn.Module):
         # Set around greedy draft forwards that select on vocab shards: logits of
         # at most this many rows are returned unreduced (0 = always gather).
         self.skip_vocab_gather_rows = 0
+        # Draft step boundary that computes one-row draft lm_heads itself (SGLANG_Q35MF_MKD_HEAD).
+        self.mkd_head = None
+        # Target-verify logits are returned unreduced for sampling on the vocab shards.
+        self.verify_logits_on_shards = (
+            envs.SGLANG_Q35MF_PDDEC_SHARDED_VERIFY_SAMPLING.get()
+            and self.do_tensor_parallel_all_gather
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_attn_tp_group
+            and not self.use_fp32_lm_head
+            and self.logit_scale is None
+            and self.final_logit_softcapping is None
+        )
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
 
@@ -510,6 +544,29 @@ class LogitsProcessor(nn.Module):
         self.input_logprob_processor = InputLogprobProcessor(
             self.vocab_size, chunking_group=chunking_group
         )
+        # Set by the EAGLE worker for its draft head (SGLANG_Q35MF_K75P_LMHEAD).
+        self.k75p_draft_select: Optional[K75PDraftSelect] = None
+        self.k75p_proof: Optional[K75PProof] = None
+
+    def enable_k75p_draft_select(
+        self, *, lm_head: VocabParallelEmbedding, max_rows: int, hidden_size: int
+    ) -> None:
+        if not (
+            self.do_tensor_parallel_all_gather_dp_attn
+            and self.use_tp_lm_head_all_to_all
+            and self.logit_scale is None
+            and self.final_logit_softcapping is None
+            and not self.use_fp32_lm_head
+            and lm_head.weight.dtype == torch.bfloat16
+            and lm_head.weight.shape[0] * get_parallel().tp_size == self.vocab_size
+        ):
+            logger.warning("K75P draft LM head disabled: unsupported LM head layout.")
+            return
+        self.k75p_draft_select = K75PDraftSelect.create(
+            max_rows=max_rows, hidden_size=hidden_size
+        )
+        if self.k75p_draft_select is not None and envs.SGLANG_Q35MF_K75P_PROOF.get():
+            self.k75p_proof = K75PProof()
 
     def forward(
         self,
@@ -597,6 +654,15 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if self._can_use_k75p_draft_select(pruned_states, lm_head, logits_metadata):
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    next_token_ids=self._get_k75p_draft_token_ids(
+                        pruned_states, lm_head, logits_metadata
+                    ),
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -868,6 +934,69 @@ class LogitsProcessor(nn.Module):
 
         return hidden_states_to_store
 
+    def _can_use_k75p_draft_select(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        if self.k75p_draft_select is None or not (
+            logits_metadata.forward_mode.is_decode()
+            or logits_metadata.forward_mode.is_draft_extend_v2()
+        ):
+            return False
+        # Same layout guard as _can_use_tp_lm_head_all_to_all; the gathered row count
+        # is the one compute_dp_attention_metadata would allocate.
+        tp_size = get_parallel().tp_size
+        base_lm_head = getattr(lm_head, "base_layer", lm_head)
+        if getattr(base_lm_head, "tp_size", None) != tp_size:
+            return False
+        global_counts_cpu = logits_metadata.global_num_tokens_for_logprob_cpu
+        is_equal_padded_graph_layout = global_counts_cpu is None and (
+            logits_metadata.global_num_tokens_for_logprob_gpu is not None
+        )
+        is_equal_eager_layout = (
+            global_counts_cpu is not None
+            and len(global_counts_cpu) == tp_size
+            and len(global_counts_cpu) > 0
+            and all(count == global_counts_cpu[0] for count in global_counts_cpu)
+        )
+        if not (is_equal_padded_graph_layout or is_equal_eager_layout):
+            return False
+        gathered_rows = (
+            sum(global_counts_cpu)
+            if global_counts_cpu is not None
+            else logits_metadata.global_dp_buffer_len
+        )
+        return (
+            self.k75p_draft_select.fits(hidden_states)
+            and gathered_rows == hidden_states.shape[0] * tp_size
+        )
+
+    def _get_k75p_draft_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        select = self.k75p_draft_select
+        logits = self._compute_lm_head(select.gather_rows(hidden_states), lm_head)
+        extend = logits_metadata.forward_mode.is_draft_extend_v2()
+        # Draft extend replaces torch.argmax (NaN wins); draft decode replaces the
+        # split argmax of draft_topk1_postprocess (NaN reads as -1e30).
+        token_ids = select.select(
+            logits=logits,
+            num_local_rows=hidden_states.shape[0],
+            torch_nan=extend,
+        )
+        if self.k75p_proof is not None:
+            self.k75p_proof.check(
+                extend=extend,
+                token_ids=token_ids,
+                stock_logits=self._get_logits(hidden_states, lm_head, logits_metadata),
+            )
+        return token_ids
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -921,6 +1050,13 @@ class LogitsProcessor(nn.Module):
 
         if 0 < logits.shape[0] <= self.skip_vocab_gather_rows:
             return logits
+        if (
+            self.verify_logits_on_shards
+            and logits_metadata.forward_mode.is_target_verify()
+        ):
+            global _VERIFY_SHARD_SOURCE
+            _VERIFY_SHARD_SOURCE = self
+            return logits
 
         used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
@@ -973,12 +1109,26 @@ class LogitsProcessor(nn.Module):
 
         return logits
 
+    def gather_verify_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """All-gather shard-local verify logits into the float32 [rows, vocab] form the
+        stock sampling paths read."""
+        logits = self._logits_gatherer(logits)
+        if logits.shape[-1] > self.vocab_size:
+            logits = logits[:, : self.vocab_size]
+        return logits.float()
+
     def _compute_lm_head(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            self.mkd_head is not None
+            and self.mkd_head.armed
+            and hidden_states.shape[0] == 1
+        ):
+            return self.mkd_head.head(hidden_states, lm_head)
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method

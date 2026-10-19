@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -16,6 +18,123 @@ DSA_SPARSE = "sparse"
 SPLIT_KV_STOCK = "split_kv_stock"
 SPLIT_KV_LONG = "split_kv_long"
 SPLIT_KV_MIN_LENGTH = 32768
+
+
+PAGED_FP8_STOCK = "paged_fp8_stock"
+PAGED_FP8_LONG = "paged_fp8_long"
+PAGED_FP8_MIN_LENGTH = 2049
+
+
+@dataclass(frozen=True)
+class PagedFP8GraphVariants:
+    """Use a host-only lower bound to select the eligible attention graph."""
+
+    capture_labels: ClassVar[tuple[str, ...]] = (PAGED_FP8_STOCK, PAGED_FP8_LONG)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if forward_batch.batch_size != 1:
+            return PAGED_FP8_STOCK
+        length = forward_batch.attention_kv_len_lower_bound
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if lengths is not None and lengths.device.type == "cpu" and lengths.numel():
+                length = int(lengths.min())
+        return (
+            PAGED_FP8_LONG
+            if length is not None and length >= PAGED_FP8_MIN_LENGTH
+            else PAGED_FP8_STOCK
+        )
+
+
+def create_paged_fp8_graph_variants(
+    capture_forward_mode, captured_req_width, *, enabled=True
+):
+    from sglang.srt.environ import envs
+
+    if enabled and envs.SGLANG_Q35MF_LL1_K1B.get() and captured_req_width in (1, 7):
+        if (
+            capture_forward_mode.is_decode_or_idle()
+            or capture_forward_mode.is_target_verify()
+            or capture_forward_mode.is_draft_extend_v2()
+        ):
+            return PagedFP8GraphVariants()
+    return None
+
+
+def use_paged_fp8_attention(forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    variant = get_capture_attention_variant()
+    if variant is not None:
+        return variant == PAGED_FP8_LONG
+    if get_is_capture_mode():
+        return False
+    return PagedFP8GraphVariants().select(forward_batch) == PAGED_FP8_LONG
+
+
+def paged_fp8_engagement():
+    """Host-only operator/captured-graph replay counters for engagement checks."""
+    from sglang.srt.runtime_context import get_buffer
+
+    return get_buffer("paged_fp8_engagement", lambda: {"calls": {}, "replays": {}})
+
+
+def record_paged_fp8_call(qlen):
+    counts = paged_fp8_engagement()["calls"]
+    key = f"q{qlen}"
+    counts[key] = counts.get(key, 0) + 1
+
+
+Q1_STOCK = "q1_stock"
+Q1_LONG = "q1_long"
+
+
+class Q1GraphVariants(msgspec.Struct, frozen=True):
+    """Draft q1 decode: the paged FP8 q1 kernel from a host-only KV length lower bound, trtllm-gen below it."""
+
+    min_length: int
+    capture_labels: ClassVar[tuple[str, ...]] = (Q1_STOCK, Q1_LONG)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if forward_batch.batch_size != 1:
+            return Q1_STOCK
+        length = forward_batch.attention_kv_len_lower_bound
+        if length is None:
+            lengths = forward_batch.seq_lens_cpu
+            if (
+                lengths is not None
+                and lengths.device.type == "cpu"
+                and lengths.numel() == 1
+            ):
+                length = int(lengths[0])
+        return Q1_LONG if length is not None and length >= self.min_length else Q1_STOCK
+
+
+def create_q1_graph_variants() -> Optional[Q1GraphVariants]:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_Q35MF_MKA_Q1.get():
+        return Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    return None
+
+
+def use_q1_attention(forward_batch: ForwardBatch) -> bool:
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+        get_is_capture_mode,
+    )
+
+    variant = get_capture_attention_variant()
+    if variant is not None:
+        return variant == Q1_LONG
+    if get_is_capture_mode():
+        return False
+    variants = Q1GraphVariants(min_length=envs.SGLANG_Q35MF_MKA_Q1_MIN_LENGTH.get())
+    return variants.select(forward_batch) == Q1_LONG
 
 
 class AttentionGraphVariants(Protocol):
@@ -31,6 +150,7 @@ class AttentionGraphVariants(Protocol):
 class SplitKVGraphVariants:
     """Keep short sequences on stock attention without a device-to-host copy."""
 
+    min_length: int = SPLIT_KV_MIN_LENGTH
     capture_labels: ClassVar[tuple[str, ...]] = (SPLIT_KV_STOCK, SPLIT_KV_LONG)
 
     def select(self, forward_batch: ForwardBatch) -> str:
@@ -47,9 +167,18 @@ class SplitKVGraphVariants:
                 length = int(lengths[0])
         return (
             SPLIT_KV_LONG
-            if length is not None and length >= SPLIT_KV_MIN_LENGTH
+            if length is not None and length >= self.min_length
             else SPLIT_KV_STOCK
         )
+
+
+def _split_kv_min_length(is_target_verify: bool) -> int:
+    from sglang.srt.environ import envs
+
+    # The split-KV producer may also take target verify below 32K; the draft extend keeps the stock threshold.
+    if is_target_verify and envs.SGLANG_Q35MF_MKA_SKV2.get():
+        return envs.SGLANG_Q35MF_MKA_SKV2_VERIFY_MIN_LENGTH.get()
+    return SPLIT_KV_MIN_LENGTH
 
 
 def create_split_kv_graph_variants(
@@ -65,7 +194,9 @@ def create_split_kv_graph_variants(
             or capture_forward_mode.is_draft_extend_v2()
         )
     ):
-        return SplitKVGraphVariants()
+        return SplitKVGraphVariants(
+            min_length=_split_kv_min_length(capture_forward_mode.is_target_verify())
+        )
     return None
 
 
@@ -77,10 +208,15 @@ def use_split_kv_attention(forward_batch: ForwardBatch) -> bool:
 
     variant = get_capture_attention_variant()
     if variant is not None:
+        if variant in (PAGED_FP8_STOCK, PAGED_FP8_LONG):
+            return False
         return variant == SPLIT_KV_LONG
     if get_is_capture_mode():
         return False
-    return SplitKVGraphVariants().select(forward_batch) == SPLIT_KV_LONG
+    variants = SplitKVGraphVariants(
+        min_length=_split_kv_min_length(forward_batch.forward_mode.is_target_verify())
+    )
+    return variants.select(forward_batch) == SPLIT_KV_LONG
 
 
 @dataclass(frozen=True)
