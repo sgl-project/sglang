@@ -488,7 +488,7 @@ def _hc_boundary_partial_kernel(
 ):
     """Grid (cdiv(M, BLOCK_M), H // BLOCK_K), one hidden slice of every copy per program. HAS_POST:
     res_out[k] = post[k]*x + sum_j comb[j,k]*res[j] in aiter::mhc_post's order, read back as bf16
-    for the statistics; HAS_COMBINE: y = sum_k pre_prev[k] * copy_k in _hc_combine_kernel's order."""
+    for the statistics; HAS_COMBINE: y = sum_k pre_prev[k] * copy_k in _mhc_combine_kernel's order."""
     tl.static_assert(HC == 4, "the weight tiles are prefetched by name")
     pid_m = tl.program_id(0)
     pid_t = tl.program_id(1)

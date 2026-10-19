@@ -3273,7 +3273,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
         # y is the post-norm activation fed into the MoE. Allocate it in the
         # symmetric memory pool so the downstream all-reduce uses the low-latency
@@ -3284,7 +3284,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
-            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
+            y = mhc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -4275,9 +4275,9 @@ class DeepseekV4Model(nn.Module):
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import hc_combine
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            hidden_states = hc_combine(
+            hidden_states = mhc_combine(
                 pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
             )
         else:
