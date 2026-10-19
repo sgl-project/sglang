@@ -135,6 +135,45 @@ During multi-GPU parallel computation, such as tensor parallelism (TP), HiCache 
 
 For example, during prefetching, `all_reduce(op=min)` is used to ensure that all ranks obtain the same number of L3 hits, preventing inconsistent judgments about whether the prefetch threshold has been reached. Similarly, after prefetching completes or terminates, `all_reduce(op=min)` is again required to guarantee consensus among ranks on the prefix length of the successfully retrieved KV cache.
 
+### Asynchronous PP admission
+
+For static PD-prefill deployments with pipeline parallelism, you can opt into
+asynchronous L3 cache admission with
+`SGLANG_ENABLE_PP_L3_CACHE_ASYNC_ADMISSION=1` on every prefill rank. It defaults to
+`false`. Configure `--pp-size` greater than 1, `--disaggregation-mode prefill`,
+`--enable-hierarchical-cache`, `--hicache-host-memory-mode cache`, and an L3
+backend through `--hicache-storage-backend` at startup.
+
+Each pipeline stage progresses its own storage reads and cache acknowledgements.
+Once all stages can stop prefetching, they agree on a page-aligned common prefix
+and hold the prefix and capacity until the native prefill scheduler selects the
+request. Stage 0 chooses the batch order and chunk boundaries; the other stages
+replay that selection. Admission updates share the existing PP transfer/release
+messages. Bootstrap remains in `PPConsensusStore`.
+
+The mode supports `best_effort`, `timeout`, and `wait_complete`. A timeout starts
+at the first blocked admission poll and uses the submitted prefetch span. The
+mode retains the ingress prefetch attempt while admission is pending: it does
+not issue the default scheduler's storage-miss retries or device-hit-loss
+refetches. This can change cache-hit rates as well as synchronization overhead.
+
+Supported cache components are full attention and KV-derived DSA. SWA/Mamba,
+custom radix-cache backends, FlexKV (`--enable-flexkv`), runtime PD role switching,
+LoRA, priority preemption, dynamic/mixed chunking, dLLM, and speculative decoding
+are rejected for this mode. Requests using structured output, beam groups, or
+sessions are also rejected. Other deployment profiles retain their default
+scheduling path.
+
+Admission uses the common HiCache storage interface and does not add a storage
+backend. Mooncake is the reference backend; other storage backends need
+end-to-end validation with this mode. An enabled admission engine cannot detach
+L3 at runtime, and an L2-only engine cannot enable admission by attaching L3:
+restart with the intended startup configuration. You can still update the
+prefetch policy for an already attached backend while the engine is idle.
+
+The earlier experimental name `SGLANG_PP_L3_CACHE_ASYNC_ADMISSION` remains a
+deprecated alias for the environment variable above.
+
 ### Data Transfer Optimization
 
 **Zero-Copy Data Transfers**: Both prefetching and write-back involve substantial data movement. Minimizing the number of data copies can significantly improve system performance. HiCache supports passing memory addresses and sizes directly when transferring data from L2 memory to an L3 backend.

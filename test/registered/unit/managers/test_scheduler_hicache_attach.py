@@ -34,6 +34,7 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
         scheduler.enable_hicache_storage = False
+        scheduler.pp_prefetch_admission = None
         scheduler.is_fully_idle = lambda: True
         scheduler.tree_cache = SimpleNamespace(
             attach_storage_backend=lambda **kwargs: (True, "attached"),

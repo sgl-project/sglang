@@ -72,9 +72,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,
+        validate_pp_cache_admission_backend,
     )
 
     run_hook(handle_hicache_ratio_default, server_args)
+    run_hook(validate_pp_cache_admission_backend, server_args)
     from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
 
     run_hook(handle_offload_compatibility, server_args)

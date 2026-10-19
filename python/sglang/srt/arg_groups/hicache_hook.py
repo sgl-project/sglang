@@ -8,9 +8,11 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     declare_resolution,
+    model_config_of,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.mem_cache.pp_prefetch_config import pp_cache_admission_requested
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,7 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    validate_pp_cache_admission_model(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:
         # The shared host pool must match KV transfer's per-layer buffers.
@@ -77,6 +80,54 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def validate_pp_cache_admission_backend(server_args: Any):
+    """Validate the selected cache path before model resolution/allocation."""
+    cfg = resolving_view(server_args)
+    if not pp_cache_admission_requested(config=cfg):
+        return
+    # Native validation already rejects HiCache + disabled radix / LMCache.
+    # Custom factories can return arbitrary classes and are outside this path.
+    if cfg.radix_cache_backend or cfg.enable_flexkv:
+        raise ValueError(
+            "PP cache admission requires the built-in UnifiedRadixCache path; "
+            "--radix-cache-backend and --enable-flexkv are not supported. "
+            "Use --hicache-storage-backend for L3 storage."
+        )
+    if cfg.enable_pd_role_switch:
+        raise ValueError(
+            "PP cache admission does not support runtime PD role switching"
+        )
+    if (
+        cfg.enable_lora
+        or cfg.lora_paths
+        or (cfg.enable_priority_scheduling and not cfg.disable_priority_preemption)
+        or cfg.enable_dynamic_chunking
+        or cfg.enable_mixed_chunk
+        or cfg.dllm_algorithm is not None
+        or cfg.speculative_algorithm is not None
+    ):
+        raise ValueError(
+            "PP cache admission requires static PD-prefill scheduling without "
+            "LoRA, priority preemption, dynamic/mixed chunking, dLLM or speculation"
+        )
+
+
+def validate_pp_cache_admission_model(server_args: Any):
+    """Validate components once model metadata is available, before pools."""
+    if not pp_cache_admission_requested(config=resolving_view(server_args)):
+        return
+
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    model_config = model_config_of(server_args)
+    if model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+        raise ValueError(
+            "SGLANG_ENABLE_PP_L3_CACHE_ASYNC_ADMISSION=1 supports FULL + KV-derived DSA "
+            "only; SWA/Mamba cache components are not supported. "
+            "Unset the environment variable to use native PP cache scheduling."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):

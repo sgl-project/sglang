@@ -599,6 +599,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        reserved_tokens: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -627,6 +628,12 @@ class PrefillAdder:
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+        # Capacity promised to PP requests not in this candidate view remains
+        # unavailable. Selected credits become native allocations, never a
+        # placeholder free/reallocate cycle. The default native path adds zero.
+        if reserved_tokens:
+            self.memory_budget.total_offset += reserved_tokens
+            self.memory_budget.current_offset += reserved_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -1349,7 +1356,12 @@ class PrefillAdder:
             self.tree_cache.buffer_pipeline.defer_staged_admission(req, pool)
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        *,
+        certified_prefix_len: Optional[int] = None,
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
@@ -1462,6 +1474,7 @@ class PrefillAdder:
                             best_match_node=req.best_match_node,
                             host_hit_length=req.host_hit_length,
                             req=req,
+                            skip_load_back_threshold=certified_prefix_len is not None,
                         )
                     )
                 if loaded is None:
@@ -1512,6 +1525,12 @@ class PrefillAdder:
                 req.prefix_len += req.host_loaded_length
                 if self.tree_cache.load_back_is_cache_owned():
                     req.kv.cache_protected_len = req.prefix_len
+
+            if certified_prefix_len is not None and (
+                req.prefix_len != certified_prefix_len
+                or admission.prefix_len != certified_prefix_len
+            ):
+                raise RuntimeError("load-back changed the certified PP prefix")
 
             # Sharded pools cannot load host KV; reserve scratch after all other gates.
             if not self._kv_shard_reserve_scratch(
