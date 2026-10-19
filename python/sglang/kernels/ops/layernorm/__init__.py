@@ -43,14 +43,12 @@ for _mod, _fn in _HC_NORM_KERNELS:
     )
 del _mod, _fn
 
-# The fused-rmsnorm variants physically live in the shared fused-pointwise
-# collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
     register_kernel(
         KernelSpec(
             op=f"layernorm.{_fn}",
             backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.elementwise.elementwise:{_fn}",
+            target=f"sglang.kernels.ops.layernorm.fused_rmsnorm:{_fn}",
         )
     )
 del _fn
