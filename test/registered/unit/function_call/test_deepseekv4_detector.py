@@ -4,8 +4,8 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
-from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -460,16 +460,22 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
                     normal, calls = self._feed_all(chunks, cls)
                     self.assertEqual(normal, one_shot.normal_text)
                     self.assertEqual(
-                        [(call.tool_index, call.name, call.parameters) for call in calls],
+                        [
+                            (call.tool_index, call.name, call.parameters)
+                            for call in calls
+                        ],
                         [(0, "get_weather", '{"city": "NY"}')],
                     )
 
-            with patch(
-                "sglang.srt.function_call.deepseekv32_detector.envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get",
-                return_value=True,
-            ), patch(
-                "sglang.srt.function_call.base_format_detector.envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get",
-                return_value=True,
+            with (
+                patch(
+                    "sglang.srt.function_call.deepseekv32_detector.envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.function_call.base_format_detector.envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get",
+                    return_value=True,
+                ),
             ):
                 one_shot_fwd = cls().detect_and_parse(text, self.tools)
                 for width in (1, 7, len(text)):
@@ -489,7 +495,10 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
                         )
                         self.assertEqual(
                             [(call.name, call.parameters) for call in calls_fwd],
-                            [(call.name, call.parameters) for call in one_shot_fwd.calls],
+                            [
+                                (call.name, call.parameters)
+                                for call in one_shot_fwd.calls
+                            ],
                         )
 
     def test_unknown_only_invoke_withholds_trailing_dsml_on_finish(self):
@@ -612,8 +621,8 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
                     self.assertEqual(self._feed_all(chunks, cls), (text, []))
 
     def test_stray_dsml_fragment_after_invoke_does_not_leak(self):
-        """Stray DSML closing fragments after an invoke must remain suppressed
-        in streaming mode just as in detect_and_parse."""
+        """Stray DSML opening or closing fragments after an invoke must remain
+        suppressed in streaming mode just as in detect_and_parse."""
         for cls in (DeepSeekV32Detector, DeepSeekV4Detector, DeepSeekV41Detector):
             d = cls()
             p = f"{d.dsml_token}{cls.parameter_tag_name}"
@@ -622,27 +631,32 @@ class TestDeepSeekV4Streaming(unittest.TestCase):
                 f'<{p} name="city" string="true">SF</{p}>'
                 f"{d.invoke_end_token}"
             )
-            chunks = [
-                f"{d.bot_token}\n{inv}",
+            for stray in (
+                f'\n<{p} name="city" string="true">SF\n',
                 f"\n</{p}>\n",
-                f"{inv}\n</{DSML}function_calls>\n{d.eot_token}",
-            ]
-            text = "".join(chunks)
-            one_shot = cls().detect_and_parse(text, self.tools)
-            stream_normal, stream_calls = self._feed_all(chunks, cls)
-            self.assertEqual(stream_normal, "")
-            self.assertEqual(stream_normal, one_shot.normal_text)
-            self.assertEqual(
-                [(c.name, c.parameters) for c in stream_calls],
-                [
-                    ("get_weather", '{"city": "SF"}'),
-                    ("get_weather", '{"city": "SF"}'),
-                ],
-            )
-            self.assertEqual(
-                [(c.name, c.parameters) for c in stream_calls],
-                [(c.name, c.parameters) for c in one_shot.calls],
-            )
+            ):
+                chunks = [
+                    f"{d.bot_token}\n{inv}",
+                    stray,
+                    f"{inv}\n</{DSML}function_calls>\n{d.eot_token}",
+                ]
+                text = "".join(chunks)
+                with self.subTest(cls=cls.__name__, stray=stray):
+                    one_shot = cls().detect_and_parse(text, self.tools)
+                    stream_normal, stream_calls = self._feed_all(chunks, cls)
+                    self.assertEqual(stream_normal, "")
+                    self.assertEqual(stream_normal, one_shot.normal_text)
+                    self.assertEqual(
+                        [(c.name, c.parameters) for c in stream_calls],
+                        [
+                            ("get_weather", '{"city": "SF"}'),
+                            ("get_weather", '{"city": "SF"}'),
+                        ],
+                    )
+                    self.assertEqual(
+                        [(c.name, c.parameters) for c in stream_calls],
+                        [(c.name, c.parameters) for c in one_shot.calls],
+                    )
 
 
 if __name__ == "__main__":
