@@ -120,7 +120,7 @@ _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 _HCA_KV_SPLITS = envs.SGLANG_MLA_HCA_KV_SPLITS.get()
 
 
-def _kv_splits_for_stream(compress_ratio: int) -> int | None:
+def kv_splits_for_stream(compress_ratio: int) -> int | None:
     """-> kv_splits override for a decode stream, or None to keep the heuristic.
 
     Only the unclamped stream is overridden. SWA (ratio 0) is a 128-entry
@@ -951,7 +951,7 @@ def sparse_attn_v4_paged_decode(
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
 
     ``kv_splits`` overrides `_kv_splits_heuristic`. The caller knows the layer's
-    ``compress_ratio`` and the heuristic does not; see `_kv_splits_for_stream`.
+    ``compress_ratio`` and the heuristic does not; see `kv_splits_for_stream`.
     """
     if _is_gfx1250_supported:
         # aiter ships only on ROCm, and this module is imported by a CPU-registered

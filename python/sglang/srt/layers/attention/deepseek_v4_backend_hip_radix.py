@@ -2949,7 +2949,7 @@ class DeepseekV4HipRadixBackend(
                     ),
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
-                _kv_splits_for_stream,
+                kv_splits_for_stream,
             )
 
             return runtime.decode(
@@ -2961,7 +2961,7 @@ class DeepseekV4HipRadixBackend(
                 softmax_scale=self.softmax_scale,
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
-                kv_splits=_kv_splits_for_stream(compress_ratio),
+                kv_splits=kv_splits_for_stream(compress_ratio),
             )
 
         # prefill / extend
