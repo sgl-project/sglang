@@ -1786,7 +1786,9 @@ class XPUAttentionBackend(AttentionBackend):
             seq_len_delta=seq_len_delta,
             page_size=self.page_size,
             swa_page_table=metadata.swa_page_table if use_swa else None,
-            token_to_kv_pool=self.token_to_kv_pool if use_swa else None,
+            full_to_swa_index_mapping=(
+                self.token_to_kv_pool.full_to_swa_index_mapping if use_swa else None
+            ),
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
