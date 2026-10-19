@@ -450,6 +450,19 @@ class OpenAIServingChat(OpenAIServingBase):
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
 
+    @staticmethod
+    def _join_final_assistant_text_parts(messages: list[dict[str, Any]]) -> None:
+        """Join a text-only parts list in the final assistant message the way
+        the V4.1 encoder does, so it gets the same handling as string content."""
+        if not messages or messages[-1].get("role") != "assistant":
+            return
+        content = messages[-1].get("content")
+        if not isinstance(content, list) or not content:
+            return
+        if not all(isinstance(p, dict) and p.get("type") == "text" for p in content):
+            return
+        messages[-1]["content"] = "\n\n".join(p.get("text", "") for p in content)
+
     def _append_assistant_prefix_to_prompt_ids(
         self, prompt_ids: list[int], assistant_prefix: str
     ) -> list[int]:
@@ -1596,6 +1609,12 @@ class OpenAIServingChat(OpenAIServingBase):
                         use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
                     )
                     msg.update(processed_msg)
+
+            # The V4.1 encoder joins text parts itself, but a final assistant
+            # message must be a string here to be rewritten or continued; a
+            # parts list would stay a finished assistant turn ending at EOS.
+            if is_dsv41:
+                self._join_final_assistant_text_parts(messages)
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(

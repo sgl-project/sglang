@@ -1507,6 +1507,38 @@ class ServingChatTestCase(CustomTestCase):
                     prompt = self.tm.tokenizer.encode.call_args.args[0]
                     self.assertEqual("calculator" in prompt, expects_tools)
 
+    def test_dsv41_final_assistant_text_parts_match_string_content(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv41"
+        parts = [
+            {"type": "text", "text": "Here is the function:"},
+            {"type": "text", "text": "def f(x):\n    return x"},
+        ]
+        joined = "Here is the function:\n\ndef f(x):\n    return x"
+
+        for continue_final_message in (False, True):
+            prompts = {}
+            for name, content in (("parts", parts), ("string", joined)):
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {"role": "user", "content": "Write f."},
+                        {"role": "assistant", "content": content},
+                    ],
+                    continue_final_message=continue_final_message,
+                )
+                self.chat._process_messages(request, is_multimodal=False)
+                prompts[name] = [
+                    call.args[0] for call in self.tm.tokenizer.encode.call_args_list
+                ]
+            with self.subTest(continue_final_message=continue_final_message):
+                self.assertEqual(prompts["parts"], prompts["string"])
+                self.assertFalse(prompts["parts"][0].endswith("<｜end▁of▁sentence｜>"))
+                if continue_final_message:
+                    self.assertEqual(prompts["parts"][-1], joined)
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
