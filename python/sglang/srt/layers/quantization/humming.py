@@ -1224,6 +1224,10 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
             # preprocess weight for inference
             HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
+            # Drop every reference to the tensors the transform replaced, then free
+            # their blocks before later allocations split them and strand the rest.
+            tensors = tensor = param = None
+            torch.cuda.empty_cache()
 
     def create_moe_runner(
         self,

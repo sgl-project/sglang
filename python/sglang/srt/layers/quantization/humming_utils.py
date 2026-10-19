@@ -159,6 +159,10 @@ def prepare_humming_moe_layer(layer: FusedMoE, quant_config: dict):
         )
 
         HummingMethod.transform_humming_layer(layer, sublayer_name=sublayer_name)
+        # Drop every reference to the tensors the transform replaced, then free
+        # their blocks before later allocations split them and strand the rest.
+        tensors = tensor = param = None
+        torch.cuda.empty_cache()
 
     if not hasattr(layer, "locks"):
         device = layer.w13_weight.device
