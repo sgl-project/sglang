@@ -139,6 +139,7 @@ async def recover_elastic_ep(raw_request: Request):
         return ORJSONResponse(
             {"error": f"Invalid JSON: {e}"}, status_code=HTTPStatus.BAD_REQUEST
         )
+
     if not isinstance(body, dict):
         return ORJSONResponse(
             {"error": "request body must be a JSON object"},
@@ -148,6 +149,9 @@ async def recover_elastic_ep(raw_request: Request):
     allocation_id = body.get("allocation_id")
     topology_generation = body.get("topology_generation")
     rank_offset = body.get("rank_offset")
+    failed_allocation_incarnation = body.get(
+        "failed_allocation_incarnation", allocation_id
+    )
     if (
         not isinstance(operation_id, str)
         or not operation_id.strip()
@@ -161,6 +165,8 @@ async def recover_elastic_ep(raw_request: Request):
         or not isinstance(rank_offset, int)
         or isinstance(rank_offset, bool)
         or rank_offset <= 0
+        or not isinstance(failed_allocation_incarnation, str)
+        or not failed_allocation_incarnation.strip()
     ):
         return ORJSONResponse(
             {
@@ -187,6 +193,7 @@ async def recover_elastic_ep(raw_request: Request):
             topology_generation=topology_generation,
             allocation_id=allocation_id,
             rank_offset=rank_offset,
+            failed_allocation_incarnation=failed_allocation_incarnation,
         )
     )
     if not result.success:
@@ -206,6 +213,63 @@ async def recover_elastic_ep(raw_request: Request):
             "operation_id": result.operation_id,
             "recovery_phase": result.recovery_phase,
         }
+    )
+
+
+@router.post("/observe_elastic_ep_membership")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def observe_elastic_ep_membership(raw_request: Request):
+    """Ingest one externally observed, fenced membership epoch."""
+    try:
+        body = await raw_request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        return ORJSONResponse(
+            {"error": f"Invalid JSON: {e}"}, status_code=HTTPStatus.BAD_REQUEST
+        )
+    if not isinstance(body, dict):
+        return ORJSONResponse(
+            {"error": "request body must be a JSON object"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    string_fields = ("runtime_instance_id", "failed_allocation_incarnation")
+    if any(
+        not isinstance(body.get(field), str) or not body[field].strip()
+        for field in string_fields
+    ):
+        return ORJSONResponse(
+            {"error": "runtime instance and allocation incarnation are required"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    numeric_fields = ("topology_generation", "rank", "membership_epoch")
+    if any(
+        not isinstance(body.get(field), int)
+        or isinstance(body[field], bool)
+        or body[field] < 0
+        for field in numeric_fields
+    ):
+        return ORJSONResponse(
+            {"error": "topology generation, rank, and membership epoch are required"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    if get_exec().moe.elastic_ep_backend is None:
+        return ORJSONResponse(
+            {"error": "elastic EP is not enabled (set --elastic-ep-backend)"},
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+    from sglang.srt.entrypoints.http_server import _global_state
+    from sglang.srt.managers.io_struct import ObserveElasticEPMembershipReqInput
+
+    result = await _global_state.tokenizer_manager.observe_elastic_ep_membership(
+        ObserveElasticEPMembershipReqInput(
+            **{field: body[field] for field in (*string_fields, *numeric_fields)}
+        )
+    )
+    if not result.accepted:
+        return ORJSONResponse(
+            {"error": result.message}, status_code=HTTPStatus.CONFLICT
+        )
+    return ORJSONResponse(
+        {"message": result.message, "observation_key": result.observation_key}
     )
 
 

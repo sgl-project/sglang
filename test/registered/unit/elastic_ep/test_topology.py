@@ -1,16 +1,30 @@
 import sys
+import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
 import pytest
+import torch
 
 from sglang.srt.arg_groups.parallel_hook import handle_elastic_ep
 from sglang.srt.elastic_ep.elastic_ep import (
+    ElasticEPState,
     ElasticEPStateManager,
+    RecoveryOperation,
     ScaleCohort,
+    get_recovery_operation_for_slot,
+    observe_recovery_membership,
+    poll_recovery_control_plane,
+    pre_dispatch_recovery_fence,
     register_scale_cohort,
     validate_scale_cohort_topology,
+)
+from sglang.srt.elastic_ep.runtime_topology import (
+    MembershipObservation,
+    RuntimeTopology,
+    publish_membership_observation,
 )
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
@@ -141,6 +155,193 @@ def test_physical_health_uses_all_members_rule():
         False,
         True,
     ]
+
+
+class _MembershipStore:
+    def __init__(self):
+        self.values = {}
+
+    def check(self, keys):
+        return all(key in self.values for key in keys)
+
+    def get(self, key):
+        return self.values[key]
+
+    def set(self, key, value):
+        self.values[key] = value
+
+    def compare_set(self, key, expected, value):
+        current = self.values.get(key, expected)
+        if current == expected:
+            self.values[key] = value
+        return self.values[key]
+
+
+def test_membership_observation_rejects_duplicate_stale_and_aba_epochs():
+    store = _MembershipStore()
+    topology = RuntimeTopology(
+        runtime_instance_id="runtime/1",
+        initial_ep_size=2,
+        allocation_width=1,
+        effective_ep_size=2,
+        max_committed_ep_size=2,
+        topology_generation=4,
+    )
+    observation = MembershipObservation(
+        runtime_instance_id="runtime/1",
+        topology_generation=4,
+        rank=1,
+        failed_allocation_incarnation="allocation/7",
+        membership_epoch=9,
+    )
+    with (
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_global_tcp_store",
+            return_value=store,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_global_tcp_store",
+            return_value=store,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_runtime_topology",
+            return_value=topology,
+        ),
+    ):
+        publish_membership_observation(observation)
+        with pytest.raises(ValueError, match="Duplicate"):
+            publish_membership_observation(observation)
+        with pytest.raises(ValueError, match="stale|ABA"):
+            publish_membership_observation(replace(observation, membership_epoch=8))
+
+
+def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
+    store = _MembershipStore()
+    topology = RuntimeTopology(
+        runtime_instance_id="runtime-1",
+        initial_ep_size=2,
+        allocation_width=1,
+        effective_ep_size=2,
+        max_committed_ep_size=2,
+    )
+    state = ElasticEPState(
+        active_ranks=torch.tensor([1, 0]),
+        last_active_ranks=torch.tensor([1, 0]),
+        active_ranks_cpu=torch.tensor([1, 0]),
+        effective_ep_size=2,
+    )
+    with (
+        patch.object(ElasticEPStateManager, "_instance", state),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(elastic_ep_recovery_policy="fixed_slot")
+            ),
+        ),
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_global_tcp_store",
+            return_value=store,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_global_tcp_store",
+            return_value=store,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_runtime_topology",
+            return_value=topology,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_runtime_topology",
+            return_value=topology,
+        ),
+    ):
+        assert state.recovery_phase == "idle"
+        assert pre_dispatch_recovery_fence() is None
+        observe_recovery_membership(
+            runtime_instance_id="runtime-1",
+            topology_generation=0,
+            rank=1,
+            failed_allocation_incarnation="inc-1",
+            membership_epoch=1,
+        )
+        assert state.recovery_phase == "idle"
+        assert state.active_ranks_cpu[1].item() == 1
+        with pytest.raises(ValueError, match="Duplicate"):
+            observe_recovery_membership(
+                runtime_instance_id="runtime-1",
+                topology_generation=0,
+                rank=1,
+                failed_allocation_incarnation="inc-1",
+                membership_epoch=1,
+            )
+        with pytest.raises(ValueError, match="stale|ABA"):
+            observe_recovery_membership(
+                runtime_instance_id="runtime-1",
+                topology_generation=0,
+                rank=1,
+                failed_allocation_incarnation="inc-1",
+                membership_epoch=0,
+            )
+        assert poll_recovery_control_plane()
+        assert state.recovery_phase == "awaiting_recovery"
+        assert state.active_ranks_cpu[1].item() == 0
+        with pytest.raises(RuntimeError, match="fence"):
+            pre_dispatch_recovery_fence()
+        with pytest.raises(ValueError, match="awaiting"):
+            observe_recovery_membership(
+                runtime_instance_id="runtime-1",
+                topology_generation=0,
+                rank=0,
+                failed_allocation_incarnation="inc-1",
+                membership_epoch=2,
+            )
+        assert ElasticEPStateManager.request_recovery(
+            RecoveryOperation(
+                runtime_instance_id="runtime-1",
+                topology_generation=0,
+                operation_id="recover-1",
+                allocation_id="alloc-1",
+                rank_offset=1,
+                failed_allocation_incarnation="inc-1",
+            )
+        )
+        assert state.recovery_phase == "restoring"
+        assert (
+            get_recovery_operation_for_slot(
+                "runtime-1", 0, 1, "alloc-1"
+            ).failed_allocation_incarnation
+            == "inc-1"
+        )
+        assert (
+            get_recovery_operation_for_slot(
+                "runtime-1", 0, 1, "alloc-1", "other-incarnation"
+            )
+            is None
+        )
+        state.recovery_phase = "warming_up"
+        state.pending_since = time.monotonic()
+        with pytest.raises(RuntimeError, match="user forward"):
+            pre_dispatch_recovery_fence()
+        assert pre_dispatch_recovery_fence(internal_warmup=True) == 0
+        state.pending_since = time.monotonic() - 1000
+        with patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(
+                    elastic_ep_recovery_policy="fixed_slot",
+                    elastic_ep_recovery_timeout=1,
+                )
+            ),
+        ):
+            assert poll_recovery_control_plane()
+        assert state.recovery_phase == "failed"
+        assert state.runtime_health == "recovery_unsupported"
+
+    with patch(
+        "sglang.srt.elastic_ep.elastic_ep.get_exec",
+        return_value=SimpleNamespace(moe=SimpleNamespace()),
+    ):
+        assert not pre_dispatch_recovery_fence()
 
 
 if __name__ == "__main__":

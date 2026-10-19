@@ -37,6 +37,7 @@ from sglang.srt.configs.model_config import (
     ModelImpl,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
@@ -48,9 +49,11 @@ from sglang.srt.elastic_ep.elastic_ep import (
     join_scale_process_group,
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
+    pre_dispatch_recovery_fence,
     register_scale_cohort,
     try_admit_scale_ranks,
     update_dp_attention_for_elastic_ep,
+    validate_post_forward_recovery_generation,
     validate_scale_cohort_topology,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
@@ -1908,6 +1911,23 @@ class ModelRunner:
                 forward_batch,
             ) as recorder_outputs,
         ):
+            recovery_state = ElasticEPStateManager.instance()
+            recovery_warmup_rid = (
+                f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-"
+                f"{recovery_state.recovery_operation_id}"
+                if recovery_state is not None
+                and recovery_state.recovery_phase == "warming_up"
+                and recovery_state.recovery_operation_id is not None
+                else None
+            )
+            recovery_warmup = bool(
+                recovery_warmup_rid is not None
+                and forward_batch.rids
+                and all(rid == recovery_warmup_rid for rid in forward_batch.rids)
+            )
+            recovery_generation = pre_dispatch_recovery_fence(
+                internal_warmup=recovery_warmup
+            )
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
@@ -1922,6 +1942,7 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
+            validate_post_forward_recovery_generation(recovery_generation)
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()

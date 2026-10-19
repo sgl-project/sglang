@@ -166,6 +166,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
+    ObserveElasticEPMembershipReqInput,
+    ObserveElasticEPMembershipReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
@@ -1940,6 +1942,10 @@ class Scheduler(
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (RecoverElasticEPReqInput, self.handle_recover_elastic_ep),
+                (
+                    ObserveElasticEPMembershipReqInput,
+                    self.handle_observe_elastic_ep_membership,
+                ),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -5222,6 +5228,7 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
+        self._poll_elastic_ep_recovery()
         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
@@ -5342,6 +5349,11 @@ class Scheduler(
                     )
                 )
 
+    def _poll_elastic_ep_recovery(self) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import poll_recovery_control_plane
+
+        poll_recovery_control_plane()
+
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
@@ -5388,6 +5400,7 @@ class Scheduler(
         self.dp_attn_adapter.drop_sync_wait_carry()
         if self._deferred_responses:
             self.stream_released_deferred_outputs()
+        self._poll_elastic_ep_recovery()
         self._maybe_schedule_recovery_warmup()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
@@ -6132,17 +6145,6 @@ class Scheduler(
             submission_id=recv_req.submission_id,
         )
 
-        if operation_id is None or runtime_instance_id is None:
-            return make_output(
-                success=False,
-                message="Elastic EP scale requests require runtime and operation IDs.",
-                operation_id=operation_id,
-                old_ep_size=old_ep_size,
-                new_ep_size=new_ep_size,
-                terminal=True,
-                effective_ep_size=old_ep_size,
-            )
-
         state = ElasticEPStateManager.instance()
         if state is not None and state.operation_id == operation_id:
             expected_allocations = list(recv_req.expected_joining_allocation_ids or [])
@@ -6243,6 +6245,17 @@ class Scheduler(
                 ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+            )
+
+        if operation_id is None or runtime_instance_id is None:
+            return make_output(
+                success=False,
+                message="Elastic EP scale requests require runtime and operation IDs.",
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
 
         parallel = get_parallel()
@@ -6351,6 +6364,8 @@ class Scheduler(
             operation_id=recv_req.operation_id,
             allocation_id=recv_req.allocation_id,
             rank_offset=recv_req.rank_offset,
+            failed_allocation_incarnation=recv_req.failed_allocation_incarnation
+            or recv_req.allocation_id,
         )
         try:
             accepted = ElasticEPStateManager.request_recovery(operation)
@@ -6385,6 +6400,34 @@ class Scheduler(
             success=True,
             message=f"Recovery operation {recv_req.operation_id} is restoring.",
             recovery_phase=state.recovery_phase,
+        )
+
+    def handle_observe_elastic_ep_membership(
+        self, recv_req: ObserveElasticEPMembershipReqInput
+    ) -> ObserveElasticEPMembershipReqOutput:
+        from sglang.srt.elastic_ep.elastic_ep import (
+            observe_recovery_membership,
+            poll_recovery_control_plane,
+        )
+
+        try:
+            key = observe_recovery_membership(
+                runtime_instance_id=recv_req.runtime_instance_id,
+                topology_generation=recv_req.topology_generation,
+                rank=recv_req.rank,
+                failed_allocation_incarnation=recv_req.failed_allocation_incarnation,
+                membership_epoch=recv_req.membership_epoch,
+            )
+            poll_recovery_control_plane()
+        except (RuntimeError, ValueError) as exc:
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=str(exc),
+            )
+        return ObserveElasticEPMembershipReqOutput(
+            accepted=True,
+            message="Elastic EP membership observation accepted.",
+            observation_key=key,
         )
 
     def _maybe_schedule_recovery_warmup(self) -> None:
