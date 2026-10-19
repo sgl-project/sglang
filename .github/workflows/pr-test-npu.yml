@@ -589,16 +589,20 @@ jobs:
     name: Recommend tests from coverage
     runs-on: ubuntu-latest
     continue-on-error: true
-    # TEMP-DISABLED: OBS coverage baseline returns 403; re-enable once fixed.
-    if: false
-    # if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
     outputs:
       coverage_paths: ${{ steps.export-paths.outputs.coverage_paths }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      # Every step carries step-level continue-on-error so the job conclusion
+      # is ALWAYS 'success' — the fast-fail health check in other jobs filters
+      # by job conclusion, and job-level continue-on-error still reports
+      # 'failure' via the API. Failed steps stay visible (red ✗ + annotation)
+      # but never cascade to test jobs.
       - name: Checkout sglang scripts
+        continue-on-error: true
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
@@ -606,6 +610,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Download test case map
+        continue-on-error: true
         run: |
           set -euo pipefail
           curl -fsSL \
@@ -619,6 +624,7 @@ jobs:
           du -h test_case_map.json
 
       - name: Download coverage package and extract covstub
+        continue-on-error: true
         run: |
           set -euo pipefail
           curl -fsSL \
@@ -636,6 +642,7 @@ jobs:
           find outputs/covstub -maxdepth 2 -type d | head -20 || true
 
       - name: Recommend tests for current PR
+        continue-on-error: true
         run: |
           set -euo pipefail
           if ! python3 -c "import regex" >/dev/null 2>&1; then
@@ -656,6 +663,7 @@ jobs:
 
       - name: Export coverage paths output
         id: export-paths
+        continue-on-error: true
         if: always()
         run: |
           FILE="scripts/ci/npu/precise-test/recommended_pytest_paths.txt"
