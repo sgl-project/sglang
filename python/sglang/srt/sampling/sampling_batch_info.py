@@ -82,6 +82,13 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Per-request penalty coefficients and already-penalized token sets for
+    # speculative verify rows. Draft tokens are applied position by position.
+    draft_presence_penalties: Optional[torch.Tensor] = None
+    draft_frequency_penalties: Optional[torch.Tensor] = None
+    draft_repetition_penalties: Optional[torch.Tensor] = None
+    draft_cumulated_presence_penalties: Optional[torch.Tensor] = None
+    draft_cumulated_repetition_penalties: Optional[torch.Tensor] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -679,7 +686,29 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        self.update_draft_penalty_state()
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+    def update_draft_penalty_state(self):
+        """Capture coefficients needed to extend penalties over draft tokens."""
+        orchestrator = self.penalizer_orchestrator
+        if orchestrator is None:
+            return
+        for penalizer in orchestrator.penalizers.values():
+            if not penalizer.is_prepared():
+                continue
+            if isinstance(penalizer, penaltylib.BatchedPresencePenalizer):
+                self.draft_presence_penalties = penalizer.presence_penalties
+                self.draft_cumulated_presence_penalties = (
+                    penalizer.cumulated_presence_penalties
+                )
+            elif isinstance(penalizer, penaltylib.BatchedFrequencyPenalizer):
+                self.draft_frequency_penalties = penalizer.frequency_penalties
+            elif isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
+                self.draft_repetition_penalties = penalizer.repetition_penalties
+                self.draft_cumulated_repetition_penalties = (
+                    penalizer.cumulated_repetition_penalties
+                )
 
 
 def merge_bias_tensor(

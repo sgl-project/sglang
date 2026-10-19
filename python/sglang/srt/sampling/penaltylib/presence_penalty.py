@@ -43,6 +43,13 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             src=self.presence_penalties,
         )
 
+    def _cumulate_output_tokens_subset(
+        self, output_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        self.cumulated_presence_penalties.index_put_(
+            (row_indices, output_ids), self.presence_penalties[row_indices, 0]
+        )
+
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         logits.sub_(self.cumulated_presence_penalties)
 

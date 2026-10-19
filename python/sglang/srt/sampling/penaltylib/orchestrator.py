@@ -42,15 +42,21 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, row_indices: Optional[torch.Tensor] = None
+    ):
         """
         Feed the output tokens to the penalizers.
 
         Args:
             output_ids (torch.Tensor): The output tokens.
+            row_indices (Optional[torch.Tensor]): Batch rows to update. When
+                unset, every row receives one token.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+            penalizer.cumulate_output_tokens(
+                output_ids=output_ids, row_indices=row_indices
+            )
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -209,11 +215,18 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(
+        self, output_ids: torch.Tensor, row_indices: Optional[torch.Tensor] = None
+    ):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        if row_indices is None:
+            self._cumulate_output_tokens(output_ids=output_ids)
+        else:
+            self._cumulate_output_tokens_subset(
+                output_ids=output_ids, row_indices=row_indices
+            )
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -257,6 +270,14 @@ class _BatchedPenalizer(abc.ABC):
         Orchestrator will call this function to feed the output tokens to the penalizer.
         """
         pass
+
+    def _cumulate_output_tokens_subset(
+        self, output_ids: torch.Tensor, row_indices: torch.Tensor
+    ):
+        """Cumulate one token for a subset of batch rows."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support subset penalty cumulation"
+        )
 
     @abc.abstractmethod
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
