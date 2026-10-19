@@ -1,4 +1,4 @@
-"""Decoder tail graphs of DeepSeek-V4.1's replay tail: the state's round trip
+"""The decoder replay tail of DeepSeek-V4.1: the state's round trip
 through the graph runner's static buffers. CPU only; capture runs on GPU."""
 
 import unittest
@@ -6,7 +6,7 @@ import unittest
 import torch
 
 from sglang.srt.models.deepseek_v4_mhc import HcNormed, HcState
-from sglang.srt.models.deepseek_v4_tail_graphs import _flatten_state
+from sglang.srt.models.deepseek_v4_replay_tail import _flatten_state
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

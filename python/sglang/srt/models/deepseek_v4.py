@@ -172,10 +172,10 @@ from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
     forward_layer_fused_boundary,
 )
-from sglang.srt.models.deepseek_v4_tail_graphs import (
-    DecoderTailGraphs,
+from sglang.srt.models.deepseek_v4_replay_tail import (
+    DecoderReplayTail,
     bcg_tail_kv_store,
-    in_decoder_tail_graph,
+    in_replay_tail_graph,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.models.utils import WeightsMapper
@@ -2310,7 +2310,7 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
-            elif in_decoder_tail_graph():
+            elif in_replay_tail_graph():
                 assert not fuse_q_rope
                 bcg_tail_kv_store(self, x_linear, positions, qkv_a)
                 kv = None
@@ -2335,7 +2335,7 @@ class MQALayer(MqaAttentionBase):
                 and is_in_breakable_cuda_graph()
                 and (
                     not getattr(attn_backend, "low_ratio_prefill_graph", False)
-                    or in_decoder_tail_graph()
+                    or in_replay_tail_graph()
                 )
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
@@ -3545,7 +3545,7 @@ DeepseekV4DecoderLayer = (
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
-    decoder_tail_graphs: Optional[DecoderTailGraphs] = None
+    decoder_replay_tail: Optional[DecoderReplayTail] = None
 
     def __init__(
         self,
@@ -3712,7 +3712,7 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
-        self.decoder_tail_graphs = DecoderTailGraphs.maybe_create(self)
+        self.decoder_replay_tail = DecoderReplayTail.maybe_create(self)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3847,9 +3847,9 @@ class DeepseekV4Model(nn.Module):
                 in_graph=tail_in_graph,
             )
         use_tail_graph = (
-            self.decoder_tail_graphs is not None
+            self.decoder_replay_tail is not None
             and tail is not None
-            and self.decoder_tail_graphs.plan(
+            and self.decoder_replay_tail.plan(
                 tail, num_tokens=input_ids.shape[0], tail_in_graph=tail_in_graph
             )
         )
@@ -3913,7 +3913,7 @@ class DeepseekV4Model(nn.Module):
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
                 if use_tail_graph:
-                    residual, pre, aux = self.decoder_tail_graphs.run(
+                    residual, pre, aux = self.decoder_replay_tail.run(
                         state=state,
                         positions=positions,
                         input_ids=input_ids,

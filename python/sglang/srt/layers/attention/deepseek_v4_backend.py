@@ -3314,13 +3314,13 @@ class DeepseekV4AttnBackend(
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
             is_in_breakable_cuda_graph,
         )
-        from sglang.srt.models.deepseek_v4_tail_graphs import in_decoder_tail_graph
+        from sglang.srt.models.deepseek_v4_replay_tail import in_replay_tail_graph
 
         # Decoder tail graphs run the low-ratio sources as an eager break.
         return (
             self.low_ratio_prefill_graph
             and is_in_breakable_cuda_graph()
-            and not in_decoder_tail_graph()
+            and not in_replay_tail_graph()
         )
 
     def _low_ratio_compress_decode(self, layer, x, req, pos) -> None:

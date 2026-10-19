@@ -1,4 +1,4 @@
-"""CUDA graphs of DeepSeek-V4.1's decoder-replay tail on eager prefill steps.
+"""DeepSeek-V4.1's decoder-replay tail layers, run from CUDA graphs on eager steps.
 
 Under decoder SWA bounded replay the layers from ``late_layer_start`` on run over
 each request's last SWA_WINDOW extend rows. An eager prefill step replays them
@@ -48,22 +48,22 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-_in_tail_graph = False
+_in_replay_tail = False
 
 
-def in_decoder_tail_graph() -> bool:
+def in_replay_tail_graph() -> bool:
     """True while the tail layers capture or replay a decoder tail graph."""
-    return _in_tail_graph
+    return _in_replay_tail
 
 
 @contextmanager
-def _tail_graph_scope():
-    global _in_tail_graph
-    _in_tail_graph = True
+def _replay_tail_scope():
+    global _in_replay_tail
+    _in_replay_tail = True
     try:
         yield
     finally:
-        _in_tail_graph = False
+        _in_replay_tail = False
 
 
 def _tail_kv_store(attention, x, positions, qkv_a) -> None:
@@ -99,7 +99,7 @@ def _flatten_state(state: HcState):
     return leaves, has_pre, rebuild
 
 
-class DecoderTailGraphs:
+class DecoderReplayTail:
     """The decoder-replay tail layers of one DeepSeek-V4.1 model, run from
     `RowBucketGraphRunner` graphs on eager prefill steps."""
 
@@ -119,7 +119,7 @@ class DecoderTailGraphs:
         )
 
     @classmethod
-    def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderTailGraphs]:
+    def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
         """The tail graphs of a model whose tail writes the source layer's KV, or
         None where they stay off."""
         max_rows = envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.get()
@@ -214,7 +214,7 @@ class DecoderTailGraphs:
                 mha_companion_layers=layers.mha_companion_layers,
             ),
             enable_breakable_cuda_graph(),
-            _tail_graph_scope(),
+            _replay_tail_scope(),
         ):
             yield
 
