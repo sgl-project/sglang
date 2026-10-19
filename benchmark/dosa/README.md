@@ -1,4 +1,4 @@
-# Reproduce GLM-5.2 TTFT
+# Reproduce DoSA TTFT
 
 DoSA reduces GLM-5.2-FP8's 1M-token TTFT from **133.65 s to 71.15 s (1.88×)**
 on eight GB200 GPUs. Upstream base: `d2a436446cca3d955358e7b4a5bf6881ea8591cd`.
@@ -129,3 +129,108 @@ DoSA reserves candidate records, ID pages and task tables within one budget
 before KV sizing. At 1M KV, 4096-row physical slabs process logical 16K/32K chunks;
 capacity overflow uses full-head exact recovery. SGLang also budgets request
 mapping and KV together. Inputs, score precision and Top-K semantics are shared.
+
+## DeepSeek-V3.2 (H64)
+
+Use the installation above and the DeepSeek-V3.2 checkpoint on both four-GPU
+GB200 nodes. This configuration uses TP8/EP8, FP8 KV and 16K prefill chunks.
+
+The inputs are contiguous prefixes of SQLite 3.53.4's `sqlite3.c`, decoded as
+UTF-8 with LF newlines. This standard-library command reconstructs the original
+five inputs; reuse the existing files when available:
+
+```bash
+python - <<'PY'
+import io
+from pathlib import Path
+from urllib.request import urlopen
+from zipfile import ZipFile
+
+url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip"
+with urlopen(url) as response, ZipFile(io.BytesIO(response.read())) as archive:
+    with archive.open("sqlite-amalgamation-3530400/sqlite3.c") as source:
+        text = io.TextIOWrapper(source, encoding="utf-8", newline=None).read()
+prefixes = {131072: 493014, 262144: 981111, 524288: 1802647,
+            786432: 2675019, 1048569: 3511994}
+output = Path("deepseek-inputs")
+output.mkdir(exist_ok=True)
+for tokens, end in prefixes.items():
+    (output / f"prefix-{tokens}.txt").write_bytes(text[:end].encode("utf-8"))
+PY
+```
+
+The filenames give the original DeepSeek tokenizer lengths, including special
+tokens. The server tokenizes the text normally.
+
+Set `NODE_RANK=0` on the first node and `NODE_RANK=1` on the second. Run each
+mode on the same node pair, using `few` for DoSA and `off` for SGLang:
+
+```bash
+source .venv/bin/activate
+export MODEL_PATH=/path/to/DeepSeek-V3.2-hf
+export NODE0_ADDR=192.0.2.10
+export NODE_RANK=0
+export SGLANG_DOSA_MODE=few
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export PYTHONPATH="$PWD/.dosa_topk/python"
+export TORCH_EXTENSIONS_DIR="/tmp/dosa-deepseek-node-${NODE_RANK}/torch_extensions"
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --tp 8 --ep 8 --nnodes 2 --node-rank "$NODE_RANK" \
+  --dist-init-addr "${NODE0_ADDR}:29784" \
+  --host 0.0.0.0 --port 30184 \
+  --context-length 1048576 \
+  --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
+  --mem-fraction-static 0.849 --page-size 64 --kv-cache-dtype fp8_e4m3 \
+  --dsa-topk-backend sgl-kernel \
+  --dsa-prefill-backend trtllm --dsa-decode-backend trtllm \
+  --moe-runner-backend flashinfer_trtllm --moe-a2a-backend none \
+  --sampling-defaults model --tokenizer-worker-num 1 \
+  --schedule-policy fcfs --schedule-conservativeness 1.0 \
+  --num-continuous-decode-steps 1 \
+  --random-seed 233767787 --stream-interval 1 \
+  --cuda-graph-config '{"decode":{"backend":"full","max_bs":512},"prefill":{"backend":"breakable","max_bs":2048}}'
+```
+
+The context flags explicitly extend the checkpoint's configured context limit
+to 1M. The graph configuration uses the upstream bucket defaults.
+
+Once the server is ready, run the existing client on node 0:
+
+```bash
+mkdir -p deepseek-results
+for tokens in 131072 262144 524288 786432 1048569; do
+  python benchmark/dosa/bench_ttft.py \
+    --url "http://${NODE0_ADDR}:30184" \
+    --text "deepseek-inputs/prefix-${tokens}.txt" --loaded 3 \
+    --output "deepseek-results/${SGLANG_DOSA_MODE}-q16384-${tokens}.json"
+done
+```
+
+Each prefix receives one warmup and three measured requests, with fresh request
+IDs and a prefix-cache flush. The client uses `max_new_tokens=2` and the model's
+default EOS. TTFT ends at the first streamed completion token and includes
+server tokenization, prefill and request-owned DoSA prior work.
+
+Eligible record-overflow recovery now scores failed rows in groups of four.
+The existing physical key and scale buffers are initialized once, including
+padding read by TMA. Recovery retains the full-head score arithmetic and exact
+Top-K selection.
+
+### DeepSeek results
+
+| Input tokens | SGLang TTFT (s) | DoSA TTFT (s) | Speedup |
+|---:|---:|---:|---:|
+| 131072 | 9.895 | 10.102 | 0.979× |
+| 262144 | 30.796 | 29.718 | 1.036× |
+| 524288 | 106.299 | 90.449 | 1.175× |
+| 786432 | 238.463 | 167.811 | 1.421× |
+| 1048569 | 432.414 | 266.591 | 1.622× |
+
+[deepseek-ttft-results.csv](deepseek-ttft-results.csv) contains all 30 measured
+samples. DoSA uses the batched-recovery implementation on this branch; SGLang
+reuses source `bdfa44aa7f06c13b30fc347eab6afb9147d89bcb` with DoSA disabled.
+Both modes use the DeepSeek configuration above.

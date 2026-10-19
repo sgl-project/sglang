@@ -2,6 +2,8 @@
 
 DoSA accelerates GLM-5.2-FP8 prefill with exact sparse scoring. At 1M input
 tokens, TTFT improves from **133.65 s to 71.15 s (1.88×)** on eight GB200 GPUs.
+DeepSeek-V3.2 with FP8 KV and 16K chunks improves from **432.41 s to 266.59 s (1.62×)**
+on eight GB200 GPUs.
 
 See [TTFT reproduction](benchmark/dosa/README.md) for installation, the original
 inputs, launch commands and complete 16K/32K results. This branch is based on

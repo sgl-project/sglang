@@ -7,7 +7,11 @@ using namespace certicascade_streaming_exact;
 using Storage=deep_gemm::layout::MQALogitsSharedStorage<kHeads,128,false,4,256,2,2,2,__nv_fp8_e4m3,float>;
 using dosa_geometry::HeadMask;
 using dosa_geometry::UnsignedHeadMask;
-struct SeedOutput {float* scores;HeadMask* masks;int64_t stride;};
+struct RecoveryOutput {
+  const int *state, *rows, *starts, *ends, *logical_nk;
+  int sms;
+};
+struct SeedOutput {float* scores;HeadMask* masks;int64_t stride;RecoveryOutput recovery;};
 // Keep the validated dynamic-shared reservation. Reducing it is a separate
 // occupancy experiment, not part of removing uninstantiated source paths.
 constexpr size_t shared_bytes(){return sizeof(Storage)+8*4*kHeads*(sizeof(float)+sizeof(HeadMask));}
@@ -16,6 +20,7 @@ __device__ __forceinline__ void tmem_load32(uint32_t address,float*destination){
 }
 
 // Shared model-head-count/BQ4 pipeline; no certificate or append mode is instantiated.
+template <bool EmitMasks, bool Recovery=false>
 CUTLASS_GLOBAL void __launch_bounds__(384,2) dense_seed_kernel(
     int nq, int nk, int splits,
     const __grid_constant__ cute::TmaDescriptor mq,
@@ -24,6 +29,15 @@ CUTLASS_GLOBAL void __launch_bounds__(384,2) dense_seed_kernel(
     const __grid_constant__ cute::TmaDescriptor mw, SeedOutput out) {
   using S=Storage;
   constexpr int H=kHeads,BQ=4,N=BQ*H,cols=2*N,FW=H,QStages=2,TStages=2;
+  if constexpr(Recovery){
+    // All pointers are stable owner buffers, published before this launch.
+    // An ineligible/empty call exits uniformly before barriers or Q4 division.
+    if(!out.recovery.state[1])return;
+    nq=(out.recovery.state[0]+BQ-1)/BQ*BQ;
+    nk=*out.recovery.logical_nk;
+    splits=min((nk+255)/256,max(4,(2*out.recovery.sms+nq/BQ-1)/(nq/BQ)));
+    if(blockIdx.x>=nq/BQ*splits)return;
+  }
   static_assert(std::extent_v<decltype(S::smem_weights), 1> >= FW*BQ);
   static_assert(sizeof(S::smem_q[0][0])==1 && sizeof(S::smem_kv[0][0])==1);
   static_assert(sizeof(S::smem_sf_kv[0][0])==4 && sizeof(S::smem_weights[0][0])==4);
@@ -135,6 +149,12 @@ CUTLASS_GLOBAL void __launch_bounds__(384,2) dense_seed_kernel(
           for(int sub=0;sub<ReadQueries;sub++){
           int t=tb+sub;const float* accum=packed+sub*H;
           int row=query*BQ+t;
+          int begin=0,end=nk;
+          if constexpr(Recovery){
+            if(row>=out.recovery.state[0])continue;
+            row=out.recovery.rows[row];
+            begin=out.recovery.starts[row];end=out.recovery.ends[row];
+          }
           float late_weights[H];
           const float* weights;
           {
@@ -150,12 +170,16 @@ CUTLASS_GLOBAL void __launch_bounds__(384,2) dense_seed_kernel(
           {
             float value=exact_h32_reduce(accum,weights,scale);
             {
-              if(key<nk){
+              if(key<nk&&key<end){
                 UnsignedHeadMask mask=0;
-                #pragma unroll
-                for(int h=0;h<H;h++)if(accum[h]>0)mask|=UnsignedHeadMask(1)<<h;
+                if constexpr(EmitMasks){
+                  #pragma unroll
+                  for(int h=0;h<H;h++)if(accum[h]>0)mask|=UnsignedHeadMask(1)<<h;
+                }
                 uint64_t dst=uint64_t(row)*out.stride+key;
-                out.scores[dst]=value;out.masks[dst]=static_cast<HeadMask>(mask);
+                if constexpr(Recovery)out.scores[dst]=key<begin?-INFINITY:value;
+                else out.scores[dst]=value;
+                if constexpr(EmitMasks)out.masks[dst]=static_cast<HeadMask>(mask);
               }
             }
           }
@@ -174,8 +198,10 @@ CUTLASS_GLOBAL void __launch_bounds__(384,2) dense_seed_kernel(
 
 }
 
-void seed_score(torch::Tensor q,torch::Tensor k,torch::Tensor scale,
-                torch::Tensor weights,torch::Tensor scores,torch::Tensor masks,int64_t sms){
+template <bool EmitMasks, bool Recovery=false>
+void launch_scores(torch::Tensor q,torch::Tensor k,torch::Tensor scale,
+                torch::Tensor weights,torch::Tensor scores,torch::Tensor masks,int64_t sms,
+                prefill_stream_ballots::RecoveryOutput recovery={}){
   using namespace certicascade_streaming_exact;
   using namespace prefill_stream_ballots;
   c10::cuda::CUDAGuard guard(q.device());int nq=q.size(0),nk=k.size(0);
@@ -189,12 +215,32 @@ void seed_score(torch::Tensor q,torch::Tensor k,torch::Tensor scale,
   auto ms=make_map(scale.data_ptr(),CU_TENSOR_MAP_DATA_TYPE_FLOAT32,{(cuuint64_t)nk,1},{scale_row_stride(nk)},{256,1},CU_TENSOR_MAP_SWIZZLE_NONE);
   auto mw=make_map(weights.data_ptr(),CU_TENSOR_MAP_DATA_TYPE_FLOAT32,{kHeads,(cuuint64_t)nq},{kHeads*sizeof(float)},{kHeads,4},CU_TENSOR_MAP_SWIZZLE_NONE);
   constexpr size_t bytes=shared_bytes();
-  SeedOutput output{scores.data_ptr<float>(),masks.data_ptr<HeadMask>(),scores.size(1)};
-  C10_CUDA_CHECK(cudaFuncSetAttribute(dense_seed_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes));
-  dense_seed_kernel<<<std::min<int>(2*sms,nq/4*splits),384,bytes,at::cuda::getCurrentCUDAStream()>>>(nq,nk,splits,mq,mk,ms,mw,output);
+  HeadMask* mask_data=nullptr;
+  if constexpr(EmitMasks)mask_data=masks.data_ptr<HeadMask>();
+  SeedOutput output{scores.data_ptr<float>(),mask_data,scores.size(1),recovery};
+  C10_CUDA_CHECK(cudaFuncSetAttribute(dense_seed_kernel<EmitMasks,Recovery>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes));
+  dense_seed_kernel<EmitMasks,Recovery><<<std::min<int>(2*sms,nq/4*splits),384,bytes,at::cuda::getCurrentCUDAStream()>>>(nq,nk,splits,mq,mk,ms,mw,output);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Q is a multiple of four. Scores are contiguous F32[Q,K]; scalar stores
+// need no vector alignment. All inputs/outputs live until stream completion.
+void seed_score(torch::Tensor q,torch::Tensor k,torch::Tensor scale,
+                torch::Tensor weights,torch::Tensor scores,torch::Tensor masks,int64_t sms){
+  launch_scores<true>(q,k,scale,weights,scores,masks,sms);
+}
+void recover_score(torch::Tensor q,torch::Tensor k,torch::Tensor scale,
+                   torch::Tensor weights,torch::Tensor scores,torch::Tensor state,
+                   torch::Tensor rows,torch::Tensor starts,torch::Tensor ends,
+                   torch::Tensor logical_nk,int64_t sms){
+  // Packed Q/W and local-row map/state belong to one serialized recovery owner.
+  // K descriptors retain fixed capacity; live extent controls work and stores.
+  prefill_stream_ballots::RecoveryOutput recovery{state.data_ptr<int>(),rows.data_ptr<int>(),
+      starts.data_ptr<int>(),ends.data_ptr<int>(),logical_nk.data_ptr<int>(),int(sms)};
+  launch_scores<false,true>(q,k,scale,weights,scores,torch::Tensor(),sms,recovery);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 m.def("seed_score", &seed_score);
+m.def("recover_score", &recover_score);
 }

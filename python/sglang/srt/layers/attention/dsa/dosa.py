@@ -106,12 +106,14 @@ class _SeedOutput(TorchDispatchMode):
 class _LeafSelection:
     """The original exact leaf hierarchy and unordered FI, with owned outputs."""
 
-    def __init__(self, rows, keys, device):
+    def __init__(self, rows, keys, device, heads):
         import triton
 
         self.chunks = triton.cdiv(keys, 32768)
         for name, shape, dtype in (
-            ("rows", (8,), torch.int32), ("state", (1,), torch.int32),
+            ("rows", (rows,), torch.int32), ("state", (2,), torch.int32),
+            ("packed_q", (rows, heads, 128), torch.float8_e4m3fn),
+            ("packed_w", (rows, heads), torch.float32),
             ("finite", (8,), torch.int32), ("lengths", (8 * self.chunks,), torch.int32),
             ("merge_lengths", (8,), torch.int32), ("fallback_lengths", (rows,), torch.int32),
             ("leaf", (8 * self.chunks, 32768), torch.float32),
@@ -134,7 +136,10 @@ class _LeafSelection:
             owner.q[begin:end].view(torch.float8_e4m3fn), owner.pk, owner.ps,
             owner.w[begin:end], owner.starts[begin:end], owner.ends[begin:end],
             status, dense, counts, self.leaf, self.rows, self.state, self.finite,
-            self.lengths, owner.live_nk)
+            self.lengths, owner.live_nk, self.packed_q, self.packed_w)
+        owner.modules["sample"].recover_score(
+            self.packed_q, owner.pk, owner.ps, self.packed_w, dense, self.state,
+            self.rows, owner.starts[begin:end], owner.ends[begin:end], owner.live_nk, owner.sms)
         leaf_ids = topk_into(self.leaf, self.leaf_zero, self.lengths, self.leaf_selected)
         core = owner.modules["hierarchy"]
         core.gather(self.leaf, leaf_ids, self.lengths, self.rows, self.state,
@@ -227,8 +232,9 @@ class FewBackend:
         self.w_input = self._empty(q, h)
         self.start_input = self._empty(q, dtype=torch.int32)
         self.end_input = self._empty(q, dtype=torch.int32)
-        self.pk = self._empty(k, 128, dtype=torch.float8_e4m3fn)
-        self.ps_bytes = self._empty(k, 4, dtype=torch.uint8)
+        # Recovery TMA reads complete tiles; define unused physical padding once.
+        self.pk = self._empty(k, 128, dtype=torch.float8_e4m3fn).zero_()
+        self.ps_bytes = self._empty(k, 4, dtype=torch.uint8).zero_()
         self.ps = self.ps_bytes.view(torch.float32).view(-1)
         self.rho = self._empty(k, dtype=torch.int32)
         self.live_nk = self._empty(1, dtype=torch.int32)
@@ -265,7 +271,7 @@ class FewBackend:
         self.seed_logits = self.seed_selected = None
         self.replay_scores = self._empty(min(q, 512), k)
         self.replay_counts = self._empty(min(q, 512), dtype=torch.int32)
-        self.leaf = _LeafSelection(min(q, 512), k, self.device)
+        self.leaf = _LeafSelection(min(q, 512), k, self.device, h)
         self.plan_epoch = 0
         self.hot_epoch = torch.zeros(k, device=self.device, dtype=torch.int32)
         self.permutation = torch.arange(k, device=self.device, dtype=torch.int32)

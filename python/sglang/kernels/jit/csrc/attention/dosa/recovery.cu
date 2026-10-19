@@ -79,6 +79,8 @@ struct Args {
   int* leaf_lengths;
   int chunks;
   const int* logical_nk;
+  uint8_t* packed_q;
+  float* packed_weights;
 };
 using dosa_h32_replay::swizzle;
 
@@ -90,11 +92,16 @@ __global__ void prepare_jobs(Args a,int nq,int2*tasks){
   if(row>=nq)return;
   a.counts[row]=0;a.row_slot[row]=-1;
   if(a.error[row]==0)return;
+  if(!(a.error[row]&16)||(a.error[row]&~(1|4|16)))atomicOr(a.state+19,1);
   int begin=a.starts[row],end=a.ends[row];
   int logical=dosa_replay_layout::logical_extent(a.logical_nk,a.nk);
-  if(!dosa_replay_layout::valid_interval(begin,end,logical,a.nk)){atomicOr(a.error+row,2);return;}
+  if(!dosa_replay_layout::valid_interval(begin,end,logical,a.nk)){
+    atomicOr(a.state+19,1);atomicOr(a.error+row,2);return;
+  }
+  if(begin==end)atomicOr(a.state+19,1); // Empty intervals retain Q1's original behavior.
   if(end>0){
     int slot=atomicAdd(a.state+2,1);a.row_slot[row]=slot;
+    a.fast_rows[slot]=row;
     if(slot<8){a.state[11+slot]=row;if(begin>0||end<2048)atomicOr(a.state+3+slot,1);}
   }
   int chunks=int((int64_t(end)-begin+PartitionKeys-1)/PartitionKeys);
@@ -104,6 +111,7 @@ __global__ void prepare_jobs(Args a,int nq,int2*tasks){
 }
 CUTLASS_GLOBAL void __launch_bounds__(128,4) replay_worker(Args a){
   const int t=threadIdx.x,warp=t/32,task_count=a.state[0];
+  if(a.state[2]>8&&a.state[19]==0)return;
   if(blockIdx.x>=task_count)return;
   extern __shared__ __align__(1024) uint8_t buf[];
   auto&s=*reinterpret_cast<Smem*>(buf);
@@ -151,7 +159,8 @@ CUTLASS_GLOBAL void __launch_bounds__(128,4) replay_worker(Args a){
   }
   if(warp==0)cute::TMEM::Allocator1Sm().free(tm,kHeads);
 }
-// Publish counts only after every worker finished all required dense writes.
+// Q1 is complete here. FI consumes counts after the later BQ4 score launch,
+// ordered on the same stream when this wrapper publishes an eligible route.
 __global__ void publish_counts(Args a,int nq){
   int index=blockIdx.x*blockDim.x+threadIdx.x,total=a.state[2];
   if(index<nq){
@@ -163,7 +172,7 @@ __global__ void publish_counts(Args a,int nq){
     }
     a.counts[index]=count;
   }
-  if(index==0)*a.fast_state=total;
+  if(index==0){a.fast_state[0]=total;a.fast_state[1]=total>8&&a.state[19]==0;}
   if(index<8){
     a.fast_rows[index]=index<total?a.state[11+index]:-1;
     a.finite[index]=total<=8&&index<total&&a.state[3+index]==0;
@@ -174,31 +183,48 @@ __global__ void publish_counts(Args a,int nq){
     a.leaf_lengths[index]=valid?max(0,min(32768,a.ends[a.state[11+slot]]-seg*32768)):0;
   }
 }
+
+// State/map are owner-retained. Padded Q4 lanes are initialized here and never
+// read a stale row-map slot. Packed storage is reused after the scorer in stream order.
+__global__ void pack_recovery(Args a){
+  if(!a.fast_state[1])return;
+  int slot=blockIdx.x,total=a.fast_state[0];
+  if(slot>=((total+3)&~3))return;
+  int row=slot<total?a.fast_rows[slot]:0;
+  for(int v=threadIdx.x;v<kHeads*8;v+=blockDim.x)
+    reinterpret_cast<uint4*>(a.packed_q+uint64_t(slot)*kHeads*128)[v]=slot<total
+        ?reinterpret_cast<const uint4*>(a.q+uint64_t(row)*kHeads*128)[v]:make_uint4(0,0,0,0);
+  if(threadIdx.x<kHeads)a.packed_weights[slot*kHeads+threadIdx.x]=
+      slot<total?a.weights[row*kHeads+threadIdx.x]:0.0f;
+}
 } // namespace partitioned_h32_replay
 static void replay_and_leaf_impl(torch::Tensor q,torch::Tensor k,torch::Tensor scale,torch::Tensor weights,
             torch::Tensor starts,torch::Tensor ends,torch::Tensor error_status,
             torch::Tensor dense_scores,torch::Tensor counts,torch::Tensor leaf,torch::Tensor fast_rows,
             torch::Tensor fast_state,torch::Tensor finite,torch::Tensor leaf_lengths,
-            torch::Tensor logical_nk) {
+            torch::Tensor logical_nk,torch::Tensor packed_q,torch::Tensor packed_weights) {
   using namespace partitioned_h32_replay;
   c10::cuda::CUDAGuard guard(q.device());
   const int64_t nq=q.size(0), nk=k.size(0);
   // Owned Q[<=512,H,128]/K[Kcap,128] FP8, F32 dense rows and scales,
   // I32 row status/intervals and the immutable I32[1] live extent. Kcap<=2^20.
   // Leaf storage is F32[8*ceil(Kcap/32768),32768] with independent I32 metadata.
+  // Owner map[512]/state[2] and packed Q/W[512] are shared with the later
+  // scorer; state publishes {failed rows, eligible} on every invocation.
   // All buffers are retained by the owner's recovery graph on this stream.
   const int* logical=logical_nk.data_ptr<int>();
   const int chunks=int((nk+32767)/32768);
   const int64_t max_tasks=nq*std::max<int64_t>(1,(nk+PartitionKeys-1)/PartitionKeys);
   const int blocks=int(std::min<int64_t>(max_tasks,4*at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount));
   auto tasks=torch::empty({max_tasks,2},error_status.options());
-  auto state=torch::zeros({19},error_status.options());
+  auto state=torch::zeros({20},error_status.options());
   auto row_slot=torch::empty({nq},error_status.options());
   Args a{static_cast<const uint8_t*>(q.data_ptr()),static_cast<const uint8_t*>(k.data_ptr()),
       scale.data_ptr<float>(),weights.data_ptr<float>(),starts.data_ptr<int>(),ends.data_ptr<int>(),
       error_status.data_ptr<int>(),dense_scores.data_ptr<float>(),counts.data_ptr<int>(),int(nk),
       reinterpret_cast<const int2*>(tasks.data_ptr<int>()),state.data_ptr<int>(),row_slot.data_ptr<int>(),
-      leaf.data_ptr<float>(),fast_rows.data_ptr<int>(),fast_state.data_ptr<int>(),finite.data_ptr<int>(),leaf_lengths.data_ptr<int>(),chunks,logical};
+      leaf.data_ptr<float>(),fast_rows.data_ptr<int>(),fast_state.data_ptr<int>(),finite.data_ptr<int>(),leaf_lengths.data_ptr<int>(),chunks,logical,
+      static_cast<uint8_t*>(packed_q.data_ptr()),packed_weights.data_ptr<float>()};
   auto stream=at::cuda::getCurrentCUDAStream();
   prepare_jobs<<<(nq+127)/128,128,0,stream>>>(a,int(nq),reinterpret_cast<int2*>(tasks.data_ptr<int>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -207,15 +233,17 @@ static void replay_and_leaf_impl(torch::Tensor q,torch::Tensor k,torch::Tensor s
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   publish_counts<<<(std::max<int64_t>(nq,8*chunks)+127)/128,128,0,stream>>>(a,int(nq));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  pack_recovery<<<packed_q.size(0),128,0,stream>>>(a);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void replay_and_leaf_capacity(torch::Tensor q,torch::Tensor k,torch::Tensor scale,torch::Tensor weights,
             torch::Tensor starts,torch::Tensor ends,torch::Tensor error_status,
             torch::Tensor dense_scores,torch::Tensor counts,torch::Tensor leaf,torch::Tensor fast_rows,
             torch::Tensor fast_state,torch::Tensor finite,torch::Tensor leaf_lengths,
-            torch::Tensor logical_nk) {
+            torch::Tensor logical_nk,torch::Tensor packed_q,torch::Tensor packed_weights) {
   replay_and_leaf_impl(q,k,scale,weights,starts,ends,error_status,dense_scores,counts,
-      leaf,fast_rows,fast_state,finite,leaf_lengths,logical_nk);
+      leaf,fast_rows,fast_state,finite,leaf_lengths,logical_nk,packed_q,packed_weights);
 }
 
 #include <ATen/cuda/CUDAContext.h>
