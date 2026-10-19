@@ -541,7 +541,8 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "nvfp4",
+    ], "DeepSeek DSA supports bfloat16, fp8_e4m3, or SM90 nvfp4 KV cache"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -706,7 +707,12 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if get_platform().is_hip:
+    if kv_cache_dtype == "nvfp4":
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "flashmla_kv"
+    elif get_platform().is_hip:
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "triton"
         if not user_set_decode:

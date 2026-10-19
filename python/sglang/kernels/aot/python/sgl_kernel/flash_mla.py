@@ -232,6 +232,62 @@ def flash_mla_with_kvcache(
     return out, softmax_lse
 
 
+def _get_nvfp4_decode_op():
+    return torch.ops.sgl_kernel.fwd_kvcache_mla_nvfp4.default
+
+
+def flash_mla_with_kvcache_nvfp4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run the SM90 sparse MLA kernel on the NVFP4 latent-cache ABI.
+
+    Each cache row is 416 bytes: 512 packed E2M1 latent values, 32 E4M3
+    block-16 scales, and 64 unscaled BF16 RoPE values. ``indices`` contains
+    flattened physical token indices.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    original_num_heads = q.shape[2]
+    if original_num_heads <= 0:
+        raise ValueError("q must contain at least one query head")
+    # The compatibility kernel has lower launch/scheduling overhead for the
+    # singleton decode shape, while the H64 specialization wins once there is
+    # more than one query token to schedule.  Keep B1/Sq1 on the former and
+    # pad all larger TP-local GLM shapes into the latter.
+    use_h64_fast_path = original_num_heads < 64 and q.shape[0] * q.shape[1] > 1
+    if use_h64_fast_path:
+        q_padded = q.new_zeros((q.shape[0], q.shape[1], 64, q.shape[3]))
+        q_padded[:, :, :original_num_heads] = q
+        q = q_padded
+
+    out, softmax_lse = _get_nvfp4_decode_op()(
+        q,
+        k_cache,
+        kv_global_scale,
+        head_dim_v,
+        cache_seqlens,
+        softmax_scale,
+        tile_scheduler_metadata,
+        num_splits,
+        indices,
+    )
+    if use_h64_fast_path:
+        out = out[:, :, :original_num_heads]
+        softmax_lse = softmax_lse[:, :original_num_heads]
+    return out, softmax_lse
+
+
 def _flash_mla_with_kvcache_sched_meta(
     q: torch.Tensor,
     k_cache: torch.Tensor,

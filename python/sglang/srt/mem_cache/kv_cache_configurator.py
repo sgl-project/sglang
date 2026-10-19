@@ -3211,6 +3211,11 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
+    if kv_cache_dtype == getattr(torch, "float4_e2m1fn_x2", None):
+        from sglang.srt.layers.attention.dsa.nvfp4_k_cache import NVFP4_BYTES_PER_TOKEN
+
+        return NVFP4_BYTES_PER_TOKEN
+
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the
     # inactive role may legitimately have a different default backend.

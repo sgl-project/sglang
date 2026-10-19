@@ -98,7 +98,27 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+#ifdef FLASHMLA_ENABLE_SM90_NVFP4
+std::vector<at::Tensor> fwd_kvcache_mla_nvfp4(
+    at::Tensor& q,
+    const at::Tensor& kcache,
+    const at::Tensor& kv_global_scale,
+    int64_t head_size_v,
+    const at::Tensor& seqlens_k,
+    double softmax_scale,
+    const at::Tensor& tile_scheduler_metadata,
+    const at::Tensor& num_splits,
+    const at::Tensor& indices);
+#endif
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+#ifdef FLASHMLA_ENABLE_SM90_NVFP4
+  m.def(
+      "fwd_kvcache_mla_nvfp4(Tensor q, Tensor kcache, Tensor kv_global_scale, int head_size_v, "
+      "Tensor seqlens_k, float softmax_scale, Tensor tile_scheduler_metadata, Tensor num_splits, "
+      "Tensor indices) -> Tensor[]");
+  m.impl("fwd_kvcache_mla_nvfp4", torch::kCUDA, &fwd_kvcache_mla_nvfp4);
+#endif
   /*
    * From FlashMLA
    */

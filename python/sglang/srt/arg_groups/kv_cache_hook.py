@@ -31,11 +31,28 @@ _NVFP4_PREFILL_DEQUANT_DTYPE = {
 }
 
 
+def _is_dsa_nvfp4(server_args: Any) -> bool:
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    cfg = resolving_view(server_args)
+    return (
+        cfg.kv_cache_dtype == "nvfp4"
+        and use_mla_backend(server_args)
+        and is_deepseek_dsa(model_config_of(cfg).hf_config)
+    )
+
+
 def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
     """Resolve the public prefill dequantization dtype to attention backends."""
 
     cfg = resolving_view(server_args)
     requested_dtype = cfg.prefill_kv_cache_dequant_dtype
+    if _is_dsa_nvfp4(server_args):
+        if requested_dtype != "auto":
+            raise ValueError(
+                "DSA NVFP4 prefill uses a BF16 workspace; leave --prefill-kv-cache-dequant-dtype=auto"
+            )
+        return
     if cfg.kv_cache_dtype != "nvfp4":
         if requested_dtype != "auto":
             raise ValueError(
@@ -113,6 +130,16 @@ def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 
     cfg = resolving_view(server_args)
+
+    if _is_dsa_nvfp4(server_args):
+        from sglang.srt.layers.attention.dsa.nvfp4_config import validate_dsa_nvfp4
+
+        validate_dsa_nvfp4(
+            cfg,
+            model_config_of(cfg).hf_config,
+            is_sm90=get_platform().is_cuda and get_platform().is_sm90,
+        )
+        return
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return
