@@ -135,7 +135,7 @@ class TestRocmRouterGate(CustomTestCase):
             config = TopKConfig(
                 top_k=TOPK + 1,
                 renormalize=True,
-                num_fused_shared_experts=1,
+                num_shared_topk_slots=1,
                 correction_bias=self.bias_bf16,
                 routed_scaling_factor=1.5,
                 fused_shared_experts_scaling_factor=scaling,

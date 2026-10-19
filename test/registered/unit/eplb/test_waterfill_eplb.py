@@ -12,7 +12,9 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe.topk import TopKConfig
+from sglang.srt.layers.moe import utils as moe_utils
+from sglang.srt.layers.moe.hash_topk import HashTopK
+from sglang.srt.layers.moe.topk import TopK, TopKConfig, TopKOutputFormat
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase
@@ -61,7 +63,7 @@ class TestWaterfillEPLB(CustomTestCase):
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_fused_shared_experts=1,
+            num_shared_topk_slots=1,
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
@@ -104,7 +106,7 @@ class TestWaterfillEPLB(CustomTestCase):
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_fused_shared_experts=1,
+            num_shared_topk_slots=1,
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
@@ -147,7 +149,7 @@ class TestWaterfillEPLB(CustomTestCase):
         topk_weights = torch.ones_like(topk_ids, dtype=torch.float32)
         topk_config = TopKConfig(
             top_k=4,
-            num_fused_shared_experts=1,
+            num_shared_topk_slots=1,
             routed_scaling_factor=1.0,
         )
         dispatch_info = SimpleNamespace(
@@ -182,6 +184,49 @@ class TestWaterfillEPLB(CustomTestCase):
 
         self.assertTrue(torch.equal(processed_ids, torch.tensor([[1, 34, 201, 256]])))
         self.assertTrue(torch.equal(recorder_ids, torch.tensor([[1, 34, 201]])))
+
+    def test_the_shared_expert_column_has_exactly_one_writer(self):
+        """Shared slots must be written exactly once, by routing or Waterfill."""
+        for enable_waterfill in (False, True):
+            exec_config = SimpleNamespace(
+                moe=SimpleNamespace(enable_waterfill=enable_waterfill)
+            )
+            with (
+                self.subTest(enable_waterfill=enable_waterfill),
+                patch.object(moe_utils, "get_exec", return_value=exec_config),
+            ):
+                topk = TopK(top_k=9, layer_id=0, num_fused_shared_experts=1)
+                hash_topk = HashTopK(
+                    topk=9,
+                    num_experts=256,
+                    num_fused_shared_experts=1,
+                    vocab_size=4,
+                    layer_id=0,
+                )
+                unfused_topk = TopK(top_k=8, layer_id=0)
+
+                for layer, router_top_k, router_shared_columns in (
+                    (
+                        topk,
+                        topk.topk_config.top_k,
+                        topk.topk_config.num_shared_topk_slots,
+                    ),
+                    (hash_topk, hash_topk.topk, hash_topk.num_shared_topk_slots),
+                ):
+                    self.assertEqual(layer.enable_waterfill, enable_waterfill)
+                    self.assertEqual(
+                        router_shared_columns + int(layer.enable_waterfill), 1
+                    )
+                    self.assertEqual(router_top_k - router_shared_columns, 8)
+                self.assertEqual(hash_topk.tid2eid.shape[1], 8)
+                if enable_waterfill:
+                    self.assertEqual(
+                        topk.topk_config.output_format, TopKOutputFormat.STANDARD
+                    )
+
+                self.assertFalse(unfused_topk.enable_waterfill)
+                self.assertEqual(unfused_topk.topk_config.top_k, 8)
+                self.assertEqual(unfused_topk.topk_config.num_shared_topk_slots, 0)
 
 
 if __name__ == "__main__":

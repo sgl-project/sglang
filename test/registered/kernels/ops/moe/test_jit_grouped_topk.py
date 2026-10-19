@@ -37,7 +37,7 @@ def _jit_routed(monkeypatch, logits, hidden, bias, groups):
         renormalize=True,
         use_grouped_topk=True,
         num_expert_group=groups,
-        num_fused_shared_experts=SHARED,
+        num_shared_topk_slots=SHARED,
         topk_group=1,
         scoring_func="sigmoid",
         correction_bias=bias,

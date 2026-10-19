@@ -694,9 +694,27 @@ def uses_per_rank_fused_shared_slots() -> bool:
     return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
 
 
-def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
-    """Check whether this layer has fused shared experts in per-rank slots."""
-    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+def has_per_rank_fused_shared_slots(num_shared: int) -> bool:
+    """Whether the backend gives each rank its own fused shared-expert slots."""
+    return num_shared > 0 and uses_per_rank_fused_shared_slots()
+
+
+def waterfill_routes_shared_experts(num_fused_shared_experts: int) -> bool:
+    """Whether Waterfill, not the top-k router, writes the fused shared experts' column.
+
+    Waterfill appends that column after the EPLB remap and may place it on another
+    rank, so the router it follows emits the routed columns only."""
+    return num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+
+
+def shared_topk_slots(num_fused_shared_experts: int) -> int:
+    """How many trailing top-k columns the router fills with fused shared experts.
+
+    ``num_fused_shared_experts`` counts the shared experts the experts layer runs as
+    extra expert slots; the router writes their columns unless Waterfill does."""
+    if waterfill_routes_shared_experts(num_fused_shared_experts):
+        return 0
+    return num_fused_shared_experts
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
