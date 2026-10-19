@@ -173,7 +173,7 @@ for _mod, _fn in [
     ("dsa.transform_index", "transform_index_page_table_decode"),
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
     ("dsa.transform_index", "transform_index_page_table_dcp"),
-    ("dsa.cp_split", "dsa_cp_interleave_q_seqs_kernel"),
+    ("dsa.cp_split", "dsa_cp_interleave_q_seqs"),
     ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
 ]:
     register_kernel(
