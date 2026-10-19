@@ -1266,7 +1266,16 @@ def mhc_pre(
     },
 )
 def mhc_post_tilelang(
-    a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
+    a,
+    b,
+    c,
+    d,
+    x,
+    hc: int,
+    hidden: int,
+    n_thr: int = 128,
+    h_blk: int = 1024,
+    num_h_blocks: int = 1,
 ):
     n = T.dynamic("num_tokens")
     h = hidden
@@ -1279,7 +1288,7 @@ def mhc_post_tilelang(
     x: T.Tensor((n, hc, h), T.bfloat16)
 
     ENABLE_PDL = is_arch_support_pdl()
-    with T.Kernel(n, threads=n_thr) as i_n:
+    with T.Kernel(n, num_h_blocks, threads=n_thr) as (i_n, i_h_block):
         if ENABLE_PDL:
             T.pdl_sync()
 
@@ -1296,7 +1305,8 @@ def mhc_post_tilelang(
         T.copy(a[i_n, 0, 0], a_local)
         T.copy(c[i_n, 0], c_local)
 
-        for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
+        for i_h_iter in T.Pipelined(T.ceildiv(h, h_blk * num_h_blocks), num_stages=2):
+            i0_h = i_h_iter * num_h_blocks + i_h_block
             T.copy(b[i_n, 0, i0_h * h_blk], b_shared)
             T.copy(d[i_n, i0_h * h_blk], d_shared)
 
@@ -1326,6 +1336,11 @@ def mhc_post(
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
     out = torch.empty_like(residual)
+    hidden_size = residual.shape[-1]
+    # Small batches need more parallelism than one CTA per token.
+    num_h_blocks = (
+        hidden_size // math.gcd(hidden_size, 1024) if x.shape[0] <= 256 else 1
+    )
     mhc_post_tilelang(
         comb_res_mix,
         residual,
@@ -1333,7 +1348,8 @@ def mhc_post(
         x,
         out,
         residual.shape[-2],
-        residual.shape[-1],
+        hidden_size,
+        num_h_blocks=num_h_blocks,
     )
     return out
 
