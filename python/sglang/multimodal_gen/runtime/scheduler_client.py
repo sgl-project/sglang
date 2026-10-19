@@ -248,6 +248,9 @@ class AsyncSchedulerClient:
         self.server_args = None
         self.request_logger: Optional[DiffusionRequestLogger] = None
         self._replica_counter = itertools.count()
+        # first reply whose error left a replica's device unusable; /health
+        # reports it until the server restarts
+        self.unrecoverable_device_error: str | None = None
 
     def initialize(self, server_args: ServerArgs):
         if self.context is not None and not self.context.closed:
@@ -281,6 +284,12 @@ class AsyncSchedulerClient:
             output_batch = await self._forward_one(
                 endpoints[replica], batch, timeout_ms
             )
+        if (
+            isinstance(output_batch, OutputBatch)
+            and output_batch.device_unrecoverable
+            and self.unrecoverable_device_error is None
+        ):
+            self.unrecoverable_device_error = output_batch.error.splitlines()[0]
         self.request_logger.log_finished_request(batch, output_batch)
         return output_batch
 
