@@ -24,10 +24,10 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
-    is_flashinfer_cutedsl_v1_path,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    is_flashinfer_cutedsl_v1_path,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
