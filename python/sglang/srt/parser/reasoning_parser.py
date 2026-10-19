@@ -36,6 +36,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     has_atem_markers,
     partial_marker_len,
 )
+from sglang.srt.parser.answer_frame import AnswerFrame, InklingAnswerFrame
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -116,6 +117,9 @@ class BaseReasoningFormatDetector:
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
+    def get_answer_frame(self) -> Optional[AnswerFrame]:
+        return None
 
     def _maybe_apply_force_nonempty_content(
         self, ret: StreamingParseResult
@@ -1376,6 +1380,9 @@ class InklingDetector(BaseReasoningFormatDetector):
         # Native framing IDs differ from encoding their printed names as plain text.
         return [INKLING_SPECIAL_TOKEN_IDS[self.think_end_token]]
 
+    def get_answer_frame(self) -> Optional[AnswerFrame]:
+        return InklingAnswerFrame()
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         self._buffer = ""
         self._kind = None
@@ -2042,21 +2049,21 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         " to=self<|message|>"    <reasoning>   "<|eom|>"
         "<|start|>assistant to=user<|message|>"  <answer>  "<|eot|>"
 
-    Reasoning is the ``to=self`` channel; the answer is ``to=user``. Any other recipient
-    is a tool call (``to=functions.get_weather``), whose body is an ATEM block that must
-    reach the function-call detector with its markers intact — so those channels are
-    emitted as normal text including their header, following GptOssDetector's precedent
-    of preserving raw structural text for tool calls.
+    Reasoning is the ``to=self`` channel; ``to=user`` and ``to=commentary`` are visible
+    content. Any other recipient is a tool call (``to=functions.get_weather``), whose
+    body is an ATEM block that must reach the function-call detector with its markers
+    intact — so those channels are emitted as normal text including their header,
+    following GptOssDetector's precedent of preserving raw structural text for tool calls.
 
     When a tool-call parser consumes this detector's normal text
-    (``tool_call_parser_active=True``), the ``to=user`` channel keeps its framing too,
-    so the downstream detector sees every channel boundary and can tell a real tool
+    (``tool_call_parser_active=True``), the visible-content channels keep their framing
+    too, so the downstream detector sees every channel boundary and can tell a real tool
     channel from one merely *quoted* inside the answer — unwrapping here would make a
     quoted ``<|start|>assistant to=<tool><|message|>`` indistinguishable from a real
     header and turn quoted markup into a live call. The tool detector unwraps
-    ``to=user`` itself, so nothing framed leaks to the client. Non-streaming
-    additionally requires that a turn *without* any ATEM block come out unwrapped,
-    because serving bypasses the tool detector entirely when ``has_tool_call()`` is
+    ``to=user`` and ``to=commentary`` itself, so nothing framed leaks to the client.
+    Non-streaming additionally requires that a turn *without* any ATEM block come out
+    unwrapped, because serving bypasses the tool detector entirely when ``has_tool_call()`` is
     false — hence the ATEM-presence branch in ``detect_and_parse``, mirroring the
     vendor's reference reasoning parser.
 
@@ -2104,7 +2111,7 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
         With flush=False, holds back a short tail that could be the prefix of a marker
         split across chunk boundaries; with flush=True, emits everything.
 
-        With preserve_channels=True, the ``to=user`` channel keeps its header and
+        With preserve_channels=True, visible-content channels keep their header and
         terminator like tool channels do (see the class docstring for why the
         function-call detector needs the framing intact); reasoning is always
         extracted and never framed.
@@ -2146,7 +2153,7 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
                     if self._saw_reasoning_block:
                         reasoning_parts.append("\n")
                     self._saw_reasoning_block = True
-                elif self._recipient != "user" or preserve_channels:
+                elif self._recipient not in ("user", "commentary") or preserve_channels:
                     # Keep the header so the function-call detector sees it.
                     normal_parts.append(header + MESSAGE)
                 continue
@@ -2165,7 +2172,10 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
                     reasoning_parts.append(body)
                 else:
                     normal_parts.append(body)
-                    if self._recipient != "user" or preserve_channels:
+                    if (
+                        self._recipient not in ("user", "commentary")
+                        or preserve_channels
+                    ):
                         normal_parts.append(end_tok)
                 self._recipient = None
                 continue

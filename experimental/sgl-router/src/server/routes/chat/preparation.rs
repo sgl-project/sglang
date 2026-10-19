@@ -2,28 +2,84 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Request validation, optional tokenization, and outgoing body preparation for
-//! chat completions, the native `/generate` endpoint, embeddings, classify and rerank.
+//! chat completions, completions, the native `/generate` endpoint, embeddings,
+//! classify and rerank.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
+use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::ForwardingScope;
+use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
+use sglang_processor::openai::{
+    lower_chat, lower_completion, OpenAiHeaders, OpenAiSettings, Responder,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
-const CHAT_PATH: &str = "/v1/chat/completions";
-const GENERATE_PATH: &str = "/generate";
+pub(super) const CHAT_PATH: &str = "/v1/chat/completions";
+pub(super) const COMPLETIONS_PATH: &str = "/v1/completions";
+pub(super) const GENERATE_PATH: &str = "/generate";
 pub(super) const EMBEDDINGS_PATH: &str = "/v1/embeddings";
 pub(super) const CLASSIFY_PATH: &str = "/v1/classify";
-const RERANK_PATH: &str = "/v1/rerank";
+pub(super) const RERANK_PATH: &str = "/v1/rerank";
+
+/// The engine's KV namespace for a request on `path`, from the fields SGLang
+/// reads there: `model: "base:adapter"` (OpenAI routes) wins over `lora_path`,
+/// and only generation honors `cache_salt`.
+pub(super) fn cache_namespace(path: &str, body: &Value) -> CacheNamespace {
+    let openai = matches!(path, CHAT_PATH | COMPLETIONS_PATH | EMBEDDINGS_PATH);
+    let generates = matches!(path, CHAT_PATH | COMPLETIONS_PATH | GENERATE_PATH);
+    let model_adapter = body["model"]
+        .as_str()
+        .filter(|_| openai)
+        .and_then(|model| model.split_once(':'))
+        .map(|(_, adapter)| adapter.trim())
+        .filter(|adapter| !adapter.is_empty())
+        .map(str::to_owned);
+    let lora_name = match model_adapter {
+        Some(adapter) => Ok(Some(adapter)),
+        None if openai || generates => namespace_field(&body["lora_path"]),
+        None => Ok(None),
+    };
+    let cache_salt = match generates {
+        true => namespace_field(&body["cache_salt"]),
+        false => Ok(None),
+    };
+    match (lora_name, cache_salt) {
+        (Ok(lora_name), Ok(cache_salt)) => CacheNamespace {
+            cache_salt,
+            lora_name,
+            ambiguous: false,
+        },
+        _ => CacheNamespace {
+            ambiguous: true,
+            ..CacheNamespace::default()
+        },
+    }
+}
+
+/// A namespace field's value; `Err` when a per-prompt list names several.
+/// A uniform list counts as its one value, as SGLang normalizes it.
+fn namespace_field(value: &Value) -> Result<Option<String>, ()> {
+    let value = match value {
+        Value::Array(items) if items.windows(2).any(|pair| pair[0] != pair[1]) => return Err(()),
+        Value::Array(items) => items.first().unwrap_or(&Value::Null),
+        value => value,
+    };
+    Ok(value.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+}
 
 /// Validated routing inputs and the original body, ready for worker selection.
 ///
@@ -38,6 +94,8 @@ pub(super) struct PreparedRequest {
     pub(super) output_tokens: Option<u64>,
     pub(super) body: Bytes,
     pub(super) tokens: Option<RequestTokens>,
+    /// The engine KV namespace `tokens` are cached under.
+    pub(super) cache_namespace: CacheNamespace,
     /// Token count for routing/load accounting; estimated from body size when unavailable.
     pub(super) input_token_count: usize,
     /// The longest prompt, for bucket and context checks.
@@ -53,25 +111,100 @@ pub(super) struct PreparedRequest {
     forwarding_booked: bool,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
+    /// Turns the engine's `/generate` response back into the OpenAI one.
+    pub(super) responder: Option<Responder>,
 }
 
 impl PreparedRequest {
-    pub(super) fn chat(
+    /// OpenAI chat and completions go to the engine's `/generate` when SGLang's
+    /// OpenAI layer is reproduced for them, else to its own route as sent.
+    pub(super) fn openai(
         ctx: &AppContext,
+        path: &'static str,
         model: ModelId,
         fields: RoutingFields,
+        headers: &HeaderMap,
         body: Bytes,
         policy_needs_request_tokens: bool,
     ) -> Result<Self, ApiError> {
-        // Validate configured sampling rules and collect missing defaults for forwarding.
+        Self::openai_inner(
+            ctx,
+            path,
+            model,
+            fields,
+            headers,
+            body,
+            policy_needs_request_tokens,
+            true,
+        )
+    }
+
+    pub(super) fn openai_grpc(
+        ctx: &AppContext,
+        path: &'static str,
+        model: ModelId,
+        fields: RoutingFields,
+        headers: &HeaderMap,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+    ) -> Result<Self, ApiError> {
+        Self::openai_inner(
+            ctx,
+            path,
+            model,
+            fields,
+            headers,
+            body,
+            policy_needs_request_tokens,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn openai_inner(
+        ctx: &AppContext,
+        path: &'static str,
+        model: ModelId,
+        fields: RoutingFields,
+        headers: &HeaderMap,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+        lower: bool,
+    ) -> Result<Self, ApiError> {
+        // The fleet's sampling contract applies to the client's body on both routes.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
-        let forwarding_scope = if ctx.config.model.disable_input_ids_forwarding {
-            ForwardingScope::Never
+        let defaults: Vec<_> = sampling_defaults
+            .iter()
+            .map(|(field, value)| (field.wire_name(), value.to_string()))
+            .collect();
+        let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
+        let lowered = if lower {
+            lower_openai(ctx, path, &model, headers, &with_defaults)
         } else {
-            ctx.tokenizers.forwarding_scope(&model.0)
+            Err("native_grpc")
         };
-        let can_forward_input_ids = forwarding_scope != ForwardingScope::Never;
+        ctx.metrics
+            .record_openai_route(&model.0, lowered.as_ref().err().copied());
+        if let Ok((mut generate, responder)) = lowered {
+            // Null fields are `GenerateReqInput`'s defaults; dropping them keeps the
+            // router's own `routed_dp_rank` and bootstrap fields from duplicating keys.
+            if let Value::Object(fields) = &mut generate {
+                fields.retain(|_, value| !value.is_null());
+            }
+            if path == CHAT_PATH {
+                ctx.metrics
+                    .record_input_ids_forwarding(&model.0, InputIdsForwarding::Forwarded);
+            }
+            return Ok(Self {
+                responder: Some(responder),
+                ..Self::generate_value(ctx, model, generate, None)?
+            });
+        }
+        // Router-rendered `input_ids` go only into chat; completions are forwarded as sent.
+        let forwarding_scope = (path == CHAT_PATH).then(|| forwarding_scope(ctx, &model));
+        let can_forward_input_ids =
+            forwarding_scope.is_some_and(|scope| scope != ForwardingScope::Never);
         let needs_tokens = should_tokenize_request(
             can_forward_input_ids,
             policy_needs_request_tokens,
@@ -86,12 +219,12 @@ impl PreparedRequest {
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
         // Routing tokens can replace engine tokenization only for supported chat templates.
-        let forwarding =
-            input_ids_forwarding(forwarding_scope, parsed_body.as_ref(), tokens.as_ref());
+        let forwarding = forwarding_scope
+            .map(|scope| input_ids_forwarding(scope, parsed_body.as_ref(), tokens.as_ref()));
         let input_tokens = input_token_count(tokens.as_ref(), &body);
         let output_tokens = fields.requested_max_output_tokens();
         Ok(Self {
-            path: CHAT_PATH,
+            path,
             model,
             streaming: fields.stream.unwrap_or(false),
             output_tokens,
@@ -101,11 +234,78 @@ impl PreparedRequest {
                 .map(|output| (input_tokens as u64).saturating_add(output)),
             body,
             tokens,
+            cache_namespace: parsed_body
+                .as_ref()
+                .map(|body| cache_namespace(path, body))
+                .unwrap_or_default(),
             caller_set_rid: fields.caller_set_rid,
-            fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            input_ids_forwarding: Some(forwarding),
+            fans_out: requests_multiple_samples(&fields, &sampling_defaults)
+                || (path == COMPLETIONS_PATH && fields.prompt_batch),
+            input_ids_forwarding: forwarding,
             forwarding_booked: false,
             parsed_body,
+            sampling_defaults,
+            responder: None,
+        })
+    }
+
+    /// OpenAI completions: chat's sampling contract, with prompts counted as
+    /// `/generate` counts them (a prompt list is a batch the engine fans out).
+    /// The body is forwarded as sent.
+    pub(super) fn completion(
+        ctx: &AppContext,
+        model: ModelId,
+        fields: RoutingFields,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+    ) -> Result<Self, ApiError> {
+        let sampling_defaults =
+            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| invalid_request())?;
+        let prompts = completion_prompts(&value);
+        let needs_tokens = should_tokenize_request(
+            false,
+            policy_needs_request_tokens,
+            ctx.bucket_selector.is_enabled(),
+        );
+        // Text is tokenized per prompt, as `/generate` does, but only for routing.
+        let text_ids = needs_tokens
+            .then(|| tokenize_text(ctx, &model, &prompts))
+            .flatten();
+        let routed = text_ids.map_or(prompts, |ids| json!({ "input_ids": ids }));
+        let batch = batch_prompt_tokens(&routed);
+        let tokens = (batch.is_none() && has_caller_input_ids(&routed))
+            .then(|| request_tokens_for(&ctx.tokenizers, &model, &routed))
+            .flatten();
+        let lengths = batch
+            .clone()
+            .unwrap_or_else(|| vec![input_token_count(tokens.as_ref(), &body)]);
+        let samples = sample_count(&fields, &sampling_defaults);
+        let sequence_tokens = lengths.iter().copied().max().unwrap_or(1);
+        let output = fields.requested_max_output_tokens();
+        Ok(Self {
+            path: COMPLETIONS_PATH,
+            model,
+            streaming: fields.stream.unwrap_or(false),
+            output_tokens: output
+                .map(|output| output.saturating_mul(lengths.len() as u64 * samples)),
+            body,
+            tokens,
+            input_token_count: lengths
+                .iter()
+                .sum::<usize>()
+                .max(1)
+                .saturating_mul(samples as usize),
+            sequence_token_count: sequence_tokens,
+            expected_peak_sequence_tokens: output
+                .map(|output| (sequence_tokens as u64).saturating_add(output)),
+            caller_set_rid: fields.caller_set_rid,
+            fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
+            input_ids_forwarding: None,
+            forwarding_booked: false,
+            responder: None,
+            cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
+            parsed_body: Some(value),
             sampling_defaults,
         })
     }
@@ -115,13 +315,27 @@ impl PreparedRequest {
     pub(super) fn generate(
         ctx: &AppContext,
         model: ModelId,
-        mut body: Bytes,
+        body: Bytes,
     ) -> Result<Self, ApiError> {
-        let mut value =
-            Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+        let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
+        Self::generate_value(ctx, model, value, Some(body))
+    }
+
+    /// [`Self::generate`] over a parsed body: the client's `body` gets the
+    /// fleet's sampling overrides, while a lowered OpenAI body (`None`) had them
+    /// applied to the OpenAI request.
+    fn generate_value(
+        ctx: &AppContext,
+        model: ModelId,
+        mut value: Value,
+        body: Option<Bytes>,
+    ) -> Result<Self, ApiError> {
         let stream =
             Option::<bool>::deserialize(&value["stream"]).map_err(|_| invalid_request())?;
-        let mut rewrite = apply_sampling_overrides(ctx, &mut value)?;
+        let mut rewrite = match body {
+            Some(_) => apply_sampling_overrides(ctx, &mut value)?,
+            None => true,
+        };
         let text_ids = tokenize_text(ctx, &model, &value);
         // Routing sees `text` as the engine's ids, whether or not they are forwarded.
         let routed = text_ids.as_ref().map(|ids| json!({ "input_ids": ids }));
@@ -134,11 +348,12 @@ impl PreparedRequest {
             fields.insert("input_ids".into(), input_ids);
             rewrite = true;
         }
-        if rewrite {
-            body = serde_json::to_vec(&value)
+        let body = match body {
+            Some(body) if !rewrite => body,
+            _ => serde_json::to_vec(&value)
                 .map_err(|error| ApiError::Internal(error.into()))?
-                .into();
-        }
+                .into(),
+        };
         let samples = parallel_samples(&value);
         let fans_out = batch.is_some() || samples > 1;
         let lengths = batch.unwrap_or_else(|| {
@@ -177,12 +392,14 @@ impl PreparedRequest {
             }),
             body,
             tokens,
+            cache_namespace: cache_namespace(GENERATE_PATH, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out,
             input_ids_forwarding: None,
             forwarding_booked: false,
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
+            responder: None,
         })
     }
 
@@ -223,6 +440,7 @@ impl PreparedRequest {
             });
         Ok(Self {
             tokens,
+            cache_namespace: cache_namespace(path, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out: batch,
             ..Self::no_output(path, model, body, &lengths)
@@ -248,6 +466,72 @@ impl PreparedRequest {
         })
     }
 
+    /// A typed gRPC request, prepared from its fields as `path` prepares its body.
+    /// It has no body: the router's additions travel as fields.
+    pub(super) fn typed(
+        ctx: &AppContext,
+        path: &'static str,
+        model: ModelId,
+        view: &RoutingView,
+    ) -> Result<Self, ApiError> {
+        let tokens = match (view.input_ids, view.text) {
+            ([], Some(text)) => ctx.tokenizers.encode_prompt(&model.0, text),
+            (ids, _) => Some(ids.iter().map(|&id| id as u32).collect()),
+        };
+        let estimate = || estimate_prefill_tokens(view.text.map_or(0, str::len));
+        let input = tokens.as_ref().map_or_else(estimate, Vec::len).max(1);
+        let tokens = tokens.map(|ids| RequestTokens {
+            ids,
+            rendered_from_chat: false,
+        });
+        let caller_set_rid = view.rid.is_some();
+        if path != GENERATE_PATH {
+            let request = Self::no_output(path, model, Bytes::new(), &[input]);
+            return Ok(Self {
+                tokens,
+                caller_set_rid,
+                ..request
+            });
+        }
+        let fields = RoutingFields::typed(view);
+        let sampling_defaults =
+            resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
+        let fans_out = requests_multiple_samples(&fields, &sampling_defaults);
+        let samples = sample_count(&fields, &sampling_defaults);
+        let output = view
+            .sampling_params
+            .and_then(|params| params.max_new_tokens);
+        let output = output.and_then(|output| u64::try_from(output).ok());
+        Ok(Self {
+            path,
+            model,
+            streaming: view.stream,
+            output_tokens: output.map(|output| output.saturating_mul(samples)),
+            body: Bytes::new(),
+            tokens,
+            input_token_count: input.saturating_mul(samples as usize),
+            sequence_token_count: input,
+            expected_peak_sequence_tokens: output
+                .map(|output| (input as u64).saturating_add(output)),
+            caller_set_rid,
+            fans_out,
+            input_ids_forwarding: None,
+            forwarding_booked: false,
+            responder: None,
+            parsed_body: None,
+            cache_namespace: CacheNamespace::default(),
+            sampling_defaults,
+        })
+    }
+
+    /// Defaults the sampling contract adds, for a typed request's fields.
+    pub(super) fn sampling_defaults(&self) -> Vec<(SamplingField, f64)> {
+        let defaults = self.sampling_defaults.iter();
+        defaults
+            .filter_map(|(field, value)| Some((*field, value.as_f64()?)))
+            .collect()
+    }
+
     /// A request of `lengths` prompts that generates nothing. No PD serves it,
     /// so it keeps no parsed body for bootstrap fields.
     fn no_output(path: &'static str, model: ModelId, body: Bytes, lengths: &[usize]) -> Self {
@@ -262,12 +546,14 @@ impl PreparedRequest {
             expected_peak_sequence_tokens: Some(sequence_tokens as u64),
             body,
             tokens: None,
+            cache_namespace: CacheNamespace::default(),
             caller_set_rid: false,
             fans_out: false,
             input_ids_forwarding: None,
             forwarding_booked: false,
             parsed_body: None,
             sampling_defaults: Vec::new(),
+            responder: None,
         }
     }
 
@@ -294,6 +580,9 @@ impl PreparedRequest {
         bootstrap: Option<&BootstrapFields>,
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
+        if self.body.is_empty() {
+            return Ok(self.body.clone());
+        }
         let input_ids = self
             .tokens
             .as_ref()
@@ -320,6 +609,94 @@ impl PreparedRequest {
         }
         Ok(body)
     }
+}
+
+fn forwarding_scope(ctx: &AppContext, model: &ModelId) -> ForwardingScope {
+    if ctx.config.model.disable_input_ids_forwarding {
+        return ForwardingScope::Never;
+    }
+    ctx.tokenizers.forwarding_scope(&model.0)
+}
+
+/// The `/generate` body and response builder SGLang's OpenAI layer would use,
+/// or why the request goes to the engine's own route.
+fn lower_openai(
+    ctx: &AppContext,
+    path: &str,
+    model: &ModelId,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(Value, Responder), &'static str> {
+    let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
+    let headers = OpenAiHeaders {
+        // The router owns DP ranks; a client's header is never forwarded.
+        routing_key: header_str(headers, "x-smg-routing-key"),
+        custom_labels: settings
+            .tokenizer_metrics_custom_labels_header
+            .as_deref()
+            .and_then(|name| header_str(headers, name)),
+        sglext_ids: ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
+            .iter()
+            .any(|name| header_str(headers, name) == Some("1")),
+    };
+    let tokenizer = ctx.tokenizers.openai();
+    if path == COMPLETIONS_PATH {
+        return lower_completion(body, &headers, &settings, tokenizer)
+            .map(|(body, responder)| (body, Responder::Completion(Box::new(responder))))
+            .map_err(|unsupported| unsupported.0);
+    }
+    // Only renderers verified against SGLang render every chat.
+    if forwarding_scope(ctx, model) != ForwardingScope::AllText {
+        return Err("chat_rendering_unverified");
+    }
+    let engine_kwargs = settings
+        .default_chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
+        != ctx.config.model.default_chat_template_kwargs
+    {
+        return Err("default_chat_template_kwargs_differ");
+    }
+    let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
+    let chat_model = ctx.tokenizers.chat_model();
+    lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
+        .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
+        .map_err(|unsupported| unsupported.0)
+}
+
+/// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
+fn model_openai_settings(ctx: &AppContext, model: &ModelId) -> Option<Arc<OpenAiSettings>> {
+    let workers = ctx.registry.workers_for(model);
+    let first = Arc::clone(workers.first()?.openai_settings()?);
+    let agree = workers.iter().all(|w| w.openai_settings() == Some(&first));
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !agree && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(model = %model.0, "workers report different OpenAI server args; \
+            serving OpenAI requests through the engines' own routes");
+    }
+    agree.then_some(first)
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// A text prompt as the ids `path` forwards in its place over HTTP: `/generate`
+/// forwards any text, embeddings and classify only a non-blank prompt.
+pub(super) fn forwarded_prompt_ids(
+    ctx: &AppContext,
+    model: &ModelId,
+    path: &str,
+    text: &str,
+) -> Option<Vec<u32>> {
+    if ctx.config.model.disable_input_ids_forwarding {
+        return None;
+    }
+    if path == GENERATE_PATH {
+        return ctx.tokenizers.encode_prompt(&model.0, text);
+    }
+    tokenize_input_text(ctx, model, &Value::from(text))?.pop()
 }
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
@@ -488,6 +865,26 @@ pub(super) struct RoutingFields {
     sampling: [SamplingValue; SamplingField::ALL.len()],
     // Preserve both string and list IDs without retaining their contents.
     caller_set_rid: bool,
+    /// A completions `prompt` listing several prompts, as strings or id lists.
+    prompt_batch: bool,
+}
+
+impl RoutingFields {
+    /// A typed request's stream flag and sampling contract fields.
+    fn typed(view: &RoutingView) -> Self {
+        let mut fields = Self {
+            stream: Some(view.stream),
+            ..Self::default()
+        };
+        if let Some(params) = view.sampling_params {
+            for field in SamplingField::ALL {
+                if let Some(value) = sampling_value(params, field) {
+                    fields.sampling[field.index()] = SamplingValue::Number(value);
+                }
+            }
+        }
+        fields
+    }
 }
 
 /// Null is absent; unrepresentable values are rejected only under a sampling contract.
@@ -621,6 +1018,7 @@ enum RequestKey {
     Routing(RoutingKey),
     Sampling(SamplingField),
     Rid,
+    Prompt,
     Other,
 }
 
@@ -641,6 +1039,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "max_tokens" => RequestKey::Routing(RoutingKey::MaxTokens),
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     "rid" => RequestKey::Rid,
+                    "prompt" => RequestKey::Prompt,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -700,6 +1099,11 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                 }
                 RequestKey::Rid => {
                     fields.caller_set_rid = map.next_value::<Option<IgnoredAny>>()?.is_some();
+                }
+                RequestKey::Prompt => {
+                    let prompt = map.next_value::<Value>()?;
+                    fields.prompt_batch =
+                        prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
                 }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
@@ -764,6 +1168,30 @@ fn requests_multiple_samples(
             .find(|(field, _)| *field == SamplingField::N)
             .and_then(|(_, value)| value.as_f64())
             .is_some_and(|n| n > 1.0),
+    }
+}
+
+/// Samples per prompt: the caller's `n`, else the contract's default; at least one.
+fn sample_count(fields: &RoutingFields, sampling_defaults: &[(SamplingField, Number)]) -> u64 {
+    let n = match fields.sampling_field(SamplingField::N) {
+        SamplingValue::Number(n) => Some(n),
+        SamplingValue::Unusable => None,
+        SamplingValue::Absent => sampling_defaults
+            .iter()
+            .find(|(field, _)| *field == SamplingField::N)
+            .and_then(|(_, value)| value.as_f64()),
+    };
+    n.filter(|n| *n >= 1.0).map_or(1, |n| n as u64)
+}
+
+/// A completions `prompt` in `/generate`'s shape: text or token ids, one or a batch.
+fn completion_prompts(value: &Value) -> Value {
+    let prompt = &value["prompt"];
+    let first = prompt.as_array().and_then(|items| items.first());
+    if first.is_some_and(|first| first.is_number() || first.is_array()) {
+        json!({ "input_ids": prompt })
+    } else {
+        json!({ "text": prompt })
     }
 }
 
@@ -1183,6 +1611,61 @@ mod tests {
         let r = PreparedRequest::embeddings(ctx, EMBEDDINGS_PATH, model, body, value).unwrap();
         let input = serde_json::from_slice::<Value>(&r.body).unwrap()["input"].take();
         (r, input)
+    }
+
+    #[test]
+    fn completions_count_prompts_as_generate_does() {
+        let ctx = tokenizer_ctx();
+        let ids: Vec<u32> = (0..100).collect();
+        // (prompt, fans out, (input total, longest prompt))
+        for (prompt, fans_out, counts) in [
+            (json!(ids), false, (100, 100)),
+            (json!([[1, 2, 3], [4]]), true, (4, 3)),
+            (json!(["abcdefgh", "abcd"]), true, (3, 2)),
+        ] {
+            let body = json!({"model": "stub-model", "prompt": prompt, "max_tokens": 2});
+            let body = Bytes::from(body.to_string());
+            let fields = parse_routing_fields(&body).unwrap();
+            let model = ModelId("stub-model".into());
+            let r = PreparedRequest::completion(&ctx, model, fields, body, false).unwrap();
+            let got = (r.input_token_count, r.sequence_token_count);
+            assert_eq!((r.fans_out, got), (fans_out, counts), "{prompt}");
+        }
+        // With routing on tokens, text is counted by the tokenizer, batched or not.
+        let text = "hi ".repeat(40);
+        let n = ctx
+            .tokenizers
+            .encode_prompt("stub-model", &text)
+            .unwrap()
+            .len();
+        for prompt in [json!(text), json!([text])] {
+            let body = json!({"model": "stub-model", "prompt": prompt});
+            let body = Bytes::from(body.to_string());
+            let fields = parse_routing_fields(&body).unwrap();
+            let model = ModelId("stub-model".into());
+            let r = PreparedRequest::completion(&ctx, model, fields, body, true).unwrap();
+            assert_eq!(r.sequence_token_count, n, "{prompt}");
+        }
+    }
+
+    #[test]
+    fn typed_generate_counts_the_contract_default_n() {
+        let mut ctx = AppContext::stub();
+        ctx.config.model.sampling_overrides = overrides_of(ConflictPolicy::Allow, r#"{"n": 4}"#);
+        let view = RoutingView {
+            input_ids: &[1, 2, 3],
+            text: None,
+            sampling_params: Some(&sglang_api_types::runtime::v1::SamplingParams {
+                max_new_tokens: Some(10),
+                ..Default::default()
+            }),
+            stream: false,
+            rid: None,
+        };
+        let model = ModelId("stub-model".into());
+        let r = PreparedRequest::typed(&ctx, GENERATE_PATH, model, &view).unwrap();
+        assert_eq!((r.input_token_count, r.output_tokens), (12, Some(40)));
+        assert!(r.fans_out);
     }
 
     #[test]
@@ -2192,5 +2675,34 @@ mod tests {
             .unwrap();
             assert_eq!(requests_multiple_samples(&fields, &defaults), fan_out);
         }
+    }
+
+    #[test]
+    fn cache_namespace_follows_sglang_resolution_per_route() {
+        let ns = |path: &str, body: Value| {
+            let ns = cache_namespace(path, &body);
+            (ns.cache_salt, ns.lora_name, ns.ambiguous)
+        };
+        let some = |s: &str| Some(s.to_owned());
+        let body = json!({"model": "m: b ", "lora_path": "a", "cache_salt": "t"});
+        // `model: base:adapter` wins on OpenAI routes; only generation is salted.
+        assert_eq!(ns(CHAT_PATH, body.clone()), (some("t"), some("b"), false));
+        assert_eq!(
+            ns(COMPLETIONS_PATH, body.clone()),
+            (some("t"), some("b"), false)
+        );
+        assert_eq!(
+            ns(GENERATE_PATH, body.clone()),
+            (some("t"), some("a"), false)
+        );
+        assert_eq!(ns(EMBEDDINGS_PATH, body.clone()), (None, some("b"), false));
+        assert_eq!(ns(CLASSIFY_PATH, body), (None, None, false));
+        // Empty values mean none; a per-prompt list counts when uniform.
+        let empty = json!({"model": "m:", "lora_path": "", "cache_salt": ""});
+        assert_eq!(ns(CHAT_PATH, empty), (None, None, false));
+        let uniform = json!({"lora_path": ["a", "a"], "cache_salt": ["t"]});
+        assert_eq!(ns(GENERATE_PATH, uniform), (some("t"), some("a"), false));
+        let mixed = json!({"lora_path": ["a", "b"]});
+        assert_eq!(ns(GENERATE_PATH, mixed), (None, None, true));
     }
 }
