@@ -439,7 +439,12 @@ class _InContextLayout:
     Three sets of sizes: this clip's token counts; those of a full-length clip, which every
     clip is padded up to; and the full-length sizes rounded up to 128 for flex_attention.
     The attention pads to the last set and the block mask is built from the same numbers,
-    so one compiled mask serves every clip of a request."""
+    so one compiled mask serves every clip of a request.
+
+    Both streams are laid into per-frame slots of one width, the larger of the two grids'
+    tokens per frame: the reference image and the driving video are each fitted to the
+    pixel budget at their own aspect ratio, so their 16-aligned grids can differ by a
+    latent row or column in either direction."""
 
     def __init__(
         self,
@@ -470,8 +475,12 @@ class _InContextLayout:
         )
 
         # A full-length clip. The generation video carries one extra reference-image frame,
-        # the reference video does not.
-        self.max_tokens_per_frame = full_clip_h * full_clip_w
+        # the reference video does not. Each frame slot must hold a frame of either stream;
+        # when the grids agree, or the reference video's is the smaller, this is the
+        # generation grid's tokens per frame.
+        self.max_tokens_per_frame = max(
+            full_clip_h * full_clip_w, reference_video_h * reference_video_w
+        )
         self.max_generation_video_num_tokens = full_clip_f * self.max_tokens_per_frame
         self.max_reference_video_num_tokens = (
             full_clip_f - 1
