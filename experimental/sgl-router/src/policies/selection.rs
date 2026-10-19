@@ -221,12 +221,18 @@ impl<'a> Selector<'a> {
             && inputs.policy.is_bucket_affinity_policy()
             && session_affinity_mode != SessionAffinityMode::Bucket;
 
-        // By uncached tokens, a cold request uses every prefill worker.
+        // By uncached tokens: a cold request uses every prefill worker, and a warm
+        // one whose buckets all queue while another worker idles spills there.
         let cold = inputs.route_by_uncached_tokens && self.uncached_tokens.is_none();
+        let idle_spill = self.idle_spill_domain();
         let uncached_tokens = self.uncached_tokens;
 
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
-        let cache_winner = self.cache_winner();
+        let cache_winner = if idle_spill.is_some() {
+            None
+        } else {
+            self.cache_winner()
+        };
         let cache_winner_hit = cache_winner.is_some();
 
         let global_affinity_probe = use_global_affinity_probe
@@ -261,14 +267,15 @@ impl<'a> Selector<'a> {
         let selected = cache_winner.or_else(|| {
             // Materializing the normal domains clones the member list of every
             // Bucket, so build them only on the rung that actually reads them.
-            let prefill_domains = || match uncached_tokens {
-                Some(extend) => inputs.bucket_selector.prefill_domains_for_extend(
+            let prefill_domains = || match (&idle_spill, uncached_tokens) {
+                (Some(domain), _) => vec![domain.clone()],
+                (None, Some(extend)) => inputs.bucket_selector.prefill_domains_for_extend(
                     inputs.workers,
                     bucket_request,
                     extend,
                 ),
-                None if cold => vec![CandidateDomain::global_prefill(inputs.workers)],
-                None => inputs
+                (None, None) if cold => vec![CandidateDomain::global_prefill(inputs.workers)],
+                (None, None) => inputs
                     .bucket_selector
                     .prefill_domains(inputs.workers, bucket_request),
             };
@@ -320,7 +327,7 @@ impl<'a> Selector<'a> {
                 model = %inputs.model_id,
                 input_tokens = bucket_request.input_tokens,
                 uncached_tokens = ?uncached_tokens,
-                route = if cold { "cold" } else { "warm" },
+                route = if idle_spill.is_some() { "idle_spill" } else if cold { "cold" } else { "warm" },
                 selected = %worker.url,
                 "prefill route by uncached tokens",
             );
@@ -340,6 +347,33 @@ impl<'a> Selector<'a> {
                 .flat_map(|domain| domain.workers)
                 .collect(),
         )
+    }
+
+    /// The workers to spill a warm request to when every DP rank of every worker
+    /// of its buckets has pending prefill work: those with a DP rank that has none.
+    fn idle_spill_domain(&self) -> Option<CandidateDomain> {
+        let targets = self.extend_bucket_workers()?;
+        let snapshot = self.inputs.load_snapshot?;
+        if targets.is_empty()
+            || !targets.iter().all(|worker| {
+                snapshot
+                    .fresh_min_rank_pending_for_url(&worker.url)
+                    .is_some_and(|n| n > 0)
+            })
+        {
+            return None;
+        }
+        let idle: Vec<Arc<Worker>> = self
+            .inputs
+            .workers
+            .iter()
+            .filter(|worker| {
+                snapshot.fresh_min_rank_pending_for_url(&worker.url) == Some(0)
+                    && !targets.iter().any(|target| target.id == worker.id)
+            })
+            .cloned()
+            .collect();
+        (!idle.is_empty()).then(|| CandidateDomain::bucket_prefill("idle-spill", idle, None))
     }
 
     /// The per-request `SelectionContext` every rung starts from.
@@ -798,7 +832,8 @@ mod tests {
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
     };
     use crate::state::load_monitor::engine_reported_load::{
-        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
+        EngineReportedLoadSnapshot, EngineReportedLoadTable, EngineReportedSchedulingLoad,
+        LoadStat, NativeCacheRankLoad,
     };
     use crate::workers::Worker;
     use std::sync::Arc;
@@ -1423,5 +1458,57 @@ mod tests {
             route_both_ways(&workers, &loads, Some(&signal)),
             ["short", "long"]
         );
+    }
+
+    /// `(waiting requests, uncached tokens still to prefill)` on each DP rank.
+    type RankPending<'a> = &'a [(u64, u64)];
+
+    fn rank_snapshot(entries: &[(&Arc<Worker>, RankPending<'_>)]) -> EngineReportedLoadSnapshot {
+        let table = EngineReportedLoadTable::new();
+        let now = Instant::now();
+        for (worker, ranks) in entries {
+            for (dp_rank, &(waiting, uncached)) in (0..).zip(ranks.iter()) {
+                let load = LoadStat {
+                    num_running_reqs: 1,
+                    num_waiting_reqs: waiting,
+                    num_tokens: 10,
+                    max_total_num_tokens: 1_000_000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: uncached,
+                        num_total_tokens: 10,
+                        max_running_requests: 64,
+                        total_prefill_uncached_tokens: 0,
+                        total_prefill_busy_us: 0,
+                    }),
+                };
+                table.set(&worker.url, dp_rank, load, now);
+            }
+        }
+        table.capture_snapshot(now)
+    }
+
+    #[test]
+    fn spills_to_a_worker_with_an_idle_dp_rank() {
+        let (short, long) = (worker("short"), worker("long"));
+        let workers = [Arc::clone(&short), Arc::clone(&long)];
+        let to_long = prefix_signal(&[(&long, 5)], 20); // E = 15,000: `long`'s bucket
+        let to_short = prefix_signal(&[(&short, 15)], 20); // E = 5,000: `short`'s bucket
+        let (busy, idle): (RankPending, RankPending) = (&[(2, 9)], &[(0, 0)]);
+        for (signal, long_ranks, short_ranks, expected) in [
+            (&to_long, busy, &[(3, 9), (0, 0)][..], "short"),
+            (&to_long, busy, &[(3, 9), (1, 9)][..], "long"),
+            // Still prefilling a chunked prompt: nothing queued, but not idle.
+            (&to_long, busy, &[(3, 9), (0, 40_000)][..], "long"),
+            // `short` spills only when every one of its ranks has pending work.
+            (&to_short, idle, &[(3, 9), (0, 0)][..], "short"),
+            (&to_short, idle, &[(3, 9), (1, 9)][..], "long"),
+        ] {
+            let loads = rank_snapshot(&[(&long, long_ranks), (&short, short_ranks)]);
+            let [picked, _] = route_both_ways(&workers, &loads, Some(signal));
+            assert_eq!(
+                picked, expected,
+                "long {long_ranks:?}, short {short_ranks:?}"
+            );
+        }
     }
 }

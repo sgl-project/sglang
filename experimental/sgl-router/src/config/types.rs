@@ -653,8 +653,9 @@ pub struct AffinityConfig {
     /// a backup for admission or pressure guards. Separate from cache-owner limits.
     pub min_load_choices: usize,
     /// Match prefill buckets on uncached tokens E instead of the input length. A
-    /// request with a reusable prefix uses E's buckets; a request without one
-    /// uses every prefill worker.
+    /// request with a reusable prefix uses E's buckets, and spills to a worker
+    /// with an idle DP rank when every rank in them has pending prefill; a
+    /// request without one uses every prefill worker.
     pub route_by_uncached_tokens: bool,
 }
 
