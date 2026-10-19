@@ -6,7 +6,9 @@ from typing import Any, List, Optional
 import torch
 
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
-    _jit_online_c128_mtp_module,
+    online_c128_mtp_commit_pending,
+    online_c128_mtp_mark_pending,
+    online_c128_mtp_write_prefix_states,
 )
 from sglang.srt.environ import envs
 
@@ -61,14 +63,14 @@ class OnlineC128MTPController:
         if head_dim is None or state_dtype is None or self._num_verify_tokens() == 0:
             return
         token_to_kv_pool = self.backend.token_to_kv_pool
-        _jit_online_c128_mtp_module(
-            head_dim, seq_lens.dtype, req_pool_indices.dtype, state_dtype
-        ).mark_pending(
+        online_c128_mtp_mark_pending(
             seq_lens,
             req_pool_indices,
             token_to_kv_pool.get_online_c128_mtp_pending_seq_lens(),
             min(seq_lens.shape[0], req_pool_indices.shape[0]),
             token_to_kv_pool.get_online_c128_state_num_req_slots(),
+            head_dim=head_dim,
+            state_dtype=state_dtype,
         )
 
     def clear(self) -> None:
@@ -144,9 +146,7 @@ class OnlineC128MTPController:
         if layer_bs <= 0:
             return
 
-        _jit_online_c128_mtp_module(
-            head_dim, ctx.seq_lens.dtype, ctx.req_pool_indices.dtype, state.dtype
-        ).write_prefix_states(
+        online_c128_mtp_write_prefix_states(
             kv_score_input,
             ctx.seq_lens,
             ctx.req_pool_indices,
@@ -156,6 +156,7 @@ class OnlineC128MTPController:
             layer_bs,
             num_verify_tokens,
             state_pool.online_mtp_state_slot_offset,
+            head_dim=head_dim,
         )
 
     def commit_pending(
@@ -182,12 +183,7 @@ class OnlineC128MTPController:
         cur_bs = min(seq_lens.shape[0], req_pool_indices.shape[0])
 
         for runtime in self._iter_layer_runtimes():
-            _jit_online_c128_mtp_module(
-                runtime.head_dim,
-                seq_lens.dtype,
-                req_pool_indices.dtype,
-                runtime.state_dtype,
-            ).commit_pending(
+            online_c128_mtp_commit_pending(
                 seq_lens,
                 req_pool_indices,
                 backend.req_to_token,
@@ -197,6 +193,7 @@ class OnlineC128MTPController:
                 num_verify_tokens,
                 runtime.state_slot_offset,
                 token_to_kv_pool.get_online_c128_state_num_req_slots(),
+                head_dim=runtime.head_dim,
             )
 
         self.clear()
