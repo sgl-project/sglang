@@ -291,6 +291,9 @@ class Envs:
     #        group at offset (r * k), improving multi-rank I/O concurrency while
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
+    # Seconds the ranks wait for each other at the end of an unbalanced weight load
+    # (one rank loading much more than the others, e.g. KTransformers' CPU experts).
+    SGLANG_UNBALANCED_LOAD_TIMEOUT_S = EnvInt(480)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
     # instead of gathering DP tokens for a global-TP lookup.
