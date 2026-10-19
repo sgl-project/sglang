@@ -26,6 +26,7 @@
 
 #include <tvm/ffi/container/tensor.h>
 
+#include "qknorm.cuh"
 #include <cmath>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -342,5 +343,123 @@ void fused_qk_norm_rope(
           attention_factor,
           rotary_dim);
 }
+
+struct QKNormMRoPEParams {
+  void* q;
+  void* k;
+  const void* q_weight;
+  const void* k_weight;
+  const bf16_t* cache;
+  const int64_t* positions;
+  const int64_t* axis_map;
+  int64_t q_stride;
+  int64_t k_stride;
+  int64_t position_stride;
+  uint32_t q_heads;
+  uint32_t k_heads;
+  uint32_t tokens;
+  float eps;
+};
+
+struct QKNormMRoPEEpilogue {
+  struct Params {
+    QKNormParams norm;
+    QKNormMRoPEParams rope;
+  };
+  static __device__ const QKNormParams& norm_params(const Params& p) {
+    return p.norm;
+  }
+  template <typename Storage>
+  static __device__ Storage apply(Storage out, const Params& params, int64_t token, int64_t head) {
+    using namespace device;
+    const auto& p = params.rope;
+    const auto lane = get_lane_id();
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+      const auto f = cast<fp32x2_t>(out[j]);
+      const auto partner = make_float2(__shfl_xor_sync(0xffffffff, f.x, 16), __shfl_xor_sync(0xffffffff, f.y, 16));
+      bf16_t values[2] = {__float2bfloat16(f.x), __float2bfloat16(f.y)};
+      const bf16_t partners[2] = {__float2bfloat16(partner.x), __float2bfloat16(partner.y)};
+#pragma unroll
+      for (int v = 0; v < 2; ++v) {
+        const auto d = (lane * 4 + 2 * j + v) % 64;
+        const auto position = p.positions[p.axis_map[d] * p.position_stride + token];
+        const auto c = p.cache[position * 128 + d];
+        const auto s = p.cache[position * 128 + d + 64];
+        const auto a = lane < 16 ? values[v] : partners[v];
+        const auto b = lane < 16 ? partners[v] : values[v];
+        // Preserve the Triton MRoPE kernel's BF16 FMA contraction order.
+        values[v] = lane < 16 ? __hfma(a, c, __hneg(__hmul(b, s))) : __hfma(a, s, __hmul(b, c));
+      }
+      out[j] = __halves2bfloat162(values[0], values[1]);
+    }
+    return out;
+  }
+};
+
+/// Validated entry point for BF16 Q/K with 128-element heads.
+template <bool kUsePDL>
+struct FusedQKNormMRoPE {
+  static void
+  run(tvm::ffi::TensorView q,
+      tvm::ffi::TensorView k,
+      tvm::ffi::TensorView q_weight,
+      tvm::ffi::TensorView k_weight,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView positions,
+      tvm::ffi::TensorView axis_map,
+      float eps) {
+    using namespace host;
+    auto N = SymbolicSize{"tokens"};
+    auto Q = SymbolicSize{"q_width"};
+    auto K = SymbolicSize{"k_width"};
+    auto Sq = SymbolicSize{"q_stride"};
+    auto Sk = SymbolicSize{"k_stride"};
+    auto Sp = SymbolicSize{"position_stride"};
+    auto C = SymbolicSize{"cache_length"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({N, Q}).with_strides({Sq, 1}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(q);
+    TensorMatcher({N, K}).with_strides({Sk, 1}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(k);
+    TensorMatcher({128}).with_dtype<bf16_t>().with_device(device).ensure_alignment(8).verify(q_weight).verify(k_weight);
+    TensorMatcher({C, 128}).with_dtype<bf16_t>().with_device(device).verify(cache);
+    TensorMatcher({3, N}).with_strides({Sp, 1}).with_dtype<int64_t>().with_device(device).verify(positions);
+    TensorMatcher({64}).with_dtype<int64_t>().with_device(device).verify(axis_map);
+    CHECK_HOST(Q.unwrap() > 0 && K.unwrap() > 0);
+    CHECK_HOST(Q.unwrap() % 128 == 0 && K.unwrap() % 128 == 0);
+    if (N.unwrap() == 0) return;
+    const auto p = QKNormMRoPEParams{
+        q.data_ptr(),
+        k.data_ptr(),
+        q_weight.data_ptr(),
+        k_weight.data_ptr(),
+        static_cast<const bf16_t*>(cache.data_ptr()),
+        static_cast<const int64_t*>(positions.data_ptr()),
+        static_cast<const int64_t*>(axis_map.data_ptr()),
+        Sq.unwrap(),
+        Sk.unwrap(),
+        Sp.unwrap(),
+        static_cast<uint32_t>(Q.unwrap() / 128),
+        static_cast<uint32_t>(K.unwrap() / 128),
+        static_cast<uint32_t>(N.unwrap()),
+        eps};
+    using Epilogue = QKNormMRoPEEpilogue;
+    const typename Epilogue::Params params{
+        QKNormParams{
+            p.q,
+            pointer::offset(p.k, -2 * static_cast<int64_t>(p.q_heads) * 128),
+            p.q_stride,
+            p.k_stride,
+            p.q_heads,
+            p.k_heads,
+            p.eps,
+            p.q_weight,
+            p.k_weight,
+            p.tokens},
+        p};
+    LaunchKernel(div_ceil((p.q_heads + p.k_heads) * p.tokens, 4u), 128, device.unwrap())
+        .enable_pdl(kUsePDL)(fused_qknorm_warp<128, kUsePDL, bf16_t, Epilogue, false>, params);
+  }
+};
 
 }  // namespace sglang

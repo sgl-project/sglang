@@ -33,38 +33,63 @@ struct QKNormParams {
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
-// Warp-level kernel for head_dim <= 256
-template <int64_t kHeadDim, bool kUsePDL, typename Float>
-__global__ void fused_qknorm_warp(const QKNormParams __grid_constant__ params) {
+struct QKNormIdentityEpilogue {
+  using Params = QKNormParams;
+  static __device__ const QKNormParams& norm_params(const Params& p) {
+    return p;
+  }
+  template <typename Storage>
+  static __device__ Storage apply(Storage output, const Params&, int64_t, int64_t) {
+    return output;
+  }
+};
+
+template <int64_t kHeadDim, bool kUsePDL, typename Float, typename Epilogue, bool kWait>
+SGL_DEVICE void qknorm_warp_head(const typename Epilogue::Params& params, uint32_t idx) {
   using namespace device;
   using Storage = norm::StorageType<Float, kHeadDim>;
-
-  static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
-  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
-
-  const auto num_blks = gridDim.x;
-  const auto num_workers = num_blks * kWarpsPerBlock;
+  const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] =
+      Epilogue::norm_params(params);
   const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
-  const auto num_works = num_q_and_k_heads * num_tokens;
-  const auto start_worker_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
+  const int64_t token_id = idx / num_q_and_k_heads;
+  const int64_t head_id = idx % num_q_and_k_heads;
+  const auto load_q = head_id < num_qo_heads;
+  const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
+                            : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
+  const auto weight = load_q ? q_weight : k_weight;
   const auto gmem = tile::Memory<Storage>::warp();
+  if constexpr (kWait) PDLWaitPrimary<kUsePDL>();
+  const auto input_vec = gmem.load(input);
+  const auto weight_vec = gmem.load(weight);
+  const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
+  const auto final_vec = Epilogue::apply(output_vec, params, token_id, head_id);
+  gmem.store(input, final_vec);
+}
 
-  PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
-
-  for (auto idx = start_worker_id; idx < num_works; idx += num_workers) {
-    const int64_t token_id = idx / num_q_and_k_heads;
-    const int64_t head_id = idx % num_q_and_k_heads;
-    const auto load_q = head_id < num_qo_heads;
-    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
-                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
-    const auto weight = load_q ? q_weight : k_weight;
-    const auto input_vec = gmem.load(input);
-    const auto weight_vec = gmem.load(weight);
-    const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
-    gmem.store(input, output_vec);
+// Warp-level kernel for head_dim <= 256
+template <
+    int64_t kHeadDim,
+    bool kUsePDL,
+    typename Float,
+    typename Epilogue = QKNormIdentityEpilogue,
+    bool kPersistent = true>
+__global__ void fused_qknorm_warp(const typename Epilogue::Params __grid_constant__ params) {
+  using namespace device;
+  static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
+  const auto& p = Epilogue::norm_params(params);
+  const auto num_workers = gridDim.x * kWarpsPerBlock;
+  const auto num_works = (p.num_qo_heads + p.num_kv_heads) * p.num_tokens;
+  const auto start_worker_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
+  if constexpr (kPersistent) {
+    PDLWaitPrimary<kUsePDL>();
+    for (auto idx = start_worker_id; idx < num_works; idx += num_workers) {
+      qknorm_warp_head<kHeadDim, kUsePDL, Float, Epilogue, false>(params, idx);
+    }
+  } else {
+    if (start_worker_id >= num_works) return;
+    qknorm_warp_head<kHeadDim, kUsePDL, Float, Epilogue, true>(params, start_worker_id);
   }
-
-  PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 // For CTA level, used for head_dim > 256 (512,1024)
