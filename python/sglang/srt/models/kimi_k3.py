@@ -1496,7 +1496,11 @@ class KimiK3MoE(nn.Module):
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+                k3_ar_fusion.all_reduce_low_sm(
+                    shared_output,
+                    num_blocks=1 if sharded_front and num_tokens == 1 else 4,
+                    unroll=8,
+                )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
