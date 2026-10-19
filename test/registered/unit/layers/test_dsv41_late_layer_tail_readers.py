@@ -355,9 +355,8 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
 
 
 def _prefill_graph_replay_widths(*, unbounded):
-    """The context widths a prefill-graph replay builds the full-row and the
-    late-layer tail metadata at, for one request of 1,024 new tokens after a
-    155,648-token cached prefix."""
+    """The widths a replay gives the full-row and tail metadata, for 1,024 new
+    tokens after a 155,648-token cached prefix."""
     seen = {}
 
     def build_full(forward_batch, *, max_seq_len_override, use_prefill_cuda_graph):

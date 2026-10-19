@@ -223,13 +223,9 @@ class SparseTableBackend:
     def publish_prefill_graph(
         self, inputs: PrefillInputs, num_rows: int, *, shared: bool
     ) -> tuple:
-        """The candidate source under the prefill CUDA graph: publish over the live
-        rows, then return the table of the graph's ``num_rows`` rows (live rows first,
-        padding rows repeat the last live row) as the tensors its consumers read.
-        With ``shared`` (at capture) they are views of this layer's buffers, so every
-        bucket reads one address; at replay eager_on_graph copies the live table
-        there, one graph at a time. The shapes, DeepGEMM's sparse schedule included,
-        depend only on the row and block counts, so the copy always fits."""
+        """The candidate source's table over the graph's ``num_rows`` rows. Buckets may
+        share one buffer: graphs replay one at a time, and the shapes, DeepGEMM's
+        schedule included, depend only on the row and block counts."""
         published = self.publish_prefill(inputs)
         assert published is not None, "candidate source published no sparse table"
         live = published.blocks.shape[0]

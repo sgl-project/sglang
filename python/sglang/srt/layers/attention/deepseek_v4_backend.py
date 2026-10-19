@@ -1018,9 +1018,8 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
 _PREFILL_GRAPH_INDEXER_ROW_CHUNK = 2048
 
 
-# DeepSeek-V4.1's prefill graph captures the ratio-1/2 indexer at this context width
-# unless any context replays: the candidate window (2,048 blocks of 8 tokens), inside
-# which the captured full top-k equals the two-level selection.
+# The candidate window (2,048 blocks of 8 tokens): inside it the captured full
+# top-k equals the two-level selection.
 _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
@@ -3002,9 +3001,7 @@ class DeepseekV4AttnBackend(
         return self.forward_metadata
 
     def _prefill_graph_context_width(self, forward_batch: ForwardBatch) -> int:
-        """The context width of the prefill graph's metadata, for the full rows and
-        the late-layer tail alike: the live context when any context replays, else
-        the captured width bounded by the graph's context limit."""
+        """One context width for the full rows' and the late-layer tail's metadata."""
         if self._prefill_graph_replays_any_context():
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
@@ -3715,10 +3712,8 @@ class DeepseekV4AttnBackend(
             out_page_indices=core.sparse_page_indices(ratio),
             out_raw_indices=core.sparse_raw_indices(ratio),
         )
-        # Two-level consumers take the two-level path at every width: inside the
-        # candidate window the published table is the identity, so it equals the
-        # plain top-k, and past it the full top-k would be wrong. The candidate
-        # source publishes the table from an eager break (forward_low_ratio_sources).
+        # At any width: inside the candidate window the published table is the
+        # identity, and past it the full top-k would be wrong.
         if indexer.uses_candidates and self._prefill_graph_two_level():
             self.prefill_candidates.consume_prefill_captured(
                 inputs, self.forward_metadata.candidate_metadata
@@ -3813,10 +3808,8 @@ class DeepseekV4AttnBackend(
         self.forward_metadata.candidate_metadata = published
 
     def _prefill_graph_two_level(self) -> bool:
-        """Whether the prefill graph selects with two-level candidates: the full
-        top-k layers score at eager breaks and the consumers score the published
-        candidate blocks. Otherwise the captured full top-k reads the ratio-1/2
-        indexer metadata by address."""
+        """Whether the full top-k layers score at eager breaks and the consumers score
+        the published candidate blocks inside the prefill graph."""
         return isinstance(self.prefill_candidates, SparseTableBackend)
 
     def _prefill_graph_replays_any_context(self) -> bool:
@@ -3831,9 +3824,8 @@ class DeepseekV4AttnBackend(
 
     @property
     def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1 bounds the replayed context by the captured indexer width
-        unless any context replays; prefill context parallelism builds its own
-        metadata and needs no bound."""
+        """DeepSeek-V4.1's captured indexer width; prefill context parallelism builds
+        its own metadata and needs none."""
         if (
             self.low_ratios != (1, 2)
             or get_parallel().attn_cp_size > 1
@@ -3851,11 +3843,9 @@ class DeepseekV4AttnBackend(
         return self.prefill_cuda_graph_default_max_seq_len
 
     def _prefill_graph_full_topk_break(self, layer, x, q_lora, pos, forward_batch):
-        """Eager break of the prefill CUDA graph: one full top-k layer's dense
-        scoring and top-k over the live batch (any context length), writing the
-        persistent sparse indices the attention break reads. The candidate source
-        also returns its block table for the captured consumers (the bounded-replay
-        tail block, else the whole bucket; SparseTableBackend.publish_prefill_graph)."""
+        """One full top-k layer at an eager break of the prefill graph, over the live
+        batch at any context length: writes the sparse indices the attention break
+        reads, and the candidate source returns its table for the captured consumers."""
         indexer = layer.indexer
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:
