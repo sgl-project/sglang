@@ -40,7 +40,7 @@ class DeepseekSparseAttnBackendKPoolMixin:
         phase: str,
     ) -> None:
         # q8 prefill consumes the tail columns as ragged ids, like the history
-        # picks. Only over a bfloat16 pool: gathering packed fp8 rows through
+        # picks over a bfloat16 or raw NoPE fp8 pool: gathering packed fp8 rows through
         # kpool tail columns is untested, so that combination keeps the guard.
         if (
             dsa_impl == "flashmla_sparse_q8"
@@ -52,13 +52,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
             topk_indices is None
             or self.dsa_index_kpool <= 1
             or dsa_impl in ("fa3", "tilelang", "trtllm")
-            or (dsa_impl == "flashmla_sparse_q8" and phase == "prefill")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
             f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
-            "backend (also flashmla_sparse_q8 for prefill)."
+            "backend."
         )
 
     def _resolve_kpool_tail_backend(

@@ -57,6 +57,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     use_mla_backend,
 )
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
+from sglang.srt.layers.attention.dsa.kv_layout import is_q8_raw_fp8_nope_layout
 
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
@@ -554,7 +555,8 @@ def _check_dsa_backend_constraints(
     *,
     hip: bool,
     dcp_size: int = 1,
-    raw_fp8_nope: bool = False,
+    kv_lora_rank: Optional[int] = None,
+    qk_rope_head_dim: Optional[int] = None,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -569,16 +571,18 @@ def _check_dsa_backend_constraints(
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
-    native_raw_nope = (
-        raw_fp8_nope
-        and prefill_backend == "flashmla_sparse_q8"
-        and decode_backend == "tilelang"
+    native_raw_nope = is_q8_raw_fp8_nope_layout(
+        prefill_backend=prefill_backend,
+        decode_backend=decode_backend,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
     if not native_raw_nope and (
         prefill_backend != "tilelang" or decode_backend != "tilelang"
     ):
         raise ValueError(
-            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
+            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang, "
+            "or Q8 prefill with TileLang decode and a 512-dim NoPE layout; "
             "raw and scaled FP8 KV layouts cannot be mixed."
         )
     if dcp_size > 1:
@@ -743,11 +747,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
-        raw_fp8_nope=(
-            model_arch == "Glm5NextForConditionalGeneration"
-            and model_config_of(view).qk_rope_head_dim == 0
-            and model_config_of(view).kv_lora_rank == 512
-        ),
+        kv_lora_rank=getattr(model_config_of(view), "kv_lora_rank", None),
+        qk_rope_head_dim=getattr(model_config_of(view), "qk_rope_head_dim", None),
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
