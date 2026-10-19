@@ -6,10 +6,12 @@ import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from torch import nn
 
-from sglang.srt.layers.moe.dwdp.layer_utils import collect_moe_layers
+from sglang.srt.layers.moe.dwdp.layer_utils import (
+    collect_moe_layers,
+    gather_per_expert_tensors,
+)
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
     build_layer_weight_specs,
@@ -188,10 +190,9 @@ class DwdpManager:
         num_total = self.layout.num_routed_experts
 
         for li, experts in moe_layers:
-            for pname, data in experts.named_per_expert_tensors(local_experts):
-                shards = [torch.empty_like(data) for _ in range(self.dwdp_size)]
-                dist.all_gather(shards, data, group=group.device_group)
-                full = torch.cat(shards, dim=0)[:num_total].contiguous()
+            for pname, full in gather_per_expert_tensors(
+                experts, local_experts, num_total, self.dwdp_size, group
+            ):
                 experts.replace_expert_tensor(pname, full)
 
                 logger.debug(

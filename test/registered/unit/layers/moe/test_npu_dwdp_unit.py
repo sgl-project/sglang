@@ -14,7 +14,7 @@ from sglang.srt.hardware_backend.npu.dwdp.vmm import (
     NPUWeightVMM,
     tensor_from_pointer,
 )
-from sglang.srt.layers.moe.dwdp.layout import WeightSpec
+from sglang.srt.layers.moe.dwdp.layout import WeightSpec, build_remote_slices
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
 from sglang.srt.layers.moe.dwdp.weight_manager import DWDPWeightManager
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -86,6 +86,106 @@ def test_cuda_manager_binds_shared_layer_discovery():
         and any(alias.name == "collect_moe_layers" for alias in node.names)
         for node in tree.body
     )
+    buffer_tree = ast.parse(
+        Path(layer_utils.__file__).with_name("weight_buffer.py").read_text()
+    )
+    setup = next(
+        node
+        for node in ast.walk(buffer_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_setup_layer"
+    )
+    calls = {
+        getattr(node.func, "id", getattr(node.func, "attr", None))
+        for node in ast.walk(setup)
+        if isinstance(node, ast.Call)
+    }
+    assert {"map_weight_pages", "build_remote_slices"} <= calls
+
+
+@pytest.mark.parametrize(
+    "backend, weight_dtype",
+    [("cuda", torch.float16), ("npu", torch.float16), ("npu", torch.bfloat16)],
+)
+def test_shared_parameter_gather_preserves_caller_order(
+    monkeypatch, backend, weight_dtype
+):
+    from sglang.srt.hardware_backend.npu.dwdp import manager as npu_manager
+    from sglang.srt.layers.moe.dwdp import layer_utils
+
+    names = ("w13_weight_bias", "w13_weight_scale", "w2_weight_bias")
+    parameters = {
+        name: torch.arange(4, dtype=torch.float32).reshape(2, 2) + index * 20
+        for index, name in enumerate(names)
+    }
+    trace, replaced, helper_calls = [], {}, []
+    num_total = 3 if backend == "cuda" else 4
+    group = NS(device_group=object())
+
+    def named(count):
+        trace.append(("named", count))
+        return list(parameters.items())
+
+    def replace(name, full):
+        trace.append(("replace", name))
+        replaced[name] = full
+
+    experts = NS(
+        num_global_routed_experts=num_total,
+        w13_weight=torch.empty(0, dtype=weight_dtype),
+        named_per_expert_tensors=named,
+        replace_expert_tensor=replace,
+    )
+
+    def all_gather(shards, data, *, group):
+        assert group is manager.group.device_group
+        assert len(shards) == 2
+        trace.append(
+            ("gather", next(name for name in names if parameters[name] is data))
+        )
+        for rank, shard in enumerate(shards):
+            assert shard.shape == data.shape and shard.dtype == data.dtype
+            shard.copy_(data + rank * 10)
+
+    def gather(experts, local_experts, num_total, dwdp_size, group):
+        helper_calls.append((experts, local_experts, num_total, dwdp_size, group))
+        return layer_utils.gather_per_expert_tensors(
+            experts, local_experts, num_total, dwdp_size, group
+        )
+
+    monkeypatch.setattr(torch.distributed, "all_gather", all_gather)
+    manager = NS(dwdp_size=2, group=group)
+    if backend == "npu":
+        monkeypatch.setattr(npu_manager, "gather_per_expert_tensors", gather)
+        NPUDwdpManager._replicate_small_params(manager, experts)
+    else:
+        source = Path(layer_utils.__file__).with_name("dwdp_manager.py").read_text()
+        method = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_allgather_small_params"
+        )
+        namespace = {
+            "gather_per_expert_tensors": gather,
+            "logger": NS(debug=lambda *_: None),
+        }
+        exec("from __future__ import annotations\n" + ast.unparse(method), namespace)
+        manager.layout = NS(num_experts_per_worker=2, num_routed_experts=num_total)
+        namespace[method.name](manager, [(7, experts)], group)
+    assert helper_calls == [(experts, 2, num_total, 2, group)]
+    assert trace == [("named", 2)] + [
+        item for name in names for item in (("gather", name), ("replace", name))
+    ]
+    assert list(replaced) == list(names)
+    for name, data in parameters.items():
+        expected = torch.cat((data, data + 10))[:num_total]
+        if (
+            backend == "npu"
+            and name.endswith("_bias")
+            and weight_dtype == torch.float16
+        ):
+            expected = expected.to(torch.float16)
+        torch.testing.assert_close(replaced[name], expected)
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2])
@@ -185,7 +285,17 @@ def test_shared_prefetch_preserves_cuda_order_and_remote_slices(monkeypatch, ran
 
 @pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("expert_bytes", [2, 64, 300, 1024])
-def test_remote_slices_cover_all_remote_weights(world, expert_bytes):
+def test_remote_slices_cover_all_remote_weights(monkeypatch, world, expert_bytes):
+    import sglang.srt.hardware_backend.npu.dwdp.manager as npu_manager
+
+    calls = []
+
+    def slices(full, start, end, total):
+        calls.append((start, end, total))
+        return build_remote_slices(full, start, end, total)
+
+    monkeypatch.setattr(npu_manager, "build_remote_slices", slices)
+    assert build_remote_slices(torch.empty(2, 1), 0, 2, 2) == []
     vmm = NPUWeightVMM.__new__(NPUWeightVMM)
     vmm.granularity = 1024
     spec = WeightSpec(
@@ -209,6 +319,7 @@ def test_remote_slices_cover_all_remote_weights(world, expert_bytes):
             manager._specs[5, name] = spec
             manager._weights[5, name] = torch.zeros(spec.full_shape, dtype=spec.dtype)
         manager._prepare_copy_views()
+        assert calls[-2:] == [(rank * 4, (rank + 1) * 4, world * 4)] * 2
         for name in ("w13_weight", "w2_weight"):
             full, covered = manager._weights[5, name], set()
             for dst, expert_start, expert_end in manager._get_remote_slices(5, name):
@@ -542,6 +653,43 @@ def test_partial_import_cleanup_skips_unfinished_steps(monkeypatch, failure):
     ]
     assert not vmm._imports and not rt.allocations
     assert not rt.mappings and not rt.reservations
+
+
+@pytest.mark.parametrize("pre, post", [(0, 0), (4, 0), (0, 2), (4, 2)])
+def test_shared_weight_mapping_order_and_cursor(pre, post):
+    allocated = []
+
+    def allocate(size):
+        allocated.append(size)
+        return len(allocated)
+
+    pool = PagePool(
+        [20, 0],
+        0,
+        granularity=1,
+        page_size=2,
+        allocate_page=allocate,
+        release_page=lambda handle: None,
+    )
+    layout = NS(
+        pre_size=pre,
+        post_size=post,
+        mnnvl_size=4,
+        pre_pages=pre // 2,
+        post_pages=post // 2,
+    )
+    trace, expected, cursor = [], [], 1
+    reservation = NS(map_existing=lambda *args: trace.append(args))
+    for handle in (100, 101):
+        before = cursor
+        cursor = pool.map_weight_pages(0, reservation, layout, handle, cursor)
+        expected += [(i * 2, 2, before + i + 1) for i in range(pre // 2)]
+        expected.append((pre, 4, handle))
+        expected += [
+            (pre + 4 + i * 2, 2, before + pre // 2 + i + 1) for i in range(post // 2)
+        ]
+    assert cursor == 1 + 2 * (pre + post) // 2
+    assert trace == expected
 
 
 def test_shared_page_pool_reuses_maximum_not_each_size():

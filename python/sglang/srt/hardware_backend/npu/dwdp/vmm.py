@@ -119,21 +119,14 @@ class NPUWeightVMM:
             for name, layout in weight_layouts.items():
                 spec = specs[li, name]
                 full = self._reserve(layout.total_size)
-                self._map(full + layout.pre_size, layout.mnnvl_size, handles[li, name])
                 reservation = SimpleNamespace(
                     map_existing=lambda offset, size, handle, base=full: self._map(
                         base + offset, size, handle
                     )
                 )
-                for offset, size in (
-                    (0, layout.pre_size),
-                    (layout.pre_size + layout.mnnvl_size, layout.post_size),
-                ):
-                    if size:
-                        self._page_pool.map_pages(
-                            assignments[li], reservation, offset, size, page_offset
-                        )
-                        page_offset += size // self._page_pool.page_size
+                page_offset = self._page_pool.map_weight_pages(
+                    assignments[li], reservation, layout, handles[li, name], page_offset
+                )
                 tensors[li, name] = tensor_from_pointer(
                     full + layout.pre_padding,
                     spec.num_experts * spec.expert_bytes,

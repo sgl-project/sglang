@@ -13,8 +13,11 @@ import socket
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.dwdp.layer_utils import collect_moe_layers
-from sglang.srt.layers.moe.dwdp.layout import WeightSpec
+from sglang.srt.layers.moe.dwdp.layer_utils import (
+    collect_moe_layers,
+    gather_per_expert_tensors,
+)
+from sglang.srt.layers.moe.dwdp.layout import WeightSpec, build_remote_slices
 from sglang.srt.layers.moe.dwdp.weight_manager import (
     DwdpPrefetch,
     copy_remote_expert_slices,
@@ -210,10 +213,9 @@ class NPUDwdpManager(DwdpPrefetch):
 
     def _replicate_small_params(self, layer):
         count = layer.num_global_routed_experts // self.dwdp_size
-        for name, data in layer.named_per_expert_tensors(count):
-            shards = [torch.empty_like(data) for _ in range(self.dwdp_size)]
-            dist.all_gather(shards, data, group=self.group.device_group)
-            full = torch.cat(shards).contiguous()
+        for name, full in gather_per_expert_tensors(
+            layer, count, layer.num_global_routed_experts, self.dwdp_size, self.group
+        ):
             if (
                 name in ("w13_weight_bias", "w2_weight_bias")
                 and layer.w13_weight.dtype == torch.float16
@@ -230,12 +232,9 @@ class NPUDwdpManager(DwdpPrefetch):
             self._peer_ranges[li] = [
                 (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
             ]
-            slices = []
-            if start > 0:
-                slices.append((full[:start], 0, start))
-            if end < spec.num_experts:
-                slices.append((full[end:], end, spec.num_experts))
-            self._remote_slices[key] = slices
+            self._remote_slices[key] = build_remote_slices(
+                full, start, end, spec.num_experts
+            )
 
     def _get_remote_slices(self, layer_idx, name):
         return self._remote_slices[layer_idx, name]

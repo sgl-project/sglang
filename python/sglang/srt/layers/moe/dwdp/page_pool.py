@@ -126,6 +126,31 @@ class PagePool:
                 handle,
             )
 
+    def map_weight_pages(self, slot, reservation, layout, local_handle, page_offset=0):
+        """Map the remote prefix, resident local shard, then remote suffix."""
+        if layout.pre_size > 0:
+            self.map_pages(
+                slot=slot,
+                reservation=reservation,
+                offset=0,
+                size=layout.pre_size,
+                page_offset=page_offset,
+            )
+            page_offset += layout.pre_pages
+
+        reservation.map_existing(layout.pre_size, layout.mnnvl_size, local_handle)
+
+        if layout.post_size > 0:
+            self.map_pages(
+                slot=slot,
+                reservation=reservation,
+                offset=layout.pre_size + layout.mnnvl_size,
+                size=layout.post_size,
+                page_offset=page_offset,
+            )
+            page_offset += layout.post_pages
+        return page_offset
+
     def release(self) -> None:
         if self._released:
             return

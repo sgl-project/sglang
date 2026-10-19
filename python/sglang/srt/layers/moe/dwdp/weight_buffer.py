@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.dwdp.layout import (
     LayerWeightSpecs,
     MnnvlHandleSet,
     PageAlignedLayout,
+    build_remote_slices,
 )
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
 from sglang.srt.utils.cuda_vmm_utils import (
@@ -119,27 +120,9 @@ class WeightBuffer:
             self._reservations[layer_idx].append(reservation)
             va_base = reservation.base
 
-            if layout.pre_size > 0:
-                self._page_pool.map_pages(
-                    slot=buf_slot,
-                    reservation=reservation,
-                    offset=0,
-                    size=layout.pre_size,
-                    page_offset=page_pool_offset,
-                )
-                page_pool_offset += layout.pre_pages
-
-            reservation.map_existing(layout.pre_size, layout.mnnvl_size, handle)
-
-            if layout.post_size > 0:
-                self._page_pool.map_pages(
-                    slot=buf_slot,
-                    reservation=reservation,
-                    offset=layout.pre_size + layout.mnnvl_size,
-                    size=layout.post_size,
-                    page_offset=page_pool_offset,
-                )
-                page_pool_offset += layout.post_pages
+            page_pool_offset = self._page_pool.map_weight_pages(
+                buf_slot, reservation, layout, handle, page_pool_offset
+            )
 
             tensor_start = va_base + layout.pre_padding
             full_tensor = tensor_from_pointer(
@@ -152,14 +135,9 @@ class WeightBuffer:
 
             self._tensors[layer_idx][name] = full_tensor
 
-            slices = []
-            if self._local_start > 0:
-                slices.append((full_tensor[: self._local_start], 0, self._local_start))
-            if self._local_end < spec.num_experts:
-                slices.append(
-                    (full_tensor[self._local_end :], self._local_end, spec.num_experts)
-                )
-            self._remote_slices[layer_idx][name] = slices
+            self._remote_slices[layer_idx][name] = build_remote_slices(
+                full_tensor, self._local_start, self._local_end, spec.num_experts
+            )
 
     def get_full_tensor(self, layer_idx: int, name: str) -> torch.Tensor:
         return self._tensors[layer_idx][name]
