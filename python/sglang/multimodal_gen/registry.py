@@ -28,6 +28,15 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
+    FLUX3_ACTION_HF_PATHS,
+    is_flux3_action_package,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
+    FLUX3_IMAGE_HF_PATHS,
+    FLUX3_IMAGE_NAME_PATTERNS,
+    is_flux3_image_package,
+)
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_MODEL_IDS,
     is_sensenova_u1_adapter_only_model,
@@ -43,6 +52,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.process import defer_full_gc_for_imports
 
 logger = init_logger(__name__)
 
@@ -67,51 +77,54 @@ def _discover_and_register_pipelines():
     if _BUILTIN_PIPELINES_DISCOVERED:
         return
 
-    package_name = "sglang.multimodal_gen.runtime.pipelines"
-    package = importlib.import_module(package_name)
-    _BUILTIN_PIPELINES_DISCOVERED = True
+    with defer_full_gc_for_imports():
+        package_name = "sglang.multimodal_gen.runtime.pipelines"
+        package = importlib.import_module(package_name)
+        _BUILTIN_PIPELINES_DISCOVERED = True
 
-    for _, module_name, ispkg in pkgutil.walk_packages(
-        package.__path__, package.__name__ + "."
-    ):
-        if not ispkg:
-            try:
-                pipeline_module = importlib.import_module(module_name)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping pipeline module %s during discovery due to import failure: %s",
-                    module_name,
-                    exc,
-                )
-                logger.debug(
-                    "Pipeline import failure details for %s", module_name, exc_info=True
-                )
-                continue
-            if hasattr(pipeline_module, "EntryClass"):
-                entry_cls = pipeline_module.EntryClass
-                entry_cls_list = (
-                    [entry_cls] if not isinstance(entry_cls, list) else entry_cls
-                )
+        for _, module_name, ispkg in pkgutil.walk_packages(
+            package.__path__, package.__name__ + "."
+        ):
+            if not ispkg:
+                try:
+                    pipeline_module = importlib.import_module(module_name)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping pipeline module %s during discovery due to import failure: %s",
+                        module_name,
+                        exc,
+                    )
+                    logger.debug(
+                        "Pipeline import failure details for %s",
+                        module_name,
+                        exc_info=True,
+                    )
+                    continue
+                if hasattr(pipeline_module, "EntryClass"):
+                    entry_cls = pipeline_module.EntryClass
+                    entry_cls_list = (
+                        [entry_cls] if not isinstance(entry_cls, list) else entry_cls
+                    )
 
-                for cls in entry_cls_list:
-                    if not issubclass(cls, ComposedPipelineBase):
-                        continue
-                    if cls.pipeline_name in _PIPELINE_REGISTRY:
-                        logger.warning(
-                            f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
-                        )
-                    _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+                    for cls in entry_cls_list:
+                        if not issubclass(cls, ComposedPipelineBase):
+                            continue
+                        if cls.pipeline_name in _PIPELINE_REGISTRY:
+                            logger.warning(
+                                f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                            )
+                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
 
-                    # Special handling for ComfyUI Pipelines:
-                    # Auto-register config classes if Pipeline class has them defined
-                    # since comfyui get model from a single weight file, so we need to register the config classes here
-                    if hasattr(cls, "pipeline_config_cls") and hasattr(
-                        cls, "sampling_params_cls"
-                    ):
-                        _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
-                            cls.pipeline_config_cls,
-                            cls.sampling_params_cls,
-                        )
+                        # Special handling for ComfyUI Pipelines:
+                        # Auto-register config classes if Pipeline class has them defined
+                        # since comfyui get model from a single weight file, so we need to register the config classes here
+                        if hasattr(cls, "pipeline_config_cls") and hasattr(
+                            cls, "sampling_params_cls"
+                        ):
+                            _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
+                                cls.pipeline_config_cls,
+                                cls.sampling_params_cls,
+                            )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
@@ -169,15 +182,22 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 # aliases next to the resolver that consumes them so CLI detection and
 # pipeline selection cannot drift apart
 KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "sana-video_2.0": "SanaVideo2Pipeline",
+    "sana-video2": "SanaVideo2Pipeline",
+    "sana_video2": "SanaVideo2Pipeline",
     "ming-image-0.1-design": "MingImagePipeline",
     "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
     "minimax/minimax-h3": "MiniMaxH3Pipeline",
-    "fastvideo/fastvideo-fasth3-4-step-preview-v1-vsa-datafree": "FastH3Pipeline",
+    "fastvideo/fastvideo-fasth3-8-step-v2": "FastH3Pipeline",
     "openvdn/vdn-minimax-h3": "VDNH3Pipeline",
     "lerobot/pi05": "Pi05Pipeline",
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
+    "flux-3-action": "Flux3ActionPipeline",
+    "herzogenhorn/f3-image-small": "Flux3ImagePipeline",
+    **{pattern: "Flux3ImagePipeline" for pattern in FLUX3_IMAGE_NAME_PATTERNS},
     "hunyuan3d": "Hunyuan3D2Pipeline",
+    "hunyuanimage-3": "HunyuanImage3Pipeline",
     "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
@@ -286,9 +306,10 @@ _configs_discovered: bool = False
 
 # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
 # SANA-Video (register before generic SANA to avoid detector overlap).
-_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video")
+_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video2", "sana_video")
 
 
+@defer_full_gc_for_imports()
 def _discover_and_register_configs() -> None:
     global _configs_discovered
     if _configs_discovered:
@@ -347,24 +368,36 @@ def _normalize_hf_cache_path(path: str) -> str:
     return os.path.normpath(path).lower().replace("\\", "/")
 
 
-def has_registered_diffusion_model_path(model_path: str) -> bool:
-    _ensure_registry_initialized()
+def _match_registered_hf_path(model_path: str) -> Optional[str]:
+    """The registered HF id ``model_path`` names: exactly, by short name, or as
+    a local HuggingFace cache path."""
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
-    if is_sensenova_u1_model(model_path):
-        return True
-
+    # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
-        return True
+        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
+        return model_path
 
+    # 2. Partial match: find the best (longest) match against all registered model hf paths.
     model_short_name = get_model_short_name(model_path.lower())
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
-        if registered_model_name in model_short_name:
-            return True
 
+        if registered_model_name in model_short_name:
+            logger.debug(
+                f"Resolved model name '{registered_model_hf_id}' from partial path match."
+            )
+            return registered_model_hf_id
+
+    # 2b. Match local HuggingFace cache snapshot/blob paths such as:
+    #   .../models--org--repo/snapshots/<hash>
+    # This lets users pass a local HF cache snapshot directory directly even
+    # when its basename is only the snapshot hash.
+    # Example:
+    #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
+    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
     normalized_model_path = _normalize_hf_cache_path(model_path)
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
@@ -373,9 +406,22 @@ def has_registered_diffusion_model_path(model_path: str) -> bool:
             f"models--{registered_model_hf_id.lower().replace('/', '--')}"
         )
         if cache_repo_fragment in normalized_model_path:
-            return True
+            logger.debug(
+                "Resolved HuggingFace cache path '%s' to registered model '%s'.",
+                model_path,
+                registered_model_hf_id,
+            )
+            return registered_model_hf_id
 
-    return False
+    return None
+
+
+def has_registered_diffusion_model_path(model_path: str) -> bool:
+    _ensure_registry_initialized()
+    return (
+        is_sensenova_u1_model(model_path)
+        or _match_registered_hf_path(model_path) is not None
+    )
 
 
 @lru_cache(maxsize=1)
@@ -409,52 +455,23 @@ def _get_config_info(
             if registered_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
                 return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
 
-    # 1. Exact match
-    if model_path in _MODEL_HF_PATH_TO_NAME:
-        model_id = _MODEL_HF_PATH_TO_NAME[model_path]
-        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
-        return _CONFIG_REGISTRY.get(model_id)
+    # Local FLUX 3 Action exports are identified by their manifest, not their name.
+    if is_flux3_action_package(model_path):
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_ACTION_HF_PATHS[0]])
+    if is_flux3_image_package(model_path):
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_IMAGE_HF_PATHS[0]])
 
-    # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    model_short_name = get_model_short_name(model_path.lower())
-    for registered_model_hf_id in all_model_hf_paths:
-        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
-            continue
-        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
-
-        if registered_model_name in model_short_name:
-            logger.debug(
-                f"Resolved model name '{registered_model_hf_id}' from partial path match."
-            )
-            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
-            return _CONFIG_REGISTRY.get(model_id)
-
-    # 2b. Match local HuggingFace cache snapshot/blob paths such as:
-    #   .../models--org--repo/snapshots/<hash>
-    # This lets users pass a local HF cache snapshot directory directly even
-    # when its basename is only the snapshot hash.
-    # Example:
-    #    /xxx/models--black-forest-labs--FLUX.2-dev-NVFP4/snapshots/142b87e70bc3006937b7093d89ff287b5f59f071
-    # -> models--black-forest-labs--flux.2-dev-nvfp4 (to match with cache_repo_fragment)
-    normalized_model_path = _normalize_hf_cache_path(model_path)
-    for registered_model_hf_id in all_model_hf_paths:
-        if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
-            continue
-        cache_repo_fragment = (
-            f"models--{registered_model_hf_id.lower().replace('/', '--')}"
-        )
-        if cache_repo_fragment in normalized_model_path:
-            logger.debug(
-                "Resolved HuggingFace cache path '%s' to registered model '%s'.",
-                model_path,
-                registered_model_hf_id,
-            )
-            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
-            return _CONFIG_REGISTRY.get(model_id)
+    # 1/2/2b. Exact, short-name, or local HuggingFace cache path match
+    registered_hf_id = _match_registered_hf_path(model_path)
+    if registered_hf_id is not None:
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
 
     # 3. Use detectors
-    config = maybe_download_model_index(model_path)
-    pipeline_name = config.get("_class_name", "").lower()
+    pipeline_name = get_non_diffusers_pipeline_name(model_path)
+    if pipeline_name is None:
+        config = maybe_download_model_index(model_path)
+        pipeline_name = config.get("_class_name", "")
+    pipeline_name = pipeline_name.lower()
 
     matched_model_names = []
     for model_id, detector in _MODEL_NAME_DETECTORS:
@@ -693,6 +710,10 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
     if is_sensenova_u1_model(model_path):
         return "SenseNovaU1Pipeline"
+    if is_flux3_action_package(model_path):
+        return "Flux3ActionPipeline"
+    if is_flux3_image_package(model_path):
+        return "Flux3ImagePipeline"
 
     normalized_model_path = _normalize_hf_cache_path(model_path)
     model_short_name = get_model_short_name(normalized_model_path)

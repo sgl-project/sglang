@@ -6,7 +6,7 @@ two-batch-overlap path on MI35x ROCm 7.2.
 TBO here is the DP-attention TP-MoE variant (moe_a2a_backend='none'): it overlaps
 one micro-batch's DP all_gatherv (pre-MoE gather) + reduce_scatterv (post-MoE
 combine) with the other micro-batch's attention + expert compute (prefill only).
-Enabled purely via `--enable-dp-attention` + `--enable-two-batch-overlap` (no opt-in
+Enabled purely via `--attn-dp-size` + `--enable-two-batch-overlap` (no opt-in
 env). This test guards that TBO does not regress GSM8K accuracy and that the DP TBO
 server launches + runs to completion (exercises op_gather/op_moe/op_combine and the
 event+ref combine-buffer lifetime that fixed the reserved-memory OOM at mem0.9).
@@ -93,9 +93,8 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
             "8",
             # DP attention + TBO: non-EP DP TP-MoE two-batch-overlap. DP TBO is
             # selected because moe_a2a_backend stays 'none'; no opt-in env needed.
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-prefill-delayer",
             "--enable-two-batch-overlap",
             "--disable-radix-cache",
@@ -113,7 +112,7 @@ class TestDeepseekV4FlashFp8Tbo(CustomTestCase):
             "0.90",
             "--swa-full-tokens-ratio",
             "0.15",
-            # global chunk; DP-attention divides by dp_size=8 -> 8192/rank.
+            # global chunk; DP-attention divides by attn_dp_size=8 -> 8192/rank.
             "--chunked-prefill-size",
             "65536",
             "--disable-shared-experts-fusion",

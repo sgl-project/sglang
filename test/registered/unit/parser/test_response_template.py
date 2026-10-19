@@ -593,6 +593,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         )
 
         self.assertIsNone(detector.think_excluded_tokens)
+        self.assertIsNone(detector.get_answer_frame())
         self.assertEqual(detector.get_think_end_token_ids(tokenizer), [10, False])
 
     def test_force_nonempty_content_returns_reasoning_only_output_as_content(self):

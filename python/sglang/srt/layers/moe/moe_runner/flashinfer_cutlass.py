@@ -26,7 +26,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import is_sm120, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -58,11 +58,8 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
-    moe_tp_size: int = 1
-    moe_tp_rank: int = 0
-    moe_ep_size: int = 1
-    moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    pair_w2_weight: Optional[torch.Tensor] = None
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -143,12 +140,6 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     # Bailing clamps after SiLU, which the kernel only implements in its
     # SwigluStep variant.
     use_swiglu_step: bool = False
-
-    # TP/EP topology (forwarded to the FlashInfer kernel)
-    moe_tp_size: int = 1
-    moe_tp_rank: int = 0
-    moe_ep_size: int = 1
-    moe_ep_rank: int = 0
 
     # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
     # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
@@ -260,6 +251,26 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
+def _sm120_mtp_mma_supported() -> bool:
+    import os
+
+    # This implementation preserves FlashInfer's default FP4 quantizer and
+    # fused FC2 epilogue. Other quantization recipes retain the stock runner.
+    return (
+        is_sm120()
+        and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+        and not envs.FLASHINFER_NVFP4_4OVER6.get()
+        and os.environ.get("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+        and os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+    )
+
+
+def _flashinfer_autotune_active() -> bool:
+    from flashinfer.autotuner import AutoTuner
+
+    return AutoTuner.get().is_tuning_mode
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -277,6 +288,35 @@ def _run_flashinfer_cutlass(
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
+
+    if (
+        quant_info.quant_type == "fp4"
+        and not runner_config.is_gated
+        and runner_config.activation == "relu2"
+        and runner_config.moe_ep_size == runner_config.moe_tp_size == 1
+        and x_sf is None
+        and not enable_alltoall
+        and is_sm120()
+    ):
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import try_nvfp4_moe
+
+        result = try_nvfp4_moe(
+            x,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.quant_scales,
+            topk_ids,
+            topk_weights,
+            output_dtype=output_dtype,
+            out=output,
+            pair_w2_weight=quant_info.pair_w2_weight,
+            # Preserve FlashInfer target/draft tactic discovery during autotuning.
+            use_mtp=_sm120_mtp_mma_supported() and not _flashinfer_autotune_active(),
+        )
+        if result is not None:
+            return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
+    if quant_info.pair_w2_weight is not None:
+        raise RuntimeError("A paired NVFP4 weight reached an unsupported MoE path")
 
     if output is None:
         with use_symmetric_memory(
@@ -318,10 +358,10 @@ def _run_flashinfer_cutlass(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
-        ep_size=quant_info.moe_ep_size,
-        ep_rank=quant_info.moe_ep_rank,
-        tp_size=quant_info.moe_tp_size,
-        tp_rank=quant_info.moe_tp_rank,
+        ep_size=runner_config.moe_ep_size,
+        ep_rank=runner_config.moe_ep_rank,
+        tp_size=runner_config.moe_tp_size,
+        tp_rank=runner_config.moe_tp_rank,
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
@@ -355,13 +395,21 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    # All-gather prefill must use ordinary expert execution and reduce-scatter
+    # combine, without the decode A2A workspace or kernel layout.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
 
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
@@ -525,10 +573,10 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
-        tp_size=quant_info.moe_tp_size,
-        tp_rank=quant_info.moe_tp_rank,
-        ep_size=quant_info.moe_ep_size,
-        ep_rank=quant_info.moe_ep_rank,
+        tp_size=runner_config.moe_tp_size,
+        tp_rank=runner_config.moe_tp_rank,
+        ep_size=runner_config.moe_ep_size,
+        ep_rank=runner_config.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         activation_type=(

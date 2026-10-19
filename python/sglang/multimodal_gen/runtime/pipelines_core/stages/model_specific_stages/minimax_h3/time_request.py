@@ -33,6 +33,7 @@ def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,
     shift_scale: float = 6.0,
+    dmd_steps: tuple[int, ...] | None = None,
 ) -> list[float]:
     if shift_scale <= 0:
         raise ValueError("MiniMax H3 shift_scale must be > 0")
@@ -41,19 +42,28 @@ def minimax_h3_time_shift_sigmas(
 
     import torch
 
-    # The rectified-flow sigma range is fixed at [1.0, 0.0].
-    base = torch.linspace(
-        1.0,
-        0.0,
-        int(num_steps),
-        device="cpu",
-        dtype=torch.float32,
-    )
+    if dmd_steps is not None:
+        if int(num_steps) != len(dmd_steps):
+            raise ValueError(
+                f"this checkpoint is distilled for {len(dmd_steps)} DiT forwards "
+                f"({len(dmd_steps) + 1} sigma grid points); got "
+                f"num_inference_steps={num_steps}"
+            )
+        # trained rungs are unshifted timesteps over 1000; append the final step to sigma 0
+        base = torch.tensor(
+            [step / 1000.0 for step in dmd_steps] + [0.0], dtype=torch.float32
+        )
+    else:
+        # The rectified-flow sigma range is fixed at [1.0, 0.0].
+        base = torch.linspace(
+            1.0,
+            0.0,
+            int(num_steps) + 1,
+            device="cpu",
+            dtype=torch.float32,
+        )
     shifted = float(shift_scale) * base / (1 + (float(shift_scale) - 1) * base)
     shifted, _ = torch.unique_consecutive(shifted, return_counts=True)
-    # A one-point request is still exactly one point.  Normal serving uses
-    # multiple points, but preserving the requested cardinality keeps
-    # ``num_inference_steps`` the sole schedule-size control.
-    if num_steps > 1 and shifted[-1].item() > 0.0:
+    if shifted[-1].item() > 0.0:
         shifted = torch.cat([shifted, torch.tensor([0.0], dtype=shifted.dtype)])
     return [float(value) for value in shifted.tolist()]

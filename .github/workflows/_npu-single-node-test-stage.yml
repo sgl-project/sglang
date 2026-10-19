@@ -71,10 +71,10 @@ on:
         description: 'If true, delegate test execution to scripts/ci/npu/precise-test/run_tests_with_coverage.sh instead of running via run_suite.py directly'
         type: boolean
         default: false
-      upload_test_logs:
-        description: 'If true, upload the test logs as a GitHub Actions artifact (only enabled by pr-test-npu)'
-        type: boolean
-        default: false
+      only_tests:
+        description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
+        type: string
+        default: ''
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -85,7 +85,7 @@ concurrency:
 
 jobs:
   e2e:
-    name: ${{ inputs.test_suite }}
+    name: ${{ inputs.test_suite }}${{ inputs.use_coverage_runner && format(' ({0})', matrix.partition) || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -188,7 +188,7 @@ jobs:
                 return false;
               }
               // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
-              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
+              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-4-npu-a3') {
                 core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
                 return false;
               }
@@ -238,6 +238,7 @@ jobs:
           SGLANG_IS_IN_CI: true
           TRANSFORMERS_VERBOSITY: "error"
           GDN_ATTN_BACKEND_TRITON: 1
+          ONLY_TESTS: ${{ inputs.only_tests }}
         shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
@@ -401,6 +402,16 @@ jobs:
             PARTITION_ARGS="--auto-partition-id ${PARTITION_ID} --auto-partition-size ${PARTITION_SIZE}"
           fi
 
+          # Precision-test mode: run only the coverage-recommended files for
+          # this suite. The bucketed list comes from recommend-tests-from-
+          # coverage; empty input keeps the full-suite behavior.
+          ONLY_FILE_ARGS=""
+          if [ -n "${ONLY_TESTS}" ]; then
+            printf '%s\n' "${ONLY_TESTS}" > /tmp/precision_tests.txt
+            ONLY_FILE_ARGS="--only-file-list /tmp/precision_tests.txt"
+            echo "Precision mode: running $(wc -l < /tmp/precision_tests.txt) recommended file(s)"
+          fi
+
           # Append `--timeout-from-est‑time` when the job belongs to the nightly pipeline.
           # per‑case timeout is derived from each case's est_time.
           TIMEOUT_FLAG=""
@@ -435,7 +446,7 @@ jobs:
           # Run NPU test suite with run_suite.py.
           # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
           # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
@@ -467,12 +478,3 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
           exit ${test_exit_code}
-
-      - name: Upload test logs
-        if: always() && inputs.use_coverage_runner != true && inputs.upload_test_logs == true
-        uses: actions/upload-artifact@v7
-        with:
-          name: selected-test-logs-${{ inputs.test_suite }}-part${{ matrix.partition }}
-          path: /tmp/test-logs/
-          if-no-files-found: ignore
-          retention-days: 14

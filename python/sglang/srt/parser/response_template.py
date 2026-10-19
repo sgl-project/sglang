@@ -409,6 +409,9 @@ class ResponseTemplateReasoningDetector:
     def get_think_end_token_ids(self, tokenizer) -> list[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
+    def get_answer_frame(self) -> None:
+        return None
+
     def detect_and_parse(self, text: str) -> _ReasoningResult:
         adapter = self._new_adapter()
         result = adapter.route_reasoning_events(
