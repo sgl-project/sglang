@@ -221,16 +221,14 @@ class TestFloatViews(unittest.TestCase):
         self.assertEqual(len(k_views), spec.layer_num)
         self.assertEqual(len(v_views), spec.layer_num)
         num_pages = pool.max_slots("swa") // page_size
-        blocks = 2 * spec.layer_num  # K at block 2l, V at 2l+1
-        n_rows = num_pages * blocks * page_size
+        n_rows = num_pages * page_size
         for k in (*k_views, *v_views):
-            # Stock 3-D per-layer MHA signature; the row index is the
-            # kernel-facing id, each view's storage_offset folding in its block
-            # origin (see `build_mha_views`).
+            # 3-D per-layer views indexed by the physical token id; the slot
+            # stride is the whole entry (see `build_dense_views`).
             self.assertEqual(tuple(k.shape), (n_rows, spec.head_num, spec.head_dim))
+            self.assertEqual(k.stride(0) * k.element_size(), spec.entry_bytes())
         # Round-trip: a float view is a real strided window into _raw.
-        slot = pool.min_slot_index("swa")
-        row = (slot // page_size) * (page_size * blocks) + slot % page_size
+        row = pool.min_slot_index("swa")
         pattern = (
             torch.arange(spec.head_num * spec.head_dim, dtype=torch.float32)
             .reshape(spec.head_num, spec.head_dim)

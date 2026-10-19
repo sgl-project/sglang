@@ -22,7 +22,6 @@ import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-import psutil
 import torch
 import tqdm
 
@@ -48,6 +47,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     empty_context,
+    get_free_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -619,7 +619,7 @@ class CPUGraphRunner:
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.tp_size = get_parallel().tp_size
-        self.dp_size = get_parallel().dp_size
+        self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
@@ -644,7 +644,7 @@ class CPUGraphRunner:
             "CPUGraphRunner does not support speculative inference yet."
         )
 
-        assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
+        assert self.num_dp_ranks == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
         # Batch sizes to capture
@@ -741,7 +741,7 @@ class CPUGraphRunner:
         )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
-                avail_mem = psutil.virtual_memory().available / (1 << 30)
+                avail_mem = get_free_cpu_memory() / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
@@ -750,7 +750,7 @@ class CPUGraphRunner:
                 self.model_runner.model,
                 bs in self.capture_bs,
                 num_tokens=bs * self.captured_req_width,
-                tp_group=self.model_runner.tp_group,
+                tp_group=get_parallel().tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
                     bs, forward, skip_cross_attention=True
@@ -831,6 +831,7 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
+        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -848,12 +849,13 @@ class CPUGraphRunner:
                     num_tokens,
                     req_pool_indices,
                     seq_lens,
+                    out_cache_loc,
                     None,
                     forward_batch.forward_mode,
                     forward_batch.spec_info,
                 )
                 with torch.no_grad():
-                    self.model_runner.tp_group.barrier()
+                    get_parallel().tp_group.barrier()
                     self.model_runner.model.forward(
                         forward_batch.input_ids,
                         forward_batch.positions,
@@ -875,7 +877,7 @@ class CPUGraphRunner:
 
                 with torch.no_grad():
                     for _ in range(2):
-                        self.model_runner.tp_group.barrier()
+                        get_parallel().tp_group.barrier()
                         out = run_once()
                     # Save the captured forward_batch in the appropriate dict
                     if skip_cross_attention:

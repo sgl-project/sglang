@@ -58,10 +58,6 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_alpha: Optional[torch.Tensor] = None
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
-    moe_tp_size: int = 1
-    moe_tp_rank: int = 0
-    moe_ep_size: int = 1
-    moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
 
 
@@ -143,12 +139,6 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     # Bailing clamps after SiLU, which the kernel only implements in its
     # SwigluStep variant.
     use_swiglu_step: bool = False
-
-    # TP/EP topology (forwarded to the FlashInfer kernel)
-    moe_tp_size: int = 1
-    moe_tp_rank: int = 0
-    moe_ep_size: int = 1
-    moe_ep_rank: int = 0
 
     # GPT-OSS pads its input hidden dim up to the (pre-padded) loaded weight
     # width and trims the output back. DSv4 leaves this as ``None`` (no pad).
@@ -318,10 +308,10 @@ def _run_flashinfer_cutlass(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
-        ep_size=quant_info.moe_ep_size,
-        ep_rank=quant_info.moe_ep_rank,
-        tp_size=quant_info.moe_tp_size,
-        tp_rank=quant_info.moe_tp_rank,
+        ep_size=runner_config.moe_ep_size,
+        ep_rank=runner_config.moe_ep_rank,
+        tp_size=runner_config.moe_tp_size,
+        tp_rank=runner_config.moe_tp_rank,
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
@@ -355,13 +345,21 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    # All-gather prefill must use ordinary expert execution and reduce-scatter
+    # combine, without the decode A2A workspace or kernel layout.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
 
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
@@ -525,10 +523,10 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
-        tp_size=quant_info.moe_tp_size,
-        tp_rank=quant_info.moe_tp_rank,
-        ep_size=quant_info.moe_ep_size,
-        ep_rank=quant_info.moe_ep_rank,
+        tp_size=runner_config.moe_tp_size,
+        tp_rank=runner_config.moe_tp_rank,
+        ep_size=runner_config.moe_ep_size,
+        ep_rank=runner_config.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         activation_type=(

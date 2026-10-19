@@ -4,6 +4,7 @@
 //! HTTP proxy — forwards requests to the upstream SGLang worker.
 
 mod abort;
+pub mod grpc;
 pub mod sse;
 
 use abort::AbortOnDrop;
@@ -16,7 +17,7 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
-use reqwest::{Client, Url};
+use reqwest::{Client, RequestBuilder, Url};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -49,11 +50,21 @@ enum BreakerOutcome {
     /// A real fault (5xx other than backpressure) → `record_failure`: count
     /// toward opening.
     Failure,
-    /// Backpressure or router-side stream expiry →
+    /// Backpressure or a router-side stream expiry or abort →
     /// `record_backpressure`: never opens the breaker and, while Closed, leaves
     /// an in-progress failure streak intact — but still resolves a half-open
     /// probe so a recovered-but-busy worker isn't wedged shut.
     Neutral,
+}
+
+impl BreakerOutcome {
+    fn record(self, breaker: &CircuitBreaker) {
+        match self {
+            BreakerOutcome::Success => breaker.record_success(),
+            BreakerOutcome::Failure => breaker.record_failure(),
+            BreakerOutcome::Neutral => breaker.record_backpressure(),
+        }
+    }
 }
 
 /// Classify an upstream status for circuit-breaker accounting.
@@ -85,13 +96,13 @@ fn breaker_outcome(status: reqwest::StatusCode) -> BreakerOutcome {
     }
 }
 
-/// Router-side expiry says nothing about worker health. Preserve the existing
+/// Router-side expiry or abort says nothing about worker health. Preserve the existing
 /// treatment of completed streams and client disconnects; upstream faults,
 /// idle timeouts, and pump panics remain failures.
 fn stream_breaker_outcome(end: sse::StreamEnd) -> BreakerOutcome {
     use sse::StreamEndReason;
     match end.reason {
-        StreamEndReason::Expired => BreakerOutcome::Neutral,
+        StreamEndReason::Expired | StreamEndReason::Aborted => BreakerOutcome::Neutral,
         StreamEndReason::Completed | StreamEndReason::ClientDisconnect => BreakerOutcome::Success,
         StreamEndReason::UpstreamError
         | StreamEndReason::IdleTimeout
@@ -109,8 +120,10 @@ pub struct Proxy {
     /// is used only for workers whose `/server_info` reported `--enable-http2`
     /// on a cleartext URL.
     h2c_client: Client,
-    /// Wall-clock timeout applied to non-streaming upstream requests. Streaming
-    /// requests deliberately do not use this (long generations are valid).
+    /// Wall-clock timeout for a non-streaming upstream request, and for a
+    /// streaming one's response headers, which SGLang's chat endpoint sends with
+    /// the first token. A stream's body is not bounded by it
+    /// (long generations are valid), only by the idle and stale-request limits.
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
@@ -123,6 +136,8 @@ pub struct Proxy {
 fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
     let builder = Client::builder()
         .pool_max_idle_per_host(64)
+        // Under SGLang's default 5 s keep-alive, so idle connections close here first.
+        .pool_idle_timeout(Duration::from_secs(3))
         .connect_timeout(Duration::from_secs(5));
     match protocol {
         WireProtocol::Http1 => builder,
@@ -132,9 +147,42 @@ fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
     .context("build reqwest client")
 }
 
+/// Sends `req`, and once more if the worker closed an HTTP/1.1 connection before
+/// answering: an engine closing an idle keep-alive connection never read the request.
+/// Not for h2c, where one connection carries many requests.
+async fn send_retrying_closed_connection(
+    req: RequestBuilder,
+    protocol: WireProtocol,
+) -> reqwest::Result<reqwest::Response> {
+    let retry = match protocol {
+        WireProtocol::Http1 => req.try_clone(),
+        WireProtocol::H2c => None,
+    };
+    match (req.send().await, retry) {
+        (Err(e), Some(retry)) if closed_before_response(&e) => {
+            tracing::debug!(error = ?e, "worker closed the connection before answering; resending");
+            retry.send().await
+        }
+        (result, _) => result,
+    }
+}
+
+/// A reset, broken pipe or EOF on an open connection, before any response.
+fn closed_before_response(e: &reqwest::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
+    !e.is_connect()
+        && std::iter::successors(std::error::Error::source(e), |c| c.source()).any(|c| {
+            c.downcast_ref::<hyper::Error>()
+                .is_some_and(hyper::Error::is_incomplete_message)
+                || c.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    matches!(io.kind(), ConnectionReset | BrokenPipe | UnexpectedEof)
+                })
+        })
+}
+
 impl Proxy {
     /// Build a proxy. `request_timeout` is the per-request wall-clock budget for
-    /// non-streaming forwards. Connect timeout is hard-coded to 5 s — even a
+    /// non-streaming forwards and for streaming response headers. Connect timeout is hard-coded to 5 s — even a
     /// streaming request fails fast at TCP setup if the worker is unreachable.
     ///
     /// WHY both clients up front: protocol is a per-worker property resolved
@@ -235,10 +283,12 @@ impl Proxy {
             .timeout(self.request_timeout);
         let mut abort =
             AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
-        let resp = req.send().await.map_err(|e| {
-            breaker.record_failure();
-            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-        })?;
+        let resp = send_retrying_closed_connection(req, protocol)
+            .await
+            .map_err(|e| {
+                breaker.record_failure();
+                Self::classify_reqwest_error_for(worker_url.clone(), e, path)
+            })?;
         let status = resp.status();
         // Defer breaker recording until after the body completes — a
         // worker that returns 2xx headers and then drops mid-body is
@@ -314,6 +364,7 @@ impl Proxy {
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
         on_stream_end: Option<Box<dyn FnOnce(sse::StreamEnd) + Send + 'static>>,
         expiration: Option<CancellationToken>,
+        stream_abort: Option<CancellationToken>,
     ) -> Result<Response<Body>, ApiError> {
         let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
             worker: worker_url.to_string(),
@@ -333,10 +384,23 @@ impl Proxy {
             .header("accept", "text/event-stream");
         let mut abort =
             AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
-        let resp = req.send().await.map_err(|e| {
-            breaker.record_failure();
-            Self::classify_reqwest_error_for(worker_url.clone(), e, path)
-        })?;
+        // A worker that never answers is a fault, unlike a long stream once it answers.
+        let resp = match tokio::time::timeout(
+            self.request_timeout,
+            send_retrying_closed_connection(req, protocol),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                breaker.record_failure();
+                return Err(Self::classify_reqwest_error_for(worker_url, e, path));
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: worker_url });
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             abort.disarm();
@@ -347,8 +411,10 @@ impl Proxy {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
+        // SGLang's `text/event-stream; charset=utf-8`: clients that decode by the
+        // header would otherwise read the UTF-8 events as Latin-1.
         let content_type = if status.is_success() {
-            "text/event-stream".to_string()
+            "text/event-stream; charset=utf-8".to_string()
         } else {
             upstream_ct
         };
@@ -410,6 +476,7 @@ impl Proxy {
             sse::StreamLimits {
                 idle_timeout: self.stream_idle_timeout,
                 expiration,
+                abort: stream_abort.filter(|_| status.is_success()),
             },
         );
         let mut out = Response::new(body);
@@ -431,6 +498,7 @@ mod tests {
     use axum::Router;
     use reqwest::StatusCode;
     use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -495,6 +563,7 @@ mod tests {
                 "/chat",
                 &headers,
                 Bytes::new(),
+                None,
                 None,
                 None,
                 None,
@@ -604,6 +673,7 @@ mod tests {
                 None,
                 None,
                 expiration,
+                None,
             )
             .await
             .unwrap();
@@ -843,6 +913,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("streaming dispatch should reach the worker");
@@ -855,6 +926,81 @@ mod tests {
                 0,
                 "iter {i}: streaming 503 must leave the breaker Closed",
             );
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Failure {
+        /// Close with the request unread, so the kernel resets the connection.
+        Reset,
+        /// Read the request, then close.
+        Close,
+        /// Read the request and never answer.
+        Hang,
+    }
+
+    /// A raw HTTP/1.1 worker failing its first `failing` connections; also
+    /// returns how many connections it accepted.
+    async fn spawn_failing_worker(failing: usize, failure: Failure) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            let mut hung = Vec::new();
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let fail = count.fetch_add(1, Ordering::SeqCst) < failing;
+                if fail && matches!(failure, Failure::Reset) {
+                    let _ = socket.peek(&mut [0]).await;
+                    continue;
+                }
+                let mut head = Vec::new();
+                let mut buf = [0; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if !fail {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                        .await;
+                } else if matches!(failure, Failure::Hang) {
+                    hung.push(socket);
+                }
+            }
+        });
+        (url, accepted)
+    }
+
+    /// A closed connection is resent once on the same worker; a timeout is not.
+    #[tokio::test]
+    async fn closed_connection_is_retried_once() {
+        for (failing, failure, status, connections) in [
+            (1, Failure::Reset, StatusCode::OK, 2),
+            (1, Failure::Close, StatusCode::OK, 2),
+            (usize::MAX, Failure::Close, StatusCode::BAD_GATEWAY, 2),
+            (1, Failure::Hang, StatusCode::GATEWAY_TIMEOUT, 1),
+        ] {
+            let (url, accepted) = spawn_failing_worker(failing, failure).await;
+            let proxy = Proxy::new(Duration::from_millis(500)).unwrap();
+            let result = proxy
+                .forward_json_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &CircuitBreaker::new(),
+                    "/generate",
+                    &HeaderMap::new(),
+                    Bytes::new(),
+                    None,
+                )
+                .await;
+            let got = result.map_or_else(|e| e.status_code(), |r| r.status());
+            let conns = accepted.load(Ordering::SeqCst);
+            assert_eq!((got, conns), (status, connections), "{failure:?}");
         }
     }
 }

@@ -2,35 +2,15 @@
 
 Packing the three BF16 text projections into one GEMM changes the reduction
 association and is therefore not bit-exact.  The packed weights stay resident
-for checkpoint compatibility, but ``quality="lossless"`` applies their three
+for checkpoint compatibility, but ``quality="exact"`` applies their three
 slices independently.  ``quality="high"`` mounts the single-GEMM path.
 """
 
 from __future__ import annotations
 
-import logging
-
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
-
-logger = logging.getLogger(__name__)
-
-_FUSION = QualityGatedFusion(
-    name="Qwen-Image fused added-QKV",
-    marker_attr="_sgl_qwen_image_added_qkv_site",
-    enabled_attr="_sgl_qwen_image_added_qkv_enabled",
-)
-
-
-def mark_qwen_image_added_qkv_site(module: nn.Module) -> None:
-    """Mark an unquantized Qwen-Image attention site; it starts unmounted."""
-    _FUSION.mark(module)
-
-
-def qwen_image_added_qkv_active(module: nn.Module) -> bool:
-    """Whether the request-scoped packed added-QKV GEMM is mounted."""
-    return _FUSION.is_enabled(module)
 
 
 def _site_reject_reason(site: nn.Module) -> str | None:
@@ -44,9 +24,9 @@ def _site_reject_reason(site: nn.Module) -> str | None:
     return None
 
 
-def mount_qwen_image_added_qkv(root: nn.Module) -> bool:
-    return _FUSION.mount(root, reject_reason=_site_reject_reason, logger=logger)
-
-
-def unmount_qwen_image_added_qkv(root: nn.Module) -> None:
-    _FUSION.unmount(root)
+QWEN_IMAGE_ADDED_QKV = QualityGatedFusion(
+    name="Qwen-Image fused added-QKV",
+    marker_attr="_sgl_qwen_image_added_qkv_site",
+    enabled_attr="_sgl_qwen_image_added_qkv_enabled",
+    reject_reason=_site_reject_reason,
+)
