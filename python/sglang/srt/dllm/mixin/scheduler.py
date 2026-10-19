@@ -28,9 +28,22 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
 
-    def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
+    def validate_dllm_request(
+        self: Scheduler, req: Req, recv_req=None
+    ) -> Optional[str]:
         if self.dllm_config is None:
             return None
+        # This runs before the shared scheduler resolves logprob_start_len.
+        if (
+            self.dllm_config.algorithm == "Gemma4Renoise"
+            and req.return_logprob
+            and recv_req is not None
+            and recv_req.logprob_start_len not in (-1, len(req.origin_input_ids))
+        ):
+            return (
+                "DiffusionGemma supports output denoiser logprobs only; "
+                "set logprob_start_len=-1 (default) to skip prompt logprobs."
+            )
         return self.dllm_config.validate_request(req)
 
     def get_new_batch_dllm(
@@ -100,6 +113,7 @@ class SchedulerDllmMixin:
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
             algo_states = result.dllm_algo_state
+            output_reqs = []
 
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx in range(batch.batch_size()):
@@ -118,7 +132,9 @@ class SchedulerDllmMixin:
 
                     req.output_ids.extend(next_token_ids)
                     req.update_finish_state(new_accepted_len=new_tokens)
+                    self._append_dllm_logprobs(batch, result, idx, next_token_ids)
                     self._finish_dllm_request_if_needed(req)
+                    output_reqs.append(req)
                     continue
 
                 next_token_ids = result.next_token_ids[idx]
@@ -156,9 +172,14 @@ class SchedulerDllmMixin:
                 self.metrics_reporter.num_generated_tokens += len(next_token_ids)
                 req.output_ids.extend(next_token_ids)
                 req.update_finish_state(new_accepted_len=len(next_token_ids))
+                self._append_dllm_logprobs(batch, result, idx, next_token_ids)
                 self._finish_dllm_request_if_needed(req)
+                output_reqs.append(req)
 
-            self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+            # Unresolved FDFO rows have no tokens or logprobs to send. Sending
+            # them can advance the streamer's logprob offset before the first
+            # canvas resolves, dropping its first row from the response.
+            self.output_streamer.stream_output(output_reqs, batch.return_logprob)
             self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.report_prefill_stats(
@@ -167,6 +188,26 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _append_dllm_logprobs(self, batch, result, index, token_ids) -> None:
+        if not batch.return_logprob:
+            return
+        req = batch.reqs[index]
+        if not req.return_logprob or self.dllm_config.algorithm != "Gemma4Renoise":
+            return
+        # Keep block alignment here. OutputStreamer applies the same EOS/stop/
+        # length truncation and streaming offset to tokens and logprob rows.
+        output = result.logits_output
+        req.logprob.output_token_logprobs_val.extend(
+            output.next_token_logprobs[index].tolist()
+        )
+        req.logprob.output_token_logprobs_idx.extend(token_ids)
+        if req.logprob.token_ids_logprob:
+            values = output.next_token_token_ids_logprobs_val[index].tolist()
+            req.logprob.output_token_ids_logprobs_val.extend(values)
+            req.logprob.output_token_ids_logprobs_idx.extend(
+                [req.logprob.token_ids_logprob] * len(token_ids)
+            )
 
     def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
         if (
