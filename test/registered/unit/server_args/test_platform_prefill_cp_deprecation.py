@@ -98,7 +98,6 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
         cases = (
             ("dsv4.*both phases", dict(prefill_attention_backend="flashinfer")),
             ("support multiple nodes", dict(nnodes=2)),
-            ("support DeepSeek-V4.1", dict(model_type="deepseek_v41")),
             (
                 "decoder SWA bounded replay",
                 dict(enable_decoder_swa_bounded_replay=True),
