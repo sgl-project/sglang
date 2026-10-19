@@ -82,17 +82,21 @@ class _SparsePrefillTable(_SparseTable):
     request_ids: torch.Tensor  # [rows] int32 row-pair ids, see _row_pair_ids
     q_dtype: torch.dtype
     page_size: int  # index-K pool page size (slots)
-    rows_per_request: List[int]  # rows of each request, in row order
+    # rows of each request, in row order; None for a table of gathered rows
+    rows_per_request: Optional[List[int]]
 
     def tail(self, rows_per_request: List[int]) -> _SparsePrefillTable:
+        assert self.rows_per_request is not None, (
+            "a table of gathered rows has no requests"
+        )
         rows = get_tail_row_indices(
             full_rows_per_request=self.rows_per_request,
             tail_rows_per_request=rows_per_request,
             device=self.blocks.device,
         )
-        return self.tail_rows(rows, rows_per_request)
+        return self.gather_rows(rows, rows_per_request)
 
-    def tail_rows(
+    def gather_rows(
         self, rows: torch.Tensor, rows_per_request: Optional[List[int]] = None
     ) -> _SparsePrefillTable:
         """The table restricted to ``rows``: a gather, graph-safe for a persistent
@@ -105,7 +109,7 @@ class _SparsePrefillTable(_SparseTable):
             page_table=self.page_table[rows].contiguous(),
             page_size=self.page_size,
             request_ids=self.request_ids[rows].contiguous(),
-            rows_per_request=rows_per_request if rows_per_request is not None else [],
+            rows_per_request=rows_per_request,
             q_dtype=self.q_dtype,
             valid_lens=valid_lens,
         )
@@ -401,7 +405,7 @@ def _build_prefill_table(
     page_table: torch.Tensor,
     page_size: int,
     request_ids: torch.Tensor,
-    rows_per_request: List[int],
+    rows_per_request: Optional[List[int]],
     q_dtype: torch.dtype,
     valid_lens: torch.Tensor,
 ) -> _SparsePrefillTable:

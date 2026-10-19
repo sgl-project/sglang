@@ -275,7 +275,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             self.assertEqual(counts, [SWA_WINDOW, 0])
 
 
-def _flat_indexer_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
+def _full_topk_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
     """Runs the candidate source's prefill-graph break; returns the request rows
     and positions it scored and the rows it handed to the consumers."""
     seen = {}
@@ -289,20 +289,19 @@ def _flat_indexer_break(*, inside_tail, real, x_rows, extend_num_tokens=20):
     def make_inputs(layer, x, q_lora, req, pos, forward_batch, rows_per_request):
         seen.update(req=req.tolist(), pos=pos.tolist(), scored=x.shape[0])
 
-    def tail_rows(self, rows):
+    def gather_rows(self, rows):
         seen["rows"] = rows.tolist()
         return SimpleNamespace(blocks=0, schedule=0, phys_blocks=0, valid_lens=0)
 
     backend = SimpleNamespace(
         forward_metadata=tail_meta if inside_tail else full_meta,
         _make_low_ratio_prefill_indexer_inputs=make_inputs,
-        _prefill_graph_low_ratio_index_captured=lambda: False,
         prefill_candidates=SimpleNamespace(
             publish_prefill=lambda inputs: object.__new__(_SparsePrefillTable)
         ),
     )
-    with patch.object(_SparsePrefillTable, "tail_rows", tail_rows):
-        DeepseekV4AttnBackend._prefill_graph_flat_indexer_break(
+    with patch.object(_SparsePrefillTable, "gather_rows", gather_rows):
+        DeepseekV4AttnBackend._prefill_graph_full_topk_break(
             backend,
             SimpleNamespace(
                 layer_id=20, indexer=SimpleNamespace(is_candidate_source=True)
@@ -329,7 +328,7 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
     def test_source_inside_the_tail_scores_the_tail_rows(self):
         # The source is the tail's first layer: x holds the 8-row tail block,
         # 5 of them live; the extend's lens and positions are not the tail's.
-        seen = _flat_indexer_break(inside_tail=True, real=5, x_rows=8)
+        seen = _full_topk_break(inside_tail=True, real=5, x_rows=8)
         self.assertEqual(seen["req"], [3, 3, 5, 5, 5])
         self.assertEqual(seen["pos"], [100, 101, 102, 103, 104])
         self.assertEqual(seen["scored"], 5)
@@ -338,7 +337,7 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
     def test_idle_dp_rank_scores_its_fabricated_rows(self):
         # An idle DP-attention rank replays on one dummy request of the padded
         # token count (6 here), inside an 8-row bucket.
-        seen = _flat_indexer_break(
+        seen = _full_topk_break(
             inside_tail=False, real=0, x_rows=8, extend_num_tokens=6
         )
         self.assertEqual(seen["scored"], 6)
@@ -366,7 +365,7 @@ def _prefill_graph_tail_width(*, unbounded):
         _prefill_graph_tail_buffers=lambda device, pos_dtype, loc_dtype: [
             torch.zeros(256, dtype=torch.int64) for _ in range(5)
         ],
-        _prefill_graph_context_unbounded=lambda: unbounded,
+        prefill_cuda_graph_context_unbounded=unbounded,
         init_forward_metadata_prefill=init_forward_metadata_prefill,
     )
     seq_len = 155648 + 1024
