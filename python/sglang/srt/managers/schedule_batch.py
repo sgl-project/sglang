@@ -2875,13 +2875,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         "encoder SWA replay does not support input_embeds or "
                         "positional_embed_overrides"
                     )
-                if req.return_logprob and req.logprob_start_len not in (
-                    -1,
-                    len(req.origin_input_ids),
-                ):
-                    raise ValueError(
-                        "encoder SWA replay cannot return cached prompt logprobs"
-                    )
             self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
