@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import copy
 import json
+import threading
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from transformers.cache_utils import DynamicCache
 
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
+    validate_sensenova_u1_parallelism,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+    NEOChatConfig,
     NEOLLMConfig,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
@@ -60,6 +64,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
     SenseNovaU1GenerationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1.stages import (
+    generation as sensenova_generation,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
@@ -479,6 +486,213 @@ def test_sensenova_u1_randn_fallback_preserves_device_rng(monkeypatch):
     assert torch.equal(device_module.get_rng_state(device), device_rng_state)
 
 
+class _ThreadedCFGGroup:
+    """Two-rank CFG group whose collectives exchange tensors between threads."""
+
+    world_size = 2
+    device = torch.device("cpu")
+
+    def __init__(self, rank_in_group, slots, barrier):
+        self.rank_in_group = rank_in_group
+        self._slots = slots
+        self._barrier = barrier
+
+    def _exchange(self, tensor):
+        self._slots[self.rank_in_group] = tensor.clone()
+        self._barrier.wait()
+        gathered = list(self._slots)
+        self._barrier.wait()
+        return gathered
+
+    def all_gather(self, input_, dim=0, separate_tensors=False):
+        assert dim == 0 and separate_tensors
+        return self._exchange(input_)
+
+    def all_reduce(self, input_):
+        return input_.copy_(sum(self._exchange(input_)))
+
+    def broadcast(self, input_, src=0):
+        return input_.copy_(self._exchange(input_)[src])
+
+
+def _make_tiny_sensenova_u1_model():
+    config = NEOChatConfig(
+        vision_config=dict(
+            patch_size=4, hidden_size=16, llm_hidden_size=32, downsample_ratio=0.5
+        ),
+        llm_config=dict(
+            architectures=["Qwen3ForCausalLM"],
+            vocab_size=512,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            max_position_embeddings=512,
+            max_position_embeddings_hw=64,
+        ),
+        downsample_ratio=0.5,
+        template="neo1_0",
+        fm_head_layers=2,
+        use_pixel_head=False,
+        concat_time_token_num=0,
+        noise_scale=1.0,
+        noise_scale_mode="none",
+        noise_scale_base_image_seq_len=64,
+        add_noise_scale_embedding=False,
+        noise_scale_max_value=8.0,
+        time_schedule="standard",
+        time_shift_type="exponential",
+        base_shift=0.5,
+        max_shift=1.15,
+        base_image_seq_len=64,
+        max_image_seq_len=4096,
+    )
+    torch.manual_seed(0)
+    return NEOChatModel(config).eval()
+
+
+@pytest.mark.parametrize(
+    ("generation_kwargs", "uncondition_steps"),
+    [
+        ({"prompt": "a red apple", "cfg_norm": "none", "seed": 1}, 6),
+        # timestep_shift=3 puts 5 of the 6 steps at t <= 0.5; the last step
+        # runs without CFG, so rank 0 broadcasts its condition prediction.
+        (
+            {
+                "prompt": "a red apple",
+                "cfg_norm": "cfg_zero_star",
+                "cfg_interval": (0.0, 0.5),
+                "seed": 1,
+            },
+            5,
+        ),
+        (
+            {
+                "prompt": ["a red apple", "two cats on a long sofa"],
+                "batch_size": 2,
+                "cfg_norm": "global",
+                "cfg_interval": (0.2, 1.0),
+                "seed": [3, 4],
+            },
+            3,
+        ),
+    ],
+)
+def test_sensenova_u1_cfg_parallel_splits_branches_and_matches_serial(
+    generation_kwargs, uncondition_steps
+):
+    """Each CFG rank denoises only its own branch, yet both ranks reproduce
+    the single-GPU image bit for bit."""
+    num_threads = torch.get_num_threads()
+    # Keep CPU kernel partitioning identical between the serial and rank runs.
+    torch.set_num_threads(1)
+    try:
+        model = _make_tiny_sensenova_u1_model()
+        kwargs = dict(
+            cfg_scale=4.0,
+            image_size=(32, 32),
+            num_steps=6,
+            timestep_shift=3.0,
+            **generation_kwargs,
+        )
+        with torch.inference_mode():
+            expected = model.t2i_generate(_FakeTokenizer(), **kwargs)
+
+        slots = [None, None]
+        barrier = threading.Barrier(2, timeout=60)
+        outputs, branch_calls, errors = [None, None], [0, 0], []
+
+        def run_rank(rank):
+            rank_model = copy.deepcopy(model)
+            predict_v = rank_model._t2i_predict_v
+
+            def counted_predict_v(*args, **inner_kwargs):
+                branch_calls[rank] += 1
+                return predict_v(*args, **inner_kwargs)
+
+            rank_model._t2i_predict_v = counted_predict_v
+            try:
+                with torch.inference_mode():
+                    outputs[rank] = rank_model.t2i_generate(
+                        _FakeTokenizer(),
+                        **kwargs,
+                        cfg_group=_ThreadedCFGGroup(rank, slots, barrier),
+                    )
+            except Exception as error:
+                errors.append(error)
+                barrier.abort()
+
+        threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        torch.set_num_threads(num_threads)
+
+    assert not errors, errors
+    assert branch_calls == [kwargs["num_steps"], uncondition_steps]
+    for output in outputs:
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def test_sensenova_u1_cfg_parallel_prefill_error_fails_both_ranks():
+    """A condition-prefill error, which only CFG rank 0 can hit, must fail the
+    request on both ranks, and the next request must still pair up correctly
+    instead of reusing collectives the failed request left behind."""
+    num_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        model = _make_tiny_sensenova_u1_model()
+        kwargs = dict(
+            prompt="a red apple", cfg_scale=4.0, image_size=(32, 32), num_steps=2
+        )
+        with torch.inference_mode():
+            expected = model.t2i_generate(_FakeTokenizer(), **kwargs)
+
+        slots = [None, None]
+        barrier = threading.Barrier(2, timeout=10)
+        errors, outputs = [None, None], [None, None]
+
+        def run_rank(rank):
+            rank_model = copy.deepcopy(model)
+            prefill = rank_model._t2i_prefill
+            if rank == 0:
+
+                def failing_prefill(*args, **inner_kwargs):
+                    rank_model._t2i_prefill = prefill
+                    raise torch.OutOfMemoryError("condition prefill")
+
+                rank_model._t2i_prefill = failing_prefill
+            cfg_group = _ThreadedCFGGroup(rank, slots, barrier)
+            with torch.inference_mode():
+                try:
+                    rank_model.t2i_generate(
+                        _FakeTokenizer(), **kwargs, cfg_group=cfg_group
+                    )
+                except Exception as error:
+                    errors[rank] = error
+                outputs[rank] = rank_model.t2i_generate(
+                    _FakeTokenizer(), **kwargs, cfg_group=cfg_group
+                )
+
+        threads = [threading.Thread(target=run_rank, args=(rank,)) for rank in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        torch.set_num_threads(num_threads)
+
+    assert isinstance(errors[0], torch.OutOfMemoryError)
+    assert isinstance(errors[1], RuntimeError)
+    assert "other CFG rank" in str(errors[1])
+    for output in outputs:
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
 def test_sensenova_u1_registry_resolves_local_and_hf_paths(tmp_path):
     _get_config_info.cache_clear()
     get_model_info.cache_clear()
@@ -766,19 +980,47 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     assert scheduler._try_merge_generation_reqs(requests) is None
 
 
-def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
+_TWO_GPU_CFG_PARALLEL_ARGS = dict(
+    num_gpus=2,
+    enable_cfg_parallel=True,
+    cfg_parallel_degree=2,
+    tp_size=1,
+    sp_degree=1,
+    dp_size=1,
+    batching_max_size=1,
+)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        dict(enable_cfg_parallel=False, cfg_parallel_degree=1),
+        dict(num_gpus=4),
+        dict(num_gpus=4, cfg_parallel_degree=4),
+        # ServerArgs never checks sp_degree against num_gpus / cfg degree.
+        dict(sp_degree=2),
+    ],
+)
+def test_sensenova_u1_rejects_multi_gpu_without_two_way_cfg_parallel(override):
     config = SenseNovaU1PipelineConfig()
 
-    with pytest.raises(ValueError, match="num_gpus=1"):
+    with pytest.raises(ValueError, match="num_gpus=2 with --enable-cfg-parallel"):
         config.validate_server_args(
-            SimpleNamespace(
-                num_gpus=2,
-                enable_torch_compile=False,
-                lora_path=None,
-                attention_backend=None,
-                component_attention_backends={},
-            )
+            SimpleNamespace(**{**_TWO_GPU_CFG_PARALLEL_ARGS, **override})
         )
+
+
+def test_sensenova_u1_rejects_dynamic_batching_with_cfg_parallel():
+    """CFG ranks time the batching delay independently and could dispatch
+    different batches into the same collectives."""
+    with pytest.raises(ValueError, match="dynamic batching"):
+        validate_sensenova_u1_parallelism(
+            SimpleNamespace(**{**_TWO_GPU_CFG_PARALLEL_ARGS, "batching_max_size": 2})
+        )
+
+
+def test_sensenova_u1_accepts_two_gpu_cfg_parallel():
+    validate_sensenova_u1_parallelism(SimpleNamespace(**_TWO_GPU_CFG_PARALLEL_ARGS))
 
 
 def test_sensenova_u1_clears_auto_tuned_runtime_defaults():
@@ -1011,7 +1253,12 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert request.perf_dump_path == "/tmp/sensenova-perf.json"
 
 
-def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():
+@pytest.mark.parametrize("enable_cfg_parallel", [False, True])
+def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch(
+    monkeypatch, enable_cfg_parallel
+):
+    cfg_group = object()
+    monkeypatch.setattr(sensenova_generation, "get_cfg_group", lambda: cfg_group)
     sampling = SenseNovaU1SamplingParams(
         prompt="a mountain lake",
         width=2304,
@@ -1032,7 +1279,9 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
         metrics=None,
     )
     model = _FakeSenseNovaModel()
-    stage = SenseNovaU1GenerationStage(model=model, tokenizer="tok")
+    stage = SenseNovaU1GenerationStage(
+        model=model, tokenizer="tok", enable_cfg_parallel=enable_cfg_parallel
+    )
 
     output = stage.forward(batch, server_args=SimpleNamespace())
 
@@ -1054,6 +1303,9 @@ def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch
     assert model.call_kwargs["num_steps"] == 30
     assert model.call_kwargs["batch_size"] == 1
     assert model.call_kwargs["seed"] == 123
+    # Without the group every CFG rank silently computes both branches.
+    expected_group = cfg_group if enable_cfg_parallel else None
+    assert model.call_kwargs["cfg_group"] is expected_group
 
 
 def test_sensenova_u1_generation_stage_passes_dynamic_batch_inputs():

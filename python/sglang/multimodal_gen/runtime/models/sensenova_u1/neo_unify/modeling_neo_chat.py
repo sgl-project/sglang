@@ -148,6 +148,69 @@ def prepare_flash_kv_cache(
         layer.flash_v_cache = v_cache
 
 
+@contextlib.contextmanager
+def _cfg_ranks_fail_together(cfg_group):
+    # Only CFG rank 0 runs the prompt-dependent prefill. A one-sided error must
+    # stop both ranks before the per-step collectives pair up wrongly.
+    if cfg_group is None:
+        yield
+        return
+    # Allocated up front so that reporting an OOM needs no device memory.
+    failed = torch.zeros(1, dtype=torch.int32, device=cfg_group.device)
+    try:
+        yield
+    except Exception:
+        cfg_group.all_reduce(failed.fill_(1))
+        raise
+    if cfg_group.all_reduce(failed).item():
+        raise RuntimeError(
+            "SenseNova-U1 prefill failed on the other CFG rank; see its log."
+        )
+
+
+def _expand_prefix_cache_batch(past_key_values, batch_size: int) -> None:
+    for layer in past_key_values.layers:
+        layer.keys = layer.keys.expand(batch_size, *layer.keys.shape[1:])
+        layer.values = layer.values.expand(batch_size, *layer.values.shape[1:])
+
+
+def _apply_t2i_cfg(
+    v_pred_condition,
+    v_pred_uncondition,
+    *,
+    cfg_scale: float,
+    cfg_norm: str,
+    step_i: int,
+    batch_size: int,
+):
+    if cfg_norm == "cfg_zero_star":
+        positive_flat = v_pred_condition.view(batch_size, -1)
+        negative_flat = v_pred_uncondition.view(batch_size, -1)
+
+        alpha = optimized_scale(positive_flat, negative_flat)
+        alpha = alpha.view(batch_size, *([1] * (len(v_pred_condition.shape) - 1)))
+        alpha = alpha.to(positive_flat.dtype)
+
+        if step_i <= 0:
+            return v_pred_condition * 0.0
+        return v_pred_uncondition * alpha + cfg_scale * (
+            v_pred_condition - v_pred_uncondition * alpha
+        )
+
+    v_pred = v_pred_uncondition + cfg_scale * (v_pred_condition - v_pred_uncondition)
+    if cfg_norm == "global":
+        norm_v_condition = torch.norm(v_pred_condition, dim=(1, 2), keepdim=True)
+        norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
+        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+        v_pred = v_pred * scale
+    elif cfg_norm == "channel":
+        norm_v_condition = torch.norm(v_pred_condition, dim=-1, keepdim=True)
+        norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
+        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(min=0, max=1.0)
+        v_pred = v_pred * scale
+    return v_pred
+
+
 def clear_flash_kv_cache(past_key_values):
     if past_key_values is None:
         return
@@ -516,6 +579,62 @@ class NEOChatModel(PreTrainedModel):
         )
         return out.past_key_values, out.last_hidden_state
 
+    def _t2i_prefill(self, tokenizer, query, *, token_h, token_w):
+        (
+            input_ids,
+            indexes,
+            attention_mask,
+            key_valid_mask,
+            prefix_lengths,
+        ) = self._build_t2i_text_inputs(tokenizer, query)
+        indexes_image = self._build_t2i_image_indexes(
+            token_h,
+            token_w,
+            (
+                int(prefix_lengths[0].item())
+                if prefix_lengths.numel() == 1
+                else prefix_lengths
+            ),
+            device=input_ids.device,
+        )
+        past_key_values, _ = self._t2i_prefix_forward(
+            input_ids, indexes, attention_mask
+        )
+        return past_key_values, indexes_image, key_valid_mask, prefix_lengths
+
+    def _t2i_think_prefill(
+        self, tokenizer, query, *, token_h, token_w, IMG_START_TOKEN
+    ):
+        (
+            input_ids,
+            indexes,
+            attention_mask,
+            key_valid_mask,
+            prefix_lengths,
+        ) = self._build_t2i_text_inputs(tokenizer, query)
+        outputs = self._think_prefix_forward(
+            input_ids=input_ids,
+            indexes=indexes,
+            attention_mask=attention_mask,
+        )
+        past_key_values, t_index, think_text = self._generate_think(
+            tokenizer,
+            outputs,
+            outputs.past_key_values,
+            indexes[0].max().item(),
+            IMG_START_TOKEN,
+        )
+        indexes_image = self._build_t2i_image_indexes(
+            token_h, token_w, t_index + 1, device=input_ids.device
+        )
+        return (
+            past_key_values,
+            indexes_image,
+            key_valid_mask,
+            prefix_lengths,
+            think_text,
+        )
+
     def _think_prefix_forward(self, **kwargs):
         """Build the Think prefix cache without materialising per-token logits."""
         return self.language_model(use_cache=True, logits_to_keep=1, **kwargs)
@@ -696,6 +815,7 @@ class NEOChatModel(PreTrainedModel):
         t_eps=0.02,
         think_mode=False,
         seed=0,
+        cfg_group=None,
     ):
         assert self.concat_time_token_num == 0
         assert cfg_norm in ["cfg_zero_star", "global", "none", "channel"]
@@ -718,162 +838,99 @@ class NEOChatModel(PreTrainedModel):
         self.config.t_eps = t_eps
         think_text = ""
         needs_cfg = cfg_scale > 1
-
-        think_content = (
-            "<think>\n" if think_mode else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+        cfg_parallel = needs_cfg and cfg_group is not None and cfg_group.world_size > 1
+        # CFG rank 0 owns the condition branch and rank 1 the unconditional one;
+        # each rank prefills and denoises only the branch it owns.
+        run_condition = not cfg_parallel or cfg_group.rank_in_group == 0
+        run_uncondition = needs_cfg and (
+            not cfg_parallel or cfg_group.rank_in_group == 1
         )
-        query_conditions = [
-            self._build_t2i_query(
-                item,
-                system_message=SYSTEM_MESSAGE_FOR_GEN,
-                append_text=think_content,
-            )
-            for item in prompts
-        ]
-        query_condition = (
-            query_conditions[0] if len(query_conditions) == 1 else query_conditions
-        )
-        query_uncondition = (
-            self._build_t2i_query("", append_text=IMG_START_TOKEN)
-            if needs_cfg
-            else None
-        )
-
-        (
-            input_ids_condition,
-            indexes_condition,
-            attention_mask_condition_prefix,
-            condition_key_valid_mask,
-            condition_prefix_lengths,
-        ) = self._build_t2i_text_inputs(tokenizer, query_condition)
-        if query_uncondition is not None:
-            (
-                input_ids_uncondition,
-                indexes_uncondition,
-                attention_mask_uncondition_prefix,
-                _,
-                uncondition_prefix_lengths,
-            ) = self._build_t2i_text_inputs(tokenizer, query_uncondition)
-        else:
-            input_ids_uncondition = indexes_uncondition = (
-                attention_mask_uncondition_prefix
-            ) = None
-            uncondition_prefix_lengths = None
 
         token_h = image_size[1] // (self.patch_size * merge_size)
         token_w = image_size[0] // (self.patch_size * merge_size)
 
-        indexes_image_condition = self._build_t2i_image_indexes(
-            token_h,
-            token_w,
-            (
-                int(condition_prefix_lengths[0].item())
-                if len(prompts) == 1
-                else condition_prefix_lengths
-            ),
-            device=input_ids_condition.device,
-        )
-        indexes_image_uncondition = (
-            self._build_t2i_image_indexes(
-                token_h,
-                token_w,
-                int(uncondition_prefix_lengths[0].item()),
-                device=input_ids_uncondition.device,
-            )
-            if indexes_uncondition is not None
-            else None
-        )
-
-        if think_mode:
-            outputs_condition = self._think_prefix_forward(
-                input_ids=input_ids_condition,
-                indexes=indexes_condition,
-                attention_mask=attention_mask_condition_prefix,
-            )
-            past_key_values_condition = outputs_condition.past_key_values
-            device = outputs_condition.logits.device
-            dtype = outputs_condition.logits.dtype
-            t_index_condition = indexes_condition[0].max().item()
-            past_key_values_condition, t_index_condition, think_text = (
-                self._generate_think(
+        past_key_values_condition = indexes_image_condition = None
+        condition_key_valid_mask = condition_prefix_lengths = None
+        past_key_values_uncondition = indexes_image_uncondition = None
+        uncondition_prefix_lengths = None
+        with _cfg_ranks_fail_together(cfg_group if cfg_parallel else None):
+            if run_condition:
+                think_content = (
+                    "<think>\n"
+                    if think_mode
+                    else "<think>\n\n</think>\n\n" + IMG_START_TOKEN
+                )
+                query_conditions = [
+                    self._build_t2i_query(
+                        item,
+                        system_message=SYSTEM_MESSAGE_FOR_GEN,
+                        append_text=think_content,
+                    )
+                    for item in prompts
+                ]
+                query_condition = (
+                    query_conditions[0]
+                    if len(query_conditions) == 1
+                    else query_conditions
+                )
+                if think_mode:
+                    (
+                        past_key_values_condition,
+                        indexes_image_condition,
+                        condition_key_valid_mask,
+                        condition_prefix_lengths,
+                        think_text,
+                    ) = self._t2i_think_prefill(
+                        tokenizer,
+                        query_condition,
+                        token_h=token_h,
+                        token_w=token_w,
+                        IMG_START_TOKEN=IMG_START_TOKEN,
+                    )
+                else:
+                    (
+                        past_key_values_condition,
+                        indexes_image_condition,
+                        condition_key_valid_mask,
+                        condition_prefix_lengths,
+                    ) = self._t2i_prefill(
+                        tokenizer, query_condition, token_h=token_h, token_w=token_w
+                    )
+            if run_uncondition:
+                (
+                    past_key_values_uncondition,
+                    indexes_image_uncondition,
+                    _,
+                    uncondition_prefix_lengths,
+                ) = self._t2i_prefill(
                     tokenizer,
-                    outputs_condition,
-                    past_key_values_condition,
-                    t_index_condition,
-                    IMG_START_TOKEN,
+                    self._build_t2i_query("", append_text=IMG_START_TOKEN),
+                    token_h=token_h,
+                    token_w=token_w,
                 )
-            )
-            indexes_image_condition = self._build_t2i_image_indexes(
-                token_h,
-                token_w,
-                t_index_condition + 1,
-                device=input_ids_condition.device,
-            )
-            del outputs_condition
-        else:
-            past_key_values_condition, prefix_hidden_states = self._t2i_prefix_forward(
-                input_ids_condition, indexes_condition, attention_mask_condition_prefix
-            )
-            device = prefix_hidden_states.device
-            dtype = prefix_hidden_states.dtype
-            del prefix_hidden_states
-        past_key_values_uncondition = None
-        if input_ids_uncondition is not None:
-            past_key_values_uncondition, _ = self._t2i_prefix_forward(
-                input_ids_uncondition,
-                indexes_uncondition,
-                attention_mask_uncondition_prefix,
-            )
+            self._notify_layer_offload_phase("denoise")
 
-        del input_ids_condition, indexes_condition, attention_mask_condition_prefix
-        if input_ids_uncondition is not None:
-            del (
-                input_ids_uncondition,
-                indexes_uncondition,
-                attention_mask_uncondition_prefix,
+            own_cache = (
+                past_key_values_condition
+                if run_condition
+                else past_key_values_uncondition
             )
-        self._notify_layer_offload_phase("denoise")
-
-        for layer_idx in range(len(past_key_values_condition.layers)):
-            past_key_values_condition.layers[
-                layer_idx
-            ].keys = past_key_values_condition.layers[layer_idx].keys.expand(
-                batch_size, *past_key_values_condition.layers[layer_idx].keys.shape[1:]
-            )
-            past_key_values_condition.layers[
-                layer_idx
-            ].values = past_key_values_condition.layers[layer_idx].values.expand(
-                batch_size,
-                *past_key_values_condition.layers[layer_idx].values.shape[1:],
-            )
-            if past_key_values_uncondition is not None:
-                past_key_values_uncondition.layers[
-                    layer_idx
-                ].keys = past_key_values_uncondition.layers[layer_idx].keys.expand(
-                    batch_size,
-                    *past_key_values_uncondition.layers[layer_idx].keys.shape[1:],
+            device = own_cache.layers[0].keys.device
+            dtype = own_cache.layers[0].keys.dtype
+            # prepare flash cache once
+            for past_key_values, prefix_lengths in (
+                (past_key_values_condition, condition_prefix_lengths),
+                (past_key_values_uncondition, uncondition_prefix_lengths),
+            ):
+                if past_key_values is None:
+                    continue
+                _expand_prefix_cache_batch(past_key_values, batch_size)
+                prepare_flash_kv_cache(
+                    past_key_values,
+                    current_len=token_h * token_w,
+                    batch_size=batch_size,
+                    prefix_lengths=prefix_lengths,
                 )
-                past_key_values_uncondition.layers[
-                    layer_idx
-                ].values = past_key_values_uncondition.layers[layer_idx].values.expand(
-                    batch_size,
-                    *past_key_values_uncondition.layers[layer_idx].values.shape[1:],
-                )
-
-        # prepare flash cache once
-        prepare_flash_kv_cache(
-            past_key_values_condition,
-            current_len=token_h * token_w,
-            batch_size=batch_size,
-            prefix_lengths=condition_prefix_lengths,
-        )
-        if past_key_values_uncondition is not None:
-            prepare_flash_kv_cache(
-                past_key_values_uncondition,
-                current_len=token_h * token_w,
-                batch_size=batch_size,
-                prefix_lengths=uncondition_prefix_lengths,
-            )
 
         # init noise image tokens
         grid_h = image_size[1] // self.patch_size
@@ -896,7 +953,12 @@ class NEOChatModel(PreTrainedModel):
         )
 
         attention_mask_condition = {"full_attention": None}
-        if device.type == "npu" and batch_size > 1 and not npu_fia_available():
+        if (
+            run_condition
+            and device.type == "npu"
+            and batch_size > 1
+            and not npu_fia_available()
+        ):
             condition_key_valid_mask = condition_key_valid_mask.expand(batch_size, -1)
             image_key_valid_mask = torch.ones(
                 (batch_size, token_h * token_w),
@@ -958,69 +1020,57 @@ class NEOChatModel(PreTrainedModel):
                     ).view(batch_size, token_h * token_w, -1)
             image_embeds = image_embeds + timestep_embeddings
 
-            v_pred_condition = self._t2i_predict_v(
-                image_embeds,
-                indexes_image_condition,
-                attention_mask_condition,
-                past_key_values_condition,
-                t,
-                z,
-                image_token_num=token_h * token_w,
-                timestep_embeddings=timestep_embeddings,
-                image_size=image_size,
-            )
-
-            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
-                v_pred_uncondition = self._t2i_predict_v(
+            v_pred_condition = None
+            if run_condition:
+                v_pred_condition = self._t2i_predict_v(
                     image_embeds,
-                    indexes_image_uncondition,
-                    attention_mask_uncondition,
-                    past_key_values_uncondition,
+                    indexes_image_condition,
+                    attention_mask_condition,
+                    past_key_values_condition,
                     t,
                     z,
                     image_token_num=token_h * token_w,
                     timestep_embeddings=timestep_embeddings,
                     image_size=image_size,
                 )
-                if cfg_norm == "cfg_zero_star":
-                    positive_flat = v_pred_condition.view(batch_size, -1)
-                    negative_flat = v_pred_uncondition.view(batch_size, -1)
 
-                    alpha = optimized_scale(positive_flat, negative_flat)
-                    alpha = alpha.view(
-                        batch_size, *([1] * (len(v_pred_condition.shape) - 1))
+            if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1:
+                v_pred_uncondition = None
+                if run_uncondition:
+                    v_pred_uncondition = self._t2i_predict_v(
+                        image_embeds,
+                        indexes_image_uncondition,
+                        attention_mask_uncondition,
+                        past_key_values_uncondition,
+                        t,
+                        z,
+                        image_token_num=token_h * token_w,
+                        timestep_embeddings=timestep_embeddings,
+                        image_size=image_size,
                     )
-                    alpha = alpha.to(positive_flat.dtype)
-
-                    if step_i <= 0:
-                        v_pred = v_pred_condition * 0.0
-                    else:
-                        v_pred = v_pred_uncondition * alpha + cfg_scale * (
-                            v_pred_condition - v_pred_uncondition * alpha
-                        )
-                else:
-                    v_pred = v_pred_uncondition + cfg_scale * (
-                        v_pred_condition - v_pred_uncondition
+                if cfg_parallel:
+                    # Every rank combines both gathered branches with the serial
+                    # op order, so z stays bit-identical across ranks.
+                    v_pred_condition, v_pred_uncondition = cfg_group.all_gather(
+                        v_pred_condition if run_condition else v_pred_uncondition,
+                        dim=0,
+                        separate_tensors=True,
                     )
-                    if cfg_norm == "global":
-                        norm_v_condition = torch.norm(
-                            v_pred_condition, dim=(1, 2), keepdim=True
-                        )
-                        norm_v_cfg = torch.norm(v_pred, dim=(1, 2), keepdim=True)
-                        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
-                            min=0, max=1.0
-                        )
-                        v_pred = v_pred * scale
-                    elif cfg_norm == "channel":
-                        norm_v_condition = torch.norm(
-                            v_pred_condition, dim=-1, keepdim=True
-                        )
-                        norm_v_cfg = torch.norm(v_pred, dim=-1, keepdim=True)
-                        scale = (norm_v_condition / (norm_v_cfg + 1e-8)).clamp(
-                            min=0, max=1.0
-                        )
-                        v_pred = v_pred * scale
+                v_pred = _apply_t2i_cfg(
+                    v_pred_condition,
+                    v_pred_uncondition,
+                    cfg_scale=cfg_scale,
+                    cfg_norm=cfg_norm,
+                    step_i=step_i,
+                    batch_size=batch_size,
+                )
             else:
+                if cfg_parallel:
+                    # v_pred has z's shape and dtype.
+                    v_pred_condition = cfg_group.broadcast(
+                        v_pred_condition if run_condition else torch.empty_like(z),
+                        src=0,
+                    )
                 v_pred = v_pred_condition
 
             z = z + (t_next - t) * v_pred
@@ -1030,8 +1080,7 @@ class NEOChatModel(PreTrainedModel):
             )
 
         clear_flash_kv_cache(past_key_values_condition)
-        if past_key_values_uncondition is not None:
-            clear_flash_kv_cache(past_key_values_uncondition)
+        clear_flash_kv_cache(past_key_values_uncondition)
 
         self.last_think_content = think_text
         if think_mode:
