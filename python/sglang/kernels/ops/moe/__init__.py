@@ -129,7 +129,7 @@ def situ_and_mul_masked_post_quant(
     transposed: bool = False,
     swizzle: bool = False,
 ) -> None:
-    from ._jit_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
+    from .kimi_k3_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
 
     return impl(
         input,
@@ -204,7 +204,7 @@ register_kernel(
     KernelSpec(
         op="moe.situ_and_mul_masked_post_quant",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe._jit_situ_and_mul_quant:situ_and_mul_masked_post_quant",
+        target="sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant:situ_and_mul_masked_post_quant",
         capabilities=CUDA_ONLY,
     )
 )

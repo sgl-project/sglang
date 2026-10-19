@@ -112,7 +112,7 @@ def situ_and_mul(
     beta: float,
     linear_beta: Optional[float],
 ) -> torch.Tensor:
-    from ._jit_situ_and_mul import situ_and_mul as impl
+    from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
     return impl(input, out, beta, linear_beta)
 
@@ -150,7 +150,7 @@ register_kernel(
     KernelSpec(
         op="activation.situ_and_mul",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.activation._jit_situ_and_mul:situ_and_mul",
+        target="sglang.kernels.ops.activation.kimi_k3_situ_and_mul:situ_and_mul",
         capabilities=CUDA_ONLY,
     )
 )
