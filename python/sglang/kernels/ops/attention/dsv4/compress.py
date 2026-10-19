@@ -44,12 +44,9 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-# Pinned staging buffers whose host-to-device copy (a raw cudaMemcpyAsync inside the JIT
-# planner) may still be queued. torch's host caching allocator only tracks copies issued
-# through torch, so dropping a buffer together with its plan lets the next plan reuse the
-# block and overwrite it before the queued copy reads it: the kernel then runs on another
-# plan's offsets (TBO two-chunk halves get same-sized plans back to back and faulted in
-# flash_c128_prefill). Release a buffer only once an event recorded behind its copy is done.
+# The JIT planner uploads pinned plan buffers with a raw cudaMemcpyAsync that torch's
+# host allocator does not track; a buffer freed with its plan can be overwritten by the
+# next plan before the queued copy reads it, so hold it until an event behind it fires.
 _pinned_in_flight: collections.deque = collections.deque()
 
 
