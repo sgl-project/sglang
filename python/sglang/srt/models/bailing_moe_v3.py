@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.moe.router import (
+from sglang.kernels.ops.gemm.router_gate_matvec import (
     ROUTER_GATE_MATVEC_MAX_M,
     router_gate_matvec,
 )
