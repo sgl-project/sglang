@@ -33,6 +33,7 @@ from sglang.srt.monokernels.spec import (
     NumericsKind,
     Requirements,
     ShapeKey,
+    StepMetadata,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -290,6 +291,21 @@ class TestMonokernelFramework(CustomTestCase):
         for _ in range(2):
             lm(torch.zeros(1), None, batch("decode", 2, 2))
         self.assertEqual(built.steps, [(2, {"layers": 1}), (2, {"layers": 1})])
+
+    def test_only_routed_steps_skip_the_metadata_a_spec_never_reads(self):
+        schedule = StepMetadata.LOW_RATIO_DECODE_SCHEDULE
+        lm, _ = switched(spec=replace(SPEC, unread_metadata=frozenset({schedule})))
+        self.assertTrue(runtime.is_metadata_unread(lm, batch("decode", 2, 2), schedule))
+        # a width not built runs the standard forward, which reads it
+        self.assertFalse(
+            runtime.is_metadata_unread(lm, batch("decode", 3, 3), schedule)
+        )
+        reads_all, _ = switched()
+        without_monokernels = Lm()
+        for model in (reads_all, without_monokernels):
+            self.assertFalse(
+                runtime.is_metadata_unread(model, batch("decode", 2, 2), schedule)
+            )
 
     def test_the_weights_iterator_passes_weights_through_and_keeps_copies(self):
         iterator = runtime.monokernel_weights_iterator

@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
     QwenImage21Attention,
+    QwenImage21TransformerBlock,
     build_layout,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
@@ -497,19 +498,27 @@ def test_condition_slots_expand_to_actual_latent_grid():
     torch.testing.assert_close(collapsed[slots][0], hidden[2])
 
 
-class _RecordingBlock(torch.nn.Module):
-    def __init__(self, layer_id):
-        super().__init__()
-        self._layer_id = layer_id
-        self.seen = None
+class _RecordingAttention(torch.nn.Module):
+    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+        self.seen = caches
+        return torch.zeros_like(x), [None] * len(caches)
 
-    def forward(self, hidden_states, *args):
-        caches = [cache[self._layer_id] for cache in args[-1]]
-        self.seen = caches[0]
-        return hidden_states
+
+def _block_recording_caches(layer_id, dim=4):
+    # The real block forward with its attention swapped for a recorder.
+    block = QwenImage21TransformerBlock.__new__(QwenImage21TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block._layer_id = layer_id
+    block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
+    block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
+    block.attn = _RecordingAttention()
+    block.img_mlp = torch.nn.Identity()
+    return block
 
 
 class _UnifiedBlocks(torch.nn.Module):
+    """Cache-DiT's wrapper: every wrapped block receives the same extras."""
+
     def __init__(self, blocks):
         super().__init__()
         self.transformer_blocks = torch.nn.ModuleList(blocks)
@@ -521,49 +530,21 @@ class _UnifiedBlocks(torch.nn.Module):
         return x
 
 
-def _run_blocks(blocks, prefix_caches):
-    x = torch.zeros(1)
-    for block in blocks:
-        x = block(x, prefix_caches)
-    return x
-
-
-def test_cache_dit_wrapper_keeps_per_layer_prefix_kv():
-    inner = [_RecordingBlock(0), _RecordingBlock(1), _RecordingBlock(2)]
-    wrapped = torch.nn.ModuleList([_UnifiedBlocks(inner)])
+@pytest.mark.parametrize("cache_dit_wrapped", [False, True])
+def test_blocks_keep_per_layer_prefix_kv(cache_dit_wrapped):
+    blocks = [_block_recording_caches(layer_id) for layer_id in range(3)]
+    runners = [_UnifiedBlocks(blocks)] if cache_dit_wrapped else blocks
     prefix_caches = [[{"layer": 0}, {"layer": 1}, {"layer": 2}]]
-
-    _run_blocks(wrapped, prefix_caches)
-    assert [block.seen for block in inner] == prefix_caches[0]
-
-
-def test_plain_blocks_still_get_per_layer_prefix_kv():
-    blocks = torch.nn.ModuleList([_RecordingBlock(0), _RecordingBlock(1)])
-    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
-
-    _run_blocks(blocks, prefix_caches)
-    assert [block.seen for block in blocks] == prefix_caches[0]
-
-
-class _FirstSlotBlock(torch.nn.Module):
-    """Old loop body: take caches[0] and broadcast it to every layer."""
-
-    def __init__(self):
-        super().__init__()
-        self.seen = None
-
-    def forward(self, hidden_states, *args):
-        self.seen = args[-1][0]
-        return hidden_states
-
-
-def test_first_slot_only_caches_are_shared_across_layers():
-    inner = [_FirstSlotBlock(), _FirstSlotBlock()]
-    unified = _UnifiedBlocks(inner)
-    prefix_caches = [[{"layer": 0}, {"layer": 1}]]
-
-    unified(torch.zeros(1), [cache[0] for cache in prefix_caches])
-    assert [block.seen for block in inner] == [prefix_caches[0][0], prefix_caches[0][0]]
+    x = torch.zeros(1, 2, 4)
+    modulation = (torch.zeros(1, 1, 4),) * 4
+    prefix_states = [{"hidden_states": None}]
+    for runner in runners:
+        x = runner(
+            x, modulation, prefix_states, None, [None], [None], prefix_caches, None
+        )
+    assert [block.attn.seen for block in blocks] == [
+        [cache] for cache in prefix_caches[0]
+    ]
 
 
 def test_adjacent_image_slots_stay_distinct():

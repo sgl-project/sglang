@@ -1629,7 +1629,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get(
+                "ignore",
+                config.get("modules_to_not_convert", config.get("exclude_modules", [])),
+            )
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
@@ -2420,6 +2423,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
+        """Align TRT-LLM weights, allowing model-specific storage layouts."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            align_fp4_moe_weights_for_flashinfer_trtllm,
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        align_fp4_moe_weights_for_flashinfer_trtllm(
+            layer,
+            hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                use_per_token_activation=self.quant_config.use_per_token_activation,
+                is_gated=layer.moe_runner_config.is_gated,
+            ),
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2635,9 +2653,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         layer.mega_l1_weights = l1_pair
         layer.mega_l2_weights = l2_pair
-        layer.mega_l1_alphas = l1_alphas
-        layer.mega_l2_alphas = l2_alphas
-        layer.mega_l2_act_scales = l2_act_scales
+        # Parameters, so EPLB moves each expert's values with its weights.
+        for name, value in (
+            ("mega_l1_alphas", l1_alphas),
+            ("mega_l2_alphas", l2_alphas),
+            ("mega_l2_act_scales", l2_act_scales),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
         # Free the checkpoint layout.
         layer.w13_weight.data = l1_pair[0]
         layer.w13_weight_scale.data = l1_pair[1]
@@ -2885,19 +2909,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_fp4_moe_weights_for_flashinfer_trtllm,
-                trtllm_nvfp4_hidden_alignment,
-            )
-
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(
-                layer,
-                hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                    use_per_token_activation=self.quant_config.use_per_token_activation,
-                    is_gated=layer.moe_runner_config.is_gated,
-                ),
-            )
+            self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
@@ -3259,7 +3272,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
+            slot = getattr(layer, "_nvfp4_layout_slot", None)
+            pair_weight = slot[0].pair[slot[1]] if slot and slot[0].is_pair else None
             quant_info = FlashInferCutlassMoeQuantInfo(
+                pair_w2_weight=pair_weight,
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,

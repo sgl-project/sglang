@@ -4,6 +4,7 @@ smallm_moe_gfx950 consumes; GLM-5.x (sigmoid noaux_tc top-8 + shared slot, [M, 9
 SGLANG_ROCM_SMALLM_ROUTER=0 disables both; a build/load failure disables them too."""
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
@@ -23,6 +24,7 @@ _GLM_VARIANTS = ((2, 4, 4), (2, 8, 8), (2, 8, 16))
 _kernels: dict = {}
 _ws: dict = {}
 _disabled = False
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -66,7 +68,7 @@ def _load() -> bool:
         for v in _GLM_VARIANTS:
             _kernels[("glm", v)] = _Kernel(mod, "smallm_router_glm_r%d_t%d_w%d" % v)
     except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
-        print(f"[smallm_router] disabled: {e}", flush=True)
+        logger.warning("smallm_router disabled: %s", e)
         _kernels.clear()
         _disabled = True
         return False
