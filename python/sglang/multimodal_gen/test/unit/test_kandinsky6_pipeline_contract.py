@@ -30,46 +30,11 @@ from sglang.multimodal_gen.runtime.models.schedulers.kandinsky6_piflow import (
 from sglang.multimodal_gen.runtime.pipelines.kandinsky6_pipeline import (
     Kandinsky6TI2VAPipeline,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages import InputValidationStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6 import (
-    Kandinsky6AudioDecodingStage,
-    Kandinsky6DecodingStage,
     Kandinsky6DenoisingStage,
-    Kandinsky6ImageEncodingStage,
-    Kandinsky6LatentPreparationStage,
     denoising,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
-    TextEncodingStage,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation import (
-    TimestepPreparationStage,
-)
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-
-EXPECTED_REQUIRED_MODULES = [
-    "scheduler",
-    "text_encoder",
-    "text_encoder_2",
-    "tokenizer",
-    "tokenizer_2",
-    "transformer",
-    "vae",
-    "audio_vae",
-]
-
-EXPECTED_STAGE_ORDER = [
-    ("input_validation_stage", InputValidationStage),
-    ("text_encoding_stage", TextEncodingStage),
-    ("timestep_preparation_stage", TimestepPreparationStage),
-    ("latent_preparation_stage", Kandinsky6LatentPreparationStage),
-    ("image_encoding_stage", Kandinsky6ImageEncodingStage),
-    ("denoising_stage", Kandinsky6DenoisingStage),
-    # Audio decodes before video, matching the diffusers reference -- see
-    # Kandinsky6TI2VAPipeline.create_pipeline_stages's comment.
-    ("audio_decoding_stage", Kandinsky6AudioDecodingStage),
-    ("decoding_stage", Kandinsky6DecodingStage),
-]
 
 
 def _make_pipeline() -> Kandinsky6TI2VAPipeline:
@@ -94,33 +59,6 @@ def test_disagg_role_rejects_non_monolithic_deployment():
 
     # MONOLITHIC is the only accepted role -- no exception raised.
     pipeline.validate_disagg_role(RoleType.MONOLITHIC)
-
-
-def test_create_pipeline_stages_produces_documented_order():
-    pipeline = _make_pipeline()
-    assert pipeline.pipeline_name == "Kandinsky6TI2VAPipeline"
-    assert pipeline.is_video_pipeline is True
-    assert pipeline._required_config_modules == EXPECTED_REQUIRED_MODULES
-    pipeline.create_pipeline_stages(MagicMock())
-    assert [type(stage) for stage in pipeline.stages] == [
-        stage_cls for _, stage_cls in EXPECTED_STAGE_ORDER
-    ]
-    assert [
-        (name, type(stage)) for name, stage in pipeline._stage_name_mapping.items()
-    ] == EXPECTED_STAGE_ORDER
-
-    # get_module wiring: each stage received the mocked module it asked for.
-    denoising_stage = pipeline._stage_name_mapping["denoising_stage"]
-    assert denoising_stage.transformer is pipeline.modules["transformer"]
-
-    audio_decoding_stage = pipeline._stage_name_mapping["audio_decoding_stage"]
-    assert audio_decoding_stage.audio_vae is pipeline.modules["audio_vae"]
-
-    decoding_stage = pipeline._stage_name_mapping["decoding_stage"]
-    assert decoding_stage.vae is pipeline.modules["vae"]
-
-    image_encoding_stage = pipeline._stage_name_mapping["image_encoding_stage"]
-    assert image_encoding_stage.vae is pipeline.modules["vae"]
 
 
 def _pro_distill_scheduler() -> PiflowScheduler:

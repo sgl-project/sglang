@@ -1953,6 +1953,9 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        prepare = getattr(self.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:

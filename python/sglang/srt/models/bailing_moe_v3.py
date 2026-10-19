@@ -479,13 +479,13 @@ class BailingMoE(nn.Module):
             share_expert_swiglu_limit_list, layer_id
         )
 
-        # Run the MoE gate in bf16. ling-v3's config sets router_dtype="fp32",
-        # but on Hopper that fp32 gate GEMM falls back to a slow sm80 (Ampere)
-        # no-tensor-core path (~7% of decode GPU time). bf16 uses Hopper tensor
-        # cores; the top-k selection re-casts gating logits back to fp32
-        # (see layers/moe/topk.py), so routing stays fp32-stable. Validated on
-        # ling-v3 TP4: accuracy-neutral (greedy), ~17% bs=1 TPOT improvement.
-        self.router_dtype = torch.bfloat16
+        # bf16 here perturbs routing enough to cause output variance, so the
+        # gate dtype follows the checkpoint config; absent means fp32.
+        router_dtype = getattr(config, "router_dtype", None)
+        if router_dtype is None or router_dtype == "fp32":
+            self.router_dtype = torch.float32
+        else:
+            self.router_dtype = torch.bfloat16
 
         self.num_expert_group = getattr(config, "n_group", 0)
         self.topk_group = getattr(config, "topk_group", 0)
