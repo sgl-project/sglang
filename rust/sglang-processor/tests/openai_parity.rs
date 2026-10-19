@@ -74,7 +74,7 @@ impl Checkpoint {
             .ok()?;
         let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
         let bos = ids("").first().copied();
-        let mut out = ids(&prompt);
+        let mut out = ids(prompt.as_str());
         let mut suffix = ids(&prefix);
         if bos.is_some() && suffix.first().copied() == bos {
             suffix.remove(0);

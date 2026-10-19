@@ -677,6 +677,10 @@ class TboForwardBatchPreparer:
         assert end_token_index >= start_token_index, (
             f"{end_token_index=}, {start_token_index=}, batch={batch}"
         )
+        assert batch.logical_forward_mode == batch.forward_mode, (
+            "Two-batch overlap does not support hybrid-SSM decode batches "
+            "relabeled as extend for DP padding."
+        )
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
@@ -774,6 +778,7 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
+            "full_prefill_cuda_graph_capture",  # forward-level flag, inherited by both child batches
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",

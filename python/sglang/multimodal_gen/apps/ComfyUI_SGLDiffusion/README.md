@@ -24,6 +24,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
+- **Qwen-Image-2.1**: Integrated mode (`model_type=qwen_image21`, auto-detected) for Comfy-Org's `qwen_image_2.1_bf16.safetensors` or INT8 `qwen_image_2.1_int8_convrot.safetensors`. Text-to-image and reference-image edit work with the official templates after swapping `UNETLoader` for `SGLDUNETLoader`. The worker manages the prefix K/V cache itself, so the `Qwen Image 2.1 Cache` node's options are ignored. Multi-GPU: Ulysses / Ring or TP through the manual layout in `SGLDiffusion Options`. DiT patches (Fun-Control, attention hooks) are not supported. LoRA: use `SGLDiffusion LoRA Loader` instead of `LoraLoaderModelOnly`. Tested with `Viggle/Qwen-Image-2.1-viggle-turbo` (`...-v0.3-6step-lora-r128.safetensors`): euler, `BasicGuider`, `ManualSigmas` `1.0, 0.967754, 0.933358, 0.857192, 0.666756, 0.400096, 0` at 1024x1024.
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -32,7 +33,7 @@ Connect to a standalone SGLang Diffusion server.
 1. **Start SGLang Diffusion Server**: Ensure the server is running and accessible.
 2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect (default: `http://localhost:3000/v1`).
 3. **Generate Content**:
-   - `SGLDiffusion Generate Image`: For text-to-image and image editing.
+   - `SGLDiffusion Generate Image`: For text-to-image and image editing. Set `num_images` (1 to 10) to get several images from one request as one `IMAGE` batch, in order. Image `i` uses `seed + i`, so the same settings and seed reproduce the same batch; a seed of `-1` lets the server pick a random seed.
    - `SGLDiffusion Generate Video`: For text-to-video and image-to-video.
    - `SGLDiffusion Generate MiniMax-H3`: For joint video-and-audio on a standalone server.
 4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
@@ -42,10 +43,44 @@ ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only the DiT and
 runs one forward per sampler step (pass-through scheduler, no text encode /
 decode on the worker).
 
-1. **Load Model**: Use the `SGLDiffusion UNET Loader` node to load your diffusion model.
-2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
+1. **Load Model**: `SGLDiffusion UNET Loader` loads ComfyUI single files (Qwen-Image, FLUX, Z-Image, MiniMax H3, including pre-quantized `*_int8_convrot` files). It takes the same file as the stock UNET loader, so a workflow switches by replacing that node. `SGLDiffusion Native Model Loader` loads native SGLang model directories that have no ComfyUI file: FastH3 8-Step V2 and VDN-H3 (the model type is read from `model_index.json`).
+2. **Configure Options** (optional): connect `SGLDiffusion Options` to the loader. Without it the worker uses auto-detection and defaults.
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+
+### Options
+
+`SGLDiffusion Options` keeps `model_type` and `num_gpus` on
+top; the other groups fold, and each folded header shows its current choice.
+The fields are plain ComfyUI widgets, so the node works without the JavaScript
+extension, which only changes the presentation.
+
+| Group | Fields |
+| --- | --- |
+| Parallel | `parallel_mode` auto or manual; manual sets `tp_size`, `ulysses_degree`, `ring_degree`, whose product must equal `num_gpus` |
+| Attention | `attention_backend`: auto (model default), flash_attention, torch_sdpa, sage_attention2, sage_attention3, sol_attention (H3; needs the `sol-attn` package; picking it fills `attention_backend_config` with its defaults), and the H3 sparse backends; `attention_backend_config` |
+| Quantization | `quantization` (online, native directories only); `int8_gemm`: GEMM implementation for INT8 ConvRot weights, auto / sglang_jit / comfy_kitchen |
+| Cache | `cache_mode`: off, cache_dit, teacache, spectrum (lossy). For cache_dit, `cache_dit_tuning` auto keeps the defaults; manual sets warmup steps, residual threshold, max consecutive cached steps and Fn compute blocks |
+| Execution | `execution_mode`: eager, torch_compile, cuda_graph (breakable CUDA graph); `regional_compile` |
+| Memory | `memory_mode`: resident or DiT layerwise offload; `resident_layers`, `prefetch_layers` |
+
+The loader checks the options against the resolved model before starting the
+worker and raises instead of dropping a setting. Current limits in integrated mode:
+
+| Option | Supported for |
+| --- | --- |
+| cuda_graph | MiniMax H3, with `cache_mode` off and no layerwise offload |
+| torch_compile | all but FastH3 and VDN-H3 |
+| ring_degree > 1 | not FastH3 / VDN-H3; MiniMax H3 needs `fa` |
+| quantization | native model directories; ComfyUI files carry their own format |
+| cache_dit, spectrum | MiniMax H3 family (spectrum: sequence-parallel degree 1); other models send each sampler step as its own request, so a step cache needs per-run state first |
+| teacache | none yet |
+
+Changing anything but the Cache group restarts the worker on the next run.
+
+For development, run `node --test web/options_state.test.mjs` in this plugin
+folder and `python -m pytest python/sglang/multimodal_gen/test/unit/test_comfyui_options.py`
+from the SGLang repository root.
 
 ## Adding a Model
 
@@ -85,6 +120,7 @@ Reference workflow files are provided in the `workflows/` directory:
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
+- **`qwen_image21_t2i_sgld.json`**: Qwen-Image-2.1 text-to-image. For reference edit, use the official template with `SGLDUNETLoader`.
 - **`minimax_h3_t2v_sgld.json`**: MiniMax-H3 T2V / I2VA / FL2VA (`fl2va` DiT).
 - **`minimax_h3_r2v_sgld.json`**: MiniMax-H3 reference-to-video (`ref2va` DiT).
 - **`minimax_h3_t2v_sgld_upscaler.json`**: H3 two-pass latent upscale (low-res then 3D ×2 refine).
