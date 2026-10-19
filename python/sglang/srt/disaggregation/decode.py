@@ -1701,6 +1701,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     int(decode_req.req.kv.req_pool_idx), seq_len
                 )
 
+            def _request_row_payload():
+                return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
+
             state_types = self.kv_manager.kv_args.state_types
             if StateType.DSV4_REQUEST_STATE in state_types:
                 clear_request_state = getattr(
@@ -1719,6 +1722,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }

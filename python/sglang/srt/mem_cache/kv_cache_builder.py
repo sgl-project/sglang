@@ -58,7 +58,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-from sglang.srt.utils import ceil_align, is_hip
+from sglang.srt.utils import ceil_align, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -72,6 +72,8 @@ def prepare_hicache_staging(
     *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
 ) -> None:
     """Materialize MHA transfer buffers before the final KV budget is measured."""
+    if is_npu():
+        return
     memory = get_memory()
     page_size = get_schedule().page_size
     if memory.hicache_mem_layout != "page_first" or not (
@@ -93,11 +95,13 @@ def prepare_hicache_staging(
             if memory.hicache_size <= 0 and not sidecar:
                 page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
             staging = prepare_mha_write_back_staging(
-                pool,
+                pool.get_device_pool_infos()[0].buffer_info,
                 layer_num=pool.layer_num + len(packed_drafts),
                 page_size=page_size,
                 page_capacity=page_capacity,
+                staging=pool.hicache_write_back_staging,
             )
+            pool.hicache_write_back_staging = staging
             if staging is not None:
                 logger.info(
                     "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
