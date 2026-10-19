@@ -851,6 +851,11 @@ class LoRAPipeline(ComposedPipelineBase):
                             for n in lora_nicknames
                         )
                         if not has_any_lora:
+                            # A previous adapter may still be merged here.
+                            if clear_existing:
+                                if layer.merged:
+                                    layer.unmerge_lora_weights()
+                                layer.clear_lora_weights()
                             layer.disable_lora = True
 
         if rank == 0:
