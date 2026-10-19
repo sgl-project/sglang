@@ -3680,6 +3680,8 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
     serving = get_serving()
     if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
         return None
+    if envs.SGLANG_RUST_SERVER.get():
+        return None
 
     from sglang.srt.rust_extensions import load_rust_extension
     from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
@@ -4455,7 +4457,9 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-def freeze_gc(context: str):
+def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
+    if gc_threshold is not None:
+        gc.set_threshold(*gc_threshold)
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()

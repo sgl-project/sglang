@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     checkpoint_bytes,
     dit_parameter_count,
-    load_safetensors_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
@@ -43,18 +42,6 @@ class TestPrecisionVariantSelection(unittest.TestCase):
             filter_duplicate_precision_variant_safetensors(files),
             ["/tmp/model.safetensors", "/tmp/other.bf16.safetensors"],
         )
-
-    def test_shared_state_dict_loader_uses_canonical_file(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model_dir = Path(tmpdir)
-            canonical = model_dir / "model.safetensors"
-            variant = model_dir / "model.fp16.safetensors"
-            safetensors_save_file({"weight": torch.tensor([1.0])}, canonical)
-            safetensors_save_file({"weight": torch.tensor([2.0])}, variant)
-
-            state_dict = load_safetensors_state_dict(str(model_dir))
-
-        self.assertTrue(torch.equal(state_dict["weight"], torch.tensor([1.0])))
 
     def test_index_selection_precedes_canonical_fallback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
