@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run with torchrun --standalone --nproc-per-node=2 -m pytest -q <this file>."""
+"""Two-rank TP / spatial-shard checks; ``test_two_ranks`` torchruns this file."""
 
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -30,13 +32,23 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or int(os.environ.get("WORLD_SIZE", "1")) != 2,
+_IS_RANK = int(os.environ.get("WORLD_SIZE", "1")) == 2
+requires_ranks = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _IS_RANK,
     reason="requires two CUDA ranks launched by torchrun",
 )
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.mark.skipif(
+    _IS_RANK or torch.cuda.device_count() < 2, reason="requires two CUDA GPUs"
+)
+def test_two_ranks():
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone"]
+    cmd += ["--nproc-per-node=2", "-m", "pytest", "-q", __file__]
+    subprocess.run(cmd, check=True, timeout=1200)
+
+
+@pytest.fixture(scope="module")
 def distributed():
     args = ServerArgs(
         model_path="Qwen/Qwen-Image-2.1",
@@ -56,6 +68,8 @@ def distributed():
     torch.backends.cudnn.allow_tf32 = cudnn_tf32
 
 
+@requires_ranks
+@pytest.mark.usefixtures("distributed")
 @pytest.mark.parametrize("edit", [False, True])
 @torch.no_grad()
 def test_encoder_tp_shards_weights_and_preserves_conditioning(edit):
@@ -126,6 +140,8 @@ def test_encoder_tp_shards_weights_and_preserves_conditioning(edit):
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
+@requires_ranks
+@pytest.mark.usefixtures("distributed")
 @pytest.mark.parametrize("height", [4, 5])
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

@@ -4,6 +4,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.request_window_copy import (
+    commit_packed_rows,
+    copy_packed_rows,
+)
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 
 
@@ -19,6 +23,20 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_valid: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+
+    def leading_rows(self, num_rows: int) -> "WindowLayout":
+        """The layout of the live queries; a prefill CUDA graph pads the rest."""
+        if num_rows == self.pos.numel():
+            return self
+        return msgspec.structs.replace(
+            self,
+            req=self.req[:num_rows],
+            pos=self.pos[:num_rows],
+            write_loc=self.write_loc[:num_rows],
+            indices=self.indices[:num_rows],
+            lengths=self.lengths[:num_rows],
+            commit_mask=self.commit_mask[:num_rows],
+        )
 
     def copy_(self, other: "WindowLayout") -> None:
         # Captured copy kernels read these tensors by address, so a graph replay
@@ -61,7 +79,10 @@ def window_layout(
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    padded_rows: Optional[int] = None,
 ):
+    """padded_rows is set for the prefill CUDA graph, which pads the layout to that
+    many query rows past the live ones in req and pos."""
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
@@ -107,6 +128,26 @@ def window_layout(
     history_loc = torch.arange(history_rows, device=device)
 
     commit_mask = (group_last - offset) < capacity
+    if padded_rows is not None and padded_rows > n:
+        # Padding rows write the workspace past the live rows and commit nowhere.
+        padding = padded_rows - n
+        zeros = req.new_zeros(padding)
+        req, pos = torch.cat([req, zeros]), torch.cat([pos, zeros])
+        write_loc = torch.cat(
+            [
+                write_loc,
+                torch.arange(
+                    history_rows + n,
+                    history_rows + padded_rows,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            ]
+        )
+        indices = torch.cat([indices, indices.new_full((padding, window), -1)])
+        lengths = torch.cat([lengths, lengths.new_zeros(padding)])
+        commit_mask = torch.cat([commit_mask, commit_mask.new_zeros(padding)])
+        n = padded_rows
     return WindowLayout(
         req,
         pos,
@@ -126,20 +167,7 @@ def copy_packed_tokens(src, dst, src_loc, dst_loc, *, page_size, layout=KVLayout
     """Move tokens between paged buffers of ``layout``: a data row and a scale row."""
     if not src_loc.numel():
         return
-    src_loc, dst_loc = src_loc.long(), dst_loc.long()
-    for width, base in (
-        (layout.data_bytes, 0),
-        (layout.scale_bytes, page_size * layout.data_bytes),
-    ):
-        cols = torch.arange(width, device=src.device)
-        values = src[
-            src_loc[:, None] // page_size,
-            base + (src_loc[:, None] % page_size) * width + cols,
-        ]
-        dst[
-            dst_loc[:, None] // page_size,
-            base + (dst_loc[:, None] % page_size) * width + cols,
-        ] = values
+    copy_packed_rows(src, dst, src_loc, dst_loc, page_size=page_size, layout=layout)
 
 
 def _capturing() -> bool:
@@ -185,6 +213,16 @@ class RequestWindow:
         size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
         self.workspace = self.pool_factory(size, 1)
 
+    def row_loc(self, slots, positions):
+        return slots * self.capacity + positions % self.capacity
+
+    def page_indices(self, slot: int, start: int, end: int):
+        assert start % self.page_size == 0, (start, self.page_size)
+        positions = torch.arange(start, end, self.page_size)
+        # capacity is whole pages, so a page's rows keep a paged pool's offsets
+        # and pair with decode's paged SWA pages one for one.
+        return (self.row_loc(slot, positions) // self.page_size).to(torch.int32).numpy()
+
     def reset(self, slots):
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
@@ -209,7 +247,7 @@ class RequestWindow:
     def initialize_dummy_history(self):
         layout = self.layout
         self.tags.fill_(-1)
-        loc = layout.history_req * self.capacity + layout.history_pos % self.capacity
+        loc = self.row_loc(layout.history_req, layout.history_pos)
         for buf in self.state.kv_buffer:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
@@ -218,7 +256,7 @@ class RequestWindow:
     def _history_src(self, layout):
         return torch.where(
             layout.history_valid,
-            layout.history_req * self.capacity + layout.history_pos % self.capacity,
+            self.row_loc(layout.history_req, layout.history_pos),
             self.zero_row,
         )
 
@@ -253,17 +291,12 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
-        dst = torch.where(
-            layout.commit_mask,
-            layout.req * self.capacity + layout.pos % self.capacity,
-            self.sink_row,
-        )
-        copy_packed_tokens(
+        commit_packed_rows(
             self.buffer(layer),
             self.state.kv_buffer[layer],
-            layout.write_loc,
-            dst,
+            self.tags[layer],
+            layout,
             page_size=self.page_size,
+            capacity=self.capacity,
             layout=self.state.kv_layout,
         )
-        self.tags[layer, dst] = layout.pos
