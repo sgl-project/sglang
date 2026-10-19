@@ -82,6 +82,13 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # Per-request penalty coefficients and already-penalized token sets for
+    # speculative verify rows. Draft tokens are applied position by position.
+    draft_presence_penalties: Optional[torch.Tensor] = None
+    draft_frequency_penalties: Optional[torch.Tensor] = None
+    draft_repetition_penalties: Optional[torch.Tensor] = None
+    draft_cumulated_presence_penalties: Optional[torch.Tensor] = None
+    draft_cumulated_repetition_penalties: Optional[torch.Tensor] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -101,6 +108,10 @@ class SamplingBatchInfo:
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
+
+    # Forward copies keep their penalty owner so speculative verify can feed
+    # accepted tokens before draft-extend, without re-applying penalties.
+    spec_penalty_source: Optional["SamplingBatchInfo"] = None
 
     watermark_keys: Optional[torch.Tensor] = None
     watermark_context_windows: Optional[torch.Tensor] = None
@@ -679,7 +690,54 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
+        self.update_draft_penalty_state()
+        forward = dataclasses.replace(self, penalizer_orchestrator=None)
+        forward.spec_penalty_source = (
+            self
+            if self.penalizer_orchestrator is not None
+            and self.penalizer_orchestrator.is_required
+            else None
+        )
+        return forward
+
+    def cumulate_accepted_output_tokens(
+        self, accepted: torch.Tensor, accept_lens: torch.Tensor
+    ):
+        """Feed every accepted speculative token into the penalty state.
+
+        Runs on the forward stream inside verify, before ``on_publish`` records
+        the relay event. The next iteration's penalty snapshot therefore sees
+        this verify's commits even though overlap scheduling has not processed
+        the result or extended ``Req.output_ids`` yet.
+        """
+        orchestrator = self.penalizer_orchestrator
+        if orchestrator is None or not orchestrator.is_required:
+            return
+        for position in range(accepted.shape[1]):
+            orchestrator.cumulate_output_tokens_masked(
+                accepted[:, position], accept_lens > position
+            )
+
+    def update_draft_penalty_state(self):
+        """Capture coefficients needed to extend penalties over draft tokens."""
+        orchestrator = self.penalizer_orchestrator
+        if orchestrator is None:
+            return
+        for penalizer in orchestrator.penalizers.values():
+            if not penalizer.is_prepared():
+                continue
+            if isinstance(penalizer, penaltylib.BatchedPresencePenalizer):
+                self.draft_presence_penalties = penalizer.presence_penalties
+                self.draft_cumulated_presence_penalties = (
+                    penalizer.cumulated_presence_penalties
+                )
+            elif isinstance(penalizer, penaltylib.BatchedFrequencyPenalizer):
+                self.draft_frequency_penalties = penalizer.frequency_penalties
+            elif isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
+                self.draft_repetition_penalties = penalizer.repetition_penalties
+                self.draft_cumulated_repetition_penalties = (
+                    penalizer.cumulated_repetition_penalties
+                )
 
 
 def merge_bias_tensor(

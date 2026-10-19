@@ -759,6 +759,7 @@ def eagle_sample(
     from sglang.srt.sampling.penaltylib.repetition_penalty import (
         apply_scaling_penalties,
     )
+    from sglang.srt.speculative.draft_penalties import apply_draft_token_penalties
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -779,8 +780,8 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
-    # Apply penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Apply penalties from the committed context. Draft-token penalties are
+    # applied per verify row below.
     if sampling_info.acc_additive_penalties is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -802,6 +803,9 @@ def eagle_sample(
                 sampling_info.logit_bias, verify_input.draft_token_num, dim=0
             )
         )
+
+    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+    apply_draft_token_penalties(next_token_logits, candidates, sampling_info)
 
     # Apply grammar mask if provided
     if grammar_mask is not None:
@@ -847,7 +851,6 @@ def eagle_sample(
                 )
             )
 
-    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
@@ -1112,9 +1115,12 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    # Accumulate penalty
-    # This is a relaxed version of penalties for speculative decoding.
+    # Seed the prefill boundary, then let verify feed accepted tokens directly.
+    # Overlap schedules the next batch before result processing extends
+    # output_ids, so the output-id path would lag one verify step.
     if batch.sampling_info.penalizer_orchestrator.is_required:
+        for req in batch.reqs:
+            req.penalty_external_cumulation = True
         batch.cumulate_penalty_output_tokens()
 
     page_size = batch.token_to_kv_pool_allocator.page_size
