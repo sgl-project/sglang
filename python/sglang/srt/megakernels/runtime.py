@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -16,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.megakernels.binding import MegakernelBinding
 from sglang.srt.megakernels.guards import deadline_s, device_isa
 from sglang.srt.megakernels.spec import (
+    ENTRIES,
     FLAG,
     BuildContext,
     BuiltMegakernel,
@@ -43,6 +45,10 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+# HF architecture -> the "module:attribute" path of the binding its megakernel gets;
+# every other architecture gets MegakernelBinding
+_BINDINGS: dict[str, str] = {}
 
 
 def megakernel_enabled() -> bool:
@@ -73,7 +79,7 @@ def install_megakernel(
     _refuse(_gather_reasons(reasons))
 
     tokens = _tokens_per_request()
-    binding = MegakernelBinding(model=model)
+    binding = _binding_class(hf_config.architectures)(model=model)
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
@@ -84,8 +90,11 @@ def install_megakernel(
     built = spec.build(model, hf_config, context)
     # not setattr: a built object that is an nn.Module must not join the state dict
     model.__dict__["_megakernel"] = built
-    # Different widths would leave ranks waiting in different collectives.
+    # Different widths would leave ranks waiting in different collectives, and
+    # different entries would run different code around them.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
+    entries = _offered_entries(built)
+    megakernel_agree(entries, what=f"entries {spec.name} offers")
     if spec.max_rows > 0 and not built.widths:
         _refuse([f"{spec.name} built no width of {list(context.widths)}"])
     # Captured kernels keep state derived from the weights that updates cannot refresh.
@@ -95,14 +104,14 @@ def install_megakernel(
     built_s = time.perf_counter() - start
     used_mib = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
     if not built.widths:
-        # a spec that covers no step, e.g. a draft spec offering draft_sampler only
-        logger.info(
-            "NVIDIA megakernel: %s: %s",
-            spec.name,
-            "draft sampler"
-            if built.draft_sampler is not None
-            else "no step and no draft sampler",
-        )
+        # a spec that covers no step, e.g. a draft spec offering only its entries
+        if built.draft_sampler is not None:
+            offers = "draft sampler"
+        elif entries:
+            offers = "entries " + ", ".join(entries)
+        else:
+            offers = "no step and no draft sampler"
+        logger.info("NVIDIA megakernel: %s: %s", spec.name, offers)
         return
     logger.info(
         "NVIDIA megakernel: active (%s: %s; widths %s; %s numerics; built in %.1f s, "
@@ -141,6 +150,29 @@ def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]
     """The built draft spec's draft_sampler factory, or None for SGLang's proposal."""
     built = built_megakernel(draft_model)
     return None if built is None else built.draft_sampler
+
+
+def megakernel_entry(model: torch.nn.Module, name: str) -> Optional[Callable]:
+    """The entry (spec.ENTRIES) the model's built megakernel offers, or None for
+    SGLang's own path."""
+    assert name in ENTRIES, name
+    built = built_megakernel(model)
+    # optional members: a built object written before an entry existed lacks it
+    return None if built is None else getattr(built, name, None)
+
+
+def _offered_entries(built: BuiltMegakernel) -> tuple[str, ...]:
+    return tuple(name for name in ENTRIES if getattr(built, name, None) is not None)
+
+
+def _binding_class(architectures: Optional[list[str]]) -> type:
+    """The binding SGLang hands the megakernel of a model of these architectures."""
+    for arch in architectures or ():
+        path = _BINDINGS.get(arch)
+        if path is not None:
+            module, _, attr = path.partition(":")
+            return getattr(importlib.import_module(module), attr)
+    return MegakernelBinding
 
 
 def _find_spec_on_every_rank(

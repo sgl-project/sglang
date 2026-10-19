@@ -22,6 +22,11 @@ from _fakes import ANY_TP, ARCH, ISA, SPEC, Lm, batch, server_args  # noqa: E402
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
+class OtherBinding:
+    def __init__(self, *, model):
+        self.model = model
+
+
 def install(
     *,
     archs=(ARCH,),
@@ -105,6 +110,28 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = install(archs=["Draft"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIs(runtime.megakernel_draft_sampler(lm), print)
+
+    def test_each_architecture_gets_its_registered_binding(self):
+        with patch.dict(runtime._BINDINGS, {ARCH: f"{__name__}:OtherBinding"}):
+            lm = install(tokens=1)
+        self.assertIsInstance(lm.context.binding, OtherBinding)
+        self.assertIs(lm.context.binding.model, lm)
+
+    def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
+        registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
+        lm = install(archs=["EagleDraft"], is_draft=True)
+        self.assertIs(runtime.megakernel_entry(lm, "draft_loop"), print)
+        self.assertIsNone(runtime.megakernel_entry(lm, "draft_extend"))
+        self.assertIsNone(runtime.megakernel_entry(Lm(), "draft_loop"))
+
+        def fewer_entries_on_rank_1(value, group=None):
+            entries = value == ("draft_loop", "begin_draft_round")
+            return [value, value[:1]] if entries else [value]
+
+        with self.assertRaisesRegex(RuntimeError, "entries fake offers differ"):
+            install(
+                archs=["EagleDraft"], is_draft=True, gathered=fewer_entries_on_rank_1
+            )
 
     def test_ranks_that_disagree_are_refused_on_every_rank(self):
         """A rank that differs would wait in a different collective."""
