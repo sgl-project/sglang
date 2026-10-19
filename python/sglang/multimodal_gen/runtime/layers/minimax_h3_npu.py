@@ -102,9 +102,21 @@ def rmsnorm_modulate(
     if ops is None:
         return None
     eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
-    return ops.rmsnorm_modulate(
-        x, norm.weight, shift, scale, indices, eps, quantize, keep_float
+    # Wide rows exhaust UB when modulation and INT8 rounding are fused.
+    split_quant = quantize and x.shape[1] > 4096
+    normalized, data, scales = ops.rmsnorm_modulate(
+        x,
+        norm.weight,
+        shift,
+        scale,
+        indices,
+        eps,
+        quantize and not split_quant,
+        keep_float or split_quant,
     )
+    if split_quant:
+        data, scales = torch.ops.npu.npu_dynamic_quant(normalized, dst_type=torch.int8)
+    return normalized if keep_float else None, data, scales
 
 
 def indexed_gate(

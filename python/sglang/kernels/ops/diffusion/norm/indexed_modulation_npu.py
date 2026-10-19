@@ -24,8 +24,6 @@ def _rmsnorm_modulate_kernel(
     SCALE,
     INDICES,
     Y,
-    Q,
-    QS,
     ROWS,
     WIDTH: tl.constexpr,
     EPS: tl.constexpr,
@@ -33,8 +31,6 @@ def _rmsnorm_modulate_kernel(
     SCALE_STRIDE: tl.constexpr,
     INDEX_STRIDE: tl.constexpr,
     MODULATE: tl.constexpr,
-    QUANTIZE: tl.constexpr,
-    KEEP_FLOAT: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     columns = tl.arange(0, BLOCK)
@@ -73,16 +69,29 @@ def _rmsnorm_modulate_kernel(
                 .to(X.dtype.element_ty, fp_downcast_rounding="rtne")
                 .to(tl.float32)
             )
-        if KEEP_FLOAT:
-            tl.store(Y + offset, y, mask)
-        if QUANTIZE:
-            amax = tl.max(tl.where(mask, tl.abs(y), 0.0), 0)
-            quant_scale = amax / 127.0
-            divisor = tl.where(quant_scale > 0.0, quant_scale, 1.0)
+        tl.store(Y + offset, y, mask)
+
+
+@triton.jit
+def _quantize_rows_kernel(Y, Q, QS, ROWS, WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    columns = tl.arange(0, BLOCK)
+    for row in range(tl.program_id(0), ROWS, tl.num_programs(0)):
+        row_offset = tl.cast(row, tl.int64) * WIDTH
+        amax = tl.full((), 0.0, tl.float32)
+        for start in range(0, WIDTH, BLOCK):
+            mask = start + columns < WIDTH
+            y = tl.load(Y + row_offset + start + columns, mask, other=0).to(tl.float32)
+            amax = tl.maximum(amax, tl.max(tl.abs(y), 0))
+        quant_scale = amax / 127.0
+        divisor = tl.where(quant_scale > 0.0, quant_scale, 1.0)
+        for start in range(0, WIDTH, BLOCK):
+            mask = start + columns < WIDTH
+            offset = row_offset + start + columns
+            y = tl.load(Y + offset, mask, other=0).to(tl.float32)
             quantized = libdevice.nearbyint(y / divisor)
             quantized = tl.minimum(tl.maximum(quantized, -127.0), 127.0)
             tl.store(Q + offset, quantized.to(tl.int8), mask)
-            tl.store(QS + row, quant_scale)
+        tl.store(QS + row, quant_scale)
 
 
 @triton.jit
@@ -119,21 +128,21 @@ def _indexed_gate_kernel(
 
 def rmsnorm_modulate(x, weight, shift, scale, indices, eps, quantize, keep_float):
     rows, width = x.shape
-    out = torch.empty_like(x) if keep_float else None
+    # Separating quantization keeps its rounding buffers out of the full-row UB.
+    out = torch.empty_like(x)
     data = torch.empty(x.shape, device=x.device, dtype=torch.int8) if quantize else None
     scales = (
         torch.empty(rows, device=x.device, dtype=torch.float32) if quantize else None
     )
     modulate = shift is not None
-    _rmsnorm_modulate_kernel[(min(rows, _vector_cores(x.device)),)](
+    grid = (min(rows, _vector_cores(x.device)),)
+    _rmsnorm_modulate_kernel[grid](
         x,
         weight,
         shift if modulate else x,
         scale if modulate else x,
         indices if modulate else x,
-        out if keep_float else x,
-        data if quantize else x,
-        scales if quantize else x,
+        out,
         rows,
         width,
         eps,
@@ -141,12 +150,20 @@ def rmsnorm_modulate(x, weight, shift, scale, indices, eps, quantize, keep_float
         scale.stride(0) if modulate else 0,
         indices.stride(0) if modulate else 0,
         modulate,
-        quantize,
-        keep_float,
         triton.next_power_of_2(width),
         enable_fp_fusion=False,
     )
-    return out, data, scales
+    if quantize:
+        _quantize_rows_kernel[grid](
+            out,
+            data,
+            scales,
+            rows,
+            width,
+            min(triton.next_power_of_2(width), 1024),
+            enable_fp_fusion=False,
+        )
+    return out if keep_float else None, data, scales
 
 
 def indexed_gate(x, gate, other, indices, allow_inplace):
