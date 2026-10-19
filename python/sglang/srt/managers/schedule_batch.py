@@ -2862,13 +2862,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     raise ValueError(
                         "encoder SWA replay currently supports token-only text requests"
                     )
-                if req.return_logprob and req.logprob_start_len not in (
-                    -1,
-                    len(req.origin_input_ids),
-                ):
-                    raise ValueError(
-                        "encoder SWA replay cannot return cached prompt logprobs"
-                    )
             self.encoder_swa_reset = [
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]

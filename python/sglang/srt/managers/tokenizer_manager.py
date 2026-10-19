@@ -1337,14 +1337,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 raise ValueError(
                     "encoder SWA replay currently supports token-only text requests"
                 )
-            if (
-                isinstance(obj, GenerateReqInput)
-                and obj.return_logprob
-                and obj.logprob_start_len not in (None, -1, len(input_ids))
-            ):
-                raise ValueError(
-                    "encoder SWA replay cannot return cached prompt logprobs"
-                )
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
