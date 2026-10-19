@@ -1085,8 +1085,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
         self._trtllm_uniform_fp8 = (
-            not self._unified
-            and get_exec().kernel.dsv4_attn_backend == "trtllm"
+            not self._unified and get_exec().kernel.dsv4_attn_backend == "trtllm"
         )
         # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would
         # under-count that ring (640 vs 1024). MTP keeps the old inflation.
