@@ -1,6 +1,4 @@
-import logging
 import unittest
-import urllib.request
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
@@ -10,11 +8,10 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME, check_rol
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
+    assert_metrics,
     run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-
-logger = logging.getLogger(__name__)
 
 register_npu_ci(
     est_time=5400,
@@ -64,8 +61,12 @@ KIMI_K3_W4A8_32P_OTHER_ARGS = [
     "bfloat16",
     "--tp-size",
     64,
-    # Deprecated spelling, still auto-converted to --attn-dp-size on main;
-    # required by the older sglang build in the nightly image.
+    # The legacy "--enable-dp-attention --dp-size" pair is auto-converted to
+    # "--attn-dp-size" on main; spelled out here because the sglang build in
+    # the nightly B-series images predates the new flag. Switch to
+    # "--attn-dp-size", 4, once those images refresh.
+    # "--attn-dp-size",
+    # 4,
     "--enable-dp-attention",
     "--dp-size",
     4,
@@ -140,6 +141,8 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     }
     timeout = 10000
     seed = 42
+    # L2 (host) hit-rate threshold (%) checked by assert_metrics.
+    host_hit_rate = 10
 
     def test_npu_kimi_k3_w4a8_32p_gpqa(self):
         """Run NPU accuracy test for Kimi-K3-w4a8 32p four nodes on gpqa_diamond"""
@@ -147,15 +150,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
 
     @check_role(allowed_roles=["master"])
     def test_npu_kimi_k3_w4a8_32p_l2_host_hit_rate(self):
-        """Run the 64k GSP bench and assert the L2 (host) hit rate is above 10%"""
-        try:
-            req = urllib.request.Request(
-                f"{self.base_url}/flush_cache", data=b"", method="POST"
-            )
-            urllib.request.urlopen(req, timeout=60)
-        except Exception as e:
-            logger.warning(f"flush_cache failed, continue anyway: {e}")
-
+        """Run the 64k GSP bench; assert_metrics checks the host hit rate"""
         # 3 groups x 32 prompts share a 57600-token prefix (64k * 0.9), which
         # exceeds L1 so evictions land in L2 (observed host hit 15.9%~20.5%).
         metrics = run_bench_serving(
@@ -173,10 +168,7 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
             warmup_requests=16,
             cache_report=True,
         )
-        host_hit = metrics.get("host_hit_rate_pct")
-        assert host_hit is not None and float(host_hit) >= 10, (
-            f"L2 host hit rate {host_hit}% is not above 10%"
-        )
+        assert_metrics(self, metrics)
 
 
 if __name__ == "__main__":

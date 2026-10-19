@@ -915,7 +915,13 @@ def assert_metrics(self, metrics):
         raise Exception("No metrics obtained from benchmark")
 
     tc_name = self.__class__.__name__
-    if self.tpot and metrics.get("mean_tpot"):
+    # getattr so accuracy-based cases (which set no perf baselines) can also
+    # route their metrics through this function.
+    tpot = getattr(self, "tpot", None)
+    output_token_throughput = getattr(self, "output_token_throughput", None)
+    ttft = getattr(self, "ttft", None)
+    mean_e2e_latency = getattr(self, "mean_e2e_latency", None)
+    if tpot and metrics.get("mean_tpot"):
         dump_metric(
             "tpot",
             float(metrics["mean_tpot"]),
@@ -923,10 +929,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "tpot_baseline",
-            float(self.tpot),
+            float(tpot),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.output_token_throughput and metrics.get("total_tps"):
+    if output_token_throughput and metrics.get("total_tps"):
         dump_metric(
             "throughput",
             float(metrics["total_tps"]),
@@ -934,10 +940,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "throughput_baseline",
-            float(self.output_token_throughput),
+            float(output_token_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.ttft and metrics.get("mean_ttft"):
+    if ttft and metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
             float(metrics["mean_ttft"]),
@@ -945,10 +951,10 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "ttft_baseline",
-            float(self.ttft),
+            float(ttft),
             labels={"test_case": tc_name, "type": "perf"},
         )
-    if self.mean_e2e_latency and metrics.get("mean_e2e_latency"):
+    if mean_e2e_latency and metrics.get("mean_e2e_latency"):
         dump_metric(
             "e2e_latency",
             float(metrics["mean_e2e_latency"]),
@@ -956,7 +962,7 @@ def assert_metrics(self, metrics):
         )
         dump_metric(
             "e2e_latency_baseline",
-            float(self.mean_e2e_latency),
+            float(mean_e2e_latency),
             labels={"test_case": tc_name, "type": "perf"},
         )
 
@@ -1027,6 +1033,32 @@ def assert_metrics(self, metrics):
         self.assertGreaterEqual(
             float(metrics["accept_length"]) / spec_num_draft_tokens,
             self.accept_rate,
+        )
+
+    # L2 (host) hit rate from --cache-report: dumped whenever the report is
+    # present; once a host_hit_rate baseline is set, a missing report must
+    # fail the test instead of being silently skipped.
+    host_hit_rate = getattr(self, "host_hit_rate", None)
+    if host_hit_rate and metrics.get("host_hit_rate_pct"):
+        dump_metric(
+            "host_hit_rate",
+            float(metrics["host_hit_rate_pct"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "host_hit_rate_baseline",
+            float(host_hit_rate),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+    if host_hit_rate:
+        self.assertIsNotNone(
+            metrics.get("host_hit_rate_pct"),
+            "host hit rate not found in bench_serving output "
+            "while host_hit_rate baseline is set",
+        )
+        self.assertGreaterEqual(
+            float(metrics["host_hit_rate_pct"]),
+            float(host_hit_rate),
         )
 
 
