@@ -22,18 +22,21 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache.page_interleave import PageInterleavePlacement
 from sglang.srt.mem_cache.pool_host.base import synchronized
 
 
 class PageInterleaveHostPoolMixin:
     """Owner-classed host slots + the per-rank narrowing of a transfer."""
 
-    def __init__(self, device_pool, *args, **kwargs):
-        # Read before super().__init__: the base constructor calls clear().
-        self.placement = device_pool.placement
-        self.shard_rank = device_pool.shard_rank
-        self.shard_size = device_pool.shard_size
-        super().__init__(device_pool, *args, **kwargs)
+    def __init__(
+        self, buffer_info, *args, placement: PageInterleavePlacement, **kwargs
+    ):
+        # Set before super().__init__: the base constructor calls clear().
+        self.placement = placement
+        self.shard_rank = placement.spec.shard_rank
+        self.shard_size = placement.spec.shard_size
+        super().__init__(buffer_info, *args, **kwargs)
         assert self.page_size == self.placement.spec.page_size, (
             "the sharded host pool pages must match the device's physical page"
         )

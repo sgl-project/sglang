@@ -328,6 +328,9 @@ class InklingMMConfig(PretrainedConfig):
             if isinstance(text_config, InklingModelConfig)
             else InklingModelConfig(**(text_config or {}))
         )
+        if isinstance(mtp_config, dict) and "n_layers" in mtp_config:
+            # HiCache reads the draft depth through the text config.
+            self.text_config.num_nextn_predict_layers = mtp_config["n_layers"]
         if isinstance(mtp_config, dict) and mtp_config.get("local_layer_ids"):
             # Banded MTP head: the checkpoint declares its sliding-window draft
             # depths on mtp_config. Canonicalize onto text_config so every
