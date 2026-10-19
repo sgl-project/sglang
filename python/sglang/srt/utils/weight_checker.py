@@ -63,6 +63,8 @@ _NON_PERSISTENT_BUFFER_PATTERNS = (
     "inv_freq",
     "freqs_cis",
     "expert_mask_gpu",
+    # DeepSeek-V4.1 WO-A FP8 copy, derived from the BF16 weight.
+    "wo_a_fp8_",
 )
 
 

@@ -57,6 +57,9 @@ class TestDerivedWeightCache(unittest.TestCase):
             def invalidate_derived_weights(self):
                 seen.append(model[0].weight.detach().clone())
 
+            def refresh_derived_weights(self):
+                pass
+
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 2, bias=False, device="cpu"), Cache()
         )
