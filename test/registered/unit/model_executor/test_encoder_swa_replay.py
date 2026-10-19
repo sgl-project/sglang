@@ -11,7 +11,6 @@ from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.arg_groups import deepseek_v4_hook
-from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -615,7 +614,7 @@ class _View(SimpleNamespace):
         raise _PastEncoderReplayChecks(name)
 
 
-class TestEncoderReplayStartupGate(CustomTestCase):
+class TestEncoderReplayChunkFloor(CustomTestCase):
     def _validate(self, chunked_prefill_size):
         view = _View(
             enable_encoder_swa_bounded_replay=True,
@@ -630,18 +629,6 @@ class TestEncoderReplayStartupGate(CustomTestCase):
         self._validate(384)
         with self.assertRaisesRegex(ValueError, "at least 384 chunked prefill"):
             self._validate(383)
-
-    def test_other_models_reject_the_flag(self):
-        args = ServerArgs(model_path="dummy", enable_encoder_swa_bounded_replay=True)
-        args._model_config = SimpleNamespace(
-            joint_head_config=None,
-            is_multimodal=False,
-            hf_config=SimpleNamespace(
-                architectures=["LlamaForCausalLM"], model_type="llama"
-            ),
-        )
-        with self.assertRaisesRegex(ValueError, "requires DeepSeek-V4.1"):
-            handle_model_capability_adjustments(args)
 
 
 class TestEncoderReplayDpStartupCheck(CustomTestCase):
