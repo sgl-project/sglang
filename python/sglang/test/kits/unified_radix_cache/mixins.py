@@ -11,11 +11,14 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
+    InitLoadBackParams,
     InsertParams,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
+    EvictLayer,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -339,6 +342,31 @@ class UnifiedRadixCacheFixtures:
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
+
+    def _evict_device_component(self, cache, node, component_type):
+        """Evict one node's device value of one component, as the eviction
+        walk does for the victim it picks."""
+        result = cache.tree_core.evict_component(
+            node, component_type, EvictLayer.DEVICE
+        )
+        cache._free_values(result.device_frees, result.host_frees)
+
+    def _load_back_through_admission(self, cache, req_to_token_pool, tokens):
+        """Match ``tokens`` and start the scheduler's load-back of the host
+        hit. The load-back holds its path lock until it is released."""
+        req = self._make_req(req_to_token_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+        return req
 
     def _match_tokens_for_chain(self, cache, chain):
         tokens: list[int] = []

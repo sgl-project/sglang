@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
@@ -80,7 +79,9 @@ register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
+class TestUnifiedRadixCacheEagleHiCacheStorageKey(
+    UnifiedRadixCacheStorageFixtures, CustomTestCase
+):
     cfg = CacheConfig(
         page_size=4,
         components=(ComponentType.FULL,),
@@ -178,61 +179,38 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         self.assertNotEqual(canonical_hashes, cache.tree_core.get_hash_values(leaf))
 
     def test_buffer_anchor_rematch_preserves_bigram_boundary(self):
-        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-
-        cache, allocator, _ = build_fixture(self.cfg)
+        cache, allocator, _ = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        pipeline = cache.buffer_pipeline
         extra_key = "adapter-a"
         cache_salt = "tenant-a"
         prefix_tokens = array("q", [1, 2, 3, 4, 5])
         value = allocator.alloc(len(prefix_tokens) - 1)
         self.assertIsNotNone(value)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(
-                    prefix_tokens,
-                    extra_key=extra_key,
-                    cache_salt=cache_salt,
-                ),
-                value=value,
-            )
-        )
-        match = cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(
-                    prefix_tokens,
-                    extra_key=extra_key,
-                    cache_salt=cache_salt,
-                )
-            )
-        )
+        key = RadixKey(prefix_tokens, extra_key=extra_key, cache_salt=cache_salt)
+        cache.insert(InsertParams(key=key, value=value))
+        match = cache.match_prefix(MatchPrefixParams(key=key))
         self.assertEqual(match.device_prefix_len, len(prefix_tokens) - 1)
-
         req_id = CacheRequestHandle("bigram-anchor", 0)
-        prefetch_key = RadixKey(
-            array("q", [prefix_tokens[-1], 6, 7, 8, 9]),
-            extra_key=extra_key,
-            is_bigram=True,
-            cache_salt=cache_salt,
-        )
+        # What prefetch_from_storage registers for a bigram request anchored
+        # at the matched node: the suffix key starts at the boundary token.
         cache.ongoing_prefetch[req_id] = _OngoingPrefetch(
             anchor_node_id=match.last_device_node,
-            prefetch_key=prefetch_key,
+            prefetch_key=RadixKey(
+                array("q", [prefix_tokens[-1], 6, 7, 8, 9]),
+                extra_key=extra_key,
+                is_bigram=True,
+                cache_salt=cache_salt,
+            ),
             host_indices=None,
             operation=None,
             anchor_lock_params=None,
             comp_xfers={},
         )
-
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline.anchor_locks = {}
-        pipeline.anchor_locked_tokens_ = 0
-        pipeline.anchor_lock_cap_tokens = 10_000
-        pipeline._anchor_lock_cap_skips = 0
-        pipeline._prefetch_prefix_ctx = {
-            req_id: (list(prefix_tokens[:-1]), extra_key, cache_salt)
-        }
-        pipeline._cache = cache
-
+        pipeline.set_prefix_ctx(
+            req_id, list(prefix_tokens[:-1]), extra_key=extra_key, cache_salt=cache_salt
+        )
         lock_ref = node_device_lock_ref(
             cache, match.last_device_node, ComponentType.FULL
         )
@@ -244,8 +222,8 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             node_device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
             lock_ref + 1,
         )
-
         pipeline.release_anchor_lock(req_id)
+        pipeline.pop_prefix_ctx(req_id)
         cache.ongoing_prefetch.pop(req_id)
         self.assertEqual(
             node_device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
@@ -287,52 +265,25 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
 
     def test_sanity_check_reads_buffer_backup_node_id_from_snapshot(self):
         """A buffer-mode backup entry keeps its node id inside the detached
-        snapshot; sanity_check must read it from there. It used to read
-        ``entry.intent.node_id``, an attribute the intent no longer has, so the
-        idle check raised AttributeError whenever a backup was in flight."""
-        from sglang.srt.mem_cache.buffer_mode.pipeline import (
-            BufferModePipeline,
-            _UnifiedBackupIntent,
-            _UnifiedBufferBackupEntry,
+        snapshot; sanity_check must read it from there while the write is in
+        flight. It used to read ``entry.intent.node_id``, an attribute the
+        intent no longer has, so the idle check raised AttributeError whenever
+        a backup was in flight."""
+        cache, allocator, _ = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
         )
-
-        cache, allocator, _ = build_fixture(self.cfg)
-        cache.enable_storage = True
         tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8, 9])
         value = allocator.alloc(len(tokens) - 1)
         self.assertIsNotNone(value)
         cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        leaf_id = cache.match_prefix(
+        leaf = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(tokens))
         ).last_device_node
-        snapshot = cache.tree_core.snapshot_buffer_backup(
-            leaf_id, pass_prefix_keys=False
-        )
-        self.assertIsNotNone(snapshot)
-
-        # The post-launch entry pins its node, as sanity_check requires of
-        # every in-flight backup.
-        lock_params = cache.inc_lock_ref(leaf_id).to_dec_params()
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        keys = list(snapshot.hash_values)
-        # Entries are keyed by the write's ack id, not by the node.
-        pipeline.ongoing_write_through = {
-            -1: _UnifiedBufferBackupEntry(
-                intent=_UnifiedBackupIntent(
-                    snapshot=snapshot, pool=PoolName.KV, keys=keys
-                ),
-                host_indices=torch.empty(0, dtype=torch.int64),
-                aux_xfers=[],
-                lock_params=lock_params,
-                occupied_units=0,
-                keys_by_pool={PoolName.KV: keys},
-            )
-        }
-        cache.buffer_pipeline = pipeline
+        write_backup(cache, leaf)
+        cache.buffer_pipeline.flush_pending_writes()
+        self.assertTrue(cache.buffer_pipeline.ongoing_write_through)
         cache.sanity_check()
-
-        cache.buffer_pipeline = None
-        cache.dec_lock_ref(leaf_id, lock_params)
+        self._drain_buffer_writes(cache)
         cache.sanity_check()
 
 
@@ -2412,6 +2363,41 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(m.device_prefix_len, len(seq))
         cons.sanity_check()
 
+    @requires_swa_only
+    @requires(
+        lambda cfg: cfg.sliding_window_size > cfg.page_size,
+        "the window must reach past the leaf's own page",
+    )
+    def test_swa_backup_reaches_device_ancestor_in_cache_mode_only(self):
+        """Backing up a leaf in cache mode carries its SWA window past the leaf
+        into the device-only parent; buffer mode writes each node's SWA under
+        its own pages, so the leaf's write holds the leaf alone."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
+        if len(chain) < 2:
+            self.skipTest("chain too short")
+        parent, leaf = chain[-2], chain[-1]
+        write_backup(cache, leaf, write_back=True)
+        cache.writing_check(write_back=True)
+        self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.SWA))
+        self.assertIsNotNone(node_host_value(cache, parent, ComponentType.SWA))
+        self.assertIsNone(node_host_value(cache, parent, ComponentType.FULL))
+
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            self._make_storage_dir()
+        )
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
+        parent, leaf = chain[-2], chain[-1]
+        write_backup(cache, leaf)
+        swa_keys = {
+            intent.snapshot.node_id: list(intent.keys)
+            for intent in cache.buffer_pipeline.pending_write_queue
+            if intent.pool == PoolName.SWA
+        }
+        self.assertEqual(swa_keys[leaf], cache.tree_core.get_hash_values(leaf))
+        self._drain_buffer_writes(cache)
+        cache.sanity_check()
+
 
 define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
 
@@ -2805,128 +2791,141 @@ class TestAnchorLockOutcomePolicy(AnchorLockOutcomePolicyFixtures, CustomTestCas
     -> cap_skip (launch unlocked, since no drain can ever fit it), merely
     over budget -> cap_busy (park)."""
 
+    cfg = CacheConfig()
     _REQ = CacheRequestHandle("req-1", 0)
     _PREFIX = list(range(100, 100 + 8))
 
     def test_intact_prefix_locks_live_node(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX))
-        pipeline = self._make_pipeline(cache)
-        self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "locked")
-        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, 99)
+        cache, pipeline = self._make_buffer_cache(resident=self._PREFIX)
+        leaf = match_prefix(cache, self._PREFIX).last_device_node
+        self.assertEqual(
+            pipeline.try_lock_anchor(self._REQ, 0), ("locked", len(self._PREFIX))
+        )
+        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, leaf)
         self.assertEqual(pipeline.anchor_locked_tokens_, len(self._PREFIX))
-        cache.tree_core.inc_full_pin.assert_called_once_with(99)
-        cache.inc_lock_ref.assert_not_called()
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 1)
+        pipeline.release_anchor_lock(self._REQ)
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
 
     def test_shrunk_prefix_reports_anchor_lost(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX) - 2)
-        pipeline = self._make_pipeline(cache)
+        cache, pipeline = self._make_buffer_cache(resident=self._PREFIX[:-2])
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "anchor_lost")
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
 
     def test_storage_cleanup_releases_buffer_prefetch_anchor(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX))
-        pipeline = self._make_pipeline(cache)
-        cache.buffer_pipeline = pipeline
-        self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "locked")
-        host_indices = torch.arange(4)
-        cache.ongoing_prefetch = {
-            self._REQ: _OngoingPrefetch(
-                anchor_node_id=99,
-                prefetch_key=RadixKey(array("q", range(16))),
-                host_indices=host_indices,
-                operation=mock.Mock(
-                    buffer_host_occupied_units=4, pool_transfers_done=True
-                ),
-                anchor_lock_params=None,
-                comp_xfers={},
-            )
-        }
-        cache.ongoing_backup = {}
-        cache.host_memory_mode = "buffer_only"
-        cache._prefetch_occupied_span.side_effect = (
-            lambda key, indices, *, operation=None: (
-                UnifiedRadixCache._prefetch_occupied_span(
-                    cache, key, indices, operation=operation
-                )
-            )
+        storage_dir = self._make_storage_dir()
+        suffix = list(range(200, 208))
+        self._produce_buffer_l3(storage_dir, self._PREFIX + suffix)
+        cache, pipeline = self._make_buffer_cache(
+            resident=self._PREFIX, storage_dir=storage_dir, prefix=None
         )
-        cache._retire_ongoing_prefetch.side_effect = lambda *args: (
-            UnifiedRadixCache._retire_ongoing_prefetch(cache, *args)
+        anchor = match_prefix(cache, self._PREFIX).last_device_node
+        pipeline.pop_prefix_ctx(self._REQ)
+        cache.prefetch_from_storage(
+            self._REQ,
+            anchor,
+            array("q", suffix),
+            cache.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=list(self._PREFIX),
         )
-        controller = cache.cache_controller
-        controller.terminate_prefetch.return_value = (4, None)
-        controller.prefetch_tokens_occupied = 12
-
-        StorageAttachment(cache)._release_pending_storage_ops()
-
+        self._pump_hicache_until(
+            cache,
+            lambda: self._REQ in pipeline.anchor_locks,
+            "the storage hit did not pin its anchor",
+        )
+        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 1)
+        detached, message = StorageAttachment(cache).detach()
+        self.assertTrue(detached, message)
         self.assertEqual(cache.ongoing_prefetch, {})
         self.assertEqual(pipeline.anchor_locks, {})
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
         self.assertNotIn(self._REQ, pipeline._prefetch_prefix_ctx)
-        cache.tree_core.dec_full_pin.assert_called_once_with(99)
-        cache.dec_lock_ref.assert_not_called()
-        cache.dec_host_lock_ref.assert_not_called()
-        self.assertEqual(controller.prefetch_tokens_occupied, 8)
+        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 0)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
 
     def test_positive_hit_with_lost_anchor_reports_anchor_lost(self):
-        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
-        cache.storage_prefetch_retries = StoragePrefetchRetries()
-        cache.ongoing_prefetch = {
-            self._REQ: SimpleNamespace(
-                operation=SimpleNamespace(storage_start=4, storage_hit_count=8)
-            )
-        }
-        cache._finish_storage_prefetch = mock.Mock()
-        cache.revoke_pending_prefetch = mock.Mock()
-
-        cache._handle_storage_prefetch_anchor_loss(self._REQ)
-
-        cache._finish_storage_prefetch.assert_called_once_with(
-            self._REQ, fulfilled_tokens=0, reason="anchor_lost"
+        """A storage hit whose anchor was evicted before the progress check
+        pinned it is declined as anchor_lost, and the request replans the
+        widened span right away -- skipping the query, the prior hit having
+        proved it stored, and the poll interval."""
+        storage_dir = self._make_storage_dir()
+        suffix = list(range(200, 208))
+        self._produce_buffer_l3(storage_dir, self._PREFIX + suffix)
+        cache, pipeline = self._make_buffer_cache(
+            resident=self._PREFIX, storage_dir=storage_dir, prefix=None
         )
-        # The eviction widened the span, so the request replans over it --
-        # skipping the query, the prior hit having proved it stored, and the
-        # poll interval, which would only let admission run without it.
-        req = SimpleNamespace(rid=self._REQ.rid, storage_prefetch_retry_attempts=0)
+        anchor = match_prefix(cache, self._PREFIX).last_device_node
+        pipeline.pop_prefix_ctx(self._REQ)
+        cache.prefetch_from_storage(
+            self._REQ,
+            anchor,
+            array("q", suffix),
+            cache.get_last_hash_value(anchor),
+            None,
+            matched_prefix_tokens=list(self._PREFIX),
+        )
+        self.assertIn(self._REQ, cache.ongoing_prefetch)
+        cache.evict(EvictParams(num_tokens=len(self._PREFIX)))
+        self.assertEqual(match_prefix(cache, self._PREFIX).device_prefix_len, 0)
+        self._pump_hicache_until(
+            cache,
+            lambda: self._REQ not in cache.ongoing_prefetch,
+            "the anchor loss did not end the prefetch",
+        )
+        self.assertEqual(pipeline.anchor_locks, {})
+        req = self._make_req(cache.req_to_token_pool)
+        req.rid = self._REQ.rid
         self.assertEqual(
-            cache.storage_prefetch_retries.pop_ready([req], 0, 8), [(req, 12)]
+            cache.storage_prefetch_retries.pop_ready([req], 0, 8),
+            [(req, len(self._PREFIX) + len(suffix))],
         )
-        cache.revoke_pending_prefetch.assert_called_once_with(self._REQ)
 
     def test_over_cap_reports_cap_skip_after_full_rematch(self):
-        cache = self._make_cache(live_match_len=len(self._PREFIX))
-        pipeline = self._make_pipeline(cache, cap_tokens=len(self._PREFIX) - 1)
+        cache, pipeline = self._make_buffer_cache(
+            resident=self._PREFIX, cap_tokens=len(self._PREFIX) - 1
+        )
+        leaf = match_prefix(cache, self._PREFIX).last_device_node
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0)[0], "cap_skip")
         self.assertEqual(pipeline.anchor_locks, {})
-        cache.tree_core.match_full_device_prefix.assert_called_once()
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
 
     def test_root_anchor_reports_no_anchor(self):
-        cache = self._make_cache(live_match_len=0)
-        cache.ongoing_prefetch[self._REQ].prefetch_key = RadixKey(array("q", range(8)))
-        pipeline = self._make_pipeline(cache)
-        pipeline._prefetch_prefix_ctx[self._REQ] = ([], None, None)
+        cache, pipeline = self._make_buffer_cache(prefix=[])
+        # What prefetch_from_storage registers for a root-anchored request.
+        cache.ongoing_prefetch[self._REQ] = _OngoingPrefetch(
+            anchor_node_id=cache.root_node_handle(),
+            prefetch_key=RadixKey(array("q", range(8))),
+            host_indices=None,
+            operation=None,
+            anchor_lock_params=None,
+            comp_xfers={},
+        )
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 8), ("no_anchor", 0))
-        cache.tree_core.match_full_device_prefix.assert_called_once()
+        cache.ongoing_prefetch.pop(self._REQ)
 
     def test_anchor_lock_requires_release_before_retry(self):
-        cache = self._make_cache(live_match_len=8, pinned_len=12)
-        pipeline = self._make_pipeline(cache)
+        # One resident node longer than the prefix: the partial match pins it all.
+        tokens = self._PREFIX + [900, 901, 902, 903]
+        cache, pipeline = self._make_buffer_cache(resident=tokens)
+        node = match_prefix(cache, tokens).last_device_node
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0), ("locked", 8))
         with self.assertRaisesRegex(AssertionError, "prefetch anchor already locked"):
             pipeline.try_lock_anchor(self._REQ, 0)
-        self.assertEqual(pipeline.anchor_locked_tokens_, 12)
-        cache.tree_core.match_full_device_prefix.assert_called_once()
-        cache.tree_core.inc_full_pin.assert_called_once_with(99)
-
+        self.assertEqual(pipeline.anchor_locked_tokens_, len(tokens))
+        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.FULL), 1)
         pipeline.release_anchor_lock(self._REQ)
         self.assertEqual(pipeline.anchor_locked_tokens_, 0)
-        cache.tree_core.dec_full_pin.assert_called_once_with(99)
-        cache.tree_core.match_full_device_prefix.return_value = (8, 100, 8)
+        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.FULL), 0)
+        # A branch at the prefix boundary splits the node; the retry re-matches
+        # the live tree and pins the new prefix node alone.
+        self._insert_tokens(cache, self._PREFIX + [800, 801])
+        prefix_node = match_prefix(cache, self._PREFIX).last_device_node
         self.assertEqual(pipeline.try_lock_anchor(self._REQ, 0), ("locked", 8))
-        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, 100)
-        self.assertEqual(pipeline.anchor_locked_tokens_, 8)
-        self.assertEqual(cache.tree_core.match_full_device_prefix.call_count, 2)
+        self.assertEqual(pipeline.anchor_locks[self._REQ].node_id, prefix_node)
+        self.assertEqual(pipeline.anchor_locked_tokens_, len(self._PREFIX))
+        pipeline.release_anchor_lock(self._REQ)
 
 
 if __name__ == "__main__":

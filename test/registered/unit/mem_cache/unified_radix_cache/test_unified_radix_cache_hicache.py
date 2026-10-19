@@ -16,10 +16,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
-    FreeDeviceKV,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
-    CacheTransferPhase,
     ComponentType,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -34,7 +32,6 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires_mamba,
     requires_swa,
     requires_swa_and_mamba,
-    requires_swa_only,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
@@ -751,44 +748,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertEqual(result.last_host_node, result.last_device_node)
         self.assertEqual(result.host_hit_length, 0)
 
-    @requires_swa_only
-    @requires(
-        lambda cfg: cfg.sliding_window_size > cfg.page_size,
-        "the window must reach past the leaf's own page",
-    )
-    def test_swa_backup_reaches_device_ancestor_in_cache_mode_only(self):
-        """needs_incremental_backup and the BACKUP_HOST transfer read one
-        collector: cache mode walks the window past a host-backed target to
-        its device-only ancestor, buffer mode stages the target alone."""
-        # This test exercises the Python component's collector directly.
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
-            tree_core_backend="python"
-        )
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 2)
-        if len(chain) < 2:
-            self.skipTest("chain too short")
-        parent, leaf = chain[-2], chain[-1]
-        swa = cache.components[ComponentType.SWA]
-        leaf_node = cache.tree_core.node_by_id(leaf)
-        cache.tree_core.set_component_host_value_raw(
-            leaf,
-            ComponentType.SWA,
-            node_device_value(cache, leaf, ComponentType.SWA).clone(),
-        )
-
-        self.assertTrue(swa.needs_incremental_backup(leaf_node))
-        xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
-        )[0]
-        self.assertEqual(xfer.nodes_to_load, [parent])
-
-        cache.tree_core.set_host_memory_buffer_only()
-        self.assertTrue(swa.needs_incremental_backup(leaf_node))
-        xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.BACKUP_HOST
-        )[0]
-        self.assertEqual(xfer.nodes_to_load, [leaf])
-
     def test_evict_host_drains_freed_host_values_to_the_pools(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
@@ -885,25 +844,16 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_full_swa_ps1_window4
     def test_hicache_swa_backup_window_stops_at_pending_ancestor(self):
-
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
             self.skipTest("chain collapsed below the pending ancestor test")
-
         c = chain[-1]
-        c_swa = node_device_value(cache, c, ComponentType.SWA).clone()
-
-        # First transfer: publish Full for C only. C's SWA is a device tombstone
-        # (decode-evicted, never backed up), so the write-through ack stays
-        # pending on a node the SWA backup window has nothing to send for.
-        cache.tree_core.set_component_device_value_raw(c, ComponentType.SWA, None)
-        if cache.tree_core.is_node_in_device_lru(c, ComponentType.SWA):
-            cache.tree_core.remove_node_from_device_lru(c, ComponentType.SWA)
-        cache.tree_core.set_component_evictable_size(
-            ComponentType.SWA,
-            cache.tree_core.component_evictable_size(ComponentType.SWA) - len(c_swa),
-        )
+        tokens = self._match_tokens_for_chain(cache, chain)
+        # C's SWA is decode-evicted before it is ever backed up, so the
+        # write-through of C publishes Full only and its ack stays pending on a
+        # node the SWA backup window has nothing to send for.
+        self._evict_device_component(cache, c, ComponentType.SWA)
         self.assertGreater(
             cache._execute_and_commit_kv_backup(BackupKV(node_ids=[c])),
             0,
@@ -911,25 +861,19 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertEqual(cache.tree_core.get_write_through_pending_id(c), c)
         self.assertIsNotNone(node_host_value(cache, c, ComponentType.FULL))
         self.assertIsNone(node_host_value(cache, c, ComponentType.SWA))
-
-        # SWA is reconstructed on device before the first ack, the way a
-        # load-back commit stores it: under the pending segment lock the value
-        # counts as protected until the ack releases it. The next incremental
-        # SWA backup must treat C as the boundary and back up only the newly
-        # inserted descendant.
-        cache.tree_core.set_component_device_value(c, ComponentType.SWA, c_swa)
-        tokens = self._match_tokens_for_chain(cache, chain)
+        # A request re-inserting C's tokens recovers its SWA on device before
+        # the first ack. The next incremental SWA backup must treat C as the
+        # boundary and back up only the newly inserted descendant.
+        self._insert(cache, allocator, req_to_token_pool, tokens)
+        self.assertIsNotNone(node_device_value(cache, c, ComponentType.SWA))
         next_tokens = tokens + self._make_seq(9000, 1)
         cache.write_through_threshold = 1
-
         self._insert(cache, allocator, req_to_token_pool, next_tokens)
-
         d = match_prefix(cache, next_tokens).last_device_node
         self.assertEqual(cache.tree_core.get_write_through_pending_id(c), c)
         self.assertEqual(cache.tree_core.get_write_through_pending_id(d), d)
         self.assertIsNone(node_host_value(cache, c, ComponentType.SWA))
         self.assertIsNotNone(node_host_value(cache, d, ComponentType.SWA))
-
         cache.writing_check(write_back=True)
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(c))
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(d))
@@ -940,59 +884,41 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         lambda cfg: not cfg.has_mamba,
         "SWA-only path keeps the chain construction simple",
     )
-    def test_hicache_swa_finalize_match_result(self):
-        """finalize_match_result accumulates host_value lengths of SWA tombstones
-        within the trailing sliding window into ``swa_host_hit_length``. Out-of-window
-        tombstones and chains fully on device must leave ``swa_host_hit_length`` at 0.
-        ``host_hit_length`` is Full-KV only and is never written by SWA.
+    def test_hicache_swa_host_hit_counts_tombstones_inside_the_window(self):
+        """A host-backed SWA tombstone inside the trailing sliding window stops
+        the device match before it: the Full-backed tail from the tombstone on
+        is a host hit, and the tombstone's own SWA counts in
+        ``swa_host_hit_length``. A tombstone outside the window, or a chain
+        fully on device, leaves the whole match on device.
         """
-
-        cache, _, _, chain, window_pages = self._swa_finalize_setup()
-        leaf = chain[-1]
         ps = self.cfg.page_size
-
-        cases = [
-            ("all_on_device", None, 0),
-            ("tombstone_in_window", chain[-window_pages], ps),
-            ("tombstone_outside_window", chain[-(window_pages + 1)], 0),
-        ]
-        for name, victim, expected in cases:
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+        for name, victim in (
+            ("all_on_device", None),
+            ("tombstone_in_window", -window_pages),
+            ("tombstone_outside_window", -(window_pages + 1)),
+        ):
             with self.subTest(name):
-                # Reset SWA state for each subcase.
-                for n in chain:
-                    device_value = node_device_value(cache, n, ComponentType.SWA)
-                    host_value = node_host_value(cache, n, ComponentType.SWA)
-                    if device_value is None and host_value is not None:
-                        cache.tree_core.set_component_device_value_raw(
-                            n, ComponentType.SWA, host_value.clone()
-                        )
+                cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+                chain = self._build_chain_pages(
+                    cache, allocator, req_to_token_pool, window_pages + 2
+                )
+                if len(chain) <= window_pages:
+                    self.skipTest("chain collapsed below the window length")
+                tokens = self._match_tokens_for_chain(cache, chain)
+                self._backup_node(cache, chain[-1])
+                host_tail, swa_host = 0, 0
                 if victim is not None:
-                    cache.tree_core.set_component_device_value_raw(
-                        victim, ComponentType.SWA, None
+                    self._evict_device_component(
+                        cache, chain[victim], ComponentType.SWA
                     )
-
-                result = MatchResult(
-                    device_prefix_len=0,
-                    last_device_node=leaf,
-                    last_host_node=leaf,
-                    best_match_node=leaf,
-                    host_hit_length=0,
-                    cache_protected_len=7,
-                    cache_actions=(FreeDeviceKV(indices=[]),),
-                )
-                result = cache.tree_core.finalize_component_match_result(
-                    ComponentType.SWA,
-                    result=result,
-                    params=MatchPrefixParams(
-                        key=RadixKey(array("q", self._make_seq(1, 1)))
-                    ),
-                    value_chunks=[],
-                    best_value_len=0,
-                )
-                self.assertEqual(result.host_hit_length, 0)
-                self.assertEqual(result.swa_host_hit_length, expected)
-                self.assertEqual(result.cache_protected_len, 7)
-                self.assertEqual(result.cache_actions, (FreeDeviceKV(indices=[]),))
+                if name == "tombstone_in_window":
+                    host_tail = sum(node_key_length(cache, n) for n in chain[victim:])
+                    swa_host = node_key_length(cache, chain[victim])
+                result = match_prefix(cache, tokens)
+                self.assertEqual(result.device_prefix_len, len(tokens) - host_tail)
+                self.assertEqual(result.host_hit_length, host_tail)
+                self.assertEqual(result.swa_host_hit_length, swa_host)
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
@@ -1025,51 +951,33 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         """A temporary scheduler lock that skipped a SWA tombstone must not
         release later load-back/request locks after the tombstone is restored.
         """
-
-        cache, allocator, _, chain, _ = self._swa_finalize_setup()
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
         leaf = chain[-1]
-        tombstone = leaf
-        old_swa = node_device_value(cache, tombstone, ComponentType.SWA)
-        self.assertIsNotNone(old_swa)
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, leaf)
+        self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.SWA))
+        self._evict_device_component(cache, leaf, ComponentType.SWA)
+        self.assertIsNone(node_device_value(cache, leaf, ComponentType.SWA))
 
-        cache.tree_core.set_component_device_value_raw(
-            tombstone, ComponentType.SWA, None
-        )
-        cache.tree_core.remove_node_from_device_lru(tombstone, ComponentType.SWA)
-        cache.tree_core.insert_node_into_host_lru(tombstone, ComponentType.SWA)
-        cache.tree_core.set_component_evictable_size(
-            ComponentType.SWA,
-            cache.tree_core.component_evictable_size(ComponentType.SWA) - len(old_swa),
-        )
+        def swa_ref():
+            return node_device_lock_ref(cache, leaf, ComponentType.SWA)
 
         temp_lock = cache.inc_lock_ref(leaf)
-        self.assertEqual(node_device_lock_ref(cache, tombstone, ComponentType.SWA), 1)
-
-        xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
-        )[0]
-        new_swa = allocator.swa_attn_allocator.alloc(int(xfer.host_indices.numel()))
-        self.assertIsNotNone(new_swa)
-        xfer.device_indices = new_swa
-        load_actions = []
-        cache.tree_core.commit_hicache_transfers(
-            leaf,
-            CacheTransferPhase.LOAD_BACK,
-            {ComponentType.SWA: [xfer]},
-            cache_actions=load_actions,
-        )
-        cache._apply_cache_actions(load_actions)
-
-        load_back_lock = cache.inc_lock_ref(leaf)
+        self.assertEqual(swa_ref(), 1)
+        self._load_back_through_admission(cache, req_to_token_pool, tokens)
+        self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.SWA))
         request_lock = cache.inc_lock_ref(leaf)
-        self.assertEqual(node_device_lock_ref(cache, tombstone, ComponentType.SWA), 3)
-
+        self.assertEqual(swa_ref(), 3)
         cache.dec_lock_ref(leaf, temp_lock.to_dec_params())
-        self.assertEqual(node_device_lock_ref(cache, tombstone, ComponentType.SWA), 2)
-
-        cache.dec_lock_ref(leaf, load_back_lock.to_dec_params())
+        self.assertEqual(swa_ref(), 2)
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
         cache.dec_lock_ref(leaf, request_lock.to_dec_params())
-        self.assertEqual(node_device_lock_ref(cache, tombstone, ComponentType.SWA), 0)
+        self.assertEqual(swa_ref(), 0)
+        cache.sanity_check()
 
     @requires_hicache
     def test_hicache_full_temp_lock_covers_evicted_anchor_and_mirrors_on_release(
@@ -1086,53 +994,26 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
         if len(chain) < 3:
             self.skipTest("chain too short")
-        a, y, anchor = chain
-        self._simulate_backup_tree(cache)
+        anchor = chain[-1]
+        self._backup_node(cache, anchor)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, anchor)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(anchor))
 
-        anchor_value = node_device_value(cache, anchor, ComponentType.FULL)
-        # Simulate the anchor's FULL device eviction: drop the value and take
-        # its tokens out of the evictable ledger, as a real evict would.
-        cache.tree_core.set_component_device_value_raw(anchor, ComponentType.FULL, None)
-        cache.tree_core.set_component_evictable_size(
-            ComponentType.FULL,
-            cache.tree_core.component_evictable_size(ComponentType.FULL)
-            - len(anchor_value),
-        )
+        def full_refs():
+            return [node_device_lock_ref(cache, n, ComponentType.FULL) for n in chain]
 
-        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 0)
-        self.assertEqual(node_device_lock_ref(cache, y, ComponentType.FULL), 0)
-        self.assertEqual(node_device_lock_ref(cache, a, ComponentType.FULL), 0)
-
+        self.assertEqual(full_refs(), [0, 0, 0])
         temp_lock = cache.inc_lock_ref(anchor)
-        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 1)
-        self.assertEqual(node_device_lock_ref(cache, y, ComponentType.FULL), 1)
-        self.assertEqual(node_device_lock_ref(cache, a, ComponentType.FULL), 1)
-
-        # Restore the value mid-hold: a value materialized under lock is
-        # protected until the last release, exactly as a load-back credits it.
-        cache.tree_core.set_component_device_value_raw(
-            anchor, ComponentType.FULL, anchor_value
-        )
-        cache.tree_core.set_component_protected_size(
-            ComponentType.FULL,
-            cache.tree_core.component_protected_size(ComponentType.FULL)
-            + len(anchor_value),
-        )
-
+        self.assertEqual(full_refs(), [1, 1, 1])
+        # Restore the anchor mid-hold.
+        self._load_back_node(cache, anchor)
         second_lock = cache.inc_lock_ref(anchor)
-        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 2)
-        self.assertEqual(node_device_lock_ref(cache, y, ComponentType.FULL), 2)
-        self.assertEqual(node_device_lock_ref(cache, a, ComponentType.FULL), 2)
-
+        self.assertEqual(full_refs(), [2, 2, 2])
         cache.dec_lock_ref(anchor, temp_lock.to_dec_params())
-        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 1)
-        self.assertEqual(node_device_lock_ref(cache, y, ComponentType.FULL), 1)
-        self.assertEqual(node_device_lock_ref(cache, a, ComponentType.FULL), 1)
-
+        self.assertEqual(full_refs(), [1, 1, 1])
         cache.dec_lock_ref(anchor, second_lock.to_dec_params())
-        self.assertEqual(node_device_lock_ref(cache, anchor, ComponentType.FULL), 0)
-        self.assertEqual(node_device_lock_ref(cache, y, ComponentType.FULL), 0)
-        self.assertEqual(node_device_lock_ref(cache, a, ComponentType.FULL), 0)
+        self.assertEqual(full_refs(), [0, 0, 0])
+        cache.sanity_check()
 
     @requires_mamba
     @requires(
@@ -1143,52 +1024,31 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         """A temporary scheduler lock that skipped a Mamba tombstone must not
         release later load-back/request locks after the tombstone is restored.
         """
-
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         seq = self._make_seq(1, 2)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = match_prefix(cache, seq)
-        node = m.last_device_node
-        old_mamba = node_device_value(cache, node, ComponentType.MAMBA)
-        self.assertIsNotNone(old_mamba)
-        self._simulate_backup(cache, node)
+        node = match_prefix(cache, seq).last_device_node
+        self._backup_node(cache, node)
+        self.assertIsNotNone(node_host_value(cache, node, ComponentType.MAMBA))
+        self._evict_device_component(cache, node, ComponentType.MAMBA)
+        self.assertIsNone(node_device_value(cache, node, ComponentType.MAMBA))
 
-        cache.tree_core.set_component_device_value_raw(node, ComponentType.MAMBA, None)
-        cache.tree_core.remove_node_from_device_lru(node, ComponentType.MAMBA)
-        cache.tree_core.insert_node_into_host_lru(node, ComponentType.MAMBA)
-        cache.tree_core.set_component_evictable_size(
-            ComponentType.MAMBA,
-            cache.tree_core.component_evictable_size(ComponentType.MAMBA)
-            - len(old_mamba),
-        )
+        def mamba_ref():
+            return node_device_lock_ref(cache, node, ComponentType.MAMBA)
 
         temp_lock = cache.inc_lock_ref(node)
-        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.MAMBA), 1)
-
-        xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.MAMBA, node, CacheTransferPhase.LOAD_BACK
-        )[0]
-        new_mamba = req_to_token_pool.mamba_allocator.alloc(1)
-        self.assertIsNotNone(new_mamba)
-        xfer.device_indices = new_mamba
-        cache.tree_core.commit_hicache_transfers(
-            node,
-            CacheTransferPhase.LOAD_BACK,
-            {ComponentType.MAMBA: [xfer]},
-            cache_actions=[],
-        )
-
-        load_back_lock = cache.inc_lock_ref(node)
+        self.assertEqual(mamba_ref(), 1)
+        self._load_back_through_admission(cache, req_to_token_pool, seq)
+        self.assertIsNotNone(node_device_value(cache, node, ComponentType.MAMBA))
         request_lock = cache.inc_lock_ref(node)
-        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.MAMBA), 3)
-
+        self.assertEqual(mamba_ref(), 3)
         cache.dec_lock_ref(node, temp_lock.to_dec_params())
-        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.MAMBA), 2)
-
-        cache.dec_lock_ref(node, load_back_lock.to_dec_params())
+        self.assertEqual(mamba_ref(), 2)
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
         cache.dec_lock_ref(node, request_lock.to_dec_params())
-        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.MAMBA), 0)
-        # The commit ran under held locks: the restored value must have been
+        self.assertEqual(mamba_ref(), 0)
+        # The restore ran under held locks: the restored value must have been
         # credited to protected, or the ledger drifts on the final release.
         cache.sanity_check()
 

@@ -1061,78 +1061,45 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         "SWA-only path keeps the chain construction simple",
     )
     def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
-        """LOAD_BACK commit must:
-        (1) restore SWA cd.value via _restore_device_value (host LRU -> device LRU),
-        (2) rewrite full_to_swa_index_mapping[full_idx] = new_swa_idx for every
-            loaded chunk so subsequent SWA reads via translate_loc_from_full_to_swa
-            return the freshly allocated SWA slot."""
-
-        cache, allocator, _, chain, window_pages = self._swa_finalize_setup()
-
-        # Tombstone every SWA node in the trailing window.
+        """A load-back that restores SWA must:
+        (1) bring each tombstoned window node's SWA value back to device
+            (host LRU -> device LRU),
+        (2) map every restored Full slot to its new SWA slot, so SWA reads via
+            translate_loc_from_full_to_swa return the restored slots."""
+        ps = self.cfg.page_size
+        window_pages = (self.cfg.sliding_window_size + ps - 1) // ps
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(
+            cache, allocator, req_to_token_pool, window_pages + 2
+        )
+        if len(chain) <= window_pages:
+            self.skipTest("chain collapsed below the window length")
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, chain[-1])
         loaded_nodes = chain[-window_pages:]
         for n in loaded_nodes:
-            cache.tree_core.set_component_device_value_raw(n, ComponentType.SWA, None)
-            # SWA LRU bookkeeping must reflect tombstone state for the
-            # _restore_device_value path to exercise the host->device move.
-            cache.tree_core.remove_node_from_device_lru(n, ComponentType.SWA)
-            cache.tree_core.insert_node_into_host_lru(n, ComponentType.SWA)
-
-        # Build the LOAD_BACK transfer the same way load_back() would.
-        transfers = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, chain[-1], CacheTransferPhase.LOAD_BACK
-        )
-        self.assertIsNotNone(transfers)
-        xfer = transfers[0]
-        self.assertEqual(xfer.nodes_to_load, loaded_nodes)
-
-        # Allocate SWA device slots from the inner allocator (mirrors how
-        # _resolve_device_transfers routes via device_alloc_fn ->
-        # swa_attn_allocator.alloc on the load-back path).
-        n_swa = int(xfer.host_indices.numel())
-        new_swa = allocator.swa_attn_allocator.alloc(n_swa)
-        self.assertIsNotNone(new_swa)
-        xfer.device_indices = new_swa
-
-        # Snapshot pre-commit state for invariants checks.
+            self._evict_device_component(cache, n, ComponentType.SWA)
         pre_evictable = cache.tree_core.component_evictable_size(ComponentType.SWA)
 
-        load_actions = []
-        cache.tree_core.commit_hicache_transfers(
-            chain[-1],
-            CacheTransferPhase.LOAD_BACK,
-            {ComponentType.SWA: transfers},
-            cache_actions=load_actions,
-        )
-        cache._apply_cache_actions(load_actions)
+        self._load_back_through_admission(cache, req_to_token_pool, tokens)
+        self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
 
-        # (1) cd.value restored, host LRU -> device LRU swap done.
-        offset = 0
+        restored = 0
         for n in loaded_nodes:
-            value = node_device_value(cache, n, ComponentType.SWA)
-            self.assertIsNotNone(value)
-            chunk_len = int(value.numel())
-            self.assertEqual(
-                value.tolist(),
-                new_swa[offset : offset + chunk_len].tolist(),
-            )
-            offset += chunk_len
+            swa_idx = node_device_value(cache, n, ComponentType.SWA)
+            self.assertIsNotNone(swa_idx)
             self.assertTrue(cache.tree_core.is_node_in_device_lru(n, ComponentType.SWA))
             self.assertFalse(cache.tree_core.is_node_in_host_lru(n, ComponentType.SWA))
-        self.assertEqual(offset, n_swa)
-
-        # (2) full_to_swa_index_mapping rebuilt for every loaded chunk.
-        for n in loaded_nodes:
             full_idx = node_device_value(cache, n, ComponentType.FULL)
-            swa_idx = node_device_value(cache, n, ComponentType.SWA)
             translated = allocator.translate_loc_from_full_to_swa(full_idx)
             self.assertEqual(translated.tolist(), swa_idx.tolist())
-
-        # Evictable size moved up by the restored token count.
+            restored += int(swa_idx.numel())
         self.assertEqual(
             cache.tree_core.component_evictable_size(ComponentType.SWA) - pre_evictable,
-            n_swa,
+            restored,
         )
+        cache.sanity_check()
 
     def test_hicache_swa_load_back_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()

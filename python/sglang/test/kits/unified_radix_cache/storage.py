@@ -774,25 +774,26 @@ class UnifiedRadixCacheStorageAttachBackfillFixtures:
         return hashes
 
 
-class AnchorLockOutcomePolicyFixtures:
-    def _make_pipeline(self, cache, cap_tokens=10_000):
-        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+class AnchorLockOutcomePolicyFixtures(UnifiedRadixCacheStorageFixtures):
+    def _insert_tokens(self, cache, tokens):
+        value = cache.token_to_kv_pool_allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=value))
 
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline.anchor_locks = {}
-        pipeline.anchor_locked_tokens_ = 0
-        pipeline.anchor_lock_cap_tokens = cap_tokens
-        pipeline._anchor_lock_cap_skips = 0
-        pipeline._prefetch_prefix_ctx = {self._REQ: (list(self._PREFIX), None, None)}
-        pipeline._cache = cache
-        return pipeline
-
-    def _make_cache(self, live_match_len, pinned_len=None):
-        cache = mock.MagicMock()
-        cache.tree_core.is_eagle = False
-        cache.tree_core.match_full_device_prefix.return_value = (
-            live_match_len,
-            99,
-            live_match_len if pinned_len is None else pinned_len,
+    def _make_buffer_cache(
+        self, resident=(), cap_tokens=None, prefix=(), storage_dir=None
+    ):
+        """A buffer-mode cache holding ``resident`` on device, with the
+        request's matched prefix recorded as prefetch enqueue records it."""
+        cache, _, _ = self._build_buffer_hicache_fixture(
+            storage_dir or self._make_storage_dir()
         )
-        return cache
+        if resident:
+            self._insert_tokens(cache, list(resident))
+        pipeline = cache.buffer_pipeline
+        if cap_tokens is not None:
+            pipeline.anchor_lock_cap_tokens = cap_tokens
+        pipeline.set_prefix_ctx(
+            self._REQ, self._PREFIX if prefix == () else (prefix or [])
+        )
+        return cache, pipeline
