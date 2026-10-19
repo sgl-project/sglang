@@ -7,31 +7,29 @@ from unittest import mock
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
-    BlockRemoved,
-    BlockStored,
     StorageMedium,
     kv_event_namespace_seed,
     namespaced_block_hash,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
-    InsertParams,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache_unittest.config import (
     CacheConfig,
-    _drop_hicache_atexit_pin,
-    _match_prefix,
-    _node_children,
-    _node_token_ids,
-    _write_backup,
+)
+from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     build_fixture,
+    node_children,
+    node_token_ids,
+    write_backup,
+)
+from sglang.test.kits.unified_radix_cache_unittest.kv_events import (
+    LoraReq,
+    UnifiedRadixCacheKVEventsFixtures,
+    make_lora_names,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,100 +37,8 @@ register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
 
 
-class _LoraReq:
-    """The request fields KvEventLoraNames reads."""
-
-    def __init__(self, extra_key, lora_id="lora-id"):
-        self.extra_key = extra_key
-        self.lora_id = lora_id
-
-
-def _lora_names(**names_by_extra_key):
-    """A name table plus the requests that keep its entries alive."""
-    table = KvEventLoraNames()
-    reqs = [_LoraReq(key) for key in names_by_extra_key]
-    for req in reqs:
-        table.register(req, names_by_extra_key[req.extra_key])
-    return table, reqs
-
-
-class TestUnifiedRadixCacheKVEvents(CustomTestCase):
+class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
-
-    def _insert(
-        self,
-        cache,
-        allocator,
-        tokens,
-        *,
-        extra_key=None,
-        cache_salt=None,
-        session_id=None,
-    ):
-        key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
-        value = allocator.alloc(len(tokens))
-        self.assertIsNotNone(value)
-        return cache.insert(
-            InsertParams(
-                key=key,
-                value=value[: len(key)],
-                session_id=session_id,
-            )
-        )
-
-    def _stored_events(self, cache, medium=None):
-        events = [e for e in cache.take_events() if isinstance(e, BlockStored)]
-        if medium is not None:
-            events = [e for e in events if e.medium == medium]
-        return events
-
-    def _removed_events(self, cache, medium=None):
-        events = [e for e in cache.take_events() if isinstance(e, BlockRemoved)]
-        if medium is not None:
-            events = [e for e in events if e.medium == medium]
-        return events
-
-    def _event_hashes(self, events):
-        return [block_hash for event in events for block_hash in event.block_hashes]
-
-    def _leaf_for(self, cache, tokens):
-        match = _match_prefix(cache, tokens)
-        leaf = match.last_device_node
-        self.assertNotEqual(leaf, cache.root_node_handle())
-        return leaf
-
-    def _init_hicache(self, cache, *, write_policy: str = "write_through"):
-        # Production config: kernel IO backend + page_first layout with
-        # PINNED host pools (kernel GPU DMA requires them). Pools track their
-        # cudaHostRegister'd pointers and unregister on destroy()/GC, so the
-        # many fixtures sharing this process cannot collide on recycled
-        # address ranges (rc=712).
-        server_args = ServerArgs(
-            model_path="dummy",
-            page_size=self.cfg.page_size,
-            hicache_io_backend="kernel",
-            hicache_write_policy=write_policy,
-        )
-        set_global_server_args_for_scheduler(server_args)
-        cache.init_hicache(server_args, cache.cache_init_params)
-        self.addCleanup(_drop_hicache_atexit_pin, cache)
-        self.addCleanup(cache.release_host_resources)
-        cache.write_through_threshold = 1 << 30
-        cache.load_back_threshold = 0
-
-    def _backup_node(self, cache, node):
-        backed_up = _write_backup(cache, node, write_back=True)
-        self.assertGreater(backed_up, 0)
-        cache.writing_check(write_back=True)
-
-    def _load_back_node(self, cache, node):
-        loaded = cache.load_back(node)
-        self.assertTrue(loaded)
-        producer_id = cache.ready_to_load_host_cache()
-        self.assertNotEqual(producer_id, -1)
-        for ack in list(cache.cache_controller.ack_load_queue):
-            ack.finish_event.synchronize()
-        cache.loading_check()
 
     def test_kv_events_store_and_remove_full_blocks(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
@@ -284,7 +190,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
     def test_lora_external_ids_separate_adapter_loads(self):
         """External IDs distinguish loads; routers match tokens and public names."""
-        lora_names, _reqs = _lora_names(
+        lora_names, _reqs = make_lora_names(
             **{
                 "uuid-a": "adapter-a",
                 "user|uuid-a2": "adapter-a",
@@ -329,7 +235,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     def test_dynamo_lora_hashes_keep_the_dynamo_namespace(self):
         """The default LoRA mix must not be applied a second time to Dynamo hashes."""
         extra_key = "0123456789abcdef0123456789abcdef"
-        names, reqs = _lora_names(**{extra_key: "adapter-a"})
+        names, reqs = make_lora_names(**{extra_key: "adapter-a"})
 
         def publish(*, dynamo_format, namespace):
             cache, allocator, _ = build_fixture(
@@ -367,7 +273,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     def test_lora_request_without_optional_ipc_name_uses_loaded_adapter(self):
         names = KvEventLoraNames()
         names.register(lora_id="loaded-id", lora_name="adapter-a")
-        req = _LoraReq("user|loaded-id", lora_id="loaded-id")
+        req = LoraReq("user|loaded-id", lora_id="loaded-id")
         names.register(req)
         cache, allocator, _ = build_fixture(
             self.cfg, enable_kv_cache_events=True, kv_event_lora_names=names
@@ -384,7 +290,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
     def test_lora_name_survives_a_gap_before_a_delayed_store(self):
         """Write-back can publish a store after the request and GPU blocks are gone."""
-        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        lora_names, reqs = make_lora_names(**{"uuid-a": "adapter-a"})
         cache, allocator, _ = build_fixture(
             self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
         )
@@ -407,7 +313,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     def test_lora_name_survives_until_queued_stores_are_taken(self):
         """A finished request's blocks still publish under its adapter when
         other requests register before the events are taken."""
-        lora_names, reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        lora_names, reqs = make_lora_names(**{"uuid-a": "adapter-a"})
         cache, allocator, _ = build_fixture(
             self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
         )
@@ -415,13 +321,13 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
         del reqs
         for i in range(200):
-            lora_names.register(_LoraReq(f"other-{i}"), "adapter-b")
+            lora_names.register(LoraReq(f"other-{i}"), "adapter-b")
 
         stored = self._stored_events(cache, StorageMedium.GPU)
         self.assertEqual([e.lora_name for e in stored], ["adapter-a"])
 
     def test_lora_event_parentage_survives_node_split(self):
-        lora_names, _reqs = _lora_names(**{"uuid-a": "adapter-a"})
+        lora_names, _reqs = make_lora_names(**{"uuid-a": "adapter-a"})
         cache, allocator, _ = build_fixture(
             self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
         )
@@ -450,12 +356,12 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertEqual(list(second_insert[0].token_ids), [5, 6])
         self.assertEqual(second_insert[0].parent_block_hash, split_parent_hash)
 
-        split_parent = _node_children(cache, cache.root_node_handle())[0]
+        split_parent = node_children(cache, cache.root_node_handle())[0]
         split_child = next(
             (
                 child
-                for child in _node_children(cache, split_parent)
-                if _node_token_ids(cache, child)[:2] == [3, 4]
+                for child in node_children(cache, split_parent)
+                if node_token_ids(cache, child)[:2] == [3, 4]
             ),
             None,
         )
@@ -530,7 +436,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
         self._insert(cache, allocator, [1, 2, 3, 4])
         node = self._leaf_for(cache, [1, 2, 3, 4])
-        backed_up = _write_backup(cache, node, write_back=True)
+        backed_up = write_backup(cache, node, write_back=True)
         self.assertGreater(backed_up, 0)
 
         # Split the node while its write-through DMA is still pending.
@@ -544,7 +450,7 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
             cache.writing_check(write_back=True)
         self.assertEqual(
             [
-                _node_token_ids(cache, call.args[0])
+                node_token_ids(cache, call.args[0])
                 for call in backup_storage.call_args_list
             ],
             [[1, 2], [3, 4]],

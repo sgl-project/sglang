@@ -5,7 +5,6 @@ import unittest
 from array import array
 from collections import defaultdict
 from dataclasses import replace
-from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -13,13 +12,11 @@ import torch
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
-    Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     InsertParams,
-    MatchPrefixParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
@@ -39,21 +36,27 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
     EvictDeviceNextNodeResult,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache_unittest.config import (
     CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     UnifiedRadixCacheFixtures,
-    _device_lock_ref,
-    _device_value,
-    _host_lock_ref,
-    _match_prefix,
-    _node_children,
-    _node_key_length,
-    _node_parent,
-    _node_token_ids,
-    _write_backup,
     build_fixture,
+    match_prefix,
+    node_children,
+    node_device_lock_ref,
+    node_device_value,
+    node_key_length,
+    node_parent,
+    node_token_ids,
+    write_backup,
+)
+from sglang.test.kits.unified_radix_cache_unittest.insert_walk import (
+    ResumableInsertWalkSWAFixtures,
+    SegmentLockFuzzFixtures,
+    SegmentLockProtocolFixtures,
+    StreamingSessionLockLifecycleFixtures,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,10 +74,10 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
 
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (top,) = _node_children(cache, cache.root_node_handle())
+        (top,) = node_children(cache, cache.root_node_handle())
         self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
-        (h_leaf,) = _node_children(cache, top)
-        self.assertGreater(_write_backup(cache, h_leaf, write_back=True), 0)
+        (h_leaf,) = node_children(cache, top)
+        self.assertGreater(write_backup(cache, h_leaf, write_back=True), 0)
         cache.writing_check(write_back=True)
         cache.evict(EvictParams(num_tokens=4))
         self.assertTrue(cache.tree_core.is_full_device_evicted(h_leaf))
@@ -84,18 +87,18 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         top_lock = cache.inc_lock_ref(top)
         host_pool = cache.cache_controller.mem_pool_host
         start = 1000
-        top_len = _node_key_length(cache, top)
+        top_len = node_key_length(cache, top)
         while host_pool.available_size() >= top_len:
             count = min(host_pool.available_size() - top_len + 1, 250)
             tokens = list(range(start, start + count))
             start += 1000
             self._insert(cache, allocator, req_to_token_pool, tokens)
             filler = None
-            for child in _node_children(cache, cache.root_node_handle()):
+            for child in node_children(cache, cache.root_node_handle()):
                 if child != top and not cache.tree_core.is_full_device_evicted(child):
                     filler = child
             self.assertIsNotNone(filler)
-            self.assertGreater(_write_backup(cache, filler, write_back=True), 0)
+            self.assertGreater(write_backup(cache, filler, write_back=True), 0)
             cache.writing_check(write_back=True)
             cache.evict(EvictParams(num_tokens=count))
             self.assertTrue(cache.tree_core.is_full_device_evicted(filler))
@@ -108,10 +111,10 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         cache.writing_check(write_back=True)
 
         self.assertTrue(cache.tree_core.is_backuped(top))
-        self.assertNotIn(h_leaf, _node_children(cache, top))
+        self.assertNotIn(h_leaf, node_children(cache, top))
         self.assertFalse(cache.tree_core.contains_node(h_leaf))
         (child_key_len,) = {
-            _node_key_length(cache, child) for child in _node_children(cache, top)
+            node_key_length(cache, child) for child in node_children(cache, top)
         }
         self.assertEqual(child_key_len, 8)
         cache.sanity_check()
@@ -133,7 +136,7 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         # The tree stays usable and the crossing re-fires on the next walk.
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         cache.writing_check(write_back=True)
-        (ancestor,) = _node_children(cache, cache.root_node_handle())
+        (ancestor,) = node_children(cache, cache.root_node_handle())
         self.assertTrue(cache.tree_core.is_backuped(ancestor))
         cache.sanity_check()
 
@@ -168,7 +171,7 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         self._insert(cache, allocator, req_to_token_pool, [1, 2])
 
-        (parent,) = _node_children(cache, cache.root_node_handle())
+        (parent,) = node_children(cache, cache.root_node_handle())
         cache.write_through_threshold = cache.tree_core.get_node_hit_count(parent) + 1
 
         # The parent emits a backup barrier. The injected failure advances the
@@ -215,15 +218,15 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         backup would allocate a second host copy and leak the first."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (node,) = _node_children(cache, cache.root_node_handle())
+        (node,) = node_children(cache, cache.root_node_handle())
 
-        self.assertGreater(_write_backup(cache, node, write_back=True), 0)
+        self.assertGreater(write_backup(cache, node, write_back=True), 0)
         cache.writing_check(write_back=True)
         self.assertTrue(cache.tree_core.is_backuped(node))
         host_avail = cache.cache_controller.mem_pool_host.available_size()
 
         # Re-applying an overlapping chain is a no-op skip, not a re-backup.
-        self.assertEqual(_write_backup(cache, node, write_back=True), 0)
+        self.assertEqual(write_backup(cache, node, write_back=True), 0)
         cache.writing_check(write_back=True)
         self.assertEqual(
             cache.cache_controller.mem_pool_host.available_size(), host_avail
@@ -234,7 +237,7 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         the same insert as the deeper crossing (its own walk barrier)."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (top,) = _node_children(cache, cache.root_node_handle())
+        (top,) = node_children(cache, cache.root_node_handle())
 
         # Break backup continuity: a backuped (then device-evicted) middle
         # below the still-unbacked top. insert_host refills below an
@@ -242,8 +245,8 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         # (host_insert_dropped), so the state is built through an explicit
         # backup + device eviction.
         self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
-        (middle,) = _node_children(cache, top)
-        self.assertGreater(_write_backup(cache, middle, write_back=True), 0)
+        (middle,) = node_children(cache, top)
+        self.assertGreater(write_backup(cache, middle, write_back=True), 0)
         cache.writing_check(write_back=True)
         cache.evict(EvictParams(num_tokens=4))
         self.assertTrue(cache.tree_core.is_full_device_evicted(middle))
@@ -252,7 +255,7 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
 
         # The device insert unevicts the middle and adds the deep leaf.
         self._insert(cache, allocator, req_to_token_pool, list(range(1, 13)))
-        (deep,) = _node_children(cache, middle)
+        (deep,) = node_children(cache, middle)
 
         cache.write_through_threshold = (
             min(
@@ -295,9 +298,9 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
         whatever order the component transfers listed them in."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (parent,) = _node_children(cache, cache.root_node_handle())
+        (parent,) = node_children(cache, cache.root_node_handle())
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4, 5, 6])
-        (child,) = _node_children(cache, parent)
+        (child,) = node_children(cache, parent)
 
         cache._track_write_through_node(
             child, lock_params=None, publish_node_ids=[child, parent]
@@ -327,52 +330,23 @@ class TestResumableInsertWalk(UnifiedRadixCacheFixtures, CustomTestCase):
             side_effect=RuntimeError("boom"),
         ):
             with self.assertRaises(RuntimeError):
-                _match_prefix(cache, [1, 2])
+                match_prefix(cache, [1, 2])
 
         # The relocation reached the pending record: the ack clears the
         # pending marker on both split halves, not just the stale node.
         cache.writing_check(write_back=True)
-        (parent,) = _node_children(cache, cache.root_node_handle())
-        (child,) = _node_children(cache, parent)
+        (parent,) = node_children(cache, cache.root_node_handle())
+        (child,) = node_children(cache, parent)
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(parent))
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(child))
         cache.sanity_check()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestResumableInsertWalkSWA(UnifiedRadixCacheFixtures, CustomTestCase):
+class TestResumableInsertWalkSWA(ResumableInsertWalkSWAFixtures, CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
-
-    def _recover_swa_tombstone_with_tracking(self, *, lock_full: bool):
-        cache, allocator, _ = build_fixture(self.cfg)
-        seq = list(range(1, self.cfg.sliding_window_size + 1))
-        key = RadixKey(array("q", seq))
-        evicted = self._alloc(allocator, len(seq))
-        # Window eviction already released the peers below the floor.
-        allocator.free_swa(evicted)
-        cache.insert(
-            InsertParams(
-                key=key,
-                value=evicted,
-                component_evicted_seqlens={ComponentType.SWA: len(seq)},
-            )
-        )
-        (leaf,) = _node_children(cache, cache.root_node_handle())
-        lock_result = cache.inc_lock_ref(leaf) if lock_full else None
-        try:
-            result = cache.insert(
-                InsertParams(
-                    key=key,
-                    value=self._alloc(allocator, len(seq)),
-                    track_adopted_ranges=True,
-                )
-            )
-        finally:
-            if lock_result is not None:
-                cache.dec_lock_ref(leaf, lock_result.to_dec_params())
-        return result, len(seq)
 
     def test_swa_tombstone_recovery_reports_unlocked_full_adoption(self):
         result, seq_len = self._recover_swa_tombstone_with_tracking(lock_full=False)
@@ -430,19 +404,19 @@ class TestResumableInsertWalkSWA(UnifiedRadixCacheFixtures, CustomTestCase):
                 component_evicted_seqlens={ComponentType.SWA: sw},
             )
         )
-        (prefix_node,) = _node_children(cache, cache.root_node_handle())
-        (window_node,) = _node_children(cache, prefix_node)
-        self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
+        (prefix_node,) = node_children(cache, cache.root_node_handle())
+        (window_node,) = node_children(cache, prefix_node)
+        self.assertIsNone(node_device_value(cache, prefix_node, ComponentType.SWA))
 
         # Re-inserting fully in-window recovers the prefix span's SWA data.
         cache.insert(InsertParams(key=key, value=self._alloc(allocator, len(seq))))
-        self.assertIsNotNone(_device_value(cache, prefix_node, ComponentType.SWA))
+        self.assertIsNotNone(node_device_value(cache, prefix_node, ComponentType.SWA))
 
         # SWA eviction takes the recovered span and keeps the window leaf.
         cache.evict(EvictParams(num_tokens=0, swa_num_tokens=sw))
-        self.assertIsNone(_device_value(cache, prefix_node, ComponentType.SWA))
-        self.assertIsNotNone(_device_value(cache, window_node, ComponentType.SWA))
-        self.assertIsNotNone(_device_value(cache, window_node, ComponentType.FULL))
+        self.assertIsNone(node_device_value(cache, prefix_node, ComponentType.SWA))
+        self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.SWA))
+        self.assertIsNotNone(node_device_value(cache, window_node, ComponentType.FULL))
         cache.sanity_check()
 
     def test_dup_slice_below_eviction_floor_frees_full_only(self):
@@ -483,14 +457,16 @@ class TestResumableInsertWalkSWA(UnifiedRadixCacheFixtures, CustomTestCase):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, self.cfg.sliding_window_size + 4)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        m = _match_prefix(cache, seq)
+        m = match_prefix(cache, seq)
         node = m.last_device_node
 
         lock_result = cache.inc_lock_ref(node)
-        self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.SWA), 1)
+        self.assertGreaterEqual(node_device_lock_ref(cache, node, ComponentType.SWA), 1)
         cache.release_swa(TreeLock(node, lock_result.to_dec_params()))
-        self.assertEqual(_device_lock_ref(cache, node, ComponentType.SWA), 0)
-        self.assertGreaterEqual(_device_lock_ref(cache, node, ComponentType.FULL), 1)
+        self.assertEqual(node_device_lock_ref(cache, node, ComponentType.SWA), 0)
+        self.assertGreaterEqual(
+            node_device_lock_ref(cache, node, ComponentType.FULL), 1
+        )
 
         cache.dec_lock_ref(node, lock_result.to_dec_params(), skip_swa=True)
         cache.sanity_check()
@@ -518,10 +494,10 @@ class TestResumableInsertWalkWriteBack(UnifiedRadixCacheFixtures, CustomTestCase
         g1 = c1 + self._make_seq(2000, 2)
         self._insert(cache, allocator, req_to_token_pool, g1)
         cache.evict(EvictParams(num_tokens=4))
-        m = _match_prefix(cache, p1)
+        m = match_prefix(cache, p1)
         parent = m.last_device_node
-        (child,) = _node_children(cache, parent)
-        (grandchild,) = _node_children(cache, child)
+        (child,) = node_children(cache, parent)
+        (grandchild,) = node_children(cache, child)
         self.assertTrue(
             cache.tree_core.is_full_device_evicted(child)
             and cache.tree_core.is_backuped(child)
@@ -537,8 +513,8 @@ class TestResumableInsertWalkWriteBack(UnifiedRadixCacheFixtures, CustomTestCase
         p2 = self._make_seq(5000, 4)
         self._insert(cache, allocator, req_to_token_pool, p2)
         leaf2 = None
-        for node in _node_children(cache, cache.root_node_handle()):
-            if _node_token_ids(cache, node)[: len(p2)] == list(p2):
+        for node in node_children(cache, cache.root_node_handle()):
+            if node_token_ids(cache, node)[: len(p2)] == list(p2):
                 leaf2 = node
         self.assertIsNotNone(leaf2)
         self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
@@ -574,7 +550,7 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
         passes the payload through; a wrapper that forgets strands pool slots."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
-        (node,) = _node_children(cache, cache.root_node_handle())
+        (node,) = node_children(cache, cache.root_node_handle())
         tracker = {ct: 0 for ct in cache.tree_components}
         sentinel = torch.tensor([7], dtype=torch.int64)
 
@@ -740,15 +716,15 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         self._insert(cache, allocator, req_to_token_pool, [1, 2, 3, 4])
         self._insert(cache, allocator, req_to_token_pool, list(range(1, 9)))
-        (parent,) = _node_children(cache, cache.root_node_handle())
-        (child,) = _node_children(cache, parent)
+        (parent,) = node_children(cache, cache.root_node_handle())
+        (child,) = node_children(cache, parent)
 
         self.assertTrue(cache.is_root(cache.root_node_handle()))
         self.assertFalse(cache.is_root(child))
         self.assertFalse(cache.is_backuped(parent))
         self.assertIsNone(cache.get_last_hash_value(parent))
 
-        self.assertGreater(_write_backup(cache, parent, write_back=True), 0)
+        self.assertGreater(write_backup(cache, parent, write_back=True), 0)
         cache.writing_check(write_back=True)
         self.assertTrue(cache.is_backuped(parent))
 
@@ -760,7 +736,7 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
+class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
     """Segment-lock protocol regressions, replaying the production lock-theft
     failure classes (F1/F2) and the split hazards.
 
@@ -775,53 +751,6 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
     cfg = CacheConfig(
         components=(ComponentType.FULL, ComponentType.SWA), sliding_window_size=8
     )
-
-    @staticmethod
-    def _swa_ref(cache, node_id):
-        return _device_lock_ref(cache, node_id, ComponentType.SWA)
-
-    @staticmethod
-    def _segment(cache, leaf_id, window):
-        """Node ids from leaf up to the position-based window boundary."""
-        nodes, covered, cur = [], 0, leaf_id
-        while not cache.tree_core.is_root(cur) and covered < window:
-            nodes.append(cur)
-            covered += cache.tree_core.get_node_key_length(cur)
-            cur = _node_parent(cache, cur)
-        return nodes
-
-    @staticmethod
-    def _full_path(cache, leaf_id):
-        """Non-root node ids protected by a Full device lock."""
-        nodes, cur = [], leaf_id
-        while not cache.tree_core.is_root(cur):
-            nodes.append(cur)
-            cur = _node_parent(cache, cur)
-        return nodes
-
-    def _match_leaf(self, cache, seq):
-        m = _match_prefix(cache, seq)
-        return m.last_device_node
-
-    @staticmethod
-    def _deepest(cache):
-        """Structurally deepest node — bypasses SWA match validation, which
-        never adopts a holed window (simulates the stale-relock drift case)."""
-        node_id = cache.root_node_handle()
-        while True:
-            children = _node_children(cache, node_id)
-            if not children:
-                return node_id
-            node_id = children[0]
-
-    def _assert_protocol_violation(self, fn, fragment):
-        """Both cores report ownership violations as ordinary Python exceptions."""
-        try:
-            fn()
-        except (AssertionError, RuntimeError) as exc:
-            self.assertIn(fragment, str(exc))
-        else:
-            self.fail(f"protocol violation went unreported: {fragment}")
 
     def test_rebuilt_tombstone_relock_release_no_theft(self):
         """F1 attribution replay: A locks a window containing a tombstone; the
@@ -846,7 +775,9 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
         leaf = self._deepest(cache)
         segment = self._segment(cache, leaf, sw)
         self.assertTrue(
-            any(_device_value(cache, n, ComponentType.SWA) is None for n in segment),
+            any(
+                node_device_value(cache, n, ComponentType.SWA) is None for n in segment
+            ),
             "fixture must place a tombstone inside the window",
         )
 
@@ -871,7 +802,7 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
         leaf = self._deepest(cache)
         segment = self._segment(cache, leaf, sw)
         for n in segment:
-            self.assertIsNotNone(_device_value(cache, n, ComponentType.SWA))
+            self.assertIsNotNone(node_device_value(cache, n, ComponentType.SWA))
 
         lock_b = cache.inc_lock_ref(leaf)
         for n in segment:
@@ -941,7 +872,7 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
         seq = self._make_seq(1, 2 * sw)
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = self._match_leaf(cache, seq)
-        parent = _node_parent(cache, leaf)
+        parent = node_parent(cache, leaf)
         self.assertFalse(cache.tree_core.is_root(parent))
         lock = cache.inc_lock_ref(leaf)
         self.assertEqual(lock.node_id, leaf)
@@ -950,44 +881,6 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
             lambda: cache.dec_lock_ref(parent, lock.to_dec_params()),
             "lock receipt anchored on node",
         )
-
-    def _locked_path_state(self, cache, allocator, leaf):
-        """Every lock count on the leaf's path plus every free-slot count."""
-        refs = [
-            (_device_lock_ref(cache, n, ct), _host_lock_ref(cache, n, ct))
-            for n in self._full_path(cache, leaf)
-            for ct in self.cfg.components
-        ]
-        free_slots = [
-            allocator.full_attn_allocator.available_size(),
-            allocator.swa_attn_allocator.available_size(),
-        ]
-        if cache.cache_controller is not None:
-            free_slots.append(cache.cache_controller.mem_pool_host.available_size())
-        return refs, free_slots
-
-    def _leaf_with_lock_path(self, *, hicache=False):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        if hicache:
-            self._init_hicache(cache, write_policy="write_back")
-        seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = self._match_leaf(cache, seq)
-        self.assertFalse(cache.tree_core.is_root(leaf))
-        return cache, allocator, leaf
-
-    def _assert_unanchored_release_rejected(
-        self, cache, allocator, leaf, release, unlock
-    ):
-        """The anchor check runs before any lock count or free list changes."""
-        before = self._locked_path_state(cache, allocator, leaf)
-        self._assert_protocol_violation(release, "lock receipt anchored on node")
-        if cache._tree_core_backend == "rust":
-            # A Rust panic poisons the core; the crate's own test checks state.
-            return
-        self.assertEqual(self._locked_path_state(cache, allocator, leaf), before)
-        unlock()
-        cache.sanity_check()
 
     def test_unanchored_device_release_fails_loud(self):
         """#41261 replay: a receipt that lost its anchor must not walk the
@@ -1088,7 +981,7 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
         cache.release_swa(lock)  # a repeat is a no-op
         cache.unlock(lock)
         self.assertEqual(self._swa_ref(cache, leaf), 0)
-        self.assertEqual(_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
         cache.sanity_check()
 
     def test_split_under_lock_releases_balanced(self):
@@ -1114,13 +1007,13 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
         for n in post_segment:
             self.assertEqual(self._swa_ref(cache, n), 1)
         for n in post_full_path:
-            self.assertEqual(_device_lock_ref(cache, n, ComponentType.FULL), 1)
+            self.assertEqual(node_device_lock_ref(cache, n, ComponentType.FULL), 1)
 
         cache.dec_lock_ref(leaf, lock.to_dec_params())
         for n in post_segment:
             self.assertEqual(self._swa_ref(cache, n), 0)
         for n in post_full_path:
-            self.assertEqual(_device_lock_ref(cache, n, ComponentType.FULL), 0)
+            self.assertEqual(node_device_lock_ref(cache, n, ComponentType.FULL), 0)
         cache.sanity_check()
 
     def test_aux_release_readmits_the_leaf_whatever_the_release_order(self):
@@ -1149,7 +1042,7 @@ class TestSegmentLockProtocol(UnifiedRadixCacheFixtures, CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestSegmentLockFuzz(UnifiedRadixCacheFixtures, CustomTestCase):
+class TestSegmentLockFuzz(SegmentLockFuzzFixtures, CustomTestCase):
     """Random lock/insert/evict interleavings with the tree's own ledger
     recomputation (sanity_check) as the per-step oracle, on both cores."""
 
@@ -1159,98 +1052,6 @@ class TestSegmentLockFuzz(UnifiedRadixCacheFixtures, CustomTestCase):
         kv_size=4096,
         max_num_reqs=256,
     )
-
-    def _lock_skips(self, rng):
-        """The decode hold opts the Mamba lock out; exercise both receipts."""
-        if self.cfg.has_mamba and rng.random() < 0.5:
-            return (ComponentType.MAMBA,)
-        return ()
-
-    def _run_seed(self, seed: int, steps: int = 120):
-        import random as _random
-
-        rng = _random.Random(seed)
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        chains: list[list[int]] = []
-        held: list[list] = []  # [node_id, receipt, released] entries
-
-        for step in range(steps):
-            op = rng.random()
-            try:
-                if op < 0.35 or not chains:
-                    # Insert: fresh chain or extend/diverge an existing one.
-                    if chains and rng.random() < 0.6:
-                        base = rng.choice(chains)
-                        cut = rng.randrange(1, len(base) + 1)
-                        seq = base[:cut] + self._make_seq(
-                            1000 * (step + 1), rng.randrange(2, 12)
-                        )
-                    else:
-                        seq = self._make_seq(1000 * (step + 1), rng.randrange(4, 20))
-                    if allocator.available_size() < len(seq):
-                        cache.evict(EvictParams(num_tokens=len(seq) * 2))
-                    if allocator.available_size() < len(seq):
-                        continue
-                    swa_evict = rng.randrange(0, len(seq)) if rng.random() < 0.3 else 0
-                    value = self._alloc(allocator, len(seq))
-                    # Release the evicted prefix's SWA peers first, as the
-                    # scheduler does before inserting a window-trimmed request.
-                    allocator.free_swa(value[:swa_evict])
-                    params = InsertParams(
-                        key=RadixKey(array("q", seq)),
-                        value=value,
-                        component_evicted_seqlens={ComponentType.SWA: swa_evict},
-                    )
-                    if self.cfg.has_mamba:
-                        req = self._make_req(req_to_token_pool)
-                        params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
-                    cache.insert(params)
-                    chains.append(seq)
-                elif op < 0.6:
-                    # Lock a random chain's current deepest device node.
-                    seq = rng.choice(chains)
-                    m = _match_prefix(cache, seq)
-                    node_id = m.last_device_node
-                    if cache.tree_core.is_root(node_id):
-                        continue
-                    receipt = cache.inc_lock_ref(
-                        node_id, skip_lock_components=self._lock_skips(rng)
-                    )
-                    held.append([node_id, receipt, False])
-                elif op < 0.8 and held:
-                    # Full release of a random held lock.
-                    idx = rng.randrange(len(held))
-                    node_id, receipt, released = held.pop(idx)
-                    cache.dec_lock_ref(
-                        node_id, receipt.to_dec_params(), skip_swa=released
-                    )
-                elif op < 0.9 and held:
-                    # Early SWA release of a random not-yet-released lock.
-                    idx = rng.randrange(len(held))
-                    node_id, receipt, released = held[idx]
-                    if (
-                        released
-                        or receipt.component_lock_uuids[ComponentType.SWA] is None
-                    ):
-                        continue
-                    cache.release_swa(TreeLock(node_id, receipt.to_dec_params()))
-                    held[idx][2] = True
-                else:
-                    cache.evict(
-                        EvictParams(
-                            num_tokens=rng.randrange(0, 32),
-                            swa_num_tokens=rng.randrange(0, 32),
-                            mamba_num=rng.randrange(0, 4) if self.cfg.has_mamba else 0,
-                        )
-                    )
-            except AssertionError:
-                raise
-            cache.sanity_check()
-
-        # Drain remaining locks; the tree must come back exactly balanced.
-        for node_id, receipt, released in held:
-            cache.dec_lock_ref(node_id, receipt.to_dec_params(), skip_swa=released)
-        cache.sanity_check()
 
     def test_fuzz_seed0(self):
         self._run_seed(0)
@@ -1277,7 +1078,9 @@ class TestSegmentLockFuzzWithMamba(TestSegmentLockFuzz):
     )
 
 
-class TestStreamingSessionLockLifecycle(CustomTestCase):
+class TestStreamingSessionLockLifecycle(
+    StreamingSessionLockLifecycleFixtures, CustomTestCase
+):
     """A streaming session owns its record and prefix lock from the first
     turn's row allocation; every move of that lock keeps the tree balanced."""
 
@@ -1289,41 +1092,6 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         max_context_len=64,
     )
 
-    def _session(self, session_id):
-        return SimpleNamespace(
-            session_id=session_id,
-            streaming=True,
-            finish_req=lambda req: None,
-            abort_req=lambda: None,
-        )
-
-    def _turn(self, tokens, session):
-        req = Req(
-            rid="turn",
-            origin_input_text="",
-            origin_input_ids=array("q", tokens),
-            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-        )
-        req.session = session
-        req.extra_key = None
-        req.output_ids = array("q")
-        req.refresh_fill_ids()
-        return req
-
-    def _admitted_turn(self, cache, allocator, pool, tokens, session):
-        """A first turn with its own row and the root lock admission took."""
-        req = self._turn(tokens, session)
-        pool.alloc([req])
-        pool.write(
-            (req.kv.req_pool_idx, slice(0, len(tokens))),
-            allocator.alloc(len(tokens)),
-        )
-        req.kv.kv_committed_len = len(tokens)
-        req.kv.kv_allocated_len = len(tokens)
-        req.last_node = cache.root_node_handle()
-        req.lock = cache.lock(req.last_node)
-        return req
-
     def test_slot_publishes_first_prompt_but_not_its_output(self):
         cache, allocator, pool = build_fixture(self.cfg)
         tokens = list(range(1, 9))
@@ -1332,7 +1100,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         slot = cache.session.slots["s"]
 
         cache.checkpoint(req, up_to=len(tokens))
-        match = _match_prefix(cache, tokens)
+        match = match_prefix(cache, tokens)
         self.assertEqual(slot.lock.node, match.last_device_node)
         self.assertIs(req.last_node, slot.virtual_node)
 
@@ -1345,7 +1113,7 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         release_kv_cache(req, cache, checkpoint=True)
 
         self.assertIs(cache.session.slots["s"], slot)
-        match = _match_prefix(cache, range(1, 13))
+        match = match_prefix(cache, range(1, 13))
         self.assertEqual(match.device_prefix_len, len(tokens))
         cache.session.release_session("s")
         cache.sanity_check()
@@ -1367,27 +1135,6 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         self.assertTrue(cache.session.try_cache_finished_req(req))
         cache.session.release_session("s")
         cache.sanity_check()
-
-    def _later_turn(self, cache, allocator, pool):
-        """A finished first turn, then a second turn on the slot's record."""
-        session = self._session("s")
-        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
-        cache.maybe_hand_to_session(first)
-        cache.checkpoint(first, up_to=8)
-        first.finished_reason = FINISH_LENGTH(length=0)
-        self.assertTrue(cache.session.try_cache_finished_req(first))
-
-        tokens = list(range(1, 13))
-        req = self._turn(tokens, session)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        req.last_node = match.last_device_node
-        pool.write((req.kv.req_pool_idx, slice(8, 12)), allocator.alloc(4))
-        req.kv.kv_committed_len = 12
-        req.kv.kv_allocated_len = 12
-        cache.maybe_hand_to_session(req)
-        return cache.session.slots["s"], req
 
     def test_later_turn_borrows_without_publishing(self):
         cache, allocator, pool = build_fixture(self.cfg)

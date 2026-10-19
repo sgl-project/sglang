@@ -3,11 +3,8 @@
 import atexit
 import json
 from array import array
-from dataclasses import dataclass
 from typing import Optional
 from unittest import mock
-
-import torch
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -51,98 +48,35 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device
+from sglang.test.kits.unified_radix_cache_unittest.config import (
+    CacheConfig,
+    supports_hicache,
+)
 from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
 )
 from sglang.test.kits.unified_radix_cache_unittest.unified_tree_core_inspector import (
     UnifiedTreeCoreInspector,
 )
-from sglang.test.test_utils import CustomTestCase
 
 # The Rust re-run entry point overrides this without changing the process-wide
 # production backend selection. Every cache built by build_fixture follows it;
 # tests that construct a Python core directly stay Python-only.
-_TREE_CORE_TEST_BACKEND: Optional[str] = "python"
+TREE_CORE_TEST_BACKEND: Optional[str] = "python"
 
 
-def _selected_tree_core_test_backend() -> str:
-    return _TREE_CORE_TEST_BACKEND or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+def selected_tree_core_test_backend() -> str:
+    return TREE_CORE_TEST_BACKEND or envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
 
 
-@dataclass(frozen=True)
-class CacheConfig:
-    # Tree
-    page_size: int = 1
-    components: tuple[ComponentType, ...] = (ComponentType.FULL,)
-
-    # Layer split (only matters for SWA/Mamba)
-    num_layers: int = 24
-    full_attention_layer_ids: tuple[int, ...] = (3, 7, 11, 15, 19, 23)
-
-    # SWA
-    sliding_window_size: Optional[int] = None
-    draft_swa_window: int = 0
-    decoder_swa_bounded_replay: bool = False
-
-    # Mamba
-    enable_mamba_extra_buffer: bool = False
-    mamba_cache_size: int = 20
-    mamba_intermediate_size: int = 256
-    mamba_n_groups: int = 1
-    mamba_num_heads: int = 2
-    mamba_head_dim: int = 16
-    mamba_state_size: int = 16
-    mamba_conv_kernel: int = 4
-    enable_int8_mamba_checkpoint: bool = False
-
-    # Model / pool
-    kv_size: int = 256
-    max_num_reqs: int = 10
-    max_context_len: int = 512
-    head_num: int = 2
-    head_dim: int = 64
-    dtype: torch.dtype = torch.bfloat16
-    eviction_policy: str = "lru"
-    is_eagle: bool = False
-
-    @property
-    def has_mamba(self) -> bool:
-        return ComponentType.MAMBA in self.components
-
-    @property
-    def has_swa(self) -> bool:
-        return ComponentType.SWA in self.components
-
-    @property
-    def non_full_layer_ids(self) -> list[int]:
-        full = set(self.full_attention_layer_ids)
-        return [i for i in range(self.num_layers) if i not in full]
-
-    @property
-    def label(self) -> str:
-        comp = "_".join(c.name for c in self.components)
-        parts = [f"{comp}_ps{self.page_size}"]
-        if self.sliding_window_size is not None:
-            parts.append(f"sw{self.sliding_window_size}")
-        defaults = self.__dataclass_fields__
-        if (
-            self.head_num != defaults["head_num"].default
-            or self.num_layers != defaults["num_layers"].default
-        ):
-            parts.append(f"h{self.head_num}l{self.num_layers}")
-        if self.is_eagle:
-            parts.append("eagle")
-        return "_".join(parts)
-
-
-def _drop_hicache_atexit_pin(cache):
+def drop_hicache_atexit_pin(cache):
     """init_hicache registers ``cache.shutdown`` with atexit, which pins the
     fixture's device and host pools until process exit; hundreds of HiCache
     fixtures in this suite would otherwise accumulate on the GPU."""
     atexit.unregister(cache.shutdown)
 
 
-def _write_backup(cache, node, write_back: bool = False) -> int:
+def write_backup(cache, node, write_back: bool = False) -> int:
     """Back up one node's KV D->H via the tree's build+execute primitives."""
     return cache._execute_and_commit_kv_backup(
         BackupKV(node_ids=cache.tree_core.build_backup_node_ids(node, write_back)),
@@ -150,39 +84,39 @@ def _write_backup(cache, node, write_back: bool = False) -> int:
     )
 
 
-def _node_key_length(cache, node_id):
+def node_key_length(cache, node_id):
     return cache.tree_core.get_node_key_length(node_id)
 
 
-def _node_token_ids(cache, node_id):
+def node_token_ids(cache, node_id):
     return cache.tree_core.get_node_token_ids(node_id)
 
 
-def _node_parent(cache, node_id):
+def node_parent(cache, node_id):
     return cache.tree_core.get_parent_node_id(node_id)
 
 
-def _node_children(cache, node_id):
+def node_children(cache, node_id):
     return cache.tree_core.get_child_node_ids(node_id)
 
 
-def _device_value(cache, node_id, component_type):
+def node_device_value(cache, node_id, component_type):
     return cache.tree_core.get_component_device_value(node_id, component_type)
 
 
-def _host_value(cache, node_id, component_type):
+def node_host_value(cache, node_id, component_type):
     return cache.tree_core.get_component_host_value(node_id, component_type)
 
 
-def _device_lock_ref(cache, node_id, component_type):
+def node_device_lock_ref(cache, node_id, component_type):
     return cache.tree_core.get_component_device_lock_ref(node_id, component_type)
 
 
-def _host_lock_ref(cache, node_id, component_type):
+def node_host_lock_ref(cache, node_id, component_type):
     return cache.tree_core.get_component_host_lock_ref(node_id, component_type)
 
 
-def _match_prefix(cache, tokens):
+def match_prefix(cache, tokens):
     return cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
 
@@ -337,7 +271,7 @@ def build_fixture(
         is_eagle=cfg.is_eagle,
         component_registry_override=component_registry_override,
     )
-    requested_backend = tree_core_backend or _selected_tree_core_test_backend()
+    requested_backend = tree_core_backend or selected_tree_core_test_backend()
     selected_backend = resolve_tree_core_backend(requested_backend, cache_init_params)
 
     def python_inspector_factory(params, components):
@@ -366,192 +300,6 @@ def build_fixture(
     cache.cache_init_params = cache_init_params
 
     return cache, allocator, req_to_token_pool
-
-
-_CONFIGS: list[CacheConfig] = [
-    CacheConfig(page_size=1, components=(ComponentType.FULL,)),
-    CacheConfig(page_size=4, components=(ComponentType.FULL,)),
-    CacheConfig(page_size=16, components=(ComponentType.FULL,)),
-    CacheConfig(
-        page_size=64,
-        components=(ComponentType.FULL,),
-        kv_size=1024,
-        max_context_len=1024,
-    ),
-    CacheConfig(
-        page_size=128,
-        components=(ComponentType.FULL,),
-        kv_size=2048,
-        max_context_len=2048,
-    ),
-    CacheConfig(
-        page_size=1,
-        components=(ComponentType.FULL, ComponentType.MAMBA),
-    ),
-    CacheConfig(
-        page_size=4,
-        components=(ComponentType.FULL, ComponentType.MAMBA),
-        enable_mamba_extra_buffer=True,  # Mamba page_size > 1 requires enable_mamba_extra_buffer=True
-        mamba_cache_size=60,
-    ),
-    CacheConfig(
-        page_size=64,
-        components=(ComponentType.FULL, ComponentType.MAMBA),
-        enable_mamba_extra_buffer=True,
-        mamba_cache_size=60,
-        kv_size=1024,
-        max_context_len=1024,
-    ),
-    CacheConfig(
-        page_size=128,
-        components=(ComponentType.FULL, ComponentType.MAMBA),
-        enable_mamba_extra_buffer=True,
-        mamba_cache_size=60,
-        kv_size=2048,
-        max_context_len=2048,
-    ),
-    CacheConfig(
-        page_size=1,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=4,
-    ),
-    CacheConfig(
-        page_size=4,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=4,
-    ),
-    CacheConfig(
-        page_size=4,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=2,  # window < page_size edge case
-    ),
-    CacheConfig(
-        page_size=16,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=16,
-        kv_size=512,
-    ),
-    CacheConfig(
-        page_size=64,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=64,
-        kv_size=4096,
-        max_context_len=4096,
-    ),
-    CacheConfig(
-        page_size=128,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=128,
-        kv_size=8192,
-        max_context_len=8192,
-    ),
-    CacheConfig(
-        page_size=128,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=4,
-        kv_size=8192,
-        max_context_len=8192,
-    ),
-    CacheConfig(
-        page_size=1,
-        components=(ComponentType.FULL, ComponentType.SWA),
-        sliding_window_size=128,
-        kv_size=1024,
-        max_context_len=1024,
-    ),
-    CacheConfig(
-        page_size=1,
-        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
-        sliding_window_size=128,
-        head_num=8,
-        num_layers=32,
-        full_attention_layer_ids=(7, 15, 23, 31),
-        kv_size=1024,
-        max_context_len=1024,
-    ),
-    CacheConfig(
-        page_size=64,
-        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
-        sliding_window_size=64,
-        enable_mamba_extra_buffer=True,
-        mamba_cache_size=60,
-        kv_size=4096,
-        max_context_len=4096,
-    ),
-]
-
-
-def _requires(predicate, reason):
-    """Run a suite test only under the configs that satisfy ``predicate``.
-
-    Stacked requirements are checked top to bottom and stop at the first that
-    fails, so a lower one may assume the ones above it hold.
-    """
-
-    def decorate(test):
-        requirements = getattr(test, "_cfg_requirements", ())
-        test._cfg_requirements = ((predicate, reason), *requirements)
-        return test
-
-    return decorate
-
-
-def _supports_hicache(cfg):
-    return not (cfg.has_swa and cfg.has_mamba)
-
-
-_requires_hicache = _requires(
-    _supports_hicache, "HiCache unit fixture does not support SWA + Mamba stacks"
-)
-_requires_swa = _requires(lambda cfg: cfg.has_swa, "requires SWA")
-_requires_mamba = _requires(lambda cfg: cfg.has_mamba, "requires Mamba")
-_requires_swa_only = _requires(
-    lambda cfg: cfg.has_swa and not cfg.has_mamba, "requires SWA without Mamba"
-)
-_requires_swa_and_mamba = _requires(
-    lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba"
-)
-_requires_paged = _requires(lambda cfg: cfg.page_size != 1, "requires page_size > 1")
-_requires_ps1_window4 = _requires(
-    lambda cfg: cfg.page_size == 1 and cfg.sliding_window_size == 4,
-    "requires page_size=1, sliding_window_size=4",
-)
-_requires_full_swa_ps1 = _requires(
-    lambda cfg: cfg.has_swa and not cfg.has_mamba and cfg.page_size == 1,
-    "requires page_size=1 Full+SWA",
-)
-_requires_full_swa_ps1_window4 = _requires(
-    lambda cfg: (
-        cfg.has_swa
-        and not cfg.has_mamba
-        and cfg.page_size == 1
-        and cfg.sliding_window_size == 4
-    ),
-    "requires page_size=1 Full+SWA with window_size=4",
-)
-_requires_full_mamba_ps1 = _requires(
-    lambda cfg: cfg.has_mamba and not cfg.has_swa and cfg.page_size == 1,
-    "requires page_size=1 Full+Mamba",
-)
-
-
-def _config_attrs(suite, cfg):
-    """Bind ``suite`` to ``cfg``, hiding the tests whose requirements it fails."""
-    attrs = {"cfg": cfg}
-    for name, test in vars(suite).items():
-        requirements = getattr(test, "_cfg_requirements", ())
-        if not all(predicate(cfg) for predicate, _ in requirements):
-            attrs[name] = None
-    return attrs
-
-
-def _define_config_test_classes(suite, namespace):
-    """Define ``Test_<label>`` in ``namespace`` for each config, binding ``suite``."""
-    for cfg in _CONFIGS:
-        name = f"Test_{cfg.label}"
-        test_class = type(name, (suite, CustomTestCase), _config_attrs(suite, cfg))
-        test_class.__module__ = namespace["__name__"]
-        namespace[name] = test_class
 
 
 class UnifiedRadixCacheFixtures:
@@ -629,12 +377,12 @@ class UnifiedRadixCacheFixtures:
         cur = node
         while cur != cache.root_node_handle():
             chain.append(cur)
-            cur = _node_parent(cache, cur)
+            cur = node_parent(cache, cur)
         chain.reverse()
         return chain
 
     def _skip_unsupported_hicache_test(self):
-        if not _supports_hicache(self.cfg):
+        if not supports_hicache(self.cfg):
             self.skipTest("HiCache unit fixture does not support SWA + Mamba stacks")
         return False
 
@@ -644,8 +392,8 @@ class UnifiedRadixCacheFixtures:
             for ct in (ComponentType.FULL, ComponentType.MAMBA, ComponentType.SWA):
                 if ct not in self.cfg.components:
                     continue
-                value = _device_value(cache, ancestor, ct)
-                if value is not None and _host_value(cache, ancestor, ct) is None:
+                value = node_device_value(cache, ancestor, ct)
+                if value is not None and node_host_value(cache, ancestor, ct) is None:
                     cache.tree_core.set_component_host_value_raw(
                         ancestor, ct, value.clone()
                     )
@@ -660,7 +408,7 @@ class UnifiedRadixCacheFixtures:
             node = stack.pop()
             if node != root:
                 self._simulate_backup(cache, node)
-            stack.extend(_node_children(cache, node))
+            stack.extend(node_children(cache, node))
 
     def _init_hicache(
         self,
@@ -716,7 +464,7 @@ class UnifiedRadixCacheFixtures:
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
-        self.addCleanup(_drop_hicache_atexit_pin, cache)
+        self.addCleanup(drop_hicache_atexit_pin, cache)
         self.addCleanup(cache.release_host_resources)
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
@@ -745,7 +493,7 @@ class UnifiedRadixCacheFixtures:
         for ancestor in self._path_chain(cache, node):
             if cache.tree_core.is_backuped(ancestor):
                 continue
-            backed_up = _write_backup(cache, ancestor, write_back=True)
+            backed_up = write_backup(cache, ancestor, write_back=True)
             self.assertGreater(backed_up, 0)
         cache.writing_check(write_back=True)
         self.assertTrue(cache.tree_core.is_backuped(node))
@@ -756,7 +504,7 @@ class UnifiedRadixCacheFixtures:
         stack = [root]
         while stack:
             node = stack.pop()
-            children = _node_children(cache, node)
+            children = node_children(cache, node)
             stack.extend(reversed(children))
             if node != root:
                 self._backup_node(cache, node)
@@ -769,7 +517,7 @@ class UnifiedRadixCacheFixtures:
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
-        return _device_value(cache, node, ComponentType.FULL)
+        return node_device_value(cache, node, ComponentType.FULL)
 
     def _get_full_kv_pool(self, allocator):
         kv_pool = allocator.get_kvcache()
@@ -800,12 +548,12 @@ class UnifiedRadixCacheFixtures:
         for i in range(num_pages):
             seq = seq + self._make_seq(1000 * (i + 1), 1)
             self._insert(cache, allocator, req_to_token_pool, seq)
-        m = _match_prefix(cache, seq)
+        m = match_prefix(cache, seq)
         chain: list = []
         cur = m.last_device_node
         while cur != cache.root_node_handle():
             chain.append(cur)
-            cur = _node_parent(cache, cur)
+            cur = node_parent(cache, cur)
         chain.reverse()
         return chain
 
@@ -827,13 +575,13 @@ class UnifiedRadixCacheFixtures:
     def _match_tokens_for_chain(self, cache, chain):
         tokens: list[int] = []
         for node in chain:
-            tokens.extend(_node_token_ids(cache, node))
+            tokens.extend(node_token_ids(cache, node))
         return tokens
 
     def _set_aux_host_tombstone(self, cache, node, component_type):
-        value = _device_value(cache, node, component_type)
+        value = node_device_value(cache, node, component_type)
         self.assertIsNotNone(value)
-        if _host_value(cache, node, component_type) is None:
+        if node_host_value(cache, node, component_type) is None:
             cache.tree_core.set_component_host_value_raw(
                 node, component_type, value.clone()
             )

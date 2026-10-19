@@ -28,12 +28,12 @@ class RustBackendSuite(unittest.TestSuite):
     """Scope the test backend to this suite without polluting discovery."""
 
     def run(self, result, debug=False):
-        previous = fixtures._TREE_CORE_TEST_BACKEND
-        fixtures._TREE_CORE_TEST_BACKEND = "rust"
+        previous = fixtures.TREE_CORE_TEST_BACKEND
+        fixtures.TREE_CORE_TEST_BACKEND = "rust"
         try:
             return super().run(result, debug)
         finally:
-            fixtures._TREE_CORE_TEST_BACKEND = previous
+            fixtures.TREE_CORE_TEST_BACKEND = previous
 
 
 def load_tests(loader, standard_tests, pattern):

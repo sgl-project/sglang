@@ -1,26 +1,21 @@
 """L3 storage, buffer-only host memory and prefetch tests for UnifiedRadixCache."""
 
 import os
-import shutil
-import tempfile
 import time
 import unittest
 from array import array
 from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import Optional
 from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -34,112 +29,56 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
-    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
 )
-from sglang.srt.server_args import (
-    ServerArgs,
-    set_global_server_args_for_scheduler,
-)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
+from sglang.test.kits.unified_radix_cache_unittest.config import (
     CacheConfig,
+    define_config_test_classes,
+    requires,
+    requires_full_mamba_ps1,
+    requires_full_swa_ps1,
+    requires_hicache,
+    requires_ps1_window4,
+    requires_swa,
+    requires_swa_only,
+)
+from sglang.test.kits.unified_radix_cache_unittest.fixtures import (
     UnifiedRadixCacheFixtures,
-    _define_config_test_classes,
-    _device_lock_ref,
-    _device_value,
-    _drop_hicache_atexit_pin,
-    _host_value,
-    _match_prefix,
-    _node_key_length,
-    _node_parent,
-    _node_token_ids,
-    _requires,
-    _requires_full_mamba_ps1,
-    _requires_full_swa_ps1,
-    _requires_hicache,
-    _requires_ps1_window4,
-    _requires_swa,
-    _requires_swa_only,
-    _write_backup,
     build_fixture,
+    match_prefix,
+    node_device_lock_ref,
+    node_host_value,
+    node_key_length,
+    node_parent,
+    node_token_ids,
+    write_backup,
+)
+from sglang.test.kits.unified_radix_cache_unittest.storage import (
+    AnchorLockOutcomePolicyFixtures,
+    ExtraPoolFullComponent,
+    UnifiedRadixCacheStorageAttachBackfillFixtures,
+    UnifiedRadixCacheStorageFixtures,
+    UnifiedRadixPrefetchCorruptionFixtures,
+    aux_storage_key_transfers,
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
-
-
-def _aux_storage_key_transfers(cache, node_id):
-    transfers = []
-    if ComponentType.SWA in cache.tree_components:
-        value = _device_value(cache, node_id, ComponentType.SWA)
-        if value is not None:
-            num_pages = len(value) // cache.page_size
-            if num_pages > 0:
-                transfers.append(
-                    PoolTransfer(
-                        name=PoolName.SWA,
-                        keys=cache.tree_core.get_hash_values(node_id)[-num_pages:],
-                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
-                    )
-                )
-    return transfers or None
-
-
-class _ExtraPoolFullComponent(FullComponent):
-    """FULL component that also stores every page under a pool of its own,
-    staged through the anchor's host pool."""
-
-    EXTRA_POOL = PoolName.DRAFT
-
-    def buffer_mode_host_pool_entries(self, host_pool_group):
-        anchor = host_pool_group.anchor_entry
-        return [
-            PoolEntry(
-                name=self.EXTRA_POOL,
-                host_pool=anchor.host_pool,
-                device_pool=anchor.device_pool,
-                layer_mapper=anchor.layer_mapper,
-            )
-        ]
-
-    def buffer_backup_keys(self, node, hash_values):
-        return {self.EXTRA_POOL: list(hash_values)}
-
-    def build_hicache_transfers(self, node, phase, **kwargs):
-        if phase == CacheTransferPhase.BACKUP_HOST:
-            # Two transfers of the pool, each keyed by its own pages: the
-            # storage write must keep the keys per transfer.
-            value = node.component_data[BASE_COMPONENT_TYPE].value
-            keys = list(node.hash_value)
-            split = len(keys) // 2
-            page_size = self.tree_core.page_size
-            halves = [
-                (value[: split * page_size], keys[:split]),
-                (value[split * page_size :], keys[split:]),
-            ]
-            return [
-                PoolTransfer(name=self.EXTRA_POOL, device_indices=rows, keys=part)
-                for rows, part in halves
-                if part
-            ]
-        return super().build_hicache_transfers(node, phase, **kwargs)
 
 
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
@@ -295,20 +234,22 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         }
         pipeline._cache = cache
 
-        lock_ref = _device_lock_ref(cache, match.last_device_node, ComponentType.FULL)
+        lock_ref = node_device_lock_ref(
+            cache, match.last_device_node, ComponentType.FULL
+        )
         self.assertEqual(
             pipeline.try_lock_anchor(req_id, remaining_full_tokens=1), ("locked", 4)
         )
         self.assertEqual(pipeline.anchor_locks[req_id].node_id, match.last_device_node)
         self.assertEqual(
-            _device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
             lock_ref + 1,
         )
 
         pipeline.release_anchor_lock(req_id)
         cache.ongoing_prefetch.pop(req_id)
         self.assertEqual(
-            _device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(cache, match.last_device_node, ComponentType.FULL),
             lock_ref,
         )
         cache.sanity_check()
@@ -396,578 +337,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         cache.sanity_check()
 
 
-class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
-    # ---------- L3 storage (file backend) helpers ----------
-
-    def _make_storage_dir(self):
-        storage_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
-        return storage_dir
-
-    def _write_path_to_l3(self, cache, node):
-        """Offload every node on root->node path from host to L3 storage."""
-        for n in self._path_chain(cache, node):
-            cache.write_backup_storage(n)
-
-    def _ongoing_l3_backups(self, cache):
-        """Storage writes in flight (buffer mode tracks them on the pipeline)."""
-        if cache.buffer_pipeline is not None:
-            return cache.buffer_pipeline.ongoing_backup
-        return cache.ongoing_backup
-
-    def _flush_l3_backups(self, cache, timeout: float = 10.0):
-        """Wait for backup threads to finish, then drain acks (release locks)."""
-        deadline = time.time() + timeout
-        while self._ongoing_l3_backups(cache) and time.time() < deadline:
-            cache.drain_storage_control_queues()
-            if self._ongoing_l3_backups(cache):
-                time.sleep(0.01)
-        cache.drain_storage_control_queues()
-        self.assertFalse(
-            self._ongoing_l3_backups(cache), "L3 backups did not complete in time"
-        )
-
-    def _run_prefetch_to_completion(self, cache, req_id, timeout: float = 10.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            # Host memory is reserved (and IO started) by the scheduler-thread
-            # drain once the L3 hit count is known, and the buffer-mode fill
-            # commits at its H2D ack in loading_check — pump the full event
-            # round like the real scheduler loop does.
-            cache.check_hicache_events()
-            if cache.check_prefetch_progress(req_id):
-                # Buffer mode parks a completed fetch as a staged prefetch;
-                # consume it like the PrefillAdder would so callers see the
-                # span tree-resident.
-                if (
-                    cache.buffer_pipeline is not None
-                    and cache.buffer_pipeline.has_staged(req_id)
-                ):
-                    self._consume_staged_prefetch(cache, req_id, timeout=timeout)
-                return
-            time.sleep(0.01)
-        self.fail(f"prefetch {req_id} did not complete in time")
-
-    def _consume_staged_prefetch(
-        self,
-        cache,
-        req_id,
-        prefix_len=None,
-        timeout: float = 10.0,
-        *,
-        extra_key=None,
-        cache_salt=None,
-        last_node=None,
-        on_dispatched=None,
-        return_req: bool = False,
-    ):
-        """Simulate the PrefillAdder consuming a staged prefetch at admission:
-        init_load_back (buffer dispatch: device alloc + queued H2D), the batch
-        start_loading flush, then pump until the ack commit lands. Returns
-        the spliced device indices (empty on degrade). ``on_dispatched`` runs
-        between the two, where the H2D is still in flight."""
-        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
-
-        f = cache.buffer_pipeline.staged_prefetches[req_id]
-        if prefix_len is None:
-            prefix_len = f.matched_len
-        req = mock.Mock()
-        req.rid = req_id.rid
-        req.cache_request_handle = req_id
-        req.extra_key = extra_key
-        req.cache_salt = cache_salt
-        req.prefix_len = prefix_len
-        req.last_node = cache.root_node_handle() if last_node is None else last_node
-        joint = cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(
-                    array("q", f.key_tokens), extra_key=extra_key, cache_salt=cache_salt
-                )
-            )
-        )
-        req.prefix_len = joint.device_prefix_len
-        joint_covers_span = joint.device_prefix_len >= len(f.key_tokens)
-        adder = PrefillAdder.__new__(PrefillAdder)
-        adder.tree_cache = cache
-        with (
-            mock.patch.object(
-                cache.tree_core,
-                "match_full_device_prefix",
-                wraps=cache.tree_core.match_full_device_prefix,
-            ) as full_match,
-            mock.patch.object(
-                cache.tree_core,
-                "collect_full_device_indices",
-                wraps=cache.tree_core.collect_full_device_indices,
-            ) as collect_indices,
-        ):
-            self.assertTrue(
-                cache.buffer_pipeline.prepare_staged_prefetch(req),
-                "production admission FULL rematch unexpectedly deferred",
-            )
-            with adder._lock_node(req.last_node):
-                loaded = cache.init_load_back(
-                    InitLoadBackParams(
-                        best_match_node=None,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
-                    )
-                )
-            if joint_covers_span:
-                # A joint match past the staged span is kept without a rematch.
-                full_match.assert_not_called()
-            else:
-                full_match.assert_called_once()
-                # A load-back committing here reads the path again for its
-                # slot-ownership check.
-                collect_indices.assert_called()
-        loaded_len, last_node = (0, req.last_node) if loaded is None else loaded
-        path = cache.path_device_indices(last_node)
-        new_indices = path[len(path) - loaded_len :]
-        if on_dispatched is not None:
-            on_dispatched()
-        # Batch formation flushes the queued load into the batch's producer.
-        cache.ready_to_load_host_cache()
-        self._pump_hicache_until(
-            cache,
-            lambda: not cache.buffer_pipeline.ongoing_buffer_load_back,
-            "staged-prefetch consumption did not commit",
-            timeout=timeout,
-        )
-        return (new_indices, req) if return_req else new_indices
-
-    def _all_page_hashes(self, cache, node):
-        hashes = []
-        for n in self._path_chain(cache, node):
-            hashes.extend(cache.tree_core.get_hash_values(n))
-        return hashes
-
-    def _init_buffer_hicache(
-        self,
-        cache,
-        storage_dir,
-        prefetch_policy: str = "wait_complete",
-        storage_extra: Optional[dict] = None,
-        context_length: Optional[int] = None,
-    ):
-        if self.cfg.has_mamba:
-            self.skipTest(
-                "load-back requests here are Mocks; buffer_only Mamba is "
-                "covered by TestUnifiedHybridBufferOnlyBitExact"
-            )
-        self._init_hicache(
-            cache,
-            storage_backend="file",
-            storage_dir=storage_dir,
-            prefetch_threshold=1,
-            host_memory_mode="buffer_only",
-            prefetch_policy=prefetch_policy,
-            storage_extra=storage_extra,
-            context_length=context_length,
-        )
-
-    def _pump_hicache_until(self, cache, cond, msg, timeout: float = 10.0):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            cache.check_hicache_events()
-            if cond():
-                return
-            time.sleep(0.01)
-        self.fail(msg)
-
-    def _host_avail_sizes(self, cache):
-        group = cache.cache_controller.mem_pool_host
-        return {entry.name: entry.host_pool.available_size() for entry in group.entries}
-
-    def _storage_exists_count(self, cache, page_hashes, pool_transfers=None):
-        """Ground-truth longest-prefix existence count from the backend,
-        folded across pools like the prefetch hit query."""
-        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
-
-        backend = cache.cache_controller.storage_backend
-        extra_info = HiCacheStorageExtraInfo(prefix_keys=None)
-        if pool_transfers:
-            result = backend.batch_exists_v2(page_hashes, pool_transfers, extra_info)
-            return min(result.kv_hit_pages, len(page_hashes))
-        return backend.batch_exists(page_hashes, extra_info)
-
-    def _buffer_backup_and_wait(self, cache, node):
-        # Parent-first over the whole path, mirroring the production trigger
-        # (_inc_hit_count fires per matched node on the insert walk): the SWA
-        # component may have split the leaf at the window boundary.
-        pipeline = cache.buffer_pipeline
-        chain = self._path_chain(cache, node)
-        _write_backup(cache, node)
-        for n in chain:
-            self.assertIn(n, pipeline.inflight_backup_node_ids)
-        self._pump_hicache_until(
-            cache,
-            lambda: (
-                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
-            ),
-            "buffer backup pipeline did not drain",
-        )
-
-    def _produce_buffer_l3(
-        self, storage_dir, seq, marker=None, *, extra_key=None, cache_salt=None
-    ):
-        """Producer tree in buffer mode: insert seq and push it to L3."""
-        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(prod, storage_dir)
-        self._insert(
-            prod,
-            prod_alloc,
-            prod_rtp,
-            seq,
-            extra_key=extra_key,
-            cache_salt=cache_salt,
-        )
-        key = RadixKey(array("q", seq), extra_key=extra_key, cache_salt=cache_salt)
-        leaf = prod.match_prefix(MatchPrefixParams(key=key)).last_device_node
-        expected = None
-        if marker is not None:
-            m = prod.match_prefix(MatchPrefixParams(key=key))
-            self._fill_full_kv(
-                prod_alloc, prod.path_device_indices(m.last_device_node), marker=marker
-            )
-            expected = self._snapshot_full_kv(
-                prod_alloc, prod.path_device_indices(m.last_device_node)
-            )
-        self._buffer_backup_and_wait(prod, leaf)
-        return leaf, expected
-
-    def _buffer_swa_seq(self, min_pages=4):
-        """Sequence long enough for SWA prefetch (one full window + 1)."""
-        num_pages = min_pages
-        if self.cfg.has_swa:
-            sw_pages = (
-                self.cfg.sliding_window_size + self.cfg.page_size - 1
-            ) // self.cfg.page_size
-            num_pages = max(num_pages, sw_pages + 1)
-        return self._make_seq(1, num_pages)
-
-    def _drain_buffer_writes(self, cache):
-        pipeline = cache.buffer_pipeline
-        self._pump_hicache_until(
-            cache,
-            lambda: (
-                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
-            ),
-            "buffer backup pipeline did not drain",
-        )
-        self.assertFalse(pipeline.pending_write_queue)
-        self.assertFalse(pipeline._queued_span_refs)
-        self.assertEqual(pipeline.write_backlog_tokens_, 0)
-        self.assertEqual(pipeline.write_staged_tokens_, 0)
-
-    @staticmethod
-    def _writes_by_pool(write_storage, extra):
-        """Key tuples of the KV writes and of the ``extra`` pool's writes
-        among the storage writes recorded by ``write_storage``."""
-        kv_writes, extra_writes = set(), set()
-        for call in write_storage.call_args_list:
-            host_indices, _, hash_value = call.args[:3]
-            transfers = call.kwargs.get("extra_pools") or []
-            names = [transfer.name for transfer in transfers]
-            if hash_value:
-                assert extra not in names
-                kv_writes.add(tuple(hash_value))
-            elif extra in names:
-                # The pool's transfers reach storage as one contiguous span.
-                assert host_indices.numel() == 0 and names == [extra]
-                extra_writes.add(tuple(transfers[0].keys))
-        return kv_writes, extra_writes
-
-    def _assert_masked_full_is_reused(self, storage_dir, seq, live_tail: int):
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
-        cons.enable_storage_metrics = True
-        cons.storage_metrics_collector = mock.Mock()
-
-        # Masked state: nodes born with live FULL under SWA tombstones (a
-        # sibling insert whose SWA ring had slid past the span). live_tail is
-        # how far short of the span end the ring stopped.
-        live_from = len(seq) - live_tail
-        value = self._alloc(cons_alloc, len(seq))
-        cons.insert(
-            InsertParams(
-                key=RadixKey(array("q", seq)),
-                value=value[: len(seq)],
-                component_evicted_seqlens={ComponentType.SWA: live_from},
-            )
-        )
-        masked = _match_prefix(cons, seq)
-        self.assertEqual(masked.device_prefix_len, 0, "unified match not masked")
-        self.assertEqual(masked.full_kv_hit_length, len(seq), "live FULL not resident")
-        masked_full = value[: len(seq)].clone()
-        # Model the real SWA-eviction path: tombstoned positions have their
-        # allocator mapping cleared, while the live trailing portion remains.
-        cons_alloc.free_swa(masked_full[:live_from])
-        self._fill_full_kv(cons_alloc, masked_full, marker=7)
-        masked_kv = self._snapshot_full_kv(cons_alloc, masked_full)
-        tail_full = masked_full[live_from:]
-        tail_swa = cons_alloc.full_to_swa_index_mapping[tail_full].clone()
-        self.assertTrue(bool((tail_swa > 0).all()), "tail SWA not left resident")
-
-        avail0 = self._host_avail_sizes(cons)
-        req_id = CacheRequestHandle(f"masked-overlap-{live_tail}", 0)
-        cons.prefetch_from_storage(
-            req_id, cons.root_node_handle(), array("q", seq), None, None
-        )
-        # A parked SWA-only retry has no FULL suffix, but must re-pin its prefix.
-        with mock.patch.object(cons.swa_kv_pool_host, "alloc", return_value=None):
-            self._pump_hicache_until(
-                cons,
-                lambda: bool(cons.buffer_pipeline.pending_hit_allocs),
-                "SWA-only hit was not parked on the staging shortfall",
-            )
-            self.assertEqual(
-                cons.ongoing_prefetch[req_id].operation.storage_hit_count, 0
-            )
-            self.assertEqual(
-                cons.buffer_pipeline._prefetch_prefix_ctx[req_id][0], list(seq)
-            )
-            self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
-            self.assertEqual(cons.buffer_pipeline.anchor_locked_tokens_, 0)
-        self._pump_hicache_until(
-            cons,
-            lambda: (
-                cons.check_prefetch_progress(req_id)
-                and cons.buffer_pipeline.has_staged(req_id)
-            ),
-            "prefetch did not stage",
-        )
-        self.assertIn(req_id, cons.buffer_pipeline.anchor_locks)
-        cons.pop_prefetch_loaded_tokens(req_id)
-        staged = cons.buffer_pipeline.staged_prefetches[req_id]
-        self.assertEqual(staged.matched_len, len(seq))
-        self.assertEqual(staged.num_tokens, 0, "resident FULL must not be re-fetched")
-        window_tokens = sum(
-            len(t.host_indices)
-            for t in staged.aux_xfers
-            if t.name == PoolName.SWA and t.host_indices is not None
-        )
-        self.assertGreater(window_tokens, live_tail, "window not partly tombstoned")
-        full_avail0 = cons_alloc.full_available_size()
-        mapping_before = cons_alloc.full_to_swa_index_mapping[masked_full].clone()
-        dispatched = {}
-
-        def capture_swa_mapping():
-            load = cons.cache_controller.load_queue[-1]
-            swa_xfer = next(t for t in load.pool_transfers if t.name == PoolName.SWA)
-            dispatched["device"] = swa_xfer.device_indices.clone()
-            full_window = masked_full[-window_tokens:]
-            old_window = mapping_before[-window_tokens:]
-            expected = old_window.clone()
-            expected[old_window <= 0] = swa_xfer.device_indices
-            self.assertTrue(
-                torch.equal(
-                    cons_alloc.full_to_swa_index_mapping[full_window],
-                    expected,
-                ),
-                "admitted request did not fill the missing SWA mappings",
-            )
-
-        spliced, req = self._consume_staged_prefetch(
-            cons,
-            req_id,
-            prefix_len=0,
-            on_dispatched=capture_swa_mapping,
-            return_req=True,
-        )
-        self.assertEqual(int(spliced.numel()), 0)
-        self.assertEqual(req.prefix_len, len(seq), "FULL rematch was lost")
-        self.assertEqual(len(dispatched["device"]), window_tokens - live_tail)
-        self.assertEqual(cons_alloc.full_available_size(), full_avail0)
-        k, v = self._snapshot_full_kv(cons_alloc, masked_full)
-        self.assertTrue(torch.equal(k, masked_kv[0]))
-        self.assertTrue(torch.equal(v, masked_kv[1]))
-        self.assertTrue(
-            torch.equal(cons_alloc.full_to_swa_index_mapping[tail_full], tail_swa),
-            "live tail changed while dropping the staged overlap",
-        )
-        self.assertEqual(cons.buffer_pipeline.ongoing_buffer_load_back, {})
-        self.assertEqual(cons.buffer_pipeline.anchor_locks, {})
-        self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
-        self.assertEqual(self._host_avail_sizes(cons), avail0)
-        after = _match_prefix(cons, seq)
-        self.assertEqual(after.full_kv_hit_length, len(seq))
-        self.assertEqual(after.device_prefix_len, len(seq))
-        # Only the fetched SWA tail made the resident FULL reusable.
-        self.assertEqual((req.storage_hit_start, req.storage_hit_length), (0, len(seq)))
-        cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
-        cons.sanity_check()
-
-    def _assert_sibling_head_is_trimmed(self, storage_dir, seq, window_sized: bool):
-        _, (expected_k, expected_v) = self._produce_buffer_l3(
-            storage_dir, seq, marker=9
-        )
-
-        cons, cons_alloc, cons_rtp = build_fixture(self.cfg)
-        self._init_buffer_hicache(cons, storage_dir)
-        avail0 = self._host_avail_sizes(cons)
-
-        req_id = CacheRequestHandle(f"growth-trim-{len(seq)}", 0)
-        cons.prefetch_from_storage(
-            req_id, cons.root_node_handle(), array("q", seq), None, None
-        )
-        self._pump_hicache_until(
-            cons,
-            lambda: (
-                cons.check_prefetch_progress(req_id)
-                and cons.buffer_pipeline.has_staged(req_id)
-            ),
-            "prefetch did not stage",
-        )
-        cons.pop_prefetch_loaded_tokens(req_id)
-
-        # Sibling publishes the first page of the span while the hold parks.
-        head = seq[: self.cfg.page_size]
-        self._insert(cons, cons_alloc, cons_rtp, head)
-        sib = _match_prefix(cons, head)
-        self.assertEqual(sib.device_prefix_len, len(head))
-        self._fill_full_kv(
-            cons_alloc, cons.path_device_indices(sib.last_device_node), marker=3
-        )
-        head_k, head_v = self._snapshot_full_kv(
-            cons_alloc, cons.path_device_indices(sib.last_device_node)
-        )
-
-        if window_sized:
-            # FULL shrank below a window; the complete SWA staging must survive.
-            staged = cons.buffer_pipeline.staged_prefetches[req_id]
-            aux_max = max(
-                (
-                    t.host_indices.numel()
-                    for t in staged.aux_xfers
-                    if t.host_indices is not None
-                ),
-                default=0,
-            )
-            self.assertGreater(aux_max, len(seq) - len(head))
-
-        # The surfaced host hit is the splice-able tail, not the full span.
-        req = SimpleNamespace(
-            rid=req_id.rid,
-            cache_request_handle=req_id,
-            prefix_len=sib.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=sib.device_prefix_len),
-        )
-        self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
-        self.assertEqual(req.host_hit_length, len(seq) - len(head))
-        self.assertTrue(cons.buffer_pipeline.has_staged(req_id))
-
-        spliced = self._consume_staged_prefetch(cons, req_id, prefix_len=len(head))
-        self.assertEqual(int(spliced.numel()), len(seq) - len(head))
-
-        m = _match_prefix(cons, seq)
-        self.assertEqual(m.device_prefix_len, len(seq))
-        self.assertTrue(
-            torch.equal(
-                cons.path_device_indices(m.last_device_node)[: len(head)],
-                cons.path_device_indices(sib.last_device_node),
-            )
-        )
-        k, v = self._snapshot_full_kv(
-            cons_alloc, cons.path_device_indices(m.last_device_node)[len(head) :]
-        )
-        self.assertTrue(torch.equal(k, expected_k[len(head) :]))
-        self.assertTrue(torch.equal(v, expected_v[len(head) :]))
-        hk, hv = self._snapshot_full_kv(
-            cons_alloc, cons.path_device_indices(m.last_device_node)[: len(head)]
-        )
-        self.assertTrue(torch.equal(hk, head_k))
-        self.assertTrue(torch.equal(hv, head_v))
-
-        # The whole bounce (trimmed head included) frees at the ack.
-        self.assertEqual(self._host_avail_sizes(cons), avail0)
-        self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
-        cons.sanity_check()
-
-    def _patch_tp_prefetch_sync(self, cache, drop_swa: bool):
-        """Fake all_reduce so _reduce_prefetch_ack runs the tp>1 path."""
-        import torch.distributed as dist
-
-        cc = cache.cache_controller
-
-        # Fake _reduce_prefetch_ack to drop SWA pool_hits when drop_swa is True.
-        def fake_reduce(ack):
-            if drop_swa and ack.pool_hits is not None:
-                if PoolName.SWA.value in ack.pool_hits:
-                    ack.pool_hits[PoolName.SWA.value] = 0
-
-        p_reduce = mock.patch.object(
-            cc, "_reduce_prefetch_ack", side_effect=fake_reduce
-        )
-        p_reduce.start()
-        self.addCleanup(p_reduce.stop)
-
-        # Make all_reduce no-op.  The real all_reduce fails in unit tests with tp_world_size=2.
-        p_dist = mock.patch.object(dist, "all_reduce", return_value=None)
-        p_dist.start()
-        self.addCleanup(p_dist.stop)
-
-    def _swa_host_on_path(self, cache, seq):
-        m = _match_prefix(cache, seq)
-        node = m.last_host_node
-        while node != cache.root_node_handle():
-            if _host_value(cache, node, ComponentType.SWA) is not None:
-                return True
-            node = _node_parent(cache, node)
-        return False
-
-    def _l3_produce(self, storage_dir, seq):
-        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
-        self._init_hicache(
-            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
-        )
-        self._insert(prod, prod_alloc, prod_rtp, seq)
-        leaf = _match_prefix(prod, seq).last_device_node
-        self._backup_node(prod, leaf)
-        self._write_path_to_l3(prod, leaf)
-        self._flush_l3_backups(prod)
-
-    def _l3_consumer(self, storage_dir):
-        cons, _, _ = build_fixture(self.cfg)
-        self._init_hicache(
-            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
-        )
-        return cons
-
-    def _consume_prefetch(self, cons, seq, req_id):
-        cons.prefetch_from_storage(
-            req_id, cons.root_node_handle(), array("q", seq), None, None
-        )
-        self._run_prefetch_to_completion(cons, req_id)
-
-    def _setup_swa_tp_prefetch(self):
-        """Skip non-SWA fixtures; produce one full SWA window+1 page to L3.
-
-        Returns (storage_dir, seq) or None when this fixture cannot exercise
-        SWA L3 prefetch (then the caller skips).
-        """
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            self.skipTest("SWA-only fixture required")
-        if self._skip_unsupported_hicache_test():
-            return None
-        sw_pages = (
-            self.cfg.sliding_window_size + self.cfg.page_size - 1
-        ) // self.cfg.page_size
-        seq = self._make_seq(1, sw_pages + 1)
-
-        storage_dir = self._make_storage_dir()
-        self._l3_produce(storage_dir, seq)
-
-        # Baseline (single rank) must actually adopt SWA, else the TP assertions
-        # below would be vacuous -> skip.
-        base = self._l3_consumer(storage_dir)
-        self._consume_prefetch(base, seq, CacheRequestHandle("base", 0))
-        if not self._swa_host_on_path(base, seq):
-            self.skipTest("fixture does not exercise SWA L3 prefetch")
-        return storage_dir, seq
-
-    @_requires_hicache
-    @_requires(
+class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
+    @requires_hicache
+    @requires(
         lambda cfg: not cfg.has_mamba,
         "mamba L3 prefetch is out of scope for this unit fixture",
     )
@@ -999,7 +371,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = _match_prefix(prod, seq)
+        mp = match_prefix(prod, seq)
         prod_leaf = mp.last_device_node
         self._fill_full_kv(
             prod_alloc, prod.path_device_indices(mp.last_device_node), marker=7
@@ -1026,7 +398,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._run_prefetch_to_completion(cons, req_id)
 
         # The full prefix must now be a host hit (loaded from L3).
-        mc = _match_prefix(cons, seq)
+        mc = match_prefix(cons, seq)
         self.assertEqual(mc.host_hit_length, len(seq))
         host_node = mc.last_host_node
         self.assertNotEqual(host_node, cons.root_node_handle())
@@ -1035,7 +407,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # Load the reloaded host prefix back to device and verify KV bytes.
         self._load_back_node(cons, host_node)
         loaded_indices = cons.path_device_indices(
-            _match_prefix(cons, seq).last_device_node
+            match_prefix(cons, seq).last_device_node
         )
         self.assertEqual(len(loaded_indices), len(seq))
         loaded_k, loaded_v = self._snapshot_full_kv(cons_alloc, loaded_indices)
@@ -1043,8 +415,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertTrue(torch.equal(loaded_v, expected_v))
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires(
+    @requires_hicache
+    @requires(
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
@@ -1077,7 +449,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = _match_prefix(prod, seq)
+        mp = match_prefix(prod, seq)
         prod_leaf = mp.last_device_node
         self._backup_node(prod, prod_leaf)
         self._write_path_to_l3(prod, prod_leaf)
@@ -1198,8 +570,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires(
+    @requires_hicache
+    @requires(
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
@@ -1232,7 +604,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             prefetch_threshold=1,
         )
         self._insert(prod, prod_alloc, prod_rtp, seq)
-        mp = _match_prefix(prod, seq)
+        mp = match_prefix(prod, seq)
         prod_leaf = mp.last_device_node
         self._backup_node(prod, prod_leaf)
         self._write_path_to_l3(prod, prod_leaf)
@@ -1323,8 +695,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
     # Buffer-only host memory mode (host = transient staging, L3 = cache)
     # ================================================================
 
-    @_requires_hicache
-    @_requires_swa
+    @requires_hicache
+    @requires_swa
     def test_buffer_only_swa_tail_only_backups(self):
         """Tail-only backups: SWA reaches storage as the window ending at
         each node, a hit falls back to the last node end whose window is
@@ -1352,7 +724,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self._insert(cache, allocator, req_to_token_pool, seq[: end_pages * page])
 
         def chain_pages(key):
-            leaf = _match_prefix(cache, key).last_device_node
+            leaf = match_prefix(cache, key).last_device_node
             hashes: list[str] = []
             ends: list[int] = []
             for node in self._path_chain(cache, leaf):
@@ -1440,7 +812,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self._run_prefetch_to_completion(cons, handle)
         self.assertEqual(
-            _match_prefix(cons, seq).device_prefix_len,
+            match_prefix(cons, seq).device_prefix_len,
             len(seq),
         )
 
@@ -1471,7 +843,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cache.sanity_check()
         cons.sanity_check()
 
-    @_requires_hicache
+    @requires_hicache
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
         -> free. Staging and locks fully released, pages stored under every
@@ -1486,12 +858,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         seq_ab = seq_a + self._make_seq(500, 2)
         self._insert(cache, allocator, req_to_token_pool, seq_a)
         self._insert(cache, allocator, req_to_token_pool, seq_ab)
-        leaf = _match_prefix(cache, seq_ab).last_device_node
+        leaf = match_prefix(cache, seq_ab).last_device_node
         chain = self._path_chain(cache, leaf)
 
         pipeline = cache.buffer_pipeline
         controller = cache.cache_controller
-        _write_backup(cache, leaf)
+        write_backup(cache, leaf)
         # One intent per pool of every node on the path.
         intents = list(pipeline.pending_write_queue)
         node_ids = sorted({intent.snapshot.node_id for intent in intents})
@@ -1550,12 +922,16 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # GPU completion alone must not release any entry's device lock.
         ack.finish_event.synchronize()
         for node_id in node_ids:
-            self.assertGreater(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertGreater(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
         cache.writing_check(finish_count=1)
         self.assertFalse(pipeline.ongoing_write_through)
         self.assertEqual(len(pipeline.ongoing_backup), len(intents))
         for node_id in node_ids:
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
         # Each storage write still owns its staging until its separate ACK.
         self.assertEqual(self._host_avail_sizes(cache), staged_avail)
         self._pump_hicache_until(
@@ -1566,7 +942,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             "merged buffer backup did not drain every storage write",
         )
         self.assertFalse(cache.tree_core.is_backuped(leaf))
-        self.assertEqual(_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
+        self.assertEqual(node_device_lock_ref(cache, leaf, ComponentType.FULL), 0)
         self.assertEqual(self._host_avail_sizes(cache), avail0)
         self.assertEqual(cache.buffer_pipeline.write_backlog_tokens_, 0)
         page_hashes = self._all_page_hashes(cache, leaf)
@@ -1574,7 +950,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self._storage_exists_count(
                 cache,
                 page_hashes,
-                _aux_storage_key_transfers(cache, leaf),
+                aux_storage_key_transfers(cache, leaf),
             ),
             len(page_hashes),
         )
@@ -1584,21 +960,21 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                     cache.tree_core.get_hash_values(n)
                 )
             )
-            for transfer in _aux_storage_key_transfers(cache, n) or ():
+            for transfer in aux_storage_key_transfers(cache, n) or ():
                 self.assertTrue(
                     cache.storage_existence_cache.pool(transfer.name).contains_all(
                         transfer.keys
                     )
                 )
         # Re-hit absorbed when every pool is believed present.
-        _write_backup(cache, leaf)
+        write_backup(cache, leaf)
         self.assertNotIn(leaf, cache.buffer_pipeline.inflight_backup_node_ids)
 
         if self.cfg.has_swa:
             # Only the SWA window dropped: the next insert queues the SWA pool
             # alone. A private SWA arena's write proceeds even with FULL staging
             # at the live cap (shared or anchor-aliased layouts keep the gate).
-            swa_transfer = _aux_storage_key_transfers(cache, leaf)[0]
+            swa_transfer = aux_storage_key_transfers(cache, leaf)[0]
             cache.storage_existence_cache.pool(PoolName.SWA).invalidate_beyond(
                 swa_transfer.keys, keep_pages=0
             )
@@ -1675,7 +1051,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self.assertEqual(self._host_avail_sizes(cache), avail0)
         cache.sanity_check()
 
-    @_requires_hicache
+    @requires_hicache
     def test_buffer_only_split_intent_writes_every_piece(self):
         """Repeated splits preserve every pool's write once, parents first."""
         storage_dir = self._make_storage_dir()
@@ -1686,18 +1062,18 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         seq = self._buffer_swa_seq(min_pages=4)
         self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = _match_prefix(cache, seq).last_device_node
+        leaf = match_prefix(cache, seq).last_device_node
         chain = self._path_chain(cache, leaf)
         span_hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
-        aux_keys = _aux_storage_key_transfers(cache, leaf)
-        _write_backup(cache, leaf)
+        aux_keys = aux_storage_key_transfers(cache, leaf)
+        write_backup(cache, leaf)
         expected_keys = [
             (i.pool, key) for i in pipeline.pending_write_queue for key in i.keys
         ]
         # SWA may already have split the leaf at its window boundary.
         end = len(seq)
         for node in reversed(chain):
-            node_len = _node_key_length(cache, node)
+            node_len = node_key_length(cache, node)
             if node_len >= 3 * ps:
                 break
             end -= node_len
@@ -1711,8 +1087,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                 req_to_token_pool,
                 seq[:split_at] + self._make_seq(9000, 2),
             )
-            self.assertEqual(_node_key_length(cache, node), end - split_at)
-            _write_backup(cache, _node_parent(cache, node))
+            self.assertEqual(node_key_length(cache, node), end - split_at)
+            write_backup(cache, node_parent(cache, node))
 
         pipeline._refresh_pending_backup_intents()
         kv_order = [
@@ -1732,7 +1108,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         cache.sanity_check()
 
-    @_requires(
+    @requires(
         lambda cfg: cfg.components == (ComponentType.FULL,),
         "only FULL-only caches split the leaf at the prompt",
     )
@@ -1761,17 +1137,17 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         req.extra_key = None
         finish_req(cache, req, kv_len)
 
-        leaf = _match_prefix(cache, prompt + output).last_device_node
+        leaf = match_prefix(cache, prompt + output).last_device_node
         chain = self._path_chain(cache, leaf)
         self.assertEqual(
-            [_node_key_length(cache, n) for n in chain], [len(prompt), len(output)]
+            [node_key_length(cache, n) for n in chain], [len(prompt), len(output)]
         )
         self._drain_buffer_writes(cache)
         hashes = [h for n in chain for h in cache.tree_core.get_hash_values(n)]
         self.assertEqual(self._storage_exists_count(cache, hashes), len(hashes))
         cache.sanity_check()
 
-    @_requires_hicache
+    @requires_hicache
     def test_buffer_only_writes_component_pools_independently(self):
         """A component's own pool (aliased host entry, per-pool keys,
         BACKUP_HOST transfers) is written, believed and re-written
@@ -1781,18 +1157,18 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: _ExtraPoolFullComponent},
+            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
-        extra = _ExtraPoolFullComponent.EXTRA_POOL
+        extra = ExtraPoolFullComponent.EXTRA_POOL
         controller = cache.cache_controller
         self.assertIn(extra, controller.mem_pool_host.entry_map)
         avail0 = self._host_avail_sizes(cache)
 
         seq = self._buffer_swa_seq()
         self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = _match_prefix(cache, seq).last_device_node
+        leaf = match_prefix(cache, seq).last_device_node
         chain = self._path_chain(cache, leaf)
         pipeline = cache.buffer_pipeline
         expected_intents = []
@@ -1815,7 +1191,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         with mock.patch.object(
             controller, "write_storage", wraps=controller.write_storage
         ) as write_storage:
-            _write_backup(cache, leaf)
+            write_backup(cache, leaf)
             self.assertEqual(
                 [
                     (intent.snapshot.node_id, intent.pool)
@@ -1910,7 +1286,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
 
-    @_requires_hicache
+    @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
         """Read path end to end: prefetch -> staged (host bounce only,
         nothing device-side, unmatchable, stable readiness, counters fed) ->
@@ -1954,7 +1330,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertNotEqual(self._host_avail_sizes(cons), avail0)
         self.assertEqual(cons.token_to_kv_pool_allocator.available_size(), dev_avail0)
         self.assertEqual(
-            len(cons.path_device_indices(_match_prefix(cons, seq).last_device_node)),
+            len(cons.path_device_indices(match_prefix(cons, seq).last_device_node)),
             0,
         )
         self.assertTrue(cons.check_prefetch_progress(req_id))
@@ -1996,7 +1372,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self.assertEqual(spliced_len, len(seq))
         cons.ready_to_load_host_cache()
-        m = _match_prefix(cons, seq)
+        m = match_prefix(cons, seq)
         self.assertEqual(
             (m.device_prefix_len, m.last_device_node), (len(seq), spliced_node)
         )
@@ -2011,13 +1387,13 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             ),
             "load-back ack did not free the bounce",
         )
-        mc = _match_prefix(cons, seq)
+        mc = match_prefix(cons, seq)
         self.assertEqual(mc.host_hit_length, 0)
         self.assertEqual(mc.device_prefix_len, len(seq))
         leaf = mc.last_device_node
         for cur in self._path_chain(cons, leaf):
             for component_type in cons.tree_components:
-                self.assertIsNone(_host_value(cons, cur, component_type))
+                self.assertIsNone(node_host_value(cons, cur, component_type))
         self.assertTrue(
             cons.storage_existence_cache.pool(PoolName.KV).contains_all(
                 self._all_page_hashes(cons, leaf)
@@ -2025,7 +1401,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         # The fetch is evidence for every pool it delivered, so the
         # consumer's own re-write of the span is skipped pool by pool.
-        for transfer in _aux_storage_key_transfers(cons, leaf) or ():
+        for transfer in aux_storage_key_transfers(cons, leaf) or ():
             self.assertTrue(
                 cons.storage_existence_cache.pool(transfer.name).contains_all(
                     transfer.keys
@@ -2054,8 +1430,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires(
+    @requires_hicache
+    @requires(
         lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
         "one FULL page_size=4 fixture covers namespace routing",
     )
@@ -2148,7 +1524,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             )
         )
         anchor = prefix_match.last_device_node
-        lock_ref = _device_lock_ref(cons2, anchor, ComponentType.FULL)
+        lock_ref = node_device_lock_ref(cons2, anchor, ComponentType.FULL)
         anchored_req = CacheRequestHandle("salted-mid-tree-prefetch", 0)
         cons2.prefetch_from_storage(
             anchored_req,
@@ -2171,7 +1547,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self.assertIn(anchored_req, cons2.buffer_pipeline.anchor_locks)
         self.assertEqual(
-            _device_lock_ref(cons2, anchor, ComponentType.FULL), lock_ref + 1
+            node_device_lock_ref(cons2, anchor, ComponentType.FULL), lock_ref + 1
         )
         self._consume_staged_prefetch(
             cons2,
@@ -2183,14 +1559,16 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self.assertNotIn(anchored_req, cons2.buffer_pipeline.anchor_locks)
         self.assertEqual(cons2.buffer_pipeline.anchor_locked_tokens_, 0)
-        self.assertEqual(_device_lock_ref(cons2, anchor, ComponentType.FULL), lock_ref)
+        self.assertEqual(
+            node_device_lock_ref(cons2, anchor, ComponentType.FULL), lock_ref
+        )
         self.assertEqual(
             cons2.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, len(seq)
         )
         cons2.sanity_check()
 
-    @_requires_hicache
-    @_requires_ps1_window4
+    @requires_hicache
+    @requires_ps1_window4
     def test_buffer_only_storage_prefetch_miss_marker_and_retry(self):
         """A too-early storage query misses; the miss must arm the retry
         marker exactly once, a re-issued check must serve once the content
@@ -2275,8 +1653,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertNotIn("fully-matched", cons.storage_prefetch_retries._pending)
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires_ps1_window4
+    @requires_hicache
+    @requires_ps1_window4
     def test_buffer_only_anchor_lock_cap_clamped_by_context_headroom(self):
         """Deadlock invariant: cap <= pool - context_length (floor 0), so
         pinned anchors always leave room to admit the largest request."""
@@ -2302,8 +1680,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._init_buffer_hicache(cache2, storage_dir, context_length=pool)
         self.assertEqual(cache2.buffer_pipeline.anchor_lock_cap_tokens, 0)
 
-    @_requires_hicache
-    @_requires(lambda cfg: cfg.has_swa, "SWA-specific admission accounting")
+    @requires_hicache
+    @requires(lambda cfg: cfg.has_swa, "SWA-specific admission accounting")
     def test_buffer_load_back_swa_window_charged_at_admission(self):
         """Admission contract: a request the SWA budget gate accepts must be
         allocatable at batch time (estimate_swa_kv_tokens: "an admitted request
@@ -2421,7 +1799,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             # Rejection must come from the surfaced window charge.
             self.assertGreaterEqual(surfaced_swa_hit, window)
 
-    @_requires_hicache
+    @requires_hicache
     def test_buffer_only_load_back_drops_on_sibling_published_span(self):
         """Queued-UAF regression: a sibling publishes the staged span between
         staging and consumption; the live pre-check must drop the hold before
@@ -2453,7 +1831,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         # Sibling publishes the identical span (live FULL + SWA).
         self._insert(cons, cons_alloc, cons_rtp, seq)
-        sib = _match_prefix(cons, seq)
+        sib = match_prefix(cons, seq)
         self.assertEqual(sib.device_prefix_len, len(seq))
         self._fill_full_kv(
             cons_alloc, cons.path_device_indices(sib.last_device_node), marker=3
@@ -2474,7 +1852,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         self.assertEqual(self._host_avail_sizes(cons), avail0)
-        m = _match_prefix(cons, seq)
+        m = match_prefix(cons, seq)
         self.assertTrue(
             torch.equal(
                 cons.path_device_indices(m.last_device_node),
@@ -2491,8 +1869,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
+    @requires_hicache
+    @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
         """FULL-only rematch keeps resident FULL and repairs missing SWA rows."""
         storage_dir = self._make_storage_dir()
@@ -2510,8 +1888,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                     storage_dir, seq, live_tail=self.cfg.page_size
                 )
 
-    @_requires_hicache
-    @_requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
+    @requires_hicache
+    @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
     def test_buffer_only_load_back_reuses_partial_masked_full(self):
         """FULL-only rematch reuses a resident head and fetches only its tail."""
         page_size = self.cfg.page_size
@@ -2534,7 +1912,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                 component_evicted_seqlens={ComponentType.SWA: len(sibling)},
             )
         )
-        live = _match_prefix(cons, seq)
+        live = match_prefix(cons, seq)
         self.assertEqual(live.device_prefix_len, 0, "unified match not masked")
         self.assertEqual(live.full_kv_hit_length, split_at, "FULL run not partial")
         head_full = value[:split_at].clone()
@@ -2588,8 +1966,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertTrue(torch.equal(full_indices[split_at:], spliced))
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
+    @requires_hicache
+    @requires(lambda cfg: cfg.has_swa, "masked overlap requires an SWA component")
     def test_buffer_only_masked_head_is_not_evicted_for_tail_load(self):
         """Loading past a masked FULL head preserves its existing ownership."""
         page_size = self.cfg.page_size
@@ -2647,11 +2025,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
 
         self.assertEqual(accounted0, full_accounted(), "a FULL page is free and owned")
         # The resident FULL head was reused rather than evicted for the tail.
-        live = _match_prefix(cons, seq)
+        live = match_prefix(cons, seq)
         self.assertEqual(live.full_kv_hit_length, split_at)
         cons.sanity_check()
 
-    @_requires_hicache
+    @requires_hicache
     def test_buffer_only_load_back_fail_stops_on_post_check_overlap(self):
         """If the tree mutates between the pre-check and the insert (simulated
         via cc.load), consumption must fail-stop rather than hand out slots a
@@ -2704,8 +2082,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
                     )
                 )
 
-    @_requires_hicache
-    @_requires_ps1_window4
+    @requires_hicache
+    @requires_ps1_window4
     def test_buffer_only_load_back_trims_head_published_by_sibling(self):
         """Growth-waste regression: a sibling publishing the span HEAD after
         enqueue used to invalidate the whole staged fetch at consumption
@@ -2732,8 +2110,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             )
             self._assert_sibling_head_is_trimmed(storage_dir, seq, window_sized=True)
 
-    @_requires_hicache
-    @_requires_ps1_window4
+    @requires_hicache
+    @requires_ps1_window4
     def test_buffer_only_plan_frees_covered_hold(self):
         """A hold whose whole span became device-resident can never splice:
         the surface-time plan must report (0, 0) and free it (bounce, anchor
@@ -2766,7 +2144,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         cons.pop_prefetch_loaded_tokens(req_id)
         self._insert(cons, cons_alloc, cons_rtp, seq)
 
-        live = _match_prefix(cons, seq)
+        live = match_prefix(cons, seq)
         req = mock.Mock(
             rid=req_id.rid,
             cache_request_handle=req_id,
@@ -2784,8 +2162,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertIsNone(req.staged_prefetch_plan)
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires_ps1_window4
+    @requires_hicache
+    @requires_ps1_window4
     def test_buffer_only_hit_commit_cancels_device_covered_fetch(self):
         """A sibling that publishes the span while the storage hit query is
         in flight makes the fetch unconsumable; the IO-commit gate must
@@ -2833,8 +2211,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(self._host_avail_sizes(cons), avail0)
         cons.sanity_check()
 
-    @_requires_hicache
-    @_requires_swa
+    @requires_hicache
+    @requires_swa
     def test_buffer_only_swa_window_semantics(self):
         """Root and mid-tree requests and hits share a complete-window minimum."""
         window = self.cfg.sliding_window_size
@@ -2875,7 +2253,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self._init_buffer_hicache(cons2, storage_dir)
             avail2 = self._host_avail_sizes(cons2)
             self._insert(cons2, cons2_alloc, cons2_rtp, seq_a)
-            m = _match_prefix(cons2, seq_a)
+            m = match_prefix(cons2, seq_a)
             last_hash = cons2.get_last_hash_value(m.last_device_node)
             cons2.prefetch_from_storage(
                 CacheRequestHandle("subwin-req", 0),
@@ -2928,7 +2306,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self.assertEqual(
                 len(
                     cons2.path_device_indices(
-                        _match_prefix(cons2, seq_ab).last_device_node
+                        match_prefix(cons2, seq_ab).last_device_node
                     )
                 ),
                 len(seq_ab),
@@ -2958,7 +2336,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(operation.storage_hit_count, len(stored))
         self.assertEqual(
             len(
-                cons3.path_device_indices(_match_prefix(cons3, stored).last_device_node)
+                cons3.path_device_indices(match_prefix(cons3, stored).last_device_node)
             ),
             0,
             "sub-window hit should not be loaded",
@@ -2986,7 +2364,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
-        m = _match_prefix(cons, seq)
+        m = match_prefix(cons, seq)
         self.assertEqual(m.host_hit_length, 0)
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
@@ -3006,7 +2384,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._patch_tp_prefetch_sync(cons, drop_swa=False)  # peer == local
         self._consume_prefetch(cons, seq, CacheRequestHandle("keep", 0))
 
-        m = _match_prefix(cons, seq)
+        m = match_prefix(cons, seq)
         self.assertEqual(m.host_hit_length, len(seq))
         self.assertTrue(
             self._swa_host_on_path(cons, seq),
@@ -3029,14 +2407,14 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
         self.assertEqual(
-            _match_prefix(cons, seq).host_hit_length,
+            match_prefix(cons, seq).host_hit_length,
             0,
         )
         # Whole window dropped -> its host buffer is fully released back.
         cons.drain_storage_control_queues()  # Drain the release queue.
         self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
 
-    @_requires_full_swa_ps1
+    @requires_full_swa_ps1
     def test_prepare_prefetch_swa(self):
         cache, _, _ = self._build_hicache_fixture()
         sw = cache.sliding_window_size
@@ -3076,7 +2454,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         self.assertEqual(cache.swa_kv_pool_host.available_size(), avail)
         self.assertEqual(int(swa.alloc_prefetch_staging(sw).numel()), sw)
 
-    @_requires_full_swa_ps1
+    @requires_full_swa_ps1
     def test_prepare_prefetch_swa_pool_exhausted(self):
         cache, _, _ = self._build_hicache_fixture()
         sw = cache.sliding_window_size
@@ -3090,7 +2468,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         # the retry must evict the SWA host pool, not the default (FULL) one
         evict_host.assert_called_once_with(sw, ComponentType.SWA)
 
-    @_requires_full_mamba_ps1
+    @requires_full_mamba_ps1
     def test_prepare_prefetch_mamba(self):
         cache, _, _ = self._build_hicache_fixture()
         # mamba always participates with exactly one state slot
@@ -3103,8 +2481,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
         )
         self.assertEqual(int(mamba.alloc_prefetch_staging(1).numel()), 1)
 
-    @_requires_swa_only
-    @_requires_hicache
+    @requires_swa_only
+    @requires_hicache
     def test_buffer_only_hit_parks_on_swa_staging_shortfall(self):
         """A hit whose SWA window cannot be staged parks whole and launches
         once the pool frees. It is never forfeited, and it never launches with
@@ -3147,12 +2525,12 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheFixtures):
             self.assertEqual(pool.available_size(), avail)
         self._run_prefetch_to_completion(cons, CacheRequestHandle("r", 0))
         cons.drain_storage_control_queues()
-        m = _match_prefix(cons, seq)
+        m = match_prefix(cons, seq)
         self.assertEqual(m.device_prefix_len, len(seq))
         cons.sanity_check()
 
 
-_define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
+define_config_test_classes(UnifiedRadixCacheStorageSuite, globals())
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
@@ -3165,7 +2543,7 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         prefix = [1, 2]
         self._insert(cache, allocator, req_to_token_pool, prefix)
-        anchor = _match_prefix(cache, prefix).last_device_node
+        anchor = match_prefix(cache, prefix).last_device_node
 
         cache.tree_core.is_write_back = True
         suffix = [3, 4]
@@ -3199,7 +2577,7 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
         )
 
         self.assertIsNone(
-            _host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
+            node_host_value(cache, insert_result.inserted_host_node, ComponentType.SWA)
         )
         self.assertEqual(len(actions), 1)
         self.assertIsInstance(actions[0], FreeComponentHostSlot)
@@ -3279,7 +2657,9 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         self.assertEqual(cache.ongoing_prefetch, {})
 
 
-class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
+class TestUnifiedRadixPrefetchCorruption(
+    UnifiedRadixPrefetchCorruptionFixtures, CustomTestCase
+):
     """Prefetch must not hang a backed-up host child under an un-backed-up parent.
 
     Under write-through that broke the "child backed up => parent backed up"
@@ -3294,66 +2674,6 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         kv_size=4096,
         max_context_len=4096,
     )
-
-    def _init_hicache(self, cache, *, write_policy="write_through"):
-        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
-
-        orig_get_mha_host_pool_cls = assembler.get_mha_host_pool_cls
-
-        def get_mha_host_pool_cls_wrapper(device_pool):
-            host_pool_cls = orig_get_mha_host_pool_cls(device_pool)
-
-            def kv_host_pool_wrapper(*args, **kwargs):
-                kwargs["pin_memory"] = False
-                return host_pool_cls(*args, **kwargs)
-
-            return kv_host_pool_wrapper
-
-        patcher = mock.patch.object(
-            assembler,
-            "get_mha_host_pool_cls",
-            side_effect=get_mha_host_pool_cls_wrapper,
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-        server_args = ServerArgs(
-            model_path="dummy",
-            page_size=self.cfg.page_size,
-            hicache_io_backend="direct",
-            hicache_mem_layout="page_first_direct",
-            hicache_write_policy=write_policy,
-        )
-        server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
-        set_global_server_args_for_scheduler(server_args)
-        cache.init_hicache(server_args, cache.cache_init_params)
-        self.addCleanup(_drop_hicache_atexit_pin, cache)
-        cache.write_through_threshold = 1 << 30
-        cache.load_back_threshold = 0
-
-    def _insert_device(self, cache, allocator, ids):
-        """Insert a device-only chain (no auto-backup) and return its leaf id."""
-        key = RadixKey(array("q", ids)).page_aligned(self.ps)
-        val = allocator.alloc(len(key))
-        self.assertIsNotNone(val)
-        val = val.to(dtype=torch.int64)
-        cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0))
-        return cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
-
-    def _attach_host_child(self, cache, parent_id, start_token):
-        """Mimic a prefetch commit: hang a backed-up host chain under `parent_id`."""
-        ps = self.ps
-        child_key = RadixKey(
-            array("q", list(range(start_token, start_token + 2 * ps)))
-        ).page_aligned(ps)
-        host_idx = cache.cache_controller.mem_pool_host.alloc(len(child_key))
-        self.assertIsNotNone(host_idx, "host pool alloc failed")
-        host_idx = host_idx.to(dtype=torch.int64)
-        hashes = [f"h{i}" for i in range(len(child_key) // ps)]
-        res = cache.tree_core.insert_host(parent_id, child_key, host_idx, hashes)
-        if res.host_insert_dropped:
-            cache.cache_controller.mem_pool_host.free(host_idx)
-        return res.inserted_host_node
 
     def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
         """Write-through: a refill under an un-backed-up parent is dropped."""
@@ -3523,7 +2843,9 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
 
-class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
+class TestUnifiedRadixCacheStorageAttachBackfill(
+    UnifiedRadixCacheStorageAttachBackfillFixtures, CustomTestCase
+):
     """Enabling a storage backend must hash nodes that predate it.
 
     Page hashes chain off the parent's last hash, so a node hashed against an
@@ -3541,32 +2863,6 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
 
     prefix_tokens = array("q", [1, 2, 3, 4, 5, 6, 7, 8])
     suffix_tokens = array("q", [9, 10, 11, 12])
-
-    def _build_two_level_tree(self, *, storage_on_from_the_start: bool):
-        """A parent node plus a child extending it, built with storage on or off."""
-        cache, allocator, _ = build_fixture(self.cfg)
-        cache.enable_storage = storage_on_from_the_start
-        for tokens in (self.prefix_tokens, self.prefix_tokens + self.suffix_tokens):
-            value = allocator.alloc(len(tokens))
-            self.assertIsNotNone(value)
-            cache.insert(InsertParams(key=RadixKey(tokens), value=value))
-        return cache
-
-    @staticmethod
-    def _hashes_by_token_ids(cache):
-        """Every non-root node's token ids mapped to its hash chain."""
-        hashes = {}
-        root = cache.root_node_handle()
-        for node in cache.tree_core.get_all_node_ids():
-            if node == root:
-                continue
-            hash_values = cache.tree_core.get_hash_values(node)
-            hashes[tuple(_node_token_ids(cache, node))] = (
-                hash_values
-                if cache.tree_core.get_last_hash_value(node) is not None
-                else None
-            )
-        return hashes
 
     def test_backfill_reproduces_hashing_from_the_start(self):
         expected = self._hashes_by_token_ids(
@@ -3603,7 +2899,7 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
 
         self.assertEqual(snapshot.key.token_ids, self.suffix_tokens)
         snapshot.key.token_ids[0] = -1
-        self.assertEqual(_node_token_ids(cache, child), list(self.suffix_tokens))
+        self.assertEqual(node_token_ids(cache, child), list(self.suffix_tokens))
 
         parent_hashes = cache.tree_core.get_hash_values(parent)
         replacement_hashes = ["a" * 64] * len(parent_hashes)
@@ -3633,7 +2929,7 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
         )
 
 
-class TestAnchorLockOutcomePolicy(CustomTestCase):
+class TestAnchorLockOutcomePolicy(AnchorLockOutcomePolicyFixtures, CustomTestCase):
     """try_lock_anchor finds the anchor by re-matching the live tree (no
     carried node id to go stale): prefix intact -> lock the live node;
     prefix shrunk -> anchor_lost so the caller re-plans; over the whole cap
@@ -3642,28 +2938,6 @@ class TestAnchorLockOutcomePolicy(CustomTestCase):
 
     _REQ = CacheRequestHandle("req-1", 0)
     _PREFIX = list(range(100, 100 + 8))
-
-    def _make_pipeline(self, cache, cap_tokens=10_000):
-        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline.anchor_locks = {}
-        pipeline.anchor_locked_tokens_ = 0
-        pipeline.anchor_lock_cap_tokens = cap_tokens
-        pipeline._anchor_lock_cap_skips = 0
-        pipeline._prefetch_prefix_ctx = {self._REQ: (list(self._PREFIX), None, None)}
-        pipeline._cache = cache
-        return pipeline
-
-    def _make_cache(self, live_match_len, pinned_len=None):
-        cache = mock.MagicMock()
-        cache.tree_core.is_eagle = False
-        cache.tree_core.match_full_device_prefix.return_value = (
-            live_match_len,
-            99,
-            live_match_len if pinned_len is None else pinned_len,
-        )
-        return cache
 
     def test_intact_prefix_locks_live_node(self):
         cache = self._make_cache(live_match_len=len(self._PREFIX))
