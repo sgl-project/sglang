@@ -1425,7 +1425,35 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if input_scale is not None:
-        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        if input_scale.dtype == torch.int32:
+            # Packed activation scales cannot go through the Triton fallback.
+            # Accept exactly the group-128, column-major TMA layout we produce.
+            if not (
+                deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and input.ndim == 2
+                and input.is_contiguous()
+                and input.is_cuda
+                and weight.ndim == 2
+                and input.shape[1] == weight.shape[1]
+                and input.device == weight.device
+                and input_scale.device == input.device
+                and weight_scale.device == input.device
+                and input_scale.shape
+                == (input.shape[0], ceil_div(input.shape[1] // 128, 4))
+                and input_scale.stride() == (1, ceil_align(input.shape[0], 4))
+                and input.data_ptr() % 16 == 0
+                and input_scale.data_ptr() % 16 == 0
+                and list(block_size) == [128, 128]
+                and _deepgemm_block_fp8_supported(
+                    weight.shape, block_size, torch.bfloat16
+                )
+            ):
+                raise ValueError(
+                    "Pre-quantized DeepGEMM block-FP8 input requires supported "
+                    "[128, 128] weights and TMA-aligned, column-major packed UE8M0 scales"
+                )
+        else:
+            assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         assert input.dtype == torch.float8_e4m3fn
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
@@ -1451,8 +1479,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         )
 
     if input_scale is not None:
-        # Pre-quantized activations retain their per-token group size and
-        # fp32 scales. DeepGEMM aligns scale storage for TMA when needed.
+        # Pre-quantized activations retain their group size and scale format.
+        # DeepGEMM aligns fp32 scale storage for TMA when needed.
         input_2d = input.view(-1, input.shape[-1])
         output = w8a8_block_fp8_matmul_deepgemm(
             input_2d,
