@@ -502,6 +502,10 @@ class DllmManager:
 
         return aborted_reqs
 
+    def pop_all_reqs(self) -> List[Req]:
+        """Remove and return every request in both queues once."""
+        return self.pop_aborted_reqs(abort_all=True, rid="")
+
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""
         for req in self.staging_queue:
