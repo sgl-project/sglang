@@ -43,6 +43,7 @@ class TestHiCacheSharedGraphGate(CustomTestCase):
         counter.events = [SimpleNamespace(finish_event=event) for _ in range(3)]
 
         runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+        runner.model = SimpleNamespace()
         runner.device = "cuda"
         runner.attn_backend = None
         runner.token_to_kv_pool = SimpleNamespace(layer_transfer_counter=counter)

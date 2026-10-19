@@ -34,7 +34,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -193,7 +193,7 @@ def build_kv_host_pool(
         if not use_mla:
             raise ValueError("Shared host restore requires an MLA/DSA host pool.")
         kwargs["shared_memory_group"] = shared_memory_group
-    if is_dummy:
+    if is_dummy and not use_mla:
         kwargs["is_dummy"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
@@ -216,6 +216,24 @@ def build_kv_host_pool(
                 else kv_pool.layer_num
             ),
         )
+        if is_dummy:
+            # Allocator-only MLA hosts take geometry rather than device buffers.
+            # Packed drafts still count toward logical capacity, but must not
+            # retain physical draft buffers on a non-owner rank.
+            draft_layer_num = len(kwargs["draft_buffer_infos"])
+            width = override_kv_cache_dim or host_input.kv_cache_dim
+            host_input = MLAHostAllocation(
+                dtype=host_input.dtype,
+                kv_lora_rank=host_input.kv_lora_rank,
+                qk_rope_head_dim=host_input.qk_rope_head_dim,
+                kv_cache_dim=width,
+                size_per_token=width
+                * host_input.dtype.itemsize
+                * (kwargs["target_layer_num"] + draft_layer_num),
+                draft_layer_num=draft_layer_num,
+                packed_fp8=host_input.packed_fp8,
+            )
+            kwargs["draft_buffer_infos"] = ()
     else:
         kwargs.update(mha_kwargs)
     parallel = get_parallel()

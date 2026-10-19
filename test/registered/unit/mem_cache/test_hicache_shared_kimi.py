@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.pool_host import base as host_base
@@ -53,10 +54,25 @@ class TestSharedKimiBuilder(CustomTestCase):
         kv_host = host("kv", is_shared=shared)
         state_host = host("state", is_shared=False)
         kv_pool = SimpleNamespace(layer_num=2, page_size=64)
-        state_pool = SimpleNamespace(layer_num=6, size=8)
+        state_info = DevicePoolInfo(
+            pool_name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            layer_ids=(0, 1, 2, 4, 5, 6),
+            buffer_info=MambaStateBufferInfo(
+                temporal=torch.zeros((6, 9, 2, 4, 4), dtype=torch.float32),
+                conv=(torch.zeros((6, 9, 3, 32), dtype=torch.bfloat16),),
+            ),
+        )
+        state_pool = SimpleNamespace(
+            layer_num=6,
+            size=8,
+            host_capacity_tokens=None,
+            get_device_pool_infos=lambda: (state_info,),
+        )
         params = SimpleNamespace(
             page_size=64,
             mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
             token_to_kv_pool_allocator=object(),
             tp_cache_group=group,
             attn_cp_cache_group=None,
@@ -107,7 +123,7 @@ class TestSharedKimiBuilder(CustomTestCase):
                     decls=(make_kv_pool_decl(kv_pool),),
                     mamba_pool=state_pool,
                     full_layer_mapping={3: 0, 7: 1},
-                    mamba_layer_mapping={0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 6: 5},
+                    start_layer=0,
                     load_cache_event=None,
                     storage_backend=None,
                     use_mla=True,
@@ -179,16 +195,10 @@ class TestSharedKimiBuilder(CustomTestCase):
 
 
 class TestPrivateKDAConstructionRollback(CustomTestCase):
-    def _device_pool(self):
-        return SimpleNamespace(
-            size=8,
-            device="cpu",
-            num_mamba_layers=6,
-            _slot_siblings=(),
-            mamba_cache=SimpleNamespace(
-                temporal=torch.zeros((6, 9, 2, 4, 4), dtype=torch.float32),
-                conv=[torch.zeros((6, 9, 3, 32), dtype=torch.bfloat16)],
-            ),
+    def _buffer_info(self):
+        return MambaStateBufferInfo(
+            temporal=torch.zeros((6, 9, 2, 4, 4), dtype=torch.float32),
+            conv=(torch.zeros((6, 9, 3, 32), dtype=torch.bfloat16),),
         )
 
     def _run_failure(self, *, fail_after_buffers):
@@ -228,9 +238,10 @@ class TestPrivateKDAConstructionRollback(CustomTestCase):
                 )
             with self.assertRaises((MemoryError, RuntimeError)):
                 host_mamba.MambaPoolHost(
-                    self._device_pool(),
+                    self._buffer_info(),
                     host_to_device_ratio=2,
                     host_size=0,
+                    device_capacity=8,
                     pin_memory=True,
                     layout="page_first_direct",
                 )

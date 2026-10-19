@@ -107,6 +107,7 @@ def _run_shared_rank(rank, init_method, with_indexer):
                 **fields,
                 index_head_dim=128,
                 kv_cache_dim=128,
+                index_buf_size=fields["size"],
                 skip_topk_layers=[True, False, False],
             )
         else:
@@ -116,7 +117,11 @@ def _run_shared_rank(rank, init_method, with_indexer):
             ((indices // 64 + rank * 2) % 7) * 64 + indices % 64
         )
         host = _DelayedHostPool(
-            pool,
+            pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
             host_to_device_ratio=2,
             host_size=0,
             page_size=64,

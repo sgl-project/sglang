@@ -141,6 +141,7 @@ def _kimi_rank(rank, init_method):
         params = SimpleNamespace(
             page_size=64,
             mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
             token_to_kv_pool_allocator=allocator,
             req_to_token_pool=req,
             tp_cache_group=cpu_group,
@@ -174,7 +175,7 @@ def _kimi_rank(rank, init_method):
                 decls=hybrid.host_pool_decls(),
                 mamba_pool=state,
                 full_layer_mapping={3: 0, 7: 1},
-                mamba_layer_mapping=req.mamba_map,
+                start_layer=req.start_layer,
                 load_cache_event=threading.Event(),
                 storage_backend=None,
                 use_mla=True,
