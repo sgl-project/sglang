@@ -134,7 +134,7 @@ sgl-router --model-id qwen3 --chat-routing reorg \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
   --policy cache_aware \
   --affinity-mode prefer --cache-affinity-min-match-ratio 0.2 \
-  --max-waiting-requests 16 --max-in-flight 56
+  --max-waiting-requests 16 --max-inflight-requests 56
 ```
 
 - **Engines:** two plain engines; each handles both prefill and decode.
