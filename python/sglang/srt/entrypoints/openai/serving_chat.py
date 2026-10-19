@@ -1608,6 +1608,18 @@ class OpenAIServingChat(OpenAIServingBase):
             # system token for it, so it only gets one when tools need the host.
             if messages[0]["role"] != "system" and (request_tools or not is_dsv41):
                 messages.insert(0, {"role": "system", "content": ""})
+            # dpsk only support json_object, text response_format
+            if request.response_format and request.response_format.type in [
+                "text",
+                "json_schema",
+                "json_object",
+            ]:
+                dpsk_response_format = request.response_format.model_dump(by_alias=True)
+                if dpsk_response_format["type"] == "json_schema":
+                    # convert type from json_schema to json_object to align dpsk official document
+                    # https://api-docs.deepseek.com/zh-cn/api/create-chat-completion
+                    dpsk_response_format["type"] = "json_object"
+                messages[0]["response_format"] = dpsk_response_format
             if request_tools:
                 messages[0]["tools"] = [
                     (
@@ -1617,8 +1629,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     for tool in request_tools
                 ]
-            if request.response_format:
-                messages[0]["response_format"] = request.response_format.model_dump()
 
             # Default encoding (dsv4/dsv41/dsv32)
             if self.chat_encoding_spec == "dsv4":
