@@ -1778,6 +1778,69 @@ class TestGraniteThinkingDetector(CustomTestCase):
         self.assertEqual(normal, "truncated")
 
 
+class TestMuseSparkReasoningParser(CustomTestCase):
+    # Contract: meta-models/Muse-Spark-open-816B-A42B-NVFP4 at
+    # 7ea492f704b13336c1f7dab909c70d9e4a8beabc, tokenizer_config.json's
+    # response_template and chat_template.jinja. Expectations are literal.
+    def _assert_parses(self, text, expected):
+        self.assertEqual(ReasoningParser("muse").parse_non_stream(text), expected)
+        for size in (1, 7, len(text)):
+            with self.subTest(chunk_size=size):
+                parser = ReasoningParser("muse")
+                reasoning, content = "", ""
+                for i in range(0, len(text), size):
+                    thought, normal = parser.parse_stream_chunk(text[i : i + size])
+                    reasoning += thought
+                    content += normal
+                thought, normal = parser.parse_stream_end()
+                self.assertEqual((reasoning + thought, content + normal), expected)
+                self.assertEqual(parser.parse_stream_end(), ("", ""))
+
+    def test_self_channel_is_reasoning_and_user_channel_is_content(self):
+        # Generation starts after the template's <|start|>assistant prefix.
+        for prefix in ("", "<|start|>assistant"):
+            with self.subTest(prefix=prefix):
+                self._assert_parses(
+                    prefix + " to=self<|message|>Let me think.<|eom|>"
+                    "<|start|>assistant to=user<|message|>42.<|eot|>",
+                    ("Let me think.", "42."),
+                )
+
+    def test_user_and_commentary_join_without_protocol_tokens(self):
+        self._assert_parses(
+            " to=commentary<|message|>First update.<|eom|>"
+            "<|start|>assistant to=commentary<|message|>Second update.<|eom|>"
+            "<|start|>assistant to=user<|message|>Final answer.<|eot|>",
+            ("", "First update.Second update.Final answer."),
+        )
+
+    def test_content_accepts_both_message_and_turn_terminators(self):
+        for recipient in ("user", "commentary"):
+            for terminator in ("<|eom|>", "<|eot|>"):
+                with self.subTest(recipient=recipient, terminator=terminator):
+                    self._assert_parses(
+                        f" to={recipient}<|message|>  answer\n{terminator}",
+                        ("", "  answer\n"),
+                    )
+
+    def test_truncated_body_stays_in_its_channel(self):
+        for recipient, expected in (
+            ("self", ("unfinished", "")),
+            ("user", ("", "unfinished")),
+            ("commentary", ("", "unfinished")),
+        ):
+            with self.subTest(recipient=recipient):
+                self._assert_parses(f" to={recipient}<|message|>unfinished", expected)
+
+    def test_atem_example_in_reasoning_is_not_visible_content(self):
+        quoted = '<atem:invoke name="report"></atem:invoke>'
+        self._assert_parses(
+            f" to=self<|message|>Consider {quoted}.<|eom|>"
+            "<|start|>assistant to=user<|message|>No tool needed.<|eot|>",
+            (f"Consider {quoted}.", "No tool needed."),
+        )
+
+
 class TestReasoningParserNames(CustomTestCase):
     def test_matches_registry(self):
         # `server_args` builds the --reasoning-parser choices from this list to

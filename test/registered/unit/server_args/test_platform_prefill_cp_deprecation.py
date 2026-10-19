@@ -98,7 +98,10 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
         cases = (
             ("dsv4.*both phases", dict(prefill_attention_backend="flashinfer")),
             ("support multiple nodes", dict(nnodes=2)),
-            ("bounded-replay", dict(enable_decoder_swa_bounded_replay=True)),
+            (
+                "decoder SWA bounded replay",
+                dict(enable_decoder_swa_bounded_replay=True),
+            ),
             ("two-batch-overlap", dict(enable_two_batch_overlap=True)),
         )
         for regex, overrides in cases:
