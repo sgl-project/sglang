@@ -248,6 +248,10 @@ def test_reclassified_public_entry_points_are_inventoried():
         "moe.shared_expert_gate",
         "memory.adler32",
         "memory.row_compact",
+        "kv_canary.plan.api",
+        "kv_canary.write",
+        "kv_canary.verify",
+        "kv_canary.scatter_req_token_ids",
         "mm.process.image",
         "speculative.row_argmax",
     )
