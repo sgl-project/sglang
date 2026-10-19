@@ -2,6 +2,7 @@
 
 import atexit
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -124,8 +125,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd")
 
 # A dedicated test entry point overrides this without changing the process-wide
 # production backend selection. Direct Python-core tests in this module remain
@@ -153,6 +154,8 @@ class CacheConfig:
 
     # SWA
     sliding_window_size: Optional[int] = None
+    draft_swa_window: int = 0
+    decoder_swa_bounded_replay: bool = False
 
     # Mamba
     enable_mamba_extra_buffer: bool = False
@@ -740,6 +743,8 @@ def build_fixture(
         page_size=cfg.page_size if tree_page_size is None else tree_page_size,
         disable=False,
         sliding_window_size=cfg.sliding_window_size,
+        draft_swa_window=cfg.draft_swa_window,
+        decoder_swa_bounded_replay=cfg.decoder_swa_bounded_replay,
         tree_components=cfg.components,
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
         enable_kv_cache_events=enable_kv_cache_events,
@@ -4352,6 +4357,160 @@ class UnifiedRadixCacheSuite:
             num_pages = max(num_pages, sw_pages + 1)
         return self._make_seq(1, num_pages)
 
+    def test_buffer_only_swa_tail_only_backups(self):
+        """Tail-only backups: SWA reaches storage as the window ending at
+        each node, a hit falls back to the last node end whose window is
+        stored, and a split makes its point restorable once the parent is
+        backed up again."""
+        self._skip_unsupported_hicache_test()
+        if not self.cfg.has_swa:
+            self.skipTest("requires an SWA component")
+        page = self.cfg.page_size
+        sw_pages = (self.cfg.sliding_window_size + page - 1) // page
+        # Nodes longer than two windows (the SWA component may split a leaf
+        # at the window boundary), shorter than the window, and one window.
+        node_pages = [2 * sw_pages + 3, max(sw_pages - 1, 1), sw_pages]
+        total_pages = sum(node_pages)
+        # Each growing insert allocates its whole sequence next to the
+        # resident prefix before the duplicate is released.
+        if 2 * total_pages * page > self.cfg.kv_size:
+            self.skipTest("chain does not fit the device pool")
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        with envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True):
+            self._init_buffer_hicache(cache, storage_dir)
+        seq = self._make_seq(1, total_pages)
+        end_pages = 0
+        for pages in node_pages:
+            end_pages += pages
+            self._insert(cache, allocator, req_to_token_pool, seq[: end_pages * page])
+
+        def chain_pages(key):
+            leaf = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", key)))
+            ).last_device_node
+            hashes: list[str] = []
+            ends: list[int] = []
+            for node in self._path_chain(cache, leaf):
+                hashes.extend(cache.tree_core.get_hash_values(node))
+                ends.append(len(hashes))
+            return leaf, hashes, ends
+
+        def window_pages(ends):
+            kept = set()
+            for end in ends:
+                kept.update(range(max(0, end - sw_pages), end))
+            return kept
+
+        def restorable(prefix, kept):
+            """Longest prefix of ``prefix`` pages whose window is stored."""
+            return next(
+                (
+                    length
+                    for length in range(prefix, 0, -1)
+                    if all(p in kept for p in range(max(0, length - sw_pages), length))
+                ),
+                0,
+            )
+
+        leaf, page_hashes, node_ends = chain_pages(seq)
+        self.assertEqual(len(page_hashes), total_pages)
+        controller = cache.cache_controller
+        with mock.patch.object(
+            controller, "write_storage", wraps=controller.write_storage
+        ) as write_storage:
+            self._buffer_backup_and_wait(cache, leaf)
+
+        kept = window_pages(node_ends)
+        self.assertLess(len(kept), total_pages)
+        backend = controller.storage_backend
+        swa_page_size = controller.mem_pool_host.entry_map[
+            PoolName.SWA
+        ].host_pool.page_size
+
+        def stored(pool, key):
+            return os.path.exists(
+                os.path.join(
+                    backend.file_path, backend._get_component_key(key, pool) + ".bin"
+                )
+            )
+
+        swa_beliefs = cache.storage_existence_cache.pool(PoolName.SWA)
+        for i, key in enumerate(page_hashes):
+            self.assertTrue(stored(PoolName.KV, key), f"KV page {i}")
+            self.assertEqual(stored(PoolName.SWA, key), i in kept, f"SWA page {i}")
+            self.assertEqual(swa_beliefs.contains(key), i in kept, f"SWA belief {i}")
+        # Each SWA write staged exactly the rows of the keys it stored.
+        written: list[str] = []
+        for call in write_storage.call_args_list:
+            for transfer in call.kwargs.get("extra_pools") or ():
+                if transfer.name == PoolName.SWA:
+                    self.assertEqual(
+                        transfer.host_indices.numel(),
+                        len(transfer.keys) * swa_page_size,
+                    )
+                    written.extend(transfer.keys)
+        self.assertEqual(sorted(written), sorted(page_hashes[i] for i in kept))
+
+        # A hit's usable prefix is the last node end whose window is stored.
+        swa_query = [
+            PoolTransfer(
+                name=PoolName.SWA,
+                keys=["_"] * sw_pages,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
+        for prefix in range(1, total_pages + 1):
+            self.assertEqual(
+                self._storage_exists_count(cache, page_hashes[:prefix], swa_query),
+                restorable(prefix, kept),
+                f"prefix {prefix}",
+            )
+
+        # The whole chain is still served end to end from the sparse store.
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        handle = CacheRequestHandle("tail-only-req", 0)
+        cons.prefetch_from_storage(
+            handle, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._run_prefetch_to_completion(cons, handle)
+        self.assertEqual(
+            cons.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", seq)))
+            ).device_prefix_len,
+            len(seq),
+        )
+
+        # A partial match inside the first node splits it; the parent's next
+        # backup stores the window ending at the split, so a hit there is
+        # served exactly from storage.
+        split = max(
+            (
+                p
+                for p in range(1, node_ends[0])
+                if p not in node_ends and restorable(p, kept) < p
+            ),
+            default=None,
+        )
+        if split is None:
+            self.skipTest("the first node has no unrestorable interior page")
+        branch = seq[: split * page] + self._make_seq(10_000, 1)
+        self._insert(cache, allocator, req_to_token_pool, branch)
+        branch_leaf, branch_hashes, branch_ends = chain_pages(branch)
+        self.assertEqual(branch_hashes[:split], page_hashes[:split])
+        self.assertIn(split, branch_ends)
+        self._buffer_backup_and_wait(cache, branch_leaf)
+        for i in range(max(0, split - sw_pages), split):
+            self.assertTrue(stored(PoolName.SWA, page_hashes[i]), f"split page {i}")
+        self.assertEqual(
+            self._storage_exists_count(cache, page_hashes[:split], swa_query), split
+        )
+        cache.sanity_check()
+        cons.sanity_check()
+
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
         -> free. Staging and locks fully released, pages stored under every
@@ -5428,7 +5587,7 @@ class UnifiedRadixCacheSuite:
         cons.sanity_check()
 
     def test_buffer_only_load_back_uses_full_behind_swa_tombstone(self):
-        """FULL-only rematch keeps resident FULL and loads the complete SWA window."""
+        """FULL-only rematch keeps resident FULL and repairs missing SWA rows."""
         self._skip_unsupported_hicache_test()
         if not self.cfg.has_swa:
             self.skipTest("masked overlap requires an SWA component")
@@ -5523,12 +5682,13 @@ class UnifiedRadixCacheSuite:
         dispatched = {}
 
         def capture_swa_mapping():
-            load = next(iter(cons.buffer_pipeline.ongoing_buffer_load_back.values()))
-            swa_xfer = next(t for t in load.aux_xfers if t.name == PoolName.SWA)
+            load = cons.cache_controller.load_queue[-1]
+            swa_xfer = next(t for t in load.pool_transfers if t.name == PoolName.SWA)
             dispatched["device"] = swa_xfer.device_indices.clone()
-            full_window = masked_full[-len(swa_xfer.device_indices) :]
-            old_window = mapping_before[-len(swa_xfer.device_indices) :]
-            expected = torch.where(old_window > 0, old_window, swa_xfer.device_indices)
+            full_window = masked_full[-window_tokens:]
+            old_window = mapping_before[-window_tokens:]
+            expected = old_window.clone()
+            expected[old_window <= 0] = swa_xfer.device_indices
             self.assertTrue(
                 torch.equal(
                     cons_alloc.full_to_swa_index_mapping[full_window],
@@ -5546,7 +5706,7 @@ class UnifiedRadixCacheSuite:
         )
         self.assertEqual(int(spliced.numel()), 0)
         self.assertEqual(req.prefix_len, len(seq), "FULL rematch was lost")
-        self.assertEqual(len(dispatched["device"]), window_tokens)
+        self.assertEqual(len(dispatched["device"]), window_tokens - live_tail)
         self.assertEqual(cons_alloc.full_available_size(), full_avail0)
         k, v = self._snapshot_full_kv(cons_alloc, masked_full)
         self.assertTrue(torch.equal(k, masked_kv[0]))
@@ -7157,6 +7317,9 @@ class UnifiedRadixCacheSuite:
         # The backed parent stops the Full backup chain, while the SWA window
         # reaches the unbacked grandparent and marks it under the anchor's ack.
         insert(3 * page)
+        # Queue the asynchronous window backup explicitly: write-back insertion
+        # no longer publishes it, but Mamba eviction must still respect its ack.
+        cache._execute_and_commit_kv_backup(BackupKV(node_ids=[anchor]))
         self.assertEqual(
             cache.ongoing_write_through[anchor].publish_node_ids, nodes[:3]
         )
@@ -9406,11 +9569,8 @@ class UnifiedRadixCacheSuite:
 
         cache.sanity_check()
 
-    def test_write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone(
-        self,
-    ):
-        """Write-back builds the insert backup as [target] only, so a second SWA
-        window publish never re-marks an ancestor another ack still holds."""
+    def test_write_back_defers_swa_window_backup_until_eviction(self):
+        """Reinserting backed Full nodes must not publish freshly recovered SWA."""
         if not self.cfg.has_swa:
             self.skipTest("requires SWA")
         if self._skip_unsupported_hicache_test():
@@ -9454,16 +9614,14 @@ class UnifiedRadixCacheSuite:
             "_execute_and_commit_kv_backup",
             wraps=cache._execute_and_commit_kv_backup,
         ) as backups:
-            for seq, target in ((t1_seq, t1), (t2_seq, t2)):
-                backups.reset_mock()
+            for seq in (t1_seq, t2_seq):
                 self._insert(cache, allocator, req_to_token_pool, seq)
-                self.assertEqual(
-                    [call.args[0].node_ids for call in backups.call_args_list],
-                    [[target]],
-                )
+            backups.assert_not_called()
 
-        for node, ack in ((c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)):
-            self.assertEqual(cache.tree_core.get_write_through_pending_id(node), ack)
+        for node in (c, b, t1, d, t2):
+            self.assertIsNone(cache.tree_core.get_write_through_pending_id(node))
+            self.assertIsNone(_host_value(cache, node, ComponentType.SWA))
+        self.assertEqual(cache.cache_controller.write_queue, [])
         # Write-back defers the unbacked Full prefix to eviction.
         self.assertFalse(cache.tree_core.is_backuped(c))
         self.assertFalse(cache.tree_core.is_backuped(d))
@@ -11269,6 +11427,105 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
 
+class TestSWADraftHistory(CustomTestCase):
+    """A widened draft needs SWA history before the target window. A running
+    checkpoint must lock that history, and an incomplete cached window must
+    not be reused even when the target alone could read it. The shared suite
+    runs these contracts against both Python and Rust TreeCore.
+    """
+
+    cfg = CacheConfig(
+        page_size=1,
+        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        sliding_window_size=511,
+        draft_swa_window=516,
+        is_eagle=True,
+        kv_size=2048,
+        max_context_len=2048,
+        num_layers=2,
+        full_attention_layer_ids=(0,),
+        head_num=1,
+        head_dim=8,
+        enable_mamba_extra_buffer=True,
+    )
+
+    def _request(self, pool):
+        tokens = array("q", range(1, 1025))
+        req = Req(
+            rid="widened-draft",
+            origin_input_text="",
+            origin_input_ids=tokens,
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=16),
+        )
+        pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = tokens
+        req.extend_end = len(tokens)
+        req.kv.kv_committed_len = req.kv.kv_allocated_len = len(tokens)
+        req.kv.cache_protected_len = 0
+        req.kv.mamba_last_track_seqlen = len(tokens)
+        req.kv.mamba_last_track_idx = 0
+        req.kv.mamba_next_track_idx = pool.get_mamba_ping_pong_other_idx(0)
+        req.lock = None
+        req.extra_key = None
+        return req
+
+    def test_checkpoint_protects_widened_draft_history_under_eviction(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=64)
+        req = self._request(pool)
+        req.last_node = cache.root_node_handle()
+        kv = allocator.alloc(1024)
+        pool.write((req.kv.req_pool_idx, slice(0, 1024)), kv)
+        cache.checkpoint(req, up_to=1024)
+        self.addCleanup(lambda: cache.unlock(req.lock))
+
+        # Mamba disables bigram keys: this checkpoint is exactly at 1024.
+        self.assertEqual(req.kv.cache_protected_len, 1024)
+        # A three-depth draft with five front rows and three warmup rows has
+        # its first real query at 1022. Its window needs key 511, which lies
+        # before the target-only lock [513, 1024).
+        needed = kv[1024 - self.cfg.draft_swa_window : 1024]
+        mapping = allocator.full_to_swa_index_mapping
+        before = mapping[needed].clone()
+        self.assertTrue(bool((before > 0).all()))
+        cache.evict(EvictParams(swa_num_tokens=1))
+        torch.testing.assert_close(mapping[needed], before)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+        )
+        self.assertEqual(match.device_prefix_len, 1024)
+
+        # Decode advances past the last recurrent checkpoint. Its complete
+        # draft history must remain until a newer checkpoint replaces it.
+        cache.evict_sliding_windows(req, 1040)
+        torch.testing.assert_close(mapping[needed], before)
+        cache.sanity_check()
+
+    def test_prefix_match_rejects_target_only_swa_history(self):
+        for retained, expected_match in ((511, 0), (516, 1024)):
+            with self.subTest(retained=retained):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=64
+                )
+                req = self._request(pool)
+                kv = allocator.alloc(1024)
+                cutoff = 1024 - retained
+                allocator.free_swa_segment(kv[:cutoff], start_pos=0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(req.origin_input_ids),
+                        value=kv,
+                        mamba_value=req.kv.mamba_pool_idx.unsqueeze(0),
+                        component_evicted_seqlens={ComponentType.SWA: cutoff},
+                    )
+                )
+                result = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(req.origin_input_ids))
+                )
+                self.assertEqual(result.device_prefix_len, expected_match)
+                cache.sanity_check()
+
+
 class TestSWAWindowUnderBigramKey(CustomTestCase):
     """`checkpoint` has to leave the leaf it inserts holding a full
     sliding window of live SWA. Otherwise the match that follows the insert
@@ -11343,6 +11600,59 @@ class TestSWAWindowUnderBigramKey(CustomTestCase):
         )
 
         cache.unlock(req.lock)
+        cache.sanity_check()
+
+    def test_finish_after_decode_eviction_frees_only_the_requests_pages(self):
+        # Decode evicts at pre_len = seq_len - 1. When the last verify then commits
+        # one token, the finished insert ends at page_floor(pre_len): the frontier
+        # must sit a full window below it although the window is not page-aligned.
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page_size = self.cfg.page_size
+        full_total = allocator.full_available_size()
+        swa_total = allocator.swa_available_size()
+        prompt_len, owned = 4 * page_size, 6 * page_size
+        tokens = list(range(1, owned + 1))
+
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=array("q", tokens[:prompt_len]),
+            sampling_params=SamplingParams(
+                temperature=0, max_new_tokens=owned - prompt_len
+            ),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
+        req.extend_end = prompt_len
+        kv_indices = self._alloc_paged(allocator, owned)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, owned)), kv_indices)
+        req.kv.kv_committed_len = prompt_len
+        req.kv.kv_allocated_len = owned
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        cache.checkpoint(req, up_to=prompt_len)
+
+        req.output_ids = tokens[prompt_len:]
+        req.kv.kv_committed_len = owned
+        cache.evict_sliding_windows(req, owned - 1)
+        insert_boundary = (owned - 1) // page_size * page_size
+        self.assertGreaterEqual(
+            insert_boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
+            self.cfg.sliding_window_size,
+        )
+        req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        # Each page is back in the pool or held by the tree, never both.
+        self.assertEqual(
+            allocator.full_available_size() + cache.full_evictable_size(), full_total
+        )
+        self.assertEqual(
+            allocator.swa_available_size() + cache.swa_evictable_size(), swa_total
+        )
         cache.sanity_check()
 
 
@@ -12271,6 +12581,64 @@ class TestStreamingSessionLockLifecycle(CustomTestCase):
         release_kv_cache(req, cache, checkpoint=True)
         self.assertNotIn("s", cache.session.slots)
         cache.sanity_check()
+
+    def test_bounded_replay_turn_borrows_record_without_hold_back(self):
+        """A short turn borrows its whole record; holding back a window would end
+        the match inside the published prompt, which the slot cannot rewind."""
+        cache, allocator, pool = build_fixture(
+            replace(self.cfg, decoder_swa_bounded_replay=True)
+        )
+        session = self._session("s")
+        first = self._admitted_turn(cache, allocator, pool, list(range(1, 9)), session)
+        cache.maybe_hand_to_session(first)
+        cache.checkpoint(first, up_to=8)
+        first.finished_reason = FINISH_LENGTH(length=0)
+        self.assertTrue(cache.session.try_cache_finished_req(first))
+
+        req = self._turn(list(range(1, 11)), session)
+        req.init_next_round_input(cache)
+        self.assertIn("s", cache.session.slots)
+        self.assertEqual(req.prefix_len, 8)
+
+        cache.session.release_session("s")
+        cache.sanity_check()
+
+
+class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
+    def _matched_len(self, cache, tokens) -> int:
+        req = Req(
+            rid="decoder-swa-bounded-replay",
+            origin_input_text="",
+            origin_input_ids=array("q", tokens),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        return req.prefix_len
+
+    def test_match_stops_one_window_short_under_bounded_replay(self):
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=128,
+        )
+        for bounded_replay, matched in ((False, 200), (True, 260 - 128)):
+            with self.subTest(decoder_swa_bounded_replay=bounded_replay):
+                cache, allocator, _ = build_fixture(
+                    replace(cfg, decoder_swa_bounded_replay=bounded_replay)
+                )
+                cached = list(range(1, 201))
+                value = allocator.alloc(len(cached))
+                self.assertIsNotNone(value)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", cached)), value=value[: len(cached)]
+                    )
+                )
+                # 200 of 260 cached: a plain hit would leave a 60-row extend
+                prompt = cached + list(range(1001, 1061))
+                self.assertEqual(
+                    cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
+                )
+                self.assertEqual(self._matched_len(cache, prompt), matched)
 
 
 if __name__ == "__main__":

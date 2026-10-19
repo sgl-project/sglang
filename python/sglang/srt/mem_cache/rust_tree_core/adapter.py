@@ -18,7 +18,6 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -469,8 +468,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 enable_hicache=False,
                 write_through_threshold=256,
                 device=str(self.device),
-                swa_sliding_window_size=params.sliding_window_size,
-                swa_req_ring=is_swa_req_ring(self._allocator),
+                # Rust's tree window has the same cache-history contract as
+                # SWAComponent, including the fused draft's front rows.
+                swa_sliding_window_size=params.swa_retain_window,
+                swa_req_ring=not params.swa_gates_prefix_match,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 dynamo_kv_event_format=params.dynamo_kv_event_format,
                 mamba_cache_chunk_size=(
@@ -520,8 +521,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         raise NotImplementedError("root_node: not yet ported to the Rust tree core")
 
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
+        if component_type != ComponentType.SWA:
+            raise NotImplementedError("The Rust tree core supports one SWA window")
         return self._binding.swa_tombstone_ranges(
             self._bindings.MatchParamsBinding(
                 key=_radix_key_buffer(key),
@@ -538,7 +545,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
+        if component_type != ComponentType.SWA:
+            raise NotImplementedError("The Rust tree core supports one SWA window")
         return _cache_actions_from_tagged(
             self._binding.attach_swa_window(
                 self._bindings.MatchParamsBinding(

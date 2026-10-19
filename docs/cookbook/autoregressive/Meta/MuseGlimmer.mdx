@@ -1,7 +1,6 @@
 ---
 title: Muse Glimmer
 description: "A multimodal reasoning model served from a BF16, NVFP4 + MXFP8, vendor GGUF, or MLX checkpoint."
-tag: NEW
 ---
 
 ## Deployment
