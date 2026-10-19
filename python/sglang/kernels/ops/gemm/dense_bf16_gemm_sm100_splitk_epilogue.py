@@ -165,39 +165,6 @@ def validate_tactic(
         )
 
 
-def autotune_tactics(
-    m: int,
-    n: int,
-    k: int,
-    *,
-    smem_capacity: int = _SMEM_CAPACITY_BYTES,
-) -> list[SplitKTactic]:
-    """Return valid tactics in the shape-specific stage window."""
-    tactics: list[SplitKTactic] = []
-    for mma_m in _SUPPORTED_MMA_M:
-        for mma_n in _SUPPORTED_MMA_N:
-            for split_k in _SUPPORTED_SPLIT_K:
-                base = SplitKTactic(mma_m, mma_n, split_k, _MIN_AB_STAGES)
-                try:
-                    validate_tactic(base, m, n, k, smem_capacity=smem_capacity)
-                except ValueError:
-                    continue
-                max_stages = _max_ab_stages_for(base, smem_capacity)
-                # Short K favors shallow pipelines; long K stays near the cap.
-                tactics.extend(
-                    dataclasses.replace(base, ab_stages=ab_stages)
-                    for ab_stages in (
-                        range(_MIN_AB_STAGES, min(max_stages, 6) + 1)
-                        if k <= 4 * _CTA_K
-                        else range(
-                            min(max(5, max_stages - 2), max_stages),
-                            max_stages + 1,
-                        )
-                    )
-                )
-    return tactics
-
-
 def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
     """Choose the default occupancy-oriented tactic."""
     if n <= 512:
@@ -241,7 +208,6 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
 
 __all__ = [
     "SplitKTactic",
-    "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
     "run_splitk_dense_silu",

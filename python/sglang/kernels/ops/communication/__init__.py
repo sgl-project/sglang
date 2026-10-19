@@ -6,7 +6,12 @@ records metadata; importing this group does not load the implementations.
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 __all__ = []
 
@@ -16,7 +21,6 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.communication.all_reduce_fusion:moe_finalize_shared_gate_all_reduce",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
-        description="BF16 routed finalize, FP32 shared gate, and clustered all-reduce.",
     )
 )
 
@@ -39,7 +43,7 @@ for _mod, _fn in [
             op=f"communication.{_fn}",
             backend=KernelBackend.JIT,
             target=f"sglang.kernels.ops.communication.{_mod}:{_fn}",
-            capabilities=frozenset({CapabilityRequirement.CUDA}),
+            capabilities=CUDA_ONLY,
         )
     )
 del _mod, _fn
