@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
     causal_conv1d_fn,
@@ -1378,7 +1378,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
         dispatcher selected the FlashInfer bf16-state verify, else the Triton
         recurrent kernel (both store the same raw window)."""
-        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
 
@@ -1468,7 +1468,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
         checkpoint.
         """
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             gdn_replayssm_spec_decode,
         )
 
