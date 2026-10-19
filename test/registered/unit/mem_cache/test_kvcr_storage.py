@@ -1,7 +1,6 @@
 """CPU contracts for indexed HiCache IO; native NIXL is a separate integration gate."""
 
 import ctypes
-import gc
 import json
 import mmap
 import types
@@ -27,10 +26,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
     StorageOperation,
 )
-from sglang.srt.mem_cache.storage.kvcr.diagnostics import (
-    DiagnosticGCObserver,
-    DiagnosticStats,
-)
+from sglang.srt.mem_cache.storage.kvcr.diagnostics import DiagnosticStats
 from sglang.srt.mem_cache.storage.kvcr.hints import peer_hint
 from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
 from sglang.srt.mem_cache.storage.kvcr.layout import (
@@ -557,49 +553,6 @@ class TestKVCRStorage(CustomTestCase):
                     for field in ("descriptor_ms", "align_before_ms", "hint_ms")
                 ),
             )
-
-    def test_gc_observer_bounds_events_and_preserves_other_callback_leases(self):
-        """A full observation buffer must not grow, hide loss, or remove other owners."""
-        callbacks = [lambda *_: None]
-        clock = iter([1.0, 1.1, 2.0, 2.2, 3.0, 3.3])
-        wall = iter([101.0, 101.1, 102.0, 102.2, 103.0])
-        with patch(
-            "sglang.srt.mem_cache.storage.kvcr.diagnostics.gc.callbacks", callbacks
-        ):
-            observer = DiagnosticGCObserver(
-                2, clock=lambda: next(clock), wall_clock=lambda: next(wall)
-            )
-            self.addCleanup(observer.close)
-            for generation in range(3):
-                observer._observe("start", {"generation": generation})
-                observer._observe("stop", {"generation": generation, "collected": 7})
-            observed = observer.drain()
-            self.assertEqual(observed["dropped_observations"], 1)
-            self.assertEqual(len(observed["collections"]), 2)
-            self.assertAlmostEqual(observed["collections"][0]["duration_ms"], 100)
-            self.assertEqual(observed["collections"][1]["collected"], 7)
-            self.assertEqual(
-                observer.drain(), {"collections": [], "dropped_observations": 0}
-            )
-            observer.close()
-            observer.close()
-            self.assertEqual(len(callbacks), 1)
-
-    def test_gc_observer_records_real_collection_without_changing_gc_policy(self):
-        """Closing the owned callback must leave global GC policy and other owners intact."""
-        policy = (gc.isenabled(), gc.get_threshold())
-        callbacks = tuple(gc.callbacks)
-        observer = DiagnosticGCObserver()
-        self.addCleanup(observer.close)
-        gc.collect(2)
-        self.assertTrue(
-            any(row["generation"] == 2 for row in observer.drain()["collections"])
-        )
-        self.backend._gc_observer = observer
-        self.backend._runner = None
-        self.backend.close()
-        self.assertEqual(tuple(gc.callbacks), callbacks)
-        self.assertEqual((gc.isenabled(), gc.get_threshold()), policy)
 
     def test_diagnostic_config_rejects_truthy_non_booleans(self):
         for value in ("false", 1, None):

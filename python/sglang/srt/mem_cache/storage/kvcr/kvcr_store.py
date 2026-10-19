@@ -96,7 +96,6 @@ class KVCRStore(HiCacheStorage):
         self._completion = threading.Condition(self._lock)
         self._completed = {}
         self._poll_thread = None
-        self._gc_observer = None
         self._stop_poll = threading.Event()
         self._closed = False
         self._pinning = _NoFrameworkPinning()
@@ -195,10 +194,7 @@ class KVCRStore(HiCacheStorage):
         from kvcr.control_channels import ZmqPeerControlChannel
         from kvcr.types import KVCRStartupError, RegionDescriptor
 
-        from sglang.srt.mem_cache.storage.kvcr.diagnostics import (
-            DiagnosticGCObserver,
-            DiagnosticStats,
-        )
+        from sglang.srt.mem_cache.storage.kvcr.diagnostics import DiagnosticStats
 
         if not self._layouts:
             raise ValueError("KVCR has no registered physical host pools")
@@ -336,8 +332,6 @@ class KVCRStore(HiCacheStorage):
             target=self._poll_loop, name="kvcr-storage-completions", daemon=True
         )
         self._poll_thread.start()
-        if self._diagnostic_telemetry:
-            self._gc_observer = DiagnosticGCObserver()
         logger.info(
             "KVCR L3 ready: endpoint=%s physical_pools=%s bytes=%d namespace=%s",
             channel.endpoint,
@@ -472,21 +466,6 @@ class KVCRStore(HiCacheStorage):
                     separators=(",", ":"),
                 ),
             )
-        if self._gc_observer is not None:
-            observed = self._gc_observer.drain()
-            if observed["collections"] or observed["dropped_observations"]:
-                logger.info(
-                    "KVCR L3 GC pauses %s",
-                    json.dumps(
-                        {
-                            "epoch": time.time(),
-                            "agent": self._agent_name,
-                            "endpoint": self._control_endpoint,
-                            **observed,
-                        },
-                        separators=(",", ":"),
-                    ),
-                )
         self._diagnostic_epoch = now
 
     def _transfer_digests(self, blocks, results):
@@ -878,8 +857,6 @@ class KVCRStore(HiCacheStorage):
         if self._poll_thread is not None:
             self._poll_thread.join()
         with self._lock:
-            if self._gc_observer is not None:
-                self._gc_observer.close()
             if self._runner is not None:
                 try:
                     if self._diagnostic_telemetry:
