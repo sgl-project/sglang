@@ -1198,11 +1198,6 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_PP_L3_CACHE_ASYNC_ADMISSION</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable asynchronous L3 cache admission for static PD-prefill with PP greater than 1 and HiCache in cache mode. Set on every prefill rank at startup. See <a href="/docs/advanced_features/hicache_design#asynchronous-pp-admission">supported configurations and limitations</a>.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode-side incremental KV cache offload stride. Rounded down to a multiple of <code>--page-size</code> (min is <code>--page-size</code>). If unset/invalid/&lt;=0, it falls back to <code>--page-size</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses <code>--page-size</code>)</td>
