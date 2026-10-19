@@ -29,7 +29,7 @@ COMMON_ARGS = ["--attention-backend", "trtllm_mla", "--page-size", str(PAGE_SIZE
 # Physical KV rows per prefill rank. 512 logical pages, so GSM8K's prefill
 # radix footprint (~243 pages) never forces eviction.
 PREFILL_POOL_TOKENS = 16384
-# 1.5x one rank's rows, well under the sharded admission bound ~2 * (16384 - 64).
+# 1.5x one rank's rows, well under the sharded admission bound 2 * (16384 - 64) - 2.
 LONG_PROMPT_TOKENS = 24576
 # Page p of a fresh prompt is owned by prefill rank p % 2, so these needles sit
 # on different ranks. Page 20 ends before the last 16448 tokens; page 341

@@ -142,6 +142,18 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
     )
 
 
+def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
+    """Longest prompt the bootstrap queue accepts.
+
+    Sharded PrefillAdder admission needs prompt + 1 new token + one page per
+    shard < capacity, so a longer prompt never fits even an empty pool. The
+    unsharded limit stays the plain capacity.
+    """
+    if shard_size == 1:
+        return capacity
+    return capacity - shard_size * page_size - 2
+
+
 def maybe_release_metadata_buffer(
     req: Req, allocator: ReqToMetadataIdxAllocator
 ) -> None:
@@ -195,6 +207,11 @@ class PrefillBootstrapQueue:
         self.max_total_num_tokens = (
             self.scheduler.tp_worker.model_runner.effective_logical_max_total_num_tokens
             * self.scheduler.kv_shard_widening
+        )
+        self.max_input_len = max_bootstrap_input_len(
+            capacity=self.max_total_num_tokens,
+            page_size=self.scheduler.token_to_kv_pool_allocator.page_size,
+            shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
         self.pp_poll_sync_work_list: List = []
@@ -446,8 +463,8 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_total_num_tokens:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
+        if len(req.origin_input_ids) > self.max_input_len:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
