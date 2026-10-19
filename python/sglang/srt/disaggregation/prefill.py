@@ -98,6 +98,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import is_npu
 
+from sglang.srt.utils.rank_consensus_checker import rank_consensus
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -1104,6 +1106,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.maybe_send_health_check_signal()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    @rank_consensus(same_results=["[req.rid for req in results]"])
     def process_disagg_prefill_inflight_queue(self: Scheduler) -> List[Req]:
         """
         Poll the requests in the middle of transfer. If done, return the request.
