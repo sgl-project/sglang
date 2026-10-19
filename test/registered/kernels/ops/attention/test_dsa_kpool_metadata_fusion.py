@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsa_kpool_metadata.verify import (
+from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
     fused_dsa_target_verify_metadata,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

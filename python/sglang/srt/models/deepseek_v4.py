@@ -29,7 +29,6 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
-    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
@@ -38,6 +37,9 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
+)
+from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -1019,7 +1021,7 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
         )
 
-        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+        from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
         self.rope_scaling = dict(rope_scaling) if rope_scaling else None
@@ -1329,7 +1331,7 @@ class MQALayer(MqaAttentionBase):
         )
         self.mega_cos_sin_cache = None
         if self.use_mega_attention:
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            from sglang.kernels.ops.attention.dsv4.rope import (
                 precompute_cos_sin_table,
             )
 
@@ -2029,7 +2031,7 @@ class MQALayer(MqaAttentionBase):
         use_cp = is_cp_active(forward_batch)
         kv: Optional[torch.Tensor]
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -2434,7 +2436,7 @@ class MQALayer(MqaAttentionBase):
                 )
             )
         )
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -4336,7 +4338,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
-            from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
+            from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
             from sglang.srt.layers.quantization.fp8_utils import (
                 set_dense_mxscale,
                 set_force_ck_w8a8,

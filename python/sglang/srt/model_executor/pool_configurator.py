@@ -1056,7 +1056,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )

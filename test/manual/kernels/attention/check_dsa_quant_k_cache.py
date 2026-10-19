@@ -3,10 +3,10 @@ import triton
 
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     _quantize_k_cache_fast_wrapped,
-    _quantize_k_cache_ref,
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.test.kernels.dsa_k_cache_reference import _quantize_k_cache_ref
 
 if __name__ == "__main__":
     import dequant_k_cache
@@ -49,7 +49,7 @@ if __name__ == "__main__":
         page_table_1 = torch.arange(
             num_blocks * block_size, dtype=torch.int32, device="cuda"
         )
-        actual_dequant_paged = dequant_k_cache.dequantize_k_cache_paged(
+        actual_dequant_paged = dequant_k_cache.dequantize_k_cache_paged_dsa(
             actual_quant, page_table_1
         ).reshape(actual_actual_dequant.shape)
         print(f"{torch.mean(actual_actual_dequant - actual_dequant_paged)=}")
@@ -127,7 +127,9 @@ if __name__ == "__main__":
         )
 
         def run_ans():
-            return dequant_k_cache.dequantize_k_cache_paged(actual_quant, page_table_1)
+            return dequant_k_cache.dequantize_k_cache_paged_dsa(
+                actual_quant, page_table_1
+            )
 
         ans_time: float = triton.testing.do_bench(run_ans, warmup=10, rep=20) / 1000  # type: ignore
         print(f"seq_kv: {num_blocks * block_size}, time: {ans_time * 1e6: 4.0f} us")

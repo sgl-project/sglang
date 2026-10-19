@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsa_kpool_metadata.scan import bounded_scan_num_splits
+from sglang.kernels.ops.attention.dsa.kpool_metadata.scan import bounded_scan_num_splits
 
 
 @triton.jit(

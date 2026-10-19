@@ -28,9 +28,9 @@ from sglang.srt.runtime_context import (
 logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsa,
     gather_cast_kv_fp8_pad_paged,
-    gather_dequant_requant_fp8_paged,
+    gather_dequant_requant_fp8_paged_dsa,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
@@ -2414,7 +2414,7 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
+                    kv_cache = dequantize_k_cache_paged_dsa(
                         kv_cache, page_table_1_flattened
                     )
                 else:
@@ -3007,7 +3007,7 @@ class DeepseekSparseAttnBackend(
           * non-prefix extend: ``kv_bf16`` (the gathered bf16 KV) is cast into
             a zero-padded fp8 buffer.
           * prefix extend on an fp8 pool (656 B/token: nope_fp8 + per-group
-            scales + rope_bf16): ``gather_dequant_requant_fp8_paged`` gathers,
+            scales + rope_bf16): ``gather_dequant_requant_fp8_paged_dsa`` gathers,
             dequantizes per group and requantizes to per-tensor fp8 in one
             fused Triton kernel.
           * prefix extend on a bf16 pool: ``gather_cast_kv_fp8_pad_paged``
@@ -3130,7 +3130,7 @@ class DeepseekSparseAttnBackend(
             )
             self._q8kv8_kv_buf = kv_buf
         if paged_kv_cache is not None and self.dsa_kv_cache_store_fp8:
-            kv_padded = gather_dequant_requant_fp8_paged(
+            kv_padded = gather_dequant_requant_fp8_paged_dsa(
                 paged_kv_cache,
                 page_table_1_flattened,
                 extra_rows=topk,
@@ -4026,7 +4026,7 @@ class DeepseekSparseAttnBackend(
                 ):
                     total_kv_tokens = forward_batch.seq_lens_sum
                     total_q_tokens = forward_batch.extend_num_tokens
-                    # Heuristic based on benchmarking flashmla_kv vs flashmla_sparse + dequantize_k_cache_paged
+                    # Heuristic based on benchmarking flashmla_kv vs flashmla_sparse + dequantize_k_cache_paged_dsa
                     if total_kv_tokens < total_q_tokens * 512:
                         self.dsa_prefill_impl = "flashmla_sparse"
                         return
@@ -4186,7 +4186,7 @@ class DeepseekSparseAttnMultiStepBackend:
         # This is 3x faster than calling the single-backend copy 3 times
         if self.speculative_num_steps > 3:
             try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
                     fused_metadata_copy_multi_cuda,
                 )
 

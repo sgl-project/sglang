@@ -25,7 +25,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
-    from sglang.kernels.ops.attention.fused_store_index_cache import (
+    from sglang.kernels.ops.attention.dsa.fused_store_index_cache import (
         can_use_dsa_fused_store,
         fused_store_index_k_cache,
     )
@@ -187,7 +187,7 @@ def _reference_quantize_and_store(
 
 def _import_act_quant():
     try:
-        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+        from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         return act_quant
     except Exception:

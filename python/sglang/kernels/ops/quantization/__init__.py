@@ -8,7 +8,6 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
-    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
@@ -122,3 +121,24 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="quantization.quantize_fp4_indexer_tensor",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.quantization.fp4_indexer_quant"
+            ":quantize_fp4_indexer_tensor"
+        ),
+    )
+)
+
+# act_quant also has a TileLang implementation (act_quant_tilelang, used on HIP);
+# KernelBackend has no TileLang provenance, so only the Triton one is inventoried.
+register_kernel(
+    KernelSpec(
+        op="quantization.act_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.act_quant_triton:act_quant",
+    )
+)

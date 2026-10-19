@@ -8,7 +8,7 @@ torch gather of the K and S regions of the paged buffer.
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsa.index_buf_accessor import GetKAndS
+from sglang.kernels.ops.kvcache.dsa_index_k_cache import GetKAndS
 
 
 class MockDSATokenToKVPool:

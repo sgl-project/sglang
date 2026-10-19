@@ -13,10 +13,13 @@ from sglang.kernels.jit.utils import (
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
-from .utils import make_name
-
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+def make_name(name: str) -> str:
+    return f"dpsk_v4_{name}"
+
 
 _GROUP_SIZE = 128
 _UE8M0_SCALES_PER_PACK = 4
