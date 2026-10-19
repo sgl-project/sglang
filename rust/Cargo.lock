@@ -3750,6 +3750,7 @@ dependencies = [
  "hf-hub",
  "minijinja",
  "regex",
+ "ryu",
  "serde",
  "serde_json",
  "sha2",

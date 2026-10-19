@@ -212,13 +212,10 @@ fn parse_effort(value: &Value) -> Result<f64, String> {
 }
 
 /// TMLv0's `ThinkingEffort(millieffort=round(effort * 1000))` text: two
-/// decimals, both roundings half-to-even, trailing zeros stripped.
+/// decimals of `millieffort / 1000`, both roundings half-to-even in `f64`.
 fn format_effort(effort: f64) -> String {
-    let milli = (effort * 1000.0).round_ties_even() as u32;
-    let (mut centi, rest) = (milli / 10, milli % 10);
-    if rest > 5 || (rest == 5 && centi % 2 == 1) {
-        centi += 1;
-    }
+    let milli = (effort * 1000.0).round_ties_even();
+    let centi = (milli / 1000.0 * 100.0).round_ties_even() as u32;
     let text = format!("{}.{:02}", centi / 100, centi % 100);
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
@@ -485,10 +482,10 @@ fn tool_call_arguments(arguments: &Value) -> Result<Value, String> {
 
 #[derive(Clone, Copy)]
 enum NumberStyle {
-    /// Call arguments: TMLv0 re-parses Python's `json.dumps` text with
-    /// serde_json's default (inexact) float parser.
+    /// Call arguments: TMLv0 reads Python's `json.dumps` text with serde_json's
+    /// default (inexact) float parser.
     Arguments,
-    /// Tool declarations keep each float exactly and sign positive exponents.
+    /// Tool declarations go through that parser twice and sign positive exponents.
     Declaration,
 }
 
@@ -543,65 +540,31 @@ fn tml_number(number: &Number, style: NumberStyle) -> Result<String, String> {
     {
         return Err("Inkling numbers serde_json reads unlike Python render on the engine".into());
     }
+    let mut buffer = ryu::Buffer::new();
     Ok(match style {
-        NumberStyle::Arguments => format_float(serde_lossy_parse(value), false),
-        NumberStyle::Declaration => format_float(value, true),
+        NumberStyle::Arguments => buffer.format_finite(serde_reparse(value)).to_owned(),
+        NumberStyle::Declaration => {
+            let printed = buffer.format_finite(serde_reparse(serde_reparse(value)));
+            match printed.split_once('e') {
+                Some((mantissa, exponent)) if !exponent.starts_with('-') => {
+                    format!("{mantissa}e+{exponent}")
+                }
+                _ => printed.to_owned(),
+            }
+        }
     })
 }
 
-/// The shortest round-trip digits of `|value|` and their power of ten.
-fn shortest_digits(value: f64) -> (String, i32) {
-    let scientific = format!("{:e}", value.abs());
-    let (mantissa, exponent) = scientific.split_once('e').unwrap();
-    let digits = mantissa.replace('.', "");
-    let exponent = exponent.parse::<i32>().unwrap() - (digits.len() as i32 - 1);
-    (digits, exponent)
-}
-
-/// ryu's float layout, which TMLv0 prints with.
-fn format_float(value: f64, signed_exponent: bool) -> String {
-    let (digits, exponent) = shortest_digits(value);
-    let length = digits.len() as i32;
-    let point = length + exponent;
-    let body = if (0..=16).contains(&point) && exponent >= 0 {
-        format!("{digits}{}.0", "0".repeat(exponent as usize))
-    } else if (1..=16).contains(&point) {
-        let (whole, fraction) = digits.split_at(point as usize);
-        format!("{whole}.{fraction}")
-    } else if (-4..=0).contains(&point) {
-        format!("0.{}{digits}", "0".repeat(-point as usize))
-    } else {
-        let (first, rest) = digits.split_at(1);
-        let mantissa = if rest.is_empty() {
-            first.to_owned()
-        } else {
-            format!("{first}.{rest}")
-        };
-        let sign = if signed_exponent && point > 0 {
-            "+"
-        } else {
-            ""
-        };
-        format!("{mantissa}e{sign}{}", point - 1)
-    };
-    if value.is_sign_negative() {
-        format!("-{body}")
-    } else {
-        body
-    }
-}
-
-/// serde_json's `f64_from_parts` on Python's `repr` of `value`: the decimal
-/// significand times an `f64` power of ten, which can round twice.
-fn serde_lossy_parse(value: f64) -> f64 {
-    let (digits, exponent) = shortest_digits(value);
-    // `repr` writes integral floats below 1e16 in fixed notation with a trailing `.0`.
-    let (significand, mut exponent) = if (1e-4..1e16).contains(&value.abs()) && exponent >= 0 {
-        (format!("{digits}{}0", "0".repeat(exponent as usize)), -1)
-    } else {
-        (digits, exponent)
-    };
-    let mut parsed = significand.parse::<u64>().unwrap() as f64;
+/// serde_json's default float parse (`f64_from_parts`) of `value` as ryu and
+/// Python's `repr` print it: the decimal significand times an `f64` power of ten,
+/// which can round twice.
+fn serde_reparse(value: f64) -> f64 {
+    let mut buffer = ryu::Buffer::new();
+    let text = buffer.format_finite(value.abs());
+    let (mantissa, exponent) = text.split_once('e').unwrap_or((text, "0"));
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut exponent = exponent.parse::<i32>().unwrap() - fraction.len() as i32;
+    let mut parsed = format!("{whole}{fraction}").parse::<u64>().unwrap() as f64;
     loop {
         if exponent.unsigned_abs() <= 308 {
             let power = format!("1e{}", exponent.unsigned_abs())
