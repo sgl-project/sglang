@@ -11,6 +11,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -145,6 +146,10 @@ def _parse_storage_extra_config(raw_config):
 
 
 class UMBPDirectLinker(UnifiedCacheLinker):
+    # Pages restore from this node's host memory (SSD and remote fetch are
+    # disabled below), so they are published as the host tier.
+    kv_event_medium = StorageMedium.CPU
+
     def __init__(
         self,
         server_args,

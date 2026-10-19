@@ -431,6 +431,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
+        # KV-event medium for pages the external linker confirms; None publishes nothing.
+        self.external_cache_medium = None
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -2752,6 +2754,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for node in nodes:
             node.write_through_pending_id = None
             node.external_cache_stored |= success
+            if success and self.external_cache_medium is not None:
+                self.kv_events.record_store(node, medium=self.external_cache_medium)
 
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
