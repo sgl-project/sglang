@@ -3906,7 +3906,7 @@ class DeepseekV4Model(nn.Module):
                     saved_full = attn_backend.prefill_graph_late_layer_saved
                     if (
                         self.decoder_replay_tail is not None
-                        and self.decoder_replay_tail.in_prefill_graph(
+                        and self.decoder_replay_tail.breaks_out_of_prefill_graph(
                             tail, num_tokens=input_ids.shape[0]
                         )
                     ):

@@ -149,7 +149,7 @@ class DecoderReplayTail:
         # Bridge outputs of prefill-graph steps, one set per output structure,
         # sized by the first (largest) captured shape; older sets stay alive for
         # the graphs that read them.
-        self._bridge: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
+        self._bridge_buffers: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
 
     @classmethod
     def maybe_create(cls, model: torch.nn.Module) -> Optional[DecoderReplayTail]:
@@ -270,7 +270,9 @@ class DecoderReplayTail:
             return None
         return list(early)
 
-    def in_prefill_graph(self, tail: LateLayerTail, *, num_tokens: int) -> bool:
+    def breaks_out_of_prefill_graph(
+        self, tail: LateLayerTail, *, num_tokens: int
+    ) -> bool:
         """Whether a prefill-graph capture of ``num_tokens`` hands the tail layers
         to the tail graphs' break instead of capturing them over the block."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -404,7 +406,7 @@ class DecoderReplayTail:
             out_rows=state.residual.shape[0],
         )
 
-    def run_eager(
+    def _run_layers_eagerly(
         self,
         *,
         state: HcState,
@@ -475,13 +477,13 @@ class DecoderReplayTail:
         )
         return residual, pre, aux
 
-    def bridge(
+    def _bridge_outputs(
         self, block_rows: int, outputs: List[Optional[torch.Tensor]]
     ) -> Tuple[Optional[torch.Tensor], ...]:
         """Copy the tail rows into the bridge buffers of a prefill-graph step and
         return their block-sized views; the rows past the tail are zeroed."""
         key = tuple(None if t is None else (t.dtype, t.shape[1:]) for t in outputs)
-        sets = self._bridge.setdefault(key, [])
+        sets = self._bridge_buffers.setdefault(key, [])
         if not sets or sets[0][0].shape[0] < block_rows:
             sets.insert(
                 0,
@@ -594,6 +596,52 @@ class DecoderReplayTail:
         return state.residual, state.pre, aux
 
 
+def _unpadded_batch(forward_batch: ForwardBatch) -> ForwardBatch:
+    """The prefill-graph step's batch cut to its live requests and tokens; the
+    graph pads both, while the per-request extend lengths stay exact."""
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    if extend_lens is None:
+        return forward_batch
+    bs, num_tokens = len(extend_lens), int(sum(extend_lens))
+    view = copy.copy(forward_batch)
+    view.batch_size = bs
+    for name in (
+        "req_pool_indices",
+        "seq_lens",
+        "seq_lens_cpu",
+        "extend_seq_lens",
+        "extend_prefix_lens",
+        "extend_start_loc",
+    ):
+        value = getattr(forward_batch, name, None)
+        if value is not None:
+            setattr(view, name, value[:bs])
+    for name in ("positions", "out_cache_loc", "input_ids"):
+        value = getattr(forward_batch, name, None)
+        if value is not None:
+            setattr(view, name, value[:num_tokens])
+    return view
+
+
+def _enter_eager_tail_in_prefill_graph(
+    backend, graph_batch: ForwardBatch, source_kv_layer_id: Optional[int]
+) -> Tuple[tuple, ForwardBatch]:
+    """Inside a prefill-graph step's tail break: switch onto exact-row tail
+    metadata of the live batch. Returns the state for exit_late_layer_tail and
+    the batch the tail runs on (the capture batch while the graph captures)."""
+    forward_batch = _unpadded_batch(backend.prefill_graph_replay_batch or graph_batch)
+    held = backend.tail_forward_metadata
+    backend.tail_forward_metadata = backend._build_late_layer_tail_metadata(
+        forward_batch
+    )
+    try:
+        saved = backend.enter_late_layer_tail(forward_batch)
+    finally:
+        backend.tail_forward_metadata = held
+    backend.tail_source_kv_layer_id = source_kv_layer_id
+    return saved, forward_batch
+
+
 def _tail_layers_in_prefill_graph(
     tail_layers: DecoderReplayTail,
     rebuild: Callable[[List[torch.Tensor]], HcState],
@@ -607,8 +655,8 @@ def _tail_layers_in_prefill_graph(
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
     backend = get_attn_backend()
-    saved, forward_batch = backend.enter_eager_tail_in_prefill_graph(
-        get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
+    saved, forward_batch = _enter_eager_tail_in_prefill_graph(
+        backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
     )
     # This body runs between the outer graph's segments, also while it captures:
     # the breaks inside the tail layers must run directly, not end its segment.
@@ -665,11 +713,12 @@ def _tail_layers_in_prefill_graph(
         ):
             residual, pre, aux = tail_layers.run(**kwargs)
         else:
-            residual, pre, aux = tail_layers.run_eager(**kwargs)
-        return tail_layers.bridge(block_rows, [residual, pre, *aux])
+            residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
+        return tail_layers._bridge_outputs(block_rows, [residual, pre, *aux])
     finally:
         bcg_module._current_capture_var.reset(capture_token)
         backend.exit_late_layer_tail(saved, forward_batch)
+        backend.prefill_graph_replay_batch = None
 
 
 bcg_tail_layers_in_prefill_graph = eager_on_graph(True)(_tail_layers_in_prefill_graph)
