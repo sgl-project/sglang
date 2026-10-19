@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -195,6 +196,14 @@ def _is_consistency_failure(full_output: str) -> bool:
     )
 
 
+def _hf_rate_limit_retry_delay(full_output: str) -> float | None:
+    lowered = full_output.lower()
+    if "huggingface.co/" not in lowered or "429 too many requests" not in lowered:
+        return None
+    delays = re.findall(r"retry after (\d+(?:\.\d+)?) seconds", lowered)
+    return max((float(delay) for delay in delays), default=60.0)
+
+
 def _is_retryable_failure(full_output: str) -> bool:
     if _is_consistency_failure(full_output):
         return False
@@ -215,7 +224,12 @@ def _is_retryable_failure(full_output: str) -> bool:
         "out of memory" in full_output.lower() or "oom killer" in full_output.lower()
     )
 
-    return is_aggregated_retryable_failure or is_flaky_ci_assertion or is_oom_error
+    return (
+        is_aggregated_retryable_failure
+        or is_flaky_ci_assertion
+        or is_oom_error
+        or _hf_rate_limit_retry_delay(full_output) is not None
+    )
 
 
 def _print_attempt_tail_summary(
@@ -355,11 +369,12 @@ def run_pytest(
             _print_attempt_tail_summary(attempt_reports, len(files))
             return (returncode, list(all_executed_cases), all_case_results)
 
+        retry_delay = _hf_rate_limit_retry_delay(full_output) or 0.0
         if retry_deadline is not None:
             remaining = retry_deadline - time.time()
             retry_estimate = _estimate_failed_test_time(junit_xml_path, attempt_time)
             # leave headroom for pytest startup and variation in the failed cases
-            required = retry_estimate * 1.1 + 30
+            required = retry_delay + retry_estimate * 1.1 + 30
             if remaining < required:
                 print(
                     f"Retry budget exhausted: {remaining:.1f}s remaining, "
@@ -374,6 +389,12 @@ def run_pytest(
             f"Retryable failure detected on attempt {i + 1}. "
             "Retrying only previously failed items."
         )
+        if retry_delay:
+            print(
+                f"Hugging Face rate limit: waiting {retry_delay:.1f}s before retry.",
+                flush=True,
+            )
+            time.sleep(retry_delay)
 
     _print_attempt_tail_summary(attempt_reports, len(files))
     return (
