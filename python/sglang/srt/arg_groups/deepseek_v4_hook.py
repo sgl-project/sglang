@@ -352,8 +352,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             hf_config, "language_model_only", False
         ):
             raise ValueError(
-                "--dsv41-encoder-only-prefill requires a text-only model "
-                "(checkpoint vision_n_layers=0 or language_model_only=True)"
+                "--dsv41-encoder-only-prefill currently requires a text-only "
+                "configuration; image inputs are not supported in this mode"
             )
         if getattr(hf_config, "window_size", None) != DSV41_REPLAY_WINDOW:
             raise ValueError(
