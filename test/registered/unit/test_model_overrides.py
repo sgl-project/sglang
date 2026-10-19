@@ -198,8 +198,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
+                    "enable_decoder_swa_bounded_replay",
                     "dsa_topk_backend",
                     "enable_dsa_fused_indexer",
+                    "enable_fused_qk_norm_rope",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
@@ -225,6 +227,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "radix_eviction_policy",
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
+                    "mm_enable_dp_encoder",
                 }
             ),
         )
