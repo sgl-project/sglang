@@ -247,6 +247,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
         self.page_size = model_runner.page_size
+        if self.page_size > 128:
+            self.page_size = 64
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
 
