@@ -69,12 +69,12 @@ class TestUnoInactiveLoRABatch(CustomTestCase):
             manager, adapter_id = init_uno_lora_manager(runner)
         self.assertIs(manager, manager_cls.return_value)
         self.assertEqual(adapter_id, "internal")
-        self.assertEqual(manager_cls.call_args.kwargs["lora_backend"], "ascend")
+        self.assertEqual(manager_cls.call_args.kwargs["lora_backend"], "uno_ascend")
         manager.fetch_new_loras.assert_called_once_with({None, "internal"})
 
     def test_internal_backend_selection(self):
-        self.assertEqual(uno_lora_backend_for_device("npu"), "ascend")
-        self.assertEqual(uno_lora_backend_for_device("npu:0"), "ascend")
+        self.assertEqual(uno_lora_backend_for_device("npu"), "uno_ascend")
+        self.assertEqual(uno_lora_backend_for_device("npu:0"), "uno_ascend")
         self.assertEqual(uno_lora_backend_for_device("cuda"), "uno_cublas")
 
     def test_ascend_explicit_segments_preserve_uno_row_order(self):

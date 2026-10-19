@@ -47,6 +47,7 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.server_args import ServerArgs
 
 
@@ -776,7 +777,15 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
+        # The scheduler passes this keyword even with PP=1. UNO's startup
+        # validation forbids PP>1, so accept None but never discard real relay
+        # tensors and accidentally execute a partial model as a full model.
+        if pp_proxy_tensors is not None:
+            raise NotImplementedError(
+                "UNO requires PP=1 and does not support pipeline proxy tensors."
+            )
         del grammar_barrier
         self._validate_batch(batch)
 

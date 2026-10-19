@@ -1049,13 +1049,17 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_mode.is_target_verify():
             seq_lens = seq_lens + self.speculative_num_draft_tokens
-            # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
-            # length; refresh the graph-bound list from that CPU tensor.
+            # UNO capture starts with prefix lengths (zero for dummy requests),
+            # while replay publishes final host KV lengths. Use the resolved
+            # lengths above so FIA never captures Q=F with KV=0, and replay
+            # does not add F twice. DFlash follows the same host-length ABI.
             # Other spec algorithms keep the capture-time list (graph_runner
             # recomputes it): gathering seq_lens[:bs] here would force a D2H
             # sync for models (e.g. DSA+MTP) whose replay path is otherwise
             # sync-free.
-            if _is_dflash_verify(spec_info):
+            if _is_uno_forward(spec_info):
+                metadata.seq_lens_cpu_list = attention_kv_lens_cpu.tolist()
+            elif _is_dflash_verify(spec_info):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:

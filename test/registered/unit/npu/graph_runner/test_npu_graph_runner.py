@@ -7,10 +7,36 @@ import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu.graph_runner import npu_graph_runner as mod
+from sglang.srt.hardware_backend.npu.graph_runner.uno_npu_graph_runner import (
+    UnoNPUGraphRunner,
+)
+from sglang.srt.speculative.uno_cuda_graph_runner import UnoDecodeCudaGraphRunner
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_uno_capture_resets_prefix_for_each_lora_variant_and_bucket():
+    runner = UnoNPUGraphRunner.__new__(UnoNPUGraphRunner)
+    runner.seq_len_fill_value = 0
+    runner.buffers = SimpleNamespace(
+        seq_lens=torch.full((64,), 8, dtype=torch.int32),
+        seq_lens_cpu=torch.full((64,), 8, dtype=torch.int32),
+    )
+
+    def prepare(size, stream_idx=None, num_tokens=None):
+        assert torch.count_nonzero(runner.buffers.seq_lens).item() == 0
+        assert torch.count_nonzero(runner.buffers.seq_lens_cpu).item() == 0
+        # Simulate Ascend's in-place prefix -> final KV conversion.
+        runner.buffers.seq_lens[:size].add_(8)
+        return size, stream_idx, num_tokens
+
+    with mock.patch.object(
+        UnoDecodeCudaGraphRunner, "capture_prepare", side_effect=prepare
+    ):
+        for bs in (64, 64, 1, 1):
+            assert runner.capture_prepare(bs, num_tokens=bs * 8) == (bs, None, bs * 8)
 
 
 def test_replay_updates_sequence_lengths_and_slices_logits_to_raw_batch():
