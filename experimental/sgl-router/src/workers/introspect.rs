@@ -429,8 +429,10 @@ struct ServerInfoBody {
     #[serde(default)]
     grpc_port: Option<u16>,
     /// `ServerArgs.optimistic_prefill_attempts`; absent on engines that predate it.
+    /// Signed like the engine's unvalidated `int`, so a negative value reads as
+    /// no optimistic prefill instead of failing the whole body.
     #[serde(default)]
-    optimistic_prefill_attempts: Option<u32>,
+    optimistic_prefill_attempts: Option<i64>,
     /// `ServerArgs.disaggregation_decode_allocation_policy`.
     #[serde(default)]
     disaggregation_decode_allocation_policy: Option<String>,
@@ -898,6 +900,7 @@ mod tests {
                 }),
                 Some(false),
             ),
+            (json!({"optimistic_prefill_attempts": -1}), Some(false)),
             (json!({}), None),
         ] {
             let (url, _shutdown) = spawn_fake_worker(body).await;
