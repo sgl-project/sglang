@@ -810,7 +810,7 @@ install_extra_deps() {
     # >>> TEMP -- DO NOT MERGE: validate Mooncake PR #3673 wheels -----------
     MOONCAKE_WHEEL_ZIP_URL=""
     if [ "$(uname -m)" = "x86_64" ]; then
-        case "${SYS_PYTHON_VER}" in
+        case "${CI_PYTHON_VER}" in
             3.10) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12142414037.zip" ;;
             3.12) MOONCAKE_WHEEL_ZIP_URL="https://nightly.link/kvcache-ai/Mooncake/actions/artifacts/12142894409.zip" ;;
         esac
@@ -822,7 +822,7 @@ install_extra_deps() {
         python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
             "${MOONCAKE_WHEEL_DIR}/wheel.zip" "${MOONCAKE_WHEEL_DIR}"
         MOONCAKE_PKG="$(ls "${MOONCAKE_WHEEL_DIR}"/*.whl)"
-        echo "TEMP: overriding Mooncake with PR #3673 wheel for x86_64/py${SYS_PYTHON_VER}: ${MOONCAKE_PKG}"
+        echo "TEMP: overriding Mooncake with PR #3673 wheel for x86_64/py${CI_PYTHON_VER}: ${MOONCAKE_PKG}"
     fi
     # <<< TEMP ---------------------------------------------------------------
 
