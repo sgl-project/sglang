@@ -227,9 +227,7 @@ def check_simulate_acc_token_mode() -> None:
 
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = (
-    _is_cuda or _is_musa
-)  # This kernel is only available for CUDA and MUSA now
+TREE_SPEC_KERNEL_AVAILABLE = _is_cuda or _is_hip or _is_musa
 
 
 def draft_kv_indices_buffer_width(
