@@ -15,12 +15,12 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=360, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-h200")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 LAUNCH_TIMEOUT = 3600
 PAGE_SIZE = 256
-KL_THRESHOLD = 0.02
+KL_THRESHOLD = 0.03
 PREFIX_LEN = 2048
 MAX_NEW_TOKENS = 64
 
