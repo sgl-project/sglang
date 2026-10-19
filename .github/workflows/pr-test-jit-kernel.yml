@@ -28,6 +28,11 @@ on:
         required: false
         type: boolean
         default: false
+      continue_on_error:
+        description: 'Run every file in the suite even after one fails (full/scheduled runs)'
+        required: false
+        type: string
+        default: 'false'
 
 # Workflow-level env is NOT inherited from the caller in reusable workflows (verified by CI test).
 # The github context (including github.event_name) IS inherited from the caller.
@@ -94,7 +99,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.11-cuda13.0
 
       - uses: ./.github/actions/download-rust-ext
         with:
@@ -107,6 +112,8 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }}
+          python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }} $CONTINUE_ON_ERROR_FLAG
