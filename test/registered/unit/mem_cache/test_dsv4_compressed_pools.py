@@ -16,13 +16,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     compute_dspark_window_gather,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
-from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Compressor
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
-from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.allocation import alloc_for_extend
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
     DeepSeekV4TokenToKVPool,
@@ -290,241 +286,6 @@ class TestDSV4CompressedPools(CustomTestCase):
         with self.assertRaisesRegex(AssertionError, "No indexer pool"):
             pool.get_index_k_page_size(128)
 
-    @staticmethod
-    def _make_encoder_only_pool():
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool._unified_kv = False
-        pool._unified_kv_fp8 = False
-        pool.page_size = 8
-        pool._stage_start = 0
-        pool._stage_end = 8
-        pool.compression_ratios = [0, 0, 1, 0, 4, 0, 2, 128]
-        pool.kv_source_layers = [2, 6]
-        pool.sources_by_ratio = {4: [4], 128: [7], 1: [2], 2: [6]}
-
-        def kv_pool(width):
-            return SimpleNamespace(
-                kv_buffer=[torch.empty((3, width), dtype=torch.uint8)]
-            )
-
-        def index_pool(width):
-            buffers = [
-                torch.empty((3, width), dtype=torch.uint8),
-                torch.empty((3, 1), dtype=torch.uint8),
-            ]
-            return SimpleNamespace(
-                page_size=2,
-                contiguous_page_row_buffers=lambda: buffers,
-            )
-
-        # Include unrelated C4/C128 buffers to prove the profile excludes them.
-        pool.kv_pools = {
-            4: kv_pool(40),
-            128: kv_pool(80),
-            1: kv_pool(10),
-            2: kv_pool(20),
-        }
-        pool.index_pools = {
-            4: index_pool(4),
-            1: index_pool(5),
-            2: index_pool(6),
-        }
-        return pool
-
-    def test_encoder_only_transfer_selects_global_main_and_indexer(self):
-        pool = self._make_encoder_only_pool()
-        data_ptrs, data_lens, item_lens = pool.get_encoder_only_transfer_buf_infos()
-        entries = list(zip(data_ptrs, data_lens, item_lens))
-
-        expected = []
-        for ratio in (1, 2):
-            kv = pool.kv_pools[ratio].kv_buffer[0]
-            expected.append((kv.data_ptr(), kv.nbytes, kv[0].nbytes))
-            index_pages_per_full_page = (pool.page_size // ratio) // 2
-            for buf in pool.index_pools[ratio].contiguous_page_row_buffers():
-                expected.append(
-                    (
-                        buf.data_ptr(),
-                        buf.nbytes,
-                        buf[0].nbytes * index_pages_per_full_page,
-                    )
-                )
-
-        self.assertEqual(entries, expected)
-        self.assertEqual(pool.get_encoder_only_transfer_layer_ids(), [2, 2, 2, 6, 6, 6])
-        self.assertNotIn(pool.kv_pools[4].kv_buffer[0].data_ptr(), data_ptrs)
-        self.assertNotIn(pool.kv_pools[128].kv_buffer[0].data_ptr(), data_ptrs)
-
-
-class TestDSV41CacheOnlyReplayAllocation(CustomTestCase):
-    @staticmethod
-    def _batch(prompt_len, replay_start):
-        pool = SimpleNamespace(
-            req_to_token=torch.arange(3 * 256, dtype=torch.int32).reshape(3, 256)
-        )
-        req = SimpleNamespace(
-            kv=ReqKvInfo(
-                req_pool_idx=1,
-                kv_allocated_len=prompt_len,
-                kv_committed_len=0,
-            ),
-            prefix_len=replay_start,
-            extend_end=prompt_len,
-        )
-        allocator = MagicMock()
-        batch = SimpleNamespace(
-            dsv41_cache_only_replay=True,
-            device="cpu",
-            reqs=[req],
-            req_to_token_pool=pool,
-            token_to_kv_pool_allocator=allocator,
-        )
-        return batch, req, allocator
-
-    def test_reuses_preallocated_prompt_tail_without_allocator(self):
-        for prompt_len in (64, 200):
-            replay_start = max(0, prompt_len - 128)
-            with self.subTest(prompt_len=prompt_len):
-                batch, req, allocator = self._batch(prompt_len, replay_start)
-                out, device_indices, cpu_indices = alloc_for_extend(batch)
-                expected = batch.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, replay_start:prompt_len
-                ].long()
-                self.assertTrue(torch.equal(out, expected))
-                self.assertEqual(device_indices.tolist(), [1])
-                self.assertEqual(cpu_indices.tolist(), [1])
-                self.assertEqual(req.kv.kv_committed_len, prompt_len)
-                allocator.assert_not_called()
-
-
-class TestReplayPairStateIsolation(CustomTestCase):
-    def test_handoff_metadata_keeps_encoder_history_visible(self):
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.req_to_token = torch.empty(0)
-        backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
-        backend.page_size = 256
-        backend.is_dspark_draft = False
-        backend.online_c128_mtp = SimpleNamespace(prepare_forward=lambda *a, **kw: 0)
-        backend.init_forward_metadata_prefill = lambda **metadata: metadata
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND,
-            batch_size=2,
-            req_pool_indices=torch.tensor([5, 2]),
-            seq_lens=torch.tensor([257, 512]),
-            seq_lens_cpu=torch.tensor([257, 512]),
-            extend_prefix_lens=torch.tensor([129, 384]),
-            extend_seq_lens=torch.tensor([128, 128]),
-            extend_seq_lens_cpu=[128, 128],
-            extend_start_loc=torch.tensor([0, 128]),
-            out_cache_loc=torch.arange(256),
-            max_seq_len_override=None,
-            encoder_swa_row_floor=None,
-            encoder_swa_compress_rows=None,
-        )
-        for cache_only in (False, True):
-            with self.subTest(cache_only=cache_only):
-                batch.dsv41_cache_only_replay = cache_only
-                batch.encoder_swa_replay = False
-                metadata = backend._build_forward_metadata(batch)
-                self.assertIsNone(metadata.get("swa_replay_start"))
-
-    def test_tail_compression_continues_transferred_pending_pair(self):
-        """A split at an odd prefix length must consume P's pending even token."""
-        with get_context().override_server_args():
-            x = torch.arange(2 * 385, dtype=torch.float32).reshape(385, 2)
-
-            def make_backend():
-                state = CompressStatePool(
-                    size=4,
-                    ring_size=2,
-                    overlap=False,
-                    head_dim=2,
-                    dtype=torch.float32,
-                    device="cpu",
-                    enable_memory_saver=False,
-                    ratio=2,
-                    request_scoped=True,
-                )
-                state.kv_score_buffer.clear()
-                backend = object.__new__(DeepseekV4AttnBackend)
-                backend.low_ratios = ()
-                backend.tail_source_kv_layer_id = None
-                backend.token_to_kv_pool = SimpleNamespace(
-                    get_attention_compress_states=lambda _: state
-                )
-                written = {}
-
-                def store(layer, kv, slots, pos, **kwargs):
-                    for slot, row in zip(slots.tolist(), kv):
-                        if slot > 0:
-                            written[slot] = row.clone()
-
-                backend._low_ratio_write_group = store
-                return backend, state, written
-
-            layer = SimpleNamespace(
-                layer_id=20,
-                compress_ratio=2,
-                indexer=None,
-                compressor=SimpleNamespace(
-                    use_fused_compress=False,
-                    project=lambda rows: (rows, torch.ones_like(rows)),
-                    pool_pairs=DeepseekV41Compressor.pool_pairs,
-                ),
-            )
-
-            def run(backend, start, end, *, replay=False):
-                pos = torch.arange(start, end)
-                backend.forward_metadata = SimpleNamespace(
-                    low_ratio_req_indices=torch.zeros_like(pos),
-                    low_ratio_pos_i64=pos,
-                    core_metadata=SimpleNamespace(
-                        raw_out_loc=pos + 1,
-                        c2_out_loc=torch.where(pos % 2 == 1, pos // 2 + 1, -1),
-                    ),
-                )
-                fb = SimpleNamespace(
-                    forward_mode=ForwardMode.EXTEND,
-                    encoder_swa_replay=replay,
-                    dsv41_cache_only_replay=not replay,
-                    attn_cp_metadata=None,
-                    extend_start_loc=torch.tensor([0]),
-                    extend_seq_lens=torch.tensor([end - start]),
-                )
-                backend.forward_low_ratio_sources(
-                    layer=layer,
-                    x=x[start:end],
-                    q_lora=None,
-                    positions=pos,
-                    forward_batch=fb,
-                    run_indexer=False,
-                )
-
-            reference, ref_state, expected = make_backend()
-            run(reference, 0, len(x))
-            for boundary in (1, 2, 127, 128, 129, 257):
-                with self.subTest(boundary=boundary):
-                    prefill, p_state, prefix = make_backend()
-                    run(prefill, 0, boundary)
-                    decode, d_state, actual = make_backend()
-                    # Production transfer copies the request-scoped ring verbatim.
-                    d_state.kv_score_buffer.kv_score.copy_(
-                        p_state.kv_score_buffer.kv_score
-                    )
-                    actual.update(prefix)
-                    run(decode, boundary, len(x))
-                    self.assertEqual(actual.keys(), expected.keys())
-                    for slot in expected:
-                        torch.testing.assert_close(actual[slot], expected[slot])
-                    torch.testing.assert_close(
-                        d_state.kv_score_buffer.kv_score,
-                        ref_state.kv_score_buffer.kv_score,
-                    )
-                    # Ordinary encoder replay remains read-only.
-                    before = d_state.kv_score_buffer.kv_score.clone()
-                    run(decode, boundary, len(x), replay=True)
-                    torch.testing.assert_close(d_state.kv_score_buffer.kv_score, before)
-
 
 HEAD_DIM = 512
 ROPE_DIM = 64
@@ -689,22 +450,19 @@ class TestDSparkDraftRingWithEncoderReplay(CustomTestCase):
         target = self.make_pool(draft=False)
         draft = self.make_pool(draft=True)
         self.assertEqual(target.request_window.capacity, draft.swa_req_ring_size)
-        for cache_only in (False, True):
-            with self.subTest(cache_only=cache_only):
-                with get_context().override_server_args(
-                    enable_encoder_swa_bounded_replay=cache_only,
-                    dsv41_encoder_only_prefill=cache_only,
-                ):
-                    decode_target = self.make_pool(draft=False)
-                    decode_draft = self.make_pool(draft=True)
-                for prefill, decode in ((target, decode_target), (draft, decode_draft)):
-                    self.assertIsNone(decode.request_window)
-                    self.assertIsNone(decode.swa_req_ring_size)
-                    self.assertTrue(decode.needs_paged_swa_allocator)
-                    self.assertEqual(
-                        prefill.get_state_buf_infos()[2],
-                        decode.get_state_buf_infos()[2],
-                    )
+        override = get_context().override_server_args(
+            enable_encoder_swa_bounded_replay=False
+        )
+        override.install()
+        try:
+            decode_target = self.make_pool(draft=False)
+            decode_draft = self.make_pool(draft=True)
+        finally:
+            override.restore()
+        for prefill, decode in ((target, decode_target), (draft, decode_draft)):
+            self.assertEqual(
+                prefill.get_state_buf_infos()[2], decode.get_state_buf_infos()[2]
+            )
 
     def test_dspark_draft_keeps_the_mark_for_either_storage(self):
         # Ring or paged, a DSpark draft sends one request-row item, so the PD

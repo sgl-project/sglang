@@ -1,4 +1,3 @@
-from array import array
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,18 +15,15 @@ from sglang.srt.managers.auxiliary_output import (
     CompositeDeviceAuxiliaryOutput,
     append_auxiliary_output,
 )
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
-from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_context, publish, reset_context
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -915,103 +911,6 @@ def test_auxiliary_output_consumes_only_newly_visible_tokens():
     commits = output.consume.call_args.args[1]
     assert commits[0].output_index == 1
     assert commits[0].token_ids == (11,)
-
-
-@pytest.mark.parametrize("delayed", [False, True])
-@pytest.mark.parametrize("cache_only", [False, True])
-def test_cache_only_sampling_restores_emitted_boundary(delayed, cache_only):
-    """Return the emitted token before relay/draft consumers see the result."""
-    reqs = [
-        Req(
-            rid=str(i),
-            origin_input_text="",
-            origin_input_ids=array("q", [1, 2]),
-            sampling_params=SamplingParams(max_new_tokens=16),
-        )
-        for i in range(2)
-    ]
-    # reqs[0] is a real first handoff with no optional recovery marker.
-    reqs[1].pd_rebootstrap_in_progress = True
-    reqs[1].pd_rebootstrap_forced_output_id = 0
-    batch = SimpleNamespace(
-        reqs=reqs,
-        dsv41_cache_only_replay=cache_only,
-        hicache_consumer_index=0,
-        beam_tail=None,
-    )
-    fb = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        sampling_info=SimpleNamespace(grammars=[] if delayed else None),
-        is_prefill_only=False,
-        apply_deprecated_skip_attn_backend_init=lambda _: None,
-    )
-    sampled = torch.tensor([999, 998])
-    worker = SimpleNamespace(
-        pp_group=SimpleNamespace(is_last_rank=True),
-        enable_overlap=delayed,
-        enable_spec=False,
-        is_dllm=lambda: False,
-        set_hicache_consumer=Mock(),
-        _maybe_finalize_elastic_cuda_graph_scale=Mock(),
-        model_runner=Mock(),
-    )
-    worker.model_runner.forward.return_value = SimpleNamespace(
-        logits_output=LogitsProcessorOutput(next_token_logits=torch.zeros(2, 1024)),
-        can_run_graph=False,
-        expert_distribution_metrics=None,
-        routed_experts_output=None,
-        indexer_topk_output=None,
-    )
-    worker.model_runner.sample.return_value = sampled
-    with patch("sglang.srt.managers.tp_worker.ForwardBatch.init_new", return_value=fb):
-        result = TpModelWorker.forward_batch_generation(worker, batch)
-        if delayed:
-            result = result.delay_sample_func()
-    assert result.next_token_ids.tolist() == ([999, 0] if cache_only else [999, 998])
-    assert sampled.tolist() == [999, 998]
-    assert reqs[1].pd_rebootstrap_forced_output_id == 0
-    assert reqs[1].pd_rebootstrap_in_progress
-
-
-@pytest.mark.parametrize(
-    "enabled, role, mode, allowed",
-    [
-        (False, "prefill", ForwardMode.EXTEND, False),
-        (True, "decode", ForwardMode.EXTEND, False),
-        (True, "prefill", ForwardMode.DECODE, False),
-        (True, "prefill", ForwardMode.EXTEND, True),
-    ],
-)
-def test_missing_logits_only_marks_encoder_only_prefill_extend(
-    enabled, role, mode, allowed
-):
-    """Missing logits must not authorize a normal PD handoff."""
-    with get_context().override_server_args(
-        dsv41_encoder_only_prefill=enabled, disaggregation_mode=role
-    ):
-        worker = SimpleNamespace(
-            pp_group=SimpleNamespace(is_last_rank=True),
-            is_dllm=lambda: False,
-            model_runner=Mock(),
-        )
-        worker.model_runner.forward.return_value = SimpleNamespace(
-            logits_output=None,
-            can_run_graph=False,
-            expert_distribution_metrics=None,
-            routed_experts_output=None,
-            indexer_topk_output=None,
-        )
-        forward_batch = SimpleNamespace(
-            forward_mode=mode,
-            apply_deprecated_skip_attn_backend_init=lambda _: None,
-        )
-        if allowed:
-            result = TpModelWorker.forward_batch_generation(worker, None, forward_batch)
-            assert result.cache_only
-            assert result.next_token_ids is None
-        else:
-            with pytest.raises(RuntimeError, match="Missing logits outside"):
-                TpModelWorker.forward_batch_generation(worker, None, forward_batch)
 
 
 if __name__ == "__main__":

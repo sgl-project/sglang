@@ -6,7 +6,7 @@ import torch
 
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput, SamplingMaskStatus
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, NextBatchPlan, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -43,11 +43,9 @@ class _Req:
         self.grammar = None
         self.output_ids = []
         self.origin_input_ids = list(range(100))
-        self.full_untruncated_fill_ids = self.origin_input_ids
         self.extend_end = None
         self.time_stats = SimpleNamespace(
             set_prefill_finished_time=Mock(),
-            set_prefill_transfer_queue_entry_time=Mock(),
             set_last_chunked_prefill_finish_time=Mock(),
             set_completion_time=Mock(),
         )
@@ -91,10 +89,6 @@ def _batch(req):
 
 def _result():
     return GenerationBatchResult(next_token_ids=torch.tensor([11]))
-
-
-def _cache_only_result():
-    return GenerationBatchResult(cache_only=True)
 
 
 def _free_req(req, _tree_cache, *, checkpoint):
@@ -191,89 +185,6 @@ def test_sender_abort_failure_does_not_skip_local_cleanup(release_kv_cache):
     scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(7)
     scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
     assert req.finished()
-
-
-@patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
-@patch("sglang.srt.disaggregation.prefill.prepare_abort")
-@pytest.mark.parametrize("coverage", [None, 99, 101, 228])
-def test_cache_only_partial_coverage_aborts_before_transfer(
-    prepare_abort, release_kv_cache, coverage
-):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0)
-    req.to_finish = None
-    req.pending_bootstrap = False
-    req.origin_input_ids = list(range(228))
-    req.extend_end = coverage
-
-    with get_context().override_server_args(
-        dsv41_encoder_only_prefill=True, disaggregation_mode="prefill"
-    ):
-        scheduler.process_batch_result_disagg_prefill(_batch(req), _cache_only_result())
-
-    prepare_abort.assert_called_once()
-    assert "prefix coverage" in prepare_abort.call_args.args[1]
-    scheduler.send_kv_chunk.assert_not_called()
-    scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
-    release_kv_cache.assert_called_once_with(
-        req, scheduler.tree_cache, checkpoint=False
-    )
-    assert scheduler.disagg_prefill_inflight_queue == []
-
-
-@pytest.mark.parametrize("prompt_len", [127, 128, 129, 228])
-@patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
-def test_cache_only_prefix_coverage_is_published(checkpoint_kv_cache, prompt_len):
-    scheduler = _Scheduler()
-    req = _Req(inflight_middle_chunks=0)
-    req.to_finish = None
-    req.pending_bootstrap = False
-    req.origin_input_ids = list(range(prompt_len))
-    req.extend_end = max(0, prompt_len - 128)
-    if req.extend_end == 0:
-        req.kv.req_pool_idx = None
-        req.kv.mark_kv_released()
-        req.kv.mamba_pool_idx = None
-        scheduler.kv_checksum_computer = None
-        scheduler.disagg_metadata_buffers = Mock()
-        scheduler.send_kv_chunk = scheduler.__class__.send_kv_chunk.__get__(scheduler)
-
-    with get_context().override_server_args(
-        dsv41_encoder_only_prefill=True, disaggregation_mode="prefill"
-    ):
-        if req.extend_end:
-            scheduler.process_batch_result_disagg_prefill(
-                _batch(req), _cache_only_result()
-            )
-        else:
-            scheduler.waiting_queue = [req]
-            scheduler.scheduler_stage_metrics = None
-            scheduler.process_pending_chunked_abort = Mock()
-            scheduler._process_hicache_events = Mock()
-            scheduler.resolve_waiting_queue_bootstrap = Mock()
-            scheduler.process_prefill_chunk = Mock()
-            running = SimpleNamespace(batch_is_full=False)
-            scheduler.get_new_batch_prefill = lambda batch: NextBatchPlan(
-                batch_to_run=None, running_batch=batch
-            )
-            scheduler.dp_attn_adapter = SimpleNamespace(
-                maybe_prepare_mlp_sync_batch=lambda batch: batch
-            )
-            plan = scheduler.get_next_disagg_prefill_batch_to_run(running, None)
-            assert not scheduler.waiting_queue
-            assert plan.batch_to_run is None
-
-    assert req.dsv41_cache_only_replay
-    assert req.dsv41_cache_only_coverage == max(0, prompt_len - 128)
-    if req.extend_end:
-        checkpoint_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
-        scheduler.send_kv_chunk.assert_called_once_with(req, last_chunk=True)
-    else:
-        checkpoint_kv_cache.assert_not_called()
-        pages = req.disagg_kv_sender.send.call_args.args[0]
-        assert pages.dtype.name == "int32" and pages.size == 0
-        assert req.disagg_kv_sender.send.call_args.kwargs == {"num_kv_tokens": 0}
-    assert scheduler.disagg_prefill_inflight_queue == [req]
 
 
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)

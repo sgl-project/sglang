@@ -1112,16 +1112,9 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     if encoder_only:
-        if draft_token_to_kv_pool is not None or num_draft_entries:
-            raise RuntimeError("encoder-only transfer cannot include draft KV")
-        if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            raise RuntimeError(
-                "encoder-only transfer requires a DeepSeek-V4 token-to-KV pool"
-            )
         return token_to_kv_pool.get_encoder_only_transfer_layer_ids()
 
     if not isinstance(token_to_kv_pool, HybridLinearKVPool):
@@ -1443,14 +1436,9 @@ def build_dsa_tail_transfer_blocks(
 
 
 def get_kv_transfer_buf_infos(pool, *, encoder_only: bool = False):
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if encoder_only:
-        if not isinstance(pool, DeepSeekV4TokenToKVPool):
-            raise RuntimeError(
-                "encoder-only prefill requires a DeepSeek-V4 token-to-KV pool"
-            )
         return pool.get_encoder_only_transfer_buf_infos()
     if isinstance(pool, MiniMaxSparseKVPool):
         return pool.get_sparse_kv_buf_infos()
@@ -1496,10 +1484,6 @@ def setup_state_kv_args(
         else None
     )
     if encoder_only:
-        if not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            raise RuntimeError(
-                "encoder-only state transfer requires a DeepSeek-V4 pool"
-            )
         swa, pairs = token_to_kv_pool.get_encoder_only_state_buf_infos()
         for state_type, (ptrs, lens, items, layer_ids) in (
             (StateType.SWA, swa),

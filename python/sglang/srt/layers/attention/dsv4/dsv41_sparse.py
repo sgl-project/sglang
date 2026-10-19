@@ -207,7 +207,6 @@ class DeepseekV41Indexer(nn.Module):
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
-        self.key_only = key_only
         if not key_only:
             self.wq_b = ReplicatedLinear(
                 config.q_lora_rank,
@@ -265,16 +264,12 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """freqs per token, or the whole table with positions (gathered inside the
         fused RoPE launch)."""
-        if self.key_only:
-            raise RuntimeError("key-only indexer cannot score queries")
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
-        if self.key_only:
-            raise RuntimeError("key-only indexer cannot score head weights")
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 

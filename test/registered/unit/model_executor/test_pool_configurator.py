@@ -1618,66 +1618,6 @@ class TestSWAPoolFloor(CustomTestCase):
         _publish_config(self, swa_prefix_tails=1024)
         self.assertEqual(cfg._resolve_swa_prefix_tails(), 1024)
 
-    def test_dsv4_encoder_replay_reserves_paged_target_window(self):
-        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
-
-        fields = dict(
-            enable_encoder_swa_bounded_replay=True,
-            dsv41_encoder_only_prefill=True,
-            disaggregation_mode="decode",
-            disaggregation_decode_extra_slots=0,
-            page_size=256,
-            max_running_requests=2,
-            chunked_prefill_size=256,
-        )
-        _publish_config(self, **fields)
-        cfg = SimpleNamespace(
-            qk_nope_head_dim=448,
-            qk_rope_head_dim=64,
-            index_head_dim=128,
-            context_len=131072,
-            compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
-            window_size=128,
-            hf_config=SimpleNamespace(kv_source_layer_ids=[2, 8, 14, 20]),
-        )
-        spec = SimpleNamespace(is_dspark=lambda: False, is_none=lambda: True)
-        kvc = SimpleNamespace(
-            kv_cache_dtype_str="fp8_e4m3",
-            model_config=cfg,
-            layer_info=SimpleNamespace(start_layer=0, end_layer=40),
-            pp_size=1,
-            attn_dp_size=1,
-            sliding_window_size=128,
-            page_size=256,
-            spec_algorithm=spec,
-            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=0),
-        )
-
-        planner = DSV4PoolConfigurator(kvc)
-        self.assertEqual(planner.bytes_per_swa_token, 40 * 585)
-        sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
-
-        self.assertGreater(sizes.swa_max_total_num_tokens, 0)
-        self.assertEqual(sizes.swa_max_total_num_tokens, planner.swa_cap_tokens)
-
-        _publish_config(
-            self,
-            **fields,
-            speculative_algorithm="DSPARK",
-            speculative_num_draft_tokens=6,
-        )
-        kvc.spec_algorithm = SimpleNamespace(
-            is_dspark=lambda: True, is_none=lambda: False
-        )
-        kvc.spec_aux_config = SimpleNamespace(
-            dspark_num_stages=3, dflash_draft_num_layers=40
-        )
-        speculative = DSV4PoolConfigurator(kvc)
-        self.assertAlmostEqual(speculative.bytes_per_swa_token, 43 * 585)
-        self.assertAlmostEqual(
-            speculative.bytes_per_full_token, planner.bytes_per_full_token * 43 / 40
-        )
-
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 

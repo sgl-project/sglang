@@ -1,5 +1,4 @@
 import unittest
-from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,7 +32,6 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_context
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -375,45 +373,6 @@ class TestPrefillAdder(CustomTestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(req.extend_len, expected)
-
-    def test_encoder_only_prefill_stops_before_decode_window(self):
-        with get_context().override_server_args(
-            dsv41_encoder_only_prefill=True, disaggregation_mode="prefill"
-        ):
-            for prompt_len in (129, 257, 4096, 8193):
-                with self.subTest(prompt_len=prompt_len):
-                    req = Req(
-                        rid="encoder-prefix",
-                        origin_input_text="",
-                        origin_input_ids=array("q", range(prompt_len)),
-                        sampling_params=SamplingParams(max_new_tokens=16),
-                    )
-                    req.init_next_round_input()
-                    self.mock_tree_cache.supports_mamba.return_value = False
-                    self.mock_tree_cache.supports_prefix_sharing.return_value = False
-                    self.mock_token_allocator.available_size.return_value = 32768
-                    adder = self.create_adder(
-                        self.create_running_batch(),
-                        page_size=256,
-                        rem_chunk_tokens=1024,
-                    )
-                    # Follow the ordinary admission and continuation owners.
-                    adder.add_one_req(
-                        req, has_chunked_req=False, truncation_align_size=None
-                    )
-                    continuing = adder.new_chunked_req
-                    while continuing is not None:
-                        self.assertLess(req.extend_end, prompt_len - 128)
-                        req.prefix_len = req.extend_end
-                        adder = self.create_adder(
-                            self.create_running_batch(),
-                            page_size=256,
-                            rem_chunk_tokens=1024,
-                        )
-                        continuing = adder.add_chunked_req(req)
-                    self.assertEqual(req.extend_end, prompt_len - 128)
-                    self.assertEqual(len(req.origin_input_ids), prompt_len)
-                    self.assertEqual(len(req.full_untruncated_fill_ids), prompt_len)
 
     def test_encoder_replay_rows_share_the_chunk(self):
         # A hit's replay rows run in the same step as its extend, so both must

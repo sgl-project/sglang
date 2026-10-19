@@ -3675,11 +3675,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_for_decode(self):
-        # Cache-only EXTEND is a one-shot reconstruction pass.  Clear both the
-        # batch marker and its request copies before constructing any DECODE
-        # ForwardBatch; otherwise ratio-2 producer logic keeps treating every
-        # subsequent decode token as replay state, and a retracted request can
-        # be re-admitted through the cache-only queue path.
+        # The handoff marker applies only to the first EXTEND, not later decode
+        # steps or a locally resumed request.
         if self.dsv41_cache_only_replay:
             self.dsv41_cache_only_replay = False
             for req in self.reqs:

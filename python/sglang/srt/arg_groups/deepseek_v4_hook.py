@@ -286,10 +286,68 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     )
 
     cfg = resolving_view(server_args)
+    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+        if cfg.dsv41_encoder_only_prefill:
+            raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
+        if cfg.enable_encoder_swa_bounded_replay:
+            raise ValueError(
+                "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
+            )
+        return
+    if (
+        cfg.dsv4_attn_backend == "trtllm"
+        and cfg.cuda_graph_config.prefill.backend
+        not in (Backend.DISABLED, Backend.BREAKABLE)
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
+            "disabled or breakable"
+        )
+    if cfg.enable_encoder_swa_bounded_replay:
+        incompatible = (
+            (
+                "hardware other than CUDA or gfx950",
+                not (
+                    get_platform().is_cuda
+                    or (get_platform().is_hip and is_gfx95_supported())
+                ),
+            ),
+            (
+                "prefill CUDA graphs other than breakable",
+                cfg.cuda_graph_config.prefill.backend
+                not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            # ROCm replays hits in a forward of their own, outside the graph.
+            (
+                "the prefill CUDA graph on ROCm",
+                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
+                and get_platform().is_hip,
+            ),
+            ("context parallelism", cfg.attn_cp_size > 1),
+            # ROCm replays hits in a forward of their own, which only the hitting
+            # attention-DP ranks would enter; CUDA folds them into the extend.
+            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
+            ("external cache linker", cfg.enable_unified_cache_external_linker),
+            ("unified memory", cfg.enable_unified_memory),
+            # Decode receives the last SWA window from prefill and never replays.
+            ("PD decode", cfg.disaggregation_mode == "decode"),
+            # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
+            (
+                "PD prefill on ROCm",
+                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
+            ),
+            ("mixed prefill/decode", cfg.enable_mixed_chunk),
+            ("LoRA", cfg.enable_lora),
+            ("radix sessions", cfg.enable_session_radix_cache),
+        )
+        for feature, enabled in incompatible:
+            if enabled:
+                raise ValueError(
+                    f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
+                )
+
     if cfg.dsv41_encoder_only_prefill:
         hf_config = model_config_of(server_args).hf_config
-        if hf_config.model_type != "deepseek_v41":
-            raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
         if getattr(hf_config, "vision_n_layers", 0) > 0 and not getattr(
             hf_config, "language_model_only", False
         ):
@@ -346,6 +404,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("unified memory", cfg.enable_unified_memory),
             ("radix sessions", cfg.enable_session_radix_cache),
             ("KV checksum", cfg.disaggregation_enable_kv_checksum),
+            ("encoder SWA bounded replay", cfg.enable_encoder_swa_bounded_replay),
+            ("TRT-LLM attention", cfg.dsv4_attn_backend == "trtllm"),
             (
                 "speculative decoding except Decode-local DSpark",
                 cfg.speculative_algorithm is not None
@@ -367,77 +427,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "to be disabled"
             )
         if cfg.disaggregation_mode == "decode":
-            # Reuse encoder replay's token-input validation.
-            # The cache-only EXTEND itself performs replay;
-            # this role retains paged SWA and never allocates RequestWindow.
             declare_resolution(
                 server_args,
                 "validate_deepseek_v41_features",
-                enable_encoder_swa_bounded_replay=True,
                 enable_decoder_swa_bounded_replay=True,
             )
-
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
-        if cfg.enable_encoder_swa_bounded_replay:
-            raise ValueError(
-                "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
-            )
-        return
-    if (
-        cfg.dsv4_attn_backend == "trtllm"
-        and cfg.cuda_graph_config.prefill.backend
-        not in (Backend.DISABLED, Backend.BREAKABLE)
-    ):
-        raise ValueError(
-            "DeepSeek-V4.1 TRT-LLM requires --cuda-graph-backend-prefill "
-            "disabled or breakable"
-        )
-    if cfg.enable_encoder_swa_bounded_replay:
-        incompatible = (
-            (
-                "hardware other than CUDA or gfx950",
-                not (
-                    get_platform().is_cuda
-                    or (get_platform().is_hip and is_gfx95_supported())
-                ),
-            ),
-            (
-                "prefill CUDA graphs other than breakable",
-                cfg.cuda_graph_config.prefill.backend
-                not in (Backend.DISABLED, Backend.BREAKABLE),
-            ),
-            # ROCm replays hits in a forward of their own, outside the graph.
-            (
-                "the prefill CUDA graph on ROCm",
-                cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
-                and get_platform().is_hip,
-            ),
-            ("context parallelism", cfg.attn_cp_size > 1),
-            # ROCm replays hits in a forward of their own, which only the hitting
-            # attention-DP ranks would enter; CUDA folds them into the extend.
-            ("DP attention on ROCm", get_platform().is_hip and attn_dp_enabled_of(cfg)),
-            ("external cache linker", cfg.enable_unified_cache_external_linker),
-            ("unified memory", cfg.enable_unified_memory),
-            # Decode receives the last SWA window from prefill and never replays.
-            (
-                "PD decode",
-                cfg.disaggregation_mode == "decode"
-                and not cfg.dsv41_encoder_only_prefill,
-            ),
-            # On ROCm the draft keeps paged SWA, so it cannot share the window's pages.
-            (
-                "PD prefill on ROCm",
-                cfg.disaggregation_mode == "prefill" and get_platform().is_hip,
-            ),
-            ("mixed prefill/decode", cfg.enable_mixed_chunk),
-            ("LoRA", cfg.enable_lora),
-            ("radix sessions", cfg.enable_session_radix_cache),
-        )
-        for feature, enabled in incompatible:
-            if enabled:
-                raise ValueError(
-                    f"--enable-encoder-swa-bounded-replay does not support {feature} yet"
-                )
 
     unsupported = (
         (

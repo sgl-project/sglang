@@ -573,7 +573,7 @@ class SchedulerDisaggregationPrefillMixin:
                 prefetch(room)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
-        if req.extend_end == 0:
+        if get_disagg().dsv41_encoder_only_prefill and req.extend_end == 0:
             # Empty prefixes own no row and publish no cache entry.
             return
         cache = self.tree_cache
@@ -880,7 +880,10 @@ class SchedulerDisaggregationPrefillMixin:
 
     def finish_encoder_only_prefill(self: Scheduler, req: Req) -> None:
         """Publish the prefix boundary, including a metadata-only empty prefix."""
-        req.time_stats.set_prefill_finished_time()
+        now = time.perf_counter()
+        if req.extend_end == 0:
+            req.time_stats.set_forward_entry_time(now)
+        req.time_stats.set_prefill_finished_time(now)
         req.dsv41_cache_only_replay = True
         req.dsv41_cache_only_coverage = req.extend_end
         self.checkpoint_disagg_prefill(req)
@@ -926,67 +929,6 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
 
-        if result.cache_only:
-            aborted_reqs: List[Req] = []
-            for req in batch.reqs:
-                if req.inflight_middle_chunks <= 0:
-                    req.time_stats.set_prefill_finished_time()
-                    if is_aborted(req):
-                        if self._retire_aborted_prefill_result(req):
-                            req.time_stats.set_completion_time()
-                            aborted_reqs.append(req)
-                        continue
-                    if req.pending_bootstrap and should_force_retry(req):
-                        self.optimistic_release_and_requeue(req)
-                        continue
-                    coverage = req.extend_end if req.extend_end is not None else 0
-                    if coverage != prefill_input_len(req):
-                        error_message = (
-                            "DeepSeek-V4.1 cache-only Prefill finished without "
-                            f"prefix coverage: request={req.rid} "
-                            f"coverage={coverage} prompt_len={len(req.origin_input_ids)}"
-                        )
-                        logger.error(error_message)
-                        prepare_abort(
-                            req,
-                            error_message,
-                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                        )
-                        if self._retire_aborted_prefill_result(req):
-                            req.time_stats.set_completion_time()
-                            aborted_reqs.append(req)
-                        continue
-                    self.finish_encoder_only_prefill(req)
-                else:
-                    req.inflight_middle_chunks -= 1
-                    still_chunking = self.chunked_req is req or (
-                        req.extend_end is not None
-                        and req.extend_end >= prefill_input_len(req)
-                    )
-                    if is_aborted(req):
-                        if not still_chunking and self._retire_aborted_prefill_result(
-                            req
-                        ):
-                            req.time_stats.set_completion_time()
-                            aborted_reqs.append(req)
-                    elif req.pending_bootstrap and not still_chunking:
-                        self.optimistic_release_and_requeue(req)
-                    elif self.enable_overlap and not req.pending_bootstrap:
-                        self.send_kv_chunk(
-                            req, last_chunk=False, end_idx=req.tmp_end_idx
-                        )
-                    req.time_stats.set_last_chunked_prefill_finish_time()
-            if aborted_reqs:
-                self.output_streamer.stream_output(aborted_reqs, False)
-            self.metrics_reporter.report_prefill_stats(
-                batch=batch,
-                prefill_stats=batch.prefill_stats,
-                can_run_cuda_graph=result.can_run_cuda_graph,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            )
-            self.maybe_send_health_check_signal()
-            return
-
         logprob_pt = 0
         aborted_reqs: List[Req] = []
         assert batch.spec_info is result.next_draft_input
@@ -1002,7 +944,11 @@ class SchedulerDisaggregationPrefillMixin:
                     "cpu", non_blocking=False
                 )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        next_token_ids = result.next_token_ids.tolist()
+        next_token_ids = (
+            [None] * len(batch.reqs)
+            if result.cache_only
+            else result.next_token_ids.tolist()
+        )
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
@@ -1041,6 +987,21 @@ class SchedulerDisaggregationPrefillMixin:
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
                     advance_logprob_pt(i, req)
+                    continue
+
+                if result.cache_only:
+                    if req.extend_end != prefill_input_len(req):
+                        prepare_abort(
+                            req,
+                            f"Invalid encoder-only prefix coverage for {req.rid}: "
+                            f"got {req.extend_end}, expected {prefill_input_len(req)}",
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                        if self._retire_aborted_prefill_result(req):
+                            req.time_stats.set_completion_time()
+                            aborted_reqs.append(req)
+                        continue
+                    self.finish_encoder_only_prefill(req)
                     continue
 
                 sampling_mask_finish_reason = None
@@ -1136,7 +1097,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # is neither, so do its deferred release here.
                 still_chunking = self.chunked_req is req or (
                     req.extend_end is not None
-                    and req.extend_end >= len(req.origin_input_ids)
+                    and req.extend_end
+                    >= (
+                        prefill_input_len(req)
+                        if result.cache_only
+                        else len(req.origin_input_ids)
+                    )
                 )
                 # Abort is terminal. Do not requeue an aborted optimistic
                 # request merely because bootstrap is still pending.
@@ -1249,9 +1215,12 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                 elif (
                     poll == KVPoll.Bootstrapping
-                    and req.kv.holds_kv
                     and get_disagg().disaggregation_decode_allocation_policy
                     != "prefill_complete"
+                    and (
+                        not get_disagg().dsv41_encoder_only_prefill
+                        or req.extend_end != 0
+                    )
                     and self.req_to_token_pool.available_size() == 0
                     and (
                         self.waiting_queue
@@ -1279,7 +1248,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finished_reason = FINISH_LENGTH(length=0)
                 # unlock the tree
-                if req.kv.holds_kv:
+                if not get_disagg().dsv41_encoder_only_prefill or req.extend_end != 0:
                     release_kv_cache(req, self.tree_cache, checkpoint=True)
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.SUCCESS

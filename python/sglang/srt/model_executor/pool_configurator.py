@@ -1175,10 +1175,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 max_speculative_num_draft_tokens() or 0
             )
 
-        self.encoder_replay = (
-            get_exec().features.enable_encoder_swa_bounded_replay
-            and not get_disagg().dsv41_encoder_only_prefill
-        )
+        self.encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         draft_layers = 0
         if self.encoder_replay and kvc.spec_algorithm.is_dspark():
             aux = kvc.spec_aux_config

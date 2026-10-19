@@ -3272,13 +3272,7 @@ class DeepseekV4AttnBackend(
                         )
             return
         if run_compressor and layer.compressor is not None:
-            self._low_ratio_compress(
-                layer,
-                x,
-                req,
-                pos,
-                forward_batch,
-            )
+            self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
@@ -3531,14 +3525,7 @@ class DeepseekV4AttnBackend(
             )
 
     def _low_ratio_compress_torch(
-        self,
-        layer,
-        x,
-        req,
-        pos,
-        projected=None,
-        *,
-        fuse_index_store=False,
+        self, layer, x, req, pos, projected=None, *, fuse_index_store=False
     ) -> None:
         core = self.forward_metadata.core_metadata
         num_tokens = pos.shape[0]

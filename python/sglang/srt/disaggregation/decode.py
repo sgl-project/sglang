@@ -2628,7 +2628,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
-        cache_only = bool(cached_tokens[CACHE_ONLY_METADATA_SLOT].item())
+        cache_only = get_disagg().dsv41_encoder_only_prefill and bool(
+            cached_tokens[CACHE_ONLY_METADATA_SLOT].item()
+        )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # Seed already_computed with the prefill-reported cache hit so decode
         # admission does not count the shared prefix twice.
@@ -3329,7 +3331,7 @@ class SchedulerDisaggregationDecodeMixin:
         self._verify_kv_checksums(batch)
         if batch.is_empty():
             return None
-        if batch.dsv41_cache_only_replay:
+        if get_disagg().dsv41_encoder_only_prefill and batch.dsv41_cache_only_replay:
             # A cache-only handoff has no Prefill-sampled token. The EXTEND
             # forward must generate it; ordinary PREBUILT processing would
             # consume an absent token and alter the replay batch.
@@ -3421,13 +3423,16 @@ class SchedulerDisaggregationDecodeMixin:
         # Requests of the other type retain their queue order and compete again
         # on the next admission; strict priority can defer a lower-priority type,
         # just as it can defer lower-priority requests within a single type.
-        cache_only_batch = bool(self.waiting_queue[0].dsv41_cache_only_replay)
+        encoder_only = get_disagg().dsv41_encoder_only_prefill
+        cache_only_batch = (
+            encoder_only and self.waiting_queue[0].dsv41_cache_only_replay
+        )
         admitted = 0
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
             # PREBUILT and cache-only EXTEND have different forward semantics;
             # never combine them in one newly admitted batch.
-            if bool(req.dsv41_cache_only_replay) != cache_only_batch:
+            if encoder_only and req.dsv41_cache_only_replay != cache_only_batch:
                 waiting_queue.append(req)
                 continue
             # we can only add at least `num_not_used_batch` new batch to the running queue

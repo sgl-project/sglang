@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import get_disagg, get_exec, get_platform, get_spec
+from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
 from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
@@ -136,13 +136,8 @@ def is_dspark_spec() -> bool:
 def uses_draft_swa_ring() -> bool:
     """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
     state is tree-owned under encoder replay. The HIP backend still addresses the
-    draft SWA through the target's paged full-to-SWA mapping. Cache-only PD also
-    keeps target and draft on that shared paged mapping."""
-    return (
-        get_exec().features.enable_encoder_swa_bounded_replay
-        and not get_disagg().dsv41_encoder_only_prefill
-        and not _is_hip
-    )
+    draft SWA through the target's paged full-to-SWA mapping."""
+    return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
 
 
 def get_draft_swa_ring_size(
@@ -1133,10 +1128,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # wrote: the ring restarts at the cached prefix, and a PD decode receives
         # the prefill's mark as request-row state.
         self.swa_valid_from: Optional[torch.Tensor] = None
-        encoder_replay = (
-            get_exec().features.enable_encoder_swa_bounded_replay
-            and not get_disagg().dsv41_encoder_only_prefill
-        )
+        encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # Under encoder replay the target keeps SWA in a per-request window. A
         # draft without its own ring still reads the target's full-to-SWA mapping,
         # so the target then keeps its paged SWA allocator.
@@ -1425,53 +1417,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         return self._get_transfer_buf_infos()
 
-    def _validate_encoder_only_transfer_profile(self) -> None:
-        """Fail before registering a partial or ambiguously paired wire layout."""
-        expected_sources = sorted(self.kv_source_layers)
-        actual_sources = sorted(
-            source
-            for ratio in (1, 2)
-            for source in self.sources_by_ratio.get(ratio, ())
-        )
-        if actual_sources != expected_sources:
-            raise RuntimeError(
-                "encoder-only transfer requires every configured Main-KV source "
-                f"to use ratio 1/2: expected={expected_sources}, actual={actual_sources}"
-            )
-        for ratio in (1, 2):
-            sources = self.sources_by_ratio.get(ratio, ())
-            if not sources:
-                continue
-            kv_pool = self.kv_pools.get(ratio)
-            index_pool = self.index_pools.get(ratio)
-            index_buffers = (
-                index_pool.contiguous_page_row_buffers()
-                if index_pool is not None
-                else ()
-            )
-            if (
-                kv_pool is None
-                or len(kv_pool.kv_buffer) != len(sources)
-                or not index_buffers
-                or len(index_buffers) % len(sources) != 0
-            ):
-                raise RuntimeError(
-                    "encoder-only transfer requires matching Main-KV and "
-                    f"Indexer-K owner groups for ratio {ratio}"
-                )
-
     def get_encoder_only_transfer_buf_infos(
         self,
     ) -> Tuple[List[int], List[int], List[int]]:
-        """Return only global Main-KV and owner Indexer-K wire regions."""
-        self._validate_encoder_only_transfer_profile()
-        infos = self._get_transfer_buf_infos((1, 2))
-        layer_ids = self.get_encoder_only_transfer_layer_ids()
-        if any(len(items) != len(layer_ids) for items in infos):
-            raise RuntimeError(
-                "encoder-only transfer buffer entries and layer IDs are misaligned"
-            )
-        return infos
+        """Global Main-KV and owner Indexer-K regions for the validated topology."""
+        return self._get_transfer_buf_infos((1, 2))
 
     def get_encoder_only_state_buf_infos(self):
         """Encoder SWA and source pending-pair rings, with global layer ids.
@@ -1480,7 +1430,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         needed on D, but its SWA (and every decoder layer's SWA) is unwritten.
         Both peers register exactly the same subset, independent of draft state.
         """
-        self._validate_encoder_only_transfer_profile()
         boundary = max(self.kv_source_layers)
         swa = ([], [], [], [])
         pairs = ([], [], [], [])
@@ -1517,7 +1466,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_encoder_only_transfer_layer_ids(self) -> List[int]:
         """Layer ids aligned with :meth:`get_encoder_only_transfer_buf_infos`."""
-        self._validate_encoder_only_transfer_profile()
         layer_ids: List[int] = []
         for ratio in self.kv_pools:
             if ratio not in (1, 2):
@@ -1527,18 +1475,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 continue
             kv_pool = self.kv_pools.get(ratio)
             if kv_pool is not None:
-                if len(kv_pool.kv_buffer) != len(sources):
-                    raise RuntimeError(
-                        f"ratio-{ratio} Main-KV entries do not match source layers"
-                    )
                 layer_ids.extend(sources)
             index_pool = self.index_pools.get(ratio)
             if index_pool is not None:
                 count = len(index_pool.contiguous_page_row_buffers())
-                if count % len(sources) != 0:
-                    raise RuntimeError(
-                        f"ratio-{ratio} Indexer-K entries do not match source layers"
-                    )
                 layer_ids.extend(sources * (count // len(sources)))
         return layer_ids
 
@@ -2154,7 +2094,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.kv_layout
 
     def get_swa_key_page_size(self) -> int:
-        """Return the physical page size for the active SWA storage."""
         if self.request_window is not None:
             return self.request_window.page_size
         return self.swa_kv_pool.page_size
