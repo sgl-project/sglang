@@ -145,13 +145,16 @@ def bf16_lm_head_matmul(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Ten
     a weight-streaming kernel (SGLANG_ENABLE_BF16_SKINNY_LM_HEAD)."""
     hidden = hidden.to(weight.dtype)
     if envs.SGLANG_ENABLE_BF16_SKINNY_LM_HEAD.get():
-        from sglang.kernels.ops.gemm.bf16_skinny_gemm import (
-            bf16_skinny_gemm,
-            bf16_skinny_supported,
-        )
-
-        if bf16_skinny_supported(hidden, weight):
-            return bf16_skinny_gemm(hidden, weight)
+        try:
+            from sglang.kernels.ops.gemm.bf16_skinny_gemm import (
+                bf16_skinny_gemm,
+                bf16_skinny_supported,
+            )
+        except ImportError:  # no Triton, e.g. a CPU-only build
+            pass
+        else:
+            if bf16_skinny_supported(hidden, weight):
+                return bf16_skinny_gemm(hidden, weight)
     return torch.matmul(hidden, weight.T)
 
 
