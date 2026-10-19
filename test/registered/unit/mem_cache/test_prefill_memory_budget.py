@@ -203,6 +203,56 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         )
         return allocator, req, adder
 
+    def test_pending_lookup_preserves_budget_and_allows_a_ready_sibling(self):
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos), published_topology():
+                allocator, pending, adder = self._new_admission(
+                    4, pool_pages=6, ignore_eos=ignore_eos
+                )
+                pending.cache_lookup_pending = True
+                adder.tree_cache.lock = MagicMock(
+                    return_value=SimpleNamespace(release=MagicMock())
+                )
+                adder.tree_cache.unlock = MagicMock()
+                adder.tree_cache.finish_storage_prefetch_admission = MagicMock()
+                before = (
+                    allocator.available_size(),
+                    adder.rem_input_tokens,
+                    adder.rem_chunk_tokens,
+                )
+                self.assertEqual(
+                    adder.add_one_req(pending, False, None), AddReqResult.CONTINUE
+                )
+                self.assertEqual(adder.can_run_list, [])
+                adder.tree_cache.lock.assert_not_called()
+                adder.tree_cache.finish_storage_prefetch_admission.assert_not_called()
+                self.assertEqual(
+                    (
+                        allocator.available_size(),
+                        adder.rem_input_tokens,
+                        adder.rem_chunk_tokens,
+                    ),
+                    before,
+                )
+
+                sibling = Req(
+                    "ready-sibling",
+                    None,
+                    array("q", [1, 2, 3, 4, 5]),
+                    SamplingParams(max_new_tokens=1, ignore_eos=ignore_eos),
+                )
+                sibling.refresh_fill_ids()
+                adder.add_one_req(sibling, False, None)
+                self.assertEqual(adder.can_run_list, [sibling])
+                self.assertTrue(pending.cache_lookup_pending)
+
+    def test_pending_lookup_is_skipped_before_batch_capacity_check(self):
+        _, req, adder = self._new_admission(4, pool_pages=6)
+        req.cache_lookup_pending = True
+        adder.prefill_max_requests = 0
+        self.assertEqual(adder.add_one_req(req, False, None), AddReqResult.CONTINUE)
+        self.assertEqual(adder.can_run_list, [])
+
     def test_unaligned_final_chunk_makes_progress(self):
         for page_size in (4, 64):
             with self.subTest(page_size=page_size):

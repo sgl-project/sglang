@@ -19,14 +19,16 @@ from test_unified_radix_cache_unittest import (
     build_fixture,
 )
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import match_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -49,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -59,6 +62,7 @@ class _FakeLinker(UnifiedCacheLinker):
     def __init__(self):
         self.layer_done_counter = object()
         self.restorable = []
+        self.cancelled_lookups = []
         self.queued_loads = {}
         self.queued_offloads = []
         self.load_landed = True
@@ -67,7 +71,10 @@ class _FakeLinker(UnifiedCacheLinker):
         self.closed = False
 
     def lookup(self, rid, transfers):
-        return list(self.restorable)
+        return None if self.restorable is None else list(self.restorable)
+
+    def cancel_lookup(self, rid):
+        self.cancelled_lookups.append(rid)
 
     def load(self, rid, transfers):
         self.queued_loads[rid] = list(transfers)
@@ -956,19 +963,31 @@ class TestUnifiedCacheLinkerTreeCoreRustBackend(
     tree_core_backend = "rust"
 
 
-def test_restorable_prefix_intersects_sparse_rank_results():
-    remote_mask = torch.tensor([0, 0, 1, 0, 0], dtype=torch.int)
+@pytest.mark.parametrize("local", [None, [], [2, 4]], ids=["pending", "miss", "hit"])
+@pytest.mark.parametrize("remote", [None, [], [2]], ids=["pending", "miss", "hit"])
+def test_restorable_prefix_intersects_readiness_and_sparse_rank_results(local, remote):
+    remote_mask = torch.zeros(5, dtype=torch.int)
+    if remote is not None:
+        remote_mask[0] = 1
+        remote_mask[remote] = 1
+    reductions = []
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
+        reductions.append(mask.clone())
         mask.copy_(torch.minimum(mask, remote_mask))
 
     cache = _cache_for_wrapper(_all_reduce_attn_groups=intersect_remote_mask)
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
-    hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
+    hit_pages = wrapper._sync_restorable_prefix(local, num_pages=4, device_hit_pages=0)
 
-    assert hit_pages == 2
+    expected = (
+        None if local is None or remote is None else (2 if local and remote else 0)
+    )
+    assert hit_pages == expected
+    assert len(reductions) == 1
+    assert reductions[0][0].item() == int(local is not None)
 
 
 def test_async_offload_pins_node_until_completion():
@@ -1336,6 +1355,218 @@ def full_linker_component():
             transfer
         ),
     )
+
+
+@pytest.fixture
+def async_lookup_cache(full_linker_component):
+    cache = _cache_for_wrapper(
+        _components_tuple=(full_linker_component,),
+        token_to_kv_pool_allocator=_swa_allocator(False),
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        page_size=2,
+        _all_reduce_attn_groups=lambda value, op: None,
+        get_last_hash_value=lambda node: None,
+        swa_reprefill_tail_tokens=lambda req: 0,
+    )
+    backend = _FakeLinker()
+    backend.lookup = MagicMock(wraps=backend.lookup)
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    cache.linker = wrapper
+    return cache, backend, wrapper
+
+
+def test_async_lookup_rematch_adopts_only_the_current_result(async_lookup_cache):
+    cache, backend, wrapper = async_lookup_cache
+    result = MatchResult(0, 0, 0, 0)
+    cache.match_prefix = lambda params: wrapper.match(params.key, params.req, result)
+    req = Req("query", None, array("q", [1, 2, 3, 4, 5]), SamplingParams())
+    assert not req.cache_lookup_pending
+
+    for restorable, pending, hit_tokens in (
+        (None, True, 0),
+        ([2], False, 4),
+        (None, True, 0),
+        ([], False, 0),
+    ):
+        backend.restorable = restorable
+        match_kv_cache(req, cache)
+        assert req.cache_lookup_pending is pending
+        assert req.host_hit_length == hit_tokens
+        assert wrapper.has_hit(req.rid) == bool(hit_tokens)
+    assert backend.lookup.call_count == 4
+    assert backend.cancelled_lookups == [req.rid]
+
+    result = result._replace(device_prefix_len=5)
+    match_kv_cache(req, cache)
+    assert not req.cache_lookup_pending
+    assert req.prefix_len == 5
+    assert backend.lookup.call_count == 4
+    assert backend.cancelled_lookups == [req.rid, req.rid]
+
+
+def test_same_rid_changed_keys_replace_the_old_match(async_lookup_cache):
+    _, backend, wrapper = async_lookup_cache
+    req = SimpleNamespace(rid="query")
+    result = MatchResult(0, 0, 0, 0)
+    key = RadixKey(array("q", [1, 2, 3, 4]))
+    backend.restorable = [2]
+    wrapper.match(key, req, result)
+    old_hashes = wrapper.hit_markers[req.rid].tail_hashes
+
+    changed = RadixKey(array("q", [5, 6, 7, 8]))
+    backend.restorable = None
+    assert wrapper.match(changed, req, result).cache_lookup_pending
+    assert not wrapper.has_hit(req.rid)
+    new_hashes = backend.lookup.call_args.args[1][0].keys
+    assert new_hashes != old_hashes
+
+    backend.restorable = [1]
+    assert wrapper.match(changed, req, result).host_hit_length == 2
+    assert wrapper.hit_markers[req.rid].tail_hashes == new_hashes[:1]
+    assert backend.cancelled_lookups == []
+
+
+@pytest.mark.parametrize("local", [[], [2]], ids=["miss", "hit"])
+def test_peer_pending_does_not_cancel_or_admit_a_local_result(
+    async_lookup_cache, local
+):
+    cache, backend, wrapper = async_lookup_cache
+    backend.restorable = local
+    key = RadixKey(array("q", [1, 2, 3, 4]))
+    req = SimpleNamespace(rid="query")
+    result = MatchResult(0, 0, 0, 0)
+    cache._all_reduce_attn_groups = lambda mask, op: mask.zero_()
+
+    for _ in range(2):
+        matched = wrapper.match(key, req, result)
+        assert matched.cache_lookup_pending
+        assert not wrapper.has_hit(req.rid)
+        assert backend.cancelled_lookups == []
+
+    cache._all_reduce_attn_groups = lambda mask, op: None
+    matched = wrapper.match(key, req, result)
+    assert not matched.cache_lookup_pending
+    assert matched.host_hit_length == (4 if local else 0)
+    assert backend.cancelled_lookups == ([] if local else [req.rid])
+
+
+@pytest.mark.parametrize("bypass", ["hbm", "no-tail", "unsupported-pool"])
+def test_unusable_external_match_retires_lookup_only(async_lookup_cache, bypass):
+    cache, backend, wrapper = async_lookup_cache
+    result = MatchResult(0, 0, 0, 0)
+    if bypass == "hbm":
+        result = result._replace(device_prefix_len=4)
+    elif bypass == "no-tail":
+        result = result._replace(device_prefix_len=2)
+    else:
+        cache._components_tuple[0].build_external_linker_transfer.return_value = None
+        cache._components_tuple[0].build_external_linker_transfer.side_effect = None
+    wrapper.hit_markers["query"] = object()
+    indices = torch.arange(4)
+    wrapper.inflight_load_rids = ["query"]
+    wrapper.private_load_indices["query"] = indices
+
+    matched = wrapper.match(
+        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="query"), result
+    )
+
+    assert not matched.cache_lookup_pending
+    assert wrapper.hit_markers == {}
+    assert backend.cancelled_lookups == ["query"]
+    backend.lookup.assert_not_called()
+    assert wrapper.inflight_load_rids == ["query"]
+    assert wrapper.private_load_indices["query"] is indices
+
+
+@pytest.mark.parametrize("bypass", ["session", "disabled"])
+@pytest.mark.parametrize("probe", [False, True], ids=["request", "probe"])
+def test_native_cache_bypass_retires_old_lookup(async_lookup_cache, bypass, probe):
+    _, backend, wrapper = async_lookup_cache
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    result = MatchResult(4, 0, 0, 0)
+    cache.session = SimpleNamespace(
+        try_match_prefix=lambda params: result if bypass == "session" else None
+    )
+    cache.disable = bypass == "disabled"
+    cache.tree_core = SimpleNamespace(empty_match_result=result)
+    cache.linker = wrapper
+    wrapper.hit_markers["query"] = object()
+    matched = cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(array("q", [1, 2, 3, 4])),
+            req=None if probe else SimpleNamespace(rid="query"),
+        )
+    )
+    assert matched is result
+    assert not matched.cache_lookup_pending
+    assert bool(wrapper.hit_markers) is probe
+    assert backend.cancelled_lookups == ([] if probe else ["query"])
+    backend.lookup.assert_not_called()
+
+
+def test_native_abort_cancels_pending_lookup(async_lookup_cache):
+    _, backend, wrapper = async_lookup_cache
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = wrapper
+    cache._storage_prefetch_wait = {}
+    cache.prefetch_loaded_tokens_by_reqid = {}
+    cache.prefetch_loaded_storage_start_by_reqid = {}
+    cache._storage_prefetch_hit_remaining_by_reqid = {}
+    cache.storage_prefetch_retries = MagicMock()
+    cache.buffer_pipeline = None
+    cache.ongoing_prefetch = {}
+    wrapper.hit_markers["query"] = object()
+
+    handle = CacheRequestHandle(rid="query", attempt_id=0)
+    cache.finish(handle, CacheRequestOutcome.ABORT)
+    cache.finish(handle, CacheRequestOutcome.ABORT)
+
+    assert backend.cancelled_lookups == ["query", "query"]
+    assert wrapper.hit_markers == {}
+
+
+def test_lookup_failure_stops_matching_without_detaching_started_load(
+    async_lookup_cache,
+):
+    _, backend, wrapper = async_lookup_cache
+    backend.lookup.side_effect = RuntimeError("lookup deadline expired")
+    indices = torch.arange(4)
+    wrapper.inflight_load_rids = ["query"]
+    wrapper.private_load_indices["query"] = indices
+
+    with pytest.raises(RuntimeError, match="lookup deadline expired"):
+        wrapper.match(
+            RadixKey(array("q", [1, 2, 3, 4])),
+            SimpleNamespace(rid="query"),
+            MatchResult(0, 0, 0, 0),
+        )
+
+    assert wrapper.inflight_load_rids == ["query"]
+    assert wrapper.private_load_indices["query"] is indices
+
+
+@pytest.mark.parametrize("queued", [False, True], ids=["started", "queued"])
+def test_lookup_cancel_error_preserves_load_cleanup_responsibility(
+    async_lookup_cache, queued
+):
+    _, backend, wrapper = async_lookup_cache
+    backend.cancel_lookup = MagicMock(
+        side_effect=RuntimeError("lookup retirement failed")
+    )
+    backend.cancel_queued_load = MagicMock(return_value=queued)
+    wrapper.hit_markers["query"] = object()
+    indices = torch.arange(4)
+    wrapper.inflight_load_rids = ["query"]
+    wrapper.private_load_indices["query"] = indices
+
+    with pytest.raises(RuntimeError, match="lookup retirement failed"):
+        wrapper.release_request("query")
+
+    backend.cancel_queued_load.assert_called_once_with("query")
+    assert wrapper.inflight_load_rids == ([] if queued else ["query"])
+    assert bool(wrapper.private_load_indices) is (not queued)
+    if not queued:
+        assert wrapper.private_load_indices["query"] is indices
 
 
 def test_linker_filters_request_relative_swa_from_lookup(

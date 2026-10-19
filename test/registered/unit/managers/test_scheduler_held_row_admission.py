@@ -5,13 +5,18 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context
 
@@ -133,6 +138,51 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_only_admitted_requests_reserve_a_lora_slot(self):
+        for defer in (True, False):
+            with (
+                self.subTest(defer=defer),
+                published_topology(pp_max_micro_batch_size=NUM_ROWS),
+            ):
+                first, ready = _Req(False), _Req(False)
+                first.lora_id, ready.lora_id = "adapter-a", "adapter-b"
+                first.cache_lookup_pending = defer
+                s = self._scheduler(DisaggregationMode.NULL, [], None, [first, ready])
+                s.enable_lora = True
+                s.lora_drainer = None
+                s.enable_lora_overlap_loading = False
+                manager = LoRAManager.__new__(LoRAManager)
+                manager.max_loras_per_batch = 1
+                manager.num_pinned_loras = 0
+                s.tp_worker.model_runner.lora_manager = manager
+                original_add = _Adder.add_one_req
+
+                def add(adder, req, has_chunked_req, truncation_align_size):
+                    if req is first and defer:
+                        return PrefillAdder.add_one_req(
+                            adder, req, has_chunked_req, truncation_align_size
+                        )
+                    return original_add(
+                        adder, req, has_chunked_req, truncation_align_size
+                    )
+
+                def capture(can_run_list, *args, **kwargs):
+                    raise _BatchBuilt(list(can_run_list))
+
+                with (
+                    patch.object(_Adder, "add_one_req", add),
+                    patch.object(ScheduleBatch, "init_new", side_effect=capture),
+                    patch("sglang.srt.managers.scheduler.set_time_batch"),
+                ):
+                    with self.assertRaises(_BatchBuilt) as built:
+                        s._get_new_batch_prefill_raw(
+                            prefill_delayer_single_pass=None,
+                            running_batch=ScheduleBatch(reqs=[]),
+                        )
+
+                self.assertEqual(built.exception.args[0], [ready] if defer else [first])
+                self.assertEqual(s.waiting_queue, [first] if defer else [ready])
 
 
 if __name__ == "__main__":

@@ -241,6 +241,7 @@ def match_kv_cache(
             tree_cache, match_result, extra_key=req.extra_key
         )
     req.prefix_len = match_result.device_prefix_len
+    req.cache_lookup_pending = match_result.cache_lookup_pending
     (
         req.last_node,
         req.last_host_node,
