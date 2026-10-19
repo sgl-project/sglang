@@ -417,6 +417,7 @@ def _encoding_topk(*, width, calls):
         row_starts,
         out_rows,
         page_table_row_index,
+        topk_v2_plan=None,
     ):
         calls.append(
             {"page_table": page_table, "page_table_row_index": page_table_row_index}
@@ -691,7 +692,7 @@ class TestKPoolPerRequestChunking(CustomTestCase):
         )
         with _chunking_patches(
             rows_per_chunk=rows_per_chunk,
-            kv_pool=SimpleNamespace(page_size=256, slots_per_page=64),
+            kv_pool=SimpleNamespace(page_size=256, index_page_size=64),
         ):
             result = IndexerKPool._get_topk_ragged_kpool(
                 backend,

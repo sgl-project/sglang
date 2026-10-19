@@ -575,9 +575,6 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
             with (
                 patch.object(exits, "_ffn_has_tokens", return_value=True),
                 patch.object(
-                    exits, "post_experts_sum_is_one_all_reduce", return_value=False
-                ),
-                patch.object(
                     exits, "get_lora", return_value=SimpleNamespace(enable_lora=True)
                 ),
                 patch.object(
@@ -602,8 +599,11 @@ class TestDeferredLoraAllReduce(unittest.TestCase):
                 ) as gate,
             ):
                 # Avoid platform-specific Aiter details: no residual cannot fuse.
+                facts = exits.ExitFacts(
+                    single_sum=False, fused_consumer_sum=exits._fused_consumer_sum()
+                )
                 with patch.object(exits, "_use_aiter", False, create=True):
-                    result = exits._batch_allows_deferred_sum(fb, boundary)
+                    result = exits._batch_allows_deferred_sum(fb, facts, boundary)
                 self.assertEqual(result, eligible and not a2a)
                 if a2a:
                     gate.assert_not_called()

@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::discovery::{ModelId, WorkerId};
 use crate::policies_reorg::{Pick, PickError, PickRequest, Policy, Stage};
+use crate::state::kv_events::CacheNamespace;
 use crate::workers::{paired_prefills, Worker, WorkerRegistry};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +86,18 @@ impl EngineGroup {
             .collect()
     }
 
+    /// Live members minus the engines this request already failed on.
+    fn candidates(
+        &self,
+        workers: &WorkerRegistry,
+        request: &BucketRequest<'_>,
+        stage: Stage,
+    ) -> Vec<Arc<Worker>> {
+        let mut engines = self.members(workers, request.model, stage);
+        engines.retain(|engine| !request.excluded.contains(&engine.id));
+        engines
+    }
+
     async fn pick_from(
         &self,
         mut engines: Vec<Arc<Worker>>,
@@ -126,8 +139,11 @@ pub struct BucketRequest<'a> {
     pub expected_peak_tokens: Option<u64>,
     pub prefix: Option<&'a crate::policies_reorg::cache_aware::PrefixMemo>,
     pub token_ids: Option<&'a [u32]>,
+    pub cache_namespace: &'a CacheNamespace,
     pub session_key: Option<&'a str>,
     pub routing_key: Option<&'a str>,
+    /// Engines this request already failed on; no group offers them again.
+    pub excluded: &'a [WorkerId],
 }
 
 /// A complete selection from one bucket. For plain serving, `prefill` is the
@@ -221,13 +237,13 @@ impl Bucket {
     ) -> Result<BucketPick, (Stage, PickError)> {
         let (prefill, decode) = match &self.groups {
             BucketGroups::Plain(group) => {
-                let engines = group.members(workers, request.model, Stage::Plain);
+                let engines = group.candidates(workers, request, Stage::Plain);
                 let plain = self.pick_from_group(group, Stage::Plain, engines, request);
                 (plain.await?, None)
             }
             BucketGroups::Pd { prefill, decode } => {
-                let prefills = prefill.members(workers, request.model, Stage::Prefill);
-                let decoders = decode.members(workers, request.model, Stage::Decode);
+                let prefills = prefill.candidates(workers, request, Stage::Prefill);
+                let decoders = decode.candidates(workers, request, Stage::Decode);
                 let stage = if prefills.is_empty() {
                     Stage::Prefill
                 } else {
@@ -287,6 +303,7 @@ impl Bucket {
             expected_peak_tokens: request.expected_peak_tokens,
             prefix: request.prefix,
             token_ids: request.token_ids,
+            cache_namespace: request.cache_namespace,
             session_key: request.session_key,
             routing_key: request.routing_key,
         };
