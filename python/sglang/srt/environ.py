@@ -1622,6 +1622,12 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # FP8 quantize-dequantize of the attention output before a bf16 wo_a, in blocks
+    # of this many values (the DeepSeek-V4.1-Flash-1017 reference uses 32); 0 = off.
+    SGLANG_DSV4_O_FP8_QDQ_BLOCK = EnvInt(0)
+    # Use the fp32 emulation of the e4m3 rounding in that step on every GPU (it is
+    # the only path before sm89); for checking it against the hardware conversion.
+    SGLANG_DSV4_O_FP8_QDQ_EMULATE = EnvBool(False)
     # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
