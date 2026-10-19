@@ -2,8 +2,8 @@
 
 A row's tiling and FP32 accumulation order depend only on (N, K), so a row must give
 the same bits alone or in any batch of up to 16 rows, also under CUDA graph replay.
-Row offsets are 64-bit, and the launch follows the operands' device. The LM-head
-dispatch is tested in test/registered/unit/layers/test_logits_processor_bf16_lm_head.py.
+Row offsets are 64-bit. The launch device is tested in test_bf16_skinny_gemm_multi_gpu.py
+and the LM-head dispatch in test/registered/unit/layers/test_logits_processor_bf16_lm_head.py.
 """
 
 import unittest
@@ -115,24 +115,6 @@ class TestBf16SkinnyGemm(CustomTestCase):
             )
         )
 
-    @unittest.skipUnless(torch.cuda.device_count() >= 2, "needs two GPUs")
-    def test_operands_on_a_non_current_device(self):
-        x, w = _inputs(6, 1000, 256, seed=6)
-        ref, bound = _error_bound(x, w)
-        x1, w1 = x.to("cuda:1"), w.to("cuda:1")
-        torch.cuda.synchronize(0)
-        torch.cuda.synchronize(1)
-        with torch.cuda.device(0):
-            # Keep device 0 busy, so a launch on its stream instead of device 1's
-            # would not have run when device 1 is synchronized below.
-            torch.cuda._sleep(2**31)
-            out = bf16_skinny_gemm(x1, w1)
-        torch.cuda.synchronize(1)
-        self.assertEqual(out.device, x1.device)
-        err = (out.cpu().double() - ref.cpu()).abs()
-        self.assertTrue(bool((err <= bound.cpu()).all()))
-        torch.cuda.synchronize(0)
-
     def test_supported_inputs(self):
         x, w = _inputs(4, 1000, 256)
         self.assertTrue(bf16_skinny_supported(x, w))
@@ -149,6 +131,8 @@ class TestBf16SkinnyGemm(CustomTestCase):
                 self.assertFalse(bf16_skinny_supported(a, b))
         with self.subTest("ROCm"), mock.patch.object(torch.version, "hip", "6.4"):
             self.assertFalse(bf16_skinny_supported(x, w))
+        with self.subTest("raises"), self.assertRaises(ValueError):
+            bf16_skinny_gemm(x.half(), w.half())
 
 
 if __name__ == "__main__":
