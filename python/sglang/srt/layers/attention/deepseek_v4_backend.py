@@ -1846,15 +1846,12 @@ class DeepseekV4AttnBackend(
             else None
         )
 
-        # When any context replays, the tail's page tables span the live context,
-        # like the full rows' in _build_forward_metadata.
-        max_seq_len = int(seq_lens_cpu.max().item())
-        if max_seq_len_override is not None and not (
-            for_prefill_graph and self.prefill_cuda_graph_context_unbounded
-        ):
-            max_seq_len = max_seq_len_override
         metadata = self.init_forward_metadata_prefill(
-            max_seq_len=max_seq_len,
+            max_seq_len=(
+                max_seq_len_override
+                if max_seq_len_override is not None
+                else int(seq_lens_cpu.max().item())
+            ),
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu.tolist(),
@@ -2883,18 +2880,11 @@ class DeepseekV4AttnBackend(
             max_seq_len = max_seq_len_override
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 actual_max_seq_len = int(seq_lens_cpu.max().item())
-                if use_prefill_cuda_graph and self.prefill_cuda_graph_context_unbounded:
-                    # Nothing captured is sized by the context: the page tables are
-                    # per-replay objects, so they span the live context.
-                    max_seq_len = actual_max_seq_len
-                elif actual_max_seq_len > max_seq_len:
-                    if self.prefill_cuda_graph_context_unbounded:
-                        max_seq_len = actual_max_seq_len
-                    else:
-                        raise ValueError(
-                            "Prefill CUDA graph max context size is smaller than the "
-                            f"live context: {max_seq_len=} < {actual_max_seq_len=}"
-                        )
+                if actual_max_seq_len > max_seq_len:
+                    raise ValueError(
+                        "Prefill CUDA graph max context size is smaller than the "
+                        f"live context: {max_seq_len=} < {actual_max_seq_len=}"
+                    )
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
@@ -2987,11 +2977,7 @@ class DeepseekV4AttnBackend(
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
-        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        if self.low_ratios == (1, 2):
-            graph_context_limit = _prefill_graph_max_seq_len()
-            if graph_context_limit is not None:
-                max_seq_len = min(max_seq_len, graph_context_limit)
+        max_seq_len = self._prefill_graph_context_width(forward_batch)
         self.forward_metadata = self._build_forward_metadata(
             forward_batch,
             max_seq_len_override=max_seq_len,
@@ -3016,6 +3002,24 @@ class DeepseekV4AttnBackend(
                     forward_batch.out_cache_loc.shape[0], ratio
                 )
         return self.forward_metadata
+
+    def _prefill_graph_context_width(self, forward_batch: ForwardBatch) -> int:
+        """The context width of the prefill graph's metadata, for the full rows and
+        the late-layer tail alike: the live context when any context replays, else
+        the captured width bounded by the graph's context limit."""
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if (
+            self.prefill_cuda_graph_context_unbounded
+            and seq_lens_cpu is not None
+            and len(seq_lens_cpu) > 0
+        ):
+            return int(seq_lens_cpu.max().item())
+        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        if self.low_ratios == (1, 2):
+            graph_context_limit = _prefill_graph_max_seq_len()
+            if graph_context_limit is not None:
+                max_seq_len = min(max_seq_len, graph_context_limit)
+        return max_seq_len
 
     def _share_bcg_low_ratio_index_buffers(self, core) -> None:
         # BCG buckets replay serially. Share only full-metadata output buffers;
@@ -3074,13 +3078,7 @@ class DeepseekV4AttnBackend(
         metadata_batch = (
             static_forward_batch if static_forward_batch is not None else forward_batch
         )
-        max_seq_len = (
-            metadata_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
-        )
-        if self.low_ratios == (1, 2):
-            graph_context_limit = _prefill_graph_max_seq_len()
-            if graph_context_limit is not None:
-                max_seq_len = min(max_seq_len, graph_context_limit)
+        max_seq_len = self._prefill_graph_context_width(metadata_batch)
         static_metadata = self._build_forward_metadata(
             metadata_batch,
             max_seq_len_override=max_seq_len,

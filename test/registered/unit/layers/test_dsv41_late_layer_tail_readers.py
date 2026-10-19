@@ -1,10 +1,9 @@
 """Decoder SWA bounded replay: the rows the late layers run (whole extends for
 requests that read prompt rows) and how DP ranks learn each other's. CPU only."""
 
-import contextlib
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import torch
 
@@ -15,9 +14,11 @@ from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
+    DSV4Metadata,
     late_layer_whole_extend,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
+    SparseTableBackend,
     _SparsePrefillTable,
 )
 from sglang.srt.model_executor import forward_batch_info
@@ -345,54 +346,64 @@ class TestPrefillGraphCandidateSourceRows(CustomTestCase):
         self.assertEqual(seen["rows"], [0, 1, 2, 3, 4, 5, 5, 5])
 
 
-class _MetadataBuilt(Exception):
-    pass
-
-
-def _prefill_graph_tail_width(*, unbounded):
-    """The max_seq_len the late-layer tail's prefill-graph metadata is built at,
-    for one request of 1,024 new tokens after a 155,648-token cached prefix."""
+def _prefill_graph_replay_widths(*, unbounded):
+    """The context widths a prefill-graph replay builds the full-row and the
+    late-layer tail metadata at, for one request of 1,024 new tokens after a
+    155,648-token cached prefix."""
     seen = {}
 
-    def init_forward_metadata_prefill(**kwargs):
-        seen["max_seq_len"] = kwargs["max_seq_len"]
-        raise _MetadataBuilt
+    def build_full(forward_batch, *, max_seq_len_override, use_prefill_cuda_graph):
+        seen["full"] = max_seq_len_override
 
-    backend = SimpleNamespace(
-        encoder_row_floor=None,
-        model_runner=SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE),
-        _prefill_graph_tail_block_rows=lambda forward_batch: 256,
-        _prefill_graph_tail_buffers=lambda device, pos_dtype, loc_dtype: [
-            torch.zeros(256, dtype=torch.int64) for _ in range(5)
-        ],
-        prefill_cuda_graph_context_unbounded=unbounded,
-        init_forward_metadata_prefill=init_forward_metadata_prefill,
-    )
-    seq_len = 155648 + 1024
-    forward_batch = SimpleNamespace(
-        extend_seq_lens_cpu=[1024],
-        extend_logprob_start_lens_cpu=None,
-        return_logprob=False,
-        capture_hidden_mode=CaptureHiddenMode.NULL,
-        seq_lens_cpu=torch.tensor([seq_len]),
-        seq_lens=torch.tensor([seq_len]),
-        req_pool_indices=torch.tensor([3]),
-        positions=torch.arange(155648, seq_len),
-        out_cache_loc=torch.arange(1024),
-    )
-    with contextlib.suppress(_MetadataBuilt):
-        DeepseekV4AttnBackend._build_late_layer_tail_metadata(
-            backend, forward_batch, for_prefill_graph=True, max_seq_len_override=16384
+    def build_tail(forward_batch, max_seq_len):
+        seen["tail"] = max_seq_len
+
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+    backend.low_ratios = (1, 2)
+    backend.prefill_candidates = object.__new__(SparseTableBackend)
+    backend._build_forward_metadata = build_full
+    backend._prefill_graph_tail_metadata = build_tail
+    backend._activate_request_window = lambda: None
+    capture = object.__new__(DSV4Metadata)
+    capture.prefill_graph_tail = True
+    with (
+        patch.object(
+            DeepseekV4AttnBackend,
+            "prefill_cuda_graph_context_unbounded",
+            new_callable=PropertyMock,
+            return_value=unbounded,
+        ),
+        patch.object(
+            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=16384
+        ),
+        patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"),
+    ):
+        DeepseekV4AttnBackend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            backend,
+            capture,
+            SimpleNamespace(
+                seq_lens_cpu=torch.tensor([155648 + 1024]),
+                max_seq_len_override=1 << 20,
+            ),
         )
-    return seen["max_seq_len"]
+    return seen
 
 
-class TestPrefillGraphTailWidth(CustomTestCase):
-    def test_tail_spans_the_live_context_when_any_context_replays(self):
-        self.assertEqual(_prefill_graph_tail_width(unbounded=True), 156672)
+class TestPrefillGraphReplayWidth(CustomTestCase):
+    """The full rows and the late-layer tail are built at one context width."""
 
-    def test_tail_keeps_the_captured_width_otherwise(self):
-        self.assertEqual(_prefill_graph_tail_width(unbounded=False), 16384)
+    def test_any_context_replay_builds_both_at_the_live_context(self):
+        self.assertEqual(
+            _prefill_graph_replay_widths(unbounded=True),
+            {"full": 156672, "tail": 156672},
+        )
+
+    def test_bounded_replay_builds_both_at_the_graph_limit(self):
+        self.assertEqual(
+            _prefill_graph_replay_widths(unbounded=False),
+            {"full": 16384, "tail": 16384},
+        )
 
 
 if __name__ == "__main__":
