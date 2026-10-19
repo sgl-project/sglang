@@ -64,6 +64,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -97,10 +98,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
-
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
-
-from sglang.srt.distributed.communication_tags import P2PTag
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler

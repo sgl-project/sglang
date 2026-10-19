@@ -125,7 +125,9 @@ def poll_and_all_reduce_prefill_pp(
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list, p2p_tag)
+    polls = pp_sync_polls(
+        polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list, p2p_tag
+    )
     return polls
 
 
