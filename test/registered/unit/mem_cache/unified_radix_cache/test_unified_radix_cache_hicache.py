@@ -756,7 +756,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         lambda cfg: cfg.sliding_window_size > cfg.page_size,
         "the window must reach past the leaf's own page",
     )
-    def test_swa_backup_collector_is_shared_by_both_call_sites(self):
+    def test_swa_backup_reaches_device_ancestor_in_cache_mode_only(self):
         """needs_incremental_backup and the BACKUP_HOST transfer read one
         collector: cache mode walks the window past a host-backed target to
         its device-only ancestor, buffer mode stages the target alone."""

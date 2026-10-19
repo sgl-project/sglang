@@ -1279,7 +1279,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
 
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
+        req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = None
@@ -1664,7 +1664,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
         # Consume at admission (init_load_back + request lock).
         held = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
+        req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = None
@@ -1981,7 +1981,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             return real_load(*args, **kwargs)
 
         f = cons.buffer_pipeline.staged_prefetches[req_id]
-        req = mock.Mock()
+        req = self._make_req(cons.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = None
@@ -2059,12 +2059,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self._insert(cons, cons_alloc, cons_rtp, seq)
 
         live = match_prefix(cons, seq)
-        req = mock.Mock(
-            rid=req_id.rid,
-            cache_request_handle=req_id,
-            prefix_len=live.device_prefix_len,
-            last_node=live.last_device_node,
-        )
+        req = self._make_req(cons.req_to_token_pool)
+        req.rid = req_id.rid
+        req.cache_request_handle = req_id
+        req.prefix_len = live.device_prefix_len
+        req.last_node = live.last_device_node
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         self.assertEqual((req.host_hit_length, req.swa_host_hit_length), (0, 0))
         self.assertFalse(cons.buffer_pipeline.has_staged(req_id))

@@ -140,7 +140,7 @@ class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
         sliding_window_size=4,
     )
 
-    def test_auxiliary_load_does_not_reuse_full_pending_pin(self):
+    def test_auxiliary_load_restores_swa_and_rebuilds_mapping(self):
         cache, _, _ = build_fixture(self.cfg)
         core = cache.tree_core
         core.is_write_back = True

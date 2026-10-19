@@ -175,7 +175,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         f = cache.buffer_pipeline.staged_prefetches[req_id]
         if prefix_len is None:
             prefix_len = f.matched_len
-        req = mock.Mock()
+        req = self._make_req(cache.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = extra_key
