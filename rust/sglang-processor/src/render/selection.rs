@@ -79,16 +79,8 @@ pub fn select_chat_formatter(
         if kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true).is_some() {
             return (Some(ChatFormatter::KimiK3), None);
         }
-        if model_type_lower.as_deref() == Some("inkling_mm_model")
-            && let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower)
-        {
-            return (
-                Some(ChatFormatter::HuggingFace {
-                    formatter,
-                    thinking: ThinkingTemplates::always(),
-                }),
-                None,
-            );
+        if model_type_lower.as_deref() == Some("inkling_mm_model") {
+            return (Some(ChatFormatter::Inkling), None);
         }
         if let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower) {
             return (
