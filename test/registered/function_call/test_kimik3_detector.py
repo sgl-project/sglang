@@ -184,6 +184,32 @@ def test_streaming_two_calls() -> None:
     ]
 
 
+def test_streaming_decodes_each_call_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    decode_count = 0
+    orig_decode = detector._decode_call
+
+    def counting_decode(attrs: str, body: str) -> dict | None:
+        nonlocal decode_count
+        decode_count += 1
+        return orig_decode(attrs, body)
+
+    monkeypatch.setattr(detector, "_decode_call", counting_decode)
+    text = (
+        f"{RESPONSE_OPEN}thinking{RESPONSE_CLOSE}{TOOLS_OPEN}"
+        + _call_block("python", 1, {"code": ("string", "x" * 200)})
+        + _call_block("python", 2, {"code": ("string", "y" * 200)})
+        + _call_block("python", 3, {"code": ("string", "z" * 200)})
+        + TOOLS_CLOSE
+    )
+    normal_text, calls = _stream(detector, _chunks(text, 5), tools)
+    detector.finish(tools)
+    assert normal_text == "thinking"
+    assert len(calls) == 3
+    assert decode_count == 3
+
+
 def test_streaming_plain_text_only() -> None:
     detector = KimiK3Detector()
     text, calls = _stream(
