@@ -177,8 +177,7 @@ class TestMambaPathStateCap(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba pool fixtures need CUDA")
 class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
-    """CI-active write-through/path-cap ordering regressions (the unified radix
-    cache unittest module is temporarily gated off on trunk)."""
+    """Write-through backup ordering regressions under the Mamba path-state cap."""
 
     cfg = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
     _rid = 0
