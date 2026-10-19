@@ -79,7 +79,23 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         mm_hashes,
         video_data,
         audio_data,
+        extra_key,
+        priority,
+        cache_salt,
+        require_reasoning,
+        lora_path,
+        session_params,
     } = req;
+    for (name, value) in [
+        ("lora_path", &lora_path),
+        ("session_params", &session_params),
+    ] {
+        if value.is_some() {
+            return Err(Error::Validation(format!(
+                "{name} is not supported by the Rust server"
+            )));
+        }
+    }
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
     let input_ids = input_ids.and_then(wire::token_ids_or_list);
@@ -103,6 +119,8 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     let video_data = video_data.map(wire::media_input).transpose()?;
     let audio_data = audio_data.map(wire::media_input).transpose()?;
     let mm_hashes = mm_hashes.and_then(wire::string_list_or_list);
+    let extra_key = extra_key.and_then(wire::string_or_list);
+    let cache_salt = cache_salt.and_then(wire::string_or_list);
 
     // Cap the batch BEFORE the columns below allocate anything. Reading the
     // declared length off the input costs nothing; the previous placement (after
@@ -263,26 +281,31 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
     let top_logprobs_nums = fan_out(top_logprobs_num, n, "top_logprobs_num")?;
     let return_hidden = fan_out(return_hidden_states, n, "return_hidden_states")?;
 
-    // PD fields fan out like Python `_normalize_bootstrap_params`: scalars
-    // broadcast — except a scalar `bootstrap_room`, which becomes `room + i`
-    // (each item needs a distinct room; rooms are the P↔D pairing key).
-    // `fan_out` yields `Option<Option<T>>` for these nullable elements
-    // (outer: absent, inner: an explicit `null` element) — flatten, both
-    // mean "not set" downstream.
-    let bootstrap_hosts = flatten_column(fan_out(bootstrap_host, n, "bootstrap_host")?);
-    let bootstrap_ports = flatten_column(fan_out(bootstrap_port, n, "bootstrap_port")?);
-    let bootstrap_rooms = match bootstrap_room {
-        // `wrapping_add`, not `checked_`: rooms are drawn from `[0, 2^63)`,
-        // so a batch can only overflow by starting within `n` of `i64::MAX`
-        // — and distinct-but-wrapped still pairs P↔D, where saturating
-        // would collide every item onto one room.
-        Some(OneOrMany::One(Some(room))) => {
-            (0..n).map(|i| Some(room.wrapping_add(i as i64))).collect()
-        }
-        other => flatten_column(fan_out(other, n, "bootstrap_room")?),
-    };
+    let BootstrapColumns {
+        bootstrap_hosts,
+        bootstrap_ports,
+        bootstrap_rooms,
+    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
+    // Python `_normalize_extra_key` / `_normalize_cache_salt`: one key
+    // broadcasts, a list is per item (batch requests only), and an empty key
+    // means none.
+    let cache_key_column = |value: Option<OneOrMany<String>>, name: &str| {
+        if !is_batch && matches!(value, Some(OneOrMany::Many(_))) {
+            return Err(Error::Validation(format!(
+                "{name} should be a string for a single request."
+            )));
+        }
+        Ok::<Vec<Option<String>>, Error>(
+            fan_out(value, n, name)?
+                .into_iter()
+                .map(|key| key.filter(|key| !key.is_empty()))
+                .collect(),
+        )
+    };
+    let extra_keys = cache_key_column(extra_key, "extra_key")?;
+    let cache_salts = cache_key_column(cache_salt, "cache_salt")?;
     // `mm_hashes` has no batch form: honoring it only here would give the two
     // servers different prefix-cache keys for the same body. Reject instead of
     // dropping it silently as Python does — the field exists to align a
@@ -324,6 +347,8 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
         bootstrap_rooms,
         bootstrap_pair_keys,
         decode_tp_sizes,
+        extra_keys,
+        cache_salts,
         images,
         videos,
         audios,
@@ -344,6 +369,8 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             bootstrap_room,
             bootstrap_pair_key,
             decode_tp_size,
+            extra_key,
+            cache_salt,
             image_data,
             video_data,
             audio_data,
@@ -373,6 +400,10 @@ pub fn into_requests(req: api_v1::GenerateRequest) -> Result<(Vec<GenerateReques
             decode_tp_size,
             routed_dp_rank,
             disagg_prefill_dp_rank,
+            extra_key,
+            cache_salt,
+            priority,
+            require_reasoning: require_reasoning.unwrap_or(false),
             mm: pack_mm(image_data, video_data, audio_data),
             mm_buffers: Vec::new(),
         },
@@ -441,9 +472,20 @@ pub enum RequestKind {
     /// the same FSM as every request (validate → register → Queued), but the
     /// stage that answers it is the detok shard itself, never the scheduler
     /// ring; the result arrives on the registered sink as one `Data` payload
-    /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
-    /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
-    Detokenize { token_ids: TokenIds },
+    /// (the raw UTF-8 text). Callers: `/v1/completions` `echo` for token-id
+    /// prompts, and `/v1/detokenize`.
+    Detokenize {
+        token_ids: TokenIds,
+        skip_special_tokens: bool,
+    },
+    /// Internal service call: encode one text to token ids (`/v1/tokenize`).
+    /// Walks the same FSM to `Queued`, then the tokenizer pool answers it
+    /// through the request's own sink with one `TokenIds` payload. It never
+    /// reaches a detok shard, so it is not registered with one.
+    Tokenize {
+        text: String,
+        add_special_tokens: bool,
+    },
 }
 
 /// A single in-flight generation request (one item after adapter fan-out),
@@ -515,6 +557,15 @@ pub struct GenerateRequest {
     /// so these are pure passthrough for the scheduler/LB protocol.
     pub routed_dp_rank: Option<i64>,
     pub disagg_prefill_dp_rank: Option<i64>,
+    /// Prefix-cache namespace: requests share cached prefixes only under the
+    /// same key.
+    pub extra_key: Option<String>,
+    /// The prefix cache's second namespace key.
+    pub cache_salt: Option<String>,
+    /// Scheduling priority, shared by every item of a batch.
+    pub priority: Option<i64>,
+    /// Grammar constraints start after the reasoning section.
+    pub require_reasoning: bool,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
     /// scheduler header. Boxed so the common text-only request doesn't grow
@@ -625,7 +676,7 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].
-pub(super) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
+pub(crate) fn check_broadcast_budget(per_clone: usize, n: usize, name: &str) -> Result<(), Error> {
     // `n == 1` is not a broadcast — there is one value and one prompt, so nothing
     // is duplicated. Charging it here rejected ordinary single requests with a
     // message about a batch they never sent.
@@ -664,6 +715,39 @@ fn fan_out<T: OneOrManyItem + Clone + HeapBytes>(
             Ok(v.into_iter().map(Some).collect())
         }
     }
+}
+
+/// Bootstrap metadata columns with matching lengths.
+pub(crate) struct BootstrapColumns {
+    pub(crate) bootstrap_hosts: Vec<Option<String>>,
+    pub(crate) bootstrap_ports: Vec<Option<i64>>,
+    pub(crate) bootstrap_rooms: Vec<Option<i64>>,
+}
+
+/// Normalize native and OpenAI bootstrap fields after wire decoding.
+/// Missing values and null elements stay unset; lists must match the prompt count.
+/// Scalars broadcast, except rooms advance once per prompt.
+pub(crate) fn normalize_bootstrap_columns(
+    hosts: Option<OneOrMany<Option<String>>>,
+    ports: Option<OneOrMany<Option<i64>>>,
+    rooms: Option<OneOrMany<Option<i64>>>,
+    prompt_count: usize,
+) -> Result<BootstrapColumns, Error> {
+    let bootstrap_hosts = flatten_column(fan_out(hosts, prompt_count, "bootstrap_host")?);
+    let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
+    let bootstrap_rooms = match rooms {
+        // Wrapping preserves distinct pairing keys at the i64 boundary;
+        // saturating would make multiple requests share a room.
+        Some(OneOrMany::One(Some(room))) => (0..prompt_count)
+            .map(|i| Some(room.wrapping_add(i as i64)))
+            .collect(),
+        other => flatten_column(fan_out(other, prompt_count, "bootstrap_room")?),
+    };
+    Ok(BootstrapColumns {
+        bootstrap_hosts,
+        bootstrap_ports,
+        bootstrap_rooms,
+    })
 }
 
 #[cfg(test)]
@@ -783,16 +867,17 @@ mod tests {
     /// to be declared and dropped by hand just to let `bench_serving` through.
     /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
     /// behavior; a typo being silently ignored is the same trade Python makes.
+    /// The exceptions are `lora_path` and `session_params`: dropping them would
+    /// silently change the answer, so a non-null value is a 400 (as Python's is
+    /// on a server without LoRA or without that session), and `null` passes.
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
-            r#""priority": 3"#,
-            r#""extra_key": "k""#,
             r#""session_id": "s""#,
-            r#""session_params": {"a": 1}"#,
+            r#""session_params": null"#,
             r#""return_sampling_mask": true"#,
             r#""custom_logit_processor": "cls""#,
-            r#""lora_path": "adapter""#,
+            r#""lora_path": null"#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
             r#""bootstrap_host": "h""#,
@@ -805,6 +890,14 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{field} must be ignored, not rejected: {e}"));
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
+        }
+        for field in [
+            r#""lora_path": "adapter""#,
+            r#""session_params": {"id": "s"}"#,
+        ] {
+            let body = format!(r#"{{"text": "hi", {field}}}"#);
+            let err = requests(&body).unwrap_err().to_string();
+            assert!(err.contains("not supported"), "{field}: {err}");
         }
     }
 
@@ -879,7 +972,13 @@ mod tests {
         let (ps, _) = requests(r#"{"text": "a", "image_data": ["u1", {"url": "u2"}]}"#).unwrap();
         assert_eq!(
             images_of(&ps[0]),
-            vec![src("u1"), MmItem::Ref { url: "u2".into() }]
+            vec![
+                src("u1"),
+                MmItem::Ref {
+                    url: "u2".into(),
+                    hints: Default::default(),
+                },
+            ]
         );
 
         // Batch + scalar image: broadcast, one image per item.
@@ -1161,6 +1260,37 @@ mod tests {
 
         let err = requests(r#"{"text": ["a", "b"], "bootstrap_room": [1, 2, 3]}"#).unwrap_err();
         assert!(err.to_string().contains("bootstrap_room"), "{err}");
+    }
+
+    /// `extra_key` fans out like Python `_normalize_extra_key` (and
+    /// `cache_salt` like `_normalize_cache_salt`, the same rules): one key
+    /// broadcasts, a list is per item and must match the batch (and needs a
+    /// batch), and an empty key means none.
+    #[test]
+    fn cache_keys_fan_out() {
+        let (ps, _) = requests(r#"{"text": "a", "extra_key": "salt"}"#).unwrap();
+        assert_eq!(ps[0].extra_key.as_deref(), Some("salt"));
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": "salt"}"#).unwrap();
+        assert!(ps.iter().all(|p| p.extra_key.as_deref() == Some("salt")));
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "extra_key": ["k", ""]}"#).unwrap();
+        assert_eq!(ps[0].extra_key.as_deref(), Some("k"));
+        assert_eq!(ps[1].extra_key, None);
+        let (ps, _) = requests(r#"{"text": "a", "extra_key": ""}"#).unwrap();
+        assert_eq!(ps[0].extra_key, None);
+        assert!(requests(r#"{"text": "a", "extra_key": ["k"]}"#).is_err());
+
+        let err = requests(r#"{"text": ["a", "b"], "extra_key": ["k"]}"#).unwrap_err();
+        assert!(err.to_string().contains("extra_key"), "{err}");
+
+        let (ps, _) = requests(r#"{"text": ["a", "b"], "cache_salt": ["s", ""]}"#).unwrap();
+        assert_eq!(ps[0].cache_salt.as_deref(), Some("s"));
+        assert_eq!(ps[1].cache_salt, None);
+        assert!(requests(r#"{"text": "a", "cache_salt": ["s"]}"#).is_err());
+        let (ps, _) =
+            requests(r#"{"text": ["a", "b"], "cache_salt": "s", "require_reasoning": true}"#)
+                .unwrap();
+        assert!(ps.iter().all(|p| p.cache_salt.as_deref() == Some("s")));
+        assert!(ps.iter().all(|p| p.require_reasoning));
     }
 
     /// The PD router (mini_lb) and PD-warmup payload shapes must parse. The

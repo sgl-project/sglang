@@ -427,7 +427,7 @@ MODELS = {
     },
     # H3 rejects a 1-step warmup request, hence --warmup-steps=2.
     "fasth3-t2va-vsa": {
-        "path": "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree",
+        "path": "FastVideo/FastVideo-FastH3-8-Step-V2",
         "prompt": (
             "A curious raccoon peers through a vibrant field of yellow "
             "sunflowers, its eyes wide with interest."
@@ -441,12 +441,11 @@ MODELS = {
                 "aspect_ratio": "16:9",
                 "duration_seconds": 10.0,
             },
-            "num_inference_steps": 5,
+            "num_inference_steps": 9,
         },
         "extra_args": [
             "--num-gpus=4",
-            "--attention-backend=video_sparse_attn_h3",
-            '--attention-backend-config={"VSA_sparsity": 0.9}',
+            "--component-attention-backends=transformer=video_sparse_attn_h3",
             "--enable-torch-compile=false",
             "--warmup-steps=2",
         ],

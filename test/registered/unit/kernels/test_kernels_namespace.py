@@ -1,7 +1,6 @@
 """GPU-free import / registry / selector tests for ``sglang.kernels`` (RFC #29630)."""
 
 import ast
-import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -68,10 +67,10 @@ def test_multi_backend_requires_explicit_backend(monkeypatch):
     # the current device means selection must name one.
     monkeypatch.setattr(sel, "_platform", lambda: _SM90)
     with pytest.raises(ValueError):
-        K.select_kernel("layernorm.rmsnorm")
-    spec = K.select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT)
+        K.select_kernel("activation.silu_and_mul")
+    spec = K.select_kernel("activation.silu_and_mul", backend=KernelBackend.JIT)
     assert spec.backend is KernelBackend.JIT
-    assert spec.target == "sglang.kernels.ops.layernorm:_RMSNORM.forward_jit"
+    assert spec.target == "sglang.kernels.ops.activation:_SILU_AND_MUL.forward_jit"
 
 
 @pytest.mark.parametrize("device, expect", [("cuda", "jit"), ("hip", "aot")])
@@ -81,25 +80,6 @@ def test_activation_default_backend(monkeypatch, device, expect):
 
     monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
     assert _SILU_AND_MUL.auto_selected_backend().value == expect
-
-
-@pytest.mark.parametrize(
-    "op_attr, device, expect",
-    [
-        ("_RMSNORM", "cuda", "aot"),
-        ("_RMSNORM", "hip", "aiter"),
-        ("_RMSNORM", "npu", "torch_npu"),
-        ("_GEMMA_RMSNORM", "cuda", "aot"),
-        ("_GEMMA_RMSNORM", "hip", "jit"),  # rocm-triton JIT pinned to HIP
-        ("_GEMMA_RMSNORM", "npu", "torch_npu"),
-    ],
-)
-def test_layernorm_default_backend(monkeypatch, op_attr, device, expect):
-    # Same AOT provenance, different device coverage per op: rmsnorm's AOT is
-    # CUDA-only, so HIP falls to aiter and NPU to torch_npu.
-    ln = importlib.import_module("sglang.kernels.ops.layernorm")
-    monkeypatch.setattr(fo, "_platform", lambda: PlatformInfo(device_type=device))
-    assert getattr(ln, op_attr).auto_selected_backend().value == expect
 
 
 @pytest.mark.parametrize(
@@ -195,7 +175,6 @@ def test_import_stays_metadata_only():
         ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
         ("attention.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),
         ("attention.fused_kda_decode_mtp_dspark", KernelBackend.CUTE_DSL, "cuda"),
-        ("attention.flydsl_kimi_k3_kda_decode", KernelBackend.FLYDSL, "hip"),
         ("attention.flydsl_kimi_k3_kda_decode_with_f_b", KernelBackend.FLYDSL, "hip"),
         ("communication.all_reduce_push_res", KernelBackend.JIT, "cuda"),
         ("communication.gemm_ag_up_proj", KernelBackend.JIT, "cuda"),
@@ -208,10 +187,6 @@ def test_kimi_k3_kernels_are_inventoried_by_operator(op, backend, device):
     assert spec.target.startswith(f"sglang.kernels.ops.{group}.")
     assert K.capabilities_satisfied(spec.capabilities, PlatformInfo(device_type=device))
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
-
-
-def test_kimi_k3_model_namespace_is_retired():
-    assert importlib.util.find_spec("sglang.kernels.ops.kimi_k3") is None
 
 
 def test_operator_and_test_groups_agree():
@@ -255,6 +230,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "embeddings.qwen4_ngram",
         "elementwise.qwen4_gate",
         "elementwise.row_scale",
+        "elementwise.hc_combine_decode",
         "mamba.qwen4_short_conv",
         "mamba.lfm_short_conv",
         "gemm.dsv4_wo_a",
@@ -268,6 +244,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "layernorm.grouped_gemma_rmsnorm",
         "moe.dsv4",
         "moe.gemma4_routing",
+        "moe.shared_expert_gate",
         "memory.adler32",
         "memory.row_compact",
         "mm.process.image",
@@ -293,6 +270,10 @@ def test_reclassified_public_entry_points_are_inventoried():
     [
         ("gemm.hopper_bf16_gemv", (9, 0), True),
         ("gemm.hopper_bf16_gemv", (10, 0), False),
+        ("elementwise.hc_combine_apply_norm", (8, 9), False),
+        ("elementwise.hc_combine_apply_norm", (9, 0), True),
+        ("communication.moe_finalize_shared_gate_all_reduce", (8, 9), False),
+        ("communication.moe_finalize_shared_gate_all_reduce", (10, 3), True),
         ("gemm.fp8_blockwise_scaled_mm", (12, 0), True),
         ("gemm.fp8_blockwise_scaled_mm", (12, 1), True),
         ("gemm.fp8_blockwise_scaled_mm", (10, 0), False),

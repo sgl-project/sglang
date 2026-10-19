@@ -181,7 +181,6 @@ def split_height_for_parallel_decode(
 def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
     if (
         x.dim() == 5
-        and hasattr(torch, "channels_last_3d")
         and x.is_contiguous(memory_format=torch.channels_last_3d)
         and not x.is_contiguous()
     ):
@@ -302,7 +301,7 @@ def gather_variable_height(
 
 def _halo_memory_format(reference: torch.Tensor) -> torch.memory_format:
     if reference.dim() > 1 and reference.stride(1) == 1:
-        if reference.dim() == 5 and hasattr(torch, "channels_last_3d"):
+        if reference.dim() == 5:
             return torch.channels_last_3d
         if reference.dim() == 4:
             return torch.channels_last
@@ -475,7 +474,6 @@ def _conv_preserves_local_height(
 def _conv3d_weight_is_channels_last_3d(weight: torch.Tensor) -> bool:
     return (
         weight.dim() == 5
-        and hasattr(torch, "channels_last_3d")
         and (current_platform.is_cuda() or current_platform.is_rocm())
         and weight.is_contiguous(memory_format=torch.channels_last_3d)
     )
