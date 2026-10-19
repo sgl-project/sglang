@@ -36,6 +36,8 @@ def sharded_front_available(group, hidden_size: int) -> bool:
 
 class KimiK3FrontWorkspace:
     def __init__(self, group, num_layers: int, hidden_size: int, max_tokens: int):
+        from flashinfer.fused_moe import core
+
         device = torch.device("cuda", torch.cuda.current_device())
         self.rank = group.rank_in_group
         self.max_tokens = max_tokens
@@ -86,9 +88,19 @@ class KimiK3FrontWorkspace:
         self.q_mc = mc_base
         self.scale_mc = mc_base + scale_start
 
+        self._allocate_routing = getattr(
+            core, "trtllm_moe_allocate_routing_metadata", None
+        )
+        self.routing = None
+
     def route(self, layer_id, scores, bias, local_x, config):
         rows = scores.shape[0]
         assert rows <= self.max_tokens
+        if rows == 1 and self.routing is None and self._allocate_routing is not None:
+            self.routing = SingleTokenRouting(
+                scores.device, scores.shape[1], config.top_k, self._allocate_routing
+            )
+        routing = self.routing if rows == 1 else None
         # Finalize/AllReduce fences the consumer before this layer reuses its slot.
         gather = QuantGather(
             self.comm,
@@ -96,8 +108,10 @@ class KimiK3FrontWorkspace:
             self.scales[layer_id, :rows],
             self.q_mc + layer_id * self.max_tokens * self.hidden_size,
             self.scale_mc + layer_id * self.max_tokens * self.scale_row_bytes,
+            routing.slot.expert_weights if routing else None,
+            routing.batch if routing else None,
         )
-        return route_quant_fused(
+        result = route_quant_fused(
             scores,
             bias,
             local_x,
@@ -111,3 +125,121 @@ class KimiK3FrontWorkspace:
             apply_scale=config.apply_routed_scaling_factor_on_output,
             gather=gather,
         )
+        return result, routing
+
+
+class SingleTokenRouting:
+    """Reuse native MoE metadata when one row selects distinct, sorted experts.
+
+    Only tile-N=8 uses the prepared layout; other autotuner choices retain the
+    native preparation. Buffer capacities come from FlashInfer's allocator.
+    """
+
+    def __init__(self, device, num_experts, top_k, allocate):
+        from flashinfer.fused_moe.core import RoutingInputMode
+
+        tile_n = 8
+        packed = torch.empty((1, top_k), dtype=torch.int32, device=device)
+        self.slot = allocate(
+            packed,
+            num_experts=num_experts,
+            top_k=top_k,
+            local_expert_offset=0,
+            num_local_experts=num_experts,
+            tile_n=tile_n,
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+        expanded = torch.arange(top_k, dtype=torch.int32, device=device) * tile_n
+        padded = top_k * tile_n
+        self.slot.total_num_padded_tokens.fill_(padded)
+        self.slot.expanded_idx_to_permuted_idx.copy_(expanded)
+        self.slot.permuted_idx_to_token_idx.fill_(-1)
+        self.slot.permuted_idx_to_token_idx[:padded:tile_n] = 0
+        self.batch = self.slot.cta_idx_xy_to_batch_idx[:top_k]
+        self.slot.cta_idx_xy_to_mn_limit[:top_k].copy_(expanded + 1)
+        self.slot.num_non_exiting_ctas.fill_(top_k)
+        self.workspaces = {}
+
+    def __call__(self, **kwargs):
+        from flashinfer.autotuner import AutoTuner
+        from flashinfer.fused_moe import core
+
+        x = kwargs["hidden_states"]
+        scale = kwargs["hidden_states_scale"]
+        native = core.get_trtllm_moe_sm100_module()
+        runner = native.MoERunner(
+            native.moe_op,
+            top_k=kwargs["top_k"],
+            num_local_experts=kwargs["local_num_experts"],
+            dtype_act=core.deduce_trtllm_gen_tensor_dtype(x, scale),
+            dtype_weights=core.deduce_trtllm_gen_tensor_dtype(
+                kwargs["gemm1_weights"], kwargs["gemm1_weights_scale"]
+            ),
+            fp8_quantization_type=core.Fp8QuantizationType.NoneFp8,
+            hidden_size=x.shape[1],
+            intermediate_size=kwargs["intermediate_size"],
+            activation_type=kwargs["activation_type"],
+            use_shuffled_weight=True,
+            num_experts=kwargs["num_experts"],
+        )
+        inputs = core.MoeRunnerInputs(
+            output=kwargs["output"],
+            routing_logits=None,
+            topk_ids=kwargs["topk_ids"],
+            expert_weights=self.slot.expert_weights,
+            hidden_states=x,
+            hidden_states_scale=scale,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+        tuning = runner._make_tuning_config(
+            inputs,
+            tune_max_num_tokens=1,
+            use_cold_l2_cache=True,
+            use_cuda_graph=True,
+        )
+        options = dict(kwargs)
+        for name in (
+            "hidden_states",
+            "hidden_states_scale",
+            "output",
+            "topk_ids",
+            "top_k",
+            "local_num_experts",
+            "intermediate_size",
+            "tune_max_num_tokens",
+        ):
+            options.pop(name)
+        options["routing_input_mode"] = core.RoutingInputMode.PackedPrecomputed
+        _, tactic = AutoTuner.get().choose_one(
+            "flashinfer::trtllm_fp4_block_scale_moe",
+            [runner],
+            tuning,
+            inputs.to_list(),
+            **options,
+        )
+        if tactic == -1 or tactic[0] != self.slot.tile_n:
+            return core.trtllm_fp4_block_scale_routed_moe(**kwargs)
+        key = (tuple(tactic), runner.get_cache_key_extras(inputs.to_list()))
+        workspace = self.workspaces.get(key)
+        if workspace is None:
+            assert not torch.cuda.is_current_stream_capturing()
+            workspace = tuple(
+                core._torch_view_of_ffi_tensor(t)
+                for t in runner.forward(
+                    inputs.to_list(),
+                    tactic=tactic,
+                    do_preparation=True,
+                    da_routing_metadata=self.slot.tensors(),
+                    **options,
+                )
+            )
+            self.workspaces[key] = workspace
+        result = runner.forward(
+            inputs.to_list(),
+            tactic=tactic,
+            da_routing_metadata=self.slot.tensors(),
+            da_body_workspace=workspace,
+            **options,
+        )
+        return [core._torch_view_of_ffi_tensor(t) for t in result]

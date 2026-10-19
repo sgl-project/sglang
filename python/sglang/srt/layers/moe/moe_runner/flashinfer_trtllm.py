@@ -1217,7 +1217,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            moe_call = trtllm_fp4_block_scale_routed_moe
+            if defer_finalize:
+                moe_call = route_quant_handoff.take_routing(routing) or moe_call
+            result = moe_call(
                 topk_ids=routing,
                 routing_bias=None,
                 hidden_states=x_quant,

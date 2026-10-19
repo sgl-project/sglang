@@ -49,6 +49,8 @@ class QuantGather(NamedTuple):
     scale_scratch: torch.Tensor
     output_mc: int
     scales_mc: int
+    routing_weights: torch.Tensor | None = None
+    routing_batch: torch.Tensor | None = None
 
 
 @cache_once
@@ -179,6 +181,8 @@ def route_quant_fused(
             float(routed_scaling_factor),
             bool(renormalize),
             bool(apply_scale),
+            gather.routing_weights,
+            gather.routing_batch,
         )
     else:
         _jit_module().run(
