@@ -1,49 +1,53 @@
-"""Unit tests for DeferredOutputSource: holding finished requests' responses."""
+"""Finished responses remain scheduler-owned while external work completes."""
 
+from array import array
 from collections import deque
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 import pytest
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.runtime_context import get_serving
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.weight_versions import (
+    WeightVersionSpan,
+    compute_weight_version_spans,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
-class Source:
-    """Holds requests until the test marks them ready."""
-
-    def __init__(self):
-        self.held = []
-        self.ready = []
-
-    def hold(self, *reqs):
-        for req in reqs:
-            req.defer_output = True
-        self.held.extend(reqs)
-
-    def poll(self):
-        ready, self.ready = self.ready, []
-        self.held = [req for req in self.held if req not in ready]
-        return ready
-
-    def has_pending(self):
-        return bool(self.held)
+@pytest.fixture(autouse=True)
+def topology():
+    with published_topology(weight_version="v1"):
+        yield
 
 
 def _req(rid, return_logprob=False):
-    return SimpleNamespace(rid=rid, defer_output=False, return_logprob=return_logprob)
+    req = Req(rid, "", array("q", [1]), SamplingParams(), return_logprob=return_logprob)
+    req.output_ids.append(2)
+    req.finished_reason = FINISH_LENGTH(1)
+    return req
 
 
 def _scheduler():
     scheduler = object.__new__(Scheduler)
     scheduler.disaggregation_mode = DisaggregationMode.NULL
+    scheduler.waiting_queue = []
+    scheduler.chunked_req = None
+    scheduler.hisparse_coordinator = None
+    scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.ipc_channels = Mock()
     streamer = object.__new__(SchedulerOutputStreamer)
     streamer.is_generation = True
     streamer.defer_outputs = False
@@ -51,81 +55,137 @@ def _scheduler():
     return scheduler
 
 
-@pytest.mark.parametrize("registered", [False, True])
-def test_streamer_filters_held_requests_only_with_a_source(registered):
+def test_response_is_filtered_until_completion_and_released_once():
     scheduler = _scheduler()
-    source = Source()
-    held, free = _req("held"), _req("free")
-    source.hold(held)
-    if registered:
-        scheduler.register_deferred_output_source(source)
-        assert scheduler.deferred_output_sources == (source,)
-    assert Scheduler.deferred_output_sources == ()
-
-    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
-        scheduler.output_streamer.stream_output([held, free], True)
-
-    stream.assert_called_once_with([free] if registered else [held, free], True, None)
-
-
-@pytest.mark.parametrize(
-    "mode", [DisaggregationMode.PREFILL, DisaggregationMode.DECODE]
-)
-def test_registering_a_source_rejects_pd_disaggregation(mode):
-    scheduler = _scheduler()
-    scheduler.disaggregation_mode = mode
-
-    with pytest.raises(ValueError, match="PD disaggregation"):
-        scheduler.register_deferred_output_source(Source())
-
-    assert scheduler.deferred_output_sources == ()
-    assert scheduler.output_streamer.defer_outputs is False
-
-
-def test_released_requests_stream_exactly_once():
-    scheduler = _scheduler()
-    source = Source()
-    scheduler.register_deferred_output_source(source)
     first, second = _req("first", return_logprob=True), _req("second")
-    source.hold(first, second)
-    source.ready = [first]
+    first_done, second_done = Future(), Future()
+    scheduler.defer_response(first, first_done)
+    scheduler.defer_response(second, second_done)
 
     with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
-        scheduler.stream_released_deferred_outputs()
-        stream.assert_called_once_with([first], True, None)
-        assert first.defer_output is False
-        assert second.defer_output is True
-        assert scheduler.has_pending_deferred_outputs()
-
+        scheduler.output_streamer.stream_output([first, second, _req("free")], True)
+        assert [req.rid for req in stream.call_args.args[0]] == ["free"]
         stream.reset_mock()
         scheduler.stream_released_deferred_outputs()
         stream.assert_not_called()
 
+        first_done.set_result(None)
+        scheduler.stream_released_deferred_outputs()
+        stream.assert_called_once_with([first], True, None)
+        assert not first.defer_output and second.defer_output
+        assert scheduler.has_pending_deferred_outputs()
+        scheduler.stream_released_deferred_outputs()
+        stream.assert_called_once()
+
+        second_done.set_result(None)
+        scheduler.stream_released_deferred_outputs()
+        assert stream.call_args == call([second], False, None)
+        assert not scheduler.has_pending_deferred_outputs()
+        assert Scheduler._deferred_responses is None
+
+
+@pytest.mark.parametrize(
+    "invalid", ["unfinished", "sent", "duplicate", "prefill", "decode"]
+)
+def test_defer_response_rejects_invalid_ownership(invalid):
+    scheduler, req = _scheduler(), _req("request")
+    if invalid == "unfinished":
+        req.finished_reason = None
+    elif invalid == "sent":
+        req.finished_output = True
+    elif invalid == "duplicate":
+        scheduler.defer_response(req, Future())
+        req = _req(req.rid)
+    else:
+        scheduler.disaggregation_mode = DisaggregationMode(invalid)
+
+    with pytest.raises(ValueError):
+        scheduler.defer_response(req, Future())
+
+    assert not req.defer_output
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_failed_completion_releases_an_error_response(cancelled):
+    scheduler, req, completion = _scheduler(), _req("failed"), Future()
+    scheduler.defer_response(req, completion)
+    if cancelled:
+        completion.cancel()
+    else:
+        completion.set_exception(RuntimeError("publish failed"))
+
+    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
+        scheduler.stream_released_deferred_outputs()
+        scheduler.stream_released_deferred_outputs()
+
+    stream.assert_not_called()
+    send = scheduler.ipc_channels.send_to_tokenizer.send_output
+    send.assert_called_once()
+    abort, sent_req = send.call_args.args
+    assert sent_req is req and abort.rid == req.rid
+    assert abort.finished_reason["type"] == "abort"
+    assert abort.finished_reason["status_code"] == 500
+    assert req.finished_output
+    assert not req.defer_output and not scheduler.has_pending_deferred_outputs()
+
+
+@pytest.mark.parametrize("abort_all", [False, True])
+def test_abort_cancels_only_matching_held_responses(abort_all):
+    scheduler = _scheduler()
+    scheduler.mm_receiver = None
+    scheduler.dllm_config = None
+    scheduler.grammar_manager = Mock()
+    reqs = [_req("group-0"), _req("other")]
+    completions = [Future(), Future()]
+    if not abort_all:
+        completions[0].set_running_or_notify_cancel()
+    for req, completion in zip(reqs, completions):
+        scheduler.defer_response(req, completion)
+
+    scheduler.abort_request(AbortReq(rid="group-", abort_all=abort_all))
+    assert [completion.cancelled() for completion in completions] == [
+        abort_all,
+        abort_all,
+    ]
+    assert [req.defer_output for req in reqs] == [False, not abort_all]
+    assert scheduler.has_pending_deferred_outputs() is (not abort_all)
+    sent = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args_list
+    assert [args[0].rid for args, _ in sent] == [
+        req.rid for req in reqs[: 2 if abort_all else 1]
+    ]
+    if not abort_all:
+        completions[0].set_result(None)
+    with patch.object(SchedulerOutputStreamer, "_stream_output_generation") as stream:
+        scheduler.stream_released_deferred_outputs()
+    stream.assert_not_called()
+
+
+def test_held_tokens_keep_their_weight_version():
+    scheduler, req = _scheduler(), _req("held")
+    scheduler.defer_response(req, Future())
+
+    scheduler.record_weight_version_change("v2")
+
+    assert compute_weight_version_spans(
+        req.weight_version_events, get_serving().weight_version, len(req.output_ids)
+    ) == [WeightVersionSpan(version="v1", start=0, end=1)]
+
 
 def test_held_responses_do_not_change_idle_state():
-    # Only the output rank holds responses under TP; idle-gated operations
-    # (cache flush, memory release) must agree across ranks.
+    # Only the output rank holds responses under TP; cache flush and memory
+    # release must still see the same idle state on every rank.
     scheduler = _scheduler()
     scheduler._engine_paused = False
     scheduler.enable_overlap = False
     scheduler.last_batch = None
-    scheduler.chunked_req = None
-    scheduler.running_batch = MagicMock()
-    scheduler.running_batch.is_empty.return_value = True
+    scheduler.running_batch = SimpleNamespace(is_empty=lambda: True)
     scheduler.result_queue = deque()
-    scheduler.waiting_queue = []
-    scheduler.dllm_manager = MagicMock()
-    scheduler.dllm_manager.any_staging_reqs.return_value = False
-    scheduler._pp_microbatches_drained = MagicMock(return_value=True)
-    scheduler.grammar_manager = MagicMock()
-    scheduler.grammar_manager.grammar_queue = []
+    scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+    scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
     scheduler.enable_hierarchical_cache = False
     scheduler.enable_lmcache = False
     scheduler.enable_hisparse = False
-    source = Source()
-    scheduler.register_deferred_output_source(source)
-
-    source.hold(_req("held"))
+    scheduler.defer_response(_req("held"), Future())
 
     assert scheduler.has_pending_deferred_outputs()
     assert scheduler.is_fully_idle()
@@ -134,7 +194,7 @@ def test_held_responses_do_not_change_idle_state():
 
 def test_batch_results_release_held_responses_first():
     scheduler = MagicMock()
-    scheduler.deferred_output_sources = (Source(),)
+    scheduler._deferred_responses = {"held": (_req("held"), Future())}
     scheduler.enable_fpm = False
     order = Mock()
     order.attach_mock(scheduler.stream_released_deferred_outputs, "release")
@@ -153,12 +213,13 @@ def test_batch_results_release_held_responses_first():
 
 
 @pytest.mark.parametrize(
-    ("fully_idle", "pending"), [(False, True), (True, True), (True, False)]
+    ("state", "pending"),
+    [("busy", True), ("idle", True), ("idle", False), ("paused", True)],
 )
-def test_idle_scheduler_polls_and_only_sleeps_after_release(fully_idle, pending):
+def test_idle_scheduler_polls_and_only_sleeps_after_release(state, pending):
     scheduler = MagicMock()
-    scheduler.deferred_output_sources = (Source(),)
-    scheduler.is_fully_idle.return_value = fully_idle
+    scheduler._deferred_responses = {"held": (_req("held"), Future())}
+    scheduler.is_fully_idle.return_value = state != "busy"
     scheduler.has_pending_deferred_outputs.return_value = pending
     scheduler._last_stall_publish_ts = float("inf")
     scheduler.enable_hicache_storage = False
@@ -167,10 +228,13 @@ def test_idle_scheduler_polls_and_only_sleeps_after_release(fully_idle, pending)
     scheduler.enable_hisparse = True  # skips the pool accounting checks
 
     with patch("sglang.srt.managers.scheduler.time.sleep") as sleep:
-        Scheduler.on_idle.__wrapped__(scheduler)
+        if state == "paused":
+            Scheduler._record_scheduler_state_for_paused_engine(scheduler)
+        else:
+            Scheduler.on_idle.__wrapped__(scheduler)
 
     scheduler.stream_released_deferred_outputs.assert_called_once_with()
-    if not fully_idle or pending:
+    if state != "idle" or pending:
         scheduler.maybe_sleep_on_idle.assert_not_called()
         sleep.assert_called_once_with(0)
     else:

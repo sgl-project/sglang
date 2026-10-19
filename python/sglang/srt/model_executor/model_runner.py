@@ -199,6 +199,7 @@ from sglang.srt.runtime_context import (
     assert_published,
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_global_dwdp_manager,
     get_lora,
@@ -356,8 +357,13 @@ class ModelRunner:
 
     def supports_forward_observer(self) -> bool:
         """Whether this runner's forward path publishes forward-observer output."""
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
         return (
             not self.is_draft_worker
+            and self.is_generation
+            and not use_mlx()
+            and not get_disagg().enable_pdmux
             and get_exec().dllm.dllm_algorithm is None
             and self.spec_algorithm.is_none()
             and get_parallel().pp_size == 1

@@ -1,41 +1,34 @@
-"""Extension contract for holding finished requests' final responses.
+"""Completion contract for ``Scheduler.defer_response(req, completion)``.
 
-An out-of-tree consumer that finishes per-request work asynchronously (for
-example, a ``HostAuxiliaryOutput`` that publishes data to external storage)
-can keep a finished request from streaming until that work completes:
+An auxiliary-output consumer can defer a finished request's response until
+its asynchronous work completes. The scheduler owns the request and polls the
+completion while busy, idle or paused. It calls ``result`` before streaming,
+on the scheduler thread, so a plugin can finalize response metadata there.
+An unhandled exception aborts the response instead of terminating the server.
 
-1. register a ``DeferredOutputSource`` with
-   ``Scheduler.register_deferred_output_source``;
-2. set ``Req.defer_output`` on a finished request, e.g. from
-   ``HostAuxiliaryOutput.consume``, which runs before the batch is streamed;
-3. return the request from ``poll`` once its work is done.
+Only one completion may hold a request; consumers must combine their work
+before deferring. A ``concurrent.futures.Future[None]`` satisfies this contract.
+Cancellation retires the response immediately even if the work is already
+running. A completion sharing a batch's work must not cancel its siblings.
 
-The scheduler skips deferred requests when streaming, polls every source on
-each iteration and while idle, streams the requests a source releases, and
-keeps polling instead of sleeping while a source has pending requests. All
-calls run on the scheduler thread.
-
-Held requests do not count against ``Scheduler.is_fully_idle``. Under tensor
-parallelism only the rank that streams outputs holds them, and idle-gated
-operations (cache flushes, memory release, storage attach) must see the same
-state on every rank. A held request has already released its KV cache, so a
-source must own the data it publishes. Sources are not supported with PD
-disaggregation.
+Held requests have released their KV cache, so the completion must own its
+payload. They do not affect ``Scheduler.is_fully_idle``: only the output rank
+holds responses under TP, and idle-gated collective operations must agree on
+all ranks. PD disaggregation is unsupported.
 """
 
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, List, Protocol
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+from typing import Protocol
 
 
-class DeferredOutputSource(Protocol):
-    def poll(self) -> List[Req]:
-        """Return held requests that may stream now, without blocking."""
+class ResponseCompletion(Protocol):
+    def done(self) -> bool:
+        """Whether ``result`` can be called without blocking."""
         ...
 
-    def has_pending(self) -> bool:
-        """Whether any request is still held by this source."""
+    def result(self) -> None:
+        """Finalize metadata on the scheduler thread, or raise on failure."""
+        ...
+
+    def cancel(self) -> bool:
+        """Attempt to cancel work without blocking; never emit a response."""
         ...
