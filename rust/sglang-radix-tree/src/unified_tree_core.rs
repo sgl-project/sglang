@@ -674,7 +674,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Adjust the component's evictable or protected count of reclaimable tokens.
-    /// The caller updates backing and size together, and restores backing on error.
+    /// Counters are unchanged on error; the caller keeps backing consistent.
     /// This changes counters only; roots and device tombstones are ignored.
     pub fn adjust_component_size(
         &mut self,
@@ -2308,7 +2308,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             displaced.is_none(),
             "add_new_node_: parent {parent_id} already has a child on the new node's page"
         );
-        self.inc_evictable_size(FULL, value.size()[0] as usize);
+        let tokens = self
+            .arena
+            .node(new_node_id)
+            .device_reclaimable_value_len(FULL);
+        self.inc_evictable_size(FULL, tokens);
         if self.enable_storage || self.enable_external_cache_linker {
             let hash_values = self.arena.compute_node_hash_values(new_node_id, page_size);
             self.arena.node_mut(new_node_id).hash_value = Some(hash_values);
@@ -2330,7 +2334,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) {
         self.arena
             .set_device_value(node_id, FULL, fresh_value.copy());
-        let tokens = fresh_value.size()[0] as usize;
+        let tokens = self.arena.node(node_id).device_reclaimable_value_len(FULL);
         // A value materialized under lock is protected; the last release
         // moves it to evictable.
         if self.arena.device_lock_ref(node_id, FULL) > 0 {
@@ -4672,8 +4676,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             component_type != BASE_COMPONENT_TYPE,
             "set_component_device_value: auxiliary components only"
         );
-        let tokens = value.size()[0] as usize;
         self.arena.set_device_value(node_id, component_type, value);
+        let tokens = self
+            .arena
+            .node(node_id)
+            .device_reclaimable_value_len(component_type);
         let host_lru = self.host_lru_list_mut(component_type);
         if host_lru.in_list(Some(node_id)) {
             host_lru.remove_node(node_id);
@@ -5133,17 +5140,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let mut evictable = 0usize;
             let mut protected = 0usize;
             for &node_id in &all_nodes {
-                if self.arena.node(node_id).is_root() {
-                    continue;
-                }
-                let state = &self.arena.node(node_id).values[ct.idx()];
-                if let Some(value) = &state.value {
-                    let tokens = value.size()[0] as usize;
-                    if state.lock_ref > 0 {
-                        protected += tokens;
-                    } else {
-                        evictable += tokens;
-                    }
+                let node = self.arena.node(node_id);
+                let tokens = node.device_reclaimable_value_len(ct);
+                if node.device_lock_ref(ct) > 0 {
+                    protected += tokens;
+                } else {
+                    evictable += tokens;
                 }
             }
             let recorded = self.component_state(ct);

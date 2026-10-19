@@ -181,8 +181,8 @@ class FullComponent(TreeComponent):
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
             # Progress toward an eviction request and the ledger move are
-            # both in allocator units (see reclaimable_tokens).
-            freed = self.reclaimable_tokens(node)
+            # both in allocator units (see reclaimable_value_len).
+            freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
@@ -310,7 +310,7 @@ class FullComponent(TreeComponent):
                 f"FULL invariant broken: evicted ancestor {cur.id} above device-on segment"
             )
             if cd.lock_ref == 0:
-                key_len = self.reclaimable_tokens(cur)
+                key_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_evictable_size_[ct] -= key_len
                 self.tree_core.component_protected_size_[ct] += key_len
                 delta += key_len
@@ -359,7 +359,7 @@ class FullComponent(TreeComponent):
                 f"FULL segment release hit lock_ref=0 on node {cur.id}"
             )
             if cd.lock_ref == 1 and cd.value is not None:
-                key_len = self.reclaimable_tokens(cur)
+                key_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_evictable_size_[ct] += key_len
                 self.tree_core.component_protected_size_[ct] -= key_len
             cd.lock_ref -= 1
@@ -453,7 +453,7 @@ class FullComponent(TreeComponent):
                 offset += n_len
                 # Full uses leaf sets, not LRU. A value materialized under
                 # lock is protected; the last release moves it to evictable.
-                ledger = self.reclaimable_tokens(n)
+                ledger = self.reclaimable_value_len(n)
                 if cd.lock_ref > 0:
                     self.tree_core.component_protected_size_[ct] += ledger
                 else:

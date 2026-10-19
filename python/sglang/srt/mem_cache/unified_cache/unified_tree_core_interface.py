@@ -430,6 +430,8 @@ class UnifiedTreeCoreInterface(ABC):
 
         Roots and nodes without device values are no-ops. Missing handles raise
         KeyError; disabled components raise ValueError.
+        Negative totals raise ValueError without updating the count. Rust also
+        rejects fixed-width overflow; Python integers are unbounded.
         """
         ...
 

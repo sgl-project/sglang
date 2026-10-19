@@ -1096,6 +1096,8 @@ def test_host_only_and_root_adjustments_are_noops(backend, is_eagle):
     for node in (root, host):
         for delta in (-10, 0, 10):
             core.adjust_component_size(node, ComponentType.FULL, delta)
+        with pytest.raises(ValueError):
+            core.adjust_component_size(node, ComponentType.SWA, 0)
     assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
     assert core.collect_path_info([host])[0][0].full_value_len is None
 
@@ -1120,6 +1122,7 @@ def test_failed_adjustments_preserve_accounting_and_tree(backend, is_eagle, lock
         (invalid_node, ComponentType.FULL, 0, KeyError),
         (leaf, ComponentType.SWA, 0, ValueError),
         (leaf, 99, 0, ValueError),
+        (leaf, ComponentType.FULL, -len(key) - 1, ValueError),
     ):
         with pytest.raises(error):
             core.adjust_component_size(node, component, delta)
@@ -1145,28 +1148,54 @@ def test_adjustment_follows_real_backing_changes_across_lock_transitions():
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 
     class SideBackingFullComponent(FullComponent):
-        def reclaimable_tokens(self, node):
-            backing = node.component_data[ComponentType.FULL].metadata.get(
-                "side_backing"
-            )
-            return super().reclaimable_tokens(node) + (
-                0 if backing is None else backing.numel()
-            )
+        def reclaimable_value_len(self, node):
+            metadata = node.component_data[ComponentType.FULL].metadata
+            tokens = super().reclaimable_value_len(node)
+            if "raw_backing" in metadata:
+                tokens = metadata["raw_backing"].numel()
+            side_backing = metadata.get("side_backing")
+            return tokens + (0 if side_backing is None else side_backing.numel())
 
     params = CacheInitParams(
         False, None, None, 1, tree_components=(ComponentType.FULL,)
     )
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    core = UnifiedTreeCore(
-        params, {ComponentType.FULL: SideBackingFullComponent(cache, params)}
-    )
+    driver = SideBackingFullComponent(cache, params)
+    core = UnifiedTreeCore(params, {ComponentType.FULL: driver})
     leaf = _insert(core, [1, 2, 3, 4], [10, 11, 12, 13]).last_device_node
-    metadata = core.node_by_id(leaf).component_data[ComponentType.FULL].metadata
+    node = core.node_by_id(leaf)
+    metadata = node.component_data[ComponentType.FULL].metadata
     metadata["side_backing"] = torch.tensor([100, 101])
     core.adjust_component_size(leaf, ComponentType.FULL, 2)
     assert (core.full_evictable_size(), core.full_protected_size()) == (6, 0)
+    assert driver.value_len(node) == 4
+    assert driver.reclaimable_value_len(node) == 6
+    assert core.collect_path_info([leaf])[0][0].full_value_len == 4
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert matched.device_prefix_len == 4
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12, 13]
 
     lock = core.inc_lock_ref(leaf)
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 6)
+    # A locked split follows logical indices; the tail keeps the side backing.
+    prefix_match = core.match_prefix(MatchPrefixParams(key=_key([1, 2])))
+    prefix = prefix_match.last_device_node
+    prefix_node = core.node_by_id(prefix)
+    assert prefix_match.device_prefix_len == 2
+    assert _path_indices(core, prefix).tolist() == [10, 11]
+    assert core.get_component_device_value(leaf, ComponentType.FULL).tolist() == [
+        12,
+        13,
+    ]
+    assert (driver.value_len(prefix_node), driver.value_len(node)) == (2, 2)
+    assert (
+        driver.reclaimable_value_len(prefix_node),
+        driver.reclaimable_value_len(node),
+    ) == (2, 4)
+    assert [
+        (span.path_start, span.path_end, span.full_value_len)
+        for span in core.collect_path_info([leaf])[0]
+    ] == [(0, 2, 2), (2, 4, 2)]
     assert (core.full_evictable_size(), core.full_protected_size()) == (0, 6)
     metadata["side_backing"] = metadata["side_backing"][:1]
     core.adjust_component_size(leaf, ComponentType.FULL, -1)
@@ -1176,9 +1205,27 @@ def test_adjustment_follows_real_backing_changes_across_lock_transitions():
     core.dec_lock_ref(leaf, lock.to_dec_params())
     assert (core.full_evictable_size(), core.full_protected_size()) == (4, 0)
     core.sanity_check([], [])
+
+    for fragment in (prefix_node, node):
+        fragment.component_data[ComponentType.FULL].metadata["raw_backing"] = (
+            torch.empty(0, dtype=torch.int64)
+        )
+        core.adjust_component_size(fragment.id, ComponentType.FULL, -2)
+        assert driver.value_len(fragment) == 2
+        assert driver.reclaimable_value_len(fragment) == 0
+    assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
+    assert [span.full_value_len for span in core.collect_path_info([leaf])[0]] == [2, 2]
+    matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3, 4])))
+    assert matched.device_prefix_len == 4
+    assert _path_indices(core, matched.last_device_node).tolist() == [10, 11, 12, 13]
+    core.sanity_check([], [])
     tracker = {}
-    _accumulate_step(core.evict_device_leaf(leaf, False), tracker, {}, {})
-    assert tracker[ComponentType.FULL] == 4
+    device_frees = {}
+    _accumulate_step(core.evict_device_leaf(leaf, False), tracker, device_frees, {})
+    assert torch.cat(device_frees[ComponentType.FULL]).tolist() == [12, 13]
+    _accumulate_step(core.evict_device_leaf(prefix, False), tracker, device_frees, {})
+    assert tracker[ComponentType.FULL] == 0
+    assert torch.cat(device_frees[ComponentType.FULL]).tolist() == [12, 13, 10, 11]
     assert (core.full_evictable_size(), core.full_protected_size()) == (0, 0)
 
 
@@ -2683,6 +2730,7 @@ def _swa_cache(
     backend="rust",
     ring=False,
     request_window=False,
+    component_registry_override=None,
 ):
     """A real UnifiedRadixCache and SWA allocator, defaulting to the Rust core."""
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -2733,6 +2781,7 @@ def _swa_cache(
                 sliding_window_size=window,
                 swa_gates_prefix_match=not (ring or request_window),
                 tree_components=(ComponentType.FULL, ComponentType.SWA),
+                component_registry_override=component_registry_override,
             )
         )
     return cache, allocator
@@ -2749,7 +2798,9 @@ def _complete_backup(core, node, full_offset=1000, aux_offset=1000):
     return full + full_offset, aux
 
 
-def _swa_mamba_cache(backend, window, enable_session=False):
+def _swa_mamba_cache(
+    backend, window, enable_session=False, component_registry_override=None
+):
     from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -2770,6 +2821,7 @@ def _swa_mamba_cache(backend, window, enable_session=False):
                 page_size=1,
                 sliding_window_size=window,
                 enable_session_radix_cache=enable_session,
+                component_registry_override=component_registry_override,
                 tree_components=(
                     ComponentType.FULL,
                     ComponentType.SWA,
@@ -2787,11 +2839,17 @@ def _internal_swa_write_back_case(
     with_mamba=False,
     prefix_nodes=1,
     enable_session=False,
+    component_registry_override=None,
 ):
     cache, allocator = (
-        _swa_mamba_cache(backend, window, enable_session)
+        _swa_mamba_cache(backend, window, enable_session, component_registry_override)
         if with_mamba
-        else _swa_cache(window=window, page_size=page_size, backend=backend)
+        else _swa_cache(
+            window=window,
+            page_size=page_size,
+            backend=backend,
+            component_registry_override=component_registry_override,
+        )
     )
     assert cache._tree_core_backend == backend
     segment = 2 * page_size
@@ -3129,6 +3187,121 @@ def _assert_internal_eviction_pending(step, component, node, swa_tokens=0):
     assert step.swa_backup_num_tokens == swa_tokens
     assert not step.tracker and not step.device_frees and not step.host_frees
     assert step.unbacked_tokens == 0
+
+
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+@pytest.mark.parametrize("early_release", [False, True], ids=["final", "early-swa"])
+def test_python_component_locks_use_reclaimable_backing(component, early_release):
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+
+    base = MambaComponent if component == ComponentType.MAMBA else SWAComponent
+
+    class SideBackingComponent(base):
+        def reclaimable_value_len(self, node):
+            backing = node.component_data[self.component_type].metadata.get("backing")
+            if backing is not None:
+                return backing.numel()
+            return super().reclaimable_value_len(node)
+
+    case = _internal_swa_write_back_case(
+        "python",
+        with_mamba=component == ComponentType.MAMBA,
+        component_registry_override={component: SideBackingComponent},
+    )
+    cache, core = case.cache, case.core
+    node_id, leaf = case.nodes
+    node = core.node_by_id(node_id)
+    state = node.component_data[component]
+    logical = state.value.clone()
+    state.metadata["backing"] = torch.arange(len(logical) + 2)
+    core.adjust_component_size(node_id, component, 2)
+
+    def ledgers():
+        return (
+            core.component_evictable_size_[component],
+            core.component_protected_size_[component],
+        )
+
+    before = ledgers()
+    reclaimed = len(logical) + 2
+    lock = core.inc_lock_ref(node_id).to_dec_params()
+    assert state.lock_ref == 1
+    assert ledgers() == (before[0] - reclaimed, before[1] + reclaimed)
+    assert cache.components[component].value_len(node) == len(logical)
+    assert torch.equal(state.value, logical)
+
+    # The final release uses current backing, not the original lock delta.
+    state.metadata["backing"] = state.metadata["backing"][:-1]
+    core.adjust_component_size(node_id, component, -1)
+    if early_release:
+        released = core.dec_swa_lock_only(node_id, lock)
+        assert not released.device_frees and not released.host_frees
+        core.dec_lock_ref(node_id, lock, skip_swa=True)
+    else:
+        core.dec_lock_ref(node_id, lock)
+    assert state.lock_ref == 0
+    assert ledgers() == (before[0] - 1, before[1])
+    assert torch.equal(state.value, logical)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
+
+
+@pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])
+def test_python_zero_accounted_internal_eviction_continues(component):
+    from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+
+    base = MambaComponent if component == ComponentType.MAMBA else SWAComponent
+
+    class ReleasedBackingComponent(base):
+        def reclaimable_value_len(self, node):
+            if node.component_data[self.component_type].metadata.get("released"):
+                return 0
+            return super().reclaimable_value_len(node)
+
+    case = _internal_swa_write_back_case(
+        "python",
+        with_mamba=component == ComponentType.MAMBA,
+        prefix_nodes=2,
+        component_registry_override={component: ReleasedBackingComponent},
+    )
+    cache, core = case.cache, case.core
+    first, second, leaf = case.nodes
+    cache.is_write_back = False
+    driver = cache.components[component]
+    expected_values = [
+        core.get_component_device_value(node, component).clone()
+        for node in (first, second)
+    ]
+    first_size = driver.reclaimable_value_len(core.node_by_id(first))
+    expected = driver.reclaimable_value_len(core.node_by_id(second))
+    core.node_by_id(first).component_data[component].metadata["released"] = True
+    core.adjust_component_size(first, component, -first_size)
+    assert driver.value_len(core.node_by_id(first)) == len(expected_values[0]) > 0
+    assert driver.reclaimable_value_len(core.node_by_id(first)) == 0
+    tracker, freed = {}, {}
+    core.evict_device_start(component, expected)
+    try:
+        first_step = core.evict_device_next_node(component, tracker)
+        assert first_step.node_id is None and first_step.made_progress
+        assert not first_step.tracker and first_step.device_frees[component]
+        _accumulate_step(first_step, tracker, freed, {})
+        assert core.get_component_device_value(first, component) is None
+        assert torch.equal(torch.cat(freed[component]), expected_values[0])
+
+        second_step = core.evict_device_next_node(component, tracker)
+        assert second_step.node_id is None and second_step.made_progress
+        _accumulate_step(second_step, tracker, freed, {})
+        assert tracker[component] == expected
+        assert core.get_component_device_value(second, component) is None
+        assert len(freed[component]) == 2
+        assert torch.equal(torch.cat(freed[component]), torch.cat(expected_values))
+        assert not core.evict_device_next_node(component, tracker).made_progress
+    finally:
+        core.evict_device_end(component)
+    cache.dec_lock_ref(leaf, case.leaf_lock)
+    core.sanity_check([], [])
 
 
 @pytest.mark.parametrize("component", [ComponentType.MAMBA, ComponentType.SWA])

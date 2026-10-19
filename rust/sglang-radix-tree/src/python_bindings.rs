@@ -1511,7 +1511,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let made_progress = node_id.is_some()
             || result.mamba_backup_node_id.is_some()
             || result.swa_backup_node_id.is_some()
-            || !result.tracker.is_empty();
+            || !result.tracker.is_empty()
+            || result.device_frees.values().any(|frees| !frees.is_empty())
+            || result.host_frees.values().any(|frees| !frees.is_empty());
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
             mamba_backup_node_id: result.mamba_backup_node_id,
