@@ -13,10 +13,13 @@ pub mod pb {
     tonic::include_proto!("kv_indexer.v1");
 }
 
+pub mod tair_kvcache_pb;
+
 mod admission;
 mod memory_backend;
 mod service;
 mod shutdown;
+mod tair_kvcache_backend;
 
 pub use admission::stamp_arrival;
 pub use client::{
@@ -31,6 +34,11 @@ pub use service::{
     MAX_GRPC_DECODING_MESSAGE_SIZE,
 };
 pub use shutdown::shutdown_signal;
+pub use tair_kvcache_backend::{
+    TairKVCacheAutoRegister, TairKVCacheBackendConfig, TairKVCacheConfigError,
+    TairKVCacheIndexerBackend, DEFAULT_APPLY_TIMEOUT_MS, DEFAULT_HEARTBEAT_INTERVAL_MS,
+    DEFAULT_QUERY_TIMEOUT_MS,
+};
 /// Re-exported because [`PrefixIndexError::Rejected`] carries it, so callers can
 /// match on a rejection without depending on tonic.
 pub use tonic::Code as RpcCode;
