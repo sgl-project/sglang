@@ -412,3 +412,17 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+# Muse Spark QK norm (+ RoPE, + KV store), built per layer: inventoried through
+# its class methods.
+for _bk in ("torch", "triton", "helion"):
+    register_kernel(
+        KernelSpec(
+            op="attention.muse_spark_qk_norm_rope_store",
+            backend=KernelBackend(_bk),
+            target="sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store:FusedQKNorm."
+            + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+            capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+        )
+    )
+del _bk

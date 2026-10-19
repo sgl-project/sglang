@@ -276,3 +276,24 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+# Muse Spark routing, built per layer: inventoried through its class methods.
+for _bk in ("torch", "jit", "triton"):
+    register_kernel(
+        KernelSpec(
+            op="moe.muse_spark_routing",
+            backend=KernelBackend(_bk),
+            target="sglang.kernels.ops.moe.muse_spark_routing:FusedMuseSparkRouting."
+            + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+            capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+        )
+    )
+del _bk
+register_kernel(
+    KernelSpec(
+        op="moe.muse_spark_post_expert_finalize",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
+        capabilities=CUDA_ONLY,
+    )
+)

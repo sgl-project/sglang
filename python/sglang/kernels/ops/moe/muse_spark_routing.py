@@ -691,6 +691,7 @@ class FusedMuseSparkRouting(BaseFusedOp):
     5. Renormalize: scores / (sum(scores) + eps) * route_scale
     """
 
+    op = "moe.muse_spark_routing"
     priority = (KernelBackend.JIT, KernelBackend.TRITON)
     capabilities = {
         KernelBackend.JIT: {CapabilityRequirement.CUDA},

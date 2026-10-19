@@ -160,6 +160,7 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
     - ``forward_jit``: the JIT CUDA kernel.
     """
 
+    op = "layernorm.muse_spark_norm_residual"
     priority = (KernelBackend.JIT, KernelBackend.TRITON)
     capabilities = {
         KernelBackend.JIT: {CapabilityRequirement.CUDA},
