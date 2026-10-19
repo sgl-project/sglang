@@ -1861,6 +1861,39 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class CheckpointReqType(Enum):
+    # Also reports whether PREPARE would be refused, changing nothing.
+    STATE = 1
+    # Release the KV cache once the paused scheduler drains.
+    PREPARE = 2
+    RESUME = 3
+
+
+class CheckpointState(str, Enum):
+    """Process checkpoint lifecycle of a scheduler; it serves only while
+    RUNNING, and may go through the cycle any number of times."""
+
+    RUNNING = "running"
+    PREPARING = "preparing"
+    # Safe to capture.
+    PREPARED = "prepared"
+    # Only across DP ranks: some resumed, others still prepared.
+    RESUMING = "resuming"
+    FAILED = "failed"
+
+
+class CheckpointReqInput(BaseReq, kw_only=True):
+    req_type: CheckpointReqType = CheckpointReqType.STATE
+
+
+class CheckpointReqOutput(BaseReq, kw_only=True):
+    # False when the request was refused, with nothing changed.
+    success: bool
+    # Why it was refused, or why the lifecycle failed.
+    message: str = ""
+    state: CheckpointState
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
