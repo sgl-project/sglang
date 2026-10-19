@@ -100,7 +100,7 @@ def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog)
         gpu_id = 0
         is_draft_worker = True
         spec_algorithm = SimpleNamespace(is_speculative=lambda: True)
-        server_args = SimpleNamespace(model_impl="auto")
+        server_args = SimpleNamespace(model_impl="auto", dllm_algorithm=None)
         req_to_token_pool = SimpleNamespace(size=32)
 
         def decode_num_tokens_per_req(self):

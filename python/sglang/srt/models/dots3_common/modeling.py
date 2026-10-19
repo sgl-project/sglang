@@ -48,6 +48,7 @@ from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -94,8 +95,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -126,7 +127,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     ceil_align,
     ceil_div,
-    get_bool_env_var,
     is_cuda,
     log_info_on_rank0,
     make_pp_layers,
@@ -1667,9 +1667,9 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             token_pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
         if mm_inputs.audio_start_id is not None and mm_inputs.audio_end_id is not None:
             token_pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
-        return MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=token_pairs or None
-        ).pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_token_pairs(
+            input_ids, mm_inputs, data_token_pairs=token_pairs or None
+        )
 
     def _get_precomputed_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         embed_param = next(self.model.embed_tokens.parameters())
@@ -1791,7 +1791,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
-                    and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                    and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.
                     # The issue is that when multiplying w_kc the reduction dim can not be divided
