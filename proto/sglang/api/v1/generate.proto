@@ -66,12 +66,51 @@ message GenerateRequest {
   // Apply grammar constraints only after the reasoning section, for every
   // batch item.
   optional bool require_reasoning = 26;
-  // Fields this server cannot honour. Unknown keys are ignored, but
-  // dropping these would silently change the result (base-model output for a
-  // LoRA request, a stateless answer for a session request), so a non-null
-  // value is rejected instead.
-  optional string lora_path = 27 [(sglang.json.v1.field_json).raw_json = true];
+  // A field this server cannot honour. Unknown keys are ignored, but dropping
+  // this one would silently return a stateless answer for a session request,
+  // so a non-null value is rejected instead.
   optional string session_params = 28 [(sglang.json.v1.field_json).raw_json = true];
+
+  // Orchestrator controls used by native gRPC clients such as Dynamo.
+  // `lora_path` and `kv_hints` follow Python's `GenerateReqInput`: a scalar
+  // applies to every prompt, a list carries one (nullable) value per prompt.
+  OptionalStringOrList lora_path = 27;
+  optional string routing_key = 31;
+  optional uint64 max_thinking_tokens = 32;
+  KvHintsEnvelopeOrList kv_hints = 29;
+}
+
+message KvHintsEnvelopeOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
+    KvHintsEnvelope one = 1;
+    KvHintsEnvelopeList many = 2;
+  }
+}
+
+message KvHintsEnvelopeList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated OptionalKvHintsEnvelope items = 1;
+}
+
+message OptionalKvHintsEnvelope {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
+  optional KvHintsEnvelope envelope = 1;
+}
+
+// Versioned KV-hint envelope forwarded from a trusted orchestrator. Action
+// payloads are JSON because each action type owns its own schema.
+message KvHintsEnvelope {
+  string protocol_version = 1;
+  string message_id = 2;
+  repeated KvHintAction actions = 3;
+}
+
+message KvHintAction {
+  string action_id = 1;
+  string action_type = 2;
+  string action_version = 3;
+  optional string payload = 4 [(sglang.json.v1.field_json).raw_json = true];
 }
 
 message SamplingParamsOrList {

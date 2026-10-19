@@ -57,6 +57,8 @@ pub enum ResponseItem {
     /// bytes for the core to decode (e.g. detokenized text), not a
     /// client-facing wire payload and not a generation frame.
     Data(Bytes),
+    /// Reply to `RequestKind::Tokenize`: the encoded token ids.
+    TokenIds(TokenIds),
     /// Terminal runtime failure; the core maps it to a semantic error.
     Error(Error),
 }
