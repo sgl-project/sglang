@@ -248,20 +248,20 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
 ):
     """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
 
-    model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    dataset_name = "random"
-    input_len = 128000
-    output_len = 1000
-    num_prompts = 32
-    max_concurrency = 16
+    model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
+    dataset_name = "generated-shared-prefix"
+    max_concurrency = 60
+    num_prompts = 110
+    input_len = 131072
+    output_len = 1024
     random_range_ratio = 1
-    warmup_requests = 16
-    request_rate = float("inf")
     seed = 1
+    repeat_rate = 0.9
+    request_rate = 3
+    warmup_requests = 16
+    pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
-    output_token_throughput = None
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
