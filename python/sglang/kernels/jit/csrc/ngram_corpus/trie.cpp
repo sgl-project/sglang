@@ -67,11 +67,12 @@ void Trie::insert(const int32_t* tokens, size_t len) {
 }
 
 void Trie::squeeze(size_t count) {
-  if (!(node_pool_.size() >= free_node_count_ + count)) {
+  // Only nodes in global_lru_ can be released; the root is in use but never in it.
+  if (!(global_lru_.size() >= count)) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
         "available to release: " +
-        std::to_string(node_pool_.size() - free_node_count_) + ", required to release: " + std::to_string(count));
+        std::to_string(global_lru_.size()) + ", required to release: " + std::to_string(count));
   }
   while (count--) {
     auto last = global_lru_.back();

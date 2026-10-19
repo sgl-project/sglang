@@ -1248,6 +1248,13 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             speculative_num_steps=cfg.speculative_num_draft_tokens
             // cfg.speculative_eagle_topk,
         )
+    if cfg.speculative_ngram_capacity <= cfg.speculative_ngram_max_trie_depth:
+        raise ValueError(
+            "--speculative-ngram-capacity must be greater than "
+            "--speculative-ngram-max-trie-depth, got "
+            f"{cfg.speculative_ngram_capacity} and "
+            f"{cfg.speculative_ngram_max_trie_depth}."
+        )
     if cfg.speculative_ngram_external_corpus_path is not None:
         if cfg.speculative_ngram_external_sam_budget <= 0:
             raise ValueError(

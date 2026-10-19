@@ -2441,6 +2441,23 @@ class TestNgramExternalSamArgs(CustomTestCase):
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
+    def test_capacity_must_exceed_max_trie_depth(self):
+        """capacity == max_trie_depth must be rejected at startup, not abort the first request."""
+        args = self._make_dummy_ngram_args(
+            page_size=1,
+            speculative_ngram_capacity=4,
+            speculative_ngram_max_trie_depth=4,
+        )
+        with self.assertRaisesRegex(ValueError, "--speculative-ngram-capacity"):
+            handle_speculative_decoding(args)
+
+        args = self._make_dummy_ngram_args(
+            page_size=1,
+            speculative_ngram_capacity=5,
+            speculative_ngram_max_trie_depth=4,
+        )
+        handle_speculative_decoding(args)
+
 
 class TestDecoupledSpecArgs(CustomTestCase):
     """Decoupled speculative-decoding CLI flags.
