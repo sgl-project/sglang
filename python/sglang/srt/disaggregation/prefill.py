@@ -143,15 +143,12 @@ def _transfer_start_layer(*, pool, hf_text_config) -> int:
 
 
 def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
-    """Longest prompt the bootstrap queue accepts.
-
-    Sharded PrefillAdder admission needs prompt + 1 new token + one page per
-    shard < capacity, so a longer prompt never fits even an empty pool. The
-    unsharded limit stays the plain capacity.
-    """
+    """Bootstrap prompt limit; sharded admission never fits a longer prompt."""
     if shard_size == 1:
         return capacity
-    return capacity - shard_size * page_size - 2
+    # Strictest path, add_one_req_ignore_eos: page-rounded prompt, one page per
+    # shard, 1 new token and 1 spare token must stay below capacity.
+    return (capacity - shard_size * page_size - 3) // page_size * page_size
 
 
 def maybe_release_metadata_buffer(

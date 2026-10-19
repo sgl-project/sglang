@@ -1104,12 +1104,11 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
     def test_bootstrap_limit_is_the_sharded_admission_boundary(self):
-        """The P/D bootstrap check rejects exactly the prompts that sharded
-        admission can never fit, so none of them waits in the queue forever."""
+        """The P/D bootstrap check rejects every prompt that sharded admission
+        can never fit, so none of them waits in the queue forever."""
         page_size, tokens_per_rank = 64, 16384
-        # tp=2, page 64, 16384 tokens per rank: 32700 used to pass the check.
         self.assertEqual(
-            max_bootstrap_input_len(capacity=32768, page_size=64, shard_size=2), 32638
+            max_bootstrap_input_len(capacity=32768, page_size=64, shard_size=2), 32576
         )
         self.assertEqual(
             max_bootstrap_input_len(capacity=16384, page_size=64, shard_size=1), 16384
@@ -1121,11 +1120,18 @@ class TestPrefillAdder(CustomTestCase):
             queue.max_input_len = max_bootstrap_input_len(
                 capacity=capacity, page_size=page_size, shard_size=shard_size
             )
-            for prompt_len, fits in (
-                (queue.max_input_len, True),
-                (queue.max_input_len + 1, False),
+            limit = queue.max_input_len
+            # Both admission paths fit the limit; the stricter ignore_eos path
+            # (radix cache disabled) refuses one token more.
+            for prompt_len, ignore_eos, fits in (
+                (limit, False, True),
+                (limit, True, True),
+                (limit + 1, True, False),
             ):
-                with self.subTest(shard_size=shard_size, prompt_len=prompt_len):
+                with self.subTest(
+                    shard_size=shard_size, prompt_len=prompt_len, ignore_eos=ignore_eos
+                ):
+                    self.mock_tree_cache.disable = ignore_eos
                     spec = PageShardSpec(
                         shard_rank=0,
                         shard_size=shard_size,
@@ -1144,6 +1150,7 @@ class TestPrefillAdder(CustomTestCase):
                         "boundary", prefix_len=0, extend_len=prompt_len
                     )
                     req.origin_input_ids = req.full_untruncated_fill_ids
+                    req.sampling_params.ignore_eos = ignore_eos
                     req.return_logprob = False
                     req.time_stats.trace_ctx = MagicMock()
 
