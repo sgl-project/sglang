@@ -344,7 +344,10 @@ async fn dispatch<T: Transport>(
     );
     let dispatch = async {
         match prefill_task {
-            Some((task, prefill)) => forward_pd(task, prefill, response).await,
+            Some((task, prefill)) => {
+                let wait = ctx.config.proxy.stream_after_prefill;
+                forward_pd(task, prefill, response, wait).await
+            }
             None => (response.await, None),
         }
     };
@@ -841,12 +844,14 @@ struct Blame {
     decode_dispatched: bool,
 }
 
-/// Returns decode's response as soon as decode answers, unless prefill fails
+/// Returns decode's response as soon as decode answers, or with
+/// `stream_after_prefill` once prefill also completes, unless prefill fails
 /// first; then prefill's failure is returned along with the blamed prefill.
 async fn forward_pd<R>(
-    task: tokio::task::JoinHandle<PrefillFailure<R>>,
+    mut task: tokio::task::JoinHandle<PrefillFailure<R>>,
     prefill: Arc<Worker>,
     decode: impl Future<Output = Result<R, ApiError>>,
+    stream_after_prefill: bool,
 ) -> (Result<R, ApiError>, Option<Blame>) {
     // Set on decode's first poll, which is where `forward_to_response_worker`
     // begins and the request reaches the worker. Read from the same task, so
@@ -863,15 +868,26 @@ async fn forward_pd<R>(
             decode_dispatched: dispatched.load(Ordering::Relaxed),
         })
     };
-    tokio::select! {
-        biased;
-        failure = task => match failure {
-            Ok(None) => (decode.await, None),
-            Ok(Some(failure)) => (failure, blame(prefill)),
-            Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill)),
-        },
-        // Dropping the handle leaves prefill running.
-        response = &mut decode => (response, None),
+    let mut held = None;
+    loop {
+        tokio::select! {
+            biased;
+            failure = &mut task => return match failure {
+                Ok(None) => match held {
+                    Some(response) => (response, None),
+                    None => (decode.await, None),
+                },
+                Ok(Some(failure)) => (failure, blame(prefill)),
+                Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill)),
+            },
+            // Dropping the handle leaves prefill running.
+            response = &mut decode, if held.is_none() => {
+                if !stream_after_prefill {
+                    return (response, None);
+                }
+                held = Some(response);
+            }
+        }
     }
 }
 
@@ -1073,5 +1089,31 @@ impl Drop for RequestDurationGuard {
     fn drop(&mut self) {
         self.metrics
             .observe_request_duration(&self.model, self.request_started_at.elapsed().as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stream_after_prefill_waits_for_prefill() {
+        let prefill = Arc::new(Worker::new(crate::discovery::WorkerSpec {
+            mode: WorkerMode::Prefill,
+            ..Default::default()
+        }));
+        for wait in [false, true] {
+            let done = Arc::new(AtomicBool::new(false));
+            let finished = Arc::clone(&done);
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                finished.store(true, Ordering::SeqCst);
+                None
+            });
+            let decode = async { Ok(Response::new(Body::empty())) };
+            let (response, blame) = forward_pd(task, Arc::clone(&prefill), decode, wait).await;
+            assert!(response.is_ok() && blame.is_none());
+            assert_eq!(done.load(Ordering::SeqCst), wait);
+        }
     }
 }
