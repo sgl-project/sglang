@@ -3,7 +3,7 @@
 
 Compares the legacy gather (``gather_dequant_requant_fp8_paged_legacy``:
 fresh ``torch.zeros`` destination + one program per (token, 128-elem
-slice)) against the new gather (``gather_dequant_requant_fp8_paged``:
+slice)) against the new gather (``gather_dequant_requant_fp8_paged_dsa``:
 no pre-zeroing needed, fused pad-row zero-fill, TOKENS_PER_PROG tokens
 per program with 16B-vectorized access), in three flavors:
 
@@ -56,7 +56,7 @@ _spec = importlib.util.spec_from_file_location("dequant_k_cache", _MOD_PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-gather_new = _mod.gather_dequant_requant_fp8_paged
+gather_new = _mod.gather_dequant_requant_fp8_paged_dsa
 _infer_dsa_dims = _mod._infer_dsa_dims
 
 
@@ -69,7 +69,7 @@ def gather_dequant_requant_fp8_paged_legacy(
     """Legacy (pre-vectorization) gather + dequant + requant.
 
     Kept as the bit-exactness / performance reference for
-    ``gather_dequant_requant_fp8_paged`` (see
+    ``gather_dequant_requant_fp8_paged_dsa`` (see
     ``benchmark/kernels/deepseek/benchmark_q8kv8_kv_gather.py``).  Allocates and zero-fills the
     full destination each call, then launches one program per
     (token, 128-elem slice).

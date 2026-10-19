@@ -209,7 +209,7 @@ def dequantize_k_cache_paged_ref(
     page_table_1_flattened: torch.Tensor,
     page_size: int,
 ) -> torch.Tensor:
-    """Pure-torch reference for ``dsv4.dequant_k_cache.dequantize_k_cache_paged``.
+    """Pure-torch reference for ``dsv4.dequant_k_cache.dequantize_k_cache_paged_dsv4``.
 
     Decodes the same v4 paged layout with vectorized torch indexing instead of
     a Triton kernel.

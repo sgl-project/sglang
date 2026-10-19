@@ -141,7 +141,7 @@ def _dequantize_k_cache_fast_kernel(
         tl.store(dst_ptr, data, mask=mask)
 
 
-def dequantize_k_cache_paged(
+def dequantize_k_cache_paged_dsa(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,
@@ -262,7 +262,7 @@ def _dequantize_k_cache_paged_kernel(
 _GATHER_TOKENS_PER_PROG = 4
 
 
-def gather_dequant_requant_fp8_paged(
+def gather_dequant_requant_fp8_paged_dsa(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     group_size: int = 128,

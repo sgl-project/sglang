@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsa,
 )
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -927,7 +927,7 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
 
         slot = self._acquire_slot_for_read(layer.layer_id)
         rows = self.translate_loc_to_scratch(loc)
-        kv = dequantize_k_cache_paged(self._scratch_kv(slot), rows)
+        kv = dequantize_k_cache_paged_dsa(self._scratch_kv(slot), rows)
         if dst_dtype is not None:
             kv = kv.to(dst_dtype)
         return (

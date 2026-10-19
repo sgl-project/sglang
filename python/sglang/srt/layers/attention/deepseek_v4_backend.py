@@ -30,9 +30,9 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsv4,
     fp8_dtype,
-    gather_dequant_requant_fp8_paged,
+    gather_dequant_requant_fp8_paged_dsv4,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -4114,14 +4114,14 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            dequantize_k_cache_paged_dsv4(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
-        dequantize_k_cache_paged(
+        dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -4292,14 +4292,14 @@ class DeepseekV4AttnBackend(
         # The Q8KV8 gather reads the 584-byte V4 layout only (its kernel is SM90).
         assert token_to_kv_pool.get_swa_key_layout() is KVLayout.V4
         if compressed_slice is not None:
-            gather_dequant_requant_fp8_paged(
+            gather_dequant_requant_fp8_paged_dsv4(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
             )
 
-        gather_dequant_requant_fp8_paged(
+        gather_dequant_requant_fp8_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,

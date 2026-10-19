@@ -24,7 +24,7 @@ NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 
-def dequantize_k_cache_paged(
+def dequantize_k_cache_paged_dsv4(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     page_size: int,
@@ -163,7 +163,7 @@ def dequantize_k_cache_paged_v41(
     return out
 
 
-def gather_dequant_requant_fp8_paged(
+def gather_dequant_requant_fp8_paged_dsv4(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     page_size: int,

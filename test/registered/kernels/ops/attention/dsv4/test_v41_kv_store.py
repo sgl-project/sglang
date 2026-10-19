@@ -17,7 +17,9 @@ from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     compress_norm_rope_store,
 )
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged_dsv4,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.norm_rope import (
     fused_k_norm_rope_flashmla,
@@ -523,7 +525,9 @@ class TestV41KVDequant(CustomTestCase):
                         device="cuda",
                         dtype=torch.int32,
                     )
-                    got = dequantize_k_cache_paged(pages, ids, page_size, layout=layout)
+                    got = dequantize_k_cache_paged_dsv4(
+                        pages, ids, page_size, layout=layout
+                    )
                     self.assertTrue(
                         torch.equal(
                             bits(got),
@@ -576,7 +580,7 @@ class TestV41KVDequant(CustomTestCase):
                 workspace = torch.zeros(
                     305, 1, 512, dtype=torch.bfloat16, device="cuda"
                 )
-                out = dequantize_k_cache_paged(
+                out = dequantize_k_cache_paged_dsv4(
                     pages, ids, page_size, out=workspace[5:], layout=layout
                 )
                 # NaN payloads (fp8 0x7F / e4m3 NaN scales) compare through their bits.

@@ -48,7 +48,9 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     SOFTMAX_SCALE as SWAPAB_SOFTMAX_SCALE,
 )
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged_dsv4,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -3214,7 +3216,7 @@ class DeepseekV4HipRadixBackend(
         cache = state.cache
         num_swa_rows = cache.swa_token_ids.shape[0]
         swa_rows = self.opus_prefill_workspace.get(num_swa_rows)
-        dequantize_k_cache_paged(
+        dequantize_k_cache_paged_dsv4(
             pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -3263,7 +3265,7 @@ class DeepseekV4HipRadixBackend(
             )
             num_rows = gather.flat_token_ids.shape[0]
             rows = self.opus_compressed_workspaces[compress_ratio].get(num_rows)
-            dequantize_k_cache_paged(
+            dequantize_k_cache_paged_dsv4(
                 c_cache,
                 gather.flat_token_ids,
                 page_size=c_page_size,

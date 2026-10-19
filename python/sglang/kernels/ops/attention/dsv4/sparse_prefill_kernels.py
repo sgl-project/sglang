@@ -275,7 +275,7 @@ def build_swa_token_ids(
     ``min(seq_len, extend + W - 1)``. Each position is translated through
     ``req_to_token`` (full kv-cache id) and then ``full_to_swa`` (SWA
     cache id) to land in the SWA-cache token-id space that
-    ``dequantize_k_cache_paged`` consumes.
+    ``dequantize_k_cache_paged_dsv4`` consumes.
 
     Args:
         seq_lens: (num_reqs,) int32, per-request total sequence length.
