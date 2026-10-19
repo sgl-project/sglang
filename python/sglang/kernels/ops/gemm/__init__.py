@@ -501,13 +501,6 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.sm120_mxfp8_skinny_gemm:mxfp8_skinny_gemm",
         capabilities=_SM120,
-        format_signature=FormatSignature(
-            supported_dtypes=("float8_e4m3fn", "bfloat16", "float16", "float32"),
-            description=(
-                "split-K MXFP8 [m, k] @ [n, k].T for m <= 128 with 32x32 "
-                "power-of-two weight block scales"
-            ),
-        ),
     )
 )
 register_kernel(
