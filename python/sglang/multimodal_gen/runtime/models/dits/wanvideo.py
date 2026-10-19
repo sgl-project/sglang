@@ -10,14 +10,12 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    NVFP4_BIAS_GELU,
     BitExactFusionGate,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
     fused_temb_table_slices,
-    mark_fused_gelu_site,
-    mark_nvfp4_bias_gelu_site,
-    nvfp4_bias_gelu_active,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -102,22 +100,22 @@ class _WanGELUMLP(MLP):
             quant_config=quant_config,
             fuse_bias_gelu_tanh=False,
         )
-        mark_fused_gelu_site(self, "fc_in")
+        FUSED_LINEAR_GELU.mark(self, "fc_in")
         self.fuse_bias_gelu_tanh = isinstance(
             self.fc_in.quant_method, ModelOptFp4LinearMethod
         )
         if self.fuse_bias_gelu_tanh:
-            mark_nvfp4_bias_gelu_site(self)
+            NVFP4_BIAS_GELU.mark(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.fc_in, x):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(self.fc_in, x):
             x = fused_linear_gelu_tanh(x, self.fc_in.weight, self.fc_in.bias)
         else:
             x, bias = self.fc_in(x)
             x = self._apply_activation(
                 x,
                 bias,
-                use_fused_bias_gelu=nvfp4_bias_gelu_active(self),
+                use_fused_bias_gelu=NVFP4_BIAS_GELU.is_enabled(self),
             )
         x, _ = self.fc_out(x)
         return x
@@ -405,31 +403,18 @@ def _wan_temb_table_slices(
     so the result is bit-identical to the eager chain; the first call still
     verifies ``torch.equal`` and falls back permanently on mismatch.
     """
-    verified = _WAN_TEMB_SLICES.verified
-    if (
-        not _WAN_TEMB_SLICES.disabled
-        and _is_cuda
-        and temb.is_cuda
-        and (verified or _WAN_TEMB_SLICES.can_attempt_once())
-    ):
-        try:
-            buf = fused_temb_table_slices(table, temb)
-        except Exception as exc:
-            _WAN_TEMB_SLICES.on_exception(exc, logger=logger)
-        else:
-            out = tuple(buf[j] for j in range(6))
-            if verified:
-                return out
-            return _WAN_TEMB_SLICES.accept_or_fallback(
-                out,
-                _eager_temb_table_slices(table, temb),
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "Wan fused temb-table slices are not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+
+    def fused():
+        buf = fused_temb_table_slices(table, temb)
+        return tuple(buf[j] for j in range(6))
+
+    if _is_cuda and temb.is_cuda:
+        return _WAN_TEMB_SLICES.run(
+            fused,
+            lambda: _eager_temb_table_slices(table, temb),
+            equal=tensors_equal,
+            logger=logger,
+        )
     return _eager_temb_table_slices(table, temb)
 
 
