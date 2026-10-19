@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import re
 import time
 from array import array
 from contextlib import contextmanager, nullcontext
@@ -121,6 +122,7 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.lora.layers import ColumnParallelLinearWithLoRA
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
@@ -192,6 +194,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_platform,
 )
@@ -880,7 +883,8 @@ class MqaAttentionBase(nn.Module):
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
-        fuse: bool = (
+        # LoRA adapts wq_a and wkv one by one
+        fuse: bool = not (get_lora().enable_lora or get_lora().lora_paths) and (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
         fp8: bool = (
@@ -1347,7 +1351,8 @@ class MQALayer(MqaAttentionBase):
         # The indexer needs the BF16 normalized row; wq_b needs the quantized one.
         if _is_hip:
             return _hip.q_norm_for_wq_b(self, q)
-        method = self.wq_b.quant_method
+        # a LoRA-wrapped wq_b has no quant_method and takes the unquantized row
+        method = getattr(self.wq_b, "quant_method", None)
         if (
             _is_cuda
             and self.is_dsv41
@@ -2252,7 +2257,11 @@ class MQALayer(MqaAttentionBase):
                     # Other MXFP8 backends may share mutable GEMM workspace.
                     and (
                         _is_gfx95_supported
-                        or getattr(self.wq_b.quant_method, "mxfp8_dense_backend", None)
+                        or getattr(
+                            getattr(self.wq_b, "quant_method", None),
+                            "mxfp8_dense_backend",
+                            None,
+                        )
                         == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
                     )
                 )
@@ -2502,10 +2511,13 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        # a fused inverse RoPE leaves no wo_a input for the adapter
+        wo_a_lora = isinstance(self.wo_a, ColumnParallelLinearWithLoRA)
         if (
             self.wo_a_fp8
             and _wo_a_fp8_mxscale_fused_invrope is not None
             and not _is_npu
+            and not wo_a_lora
         ):
             # ROCm gfx950 fused path: inverse-RoPE + per-token-group mxfp8 quant
             # in one aiter kernel on the pre-view [T,H,Dh] output, then the a8w8
@@ -2527,7 +2539,9 @@ class MQALayer(MqaAttentionBase):
                 self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
             )
             fuse_rope_wo_a = (
-                self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
+                self.use_fused_wo_a
+                and not wo_a_lora
+                and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
             if _is_npu:
@@ -2552,6 +2566,7 @@ class MQALayer(MqaAttentionBase):
                 )
 
             o = o.view(o.shape[0], self.n_local_groups, -1)
+            wo_a_input = o
 
             if fuse_rope_wo_a:
                 wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
@@ -2657,17 +2672,21 @@ class MQALayer(MqaAttentionBase):
                         self.wo_a.qweight_type.weight_type,
                         self.o_lora_rank,
                     )
+            if wo_a_lora:
+                o = self.wo_a.apply_grouped_lora(o, wo_a_input)
 
         return self._project_wo_b(o, defer_all_reduce)
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 
+        # CP decode flips the flag on the linear a LoRA wrapper holds
+        wo_b_base = getattr(self.wo_b, "base_layer", self.wo_b)
         defer_all_reduce = defer_all_reduce and (
             self.attn_tp_size > 1
             and self.attn_tp_size == get_parallel().tp_size
             and self.wo_b.reduce_results
-            and not self.wo_b.use_decode_attn_tp
+            and not wo_b_base.use_decode_attn_tp
             and not should_skip_mlp_all_reduce()
         )
         o, _ = self.wo_b(
@@ -4734,6 +4753,41 @@ class DeepseekV4ForCausalLM(nn.Module):
                 num_tokens,
             )
         return len(seen)
+
+    # the indexer, compressor and engram reuse the leaves wq_b/wkv and are not adapted
+    _lora_module_pattern = re.compile(
+        r"^model\.layers\.\d+\.(?:self_attn\.(?:wq_a|wq_b|wkv|wo_a|wo_b)"
+        r"|mlp\.shared_experts\.(?:gate_up_proj|down_proj))$"
+    )
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_module_pattern.match(module_name))
+
+    @staticmethod
+    def get_lora_target_module_name(name: str) -> str:
+        parent, _, leaf = name.rpartition(".")
+        if parent.endswith("shared_experts"):
+            return {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}.get(
+                leaf, name
+            )
+        return name
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """LoRA input/output dims; every layer is MoE, so gate_up/down are the shared expert's."""
+        config = self.config
+        shared_inter = config.moe_intermediate_size * config.n_shared_experts
+        return {
+            "wq_a": (config.hidden_size, config.q_lora_rank),
+            "wq_b": (config.q_lora_rank, config.num_attention_heads * config.head_dim),
+            "wkv": (config.hidden_size, config.head_dim),
+            "wo_a": (
+                config.num_attention_heads * config.head_dim // config.o_groups,
+                config.o_groups * config.o_lora_rank,
+            ),
+            "wo_b": (config.o_groups * config.o_lora_rank, config.hidden_size),
+            "gate_up_proj": (config.hidden_size, 2 * shared_inter),
+            "down_proj": (shared_inter, config.hidden_size),
+        }[module_name]
 
     @property
     def routed_experts_weights_of_layer(self):
