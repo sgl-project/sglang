@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_parallel,
+    get_platform,
     get_schedule,
     get_serving,
     get_spec,
@@ -53,6 +54,7 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import re
 import sys
@@ -117,6 +119,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -160,6 +163,10 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 # This ensures pad_values don't overlap with valid text token IDs.
 MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
+_MM_IDENTITY_BYTES = 32
+_MM_WIDE_PAD_TAG = b"sglang-mm-wide-pad-v1"
+# Keep MM_PAD_SHIFT_VALUE + sentinel below 2**63 so it fits an int64 token ID.
+_MM_WIDE_PAD_MASK = (1 << 62) - 1
 
 logger = logging.getLogger(__name__)
 
@@ -255,9 +262,15 @@ def split_cached_prefix_by_tier(
     return device, host, storage
 
 
-def _compute_pad_value(hash: int) -> int:
-    """Compute pad value from hash."""
-    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
+def _compute_pad_values(identity: bytes) -> Tuple[int, ...]:
+    """derive shared wide sentinels from an item hash or full identity digest"""
+    digest = hashlib.sha256(_MM_WIDE_PAD_TAG + identity).digest()
+    # prefix matching can stop after one sentinel, so each must retain wide bits
+    return tuple(
+        MM_PAD_SHIFT_VALUE
+        + (int.from_bytes(digest[i : i + 8], byteorder="big") & _MM_WIDE_PAD_MASK)
+        for i in range(0, _MM_IDENTITY_BYTES, 8)
+    )
 
 
 class BaseFinishReason:
@@ -391,6 +404,11 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         default_factory=dict
     )
 
+    # optional full identity; otherwise sentinels derive from the 64-bit item hash
+    # pad_value remains the first sentinel for scalar-padding consumers
+    identity: Optional[bytes] = None
+    pad_values: Optional[Tuple[int, ...]] = None
+
     def __post_init__(self) -> None:
         if self.hash is not None:
             msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
@@ -419,7 +437,33 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def set_hash(self, hash_value: int) -> None:
         self.hash = hash_value
-        self.pad_value = _compute_pad_value(hash_value)
+        self.identity = None
+        self.pad_values = _compute_pad_values(self.hash.to_bytes(8, byteorder="big"))
+        self.pad_value = self.pad_values[0]
+
+    def set_identity(self, identity: bytes) -> None:
+        """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
+
+        ``hash`` keeps the leading 64 bits for scalar consumers such as the
+        embedding cache; the radix key uses the full sentinel pattern.
+        """
+        if len(identity) != _MM_IDENTITY_BYTES:
+            raise ValueError(
+                f"multimodal identity must be {_MM_IDENTITY_BYTES} bytes, "
+                f"got {len(identity)}"
+            )
+        self.identity = bytes(identity)
+        self.hash = int.from_bytes(identity[:8], byteorder="big", signed=False)
+        self.pad_values = _compute_pad_values(self.identity)
+        self.pad_value = self.pad_values[0]
+
+    def padding_values(self) -> Tuple[int, ...]:
+        return self.pad_values or (self.pad_value,)
+
+    def padding_sequence(self, length: int) -> List[int]:
+        values = self.padding_values()
+        repeats, remainder = divmod(length, len(values))
+        return list(values) * repeats + list(values[:remainder])
 
     @staticmethod
     def is_empty_list(l):
@@ -433,12 +477,13 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
         from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        self.hash = resolve_multimodal_item_hash(
-            existing_hash=self.hash,
-            feature=self.feature,
-            precomputed_embeddings=self.precomputed_embeddings,
+        self.set_hash(
+            resolve_multimodal_item_hash(
+                existing_hash=self.hash,
+                feature=self.feature,
+                precomputed_embeddings=self.precomputed_embeddings,
+            )
         )
-        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -650,7 +695,9 @@ class MultimodalProcessorOutput(
 
         for item in mm_items:
             for start, end in item.offsets:
-                padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
+                padded_input_ids[start : end + 1] = item.padding_sequence(
+                    end - start + 1
+                )
         return padded_input_ids
 
     @staticmethod
@@ -2809,24 +2856,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().features.enable_encoder_swa_bounded_replay:
             for req in reqs:
+                if req.multimodal_inputs is not None and (
+                    not get_platform().is_cuda
+                    or any(
+                        item.modality != Modality.IMAGE
+                        for item in req.multimodal_inputs.mm_items
+                    )
+                ):
+                    raise ValueError(
+                        "encoder SWA replay supports multimodal inputs only for "
+                        "image requests on CUDA"
+                    )
                 if (
-                    req.multimodal_inputs is not None
-                    or req.input_embeds is not None
+                    req.input_embeds is not None
                     or req.positional_embed_overrides is not None
                 ):
                     raise ValueError(
-                        "encoder SWA replay currently supports token-only text requests"
+                        "encoder SWA replay does not support input_embeds or "
+                        "positional_embed_overrides"
                     )
-                if req.return_logprob and req.logprob_start_len not in (
-                    -1,
-                    len(req.origin_input_ids),
-                ):
-                    raise ValueError(
-                        "encoder SWA replay cannot return cached prompt logprobs"
-                    )
-            self.encoder_swa_reset = [
-                r.kv.req_pool_idx is None or r.is_retracted for r in reqs
-            ]
+            self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
@@ -3267,6 +3316,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Also stale residue; None keeps the prefill result path from
         # re-reporting old prefill stats for what is decode work.
         self.prefill_stats = None
+        # Also stale residue: decode rows are never fresh placements, so they
+        # reset no encoder SWA window and fold no replay rows the vote missed.
+        if self.encoder_swa_reset is not None:
+            self.encoder_swa_reset = [False] * bs
         # A 1-token extend's position is arange(prefix, prefix + 1), so prefix
         # must be seq_len - 1; output_ids trails the row by one or zero and
         # cannot stand in for it. Rows past bs are a beam tail, not requests.
@@ -3603,8 +3656,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         # Decode embeds the last output token via embed_tokens; clear the stale
-        # prefill-time tensor so it doesn't leak into ForwardBatch.
+        # prefill-time tensors so they don't leak into ForwardBatch.
         self.input_embeds = None
+        self.replace_embeds = None
+        self.replace_positions = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
@@ -3931,7 +3986,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
-            sliding_window_size = self.tree_cache.sliding_window_size
+            retain_window = self.tree_cache.swa_retain_window
             # Auxiliary windows check their own cursors and prefix locks.
             has_auxiliary_swa = self.tree_cache.supports_auxiliary_swa()
 
@@ -3940,9 +3995,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
-            swa_evict_due = self._swa_eviction_trigger(
-                sliding_window_size, eviction_interval
-            )
+            swa_evict_due = self._swa_eviction_trigger(retain_window, eviction_interval)
             self.token_to_kv_pool_allocator.free_group_begin()
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
@@ -3964,12 +4017,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             ),
                         )
 
-                    # Past the window the request no longer reads its prefill's SWA;
-                    # release that part of the tree lock so SWA LRU can reclaim it.
-                    if (
-                        release_leaf_lock
-                        and req.decode_batch_idx >= sliding_window_size
-                    ):
+                    # Past the retain window the request no longer reads its prefill's
+                    # SWA; release that part of the tree lock so SWA LRU can reclaim it.
+                    if release_leaf_lock and req.decode_batch_idx >= retain_window:
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (
                     self.forward_mode.is_extend()

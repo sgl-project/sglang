@@ -195,7 +195,6 @@ def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         get_exec().mamba.linear_attn_prefill_backend is not None
         or get_exec().mamba.linear_attn_backend != "triton"
         or get_exec().deterministic.enable_deterministic_inference
-        or get_memory().enable_page_major_kv_layout
         or sm_major not in (9, 10)
     ):
         return None
