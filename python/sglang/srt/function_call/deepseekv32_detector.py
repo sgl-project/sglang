@@ -106,6 +106,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return self.bot_token in text or self.invoke_start_token in text
 
     def _has_dsml_tag(self, text: str) -> bool:
+        if self.current_tool_id != -1 and (
+            f"<{self.dsml_token}" in text or f"</{self.dsml_token}" in text
+        ):
+            return True
         return (
             self.has_tool_call(text)
             or self.eot_token in text
@@ -131,11 +135,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
             for pos in (text.find(self.bot_token), text.find(self.invoke_start_token))
             if pos != -1
         ]
-        if not positions:
-            for token in (self.bot_token, self.invoke_start_token):
-                partial_len = self._ends_with_partial_token(text, token)
-                if partial_len > 0:
-                    positions.append(len(text) - partial_len)
         if not positions:
             return text
         return text[: min(positions)].removesuffix("\n\n")
