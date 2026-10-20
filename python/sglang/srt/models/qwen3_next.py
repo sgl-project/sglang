@@ -714,7 +714,11 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         # Declare the fused AR+RMSNorm+per-group-quant read only when the
         # consuming projection can take the (fp8, scale) pair; otherwise the
         # boundary keeps the plain AR+RMSNorm path.
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        # Same gate _ffn_read uses: only the aiter path can serve a
+        # quantized read, so every other backend keeps the plain tensor.
+        accepts_fp8_input = _use_aiter and _linear_accepts_fp8_tuple(
+            self.linear_attn.in_proj_qkvz
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
@@ -887,7 +891,9 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         # Declare the fused AR+RMSNorm+per-group-quant read only when the
         # consuming projection can take the (fp8, scale) pair; otherwise the
         # boundary keeps the plain AR+RMSNorm path.
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
+        # Same gate _ffn_read uses: only the aiter path can serve a
+        # quantized read, so every other backend keeps the plain tensor.
+        accepts_fp8_input = _use_aiter and _linear_accepts_fp8_tuple(self.qkv_proj)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(

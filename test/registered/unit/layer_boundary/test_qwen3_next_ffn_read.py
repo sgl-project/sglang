@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -73,6 +74,45 @@ class TestQwen3NextFfnRead(CustomTestCase):
         read = NormQuantReadout(fp8_input=Fp8Input.TUPLE_AND_BF16)
         self.assertIsInstance(read, NormQuantReadout)
         self.assertIs(read.fp8_input, Fp8Input.TUPLE_AND_BF16)
+
+
+class TestNonAiterBackendsKeepThePlainPath(CustomTestCase):
+    """No backend but aiter may see a changed declaration.
+
+    The read declarations key off the projection's quant method, which is true
+    on any backend with a block-quant FP8 projection, CUDA included. They must
+    additionally be gated on _use_aiter, or a CUDA run of Qwen3-Next would get
+    a tuple where it used to get a tensor.
+    """
+
+    def test_ffn_read_is_plain_without_aiter(self):
+        import sglang.srt.models.qwen3_next as qn
+
+        with patch.object(qn, "_use_aiter", False):
+            self.assertIs(qn._ffn_read(object(), True), NORM_READOUT)
+
+    def test_attention_declaration_is_gated_on_use_aiter(self):
+        """The gate is `_use_aiter and _linear_accepts_fp8_tuple(...)`."""
+        import inspect
+
+        import sglang.srt.models.qwen3_next as qn
+
+        src = inspect.getsource(qn)
+        for line in src.splitlines():
+            if "accepts_fp8_input = " in line and "_linear_accepts_fp8_tuple" in line:
+                self.assertIn(
+                    "_use_aiter and",
+                    line,
+                    "declare_attn's fp8_input must be gated on _use_aiter, "
+                    "otherwise CUDA installs a quantized read",
+                )
+
+    def test_select_passes_tensors_through_untouched(self):
+        """A non-tuple input is returned as-is, whatever the linear is."""
+        import sglang.srt.models.qwen3_next as qn
+
+        x = torch.zeros(4, 8)
+        self.assertIs(qn._select_fused_ar_input_for_linear(x, object()), x)
 
 
 if __name__ == "__main__":
