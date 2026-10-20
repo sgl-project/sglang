@@ -1,3 +1,4 @@
+import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, List
@@ -161,8 +162,10 @@ class TinyMLAModelConfig:
         qk_rope_head_dim: int,
         hidden_size: int,
         context_len: int,
+        dtype: torch.dtype,
     ):
         self.attention_arch = AttentionArch.MLA
+        self.dtype = dtype
         self.context_len = context_len
         self.hidden_size = hidden_size
         self.num_attention_heads = num_heads
@@ -223,6 +226,7 @@ class MockMLAModelRunner(ModelRunner):
         disable_piecewise_cuda_graph: bool = True,
         runner_batch_size: int | None = None,
         fp8_kv_cache: bool = False,
+        prefill_graph_backend: str | None = None,
     ):
         pool_batch_size = runner_batch_size or case.batch_size
         self.device = device
@@ -258,7 +262,8 @@ class MockMLAModelRunner(ModelRunner):
                     backend=Backend.DISABLED if disable_cuda_graph else Backend.FULL,
                 ),
                 prefill=PhaseConfig(
-                    backend=(
+                    backend=prefill_graph_backend
+                    or (
                         Backend.DISABLED
                         if (disable_cuda_graph or disable_piecewise_cuda_graph)
                         else Backend.TC_PIECEWISE
@@ -877,6 +882,7 @@ def build_mla_attention_fixture(
     runner_batch_size: int | None = None,
     fp8_kv_cache: bool = False,
     loc_layout: str = "shuffled_pages",
+    prefill_graph_backend: str | None = None,
 ) -> MLAAttentionFixture:
     seed = 3090 + len(case.name)
     torch.manual_seed(seed)
@@ -888,6 +894,7 @@ def build_mla_attention_fixture(
         qk_rope_head_dim=qk_rope_head_dim,
         hidden_size=hidden_size,
         context_len=max_context_len,
+        dtype=dtype,
     )
     runner = MockMLAModelRunner(
         case=case,
@@ -901,6 +908,7 @@ def build_mla_attention_fixture(
         disable_piecewise_cuda_graph=disable_piecewise_cuda_graph,
         runner_batch_size=runner_batch_size,
         fp8_kv_cache=fp8_kv_cache,
+        prefill_graph_backend=prefill_graph_backend,
     )
     try:
         backend = ATTENTION_BACKENDS[case.backend](runner)
@@ -974,10 +982,60 @@ def build_mla_attention_fixture(
     )
 
 
-def run_mla_fixture_eager(fixture: MLAAttentionFixture) -> torch.Tensor:
-    with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
+def run_mla_fixture_eager(
+    fixture: MLAAttentionFixture, *, breakable: bool = False
+) -> torch.Tensor:
+    """``breakable=True`` sets the process-global capture-mode flag that backends
+    branch on, without capturing a segmented graph."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        stack.enter_context(
+            forward_context(ForwardContext(attn_backend=fixture.backend))
+        )
+        if breakable:
+            stack.enter_context(enable_breakable_cuda_graph())
         fixture.backend.init_forward_metadata(fixture.forward_batch)
         return fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+
+
+def run_mla_fixture_captured(fixture: MLAAttentionFixture) -> torch.Tensor:
+    """Capture and replay a breakable CUDA graph around the forward, so the
+    varlen metadata must be replay-safe."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+        enable_breakable_cuda_graph,
+    )
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        BreakableCUDAGraph,
+        BreakableCUDAGraphCapture,
+    )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(torch.no_grad())
+        stack.enter_context(
+            forward_context(ForwardContext(attn_backend=fixture.backend))
+        )
+        # Set the capture-mode flag before init_forward_metadata reads it.
+        stack.enter_context(enable_breakable_cuda_graph())
+        fixture.backend.init_forward_metadata(fixture.forward_batch)
+
+        cuda_graph = BreakableCUDAGraph()
+        capture_stream = torch.cuda.Stream()  # capture needs a side stream
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            # Initialize cuBLAS and lazy kernels before capture, so a single test
+            # run does not depend on an earlier test having warmed them.
+            fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+        torch.cuda.synchronize()
+        with BreakableCUDAGraphCapture(cuda_graph, stream=capture_stream):
+            output = fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+        torch.cuda.current_stream().wait_stream(capture_stream)
+        cuda_graph.replay()
+        torch.cuda.synchronize()
+        return output
 
 
 def expected_mla_fixture_output(fixture: MLAAttentionFixture) -> torch.Tensor:
@@ -1195,6 +1253,7 @@ def run_mla_attention_case(
     atol: float = MLA_ATOL,
     rtol: float = MLA_RTOL,
     loc_layout: str = "shuffled_pages",
+    breakable: bool = False,
 ):
     fixture = build_mla_attention_fixture(
         testcase,
@@ -1207,8 +1266,48 @@ def run_mla_attention_case(
         device=device,
         fp8_kv_cache=fp8_kv_cache,
         loc_layout=loc_layout,
+        prefill_graph_backend=Backend.BREAKABLE if breakable else None,
     )
-    actual = run_mla_fixture_eager(fixture)
+    actual = run_mla_fixture_eager(fixture, breakable=breakable)
     expected = expected_mla_fixture_output(fixture)
 
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    return fixture
+
+
+def run_mla_attention_case_captured(
+    testcase,
+    case: MLAAttentionCase,
+    *,
+    kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
+    qk_rope_head_dim: int = DEFAULT_QK_ROPE_HEAD_DIM,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+    fp8_kv_cache: bool = False,
+    atol: float = MLA_ATOL,
+    rtol: float = MLA_RTOL,
+    loc_layout: str = "shuffled_pages",
+):
+    """Same contract as run_mla_attention_case, but through
+    run_mla_fixture_captured -- a real breakable CUDA graph capture + replay
+    instead of only setting the capture-mode flag."""
+    fixture = build_mla_attention_fixture(
+        testcase,
+        case,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        hidden_size=hidden_size,
+        max_context_len=max_context_len,
+        dtype=dtype,
+        device=device,
+        fp8_kv_cache=fp8_kv_cache,
+        loc_layout=loc_layout,
+        prefill_graph_backend=Backend.BREAKABLE,
+    )
+    actual = run_mla_fixture_captured(fixture)
+    expected = expected_mla_fixture_output(fixture)
+
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    return fixture
