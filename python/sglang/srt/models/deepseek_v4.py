@@ -2547,6 +2547,10 @@ class MQALayer(MqaAttentionBase):
                     # zero. The buffer is reused per layer; no consumer may keep it.
                     want = (x.shape[0], kernel_num_heads, self.head_dim)
                     meta = getattr(attn_backend, "forward_metadata", None)
+                    if in_replay_tail_graph():
+                        # Every bucket a step captures shares its metadata, so a
+                        # kept buffer would be freed under the earlier buckets' graphs.
+                        meta = None
                     q_padded = getattr(meta, "q_pad_buffer", None)
                     if (
                         q_padded is None
