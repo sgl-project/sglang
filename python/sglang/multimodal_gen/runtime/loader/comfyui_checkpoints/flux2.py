@@ -76,11 +76,14 @@ def infer_flux2_geometry(shapes: dict[str, tuple[int, ...]]) -> dict:
 
 
 def _count_blocks(shapes: dict[str, tuple[int, ...]], prefix: str) -> int:
-    return 1 + max(
+    indices = [
         int(name[len(prefix) :].split(".")[0])
         for name in shapes
         if name.startswith(prefix)
-    )
+    ]
+    if not indices:
+        raise ValueError(f"Not a BFL-layout FLUX.2 checkpoint: no {prefix}* tensors")
+    return 1 + max(indices)
 
 
 def flux2_pipeline_name(geometry: dict) -> str:
