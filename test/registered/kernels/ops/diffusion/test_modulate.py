@@ -283,6 +283,20 @@ def test_residual_gate_add_transposed_cuda_graph():
     assert out.stride() == residual.stride()
 
 
+@CUDA_NATIVE_ONLY
+def test_residual_gate_add_strided_full_gate_runs_eager():
+    # A [B, 1, D] gate with gaps between rows has the residual's shape, so it is
+    # a full gate, and the kernel reads a full gate as one flat buffer.
+    residual = torch.randn((2, 1, 64), device=DEVICE, dtype=torch.bfloat16)
+    update = torch.randn_like(residual)
+    gate = torch.randn((2, 2, 64), device=DEVICE, dtype=torch.bfloat16)[:, :1]
+    assert not gate.is_contiguous()
+    assert not can_use_residual_gate_add_cuda(residual, update, gate)
+    assert torch.equal(
+        residual_gate_add(residual, update, gate), residual + update * gate
+    )
+
+
 def test_residual_gate_add_guards_and_eager_fallback():
     residual = torch.randn((1, 8, 64), device=DEVICE, dtype=torch.bfloat16)
     update = torch.randn_like(residual)

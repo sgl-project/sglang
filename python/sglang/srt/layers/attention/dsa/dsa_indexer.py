@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
-from sglang.kernels.ops.attention.fused_store_index_cache import (
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
@@ -183,7 +183,9 @@ if _is_cuda:
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
-    from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
+    from sglang.kernels.ops.attention.dsa.indexer_q import (
+        fused_q_indexer_rope_first_quant,
+    )
 
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
@@ -484,7 +486,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # Off rather than fatal: without the fused path both phases share a format.
             self.use_gfx950_fused_indexer = hadamard_preserved(self)
         if self.use_gfx950_fused_indexer:
-            from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+            from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
                 Gfx950FusedIndexer,
                 prealloc_workspace,
             )
@@ -703,7 +705,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         """Per-call half of the gate plus the four launches. Returns the (rows,
         index_topk) physical-slot tensor, or None to mean this call is not served
         here -- forward_cuda then continues into the standard path unchanged."""
-        from sglang.kernels.ops.attention.dsa.hip_gfx950 import (
+        from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
             CACHE_TOK_STRIDE,
             MAX_ROWS,
             PAGE_SIZE,
@@ -1914,9 +1916,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if _is_hip and not _is_gfx1250_supported:
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not _is_npu:
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

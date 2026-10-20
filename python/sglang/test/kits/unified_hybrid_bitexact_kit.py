@@ -52,6 +52,7 @@ import tempfile
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
     _flush_cache,
@@ -299,6 +300,7 @@ class UnifiedHybridHiCacheBitExactMixin:
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "4",
+            "--enable-metrics",
             "--hicache-write-policy",
             "write_through",
             "--hicache-io-backend",
@@ -360,6 +362,27 @@ class UnifiedHybridHiCacheBitExactMixin:
             branches_per_group=branches,
             max_new_tokens=512,
             sampling_temperature=0,
+        )
+
+
+class UnifiedHybridHiCacheSlowLoadBitExactMixin(UnifiedHybridHiCacheBitExactMixin):
+    """A prefill CUDA graph must not replay over a host-to-device load that has not
+    landed; the delay makes the load lose that race every time."""
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.override(50_000_000):
+            super().setUpClass()
+
+    def test_multiturn_decode_cache_hit_branching(self):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
+        super().test_multiturn_decode_cache_hit_branching()
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "Delayed HiCache test did not replay the configured Full CUDA graph.",
         )
 
 

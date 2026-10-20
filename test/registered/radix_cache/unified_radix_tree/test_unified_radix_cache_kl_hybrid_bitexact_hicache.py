@@ -10,10 +10,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.unified_hybrid_bitexact_kit import (
     UnifiedHybridBufferOnlyBitExactMixin,
     UnifiedHybridHiCacheBitExactMixin,
+    UnifiedHybridHiCacheSlowLoadBitExactMixin,
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=1100, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1300, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestUnifiedHybridHiCacheBitExact(
@@ -30,6 +31,12 @@ class TestRustUnifiedHybridHiCacheBitExact(
 
 class TestUnifiedHybridBufferOnlyBitExact(
     UnifiedHybridBufferOnlyBitExactMixin, CustomTestCase
+):
+    pass
+
+
+class TestUnifiedHybridHiCacheSlowLoadBitExact(
+    UnifiedHybridHiCacheSlowLoadBitExactMixin, CustomTestCase
 ):
     pass
 
