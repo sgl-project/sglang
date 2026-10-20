@@ -1103,6 +1103,9 @@ class HiCacheController:
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
+        trimmed = getattr(operation, "prefetch_kv_page_offset", 0)
+        if prefix_keys is not None and trimmed:
+            prefix_keys = prefix_keys + operation.sidecar_hash_values[:trimmed]
         kv_derived_transfers = [
             transfer
             for transfer in getattr(operation, "pool_transfers", None) or []
