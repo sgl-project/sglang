@@ -1,19 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use sgl_kv_indexer::{GrpcPrefixIndex, PrefixIndex, PrefixIndexConfig};
 use sgl_router::{
     config::{
-        CachePrefixProvider, ChatRoutingKind, Cli, Config, KvIndexerEndpointConfig, LogFormat,
-        PolicyKind,
+        CachePrefixProvider, ChatRoutingKind, Cli, Config, DiscoveryBackend,
+        KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
     discovery::{spawn_discovery, ModelId},
-    policies::{
-        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
-        PolicyRegistry,
-    },
+    policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
     server::{
@@ -22,13 +19,13 @@ use sgl_router::{
         shutdown::drain_for_termination,
     },
     state::{
-        kv_events::{BlockSizeOracle, KvEventIndex},
+        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex, RadixTreePrefixProvider},
         load_monitor::router_inflight_load::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },
     },
     tokenizer::TokenizerRegistry,
-    workers::{manager, WorkerRegistry},
+    workers::{introspect::worker_client, manager, WorkerRegistry},
 };
 use std::{
     sync::Arc,
@@ -40,6 +37,7 @@ use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Heartbeat escalates INFO -> WARN here: earlier is a routine rollout draining
@@ -76,7 +74,7 @@ async fn main() -> Result<()> {
     let external_kv_indexer_client = create_external_kv_indexer_client(&config)?;
 
     // Monitor engine-reported KV-cache events and load statistics for routing.
-    let engine_state = start_engine_state_monitor(external_kv_indexer_client.is_some());
+    let engine_state = start_engine_state_monitor(&config, external_kv_indexer_client.is_some());
 
     // Build the policies that choose which workers receive each request.
     let (routing_policies, chat_routing, reorg_cleanup) = match routing {
@@ -107,8 +105,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Ask the built policies, so any term or filter that reads the prompt is covered.
+    ensure!(
+        config.model.tokenizer_path.is_some()
+            || !chat_routing.needs_request_tokens(&routing_policies),
+        "--no-tokenizer is incompatible with cache-aware routing and prefix-cache terms or filters"
+    );
+
     // Track this router's local view of in-flight requests.
     let (local_inflight_requests, inflight_cleanup) = start_local_inflight_tracker(&config);
+
+    // Started before worker discovery so the peer set is populated early. The
+    // registry's `synced` flag separates "not delivered yet" from "no siblings".
+    start_peer_watch(&config, &engine_state).await;
 
     // Discovery feeds worker changes to the manager, which maintains this routing catalog.
     let worker_registry = Arc::new(WorkerRegistry::default());
@@ -140,7 +149,18 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     tracing::info!("listening on {listen_addr}");
-    let outcome = serve(listener, app_context, sigterm, sigint).await;
+    let grpc_listener = match config.server.grpc_port {
+        Some(port) => {
+            let grpc_addr = format!("{}:{port}", config.server.host);
+            let listener = TcpListener::bind(&grpc_addr)
+                .await
+                .with_context(|| format!("bind {grpc_addr}"))?;
+            tracing::info!("serving native gRPC on {grpc_addr}");
+            Some(listener)
+        }
+        None => None,
+    };
+    let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
@@ -237,17 +257,25 @@ fn prefix_index_config(indexer: &KvIndexerEndpointConfig) -> PrefixIndexConfig {
     }
 }
 
-fn start_engine_state_monitor(use_external_indexer: bool) -> Arc<KvEventIndex> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .expect("default http client builds");
+fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Arc<KvEventIndex> {
+    let http = worker_client(Duration::from_secs(2), config.server.worker_auth.clone());
     if use_external_indexer {
         // External indexing still needs worker hash metadata and engine load, but no local KV tree.
-        KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new())
-    } else {
-        KvEventIndex::new_with_http(http)
+        return KvEventIndex::new_metadata_only_with_http_and_oracle(http, BlockSizeOracle::new());
     }
+    // Only a peer selector enables bootstrap; without one the tracker is
+    // pre-settled and `/readyz` never waits on it.
+    let bootstrap = Arc::new(
+        match (&config.model.cache_aware, config.discovery.peer_selector()) {
+            (Some(cache), Some(_)) => BootstrapTracker::new_with_opts(
+                Duration::from_millis(cache.bootstrap_timeout_ms),
+                Duration::from_millis(cache.bootstrap_fetch_timeout_cap_ms),
+                cache.bootstrap_seed_required,
+            ),
+            _ => BootstrapTracker::disabled(),
+        },
+    );
+    KvEventIndex::new_with_bootstrap(http, BlockSizeOracle::new(), bootstrap)
 }
 
 fn start_local_inflight_tracker(
@@ -262,6 +290,43 @@ fn start_local_inflight_tracker(
     let sweep_interval = Duration::from_secs((timeout_secs / 10).clamp(1, 60));
     let inflight_cleanup = spawn_janitor(Arc::clone(&local_inflight_requests), sweep_interval);
     (local_inflight_requests, inflight_cleanup)
+}
+
+/// Watch the EndpointSlices of this router's own Service to keep the peer
+/// registry current.
+///
+/// A no-op unless a peer selector is set and this router maintains its own tree
+/// (no external Indexer). The CLI already rejects that combination; this keeps
+/// the invariant local.
+async fn start_peer_watch(config: &Config, engine_state: &Arc<KvEventIndex>) {
+    let DiscoveryBackend::K8s(k8s) = &config.discovery else {
+        return;
+    };
+    let Some(selector) = k8s.peer_selector.as_ref() else {
+        return;
+    };
+    if engine_state.snapshot_source().is_none() {
+        return;
+    }
+    let family = sgl_router::discovery::k8s::peer_address_family(&config.server.host);
+    // Non-fatal: routing does not depend on peer discovery.
+    if let Err(e) = sgl_router::discovery::k8s::spawn_peer_watch(
+        k8s.namespace.clone(),
+        selector.clone(),
+        engine_state.peers(),
+        family,
+        i32::from(config.server.port),
+    )
+    .await
+    {
+        // Only client construction fails here; RBAC is not checked until the
+        // watch's first LIST, and a denial there is logged by the watch itself.
+        tracing::error!(
+            error = %e,
+            "kv-bootstrap: peer watch failed to start (no usable Kubernetes client \
+             config); the peer set stays unsynced",
+        );
+    }
 }
 
 async fn start_worker_discovery_and_manager(
@@ -307,6 +372,10 @@ fn build_app_context(
         routing_policies,
         local_inflight_requests,
     );
+    // An external indexer leaves the local tree empty.
+    app_context.dp_rank_prefix_provider = (config.model.dp_aware
+        && external_kv_indexer_client.is_none())
+    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
     app_context.prefix_index = external_kv_indexer_client;
     app_context.radix_tree_prefix_provider = (config.model.policy == PolicyKind::CacheAware
         && config
@@ -315,6 +384,10 @@ fn build_app_context(
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    if let Some(cache) = config.model.cache_aware.as_ref() {
+        let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
+        engine_state.tree().pending().enable(ttl);
+    }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
@@ -331,6 +404,7 @@ struct ServeOutcome {
 
 async fn serve(
     listener: TcpListener,
+    grpc_listener: Option<TcpListener>,
     app_context: Arc<AppContext>,
     sigterm: Signal,
     sigint: Signal,
@@ -342,13 +416,37 @@ async fn serve(
         Arc::clone(&app_context),
         drain_rx.clone(),
     ));
-    let result = axum::serve(listener, app)
+    // gRPC stops accepting with HTTP, or when HTTP serving fails.
+    let grpc_stop = CancellationToken::new();
+    let grpc = grpc_listener.map(|listener| {
+        let stop = grpc_stop.clone();
+        let app_context = Arc::clone(&app_context);
+        tokio::spawn(async move {
+            let shutdown = async move { stop.cancelled().await };
+            let result = sgl_router::server::grpc::serve(listener, app_context, shutdown).await;
+            if let Err(error) = &result {
+                tracing::error!(%error, "native gRPC server stopped");
+            }
+            result
+        })
+    });
+    let stop = grpc_stop.clone();
+    let mut result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal(sigterm, sigint, app_context, drain).await;
             let _ = drain_tx.send(Some(Instant::now()));
+            stop.cancel();
         })
         .await
         .context("axum serve");
+    grpc_stop.cancel();
+    if let Some(grpc) = grpc {
+        let grpc_result = grpc
+            .await
+            .context("gRPC server task")
+            .and_then(|r| r.context("gRPC serve"));
+        result = result.and(grpc_result);
+    }
     heartbeat.abort();
     let inflight_drain_secs = drain_rx.borrow().map(|at| at.elapsed().as_secs());
     ServeOutcome {
@@ -503,6 +601,32 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:50051");
         assert_eq!(config.query_deadline, Duration::from_millis(25));
         assert_eq!(config.max_inflight, 17);
+    }
+
+    #[tokio::test]
+    async fn dp_aware_gets_the_local_tree_under_any_policy() {
+        let config = Cli::try_parse_from([
+            "sgl-router",
+            "--model-id=tiny",
+            "--tokenizer-path=tests/fixtures/tiny_tokenizer.json",
+            "--worker-urls=http://127.0.0.1:1",
+            "--policy=power_of_two",
+            "--dp-aware",
+        ])
+        .unwrap()
+        .into_config()
+        .unwrap();
+        let ctx = build_app_context(
+            &config,
+            Arc::new(TokenizerRegistry::load_from_config(&config).unwrap()),
+            Default::default(),
+            Default::default(),
+            start_local_inflight_tracker(&config).0,
+            &start_engine_state_monitor(&config, false),
+            None,
+        )
+        .unwrap();
+        assert!(ctx.dp_rank_prefix_provider.is_some());
     }
 
     #[tokio::test]

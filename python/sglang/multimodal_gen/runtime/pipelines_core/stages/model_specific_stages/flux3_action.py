@@ -16,6 +16,7 @@ conditional and unconditional CFG passes, since mode blocks never see text).
 from __future__ import annotations
 
 import copy
+import functools
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -60,6 +61,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.vla import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.vla.cuda_graph import VLATensorGraphRunner
 
 logger = init_logger(__name__)
 
@@ -88,14 +90,22 @@ def _cartesian_ids(
     return torch.cartesian_prod(t, torch.arange(h), torch.arange(w), l_coord)
 
 
-def pack_video(latent: torch.Tensor, first_frame: int, fps: float):
-    """Latent ``(1, C, T, h, w)`` -> tokens ``(1, T*h*w, C)`` and ids; frame ``i`` at ``i * 4 / fps`` s."""
-    _, _, t, h, w = latent.shape
+def video_ids(*, frames: int, h: int, w: int, first_frame: int, fps: float):
+    """Ids ``(1, frames*h*w, 4)`` of latent frames; frame ``i`` at ``i * 4 / fps`` s."""
     seconds = (
-        torch.arange(first_frame, first_frame + t).float() * TEMPORAL_DOWNSAMPLE / fps
+        torch.arange(first_frame, first_frame + frames).float()
+        * TEMPORAL_DOWNSAMPLE
+        / fps
     )
     ids = _cartesian_ids(t=_times_to_ids(seconds), h=h, w=w, l_coord=torch.arange(1))
-    return rearrange(latent, "b c t h w -> b (t h w) c"), ids[None]
+    return ids[None]
+
+
+def pack_video(latent: torch.Tensor, first_frame: int, fps: float):
+    """Latent ``(1, C, T, h, w)`` -> tokens ``(1, T*h*w, C)`` and ids."""
+    _, _, t, h, w = latent.shape
+    ids = video_ids(frames=t, h=h, w=w, first_frame=first_frame, fps=fps)
+    return rearrange(latent, "b c t h w -> b (t h w) c"), ids
 
 
 def pack_action(values: torch.Tensor, seconds: torch.Tensor):
@@ -403,6 +413,34 @@ def cosmos_unipc(
     return samples
 
 
+# Flux3SegmentState as graph tensors: hidden, rope, vec and the 3 joint modulations.
+_STATE_TENSORS = 6
+
+
+def _state_tensors(state: Flux3SegmentState) -> tuple[torch.Tensor, ...]:
+    return (state.hidden, state.rope, state.vec, *state.joint_mod)
+
+
+def _state_from_tensors(
+    name: str, tensors: tuple[torch.Tensor, ...]
+) -> Flux3SegmentState:
+    hidden, rope, vec, *joint_mod = tensors
+    return Flux3SegmentState(
+        name=name, hidden=hidden, rope=rope, vec=vec, joint_mod=tuple(joint_mod)
+    )
+
+
+def _states_from_tensors(
+    names: list[str], tensors: tuple[torch.Tensor, ...]
+) -> list[Flux3SegmentState]:
+    return [
+        _state_from_tensors(
+            name, tensors[i * _STATE_TENSORS : (i + 1) * _STATE_TENSORS]
+        )
+        for i, name in enumerate(names)
+    ]
+
+
 def _cfg_parallel_policy(
     contexts: list[Flux3SegmentState], server_args: ServerArgs
 ) -> CFGPolicy | None:
@@ -557,11 +595,17 @@ class Flux3ActionObservationEncodingStage(PipelineStage):
         config: Flux3ActionPipelineConfig,
         transformer: Flux3Transformer,
         vae: Flux3VideoVAE,
+        use_cuda_graph: bool = False,
     ):
         super().__init__()
         self.config = config
         self.transformer = transformer
         self.vae = vae
+        self._graph = VLATensorGraphRunner(
+            "FLUX 3 observation",
+            enabled=use_cuda_graph,
+            max_entries=config.cuda_graph_max_entries,
+        )
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -585,6 +629,41 @@ class Flux3ActionObservationEncodingStage(PipelineStage):
         values = (token[None, :, None] * cfg.action_scale).to(device)
         return pack_action(values, seconds=torch.zeros(1))
 
+    def _encode_frame(self, frame: torch.Tensor) -> torch.Tensor:
+        h, w = self.config.latent_hw
+        latent = self.vae.encode_frame(frame)[..., :h, :w]
+        return rearrange(latent, "b c t h w -> b (t h w) c")
+
+    def _encode_streams(
+        self,
+        video: torch.Tensor,
+        frame_ids: torch.Tensor,
+        action: torch.Tensor,
+        action_ids: torch.Tensor,
+        zero: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        video_cond = self.transformer.encode_stream(
+            name="video_cond", x=video, ids=frame_ids, timesteps=zero
+        )
+        action_cond = self.transformer.encode_stream(
+            name=f"{self.config.action_modality}_cond",
+            x=action,
+            ids=action_ids,
+            timesteps=zero,
+        )
+        return (*_state_tensors(video_cond), *_state_tensors(action_cond))
+
+    def _encode(self, frame: torch.Tensor, *stream_inputs: torch.Tensor):
+        return self._encode_streams(self._encode_frame(frame), *stream_inputs)
+
+    def _vae_use(self):
+        return self.use_declared_component(component_name="vae", module=self.vae)
+
+    def _transformer_use(self):
+        return self.use_declared_component(
+            component_name="transformer", module=self.transformer
+        )
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         start = time.perf_counter()
         cfg = self.config
@@ -592,29 +671,30 @@ class Flux3ActionObservationEncodingStage(PipelineStage):
         state = vla_state(batch)
         observation: Flux3ActionObservation = state["flux3_observation"]
         h, w = cfg.latent_hw
-        with self.use_declared_component(component_name="vae", module=self.vae):
-            frame = observation.canvas.to(device, torch.bfloat16)[None]
-            latent = self.vae.encode_frame(frame)[..., :h, :w]
-        video, video_ids = pack_video(latent, first_frame=0, fps=cfg.fps)
+        frame_ids = video_ids(frames=1, h=h, w=w, first_frame=0, fps=cfg.fps)
         action, action_ids = self._state_tokens(observation.state, device)
-        zero = torch.zeros(1, device=device)
-        with (
-            self.use_declared_component(
-                component_name="transformer", module=self.transformer
-            ),
-            set_forward_context(current_timestep=0, attn_metadata=None),
-        ):
-            state["flux3_conditioning"] = [
-                self.transformer.encode_stream(
-                    name="video_cond", x=video, ids=video_ids.to(device), timesteps=zero
-                ),
-                self.transformer.encode_stream(
-                    name=f"{cfg.action_modality}_cond",
-                    x=action,
-                    ids=action_ids.to(device),
-                    timesteps=zero,
-                ),
-            ]
+        frame = observation.canvas.to(device, torch.bfloat16)[None]
+        stream_inputs = (
+            frame_ids.to(device),
+            action,
+            action_ids.to(device),
+            torch.zeros(1, device=device),
+        )
+        forward_context = set_forward_context(current_timestep=0, attn_metadata=None)
+        if self._graph.enabled:
+            # Both components are resident whenever graphs are enabled.
+            with self._vae_use(), self._transformer_use(), forward_context:
+                captured = self._graph.run(self._encode, (frame, *stream_inputs))
+                # Replays overwrite the outputs; the states outlive this request.
+                tensors = tuple(t.clone() for t in captured)
+        else:
+            with self._vae_use():
+                video = self._encode_frame(frame)
+            with self._transformer_use(), forward_context:
+                tensors = self._encode_streams(video, *stream_inputs)
+        state["flux3_conditioning"] = _states_from_tensors(
+            ["video_cond", f"{cfg.action_modality}_cond"], tensors
+        )
         vla_timings(batch)["observation_ms"] = (time.perf_counter() - start) * 1000
         return batch
 
@@ -627,11 +707,17 @@ class Flux3ActionDenoisingStage(PipelineStage):
         config: Flux3ActionPipelineConfig,
         transformer: Flux3Transformer,
         scheduler: FlowUniPCMultistepScheduler,
+        use_cuda_graph: bool = False,
     ):
         super().__init__()
         self.config = config
         self.transformer = transformer
         self.scheduler = scheduler
+        self._graph = VLATensorGraphRunner(
+            "FLUX 3 denoise",
+            enabled=use_cuda_graph,
+            max_entries=config.cuda_graph_max_entries,
+        )
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -663,6 +749,68 @@ class Flux3ActionDenoisingStage(PipelineStage):
             cfg.action_modality: action_ids,
         }
 
+    def _target_streams(
+        self,
+        samples: tuple[torch.Tensor, ...],
+        ropes: tuple[torch.Tensor, ...],
+        t: torch.Tensor,
+        *,
+        order: list[str],
+    ) -> list[Flux3SegmentState]:
+        """Noised ``video`` and action streams through their mode blocks."""
+        return [
+            self.transformer.encode_stream(
+                name=name,
+                x=x.to(torch.bfloat16),
+                ids=None,
+                timesteps=t,
+                rope=rope,
+            )
+            for name, x, rope in zip(order, samples, ropes, strict=True)
+        ]
+
+    def _denoise_pass(
+        self,
+        context: Flux3SegmentState,
+        targets: list[Flux3SegmentState],
+        conditioning: list[Flux3SegmentState],
+        *,
+        order: list[str],
+    ) -> tuple[torch.Tensor, ...]:
+        video, action = targets
+        video_cond, action_cond = conditioning
+        # Joint sequence order: video, video_cond, action, action_cond.
+        out = self.transformer.denoise(
+            context=context,
+            streams=[video, video_cond, action, action_cond],
+            targets=order,
+        )
+        return tuple(out[k] for k in order)
+
+    def _denoise_step(
+        self,
+        video: torch.Tensor,
+        action: torch.Tensor,
+        t: torch.Tensor,
+        video_rope: torch.Tensor,
+        action_rope: torch.Tensor,
+        *states: torch.Tensor,
+        order: list[str],
+        state_names: list[str],
+    ) -> tuple[torch.Tensor, ...]:
+        """Every CFG pass of one step, flattened; ``states`` = conditioning + contexts."""
+        video_cond, action_cond, *contexts = _states_from_tensors(state_names, states)
+        targets = self._target_streams(
+            (video, action), (video_rope, action_rope), t, order=order
+        )
+        return tuple(
+            p
+            for ctx in contexts
+            for p in self._denoise_pass(
+                ctx, targets, [video_cond, action_cond], order=order
+            )
+        )
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         cfg = self.config
         device = get_local_torch_device()
@@ -682,10 +830,14 @@ class Flux3ActionDenoisingStage(PipelineStage):
         start = time.perf_counter()
         samples, ids = self._noised_streams(seed)
         samples = {k: v.to(device) for k, v in samples.items()}
-        ropes = {k: self.transformer.rope(v.to(device)) for k, v in ids.items()}
-        video_cond, action_cond = conditioning
-        order = list(samples)  # joint sequence: video, video_cond, action, action_cond
+        order = list(samples)
+        ropes = tuple(self.transformer.rope(ids[k].to(device)) for k in order)
         cfg_policy = _cfg_parallel_policy(contexts, server_args)
+        state_names = [s.name for s in (*conditioning, *contexts)]
+        states = tuple(t for s in (*conditioning, *contexts) for t in _state_tensors(s))
+        denoise_step = functools.partial(
+            self._denoise_step, order=order, state_names=state_names
+        )
         step = 0
 
         def predict(
@@ -693,34 +845,34 @@ class Flux3ActionDenoisingStage(PipelineStage):
         ) -> dict[str, torch.Tensor]:
             nonlocal step
             timestep = torch.full((1,), t, device=device, dtype=torch.float32)
+            current_streams = tuple(current[k] for k in order)
             with set_forward_context(
                 current_timestep=step, attn_metadata=None, forward_batch=batch
             ):
-                targets = {
-                    name: self.transformer.encode_stream(
-                        name=name,
-                        x=current[name].to(torch.bfloat16),
-                        ids=None,
-                        timesteps=timestep,
-                        rope=ropes[name],
-                    )
-                    for name in order
-                }
-                streams = [targets["video"], video_cond, targets[order[1]], action_cond]
-
-                def denoise(ctx: Flux3SegmentState) -> tuple[torch.Tensor, ...]:
-                    out = self.transformer.denoise(
-                        context=ctx, streams=streams, targets=order
-                    )
-                    return tuple(out[k] for k in order)
-
                 if cfg_policy is not None:
+                    targets = self._target_streams(
+                        current_streams, ropes, timestep, order=order
+                    )
                     # Each rank runs one branch; all ranks get both predictions.
                     raw = run_cfg_parallel(
-                        cfg_policy, lambda branch: denoise(branch.kwargs["context"])
+                        cfg_policy,
+                        lambda branch: self._denoise_pass(
+                            branch.kwargs["context"],
+                            targets,
+                            conditioning,
+                            order=order,
+                        ),
                     )
                 else:
-                    raw = [denoise(ctx) for ctx in contexts]
+                    flat = self._graph.run(
+                        denoise_step,
+                        (*current_streams, timestep, *ropes, *states),
+                        key=(tuple(order), tuple(state_names)),
+                    )
+                    raw = [
+                        flat[i : i + len(order)]
+                        for i in range(0, len(flat), len(order))
+                    ]
                 preds = [dict(zip(order, p)) for p in raw]
             step += 1
             if len(preds) == 1:

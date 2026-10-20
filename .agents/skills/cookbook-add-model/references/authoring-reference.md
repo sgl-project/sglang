@@ -134,7 +134,7 @@ Each cell describes one verified (or auto-estimated) launch recipe.
 - DO NOT include `--host` / `--port` literally — use `{{HOST_IP}}` /
   `{{PORT}}` placeholders so users can override through the Env modal.
 - Order flags as: `--model-path` first (after any `--trust-remote-code`),
-  then parallelism (`--tp`, `--dp`, `--enable-dp-attention`), then MoE
+  then parallelism (`--tp`, `--attn-dp-size`), then MoE
   flags, then tuning knobs, with `--host` / `--port` last. The playground
   engine assumes this ordering when inserting overrides (its anchors target
   `--model-path` / `--tp` / etc., and inserts before the `--host` tail).
@@ -171,7 +171,7 @@ schemas (full reference in the `_playground.jsx` header):
 
 | Axis key | Widget | Use when |
 |---|---|---|
-| `attention` | TP / CP / DP-Attention sub-knobs (DP-Attention is a combined knob: its value is the DP degree AND toggles `--enable-dp-attention`) | Model exposes parallelism knobs in its cells (§2.2) and you want users to override them. |
+| `attention` | TP / CP / DP-Attention sub-knobs (DP-Attention is a single knob: its value is the attention DP size, emitted as `--attn-dp-size N`) | Model exposes parallelism knobs in its cells (§2.2) and you want users to override them. |
 | `moe` | Backend select (incl. MegaMoE) + EP knob; picking the MegaMoE backend reveals a Quantization sub-select (W4A8/W4A4) | Model is MoE and supports multiple `--moe-*-backend` choices. For Blackwell MoE kernel-fusion, give the `megamoe` backend option a `requiresHw` (and optional `excludesStrategy`) gate, then add a sibling `megamoeQuant` block (`{stripEnv, options}`): W4A8 = `NUM_MAX` only, W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env. |
 | `parsers` | Multi-toggle | Model has reasoning / tool-call parsers. |
 | `speculative` | Single-select chip group | Model has spec-decoding presets you want to expose. |
@@ -208,7 +208,7 @@ schemas (full reference in the `_playground.jsx` header):
   knobs/values that are disabled under the live facts, so stale picks never
   emit a blocked combination. Interleave prefill-CP + DP-Attention is
   deliberately NOT grayed (combined support is planned upstream even though
-  current releases assert `dp_size == 1` for interleave) — the engine shows
+  current releases assert `attn_dp_size == 1` for interleave) — the engine shows
   a warning hint below the command box instead.
 - The CP knob emits `--attn-cp-size N --enable-prefill-cp --cp-strategy S`,
   where S is: an optional `{ id: "cpStrategy", values: [null, "interleave",

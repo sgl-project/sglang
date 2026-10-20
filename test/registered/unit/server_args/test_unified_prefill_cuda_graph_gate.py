@@ -14,9 +14,9 @@
 """`--enable-unified-memory` and PREFILL cuda-graph capture.
 
 Capture is wired: the captured batch reads `out_cache_loc` out of the registry
-slot, refilled before each replay from the already-rebound kernel-facing loc,
+slot, refilled before each replay from the already-rebound physical loc,
 and the read tables are refilled out-of-graph from the live v2p. So BREAKABLE
-(the CUDA default) and TC_PIECEWISE must be left alone -- an earlier gate
+(the CUDA default)  must be left alone -- an earlier gate
 disabled every prefill backend outright, which cost every unified run its
 prefill graph.
 
@@ -47,12 +47,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
-def _run_handler(*, prefill_backend, attention_backends):
+def _run_handler(*, prefill_backend, attention_backends, decode_backend=Backend.FULL):
     """Run just `handle_unified_memory_pool` over a minimal stand-in."""
     sa = ServerArgs(model_path="dummy")
     cg = SimpleNamespace(
         prefill=SimpleNamespace(backend=prefill_backend),
-        decode=SimpleNamespace(backend=Backend.FULL),
+        decode=SimpleNamespace(backend=decode_backend),
     )
     for name, value in {
         "enable_unified_memory": True,
@@ -79,7 +79,7 @@ class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
     def test_non_full_prefill_backends_are_left_enabled(self):
         """BUG REGRESSION. Unified used to disable prefill capture outright, so
         the default BREAKABLE graph silently never ran."""
-        for backend in (Backend.BREAKABLE, Backend.TC_PIECEWISE):
+        for backend in (Backend.BREAKABLE,):
             for attn in (("fa4", "fa4"), ("triton", "triton")):
                 with self.subTest(prefill=backend, attn=attn):
                     cg = _run_handler(prefill_backend=backend, attention_backends=attn)
@@ -106,6 +106,17 @@ class TestUnifiedPrefillCudaGraphGate(unittest.TestCase):
             prefill_backend=Backend.DISABLED, attention_backends=("triton", "triton")
         )
         self.assertEqual(cg.prefill.backend, Backend.DISABLED)
+        self.assertEqual(cg.decode.backend, Backend.FULL)
+
+
+class TestUnifiedTrtllmMhaDecodeGraphGate(unittest.TestCase):
+    def test_trtllm_mha_decode_capture_boots(self):
+        """Its replay refills the page table from this batch's lengths, so the
+        gate leaves trtllm_mha decode capture enabled."""
+        cg = _run_handler(
+            prefill_backend=Backend.BREAKABLE,
+            attention_backends=("trtllm_mha", "trtllm_mha"),
+        )
         self.assertEqual(cg.decode.backend, Backend.FULL)
 
 

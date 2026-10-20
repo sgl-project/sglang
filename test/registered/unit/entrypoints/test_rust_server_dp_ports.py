@@ -1,19 +1,167 @@
+import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from sglang.srt import rust_extensions
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
+def _scheduler_for_typed_config():
+    return SimpleNamespace(
+        server_args=SimpleNamespace(enable_return_hidden_states=False),
+        model_config=SimpleNamespace(
+            context_len=2048,
+            vocab_size=1000,
+            is_multimodal=False,
+            hf_config=SimpleNamespace(model_type=None),
+            get_default_sampling_params=lambda: {},
+        ),
+        get_init_info=MagicMock(
+            side_effect=AssertionError("typed config must not read late init info")
+        ),
+        kv_events_publisher=SimpleNamespace(
+            local_kv_event_sources=MagicMock(
+                return_value=[{"endpoint": "tcp://127.0.0.1:5557"}]
+            )
+        ),
+        page_size=16,
+        rust_server_tokenizer_path=lambda: "tokenizer",
+        tokenizer=None,
+        max_total_num_tokens=1024,
+        load_snapshot_writer=None,
+    )
+
+
 @pytest.mark.parametrize(
-    "nnodes,tp_size,dp_size,ep_join_mode,ranks,expected",
+    "overrides,kwarg,expected",
+    [
+        ({}, "grpc_port", 50051),
+        ({"smg_grpc_mode": True}, "grpc_port", None),
+        ({"grpc_mode": True}, "grpc_port", None),
+        ({"default_priority_value": 5}, "default_priority_value", None),
+        (
+            {"enable_priority_scheduling": True, "default_priority_value": 5},
+            "default_priority_value",
+            5,
+        ),
+    ],
+    ids=[
+        "native-grpc",
+        "legacy-smg",
+        "deprecated-legacy-smg",
+        "priority-off",
+        "priority-on",
+    ],
+)
+def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):
+    extension = SimpleNamespace(
+        DisaggregationMode=SimpleNamespace(
+            Null="null", Prefill="prefill", Decode="decode"
+        ),
+        ModelConfig=MagicMock(return_value="model-config"),
+        DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
+        ServerArgs=MagicMock(return_value="server-args"),
+    )
+    scheduler = _scheduler_for_typed_config()
+    with (
+        get_context().override_server_args(grpc_port=50051, **overrides),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        assert rust_config._build_server_args(scheduler) == "server-args"
+
+    assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+    scheduler.get_init_info.assert_not_called()
+    scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+
+
+@pytest.mark.parametrize(
+    "server_args,ranks,expected",
+    [
+        ({"tp_size": 4, "attn_dp_size": 4}, {"attn_dp_rank": 2, "dp_rank": None}, 2),
+        ({"dp_size": 2}, {"attn_dp_rank": 0, "dp_rank": 1}, 1),
+        ({}, {"attn_dp_rank": 0, "dp_rank": None}, 0),
+    ],
+    ids=["attention-dp", "replica-dp", "no-dp"],
+)
+def test_deployment_info_reports_listener_dp_rank(server_args, ranks, expected):
+    """Each DP listener must advertise its own rank, matching its KV-event
+    source; a per-listener orchestrator cannot otherwise tell listeners apart."""
+    extension = SimpleNamespace(
+        DisaggregationMode=SimpleNamespace(
+            Null="null", Prefill="prefill", Decode="decode"
+        ),
+        ModelConfig=MagicMock(return_value="model-config"),
+        DefaultSamplingParams=MagicMock(return_value="sampling-defaults"),
+        ServerArgs=MagicMock(return_value="server-args"),
+    )
+    with (
+        get_context().override_server_args(**server_args),
+        get_parallel().override(**ranks),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    deployment_info = json.loads(
+        extension.ServerArgs.call_args.kwargs["deployment_info"]
+    )
+    assert deployment_info["dp_rank"] == expected
+
+
+@pytest.mark.parametrize("enable_metrics", [False, True])
+def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
+    extension = MagicMock()
+    with (
+        get_context().override_server_args(enable_metrics=enable_metrics),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
+        patch.dict("os.environ", {"PROMETHEUS_MULTIPROC_DIR": "/tmp/prom"}),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(_scheduler_for_typed_config())
+
+    metrics = extension.ServerArgs.call_args.kwargs["metrics"]
+    if enable_metrics:
+        extension.MetricsConfig.assert_called_once_with(multiproc_dir="/tmp/prom")
+        assert metrics is extension.MetricsConfig.return_value
+    else:
+        assert metrics is None
+
+
+@pytest.mark.parametrize(
+    "tokenizer,expected",
+    [
+        (None, -1),
+        (SimpleNamespace(), -1),
+        (SimpleNamespace(model_max_length=4096), 4096),
+        # HF's unset sentinel, int(1e30), is not a 64-bit integer.
+        (SimpleNamespace(model_max_length=int(1e30)), 2048),
+    ],
+    ids=["no-tokenizer", "no-attribute", "configured", "unset-sentinel"],
+)
+def test_tokenizer_model_max_length_matches_python_tokenize(tokenizer, expected):
+    assert rust_config._tokenizer_model_max_length(tokenizer, 2048) == expected
+
+
+@pytest.mark.parametrize(
+    "nnodes,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
     [
         (2, 4, 4, None, (0, 1, 2, 3), [0, 1, 0, 1]),
         (4, 4, 2, None, (0, 2), [0, 0]),
@@ -22,14 +170,13 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
     ids=["multiple-listeners-per-node", "dp-spans-nodes", "scale-joiner"],
 )
 def test_dp_leaders_reuse_node_local_ports(
-    nnodes, tp_size, dp_size, ep_join_mode, ranks, expected
+    nnodes, tp_size, attn_dp_size, ep_join_mode, ranks, expected
 ):
     with (
         get_context().override_server_args(
             nnodes=nnodes,
             tp_size=tp_size,
-            dp_size=dp_size,
-            enable_dp_attention=True,
+            attn_dp_size=attn_dp_size,
             ep_join_mode=ep_join_mode,
             host="0.0.0.0",
             port=30000,
@@ -70,8 +217,7 @@ def test_node_listener_placement(pp_size, expected, node_rank):
         node_rank=node_rank,
         tp_size=4,
         pp_size=pp_size,
-        dp_size=2,
-        enable_dp_attention=True,
+        attn_dp_size=2,
         attn_cp_size=2,
     ):
         assert node_hosts_rust_server() == expected[node_rank]
@@ -82,8 +228,6 @@ def test_scale_joiner_hosts_listener():
         nnodes=2,
         node_rank=1,
         tp_size=1,
-        dp_size=1,
-        enable_dp_attention=True,
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
