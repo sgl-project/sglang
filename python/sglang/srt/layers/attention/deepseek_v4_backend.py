@@ -3810,11 +3810,8 @@ class DeepseekV4AttnBackend(
         # raw_indices; num_qo_tokens=0 drops the query-count clause, so this errs
         # to True. Paged attention under active CP needs the page indices.
         return (
-            self.trtllm_attn
-            or self.mega_attn
+            self.mega_attn
             or self.tail_forward_metadata is not None
-            or self.forward_metadata.late_layer_tail is not None
-            or self.token_to_kv_pool.request_window is not None
             or not self._use_sparse_prefill(forward_batch, num_qo_tokens=0)
         )
 
