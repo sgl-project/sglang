@@ -170,8 +170,8 @@ def _built_runner_backend(quant_method: FusedMoEMethodBase):
     # runner the quant method actually picked is known here. Methods that keep
     # no runner of their own (including wrappers that build one on an inner
     # scheme) return None and the dispatcher follows --moe-runner-backend.
-    runner = getattr(quant_method, "runner", None)
-    return getattr(runner, "runner_backend", None)
+    runner = quant_method.runner
+    return None if runner is None else runner.runner_backend
 
 
 def create_moe_dispatcher(

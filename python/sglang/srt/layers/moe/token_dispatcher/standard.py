@@ -139,11 +139,8 @@ class StandardDispatcher(BaseDispatcher):
             backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
         )
         self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
-        # A quant method can run its experts on a runner that needs local ids
-        # while --moe-runner-backend keeps global ones (Fp8MoEMethod runs fp8
-        # experts on triton under a flashinfer_cutlass pin). Without local ids,
-        # EP ranks index experts they do not hold. The runner only ever turns
-        # the mapping on; every other flag follows the global backend.
+        # A built runner may enable local-ID mapping; all other flags above
+        # follow the requested backend.
         if (
             self.skip_local_expert_mapping
             and runner_backend is not None
