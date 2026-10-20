@@ -26,7 +26,12 @@ class _View(SimpleNamespace):
 
 class TestUnifiedKvDSparkGate(CustomTestCase):
     def _validate(
-        self, *, fp8=True, ragged=RaggedVerifyMode.STATIC, disaggregation_mode="null"
+        self,
+        *,
+        fp8=True,
+        ragged=RaggedVerifyMode.STATIC,
+        disaggregation_mode="null",
+        **pd_fields,
     ):
         view = _View(
             dsv4_attn_backend="dsv4",
@@ -37,6 +42,7 @@ class TestUnifiedKvDSparkGate(CustomTestCase):
             disaggregation_mode=disaggregation_mode,
             enable_two_batch_overlap=False,
             pp_size=1,
+            **pd_fields,
         )
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(model_type="deepseek_v41")
@@ -59,10 +65,21 @@ class TestUnifiedKvDSparkGate(CustomTestCase):
         with self.assertRaises(_PastFeatureChecks):
             self._validate()
 
+    def test_dspark_pd_over_mori_passes_on_the_fp8_layout(self):
+        """Unified KV + DSpark under PD on MI355X goes through MoRI; both sides must pass."""
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode), self.assertRaises(_PastFeatureChecks):
+                self._validate(
+                    disaggregation_mode=mode,
+                    disaggregation_transfer_backend="mori",
+                    enable_prefill_cp=False,
+                    attn_cp_size=1,
+                    dcp_size=1,
+                )
+
     def test_rejects_what_the_draft_window_is_not_wired_for(self):
         for kwargs, message in (
             (dict(ragged=RaggedVerifyMode.COMPACT), "compact ragged verify"),
-            (dict(disaggregation_mode="prefill"), "DSpark under PD"),
             (dict(fp8=False), "bf16 unified KV layout"),
         ):
             with (
