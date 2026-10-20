@@ -132,6 +132,16 @@ class TestKPoolFusedXProj(CustomTestCase):
         self.assertIsNone(indexer.x_proj_weight)
 
     @torch.no_grad()
+    def test_reload_that_is_not_bf16_exact_is_rejected(self):
+        indexer = _indexer()
+        indexer.fuse_x_projections()
+        stacked = indexer.x_proj_weight.clone()
+        indexer.weights_proj.weight.add_(1e-6)
+        with self.assertRaisesRegex(ValueError, "not bf16-exact"):
+            indexer.fuse_x_projections()
+        self.assertTrue(torch.equal(indexer.x_proj_weight, stacked))
+
+    @torch.no_grad()
     def test_lora_adapter_takes_the_unfused_path(self):
         x = torch.randn(TOKENS, HIDDEN, device="cuda").bfloat16()
         q_lora = torch.randn(TOKENS, Q_LORA, device="cuda").bfloat16()

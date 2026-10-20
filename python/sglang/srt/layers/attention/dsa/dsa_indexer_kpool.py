@@ -282,7 +282,9 @@ class IndexerKPool(MultiPlatformOp):
         target-verify path projects x once (fp32 out) instead of three GEMMs.
 
         Must run again after any of the three is reloaded. An existing stack is
-        refreshed in place: captured CUDA graphs keep reading its address."""
+        refreshed in place: captured CUDA graphs keep reading its address, so they
+        cannot fall back to the unfused path, and a reload that the bf16 stack cannot
+        hold exactly is rejected."""
         if not is_gfx95_supported():
             return
         wk = getattr(self.wk, "weight", None)
@@ -303,10 +305,10 @@ class IndexerKPool(MultiPlatformOp):
                 self.x_proj_weight = torch.cat(parts).contiguous()
             return
         if not head_exact:
-            logger.warning(
-                "Layer %d: reloaded indexer weights_proj is not bf16-exact; the fused "
-                "target-verify projection rounds it to bf16.",
-                self.layer_id,
+            raise ValueError(
+                f"Layer {self.layer_id}: reloaded indexer weights_proj is not bf16-exact, "
+                "but target verify already runs on the bf16 stacked x projection; send "
+                "bf16-representable weights_proj values."
             )
         torch.cat(parts, out=self.x_proj_weight)
 
