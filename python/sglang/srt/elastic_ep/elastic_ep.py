@@ -1073,7 +1073,15 @@ def pre_dispatch_recovery_fence(
     if state.recovery_phase == "idle":
         consume_recovery_membership_observation()
         if state.recovery_phase == "idle":
-            return None
+            topology = get_runtime_topology()
+            if topology is None:
+                raise RuntimeError(
+                    "Elastic EP recovery generation fence rejected dispatch."
+                )
+            return RecoveryDispatchFence(
+                topology_generation=topology.topology_generation,
+                membership_observation=get_membership_observation(),
+            )
     if state.recovery_phase in {
         "awaiting_recovery",
         "restoring",

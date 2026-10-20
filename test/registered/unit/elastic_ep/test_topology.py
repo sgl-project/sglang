@@ -347,7 +347,9 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         ),
     ):
         assert state.recovery_phase == "idle"
-        assert pre_dispatch_recovery_fence() is None
+        fence = pre_dispatch_recovery_fence()
+        assert fence is not None
+        assert fence.topology_generation == 0
         observe_recovery_membership(
             runtime_instance_id="runtime-1",
             topology_generation=0,
@@ -432,6 +434,51 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         return_value=SimpleNamespace(moe=SimpleNamespace()),
     ):
         assert not pre_dispatch_recovery_fence()
+
+
+def test_idle_forward_fence_rejects_membership_observed_mid_forward():
+    topology = RuntimeTopology(
+        runtime_instance_id="runtime-1",
+        initial_ep_size=2,
+        allocation_width=1,
+        effective_ep_size=2,
+        max_committed_ep_size=2,
+    )
+    state = ElasticEPState(
+        active_ranks=torch.tensor([1, 1]),
+        last_active_ranks=torch.tensor([1, 1]),
+        active_ranks_cpu=torch.tensor([1, 1]),
+        effective_ep_size=2,
+    )
+    observation = MembershipObservation(
+        runtime_instance_id="runtime-1",
+        topology_generation=0,
+        rank=1,
+        failed_allocation_incarnation="inc-1",
+        membership_epoch=1,
+    )
+    with (
+        patch.object(ElasticEPStateManager, "_instance", state),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(elastic_ep_recovery_policy="fixed_slot")
+            ),
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_runtime_topology",
+            return_value=topology,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_membership_observation",
+            side_effect=[None, None, observation],
+        ),
+    ):
+        fence = pre_dispatch_recovery_fence()
+        assert fence is not None
+        assert fence.membership_observation is None
+        with pytest.raises(RuntimeError, match="membership changed"):
+            validate_post_forward_recovery_generation(fence)
 
 
 def test_ready_recovery_allows_user_forward_and_fences_membership_change():

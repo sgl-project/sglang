@@ -84,6 +84,7 @@ def _manager() -> TokenizerManager:
     manager.elastic_recovery_operation_id = None
     manager.elastic_recovery_topology_generation = None
     manager.elastic_recovery_allocation_id = None
+    manager.elastic_recovery_failed_allocation_incarnation = None
     manager.elastic_recovery_rank_offset = None
     manager.elastic_recovery_phase = "idle"
     manager.elastic_recovery_succeeded = None
@@ -126,6 +127,52 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                 attn_tp_size=1,
                 attn_cp_size=1,
             )
+        )
+
+    def test_scheduler_observation_update_mirrors_awaiting_recovery(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=MagicMock(),
+        )
+        state = ElasticEPState(
+            active_ranks=None,
+            last_active_ranks=None,
+            active_ranks_cpu=None,
+            effective_ep_size=2,
+            recovery_phase="awaiting_recovery",
+            runtime_instance_id="runtime-1",
+            recovery_topology_generation=0,
+            recovery_rank_offset=1,
+            recovery_failed_allocation_incarnation="allocation-a",
+        )
+        with (
+            patch(
+                "sglang.srt.elastic_ep.elastic_ep.poll_recovery_control_plane",
+                return_value=True,
+            ),
+            patch.object(ElasticEPStateManager, "instance", return_value=state),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(tp_rank=0),
+            ),
+        ):
+            scheduler._poll_elastic_ep_recovery()
+
+        update = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        self.assertTrue(update.recovery_update)
+        self.assertFalse(update.terminal)
+        self.assertEqual(update.recovery_phase, "awaiting_recovery")
+        self.assertEqual(update.recovery_topology_generation, 0)
+        self.assertEqual(update.recovery_rank_offset, 1)
+
+        manager = _manager()
+        manager.forward_elastic_scale_update(update)
+        self.assertEqual(manager.elastic_recovery_phase, "awaiting_recovery")
+        self.assertEqual(manager.elastic_recovery_topology_generation, 0)
+        self.assertEqual(manager.elastic_recovery_rank_offset, 1)
+        self.assertEqual(
+            manager.elastic_recovery_failed_allocation_incarnation,
+            "allocation-a",
         )
 
     async def test_retry_returns_existing_operation_without_resubmitting(self):

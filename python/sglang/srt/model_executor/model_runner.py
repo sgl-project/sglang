@@ -1934,6 +1934,7 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+            validate_post_forward_recovery_generation(recovery_generation)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
@@ -1942,7 +1943,6 @@ class ModelRunner:
                     reinit_attn_backend,
                     split_forward_count,
                 )
-            validate_post_forward_recovery_generation(recovery_generation)
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         if isinstance(output.logits_output, LogitsProcessorOutput):
             output.logits_output.own_customized_info()

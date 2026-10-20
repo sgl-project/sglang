@@ -2349,6 +2349,9 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     runtime_error: Optional[str] = None
     recovery_update: bool = False
     recovery_phase: Optional[str] = None
+    recovery_topology_generation: Optional[int] = None
+    recovery_rank_offset: Optional[int] = None
+    recovery_failed_allocation_incarnation: Optional[str] = None
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):

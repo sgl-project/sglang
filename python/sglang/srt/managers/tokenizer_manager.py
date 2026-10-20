@@ -3687,6 +3687,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 return
             self.elastic_recovery_phase = msg.recovery_phase or "failed"
+            if msg.recovery_topology_generation is not None:
+                self.elastic_recovery_topology_generation = (
+                    msg.recovery_topology_generation
+                )
+            if msg.recovery_rank_offset is not None:
+                self.elastic_recovery_rank_offset = msg.recovery_rank_offset
+            if msg.recovery_failed_allocation_incarnation is not None:
+                self.elastic_recovery_failed_allocation_incarnation = (
+                    msg.recovery_failed_allocation_incarnation
+                )
             if msg.terminal:
                 self.elastic_recovery_succeeded = msg.success
                 self.elastic_recovery_error = None if msg.success else msg.error
@@ -3764,6 +3774,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "recovery_topology_generation": self.elastic_recovery_topology_generation,
             "recovery_allocation_id": self.elastic_recovery_allocation_id,
             "recovery_rank_offset": self.elastic_recovery_rank_offset,
+            "recovery_failed_allocation_incarnation": self.elastic_recovery_failed_allocation_incarnation,
             "recovery_error": self.elastic_recovery_error,
         }
 
