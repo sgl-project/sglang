@@ -33,6 +33,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             is_root=Mock(return_value=False),
             get_last_hash_value=Mock(return_value="h2"),
             get_prefix_hash_values=Mock(return_value=["h0", "h1"]),
+            get_hash_values=Mock(return_value=["h2"]),
             query_storage_hit_length=Mock(return_value=2),
             prefetch_from_storage=Mock(side_effect=register_prefetch),
             prefix_device_indices=Mock(return_value=torch.tensor([10, 11])),
@@ -64,7 +65,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             22,
             [4, 5, 6, 7],
             "h2",
-            ["h0", "h1"],
+            ["h0", "h1", "h2"],
             extra_key="model",
             cache_salt="tenant-a",
         )
@@ -77,7 +78,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             22,
             [4, 5],
             "h2",
-            ["h0", "h1"],
+            ["h0", "h1", "h2"],
             extra_key="model",
             cache_salt="tenant-a",
         )
