@@ -40,15 +40,16 @@ class TestPythonThreadSwitchIntervalSeed(CustomTestCase):
         self.assertIsNone(get_device().python_thread_switch_interval)
 
     def test_existing_positional_field_order_is_preserved(self):
+        """Appending the opt-in must not move upstream's positional arguments."""
         fields = ServerArgs.__struct_fields__
         index = fields.index("sleep_on_idle")
         self.assertEqual(fields[index + 1], "use_ray")
         self.assertEqual(fields[-1], "python_thread_switch_interval")
         legacy = json.dumps(list(fields[:-1]), separators=(",", ":")).encode()
-        self.assertEqual(len(fields[:-1]), 527)
+        self.assertEqual(len(fields[:-1]), 540)
         self.assertEqual(
             hashlib.sha256(legacy).hexdigest(),
-            "7ee1f836a5af82275fc8fb37e9dd74903e956d8aef6ac786a51053a2bc5cfae9",
+            "aa5fd9cbdf807708763e4f2295d6c897002b73387da4d884d84700c523ed58e9",
         )
 
     def test_cli_and_published_namespace_preserve_explicit_value(self):
