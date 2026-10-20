@@ -38,12 +38,12 @@ class TestEnableTorchCompileDebugMode(CustomTestCase):
         "ascend",
         "--disable-cuda-graph",
         "--disable-radix-cache",
-        "--enforce-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill",
+        "tc_piecewise",
     ]
     enable_args = [
         "--enable-torch-compile-debug-mode",
-        "--enforce-piecewise-cuda-graph",
-        "--piecewise-cuda-graph-max-tokens",
+        "--cuda-graph-max-bs-prefill",
         "64",
     ]
 
