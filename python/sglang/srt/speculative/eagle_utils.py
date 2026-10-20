@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
     page_aligned_decode_alloc_lens,
 )
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -391,6 +392,8 @@ def verify_tree_greedy_func(
     retrieve_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
     topk: int = -1,
+    *,
+    is_ngram: bool = False,
 ):
     if _is_cuda or _is_hip or _is_musa:
         if _is_cuda or _is_hip:
@@ -425,7 +428,12 @@ def verify_tree_greedy_func(
         )
 
     elif _is_npu:
-        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
+        if is_ngram:
+            from sgl_kernel_npu.sample.verify_ngram_tree_greedy import (
+                verify_ngram_tree_greedy as verify_tree_greedy,
+            )
+        else:
+            from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,
@@ -877,6 +885,7 @@ def eagle_sample(
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
             target_predict=target_predict,
             topk=verify_input.tree_topk,
+            is_ngram=verify_input.spec_input_type == SpecInputType.NGRAM_VERIFY,
         )
 
         if _is_hip:
