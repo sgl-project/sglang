@@ -39,7 +39,9 @@ checkout whose `python/sglang` package is available on `PYTHONPATH`, or from a
 matching official SGLang image.
 
 AIConfigurator is optional. Install it separately when using the
-`aiconfigurator` predictor. The `aic` extra pins AIConfigurator to the exact release
+`aiconfigurator` predictor or automatic device-memory profiling. Replay, including
+its KNN fallback, can use an explicit `max_total_tokens` without importing AIC.
+The `aic` extra pins AIConfigurator to the exact release
 validated with the simulator so upstream API changes cannot silently alter an
 installation. In a clean virtual environment, install the extra with:
 
