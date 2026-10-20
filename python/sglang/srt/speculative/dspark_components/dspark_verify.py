@@ -684,16 +684,9 @@ class DsparkVerifyEpilogue:
         )
 
     def snapshot_accept(self, bs: int) -> AcceptOuts:
-        """Copies of this step's accept outputs, for readers outside the graph.
-
-        The buffers are rewritten by the next target-verify replay. Under the
-        overlap scheduler the result readback (`accept_lens`, `next_token_ids`)
-        runs on copy_stream, which forward_stream never waits on, so a view read
-        late returns step N+1's values, independently on each TP rank (#42465).
-        The clones are made on the current (forward) stream right after the
-        replay, so stream order pins them to step N; `async_d2h`'s
-        `record_stream` keeps them alive until the readback has run.
-        """
+        """Clones of the accept buffers for readers outside the graph: the overlap
+        readback on copy_stream may run after the next replay rewrites the buffers.
+        Made on the forward stream; `async_d2h`'s `record_stream` keeps them alive."""
         views = self.read_accept(bs)
         return AcceptOuts(
             correct_len=views.correct_len.clone(),

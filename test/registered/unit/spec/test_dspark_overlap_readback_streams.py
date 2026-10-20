@@ -1,22 +1,7 @@
-"""The DSpark accept readback must not race the next verify replay (#42465).
-
-Black-box mechanism: the folded accept writes fixed epilogue buffers that the
-next target-verify replay rewrites. The overlap scheduler issues the result
-readback (`accept_lens`, `next_token_ids`) on copy_stream after
-`copy_stream.wait_stream(forward_stream)`, then launches the next forward on
-forward_stream without waiting for the copy. When the copy engine is busy, for
-example behind HiCache write-through device-to-host traffic, the readback runs
-after the next replay and a view returns step N+1's values. Each TP rank races
-on its own, so ranks commit different token counts and deadlock.
-
-The interleaving is reproduced deterministically: a spin kernel on copy_stream
-stands in for the busy copy engine, so the readback always runs after the
-second rewrite. Views must observe the hazard (that is what the fix changes);
-the snapshot the folded accept now hands out must read step N.
-
-Run with:
-    python3 -m pytest test/registered/unit/spec/test_dspark_overlap_readback_streams.py -v
-"""
+"""A late overlap readback must see this step's folded accept outputs, not the
+next replay's. The interleaving is forced: a spin kernel on copy_stream stands in
+for a busy copy engine, so the readback always runs after the second rewrite on
+forward_stream. Views must show the hazard, the snapshot must read step N."""
 
 import unittest
 

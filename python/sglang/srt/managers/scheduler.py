@@ -4972,9 +4972,8 @@ class Scheduler(
             elif batch.return_hidden_states or batch.spec_algorithm.is_dspark():
                 # Hidden states are views of CUDA graph buffers that the next
                 # replay rewrites; only a copy queued right behind this forward
-                # reads them in time. DSpark's accept outputs are snapshots now
-                # (DsparkVerifyEpilogue.snapshot_accept); its inline copy stays
-                # because that is the path validated under Confidential Computing.
+                # reads them in time. DSpark's accept outputs are snapshots; it
+                # keeps the inline copy, the path validated under Confidential Computing.
                 copy_fn()
             else:
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)

@@ -137,16 +137,9 @@ def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 
 class TestFoldedAcceptSnapshot(CustomTestCase):
-    """The folded accept hands the overlap scheduler copies, not views (#42465).
-
-    The in-graph accept writes fixed epilogue buffers that the next target-verify
-    replay rewrites. The overlap scheduler reads `accept_lens` / `next_token_ids`
-    back on copy_stream, which forward_stream never waits on, so a view read late
-    returns the next step's values, on each TP rank independently: ranks committed
-    different token counts and deadlocked under HiCache write-through. The folded
-    branch of `accept_and_finalize` must return tensors that neither alias the
-    buffers nor change when the buffers are rewritten.
-    """
+    """The folded accept's outputs must neither alias the epilogue buffers nor
+    change when the next replay rewrites them: a late overlap readback that saw
+    the next step's accept lengths made TP ranks commit different token counts."""
 
     def test_folded_accept_outputs_survive_the_next_replay(self):
         candidates, logits, prefix_lens = _greedy_inputs()
