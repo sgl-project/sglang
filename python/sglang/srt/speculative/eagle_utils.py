@@ -52,6 +52,7 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
+_PACKED_VERIFY_BCAST = envs.SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST.get()
 
 logger = logging.getLogger(__name__)
 
@@ -656,11 +657,13 @@ def eagle_sample(
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+    predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
+        rows=math.prod(predict_shape),
+        bs=bs,
+        depth=verify_input.max_tree_depth,
+        device=device,
+        packed=_PACKED_VERIFY_BCAST,
     )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
@@ -733,9 +736,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
@@ -827,9 +833,12 @@ def eagle_sample(
             else get_parallel().tp_group
         )
         if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+            if verify_out is not None:
+                tp_group.broadcast(verify_out, src=0)
+            else:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
@@ -893,6 +902,25 @@ def eagle_sample(
             accept_lens,
         )
     return predict, accept_lens, accept_index
+
+
+def _verify_outputs(
+    *, rows: int, bs: int, depth: int, device, packed: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """predict [rows] (zeros), accept_index [bs, depth] (-1) and num_correct_drafts
+    [bs] int32; packed (SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST): views of one buffer,
+    returned last so a sampled result goes to the TP group in one broadcast."""
+    if not packed:
+        predict = torch.zeros((rows,), dtype=torch.int32, device=device)
+        accept_index = torch.full((bs, depth), -1, dtype=torch.int32, device=device)
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
+        return predict, accept_index, num_correct_drafts, None
+    out = torch.empty((rows + bs * depth + bs,), dtype=torch.int32, device=device)
+    predict = out[:rows]
+    predict.zero_()
+    accept_index = out[rows : rows + bs * depth].view(bs, depth)
+    accept_index.fill_(-1)
+    return predict, accept_index, out[rows + bs * depth :], out
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):

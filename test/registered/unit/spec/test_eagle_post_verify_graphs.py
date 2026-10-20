@@ -421,6 +421,23 @@ class TestPostVerifyGraphs(CustomTestCase):
         }
         self.assertEqual(len(keys), 2)
 
+    def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
+        """With SGLANG_Q35MF_EDGE_PACKED_VERIFY_BCAST a sampled verify result goes to
+        the TP group in one broadcast: predict, accept_index and num_correct_drafts
+        must be views of one buffer, in order, starting from the values the
+        unpacked tensors start from."""
+        kw = dict(rows=14, bs=2, depth=7, device="cpu")
+        stock = eagle_utils._verify_outputs(packed=False, **kw)
+        *views, buffer = eagle_utils._verify_outputs(packed=True, **kw)
+        self.assertIsNone(stock[3])
+        for got, want in zip(views[:2], stock[:2]):
+            self.assertTrue(torch.equal(got, want))
+        offset = 0
+        for view in views:
+            self.assertEqual(view.data_ptr(), buffer.data_ptr() + 4 * offset)
+            offset += view.numel()
+        self.assertEqual(offset, buffer.numel())
+
     def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
         """With SGLANG_Q35MF_MKH_N3C a round's inputs and its forced length go to
         one copy plan; without it, or when the plan refuses the layout, the
