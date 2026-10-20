@@ -43,7 +43,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
 
 ARCH = "FakeMonoForCausalLM"
-BACKEND = "fake"
+BACKEND = registry.BACKEND
 WIDTHS = (1, 2, 4, 6, 12)
 
 
@@ -94,7 +94,7 @@ def server_args(**kw):
         "model_path": "dummy",
         "tp_size": 4,
         "kv_cache_dtype": "fp8_e4m3",
-        "monokernel_backend": BACKEND,
+        "enable_amd_monokernel": True,
     }
     return ServerArgs(**{**defaults, **kw})
 
@@ -153,9 +153,7 @@ def switched(mode="decode", tokens=1, spec=SPEC):
     """Build a fake model whose steps of this mode and tokens per request route."""
     lm, built = Lm(), FakeBuilt()
     served = runtime._served_keys(mode=mode, widths=WIDTHS, tokens=tokens)
-    runtime._install_forward(
-        model=lm, built=built, served=served, spec=spec, backend=BACKEND
-    )
+    runtime._install_forward(model=lm, built=built, served=served, spec=spec)
     return lm, built
 
 
@@ -348,7 +346,7 @@ class TestMonokernelFramework(CustomTestCase):
         publish(
             ServerArgs(
                 model_path="dummy",
-                monokernel_backend=BACKEND,
+                enable_amd_monokernel=True,
                 speculative_algorithm="DSPARK",
                 speculative_num_draft_tokens=2,
                 disable_cuda_graph=True,
@@ -419,9 +417,7 @@ class TestMonokernelFramework(CustomTestCase):
             ShapeKey(forward_mode="decode", batch_size=bs, tokens_per_request=1)
             for bs in (4, 8)
         )
-        check = runtime._CaptureCheck(
-            spec=SPEC, backend=BACKEND, isa="gfx950", served=served
-        )
+        check = runtime._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
         capturing = patch.object(torch.cuda, "is_current_stream_capturing")
         with capturing as is_capturing:
             is_capturing.return_value = False  # a warmup run is not a capture
@@ -429,9 +425,7 @@ class TestMonokernelFramework(CustomTestCase):
             is_capturing.return_value = True
             with self.assertRaisesRegex(ValueError, "none of the 1 captured decode"):
                 check(runner(capture_bs=[2]), None, batch("decode", 2, 2), 2)
-        check = runtime._CaptureCheck(
-            spec=SPEC, backend=BACKEND, isa="gfx950", served=served
-        )
+        check = runtime._CaptureCheck(spec=SPEC, isa="gfx950", served=served)
         with capturing:
             for bs in (2, 4):  # the check waits for every captured size
                 check(runner(capture_bs=[2, 4]), None, batch("decode", bs, bs), bs)
@@ -446,7 +440,7 @@ class TestMonokernelFramework(CustomTestCase):
         publish(
             ServerArgs(
                 model_path="dummy",
-                monokernel_backend=BACKEND,
+                enable_amd_monokernel=True,
                 speculative_algorithm="DSPARK",
                 speculative_num_draft_tokens=6,
                 cuda_graph_config=graphs,

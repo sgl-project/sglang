@@ -183,11 +183,9 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
             cfg=cfg, hf_config=model_config.hf_config, isa=device_isa()
         )
         reasons += _dtype_reasons(spec, model_config)
-    if cfg.monokernel_backend is not None:
+    if cfg.enable_amd_monokernel:
         # both replace the model's forward, which would fail only after weights load
-        reasons.append(
-            f"--monokernel-backend {cfg.monokernel_backend} is also set; use one of the two"
-        )
+        reasons.append("--enable-amd-monokernel is also set; use one of the two")
     if reasons:
         raise ValueError(
             f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.kernels.low_latency_kernels.monokernels.spec import (
+    BACKEND,
+    FLAG,
     Feature,
     MonoSpec,
     NumericsKind,
@@ -107,7 +109,7 @@ def monokernel_disable_reasons(
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
     spec, why = find_spec(
-        backend=cfg.monokernel_backend, architectures=hf_config.architectures, isa=isa
+        backend=BACKEND, architectures=hf_config.architectures, isa=isa
     )
     if spec is None:
         return None, [why]
@@ -174,11 +176,10 @@ def covered_capture_sizes(
     return covered + sorted(b for b in set(sizes) if b > covered[-1])
 
 
-def handle_monokernel(server_args: ServerArgs) -> None:
-    """Validate the selected backend and resolve its decode capture sizes."""
+def handle_amd_monokernel(server_args: ServerArgs) -> None:
+    """Validate --enable-amd-monokernel and resolve its decode capture sizes."""
     cfg = resolving_view(server_args)
-    backend = cfg.monokernel_backend
-    if backend is None:
+    if not cfg.enable_amd_monokernel:
         return
     isa = device_isa()
     spec, reasons = monokernel_disable_reasons(
@@ -186,8 +187,7 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     )
     if reasons:
         raise ValueError(
-            f"--monokernel-backend {backend} cannot run this setup:\n  - "
-            + "\n  - ".join(reasons)
+            f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
         )
     tokens = (
         int(cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
@@ -204,18 +204,17 @@ def handle_monokernel(server_args: ServerArgs) -> None:
         if sizes and new != sorted(set(sizes)):
             declare_resolution(
                 server_args,
-                "handle_monokernel",
+                "handle_amd_monokernel",
                 cuda_graph_config=with_phase(
                     graph, Phase.DECODE, bs=new, max_bs=max(new)
                 ),
             )
     logger.warning(
-        "--monokernel-backend is experimental. Its kernels, coverage and plugin API "
-        "may change."
+        "%s is experimental. Its kernels, coverage and plugin API may change.", FLAG
     )
     logger.info(
-        "--monokernel-backend %s: %s on %s, widths %s (%d tokens a request)",
-        backend,
+        "%s: %s on %s, widths %s (%d tokens a request)",
+        FLAG,
         spec.name,
         isa,
         list(spec.widths(isa)),

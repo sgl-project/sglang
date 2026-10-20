@@ -352,11 +352,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.kernels.low_latency_kernels.megakernels.guards import (
         handle_nvidia_megakernel,
     )
-    from sglang.kernels.low_latency_kernels.monokernels.guards import handle_monokernel
+    from sglang.kernels.low_latency_kernels.monokernels.guards import (
+        handle_amd_monokernel,
+    )
 
     # first, so a server with both kernel flags gets every reason in one error
     run_hook(handle_nvidia_megakernel, server_args)
-    run_hook(handle_monokernel, server_args)
+    run_hook(handle_amd_monokernel, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)
 

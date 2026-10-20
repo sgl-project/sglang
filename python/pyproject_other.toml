@@ -107,7 +107,7 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
-# Monokernels for gfx950 (--monokernel-backend amd); the ROCm image checks out this pin too.
+# Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
   "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e07665c8b36f7d42a48f6615bacf911d0656f5c5",
 ]

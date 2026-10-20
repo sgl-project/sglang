@@ -434,7 +434,7 @@ ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
 
-# sgl-amd-mono: the AMD monokernel plugin (--monokernel-backend amd). Pure Python
+# sgl-amd-mono: the AMD monokernel plugin (--enable-amd-monokernel). Pure Python
 # on top of AITER / FlyDSL; it registers its specs lazily, so it is inert unless a
 # server selects the backend. Installed on gfx950 images only (its kernels are
 # gfx950); disable with --build-arg ENABLE_SGL_AMD_MONO=0.

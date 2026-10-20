@@ -231,7 +231,7 @@ Two commands follow, one per concurrency range. TP2 covers concurrency 1 to 32 a
 - TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
 - A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency.
 - Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
-- Concurrency ≤ 16 uses the same low-latency path as §3's Low-Latency card (`--monokernel-backend amd` and `--disable-shared-experts-fusion`, as in the command below); at concurrency 32 swap those two flags for `--enforce-shared-experts-fusion`.
+- Concurrency ≤ 16 uses the same low-latency path as §3's Low-Latency card (`--enable-amd-monokernel` and `--disable-shared-experts-fusion`, as in the command below); at concurrency 32 swap those two flags for `--enforce-shared-experts-fusion`.
 
 The braced values in the command follow concurrency:
 
@@ -268,7 +268,7 @@ sglang serve \
   --ep-size 1 \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
-  --monokernel-backend amd \
+  --enable-amd-monokernel \
   --disable-shared-experts-fusion \
   --fp8-gemm-backend aiter \
   --cuda-graph-backend-prefill disabled \

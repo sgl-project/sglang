@@ -370,7 +370,7 @@ export const config = {
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
         // AMD monokernel path: shared-expert fusion must stay off.
-        "--monokernel-backend amd",
+        "--enable-amd-monokernel",
         "--disable-shared-experts-fusion",
         // The one backend worth naming on gfx950: aiter's fp8 GEMM beats what the
         // automatic selection resolves to for this model's 32-wide ue8m0 blocks.
