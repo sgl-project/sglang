@@ -458,7 +458,7 @@ crate-type = ["cdylib"]
             compat_header = root / "compat.h"
             compat_header.write_text("// compatibility\n", encoding="utf-8")
             fake_torch = SimpleNamespace(
-                __version__="2.14.1+cu130",
+                __version__="2.15.0+cu130",
                 __file__=str(torch_init),
                 compiled_with_cxx11_abi=lambda: True,
                 version=SimpleNamespace(cuda="13.0", hip=None),
@@ -490,7 +490,7 @@ crate-type = ["cdylib"]
                 "$ORIGIN/../../../../torch/lib", build.environment["RUSTFLAGS"]
             )
             self.assertIn(str(torch_root / "lib"), build.environment["RUSTFLAGS"])
-            self.assertEqual(build.fingerprint["torch_version"], "2.14.1+cu130")
+            self.assertEqual(build.fingerprint["torch_version"], "2.15.0+cu130")
             self.assertTrue(build.fingerprint["torch_cxx11_abi"])
 
             wheel_build = torch_build_configuration(
@@ -521,7 +521,7 @@ crate-type = ["cdylib"]
                 )
 
             # cc-rs keeps a quoted, spaced header path whole only in shell-words mode.
-            fake_torch.__version__ = "2.14.1+cu130"
+            fake_torch.__version__ = "2.15.0+cu130"
             spaced_header = root / "compat dir" / "compat.h"
             spaced_header.parent.mkdir()
             spaced_header.write_text("// compatibility\n", encoding="utf-8")
@@ -534,8 +534,8 @@ crate-type = ["cdylib"]
             self.assertEqual(spaced_build.environment["CC_SHELL_ESCAPED_FLAGS"], "1")
             self.assertIn(f"'{spaced_header}'", spaced_build.environment["CXXFLAGS"])
 
-            fake_torch.__version__ = "2.15.0"
-            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.14"):
+            fake_torch.__version__ = "2.16.0"
+            with self.assertRaisesRegex(RuntimeError, "PyTorch 2.11 through 2.15"):
                 torch_build_configuration(
                     compat_header=compat_header,
                     python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",

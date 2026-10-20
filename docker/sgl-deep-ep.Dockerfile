@@ -8,7 +8,7 @@ ARG CUDA_TAG=cu130
 ARG CUDA_VERSION=13.0
 ARG NCCL_VERSION=2.30.7
 ARG PYTHON_TAG=cp312-cp312
-ARG TORCH_VERSION=2.14.1
+ARG TORCH_VERSION=2.15.0
 
 ENV CUDA_HOME=/usr/local/cuda
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
@@ -54,7 +54,7 @@ RUN --mount=type=cache,id=sgl-deep-ep-pip-${CUDA_TAG}-${PYTHON_TAG}-${ARCHITECTU
     "${PYTHON_BIN}" -m pip install --upgrade pip; \
     "${PYTHON_BIN}" -m pip install --force-reinstall \
         "torch==${TORCH_VERSION}" \
-        --index-url "https://download.pytorch.org/whl/${CUDA_TAG}"; \
+        --index-url "https://download.pytorch.org/whl/test/${CUDA_TAG}"; \
     "${PYTHON_BIN}" -m pip install --force-reinstall --no-deps \
         "nvidia-nccl-cu13==${NCCL_VERSION}"; \
     "${PYTHON_BIN}" -m pip install \

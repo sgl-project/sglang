@@ -281,7 +281,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             mock.patch.dict(os.environ),
             mock.patch.dict(tree_core_registry.sys.modules),
             mock.patch.object(tree_core_registry.sys, "platform", "linux"),
-            mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.15.0"),
             mock.patch.object(
                 tree_core_registry.importlib.util,
                 "find_spec",
@@ -328,7 +328,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
                     mock.patch.dict(tree_core_registry.sys.modules),
                     mock.patch.object(tree_core_registry.sys, "platform", "linux"),
                     mock.patch.object(
-                        tree_core_registry.torch, "__version__", "2.14.1"
+                        tree_core_registry.torch, "__version__", "2.15.0"
                     ),
                     mock.patch.object(
                         tree_core_registry.importlib.util,
@@ -358,7 +358,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             mock.patch.dict(os.environ, {"SGLANG_RUST_BUILD_MODE": "auto"}),
             mock.patch.dict(tree_core_registry.sys.modules),
             mock.patch.object(tree_core_registry.sys, "platform", "linux"),
-            mock.patch.object(tree_core_registry.torch, "__version__", "2.14.1"),
+            mock.patch.object(tree_core_registry.torch, "__version__", "2.15.0"),
             mock.patch.object(
                 tree_core_registry.importlib.util, "find_spec", return_value=None
             ),
@@ -498,7 +498,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                 self.assertEqual(
                     select_tree_core_backend(_cache_init_params()), "python"
                 )
-        for version in ("2.10.0", "2.15.0", "unknown"):
+        for version in ("2.10.0", "2.16.0", "unknown"):
             with (
                 self.subTest(version=version),
                 mock.patch.object(tree_core_registry.torch, "__version__", version),

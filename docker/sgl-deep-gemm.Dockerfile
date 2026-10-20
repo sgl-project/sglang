@@ -7,7 +7,7 @@ ARG ARCH=x86_64
 ARG CUDA_VERSION=13.0
 ARG PYTHON_VERSION=3.12
 ARG PYTHON_TAG=cp312-cp312
-ARG TORCH_VER=2.14.1
+ARG TORCH_VER=2.15.0
 ARG TVM_FFI_VER=0.1.11
 ARG PIP_DEFAULT_INDEX=https://pypi.python.org/simple
 ARG PYTORCH_MIRROR=download.pytorch.org
@@ -31,6 +31,6 @@ RUN --mount=type=cache,id=sgl-deep-gemm-pip,target=/root/.cache/pip \
       13.0) CU_TAG=cu130 ;; \
       *) echo "Unsupported CUDA version: ${CUDA_VERSION}" && exit 1 ;; \
     esac; \
-    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
+    ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/test/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install --index-url ${PIP_DEFAULT_INDEX} \
         ninja setuptools wheel build numpy apache-tvm-ffi==${TVM_FFI_VER}

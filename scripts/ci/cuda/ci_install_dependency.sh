@@ -41,6 +41,10 @@ configure_environment() {
         *) echo "FATAL: unsupported CU_VERSION=${CU_VERSION}; only CUDA 13 is supported"; exit 1 ;;
     esac
 
+    # PyTorch 2.15.0 is only on the test (release candidate) channel so far.
+    # Drop the /test once it is on the stable index and PyPI.
+    PYTORCH_INDEX_URL="https://download.pytorch.org/whl/test/${CU_VERSION}"
+
     OPTIONAL_DEPS="${1:-}"
     if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
         export SGLANG_BUILD_RUST_EXTS=none
@@ -552,7 +556,7 @@ for name in ("torch", "torchaudio", "torchvision", "torchcodec", "triton"):
     $PIP_CMD install \
         "${PYTORCH_SPECS[@]}" \
         $REINSTALL_ARGS \
-        --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+        --index-url "${PYTORCH_INDEX_URL}"
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -609,7 +613,10 @@ install_sglang() {
         EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
-    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    # The extra index serves torch to the isolated build env, which PyPI cannot yet.
+    $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX \
+        --extra-index-url "${PYTORCH_INDEX_URL}" \
+        --override "${REPO_ROOT}/scripts/ci/torch-override.txt"
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
@@ -686,7 +693,8 @@ install_sglang_kernel() {
             exit 1
         fi
         echo "Installing sgl-kernel wheel: $KERNEL_WHL"
-        $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX
+        $PIP_CMD install "$KERNEL_WHL" --force-reinstall $PIP_INSTALL_SUFFIX \
+            --extra-index-url "${PYTORCH_INDEX_URL}"
     else
         if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "python/sglang/kernels/aot/dist" ]; then
             echo "ERROR: CUSTOM_BUILD_SGL_KERNEL=true but python/sglang/kernels/aot/dist not found."
