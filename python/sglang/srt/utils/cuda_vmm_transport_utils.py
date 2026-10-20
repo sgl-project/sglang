@@ -1005,7 +1005,11 @@ class CudaVmmFeatureTransport:
     def __init__(self, server_args, mm_processor) -> None:
         self.pool: CudaVmmMemoryPool | None = None
         self._publisher_executor: concurrent.futures.ThreadPoolExecutor | None = None
-        if get_mm().mm_feature_transport != "cuda_vmm":
+        self._enabled = get_mm().mm_feature_transport == "cuda_vmm"
+        self._pool_lock = threading.Lock()
+        self._closing = False
+        self._pool_kwargs: dict | None = None
+        if not self._enabled:
             return
         if mm_processor is None:
             raise RuntimeError(
@@ -1015,7 +1019,7 @@ class CudaVmmFeatureTransport:
         per_worker_pool_size = get_mm_feature_pool_size_per_worker(
             MM_FEATURE_CACHE_SIZE, get_serving().tokenizer_worker_num
         )
-        self.pool = CudaVmmMemoryPool(
+        self._pool_kwargs = dict(
             memory_size=per_worker_pool_size,
             recycle_interval=MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             # Per-worker placement; policy above reads the bags.
@@ -1028,13 +1032,26 @@ class CudaVmmFeatureTransport:
             thread_name_prefix="cuda-vmm-publisher",
         )
 
+    def _ensure_pool(self) -> CudaVmmMemoryPool:
+        pool = self.pool
+        if pool is not None:
+            return pool
+        with self._pool_lock:
+            if self._closing:
+                raise RuntimeError("CUDA VMM feature transport is shutting down")
+            if not self._enabled or self._pool_kwargs is None:
+                raise RuntimeError("CUDA VMM feature transport is disabled")
+            if self.pool is None:
+                self.pool = CudaVmmMemoryPool(**self._pool_kwargs)
+            return self.pool
+
     async def prepare_for_dispatch_async(
         self,
         mm_inputs_batch: Iterable[MultimodalProcessorOutput | None],
     ) -> list[MultimodalDataItem]:
         """Publish features without blocking the tokenizer event loop."""
         mm_inputs_batch = tuple(mm_inputs_batch)
-        if self.pool is None or not any(
+        if not self._enabled or not any(
             mm_inputs is not None and mm_inputs.mm_items
             for mm_inputs in mm_inputs_batch
         ):
@@ -1071,6 +1088,7 @@ class CudaVmmFeatureTransport:
         mm_inputs_batch: Iterable[MultimodalProcessorOutput | None],
         ready_events: list[tuple[torch.device, torch.cuda.Event]],
     ) -> list[MultimodalDataItem]:
+        self._ensure_pool()
         for device, event in ready_events:
             # Both VMM copies and a pool-full CPU fallback must see ready input.
             torch.cuda.current_stream(device).wait_event(event)
@@ -1192,10 +1210,11 @@ class CudaVmmFeatureTransport:
             ) from errors[0]
 
     def shutdown(self) -> None:
-        if self.pool is None:
-            return
+        with self._pool_lock:
+            self._closing = True
         publisher_executor = self._publisher_executor
         if publisher_executor is not None:
             publisher_executor.shutdown(wait=True, cancel_futures=True)
             self._publisher_executor = None
-        self.pool.shutdown()
+        if self.pool is not None:
+            self.pool.shutdown()
