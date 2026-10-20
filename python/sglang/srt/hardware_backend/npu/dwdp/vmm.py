@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import ctypes
-import logging
 import math
 from types import SimpleNamespace
 
@@ -13,8 +12,6 @@ import torch
 from sglang.srt.layers.moe.dwdp.layout import PageAlignedLayout
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
 from sglang.srt.utils.alignment import align_down, align_up
-
-logger = logging.getLogger(__name__)
 
 
 def _check(ret, operation):
@@ -121,49 +118,10 @@ class NPUWeightVMM:
         self._reservations = []
         self._mappings = []
         self._imports = []
-        self._fabric = None
-
-    def select_transport(self, peer_pids, gather, same_host):
-        # Unlike CUDA, ACL forbids exporting one physical handle twice. Probe
-        # on a disposable handle before choosing how to export real weights.
-        fabric, probe, error, cleanup_error = None, None, None, None
-        try:
-            fabric = _FabricHandleAPI()
-            probe = self._allocate(self.granularity)
-            fabric.export_handle(probe, peer_pids)
-        except (AttributeError, OSError, RuntimeError) as exc:
-            error = str(exc)
-            logger.info("DWDP FABRIC probe failed: %s", exc)
-        if probe is not None:
-            try:
-                self._release_page(probe)
-            except RuntimeError as exc:
-                cleanup_error = str(exc)
-        results = gather((error, cleanup_error))
-        if any(cleanup for _, cleanup in results):
-            raise RuntimeError(f"NPU DWDP FABRIC probe cleanup failed: {results}")
-        if all(error is None for error, _ in results):
-            self._fabric = fabric
-        elif not same_host:
-            raise RuntimeError(
-                f"NPU DWDP across hosts requires FABRIC on every rank; "
-                f"same-host ACL IPC fallback is not available: {results}"
-            )
-        logger.info(
-            "DWDP handle exchange via %s",
-            "FABRIC" if self._fabric is not None else "ACL IPC (same host)",
-        )
+        self._fabric = _FabricHandleAPI()
 
     def export_shard(self, handle, peer_pids):
-        if self._fabric is not None:
-            return self._fabric.export_handle(handle, peer_pids)
-        share, ret = self.rt.mem_export_to_shareable_handle(handle, 0, 0)
-        _check(ret, "mem_export_to_shareable_handle")
-        _check(
-            self.rt.mem_set_pid_to_shareable_handle(share, peer_pids),
-            "mem_set_pid_to_shareable_handle",
-        )
-        return share
+        return self._fabric.export_handle(handle, peer_pids)
 
     def _reserve(self, size):
         ptr, ret = self.rt.reserve_mem_address(size, 0, 0, 1)
@@ -243,13 +201,7 @@ class NPUWeightVMM:
         return tensors
 
     def import_shard(self, share, size, offset):
-        if self._fabric is not None:
-            handle = self._fabric.import_handle(share)
-        else:
-            handle, ret = self.rt.mem_import_from_shareable_handle(
-                share, self.device.index
-            )
-            _check(ret, "mem_import_from_shareable_handle")
+        handle = self._fabric.import_handle(share)
         # Keep imported lifetimes separate: all importers must release their
         # mappings/handles before a producer releases resident physical pages.
         self._imports.append([handle, None, False])

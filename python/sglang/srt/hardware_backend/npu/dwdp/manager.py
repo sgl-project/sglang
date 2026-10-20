@@ -8,7 +8,6 @@ order; pages intersecting a local shard remain private to that layer.
 from __future__ import annotations
 
 import logging
-import socket
 
 import torch
 import torch.distributed as dist
@@ -43,7 +42,6 @@ class NPUDwdpManager(DwdpPrefetch):
         import acl
 
         self.acl = acl
-        self.nnodes = server_args.nnodes
         parallel = get_parallel()
         self.dwdp_size, self.dwdp_rank = parallel.dwdp_size, parallel.tp_rank
         self.group = parallel.tp_group
@@ -120,21 +118,20 @@ class NPUDwdpManager(DwdpPrefetch):
             raise ValueError("NPU DWDP ranks have different expert weight layouts")
         pid, ret = self.acl.rt.device_get_bare_tgid()
         _check(ret, "device_get_bare_tgid")
-        peers = self._gather((socket.gethostname(), pid))
-        same_host = self.nnodes == 1 and len({host for host, _ in peers}) == 1
         peer_pids = [
-            pid for rank, (_, pid) in enumerate(peers) if rank != self.dwdp_rank
+            peer_pid
+            for rank, peer_pid in enumerate(self._gather(pid))
+            if rank != self.dwdp_rank
         ]
 
         self._state = "initializing"
         self._moe_layer_indices = [li for li, _ in layers]
         self._position = {li: pos for pos, li in enumerate(self._moe_layer_indices)}
-        self._vmm = NPUWeightVMM(self.acl, self.device)
-        self._vmm.select_transport(peer_pids, self._gather, same_host)
         self._init_prefetch(torch.npu, self.device)
         local_handles = {}
         error = None
         try:
+            self._vmm = NPUWeightVMM(self.acl, self.device)
             for li, layer in layers:
                 for name in _WEIGHTS:
                     local_handles[li, name] = self._migrate_weight(
@@ -145,6 +142,7 @@ class NPUDwdpManager(DwdpPrefetch):
         errors = self._gather(error)
         if any(errors):
             raise RuntimeError(f"NPU DWDP weight migration/export failed: {errors}")
+        logger.info("DWDP handle exchange via FABRIC")
         self._weights = self._vmm.create_weights(
             self._specs,
             self.dwdp_rank,
