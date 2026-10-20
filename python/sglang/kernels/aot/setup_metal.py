@@ -13,22 +13,22 @@
 # limitations under the License.
 # ==============================================================================
 
-import importlib
 import os
 import platform
 import shutil
 import subprocess
 import sys
-import sysconfig
 from pathlib import Path
 
 root = Path(__file__).parent.resolve()
 
 
 _BUILD_REQUIRES = [
-    ("setuptools", "setuptools"),
-    ("mlx", "mlx"),
-    ("nanobind", "nanobind"),
+    "setuptools>=80",
+    "mlx==0.32.4",
+    "nanobind==3.1.0",
+    "cmake>=3.25",
+    "ninja",
 ]
 
 
@@ -55,21 +55,7 @@ def _ensure_toolchain():
 
 
 def _ensure_build_requires():
-    missing = []
-    for import_name, pip_name in _BUILD_REQUIRES:
-        try:
-            importlib.import_module(import_name)
-        except ImportError:
-            missing.append(pip_name)
-    if not missing:
-        return
-    print(
-        f"[sgl-kernel:metal] installing build requirements: {missing}",
-        flush=True,
-    )
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--upgrade", *missing]
-    )
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *_BUILD_REQUIRES])
 
 
 # Section 1: Prerequisites
@@ -79,8 +65,8 @@ os.chdir(root)
 
 
 # Section 2: Build and install
-from setuptools import Extension, find_packages, setup  # noqa: E402
-from setuptools.command.build_ext import build_ext  # noqa: E402
+from mlx.extension import BuildExtension, MetalExtension  # noqa: E402
+from setuptools import find_packages, setup  # noqa: E402
 
 
 def _get_version():
@@ -90,11 +76,6 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
-operator_namespace = "sgl_kernel"
-metallib_name = "sgl_metal_kernels.metallib"
-
-# Metal shader sources (compiled with `xcrun metal`) and C++ host sources
-# (compiled with `c++`). Add new kernels by appending to these lists.
 metal_shader_sources = [
     "csrc/metal/radix_attention.metal",
     "csrc/metal/rope_pool_fused.metal",
@@ -106,6 +87,7 @@ cxx_sources = [
     "csrc/metal/rope_pool_fused.cpp",
 ]
 
+<<<<<<< HEAD
 # Header search paths shared by both the Metal shader compiler and the C++
 # host compiler.
 include_dirs = [
@@ -291,13 +273,29 @@ ext_modules = [
     )
 ]
 
+=======
+>>>>>>> upstream/main
 setup(
     name="sglang-kernel",
     version=_get_version(),
     packages=find_packages(where="python"),
     package_dir={"": "python"},
-    package_data={"sgl_kernel": ["*.metallib"]},
+    package_data={"sgl_kernel": ["*.metallib", "*.pyi"]},
     include_package_data=True,
-    ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildMetalExtension},
+    ext_modules=[
+        MetalExtension(
+            name="sgl_kernel._metal",
+            sources=[*cxx_sources, *metal_shader_sources],
+            include_dirs=["csrc", "csrc/metal"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "metal": [
+                    "-O3",
+                    "-ffast-math",
+                    f"-std={os.environ.get('SGL_METAL_STD', 'metal3.1')}",
+                ],
+            },
+        )
+    ],
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

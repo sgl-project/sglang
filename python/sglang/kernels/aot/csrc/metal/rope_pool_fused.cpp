@@ -23,6 +23,38 @@ using namespace sglang::metal_common;
 
 namespace {
 
+<<<<<<< HEAD
+=======
+// MLX caches libraries by name, independently of their file paths.
+constexpr const char* kLibraryName = "sgl_metal_kernels";
+
+MTL::Library* g_library = nullptr;
+
+const char* dtype_suffix(Dtype dt) {
+  switch (dt) {
+    case float16:
+      return "f16";
+    case bfloat16:
+      return "bf16";
+    case float32:
+      return "f32";
+    default:
+      throw std::runtime_error("rope_pool_fused: unsupported dtype");
+  }
+}
+
+void register_library_impl(const std::string& path) {
+  if (path.empty()) {
+    throw std::runtime_error("register_library requires a non-empty path");
+  }
+  auto& d = metal::device(Device::gpu);
+  g_library = d.get_library(kLibraryName, path);
+  if (g_library == nullptr) {
+    throw std::runtime_error("failed to load .metallib from: " + path);
+  }
+}
+
+>>>>>>> upstream/main
 MTL::Size pick_tg(uint32_t gx, uint32_t gy, uint32_t gz) {
   constexpr uint32_t kMaxThreads = 256;
   uint32_t tx = std::min<uint32_t>(gx, 32u);
