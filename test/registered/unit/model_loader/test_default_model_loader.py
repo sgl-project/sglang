@@ -129,6 +129,64 @@ class TestDefaultModelLoader(CustomTestCase):
                     startup_prefetch_active=True,
                 )
 
+    def test_kv_cache_scale_dropped_on_mismatch(self):
+        cases = [
+            # (checkpoint_bits, runtime_kv_dtype, expect_scales_dropped)
+            (8, "nvfp4", True),
+            (8, "bfloat16", True),
+            (8, "fp8", False),
+            (4, "nvfp4", False),
+            (4, "fp8", True),
+        ]
+        for checkpoint_bits, runtime_dtype, expect_dropped in cases:
+            with self.subTest(ckpt=checkpoint_bits, runtime=runtime_dtype):
+                model = Mock()
+                model.quant_config = SimpleNamespace(
+                    kv_cache_scheme={"num_bits": checkpoint_bits},
+                    is_nvfp4_online=False,
+                    get_name=lambda: "dummy",
+                )
+                loaded = []
+                model.load_weights.side_effect = lambda ws: loaded.extend(list(ws))
+
+                dummy_weights = [
+                    ("model.layers.0.self_attn.q_proj.weight", torch.zeros(1)),
+                    ("model.layers.0.self_attn.k_scale", torch.ones(1)),
+                    ("model.layers.0.self_attn.v_scale", torch.ones(1)),
+                ]
+
+                model_bag = SimpleNamespace(kv_cache_dtype=runtime_dtype)
+                with (
+                    patch.object(loader_mod, "is_cuda_alike", return_value=False),
+                    patch(
+                        "sglang.srt.runtime_context.get_model",
+                        return_value=model_bag,
+                    ),
+                    patch.object(
+                        loader_mod,
+                        "monokernel_weights_iterator",
+                        side_effect=lambda model, weights: weights,
+                    ),
+                ):
+                    DefaultModelLoader.load_weights_only(
+                        model, iter(dummy_weights), torch.device("cpu")
+                    )
+
+                loaded_names = [name for name, _ in loaded]
+                if expect_dropped:
+                    self.assertEqual(
+                        loaded_names, ["model.layers.0.self_attn.q_proj.weight"]
+                    )
+                else:
+                    self.assertEqual(
+                        loaded_names,
+                        [
+                            "model.layers.0.self_attn.q_proj.weight",
+                            "model.layers.0.self_attn.k_scale",
+                            "model.layers.0.self_attn.v_scale",
+                        ],
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
