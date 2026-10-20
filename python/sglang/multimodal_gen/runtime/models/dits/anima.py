@@ -64,23 +64,13 @@ def _anima_rope(q, k, cos, sin):
         )
 
         if can_use_fused_rope_rotate_half_fp32(q, k, cos, sin):
-            sig = (q.device, q.dtype, q.shape)
-            verified = _ANIMA_ROPE.is_verified(sig)
-            if verified or not torch.cuda.is_current_stream_capturing():
-                try:
-                    out = fused_rope_rotate_half_fp32(q, k, cos, sin)
-                except Exception as exc:
-                    _ANIMA_ROPE.on_exception(exc, logger=logger)
-                else:
-                    if verified:
-                        return out
-                    return _ANIMA_ROPE.accept_or_fallback(
-                        out,
-                        _anima_rope_eager(q, k, cos, sin),
-                        sig=sig,
-                        equal=tensors_equal,
-                        logger=logger,
-                    )
+            return _ANIMA_ROPE.run(
+                lambda: fused_rope_rotate_half_fp32(q, k, cos, sin),
+                lambda: _anima_rope_eager(q, k, cos, sin),
+                sig=(q.device, q.dtype, q.shape),
+                equal=tensors_equal,
+                logger=logger,
+            )
     return _anima_rope_eager(q, k, cos, sin)
 
 

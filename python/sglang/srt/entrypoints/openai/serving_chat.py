@@ -42,6 +42,7 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
+    chat_encoding_adapters,
     encoding_dsv4,
     encoding_dsv32,
     encoding_dsv41,
@@ -345,14 +346,7 @@ class OpenAIServingChat(OpenAIServingBase):
             else None
         )
 
-        # Resolve the env-configured Inkling effort default once: the env var is
-        # frozen for the server's lifetime, and a misconfigured value should
-        # fail at boot, not 400 every request.
-        self._inkling_default_reasoning_effort: float | None = (
-            self._get_inkling_default_reasoning_effort()
-            if self.chat_encoding_spec == "inkling"
-            else None
-        )
+        self._encoding_adapter = self._build_chat_encoding_adapter()
         self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
             chat_encoding.default_dsv41_reasoning_effort_from_env(
                 envs.SGLANG_DSV41_REASONING_EFFORT.get()
@@ -473,6 +467,9 @@ class OpenAIServingChat(OpenAIServingBase):
             return chat_encoding.spec_supports_inline_system(self.chat_encoding_spec)
         if self.template_manager.chat_template_name is not None:
             return False
+        python_template = self.template_manager.python_chat_template
+        if python_template is not None:
+            return python_template.supports_inline_system
         tokenizer = self.tokenizer_manager.tokenizer
         return tokenizer is not None and detect_inline_system_support(
             tokenizer.chat_template
@@ -488,6 +485,37 @@ class OpenAIServingChat(OpenAIServingBase):
             tokenizer=self.tokenizer_manager.tokenizer,
             tool_call_parser=self.tool_call_parser,
         )
+
+    def _build_chat_encoding_adapter(
+        self,
+    ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
+        if not chat_encoding_adapters.has_chat_encoding_adapter(
+            self.chat_encoding_spec
+        ):
+            return None
+        return chat_encoding_adapters.build_chat_encoding_adapter(
+            chat_encoding_adapters.ChatEncodingAdapterContext(
+                chat_encoding_spec=self.chat_encoding_spec,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                reasoning_parser=self.reasoning_parser,
+                tool_call_parser=self.tool_call_parser,
+                chat_hooks=chat_encoding_adapters.ChatOutputHooks(
+                    tool_call_parsing_active=self._tool_call_parsing_active,
+                    history_tool_calls_count=self._get_history_tool_calls_cnt,
+                    tool_call_id=self._process_tool_call_id,
+                ),
+                hf_config=self.tokenizer_manager.model_config.hf_config,
+                model_path=self.tokenizer_manager.model_path,
+                revision=get_model().revision,
+            )
+        )
+
+    def _encoding_output(
+        self,
+    ) -> Optional[chat_encoding_adapters.ChatEncodingOutputAdapter]:
+        if self._encoding_adapter is None:
+            return None
+        return self._encoding_adapter.output
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -588,44 +616,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         Returns prompt_ids if handled, None to use default encoding.
         """
-        if self.chat_encoding_spec == "inkling":
-            # Inkling: render messages -> input_ids with framing tokens + ONE placeholder per
-            # media (encoding/expansion happens later in InklingMultimodalProcessor). The
-            # server's tokenizer is the base tiktoken backend; wrap it so encode_special
-            # supplies the framing-token overlay.
-            from sglang.srt.parser.inkling_renderer import render_inkling_messages
-            from sglang.srt.parser.inkling_tokenizer import (
-                CONTENT_TEXT,
-                MESSAGE_MODEL,
-                InklingTokenizer,
+        if self._encoding_adapter is not None:
+            return self._encoding_adapter.encode_messages(
+                messages=messages, request=request, tools=tools
             )
-
-            inkling_tokenizer = InklingTokenizer(
-                tokenizer=self.tokenizer_manager.tokenizer
-            )
-            reasoning_effort = self._parse_inkling_reasoning_effort(
-                request.reasoning_effort
-            )
-            if reasoning_effort is None:
-                reasoning_effort = self._inkling_default_reasoning_effort
-            assistant_prefix = self._pop_inkling_assistant_prefix(messages, request)
-            prompt_ids = render_inkling_messages(
-                messages,
-                inkling_tokenizer,
-                add_generation_prompt=False,
-                tools=tools,
-                reasoning_effort=reasoning_effort,
-            )
-            if assistant_prefix is not None:
-                # Continue the final assistant message inside an OPEN model text
-                # block: header + payload, no <|end_message|> and no
-                # <|content_model_end_sampling|>, so the model resumes the turn.
-                prompt_ids += [
-                    inkling_tokenizer.encode_special(MESSAGE_MODEL),
-                    inkling_tokenizer.encode_special(CONTENT_TEXT),
-                    *inkling_tokenizer.encode_text(assistant_prefix),
-                ]
-            return prompt_ids
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
@@ -900,6 +894,30 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens: dict[int, int],
     ) -> AsyncGenerator[str, None]:
         """Generate SSE chunks for streaming content."""
+        encoding_output = self._encoding_output()
+        if encoding_output is not None:
+            usage = None
+            if continuous_usage_stats:
+                usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=self._reported_prompt_tokens(content["meta_info"]),
+                    reasoning_tokens=content["meta_info"].get("reasoning_tokens", 0),
+                    completion_tokens=content["meta_info"].get("completion_tokens", 0),
+                    cached_tokens=self._continuous_usage_cached_details(content),
+                ).model_dump()
+            for chunk in encoding_output.stream_chat_chunks(
+                content=content,
+                index=index,
+                request=request,
+                created=created,
+                parser_dict=parser_dict,
+                has_tool_calls=has_tool_calls,
+                choice_logprobs=choice_logprobs,
+                finish_reason_type=finish_reason_type,
+                usage=usage,
+            ):
+                yield chunk
+            return
+
         offset = stream_offsets.get(index, 0)
         if get_serving().incremental_streaming_output:
             delta = content["text"]
@@ -1378,18 +1396,19 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_call_constraint = None
 
         effective_tools = self._effective_tools(request)
-        # Only tool-bearing requests get the full-assistant EBNF: its terminal
-        # state finishes a request even under ignore_eos.
+        # A grammar reaching its terminal state ends generation regardless of
+        # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
             self.tool_call_parser == "glm47"
             and bool(effective_tools)
+            and request.tool_choice != "none"
             and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
             enable_thinking = (request.chat_template_kwargs or {}).get(
                 "enable_thinking"
             )
-            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
+            parser = FunctionCallParser(effective_tools, self.tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
@@ -1555,7 +1574,12 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if prompt_ids is not None:
-            if self.chat_encoding_spec in ("inkling", "kimi_k3"):
+            collects_openai_media = (
+                self._encoding_adapter.collects_openai_media
+                if self._encoding_adapter is not None
+                else self.chat_encoding_spec == "kimi_k3"
+            )
+            if collects_openai_media:
                 for message in request.messages:
                     msg_dict = message.model_dump()
                     if msg_dict.get("content") is None:
@@ -2396,6 +2420,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 output_ids=output_ids,
             )
 
+        encoding_output = self._encoding_output()
         for idx, ret_item in enumerate(ret):
             # Process logprobs
             choice_logprobs = None
@@ -2413,7 +2438,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            if self.reasoning_parser and request.separate_reasoning:
+            tool_calls = None
+            if encoding_output is not None:
+                reasoning_text, text, tool_calls, finish_reason = (
+                    encoding_output.parse_chat_response(
+                        request=request,
+                        output_ids=ret_item["output_ids"],
+                        finish_reason=finish_reason,
+                    )
+                )
+            elif self.reasoning_parser and request.separate_reasoning:
                 force_reasoning = (
                     self.template_manager.force_reasoning
                     or self._get_reasoning_from_request(request)
@@ -2437,9 +2471,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
             # Handle tool calls
-            tool_calls = None
             effective_tools = self._effective_tools(request)
-            if self._tool_call_parsing_active(request):
+            if encoding_output is None and self._tool_call_parsing_active(request):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
