@@ -111,6 +111,33 @@ steady-state performance; warm up each input mode and worker replica you use.
 Native pipelines can expose `stage_specs` using `StageSpec`, or deployments can
 provide the same contracts in their top-level `stages` array:
 
+For a sequential deployment, declare stage names and component requirements
+without enumerating request fields:
+
+```python
+StageSpec("encode", components=("text_encoder", "tokenizer"))
+StageSpec("denoise", components=("transformer", "scheduler"))
+StageSpec("decode", components=("vae",))
+```
+
+When no stage declares `inputs` or `outputs`, the framework transfers the full
+request context at role boundaries automatically, including nested model-specific
+fields, sampling-parameter changes, and generator state. Tensors, including
+tensors nested inside scheduler state, use the tensor transport rather than
+Python object serialization. Process-local tracing, metrics, and model modules
+are not migrated. Unsupported runtime objects fail explicitly.
+
+This mode preserves sequential pipeline order, requires every stage to be
+placed, and requires each role to contain consecutive stages. Group input
+validation and encoding into the encoder, latent/timestep initialization and
+denoising into the denoiser, and decoding/postprocessing into the decoder.
+No per-model list of embeddings, masks, or metadata fields is needed.
+The default terminal output is `result.output`; `outputs` can select other
+terminal request fields. Full-context transfer favors correctness over minimum
+communication volume and does not yet infer parallel encoder branches.
+
+For explicitly optimized fan-out/join graphs, field contracts remain available:
+
 ```python
 from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import StageSpec
 
@@ -142,10 +169,11 @@ pipeline updates, because inserting or reordering contracts changes indices.
 `result.<field>` outputs. The planner binds reads to their latest preceding
 writer. By default a stage also depends on its predecessor; `after=()` removes
 that control dependency, while data dependencies still apply. Use
-`colocate_with` for stages sharing non-transferable runtime state. Keep generator,
-scheduler, module, and CUDA-event objects local; tensors and JSON-safe metadata
-cross deployment boundaries. Required fields that cannot be serialized fail
-explicitly rather than being silently omitted.
+`colocate_with` for stages sharing non-transferable runtime state. In this
+explicit-field mode, keep generator, scheduler, module, and CUDA-event objects
+local; declared tensors and JSON-safe metadata cross deployment boundaries.
+Required fields that cannot be serialized fail explicitly rather than being
+silently omitted.
 
 A stage returning `OutputBatch` also exposes its output through the request
 context for subsequent stages. Declare `output` as written when replacing it,

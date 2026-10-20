@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Named stage fields and strict tensor-tree serialization at deployment edges."""
 
+import base64
 import copy
+import io
 import json
+import pickle
 
 import torch
 from torch.utils._pytree import (
@@ -67,6 +70,103 @@ def fork_request(req):
     fork.sampling_params = copy.deepcopy(req.sampling_params)
     fork.extra = copy.copy(req.extra)
     return fork
+
+
+class _ContextPickler(pickle.Pickler):
+    def __init__(self, stream):
+        super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
+        self.tensors = {}
+        self.tensor_ids = {}
+        self.generators = {}
+
+    def _tensor(self, tensor):
+        identity = id(tensor)
+        if identity not in self.tensor_ids:
+            key = str(len(self.tensors))
+            self.tensor_ids[identity] = key
+            self.tensors[key] = tensor
+        return self.tensor_ids[identity]
+
+    def persistent_id(self, value):
+        if isinstance(value, torch.Tensor):
+            return "tensor", self._tensor(value), value.device.type
+        if isinstance(value, torch.Generator):
+            identity = id(value)
+            if identity not in self.generators:
+                self.generators[identity] = self._tensor(value.get_state())
+            return "generator", self.generators[identity], value.device.type
+        if isinstance(value, torch.device):
+            return "device", value.type
+        if isinstance(value, torch.nn.Module):
+            raise TypeError("Model modules cannot cross a request-context boundary")
+        return None
+
+
+class _ContextUnpickler(pickle.Unpickler):
+    def __init__(self, stream, tensors, device):
+        super().__init__(stream)
+        self.tensors = tensors
+        self.device = device
+        self.generators = {}
+
+    def persistent_load(self, reference):
+        kind, *fields = reference
+        if kind == "device":
+            return torch.device(self.device if fields[0] == "cuda" else fields[0])
+        key, device_type = fields
+        tensor = self.tensors[key]
+        if kind == "tensor":
+            if device_type == "cpu" and tensor.device.type != "cpu":
+                tensor = self.tensors[key] = tensor.cpu()
+            return tensor
+        if kind == "generator":
+            if key not in self.generators:
+                device = self.device if device_type == "cuda" else device_type
+                self.generators[key] = torch.Generator(device=device).set_state(
+                    tensor.cpu()
+                )
+            return self.generators[key]
+        raise ValueError(f"Unknown request-context reference: {kind}")
+
+
+def capture_request(req):
+    # tensors, including those nested inside scheduler state, never enter pickle
+    state = {
+        name: value
+        for name, value in vars(req).items()
+        if name not in ("metrics", "trace_ctx", "modules")
+    }
+    state["extra"] = {
+        key: value
+        for key, value in req.extra.items()
+        if key not in ("_deployment_result", "_deployment_peak_memory_mb")
+    }
+    if "_deployment_result" in req.extra:
+        result = copy.copy(req.extra["_deployment_result"])
+        result.metrics = None
+        result.metrics_list = None
+        state["extra"]["_deployment_result"] = result
+    if req.modules:
+        raise TypeError("Request modules must remain local to their pipeline worker")
+    stream = io.BytesIO()
+    encoder = _ContextPickler(stream)
+    try:
+        encoder.dump(state)
+    except (TypeError, pickle.PicklingError) as exc:
+        raise TypeError(
+            f"Request contains non-transferable runtime state: {exc}"
+        ) from exc
+    return {
+        "structure": base64.b64encode(stream.getvalue()).decode("ascii"),
+        "tensors": encoder.tensors,
+    }
+
+
+def restore_request(req, context, device):
+    # this RPC is restricted to trusted workers running the same source version
+    stream = io.BytesIO(base64.b64decode(context["structure"]))
+    state = _ContextUnpickler(stream, context["tensors"], device).load()
+    vars(req).update(state)
 
 
 def pack_fields(values):

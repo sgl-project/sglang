@@ -15,10 +15,13 @@ from torch.utils._pytree import tree_flatten, tree_leaves, tree_map, tree_unflat
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
+    capture_request,
     fork_request,
     read_field,
+    restore_request,
     write_field,
 )
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import REQUEST_CONTEXT
 from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import (
     TensorTransport,
 )
@@ -28,6 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.observability.trace import TraceNullContext
 
 logger = init_logger(__name__)
 
@@ -57,12 +61,7 @@ def run_partition(scheduler, req):
 def broadcast_request(scheduler, req):
     group = get_world_group()
     if req is not None:
-        state = dict(vars(req))
-        state["extra"] = dict(req.extra)
-        if "_deployment_result" in state["extra"]:
-            state["extra"]["_deployment_result"] = vars(
-                state["extra"]["_deployment_result"]
-            )
+        state = {"context": capture_request(req), "metrics": req.metrics}
         leaves, spec = tree_flatten(state)
         tensors = [(i, x) for i, x in enumerate(leaves) if isinstance(x, torch.Tensor)]
         metadata = [(i, tuple(t.shape), t.dtype) for i, t in tensors]
@@ -85,11 +84,11 @@ def broadcast_request(scheduler, req):
         dist.broadcast(tensor, src=group.ranks[0], group=group.device_group)
         leaves[index] = tensor
     restored = object.__new__(Req)
-    vars(restored).update(tree_unflatten(leaves, spec))
-    if "_deployment_result" in restored.extra:
-        restored.extra["_deployment_result"] = OutputBatch(
-            **restored.extra["_deployment_result"]
-        )
+    state = tree_unflatten(leaves, spec)
+    vars(restored).update(
+        metrics=state["metrics"], trace_ctx=TraceNullContext(), modules={}
+    )
+    restore_request(restored, state["context"], f"cuda:{scheduler.worker.local_rank}")
     return restored
 
 
@@ -129,9 +128,15 @@ class DeploymentWorker:
         if error:
             raise RuntimeError(error)
         # staged results outlive compute and must not alias reusable output buffers
+        values = {
+            path: capture_request(req)
+            if path == REQUEST_CONTEXT
+            else read_field(req, path)
+            for path in self.role.outputs
+        }
         values = tree_map(
             lambda value: value.clone() if isinstance(value, torch.Tensor) else value,
-            {path: read_field(req, path) for path in self.role.outputs},
+            values,
         )
         ready = torch.cuda.Event()
         ready.record()
@@ -177,7 +182,10 @@ class DeploymentWorker:
                 self.args.disagg_timeout,
             )
             for path, value in values.items():
-                write_field(req, path, value)
+                if path == REQUEST_CONTEXT:
+                    restore_request(req, value, self.device)
+                else:
+                    write_field(req, path, value)
         if "_deployment_output_fields" in req.extra:
             req.extra["_deployment_result"] = OutputBatch(
                 **req.extra.pop("_deployment_output_fields")

@@ -7,6 +7,8 @@ from pathlib import Path
 
 import msgspec
 
+REQUEST_CONTEXT = "__request_context__"
+
 
 class StageSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     name: str
@@ -91,6 +93,9 @@ class ExecutionPlan:
                 if stage not in specs or stage in owner:
                     raise ValueError(f"Unknown or multiply assigned stage: {stage}")
                 owner[stage] = name
+
+        if not any(stage.inputs or stage.outputs for stage in stages):
+            return cls._compile_context(deployment, stages, owner)
 
         selected = set(owner)
         producers = {}
@@ -191,3 +196,44 @@ class ExecutionPlan:
             for name, role in deployment.roles.items()
         }
         return cls(roles, order, outputs, specs)
+
+    @classmethod
+    def _compile_context(cls, deployment, stages, owner):
+        names = [stage.name for stage in stages]
+        if set(owner) != set(names):
+            raise ValueError(
+                "Automatic request transfer requires every stage to be placed"
+            )
+        order = []
+        for index, stage in enumerate(stages):
+            if stage.after is not None and stage.after != tuple(
+                names[index - 1 : index]
+            ):
+                raise ValueError(
+                    "Automatic request transfer preserves sequential stage order"
+                )
+            role = owner[stage.name]
+            if not order or order[-1] != role:
+                if role in order:
+                    raise ValueError("A role must contain consecutive stages")
+                order.append(role)
+            for other in stage.colocate_with:
+                if owner.get(other) != role:
+                    raise ValueError(f"Stages {stage.name} and {other} must colocate")
+        outputs = {path: order[-1] for path in deployment.outputs or ("result.output",)}
+        roles = {}
+        for index, name in enumerate(order):
+            previous = order[index - 1] if index else None
+            selected = [stage for stage in stages if owner[stage.name] == name]
+            roles[name] = RolePlan(
+                name=name,
+                stages=tuple(stage.name for stage in selected),
+                components=frozenset(c for stage in selected for c in stage.components),
+                inputs={REQUEST_CONTEXT: previous} if previous else {},
+                outputs=tuple(outputs) if name == order[-1] else (REQUEST_CONTEXT,),
+                dependencies=frozenset((previous,)) if previous else frozenset(),
+                endpoints=deployment.roles[name].endpoints,
+            )
+        return cls(
+            roles, tuple(order), outputs, {stage.name: stage for stage in stages}
+        )

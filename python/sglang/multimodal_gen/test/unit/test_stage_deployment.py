@@ -18,10 +18,13 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import 
     DeploymentServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
+    capture_request,
     pack_fields,
+    restore_request,
     unpack_fields,
 )
 from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+    REQUEST_CONTEXT,
     Deployment,
     ExecutionPlan,
     RoleSpec,
@@ -93,6 +96,64 @@ def test_contracts_compile_and_tensor_tree_round_trip():
         unpack_fields({}, scalar)
     with pytest.raises(TypeError):
         pack_fields({"required": object()})
+
+
+def test_automatic_context_compiles_three_separate_roles():
+    stages = (
+        StageSpec("encode", components=("text_encoder", "tokenizer")),
+        StageSpec("denoise", components=("transformer", "scheduler")),
+        StageSpec("decode", components=("vae",)),
+    )
+    plan = ExecutionPlan.compile(
+        Deployment(
+            {
+                name: RoleSpec((index,), (f"tcp://localhost:{19000 + index}",))
+                for index, name in enumerate(("encoder", "denoiser", "decoder"))
+            }
+        ),
+        stages,
+    )
+    assert plan.order == ("encoder", "denoiser", "decoder")
+    assert plan.roles["denoiser"].inputs == {REQUEST_CONTEXT: "encoder"}
+    assert plan.roles["decoder"].inputs == {REQUEST_CONTEXT: "denoiser"}
+    assert plan.roles["encoder"].components == {"text_encoder", "tokenizer"}
+    assert plan.outputs == {"result.output": "decoder"}
+    assert REQUEST_CONTEXT not in plan.roles["decoder"].outputs
+
+
+def test_request_context_preserves_nested_state_rng_and_aliases():
+    req = Req(prompt="original", width=512, height=512)
+    req.width = 640
+    generator = torch.Generator().manual_seed(42)
+    torch.randn(7, generator=generator)
+    req.generator = [generator, generator]
+    req.prompt_embeds = [torch.arange(6).reshape(2, 3)]
+    req.extra["model_specific"] = {"mask": req.prompt_embeds[0], "sizes": (640, 512)}
+    req.scheduler = SimpleNamespace(sigmas=torch.linspace(1, 0, 4), step_index=2)
+    context = capture_request(req)
+    # the control-plane structure contains tensor references, never tensor storage
+    assert len(context["tensors"]) == 3
+    tensors, scalar = pack_fields({REQUEST_CONTEXT: context})
+    received = unpack_fields(tensors, scalar)[REQUEST_CONTEXT]
+    restored = Req(prompt="receiver")
+    metrics = restored.metrics
+    restore_request(restored, received, "cpu")
+    assert restored.width == 640
+    assert restored.extra["model_specific"]["sizes"] == (640, 512)
+    assert restored.extra["model_specific"]["mask"] is restored.prompt_embeds[0]
+    assert restored.generator[0] is restored.generator[1]
+    assert restored.metrics is metrics
+    assert restored.scheduler.step_index == 2
+    torch.testing.assert_close(restored.scheduler.sigmas, req.scheduler.sigmas)
+    torch.testing.assert_close(
+        torch.randn(16, generator=restored.generator[0]),
+        torch.randn(16, generator=req.generator[0]),
+        rtol=0,
+        atol=0,
+    )
+    req.extra["module"] = torch.nn.Linear(2, 2)
+    with pytest.raises(TypeError, match="Model modules"):
+        capture_request(req)
 
 
 @pytest.mark.parametrize("selectors", [(0, 1, 2, 3), ("text", 1, "denoise", 3)])

@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real image/video pipelines with external contracts and index selectors.
-
-Run on two idle NVIDIA GPUs with Mooncake installed. These placements keep
-generators and the request scheduler within the compute role, rather than
-claiming that arbitrary stateful boundaries are transferable.
-"""
+"""Real encoder/denoiser/decoder deployments without per-field payload contracts."""
 
 import asyncio
 import sys
@@ -41,7 +36,7 @@ class _StageCluster(DisaggCluster):
     ],
 )
 def test_external_contracts_match_monolithic(model, num_frames):
-    _require_gpus(2)
+    _require_gpus(3)
     contracts = [
         {"name": "InputValidationStage"},
         {
@@ -55,20 +50,13 @@ def test_external_contracts_match_monolithic(model, num_frames):
         {"name": "TimestepPreparationStage", "components": ["scheduler"]},
         {
             "name": "denoising_stage",
-            "outputs": ["latents"],
             "components": ["transformer"],
         },
         {
             "name": "decoding_stage",
-            "inputs": ["latents"],
-            "outputs": ["output"],
             "components": ["vae"],
         },
-        {
-            "name": "decoding_stage_postprocess",
-            "inputs": ["output"],
-            "outputs": ["output", "result.output"],
-        },
+        {"name": "decoding_stage_postprocess"},
     ]
     requests = [
         dict(
@@ -117,14 +105,14 @@ def test_external_contracts_match_monolithic(model, num_frames):
             expected.append(result.output.cpu())
 
     groups = {
-        "compute": [0, 1, 2, 3, "denoising_stage"],
-        "decode": [5],
-        "postprocess": ["decoding_stage_postprocess"],
+        "encoder": [0, 1],
+        "denoiser": [2, 3, "denoising_stage"],
+        "decoder": [5, "decoding_stage_postprocess"],
     }
     with _StageCluster(
         model=model,
         name="external_" + str(num_frames) + "_" + model.split("/")[-1],
-        gpu_layout={"compute": [0], "decode": [1], "postprocess": [1]},
+        gpu_layout={"encoder": [0], "denoiser": [1], "decoder": [2]},
         extra_role_args={
             role: ["--warmup-mode", "off"] for role in (*groups, "server")
         },
