@@ -84,14 +84,6 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-**LM-head precision.** Inkling preserves FP32 projection output for unquantized CUDA FP16/BF16 heads by default, keeping hidden states and head weights in their original dtype. This can change greedy choices when low-precision output rounding would tie distinct scores. Other head paths retain their existing precision; this default does not enable `--enable-fp32-lm-head`. Final sampler logits are FP32 in either mode.
-
-To select BF16 projection output, add the following override and omit `--enable-fp32-lm-head`:
-
-```bash
---json-model-override-args '{"text_config":{"enable_lm_head_output_fp32":false}}'
-```
-
 **Multimodal.** The recipes pass `--enable-multimodal` so the server accepts image and audio inputs alongside text — drop it for text-only serving.
 
 **DGX Spark (2× GB10).** The verified cell runs NVFP4 with TP=2 across two Sparks over ConnectX-7 (1 GPU per node). Use the `dev-inkling-small-dgx-spark` image, Triton attention + Marlin FP4/MoE, and `--disable-prefill-cuda-graph`. The Docker command already carries the ConnectX-7 flags `--ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband`.
