@@ -4,8 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-import sglang.srt.arg_groups.speculative_hook as speculative_hook
 import torch
+
+import sglang.srt.arg_groups.speculative_hook as speculative_hook
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req

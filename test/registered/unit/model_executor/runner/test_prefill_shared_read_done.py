@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, create_autospec
 
 import pytest
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,

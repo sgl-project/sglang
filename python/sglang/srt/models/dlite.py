@@ -6,6 +6,8 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -21,7 +23,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dlite_utils import parse_dlite_draft_config
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from torch import nn
 
 
 class DLiteAttention(nn.Module):

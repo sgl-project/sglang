@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+
 from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs

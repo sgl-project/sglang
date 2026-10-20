@@ -1,9 +1,11 @@
 import unittest
 from types import SimpleNamespace
 
-import sglang.kernels as kernels
 import torch
 import torch.nn.functional as F
+from transformers import Qwen3Config
+
+import sglang.kernels as kernels
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.models.dlite import DLiteDraftModel
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
@@ -11,7 +13,6 @@ from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
-from transformers import Qwen3Config
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 

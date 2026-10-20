@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from sglang.srt.speculative.dlite_utils import (
     build_dlite_target_layer_ids,
     parse_dlite_draft_config,
