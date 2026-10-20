@@ -1266,11 +1266,16 @@ def test_marlin_lora_direct_inactive_routes():
     assert torch.count_nonzero(down_output[ids < 0]) == 0
 
 
+@pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
 @pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
-def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate):
-    """Muse reuses projection storage while keeping inactive expert outputs zero."""
+def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate, weight_first):
+    """Muse finalization excludes undefined inactive projection rows and weights."""
     from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
+    from sglang.srt.layers.muse_spark.muse_spark_layers import (
+        MuseSpark1xRMSNorm,
+        MuseSpark1xRMSNormWithInputScale,
+    )
 
     torch.manual_seed(67)
     rows, local_experts, topk = 4, 2, 2
@@ -1315,18 +1320,24 @@ def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate):
         [[0.25, 0.75], [0.5, 0.5], [0.25, 0.75], [0.5, 0.5]], device="cuda"
     )
     weights[local_ids < 0] = float("nan")
-    norm = torch.nn.RMSNorm(hidden, eps=1e-6, device="cuda", dtype=dtype)
+    weights[-1, 0] = float("inf")
+    input_weights = weights.clone()
+    norm_class = (
+        MuseSpark1xRMSNormWithInputScale if weight_first else MuseSpark1xRMSNorm
+    )
+    norm = norm_class(hidden, eps=1e-6).to(device="cuda", dtype=dtype)
+    norm.weight.data.copy_(torch.linspace(0.5, 1.5, hidden, device="cuda", dtype=dtype))
     layer._post_expert_norm = norm
     layer._post_expert_norm_weight = norm.weight.detach() if fused_norm else None
     layer._post_expert_norm_eps = norm.eps
-    layer._post_expert_norm_weight_first = False
+    layer._post_expert_norm_weight_first = weight_first
 
     projection_buffers = []
 
     def record_projection_buffer(a, c, *args, **kwargs):
         projection_buffers.append(c)
-        if len(projection_buffers) == 2:
-            assert torch.count_nonzero(c) == 0
+        c.fill_(float("nan"))
+        c[local_ids.reshape(-1) < 0, 0] = float("inf")
         return moe_wna16_marlin_gemm(a, c, *args, **kwargs)
 
     with patch(
@@ -1334,13 +1345,15 @@ def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate):
         side_effect=record_projection_buffer,
     ):
         expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
-    gate_up_buffer, down_buffer = projection_buffers
-    assert gate_up_buffer.data_ptr() == down_buffer.data_ptr()
-    assert down_buffer.untyped_storage().nbytes() == (
-        rows * topk * max(2 * intermediate, hidden) * x.element_size()
-    )
+        actual = layer._forward_marlin(x, weights, ids, norm)
+    for gate_up_buffer, down_buffer in zip(
+        projection_buffers[::2], projection_buffers[1::2]
+    ):
+        assert gate_up_buffer.data_ptr() == down_buffer.data_ptr()
+        assert down_buffer.untyped_storage().nbytes() == (
+            rows * topk * max(2 * intermediate, hidden) * x.element_size()
+        )
     torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
-    assert torch.count_nonzero(expert_output[local_ids < 0]) == 0
     expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)
     w13_ref, w2_ref = references
     for row in range(rows):
@@ -1352,16 +1365,20 @@ def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate):
             gate, up = gate_up.chunk(2)
             activated = torch.nn.functional.silu(gate) * up
             expected_experts[row, route] = activated @ w2_ref[expert].T
-    torch.testing.assert_close(expert_output, expected_experts, rtol=0.05, atol=0.25)
+    torch.testing.assert_close(
+        expert_output[local_ids >= 0],
+        expected_experts[local_ids >= 0],
+        rtol=0.05,
+        atol=0.25,
+    )
     safe_weights = weights.masked_fill(local_ids < 0, 0.0)
     expected = (
         (norm(expected_experts).float() * safe_weights[..., None]).sum(1).to(dtype)
     )
-    actual = layer._forward_marlin(x, weights, ids, norm)
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.25)
     assert torch.isfinite(actual).all()
     assert torch.count_nonzero(actual[-1]) == 0
-    assert torch.isnan(weights[local_ids < 0]).all()
+    torch.testing.assert_close(weights, input_weights, rtol=0, atol=0, equal_nan=True)
 
 
 if __name__ == "__main__":
