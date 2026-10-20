@@ -264,12 +264,13 @@ def test_helion_forward_publishes_routed_experts(use_rope: bool) -> None:
     from sglang.kernels.ops.muse_spark.helion_megakernels import integration
 
     topk_ids = torch.tensor([[7, 3]], dtype=torch.int32)
-    gated = []
+    new_stream = torch.empty(1, 4)
+    calls = []
     runner = SimpleNamespace(
         topk_ids=topk_ids,
         sliding_attention=lambda **_kwargs: "mk-gated",
-        layer=lambda **kwargs: (
-            gated.append(kwargs["gated"]) or ("new-stream", "next-attention", None)
+        experts=lambda **kwargs: (
+            calls.append(("experts", kwargs["ffn_in"])) or "expert-output"
         ),
     )
     module_name = "sglang.kernels.ops.muse_spark.helion_megakernels.megakernel_verify"
@@ -281,13 +282,31 @@ def test_helion_forward_publishes_routed_experts(use_rope: bool) -> None:
     )
     layer = SimpleNamespace(
         layer_idx=11,
-        _verify_qkv=None,
+        operator_dtype=torch.bfloat16,
         _megakernel_verify_params=(object(), object(), object()),
-        _fused_ffn_boundary=object(),
+        _fused_attn_boundary=lambda stream, attn_output, **_kwargs: (
+            calls.append(("boundary", stream, attn_output))
+            or ("ffn-input", new_stream, None)
+        ),
         self_attn=SimpleNamespace(
             use_rope=use_rope,
             qkv_proj=lambda _value: (object(), None),
             gated_attention=lambda *_args: "stock-gated",
+            o_proj=lambda gated: (
+                calls.append(("o_proj", gated)) or "attn-output",
+                None,
+            ),
+        ),
+        mlp=SimpleNamespace(
+            _reduce_and_unpool=lambda output, **_kwargs: (
+                calls.append(("unpool", output)) or torch.empty(1, 2)
+            ),
+        ),
+        _fused_ffn_boundary=SimpleNamespace(
+            forward_with_ag=lambda stream, ffn_output, _comm: (
+                calls.append(("ffn_boundary", stream is new_stream))
+                or ("next-attention", "final-stream")
+            ),
         ),
     )
     attn_input, forward_batch = _verify_call(16)
@@ -296,7 +315,7 @@ def test_helion_forward_publishes_routed_experts(use_rope: bool) -> None:
     with (
         patch.dict(sys.modules, {module_name: fake_module}),
         integration.get_parallel().override(
-            tp_group=SimpleNamespace(device_group=object())
+            tp_group=SimpleNamespace(device_group=object(), ca_comm=None)
         ),
         patch.object(integration, "_attention_inputs", return_value=object()),
         patch.object(integration, "require_helion_features"),
@@ -304,12 +323,18 @@ def test_helion_forward_publishes_routed_experts(use_rope: bool) -> None:
         patch.object(integration, "megakernel_verify_enabled", return_value=True),
     ):
         result = integration.try_helion_megakernel_forward(
-            layer, object(), object(), attn_input, forward_batch
+            layer, object(), "stream", attn_input, forward_batch
         )
 
-    assert result == ("new-stream", "next-attention")
-    # Global layers keep the stock attention; both feed the layer megakernels.
-    assert gated == ["mk-gated" if use_rope else "stock-gated"]
+    assert result == ("final-stream", "next-attention")
+    # Global layers keep the stock attention; both feed the stock O-projection.
+    assert calls == [
+        ("o_proj", "mk-gated" if use_rope else "stock-gated"),
+        ("boundary", "stream", "attn-output"),
+        ("experts", "ffn-input"),
+        ("unpool", "expert-output"),
+        ("ffn_boundary", True),
+    ]
     assert captures == [{"layer_id": 11, "topk_indices": topk_ids}]
 
 
