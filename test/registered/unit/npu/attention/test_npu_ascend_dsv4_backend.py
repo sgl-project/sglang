@@ -22,6 +22,7 @@ for mod in (
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
+    "sgl_kernel_npu.kvcacheio",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -522,6 +523,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
         backend.req_to_token = torch.empty((0, 0), dtype=torch.int32)
         backend.req_to_token_pool = MagicMock()
         backend._dsv4_compress_ratios = ()
+        backend._prefill_graph_max_context_size = MagicMock(return_value=None)
         backend._compute_compress_locs = MagicMock(return_value={})
 
         forward_mode = MagicMock()
@@ -775,6 +777,10 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         with (
             patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
             patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+                return_value=False,
+            ),
+            patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
                 return_value=(MagicMock(), MagicMock()),
             ),
@@ -1026,6 +1032,235 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
         custom_ops.indexer_compress_epilog.assert_not_called()
+
+
+class TestPrefillSourceGraphMetadata(unittest.TestCase):
+    _MODULE = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+
+    @staticmethod
+    def _batch(lengths=(65, 70), prefixes=(2048, 0)):
+        lengths = torch.tensor(lengths, dtype=torch.int32)
+        prefixes = torch.tensor(prefixes, dtype=torch.int32)
+        tokens = int(lengths.sum())
+        return SimpleNamespace(
+            batch_size=len(lengths),
+            input_ids=torch.zeros(tokens, dtype=torch.int64),
+            positions=torch.arange(tokens),
+            out_cache_loc=torch.arange(1, tokens + 1),
+            req_pool_indices=torch.arange(3, 3 + len(lengths)),
+            seq_lens=lengths + prefixes,
+            seq_lens_cpu=lengths + prefixes,
+            extend_seq_lens=lengths,
+            extend_seq_lens_cpu=lengths.tolist(),
+            extend_prefix_lens=prefixes,
+            extend_prefix_lens_cpu=prefixes.tolist(),
+            extend_start_loc=torch.cat(
+                [torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)[:-1]]
+            ),
+            max_seq_len_override=None,
+        )
+
+    def test_padding_preserves_live_batch_and_adds_no_queries(self):
+        batch = self._batch()
+        original = batch.seq_lens.clone()
+        padded = DeepseekV4AscendAttnBackend._source_graph_pad_batch(batch, 4)
+
+        self.assertEqual(batch.batch_size, 2)
+        self.assertTrue(torch.equal(batch.seq_lens, original))
+        self.assertEqual(batch.extend_seq_lens_cpu, [65, 70])
+        self.assertIs(padded.input_ids, batch.input_ids)
+        self.assertIs(padded.out_cache_loc, batch.out_cache_loc)
+        self.assertEqual(padded.req_pool_indices.tolist(), [3, 4, 0, 0])
+        self.assertEqual(padded.seq_lens.tolist(), [2113, 70, 1, 1])
+        self.assertEqual(padded.extend_seq_lens_cpu, [65, 70, 0, 0])
+        self.assertEqual(padded.extend_prefix_lens_cpu, [2048, 0, 0, 0])
+
+    def test_overflow_is_rejected_before_modifying_captured_storage(self):
+        dst = torch.full((2, 3), 7, dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "metadata overflow"):
+            DeepseekV4AscendAttnBackend._source_graph_copy(dst, torch.ones(2, 4))
+        self.assertEqual(dst.tolist(), [[7, 7, 7], [7, 7, 7]])
+
+    def test_capture_reserves_boundary_outputs_and_arch35_cycle_table(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.req_to_token_pool = SimpleNamespace(size=4)
+        backend._dsv4_state_pools_by_ratio = {4: object(), 128: object()}
+        batch = self._batch((128,), (0,))
+
+        def initialize(padded):
+            backend.forward_metadata = SimpleNamespace(
+                c4_loc=torch.zeros(32, dtype=torch.int32),
+                c128_loc=torch.zeros(1, dtype=torch.int32),
+                dsv4_cycle_state_block_table=padded.req_pool_indices.to(torch.int32),
+                dsv4_explicit_state_block_tables={},
+            )
+
+        backend.init_forward_metadata = MagicMock(side_effect=initialize)
+        with (
+            patch(self._MODULE + ".is_npu_arch35", return_value=True),
+            patch(self._MODULE + "._build_explicit_state_block_table") as explicit,
+        ):
+            fm = backend.init_forward_metadata_for_breakable_cuda_graph_capture(batch)
+
+        self.assertEqual(fm.source_graph_request_slots, 4)
+        self.assertEqual(fm.c4_loc.shape, (36,))
+        self.assertEqual(fm.c128_loc.shape, (5,))
+        self.assertEqual(fm.swa_loc.shape, (128,))
+        self.assertEqual(fm.dsv4_cycle_state_block_table.tolist(), [3, 0, 0, 0])
+        self.assertEqual(fm.source_graph_topk, {})
+        explicit.assert_not_called()
+
+    def test_replay_preserves_addresses_clears_stale_tails_and_keeps_live_layout(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        topk = {1: torch.full((256, 2), 11), 5: torch.full((256, 2), 55)}
+        fm = SimpleNamespace(
+            source_graph_request_slots=4,
+            source_graph_topk=topk,
+            actual_seq_lengths_q=torch.zeros(4, dtype=torch.int32),
+            actual_seq_lengths_q_pa=torch.zeros(5, dtype=torch.int32),
+            actual_seq_lengths_kv=torch.zeros(4, dtype=torch.int32),
+            c4_page_table=torch.zeros(4, 8, dtype=torch.int32),
+            c4_loc=torch.zeros(68, dtype=torch.int32),
+            dsv4_cycle_state_block_table=torch.zeros(4, dtype=torch.int32),
+            kernel_metadata={"li_quant_metadata": torch.zeros(8, dtype=torch.int32)},
+            swa_loc=torch.zeros(256, dtype=torch.int64),
+        )
+        tensors = [
+            fm.actual_seq_lengths_q,
+            fm.actual_seq_lengths_q_pa,
+            fm.actual_seq_lengths_kv,
+            fm.c4_page_table,
+            fm.c4_loc,
+            fm.dsv4_cycle_state_block_table,
+            fm.kernel_metadata["li_quant_metadata"],
+            fm.swa_loc,
+        ]
+        addresses = [tensor.data_ptr() for tensor in tensors]
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda loc: loc + 100
+        )
+        initialized_batches = []
+
+        def initialize(batch):
+            initialized_batches.append(batch)
+            backend.forward_metadata = SimpleNamespace(
+                actual_seq_lengths_q=batch.extend_seq_lens.cumsum(0).int(),
+                actual_seq_lengths_q_pa=torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32),
+                        batch.extend_seq_lens.cumsum(0).int(),
+                    ]
+                ),
+                actual_seq_lengths_kv=batch.seq_lens.int(),
+                c4_page_table=torch.full((batch.batch_size, 2), batch.batch_size),
+                c4_loc=batch.out_cache_loc[:3].int(),
+                dsv4_cycle_state_block_table=batch.req_pool_indices.int(),
+                kernel_metadata={
+                    "li_quant_metadata": torch.arange(3, dtype=torch.int32)
+                },
+            )
+
+        backend.init_forward_metadata = MagicMock(side_effect=initialize)
+        for batch, static in (
+            (self._batch(), SimpleNamespace(max_seq_len_override=4096)),
+            (self._batch((64,), (0,)), None),
+        ):
+            backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                fm, batch, static_forward_batch=static
+            )
+            self.assertIs(backend.forward_metadata, fm)
+            self.assertIs(fm.source_live_metadata.source_graph_topk, topk)
+            self.assertEqual(
+                fm.source_live_metadata.actual_seq_lengths_q.numel(), batch.batch_size
+            )
+            self.assertEqual(fm.actual_seq_lengths_q.numel(), 4)
+            self.assertEqual([tensor.data_ptr() for tensor in tensors], addresses)
+            self.assertEqual(
+                fm.swa_loc[: batch.input_ids.numel()].tolist(),
+                (batch.out_cache_loc + 100).tolist(),
+            )
+            self.assertTrue(torch.all(fm.swa_loc[batch.input_ids.numel() :] == 0))
+            self.assertTrue(torch.all(fm.c4_page_table[:, 2:] == 0))
+            self.assertTrue(torch.all(fm.c4_loc[3:] == 0))
+            self.assertEqual(
+                fm.dsv4_cycle_state_block_table.tolist(),
+                batch.req_pool_indices.tolist() + [0] * (4 - batch.batch_size),
+            )
+
+        self.assertEqual(initialized_batches[0].max_seq_len_override, 4096)
+        self.assertIsNone(initialized_batches[2].max_seq_len_override)
+        self.assertIsNone(batch.max_seq_len_override)
+        self.assertEqual(fm.actual_seq_lengths_kv.tolist(), [64, 1, 1, 1])
+
+    def test_multiple_indexers_retain_distinct_recorded_outputs(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.forward_metadata = SimpleNamespace(source_graph_topk={})
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_mapping={i: SimpleNamespace(compress_layer_id=i) for i in (1, 5)}
+        )
+        backend._ensure_npu_c4_indexer = MagicMock()
+        backend._can_use_indexer_multi_stream = lambda: False
+        backend._forward_prepare = MagicMock(
+            return_value=(torch.empty(4, 1), torch.empty(4, 1))
+        )
+        outputs = [torch.full((4, 2), 11), torch.full((4, 2), 55)]
+        backend._forward_indexer = MagicMock(side_effect=outputs)
+        batch = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+        with patch(self._MODULE + ".maybe_capture_indexer_topk"):
+            for layer_id in (1, 5):
+                backend.forward_c4_indexer(
+                    x=torch.empty(4, 1),
+                    q_lora=torch.empty(4, 1),
+                    forward_batch=batch,
+                    c4_indexer=SimpleNamespace(layer_id=layer_id),
+                )
+        self.assertIs(backend.forward_metadata.source_graph_topk[1], outputs[0])
+        self.assertIs(backend.forward_metadata.source_graph_topk[5], outputs[1])
+
+    def test_eager_attention_reads_live_requests_and_its_own_layer_topk(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        topk = {
+            1: torch.full((4, 2), 11, dtype=torch.int32),
+            5: torch.full((4, 2), 55, dtype=torch.int32),
+        }
+        live = SimpleNamespace(
+            source_graph_topk=topk,
+            actual_seq_lengths_q_pa=torch.tensor([0, 2]),
+            actual_seq_lengths_kv=torch.tensor([64]),
+            c4_page_table=torch.zeros(1, 1),
+            swa_page_table=torch.zeros(1, 1),
+            kernel_metadata={"c4a_metadata": torch.zeros(1)},
+        )
+        backend.forward_metadata = SimpleNamespace(source_live_metadata=live)
+        backend._dsv4_sliding_window_size = 128
+        backend.token_to_kv_pool = MagicMock()
+        backend.token_to_kv_pool.get_swa_buffer.return_value = torch.empty(1, 128, 4)
+        backend.token_to_kv_pool.get_compress_buffer.return_value = torch.empty(
+            1, 32, 4
+        )
+        attention_op = MagicMock(return_value=(torch.empty(2, 1, 4), None))
+        with (
+            patch(
+                self._MODULE + "._sparse_attn_ops", return_value=(None, attention_op)
+            ),
+            patch(self._MODULE + "._sparse_attn_kv_quant_kwargs", return_value={}),
+        ):
+            for layer_id in (1, 5):
+                backend._forward_compressed(
+                    torch.empty(2, 1, 4),
+                    SimpleNamespace(layer_id=layer_id, scaling=1),
+                    SimpleNamespace(),
+                    None,
+                    4,
+                )
+                kwargs = attention_op.call_args.kwargs
+                self.assertIs(kwargs["cu_seqlens_q"], live.actual_seq_lengths_q_pa)
+                self.assertIs(kwargs["cmp_block_table"], live.c4_page_table)
+                self.assertTrue(
+                    torch.equal(
+                        kwargs["cmp_sparse_indices"], topk[layer_id][:2].view(2, 1, 2)
+                    )
+                )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -119,6 +120,12 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
+        contexts.enter_context(get_context().parallel.override(dcp_enabled=False))
+
     def test_full_backend_accepts_mixed_chunks(self):
         """Full pads the token and request axes and refreshes attention
         metadata on every replay, so the mixed-chunk startup guard must not
@@ -222,6 +229,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_seq_len = None
         runner._capture_req_slots = capture_req_slots
         runner.max_bs = 4
+        runner.backend = object()
         runner._prefill_static_buffers = None
         runner.buffer_registry = registry
         runner.require_mlp_tp_gather = False

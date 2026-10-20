@@ -2463,7 +2463,8 @@ class MQALayer(MqaAttentionBase):
             )
 
         enable_multi_stream = (
-            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            not _is_npu
+            and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
             and (
@@ -2477,8 +2478,18 @@ class MQALayer(MqaAttentionBase):
             _is_npu
             and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             and self.alt_streams is not None
-            and x.shape[0] <= self._multi_stream_bs_limit
-            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and (
+                (
+                    forward_batch.forward_mode.is_extend()
+                    and is_in_breakable_cuda_graph()
+                    and not is_cp_active(forward_batch)
+                    and self.compress_ratio not in (1, 2)
+                )
+                or (
+                    x.shape[0] <= self._multi_stream_bs_limit
+                    and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+                )
+            )
         )
 
         low_ratio_multi_stream = (

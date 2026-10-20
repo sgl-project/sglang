@@ -624,7 +624,6 @@ class Scheduler(
                         lambda c=cache_controller: not c.has_inflight_device_transfers()
                     )
         self.emit_metrics_constants()
-        self.maybe_init_hccl_dp_prewarm()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -1124,6 +1123,9 @@ class Scheduler(
             # full pool (see MultiEndedAllocator.prewarm_compaction); prewarm it
             # before graph capture and KV sizing account for its memory.
             self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
+
+        # Complete lazy HCCL initialization before the first DSV4 metadata call.
+        self.maybe_init_hccl_dp_prewarm()
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
