@@ -234,6 +234,15 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
             )
             raise ex
 
+        if config is None:
+            config = {}
+
+        if not isinstance(config, dict):
+            raise ValueError(
+                f"Config file must contain a mapping/dictionary at the root level, "
+                f"but got {type(config).__name__}: {file_path}"
+            )
+
         store_boolean_arguments = [
             action.dest for action in self._actions if isinstance(action, StoreBoolean)
         ]
