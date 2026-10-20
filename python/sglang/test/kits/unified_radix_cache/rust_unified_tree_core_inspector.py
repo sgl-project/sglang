@@ -5,9 +5,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-from unified_tree_core_inspection_interface import (
-    UnifiedTreeCoreInspectionInterface,
-)
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
@@ -22,10 +19,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
     NodeId,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(
-    est_time=0, suite="base-a-test-cpu", disabled="Rust TreeCore test inspector"
+from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
+    UnifiedTreeCoreInspectionInterface,
 )
 
 _inspection_bindings = load_tree_core_extension(inspection=True)

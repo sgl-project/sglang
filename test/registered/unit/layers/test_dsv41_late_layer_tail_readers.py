@@ -14,8 +14,10 @@ from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
+    DSV4Metadata,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
@@ -269,6 +271,65 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
             ):
                 counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
             self.assertEqual(counts, [SWA_WINDOW, 0])
+
+
+def _prefill_graph_replay(*, any_context, seq_len):
+    """The backend's default replayed-context limit and the widths a replay gives
+    the full-row and tail metadata, for one request of ``seq_len`` tokens."""
+    seen = {}
+
+    def build_full(forward_batch, *, max_seq_len_override, use_prefill_cuda_graph):
+        seen["full"] = max_seq_len_override
+
+    def build_tail(forward_batch, max_seq_len):
+        seen["tail"] = max_seq_len
+
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+    backend.low_ratios = (1, 2)
+    backend.prefill_candidates = object.__new__(SparseTableBackend)
+    backend._build_forward_metadata = build_full
+    backend._prefill_graph_tail_metadata = build_tail
+    backend._activate_request_window = lambda: None
+    backend._prefill_graph_replays_any_context = lambda: any_context
+    capture = object.__new__(DSV4Metadata)
+    capture.prefill_graph_tail = True
+    with (
+        patch.object(
+            deepseek_v4_backend,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1),
+        ),
+        patch.object(
+            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=None
+        ),
+        patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"),
+    ):
+        seen["limit"] = backend.prefill_cuda_graph_default_max_seq_len
+        DeepseekV4AttnBackend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            backend,
+            capture,
+            SimpleNamespace(
+                seq_lens_cpu=torch.tensor([seq_len]), max_seq_len_override=1 << 20
+            ),
+        )
+    return seen
+
+
+class TestPrefillGraphReplayContext(CustomTestCase):
+    """DeepSeek-V4.1's prefill graph replays past its captured indexer width only
+    when the replay is exact, and then its metadata spans the live context."""
+
+    def test_limit_and_metadata_width(self):
+        for any_context, seq_len, expected in (
+            (True, 155648 + 1024, {"limit": None, "full": 156672, "tail": 156672}),
+            (False, 8192 + 1024, {"limit": 16384, "full": 16384, "tail": 16384}),
+        ):
+            with self.subTest(any_context=any_context):
+                self.assertEqual(
+                    _prefill_graph_replay(any_context=any_context, seq_len=seq_len),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

@@ -8,16 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-import test_unified_radix_cache_unittest as shared_cache_suite
 import torch
-from test_unified_radix_cache_unittest import (
-    CacheConfig,
-    _device_lock_ref,
-    _device_value,
-    _InsertWalkSuite,
-    _node_children,
-    build_fixture,
-)
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -50,6 +41,18 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
+from sglang.test.kits.unified_radix_cache.config import (
+    CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache.fixtures import (
+    build_fixture,
+    node_children,
+    node_device_lock_ref,
+    node_device_value,
+)
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
@@ -308,19 +311,21 @@ class _TreeCoreBackendTestMixin:
     tree_core_backend = "python"
 
     def setUp(self):
-        previous = shared_cache_suite._TREE_CORE_TEST_BACKEND
+        previous = shared_cache_suite.TREE_CORE_TEST_BACKEND
         self.addCleanup(
             setattr,
             shared_cache_suite,
-            "_TREE_CORE_TEST_BACKEND",
+            "TREE_CORE_TEST_BACKEND",
             previous,
         )
-        shared_cache_suite._TREE_CORE_TEST_BACKEND = self.tree_core_backend
+        shared_cache_suite.TREE_CORE_TEST_BACKEND = self.tree_core_backend
         super().setUp()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
+class TestUnifiedCacheLinkerPythonBackend(
+    _TreeCoreBackendTestMixin, UnifiedRadixCacheFixtures, CustomTestCase
+):
     def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
         """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
         req.kv.cache_protected_len = req.prefix_len
@@ -357,11 +362,15 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(
             torch.equal(
                 kv_offload.device_indices,
-                _device_value(producer, inserted.last_device_node, ComponentType.FULL),
+                node_device_value(
+                    producer, inserted.last_device_node, ComponentType.FULL
+                ),
             )
         )
         self.assertEqual(
-            _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(
+                producer, inserted.last_device_node, ComponentType.FULL
+            ),
             1,
         )
         self.assertFalse(
@@ -378,7 +387,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         producer_linker.complete_next_offload(True)
         producer.check_hicache_events()
         self.assertEqual(
-            _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(
+                producer, inserted.last_device_node, ComponentType.FULL
+            ),
             0,
         )
         self.assertTrue(
@@ -490,8 +501,8 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         original_keys = linker.offload_calls[0][0].keys
 
         self._insert(cache, allocator, req_to_token_pool, tokens[:2])
-        (parent,) = _node_children(cache, cache.root_node_handle())
-        (child,) = _node_children(cache, parent)
+        (parent,) = node_children(cache, cache.root_node_handle())
+        (child,) = node_children(cache, parent)
         self.assertEqual(child, original_node)
         self.assertEqual(
             cache.linker.pending_offloads[0].publish_node_ids, [parent, child]
@@ -506,7 +517,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
             self.assertFalse(cache.tree_core.is_external_cache_stored(node_id))
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
         retry_calls = linker.offload_calls[1:]
@@ -521,7 +534,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
             self.assertTrue(cache.tree_core.is_external_cache_stored(node_id))
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(len(linker.offload_calls), 3)
@@ -532,12 +547,16 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(
             cache.tree_core.get_write_through_pending_id(pending_node), pending_node
         )
-        self.assertEqual(_device_lock_ref(cache, pending_node, ComponentType.FULL), 1)
+        self.assertEqual(
+            node_device_lock_ref(cache, pending_node, ComponentType.FULL), 1
+        )
 
         cache.linker.reset()
         self.assertEqual(cache.linker.pending_offloads, [])
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(pending_node))
-        self.assertEqual(_device_lock_ref(cache, pending_node, ComponentType.FULL), 0)
+        self.assertEqual(
+            node_device_lock_ref(cache, pending_node, ComponentType.FULL), 0
+        )
         cache.sanity_check()
         cache.reset()
         cache.sanity_check()
@@ -655,7 +674,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             self.assertTrue(req.kv.is_kv_released)
             self.assertIsNone(req.lock)
             for component in (ComponentType.FULL, ComponentType.SWA):
-                self.assertEqual(_device_lock_ref(consumer, loaded_node, component), 0)
+                self.assertEqual(
+                    node_device_lock_ref(consumer, loaded_node, component), 0
+                )
             self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))
             unpublished = consumer.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
@@ -691,7 +712,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(
             torch.equal(
                 mamba_offload.device_indices,
-                _device_value(producer, inserted.last_device_node, ComponentType.MAMBA),
+                node_device_value(
+                    producer, inserted.last_device_node, ComponentType.MAMBA
+                ),
             )
         )
         for _ in producer_linker.offload_calls:
@@ -808,16 +831,16 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
-    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite
+    _TreeCoreBackendTestMixin,
+    UnifiedRadixCacheFixtures,
+    CustomTestCase,
 ):
     """TreeCore linker contracts shared by the Python and Rust inspectors."""
 
     def test_builds_opaque_external_offload_transfers(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=2, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -834,7 +857,7 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(
             torch.equal(
                 transfer.device_indices,
-                shared_cache_suite._device_value(cache, node_id, ComponentType.FULL),
+                node_device_value(cache, node_id, ComponentType.FULL),
             )
         )
 
@@ -851,11 +874,9 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(core.is_external_cache_stored(node_id))
 
     def test_external_state_updates_are_atomic_and_path_scoped(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=1, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -923,11 +944,9 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(core.is_external_cache_stored(tail))
 
     def test_failed_offload_preserves_independently_confirmed_state(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=1, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 

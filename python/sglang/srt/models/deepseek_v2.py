@@ -118,15 +118,21 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    fused_shared_expert_weight,
+    is_routed_scaling_factor_fused_in_topk,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     adds_replicated_output_to_partial,
     filter_moe_weight_param_global_expert,
+    get_num_fused_shared_experts,
     has_per_rank_fused_shared_slots,
     is_deepep_class_backend,
     is_sbo_enabled,
-    is_shared_experts_fusion_disabled,
     is_tbo_enabled,
     should_add_replicated_moe_output,
     sum_post_experts_output,
@@ -625,6 +631,23 @@ class MergedMoEOutput(MoEOutput):
         return self.routed
 
 
+def _scale_routed_and_add_shared(
+    routed: torch.Tensor,
+    shared: Optional[torch.Tensor],
+    *,
+    routed_scaling_factor: float,
+    fused_in_topk: bool,
+) -> torch.Tensor:
+    """Apply any outstanding routed scale before adding the shared output."""
+    if shared is not None:
+        if fused_in_topk:
+            return shared.add_(routed)
+        return shared.add_(routed, alpha=routed_scaling_factor)
+    if not fused_in_topk:
+        routed *= routed_scaling_factor
+    return routed
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -653,11 +676,13 @@ class DeepseekV2MoE(nn.Module):
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
         )
-        _fusion_disabled = is_shared_experts_fusion_disabled()
-
         # num_fused_shared_experts drives weight remapping in deepseek_weight_loader:
         # mlp.shared_experts → mlp.experts.256 when > 0.
-        self.num_fused_shared_experts = 0 if _fusion_disabled else n_shared_experts
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        assert self.num_fused_shared_experts in (0, n_shared_experts), (
+            f"The model fuses {self.num_fused_shared_experts} shared experts, but "
+            f"this MoE block has {n_shared_experts}."
+        )
 
         # DeepEP and MegaMOE shared expert fusion: shared expert is fused into
         # the same MoE kernel as a local expert at each EP rank. Expert layout
@@ -739,24 +764,26 @@ class DeepseekV2MoE(nn.Module):
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
-                topk=config.num_experts_per_tok + self.num_fused_shared_experts,
+                topk=config.num_experts_per_tok,
                 num_experts=config.n_routed_experts,
-                num_fused_shared_experts=self.num_fused_shared_experts,
                 vocab_size=config.vocab_size,
                 scoring_func=config.scoring_func,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 layer_id=self.layer_id,
             )
+            # Hash routing folds the factor only when its flag asks for it.
+            self.routed_scaling_factor_fused_in_topk = (
+                self.topk.apply_routed_scaling_factor_on_output
+            )
         else:
             # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
             topk_kwargs = dict(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                top_k=config.num_experts_per_tok,
                 layer_id=self.layer_id,
                 renormalize=config.norm_topk_prob,
                 use_grouped_topk=True,
                 num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
                 topk_group=config.topk_group,
                 scoring_func=config.scoring_func,
                 correction_bias=self.gate.e_score_correction_bias,
@@ -785,6 +812,8 @@ class DeepseekV2MoE(nn.Module):
                         getattr(config, "model_type", None) == "deepseek_v41"
                     ),
                     is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+                    # aiter's topk_gating folds the factor regardless; the flag makes
+                    # the other routes (e.g. the vision routing fallback) fold too.
                     apply_routed_scaling_factor_on_output=(
                         True
                         if _use_aiter
@@ -792,6 +821,27 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
+            self.routed_scaling_factor_fused_in_topk = (
+                is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
+            )
+            if (
+                _use_aiter
+                and self.num_fused_shared_experts > 0
+                and not _uses_per_rank_shared_slots
+                and not self.routed_scaling_factor_fused_in_topk
+            ):
+                # Compensate for both post-MoE scaling and EP replication.
+                self.topk.topk_config.fused_shared_experts_scaling_factor = (
+                    fused_shared_expert_weight(
+                        routed_scaling_factor=self.routed_scaling_factor,
+                        fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+                    )
+                    * (
+                        fused_shared_experts_scaling_factor
+                        if fused_shared_experts_scaling_factor is not None
+                        else 1.0
+                    )
+                )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -1191,7 +1241,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             not _is_cuda
             and not _is_musa
-            and not _use_aiter
+            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
             final_hidden_states *= self.routed_scaling_factor
@@ -1383,10 +1433,9 @@ class DeepseekV2MoE(nn.Module):
             not _is_cuda
             and not _is_musa
             and not _is_xpu
-            and not _use_aiter
+            and not (_use_aiter and self.routed_scaling_factor_fused_in_topk)
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
         ):
-            # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
         if (
@@ -1705,22 +1754,12 @@ class DeepseekV2MoE(nn.Module):
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
-        if shared_output is not None:
-            x = shared_output
-            # aiter moe call will handle routed_scaling_factor in the function
-            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
-            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        else:
-            if not (
-                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
-            ):
-                final_hidden_states *= self.routed_scaling_factor
-
-        return final_hidden_states
+        return _scale_routed_and_add_shared(
+            final_hidden_states,
+            shared_output,
+            routed_scaling_factor=self.routed_scaling_factor,
+            fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+        )
 
     def _forward_shared_experts(
         self,
@@ -1987,20 +2026,12 @@ class DeepseekV2MoE(nn.Module):
             num_tokens = state.pop("num_tokens")
             final_hidden_states = final_hidden_states[:num_tokens]
 
-        if (shared_output := state.pop("shared_output")) is not None:
-            x = shared_output
-            if _use_aiter:
-                x.add_(final_hidden_states)
-            else:
-                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
-            final_hidden_states = x
-        elif _use_aiter:
-            # fused in aiter_biased_grouped_topk so we can skip here
-            pass
-        else:
-            final_hidden_states *= self.routed_scaling_factor
-
-        state.hidden_states_mlp_output = final_hidden_states
+        state.hidden_states_mlp_output = _scale_routed_and_add_shared(
+            final_hidden_states,
+            state.pop("shared_output"),
+            routed_scaling_factor=self.routed_scaling_factor,
+            fused_in_topk=self.routed_scaling_factor_fused_in_topk,
+        )
 
 
 class DeepseekV2AttentionMLA(
@@ -3251,7 +3282,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.use_dsa = is_deepseek_dsa(config)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -3299,7 +3331,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         """Why this checkpoint cannot fuse its shared expert, or None.
 
         Evaluated by the loader once per runner, before any layer is built (see
-        ``install_shared_experts_fusion_decision``), so it takes the config and
+        ``resolve_shared_experts_config``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
         # Need to disable if quant precision mismatch, even if
@@ -3366,11 +3398,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return "Deepseek V3/R1 W4AFP8/W4A16 model uses different quant method for routed experts and shared experts."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Return the model's fusable shared-expert count."""
+        return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

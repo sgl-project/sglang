@@ -375,6 +375,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
         self.max_seq_len = prefill_config.max_seq_len
+        if self.max_seq_len is None:
+            self.max_seq_len = (
+                model_runner.attn_backend.prefill_cuda_graph_default_max_seq_len
+            )
+            if self.max_seq_len is not None:
+                logger.info(
+                    "Prefill CUDA graph replays contexts up to %d tokens, the "
+                    "attention backend's default; longer contexts run eager prefill.",
+                    self.max_seq_len,
+                )
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
             table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
@@ -1647,6 +1657,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
+        with self.model_context():
+            self._capture()
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -2297,7 +2311,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
-        with self.backend.replay_session():
+        with self.model_context(), self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
