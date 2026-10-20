@@ -522,15 +522,11 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
-    # DSpark: with SGLANG_SIMULATE_ACC_LEN set, skip the accept sampling whose result the
-    # simulated length overwrites, and enable SGLANG_SIMULATE_ACC_GREEDY /
-    # SGLANG_DSPARK_SIMULATE_FOLD below. Off by default on every platform.
-    SGLANG_DSPARK_SIMULATE_ACC_FAST_PATH = EnvBool(False)
-    # DSpark fast path: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
     SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
-    # DSpark fast path: apply the simulated correct_len / bonus inside the folded verify
-    # epilogue (graph) instead of falling back to the eager accept + commit path.
+    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (hip graph) instead of falling back to the eager accept + commit path.
     SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
