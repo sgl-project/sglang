@@ -9,7 +9,7 @@ small quant_info payload and route through ``MoeRunner``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -55,6 +55,8 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
       - ``"bf16"``: unquantized weights, BF16/FP16 input, no quant scales.
       - ``"fp8"``: FP8 weights, FP8-quantized input, per-tensor scales.
       - ``"fp4"``: NVFP4 packed weights and optional NVFP4 packed input.
+      - ``"w4a16_e4m3_k32"``: SM12x E2M1 weights with E4M3 K/32 scales
+        and BF16 activations through FlashInfer's b12x W4A16 kernels.
     """
 
     quant_type: str
@@ -68,6 +70,127 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_limit: Optional[torch.Tensor] = None
     apply_routed_scaling_factor: bool = True
     pair_w2_weight: Optional[torch.Tensor] = None
+    prepared_weights: Optional[Any] = None
+
+
+@torch.inference_mode()
+def precompile_w4a16_prefill_routes(
+    *, device: torch.device, num_experts: int, top_k: int, prefill_tokens: int = 8192
+) -> bool:
+    """Compile the selected large-prefill route pack before cache allocation."""
+    device = torch.device(device)
+    if (
+        device.type != "cuda"
+        or torch.cuda.get_device_capability(device) != (12, 0)
+        or num_experts <= 0
+        or top_k <= 0
+        or prefill_tokens <= 0
+    ):
+        return False
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        select_route_block_size_m,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_route_pack import (
+        pack_topk_routes_by_expert,
+    )
+
+    topk_ids = torch.zeros((prefill_tokens, top_k), dtype=torch.int32, device=device)
+    block_size = select_route_block_size_m(prefill_tokens, top_k, num_experts)
+    pack_topk_routes_by_expert(topk_ids, block_size, num_experts)
+    return True
+
+
+def _run_flashinfer_b12x_w4a16(
+    *,
+    dispatch_output,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    output: Optional[torch.Tensor],
+    enable_alltoall: bool,
+) -> torch.Tensor:
+    if enable_alltoall:
+        raise NotImplementedError(
+            "FlashInfer b12x W4A16 does not support expert all-to-all "
+            "dispatch; run EP with --moe-a2a-backend none."
+        )
+    if runner_config.activation != "silu" or not runner_config.is_gated:
+        raise NotImplementedError(
+            "The GLM b12x W4A16 path currently requires gated SiLU."
+        )
+    assert quant_info.quant_scales is not None and len(quant_info.quant_scales) == 4
+    if (
+        runner_config.num_experts is None
+        or runner_config.num_local_experts is None
+        or runner_config.top_k is None
+    ):
+        raise ValueError(
+            "b12x W4A16 requires num_experts, num_local_experts, and top_k "
+            "in runner config"
+        )
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    if output is None:
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            if runner_config.moe_ep_size > 1:
+                # EP: tokens routed only to foreign experts get no write from
+                # this rank; zero the buffer so the layer all-reduce sums
+                # clean partials.
+                output = torch.zeros_like(x, dtype=torch.bfloat16)
+            else:
+                output = torch.empty_like(x, dtype=torch.bfloat16)
+
+    # FlashInfer's W4A16 kernels translate global expert ids through an
+    # explicit per-call map and otherwise fall back to a silent rank-0
+    # prefix map, so EP callers must always pass their own. sglang's EP
+    # without EPLB gives rank r the contiguous chunk [r * num_local_experts,
+    # (r + 1) * num_local_experts), which the map below encodes; the MoE
+    # layer all-reduces the partial outputs across ranks.
+    expert_map: Optional[torch.Tensor] = None
+    if runner_config.moe_ep_size > 1:
+        expert_map = torch.full(
+            (runner_config.num_experts,), -1, dtype=torch.int32, device=x.device
+        )
+        local_start = runner_config.moe_ep_rank * runner_config.num_local_experts
+        expert_map[
+            local_start : local_start + runner_config.num_local_experts
+        ] = torch.arange(
+            runner_config.num_local_experts, dtype=torch.int32, device=x.device
+        )
+
+    if quant_info.prepared_weights is None:
+        raise RuntimeError(
+            "SM12x E4M3-K32 W4A16 requires load-time in-place prepared weights"
+        )
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+        launch_sm120_moe,
+    )
+
+    w13_scale, w13_global_scale, w2_scale, w2_global_scale = quant_info.quant_scales
+    return launch_sm120_moe(
+        a=x,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=w13_scale,
+        w1_alpha=w13_global_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=w2_scale,
+        w2_alpha=w2_global_scale,
+        topk_ids=topk_output.topk_ids.to(torch.int),
+        topk_weights=topk_output.topk_weights,
+        num_experts=runner_config.num_experts,
+        num_local_experts=runner_config.num_local_experts,
+        top_k=runner_config.top_k,
+        scatter_output=output,
+        expert_map=expert_map,
+        activation="silu",
+        quant_mode="w4a16",
+        source_format="modelopt_e4m3_k32",
+        _prepared_weights=quant_info.prepared_weights,
+    )
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -302,6 +425,15 @@ def _run_flashinfer_cutlass(
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
 ) -> torch.Tensor:
+    if quant_info.quant_type == "w4a16_e4m3_k32":
+        return _run_flashinfer_b12x_w4a16(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=runner_config,
+            output=output,
+            enable_alltoall=enable_alltoall,
+        )
+
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
     dispatch_output = _prescale_router_weight_on_input(dispatch_output, runner_config)
