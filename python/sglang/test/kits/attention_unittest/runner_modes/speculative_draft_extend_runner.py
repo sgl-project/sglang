@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -672,6 +673,7 @@ class _EagleDraftExtendForward(nn.Module):
         device: str,
     ):
         super().__init__()
+        self.shared_experts_config = SharedExpertsConfig()
         self.module = module
         self.token_embed = nn.Embedding(
             vocab_size, hidden_size, dtype=dtype, device=device
