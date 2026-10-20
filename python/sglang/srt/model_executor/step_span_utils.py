@@ -22,7 +22,9 @@ that forward.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -72,6 +74,24 @@ def _decode_query_width(forward_batch: ForwardBatch) -> int:
     return width if isinstance(width, int) and width > 0 else 1
 
 
+def _decode_seq_lens_cpu(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+    """Host-side KV lengths for a decode-family forward.
+
+    Some decode paths (e.g. speculative verify under overlap scheduling) do not
+    keep the ``seq_lens_cpu`` mirror; fall back to the device ``seq_lens``. This
+    runs only while a detailed-annotation profile is active, and never during
+    CUDA-graph capture, where the host copy would break the capture.
+    """
+    if forward_batch.seq_lens_cpu is not None:
+        return forward_batch.seq_lens_cpu
+    seq_lens = forward_batch.seq_lens
+    if seq_lens is None:
+        return None
+    if seq_lens.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
+    return seq_lens.cpu()
+
+
 def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
     """Compute the detailed-annotation aggregates from the batch's CPU-side length mirrors.
 
@@ -81,7 +101,6 @@ def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
     groups.
     """
     mode = forward_batch.forward_mode
-    seq_lens_cpu = forward_batch.seq_lens_cpu
 
     # DECODE (vanilla or spec draft-decode) and TARGET_VERIFY both key off
     # ``seq_lens_cpu`` for N_KV and a uniform per-request query width N_Q, and
@@ -90,6 +109,7 @@ def build_detailed_annotation_suffix(forward_batch: ForwardBatch) -> str:
     #   * TARGET_VERIFY -> N_Q is ``num_tokens_per_req`` (the draft-token count);
     #                      the request is past its prompt (generation phase)
     if mode == ForwardMode.DECODE or mode == ForwardMode.TARGET_VERIFY:
+        seq_lens_cpu = _decode_seq_lens_cpu(forward_batch)
         if seq_lens_cpu is None:
             return ""
         nq = _decode_query_width(forward_batch)

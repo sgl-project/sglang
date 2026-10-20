@@ -131,6 +131,7 @@ class BenchArgs:
     profile_start_step: Optional[int] = None
     profile_steps: int = 5
     profile_by_stage: bool = False
+    profile_detailed_annotations: bool = False
     profile_prefix: Optional[str] = None
     profile_output_dir: Optional[str] = None
     dataset_path: str = ""
@@ -234,6 +235,12 @@ class BenchArgs:
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--profile-detailed-annotations",
+            action="store_true",
+            help="Add iteration-level annotations (KV / request aggregates) to the "
+            "profiled step spans, for roofline-style analysis.",
+        )
         parser.add_argument(
             "--profile-prefix",
             type=str,
@@ -614,6 +621,7 @@ def run_one_case(
     profile_start_step: Optional[int] = None,
     profile_steps: int = BenchArgs.profile_steps,
     profile_by_stage: bool = False,
+    profile_detailed_annotations: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
     dataset_name: str = BenchArgs.dataset_name,
@@ -831,6 +839,7 @@ def run_one_case(
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
             start_step=profile_start_step,
+            detailed_annotations=profile_detailed_annotations,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
@@ -1478,6 +1487,7 @@ def run_benchmark_internal(
                             profile_start_step=bench_args.profile_start_step,
                             profile_steps=bench_args.profile_steps,
                             profile_by_stage=bench_args.profile_by_stage,
+                            profile_detailed_annotations=bench_args.profile_detailed_annotations,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
                             backend=bench_args.backend,

@@ -10,6 +10,8 @@ duplicates the base label's ``bs``/``toks``.
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -41,6 +43,7 @@ def _fb(
     batch_size,
     extend_num_tokens=None,
     seq_lens_cpu=None,
+    seq_lens=None,
     extend_seq_lens_cpu=None,
     extend_prefix_lens_cpu=None,
     num_tokens_per_req=None,
@@ -57,6 +60,7 @@ def _fb(
         batch_size=batch_size,
         extend_num_tokens=extend_num_tokens,
         seq_lens_cpu=None if seq_lens_cpu is None else _CpuMirror(seq_lens_cpu),
+        seq_lens=None if seq_lens is None else torch.tensor(seq_lens),
         extend_seq_lens_cpu=extend_seq_lens_cpu,
         extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         spec_info=spec_info,
@@ -160,6 +164,34 @@ class TestStepSpanDetailedAnnotations(CustomTestCase):
             num_tokens_per_req=3,
         )
         self.assertEqual(self._name(fb), "step[VERIFY bs=2]")
+
+    def test_target_verify_without_cpu_mirror_reads_device_seq_lens(self):
+        # Overlap-scheduled verify batches carry no ``seq_lens_cpu`` mirror;
+        # the aggregates come from ``seq_lens`` instead of dropping the suffix.
+        # ndt=5, seqs=[100,200]: sq=10, sk=300, sqsq=25+25=50,
+        # sqsk=5*100+5*200=1500.
+        fb = _fb(
+            ForwardMode.TARGET_VERIFY,
+            batch_size=2,
+            seq_lens_cpu=None,
+            seq_lens=[100, 200],
+            num_tokens_per_req=5,
+        )
+        self.assertEqual(
+            self._name(fb),
+            "step[VERIFY bs=2 g_sq=10 g_sqsq=50 g_sqsk=1500 g_sk=300]",
+        )
+
+    def test_decode_prefers_cpu_mirror_over_device_seq_lens(self):
+        fb = _fb(
+            ForwardMode.DECODE,
+            batch_size=2,
+            seq_lens_cpu=[10, 20],
+            seq_lens=[100, 200],
+        )
+        self.assertEqual(
+            self._name(fb), "step[DECODE bs=2 g_sq=2 g_sqsq=2 g_sqsk=30 g_sk=30]"
+        )
 
     def test_draft_worker_prefixes_stage(self):
         # A draft runner can run under TARGET_VERIFY; its span must read as

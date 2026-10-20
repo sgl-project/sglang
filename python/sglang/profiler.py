@@ -27,6 +27,7 @@ def run_profile(
     merge_profiles: bool = False,
     profile_prefix: Optional[str] = None,
     start_step: Optional[int] = None,
+    detailed_annotations: bool = False,
 ) -> str:
     if output_dir is None:
         output_dir = PROFILER_DIR
@@ -57,6 +58,7 @@ def run_profile(
         "profile_by_stage": profile_by_stage,
         "merge_profiles": merge_profiles,
         "profile_prefix": profile_prefix,
+        "detailed_annotations": detailed_annotations,
     }
     if start_step is not None:
         json_data["start_step"] = str(start_step)
