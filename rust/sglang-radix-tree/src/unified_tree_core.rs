@@ -53,6 +53,18 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
+/// A node's position and FULL value length on a root-to-node path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreePathNodeInfo {
+    pub node_id: NodeId,
+    pub parent_id: NodeId,
+    /// Half-open offsets from the root, in tokens (or bigrams for bigram keys).
+    pub path_start: usize,
+    pub path_end: usize,
+    /// Logical FULL device indices; None when absent.
+    pub full_value_len: Option<usize>,
+}
+
 /// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
 #[derive(Default)]
 pub struct IncLockRefResult {
@@ -383,6 +395,7 @@ pub enum PoolName {
     Kv,
     Mamba,
     Swa,
+    AuxiliarySwa,
     Indexer,
     DeepseekV4C4,
     DeepseekV4C4Indexer,
@@ -660,6 +673,91 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
 }
 
 impl<K: ChildKeyType> UnifiedTreeCore<K> {
+    /// Adjust the component's evictable or protected count of reclaimable tokens.
+    /// The caller updates backing and size together, and restores backing on error.
+    /// This changes counters only; roots and device tombstones are ignored.
+    pub fn adjust_component_size(
+        &mut self,
+        node_id: NodeId,
+        component_type: ComponentType,
+        delta: i64,
+    ) -> Result<(), TreeCoreRuntimeError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        if self.components_by_type[component_type.idx()].is_none() {
+            return Err(TreeCoreRuntimeError::ComponentNotEnabled { component_type });
+        }
+        let node = self.arena.node(node_idx);
+        if node.is_root() || !node.has_device_value(component_type) {
+            return Ok(());
+        }
+        let protected = node.device_lock_ref(component_type) > 0;
+        let state = self.component_state_mut(component_type);
+        let size = if protected {
+            &mut state.protected_size
+        } else {
+            &mut state.evictable_size
+        };
+        let updated = usize::try_from(delta.unsigned_abs())
+            .ok()
+            .and_then(|magnitude| {
+                if delta >= 0 {
+                    size.checked_add(magnitude)
+                } else {
+                    size.checked_sub(magnitude)
+                }
+            })
+            .ok_or(TreeCoreRuntimeError::InvalidComponentSizeDelta {
+                node_id,
+                component_type,
+                current: *size,
+                delta,
+                protected,
+            })?;
+        *size = updated;
+        Ok(())
+    }
+
+    /// Copy root-to-node paths in input order, keeping duplicates and excluding roots.
+    /// An invalid node id fails the whole call.
+    pub fn collect_path_info(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<Vec<TreePathNodeInfo>>, TreeCoreRuntimeError> {
+        node_ids
+            .iter()
+            .map(|&node_id| {
+                let mut current = self.arena.resolve(node_id)?;
+                let mut path = Vec::new();
+                loop {
+                    let node = self.arena.node(current);
+                    if node.is_root() {
+                        break;
+                    }
+                    let parent = node.parent();
+                    path.push(TreePathNodeInfo {
+                        node_id: node.id,
+                        parent_id: self.arena.node(parent).id,
+                        path_start: 0,
+                        path_end: node.key.atom_len(),
+                        full_value_len: node
+                            .has_device_value(FULL)
+                            .then(|| node.device_value_len(FULL)),
+                    });
+                    current = parent;
+                }
+                path.reverse();
+                let mut start = 0;
+                for info in &mut path {
+                    let length = info.path_end;
+                    info.path_start = start;
+                    start += length;
+                    info.path_end = start;
+                }
+                Ok(path)
+            })
+            .collect()
+    }
+
     /// Build a tree core for the given component types with a fresh arena.
     /// Fresh per-slot LRU lists.
     pub(crate) fn new_lru_lists() -> [UnifiedLRUList; NUM_VALUE_SLOTS] {
@@ -1977,10 +2075,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     fn needs_incremental_component_backup_(&self, node_id: NodeIdx_) -> bool {
         self.components.iter().any(|component| {
             let component_type = component.component_type();
-            // Write-back defers Full and Mamba to eviction; SWA still publishes
-            // its window here because out-of-window frees never reach eviction.
             component_type != BASE_COMPONENT_TYPE
-                && (!self.is_write_back || component_type == SWA)
                 && component.needs_incremental_backup(self, node_id)
         })
     }
@@ -1991,6 +2086,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         state: &InsertWalkState<K>,
         target_node_id: NodeIdx_,
     ) -> bool {
+        if self.is_write_back {
+            return false;
+        }
         if state.is_new_leaf {
             // The new leaf runs to the end of the aligned key.
             return state.aligned_key_len > state.inserted_len
@@ -3159,13 +3257,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
-        if value && self.components_by_type[MAMBA.idx()].is_some() {
-            return Err(
-                TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-                    component_type: MAMBA,
-                },
-            );
-        }
         self.enable_external_cache_linker = value;
         Ok(())
     }
@@ -3179,12 +3270,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 Some(KvCacheEvent::BlockRemoved {
                     block_hashes: tail_hashes,
                     medium: tail_medium,
+                    extra_key: tail_extra_key,
                 }),
                 KvCacheEvent::BlockRemoved {
                     mut block_hashes,
                     medium,
+                    extra_key,
                 },
-            ) if *tail_medium == medium => tail_hashes.append(&mut block_hashes),
+            ) if *tail_medium == medium && *tail_extra_key == extra_key => {
+                tail_hashes.append(&mut block_hashes)
+            }
             (
                 Some(KvCacheEvent::BlockStored {
                     block_hashes: tail_hashes,
@@ -3193,6 +3288,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium: tail_medium,
                     cache_salt: tail_cache_salt,
                     session_id: tail_session_id,
+                    extra_key: tail_extra_key,
                     ..
                 }),
                 KvCacheEvent::BlockStored {
@@ -3203,12 +3299,13 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     medium,
                     cache_salt,
                     session_id,
-                    ..
+                    extra_key,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
                 && *tail_cache_salt == cache_salt
                 && *tail_session_id == session_id
+                && *tail_extra_key == extra_key
                 && !tail_hashes.is_empty()
                 && parent_block_hash == tail_hashes.last().copied() =>
             {
@@ -3289,11 +3386,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
         let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        // Python reads the LoRA adapter name from extra_key in the dynamo format.
-        let extra_key = self
-            .dynamo_kv_event_format
-            .then(|| self.arena.node(node_id).namespace.extra_key_arc())
-            .flatten();
+        let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
@@ -3394,9 +3487,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .map(|hash| namespaced_block_hash(namespace_seed.as_ref(), hash))
             .collect();
         if !block_hashes.is_empty() {
+            let extra_key = node.namespace.extra_key_arc();
             self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
                 block_hashes,
                 medium,
+                extra_key,
             });
         }
     }
@@ -5830,13 +5925,13 @@ pub enum KvCacheEvent<A> {
         medium: StorageMedium,
         cache_salt: Option<Arc<str>>,
         session_id: Option<Arc<str>>,
-        /// Set only in the dynamo format, and not published. Python uses it to
-        /// find the LoRA adapter name.
+        /// Not published; Python maps it to the LoRA name that namespaces the hashes.
         extra_key: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,
         medium: StorageMedium,
+        extra_key: Option<Arc<str>>,
     },
     AllBlocksCleared,
 }

@@ -103,7 +103,7 @@ Send this MessagePack map immediately after the WebSocket opens.
 | `max_chunks` | integer | No | Stop after this many chunks. Omit for a continuous session. |
 | `realtime_causal_sink_size` | integer | No | Number of sink frames/tokens retained in the causal attention window. |
 | `realtime_causal_kv_cache_num_frames` | integer | No | Number of recent frames retained in the causal KV cache window. |
-| `realtime_output_format` | `"webp"`, `"jpeg"`, `"raw"` | No | Preview/output transport. `webp` and `jpeg` send encoded preview frames; `raw` sends raw RGB; omit for lossless delta-gzip RGB. |
+| `realtime_output_format` | `"webp"`, `"jpeg"`, `"raw"` | No | Preview/output transport. `webp` and `jpeg` send encoded preview frames; `raw` (the default when omitted) sends lossless raw RGB. |
 | `output_compression` | integer | No | Preview quality for `webp` or `jpeg`, from `1` to `100`. |
 | `enable_upscaling` | boolean | No | Enable server-side super resolution after frame decode. |
 | `upscaling_scale` | integer | No | Super-resolution scale. Current default is `4` when upscaling is enabled. |

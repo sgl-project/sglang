@@ -43,12 +43,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -68,6 +70,44 @@ class ExecFeatures(msgspec.Struct):
     enable_custom_logit_processor: A[
         bool,
         "Enable users to pass custom logit processors to the server (disabled by default for security)",
+    ] = False
+    enable_watermark: A[
+        bool,
+        "Enable Aaronson-Gumbel text watermarking.",
+    ] = False
+    watermark_config: A[
+        Optional[str],
+        "Watermark settings as a JSON file path or an inline JSON object with "
+        "optional key, key_b, context_window, mixing_probability, max_probability, "
+        "default_enabled, and enforce_all fields.",
+    ] = None
+    watermark_key: A[
+        Optional[str],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_key_b: A[
+        Optional[str],
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = None
+    watermark_context_window: A[
+        int,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 4
+    watermark_mixing_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 0.5
+    watermark_max_probability: A[
+        float,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = 1.0
+    watermark_default_enabled: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
+    ] = False
+    watermark_enforce_all: A[
+        bool,
+        Arg(help="Resolved from --watermark-config.", no_cli=True, resolvable=True),
     ] = False
     enable_return_hidden_states: A[
         bool,
@@ -96,9 +136,17 @@ class ExecFeatures(msgspec.Struct):
         "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA and gfx950.",
     ] = False
     enable_decoder_swa_bounded_replay: A[
-        bool,
-        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enable DeepSeek-V4.1 decoder SWA bounded replay. Defaults on "
+            "for supported configurations. Not numerically equivalent to full "
+            "prefill; requests for prompt logprobs compute every prompt row. Use "
+            "--no-enable-decoder-swa-bounded-replay to retain full prefill, e.g. "
+            "for RL rollouts whose logprobs must match the trainer.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -143,6 +191,14 @@ class ExecKernel(msgspec.Struct):
     enable_lean_attention: A[
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+    ] = None
+    enable_nvidia_megakernel: A[
+        bool,
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
+    monokernel_backend: A[
+        Optional[str],
+        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],
@@ -274,12 +330,15 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla'. 'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
+            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
-            "through the flashinfer trtllm-gen sparse MLA kernel. The backend "
-            "choice is shared by prefill and decode.",
-            choices=["auto", "flashmla", "trtllm"],
+            "through the flashinfer trtllm-gen sparse MLA kernel. "
+            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103) runs the fused "
+            "Q-RoPE + sparse attention + inverse-RoPE + MXFP8 FlashMLA kernel. "
+            "The backend choice is shared by prefill and decode.",
+            choices=["auto", "flashmla", "flashmla_mega", "trtllm"],
             resolvable=True,
         ),
     ] = "auto"
@@ -307,8 +366,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help=(
                 "FlashInfer custom-op identifiers to skip during autotuning. "
-                "Skipped ops use FlashInfer's heuristic fallback. SGLang "
-                "temporarily skips mxfp8_gemm by default due to an IMA."
+                "Skipped ops use FlashInfer's heuristic fallback."
             ),
             nargs="+",
         ),
@@ -330,8 +388,16 @@ class ExecKernel(msgspec.Struct):
         bool, "Not using ragged prefill wrapper when running flashinfer mla"
     ] = False
     enable_fused_qk_norm_rope: A[
-        bool, "Enable fused qk normalization and rope rotary embedding."
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Fuse q/k normalization and rope rotary embedding into one "
+            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
+            "to force it either way.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",
@@ -673,7 +739,8 @@ class ExecComm(msgspec.Struct):
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
-                "Defaults to auto. "
+                "When unspecified, supported MiMo configurations use cutedsl; "
+                "other supported models use auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
                 "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
@@ -891,6 +958,22 @@ class ExecMoe(msgspec.Struct):
         bool,
         "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
+
+    # -------------------------------------------------------------------------
+    # Paged experts
+    # -------------------------------------------------------------------------
+    enable_paged_experts: A[
+        bool,
+        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
+        "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
+        "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
+        "prefill graphs must be breakable or disabled.",
+    ] = False
+    paged_experts_num_resident: A[
+        Optional[int],
+        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
+        "--enable-paged-experts; at least the router's top-k.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism

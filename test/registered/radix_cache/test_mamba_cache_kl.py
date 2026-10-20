@@ -97,7 +97,9 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
         "2048",
         "--attention-backend",
         "triton",
-        "--linear-attn-backend",
+        "--linear-attn-decode-backend",
+        "triton",
+        "--linear-attn-prefill-backend",
         "triton",
         "--mamba-backend",
         "triton",
@@ -109,6 +111,19 @@ class TestMambaLazyInplaceKL(MambaCacheKLMixin, DefaultServerBase):
         self._flush_cache()
         self._generate([44] * 128, 1)
         self._generate([42] * 128, 1)
+
+    def test_lazy_donation_with_four_slots_and_one_request(self):
+        """A prefix-hit request must finish without a fifth Mamba slot under overlap."""
+        self._flush_cache()
+        self._generate([42] * 128, 1)
+
+        # One cached prefix, live state, and keep checkpoint occupy three slots;
+        # the boundary decode takes the fourth before prefill donation runs.
+        result = self._generate([42] * 128 + [43] * 127, 32)
+        self.assertEqual(result["meta_info"]["cached_tokens"], 128)
+        logprobs = result["meta_info"]["output_token_logprobs"]
+        self.assertEqual(len(logprobs), 32)
+        self.assertTrue(np.isfinite([row[0] for row in logprobs]).all())
 
     def test_reuse_distribution_after_inplace_tracking(self):
         config = AutoConfig.from_pretrained(self.model)
@@ -174,7 +189,9 @@ class TestMambaReplaySSMFinishedKL(MambaCacheKLMixin, DefaultServerBase):
         "128",
         "--attention-backend",
         "triton",
-        "--linear-attn-backend",
+        "--linear-attn-decode-backend",
+        "triton",
+        "--linear-attn-prefill-backend",
         "triton",
     ]
 
@@ -224,6 +241,97 @@ class TestMambaReplaySSMFinishedKL(MambaCacheKLMixin, DefaultServerBase):
                     )
                     expected = len(prompt) + (32 if limit == 33 else 0)
                     self.assertEqual(cached, expected)
+
+
+class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
+    """NEXTN can advance the no_buffer state past max_new_tokens. Compare warm
+    and cold distributions for identical token IDs to detect a misaligned key.
+    Different prefill splits introduce numerical noise, so KL need not be zero.
+    """
+
+    model = "Qwen/Qwen3.5-0.8B"
+    revision = "2fc06364715b967f1860aea9cf38778875588b17"
+    other_args = [
+        "--revision",
+        revision,
+        "--mamba-radix-cache-strategy",
+        "no_buffer",
+        "--page-size",
+        "1",
+        "--disable-overlap-schedule",
+        "--disable-cuda-graph",
+        "--mem-fraction-static",
+        "0.25",
+        "--max-total-tokens",
+        "8192",
+        "--max-running-requests",
+        "8",
+        "--max-mamba-cache-size",
+        "128",
+        "--attention-backend",
+        "triton",
+        "--linear-attn-decode-backend",
+        "triton",
+        "--linear-attn-prefill-backend",
+        "triton",
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ]
+
+    def test_reuse_distribution_after_length_truncation(self):
+        tokenizer = AutoTokenizer.from_pretrained(self.model, revision=self.revision)
+        config = AutoConfig.from_pretrained(self.model, revision=self.revision)
+        self.vocab_ids = list(range(config.get_text_config().vocab_size))
+        newline = tokenizer.encode("\n", add_special_tokens=False)
+        cases = (
+            (
+                "count",
+                "Continue the sequence with numbers separated by spaces: 1 2 3 4 5 6 7 8 9 10",
+                9,
+            ),
+            ("story", "Write a story about a cat who likes fish.", 5),
+        )
+        for name, text, limit in cases:
+            with self.subTest(case=name):
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": text}],
+                    tokenize=True,
+                    return_dict=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+                self._flush_cache()
+                seed = self._generate(prompt, limit)
+                self.assertGreater(seed["meta_info"]["spec_verify_ct"], 0)
+                self.assertGreater(seed["meta_info"]["spec_num_correct_drafts"], 0)
+                self.assertEqual(seed["meta_info"]["finish_reason"]["type"], "length")
+                probe = prompt + seed["output_ids"] + newline
+                warm = self._generate(probe, 1, score=True)
+                self.assertGreater(warm["meta_info"]["cached_tokens"], 0)
+                self._flush_cache()
+                cold = self._generate(probe, 1, score=True)
+                self.assertEqual(cold["meta_info"]["cached_tokens"], 0)
+                cold_logprobs = self._distribution(cold)
+                warm_logprobs = self._distribution(warm)
+                kl = float(
+                    np.sum(np.exp(cold_logprobs) * (cold_logprobs - warm_logprobs))
+                )
+                print(
+                    f"no_buffer NEXTN {name} KL(cold || warm)={kl:.9g}, "
+                    f"cached_tokens={warm['meta_info']['cached_tokens']}, "
+                    f"prompt_tokens={len(prompt)}",
+                    flush=True,
+                )
+                self.assertGreaterEqual(kl, -1e-12)
+                self.assertLess(
+                    kl, 5e-3, "Truncated speculative state corrupted cache reuse"
+                )
 
 
 if __name__ == "__main__":
