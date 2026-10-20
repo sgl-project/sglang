@@ -1398,8 +1398,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
-    Equivalent to fused_append_shared_experts() immediately followed by
-    topk._remap_topk_for_deepep(), but the remap math runs on the rows already
+    Equivalent to topk.remap_topk_for_per_rank_shared_slots() on the same
+    routed columns, but the remap math runs on the rows already
     loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
@@ -1464,7 +1464,7 @@ def fused_append_remap_shared_experts_deepep(
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
-    Replaces the fused_append_shared_experts() + _remap_topk_for_deepep() pair on
+    Fused form of topk.remap_topk_for_per_rank_shared_slots() for
     the aiter/DeepEP-class path. Host computes the scalar remap params so the
     kernel stays branch-free.
     """

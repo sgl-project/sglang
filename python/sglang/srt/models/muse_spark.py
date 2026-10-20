@@ -19,25 +19,23 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.muse_spark.all_gather_norm_residual import (
+from sglang.kernels.ops.attention.muse_spark_qk_norm_rope_store import FusedQKNorm
+from sglang.kernels.ops.communication.muse_spark_all_gather import (
+    gemm_ag_supported,
+)
+from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
+    all_gather_norm_residual,
     all_gather_norm_residual_supported,
 )
-from sglang.kernels.ops.muse_spark.fused_muse_spark_routing import (
-    FusedMuseSparkRouting,
+from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
+    MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
-from sglang.kernels.ops.muse_spark.fused_norm_gate import FusedRMSNormGate
-from sglang.kernels.ops.muse_spark.fused_norm_residual import (
+from sglang.kernels.ops.layernorm.muse_spark_norm_gate import FusedRMSNormGate
+from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
     FusedPostNormResidualPreNorm,
 )
-from sglang.kernels.ops.muse_spark.fused_qk_norm import FusedQKNorm
-from sglang.kernels.ops.muse_spark.gemm_ag import (
-    gemm_ag,
-    gemm_ag_supported,
-    gemm_local,
-    reserve_projection_workspace,
-)
-from sglang.kernels.ops.muse_spark.router_gemm import (
-    MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
+from sglang.kernels.ops.moe.muse_spark_routing import (
+    FusedMuseSparkRouting,
 )
 from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
@@ -48,6 +46,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+from sglang.srt.layers.communication.muse_spark_gemm_ag import (
+    gemm_ag,
+    gemm_local,
+    reserve_projection_workspace,
+)
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -174,6 +177,22 @@ def _use_split_bf16_router(num_tokens: int) -> bool:
     if num_tokens <= ROUTER_GEMM_MAX_TOKENS or not _split_bf16_router_supported():
         return False
     return True
+
+
+def _fused_norm_boundary(
+    post_norm: nn.Module, residual_add: nn.Module, pre_norm: nn.Module
+) -> FusedPostNormResidualPreNorm:
+    return FusedPostNormResidualPreNorm(
+        post_norm,
+        residual_add,
+        pre_norm,
+        post_norm_is_input_scale=isinstance(
+            post_norm, MuseSpark1xRMSNormWithInputScale
+        ),
+        use_residual_gate=isinstance(
+            residual_add, MuseSpark1xNormPreservingResidualConnection
+        ),
+    )
 
 
 class MuseSpark1xRouter(nn.Module):
@@ -942,7 +961,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # Each boundary -- post-norm, residual add, next pre-norm -- is one fused
         # kernel. The FFN boundary's pre-norm belongs to the next layer, so the
         # model binds it in bind_next_pre_attn_norm once every layer exists.
-        self._fused_attn_boundary = FusedPostNormResidualPreNorm(
+        self._fused_attn_boundary = _fused_norm_boundary(
             self.post_attn_norm,
             self.post_attention_residual_gate,
             self.pre_feedforward_layernorm,
@@ -954,7 +973,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         return config.mlp_layer_types[layer_idx] == "sparse"
 
     def bind_next_pre_attn_norm(self, next_pre_attn_norm: MuseSpark1xRMSNorm) -> None:
-        self._fused_ffn_boundary = FusedPostNormResidualPreNorm(
+        self._fused_ffn_boundary = _fused_norm_boundary(
             self.post_feedforward_layernorm,
             self.post_feedforward_residual_gate,
             next_pre_attn_norm,
@@ -990,8 +1009,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
             ffn_output = self.mlp(ffn_input)
         # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
         if ffn_output.shape[-1] != stream.shape[-1]:
-            next_attn_input, stream = self._fused_ffn_boundary.forward_with_ag(
-                stream, ffn_output, get_parallel().tp_group.ca_comm
+            next_attn_input, stream = all_gather_norm_residual(
+                get_parallel().tp_group.ca_comm,
+                ffn_output,
+                stream,
+                **self._fused_ffn_boundary.jit_kernel_kwargs(),
             )
             return stream, next_attn_input
         if self._fused_ffn_boundary is None:
@@ -1064,11 +1086,11 @@ class MuseSpark1xModel(nn.Module):
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
         if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
-            from sglang.kernels.ops.muse_spark.fi_trtllm_moe_finalize_with_rmsnorm_cutedsl import (
-                FinalizePushWorkspace,
-            )
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
                 CustomAllReduceV2,
+            )
+            from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
+                FinalizePushWorkspace,
             )
 
             tp_group = get_parallel().tp_group

@@ -422,7 +422,7 @@ def fused_conv_window_scatter_with_mask(
     ``[layers, cache, dim, K-1]``.
     """
     total_requests = step_indices_raw.shape[0]
-    if total_requests == 0:
+    if total_requests == 0 or dst.numel() == 0:
         return
 
     if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
@@ -730,7 +730,13 @@ def scatter_mamba_states_after_mtp_verify(
                 src_indices_raw,
             )
 
-    pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
+    pairs = [
+        (conv, window)
+        for conv, window in zip(
+            mamba_caches.conv, mamba_caches.intermediate_conv_window
+        )
+        if conv.numel() > 0
+    ]
     if not pairs:
         return
     if mamba_track_indices is not None:

@@ -1560,7 +1560,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
         if getattr(mamba_pool, "replayssm_is_kda", False):
-            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
             )
 
