@@ -674,7 +674,8 @@ jobs:
             --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --precision-mode "${PRECISION_MODE}" \
-            --github-output "${GITHUB_OUTPUT}"
+            --github-output "${GITHUB_OUTPUT}" \
+            --github-summary "${GITHUB_STEP_SUMMARY:-}"
 
   # ==================== Coverage Assembly & Publish ==================== #
   # Assembles coverage data and publishes the baseline to the shared disk.
