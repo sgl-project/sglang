@@ -11,7 +11,7 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     MergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-    DiffusionGenerator,
+    DiffGenerator,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
@@ -31,7 +31,7 @@ def test_public_merge_entrypoints_default_to_one():
         inspect.signature(common_api.merge_lora_weights).parameters["strength"].default
     )
     assert endpoint_default.default == 1.0
-    for fn in (DiffusionGenerator.merge_lora_weights, GPUWorker.merge_lora_weights):
+    for fn in (DiffGenerator.merge_lora_weights, GPUWorker.merge_lora_weights):
         assert inspect.signature(fn).parameters["strength"].default == 1.0
 
 
