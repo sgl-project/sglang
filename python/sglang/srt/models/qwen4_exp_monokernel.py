@@ -58,7 +58,13 @@ def _checkpoint_dir(draft: bool = False) -> str:
     if not os.path.isdir(path):
         from huggingface_hub import snapshot_download
 
-        path = snapshot_download(path, revision=args.revision, local_files_only=True)
+        # Only the safetensors are read: do not require the rest of the snapshot (README, tokenizer files, ...).
+        path = snapshot_download(
+            path,
+            revision=args.revision,
+            local_files_only=True,
+            allow_patterns=["*.safetensors", "*.safetensors.index.json"],
+        )
     return path
 
 
