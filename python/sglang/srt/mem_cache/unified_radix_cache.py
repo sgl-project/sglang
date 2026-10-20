@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_call_guard import StorageCallKind
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -2023,7 +2024,15 @@ class UnifiedRadixCache(BasePrefixCache):
             last_hash,
             prefix_keys,
         )
-        _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        try:
+            _, storage_hit_count = self.cache_controller._storage_hit_query(
+                operation, call_kind=StorageCallKind.PROBE
+            )
+        except Exception:
+            # The MIN below turns this rank's miss into a miss on every rank,
+            # instead of an exception out of the scheduler loop.
+            logger.exception("HiCache storage hit probe failed; treated as a miss")
+            storage_hit_count = 0
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
             storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
@@ -3643,6 +3652,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+            self.storage_metrics_collector.log_storage_call_guard(
+                self.cache_controller.storage_call_guard.take_stats()
+            )
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

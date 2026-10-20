@@ -366,6 +366,7 @@ class MambaPoolHost(HostKVCache):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
+        self.free_slots = self.slot_quarantine.carve_after_clear(self.free_slots)
 
     def available_size(self):
         return len(self.free_slots) + self.num_release_slots
@@ -391,8 +392,10 @@ class MambaPoolHost(HostKVCache):
         if indices_cpu.numel() == 0:
             return 0
 
-        self.release_slots.append(indices_cpu)
-        self.num_release_slots += len(indices_cpu)
+        indices_cpu = self.slot_quarantine.hold_freed(indices_cpu)
+        if indices_cpu.numel():
+            self.release_slots.append(indices_cpu)
+            self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def get_size_per_token(self):

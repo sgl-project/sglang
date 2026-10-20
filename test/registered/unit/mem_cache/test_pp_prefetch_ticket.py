@@ -26,6 +26,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PPPrefetchDecision,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_call_guard import (
+    StorageCallGuard,
+    StorageCallTimeouts,
+)
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
@@ -62,6 +66,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.host_mem_release_queue = Queue()
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
+        c.storage_call_guard = StorageCallGuard(StorageCallTimeouts.disabled())
         c.prefetch_tokens_occupied = 0
         c.mem_pool_host = Mock(page_size=4)
         c.mem_pool_host.layout_lease.side_effect = nullcontext

@@ -89,6 +89,16 @@ Guidelines:
 --hicache-storage-prefetch-policy timeout
 ```
 
+### Bounding Storage Backend Calls
+
+Every storage backend call made by the HiCache controller runs under a deadline. A call that misses it is treated as an ordinary miss (0 hits, 0 transferred pages, or a failed backup) and the prefetch/backup pipeline keeps flowing, instead of one stuck call wedging the worker thread, its TP peers, and any later `/flush_cache` (on the unified page-envelope host pool a flush issued while an orphaned call still holds its layout lease gives up after 10 s and, as before, exits the scheduler). The timed-out call keeps running on an orphaned worker and the host memory it may still touch stays quarantined until it returns; `sglang:hicache_storage_call_timeouts_total`, `sglang:hicache_storage_call_errors_total`, and `sglang:hicache_storage_orphaned_calls` report it.
+
+```bash Command
+--hicache-storage-backend-extra-config '{"storage_query_timeout_s": 5, "storage_get_timeout_s": 20, "storage_set_timeout_s": 60}'
+```
+
+The values above are the defaults, in seconds per batch call (one existence query / page read / page write covers up to 128 pages, not a whole request); `0` or `null` disables the bound for that kind. Keep them well above the backend's healthy tail latency (about 10x its p99 is a good start): a call that is merely slow is cut and recomputed, and under `wait_complete` every request queued behind a hung call waits until its bound expires. At most 4 hung calls per kind are kept alive per rank; their host memory (4 x 128 pages per kind) stays pinned until they return, and further calls of that kind are refused as misses in the meantime.
+
 ### Integration with PD Disaggregation
 
 HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:

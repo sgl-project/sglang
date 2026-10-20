@@ -158,6 +158,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                         page_size=2,
                         prefetch_hits_sync_groups=[],
                         _all_reduce=capture,
+                        _bounded_storage_call=lambda kind, call, **kwargs: call(),
                     )
                     _, hit_tokens = HybridCacheController._storage_hit_query(
                         controller, operation

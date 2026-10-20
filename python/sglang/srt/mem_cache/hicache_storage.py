@@ -173,6 +173,11 @@ def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
     }
 
 
+def pool_transfer_misses(transfers: List[PoolTransfer]) -> dict[str, List[bool]]:
+    """The batch v2 result for a call that returned nothing."""
+    return {transfer.name: [False] * len(transfer.keys or ()) for transfer in transfers}
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
