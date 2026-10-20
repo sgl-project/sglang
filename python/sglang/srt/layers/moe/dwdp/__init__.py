@@ -1,6 +1,9 @@
-"""DWDP: keep tokens on-rank and prefetch peer expert weights on demand."""
+"""DWDP (Distributed Weight Data Parallelism): MoE prefill with tokens kept on-rank and peer expert weights prefetched via NVLink into a composite VMM address space."""
 
-from sglang.srt.runtime_context import get_global_dwdp_manager, set_global_dwdp_manager
+from sglang.srt.runtime_context import (
+    get_global_dwdp_manager,
+    set_global_dwdp_manager,
+)
 
 
 def __getattr__(name):
@@ -17,4 +20,8 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["DwdpManager", "get_global_dwdp_manager", "set_global_dwdp_manager"]
+__all__ = [
+    "DwdpManager",
+    "get_global_dwdp_manager",
+    "set_global_dwdp_manager",
+]
