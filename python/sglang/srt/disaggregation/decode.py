@@ -1338,6 +1338,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         rids_to_check: Optional[List[str]] = None,
         pp_good_rids: Optional[List[str]] = None,
         pp_bad_rids: Optional[List[str]] = None,
+        *,
+        allow_preallocation: bool = True,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         is_pp_mode = self.pp_size > 1
@@ -1356,33 +1358,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         num_device_preallocated = 0
         indices_to_remove = set()
 
-        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
-        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
-        retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
-        )
-
-        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
-        swa_allocatable_tokens = None
-        if self._uses_swa_reservation():
-            retractable_swa_tokens = sum(
-                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
-            )
-            full_allocatable_tokens, swa_allocatable_tokens = (
-                self._swa_aware_allocatable_token_budgets(
-                    retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=retractable_swa_tokens,
-                    count_retracted=True,
-                )
-            )
-        else:
-            retractable_swa_tokens = 0
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                retractable_tokens=retractable_tokens, count_retracted=True
-            )
-        reserved_restore_tokens = self._hicache_pending_restore_tokens()
-        full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
         if self.scheduler.enable_priority_scheduling:
@@ -1414,6 +1389,39 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
 
+        if not allow_preallocation:
+            self.queue = [
+                req for i, req in enumerate(self.queue) if i not in indices_to_remove
+            ]
+            return [], failed_reqs
+
+        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
+        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+        retractable_tokens = sum(
+            len(r.origin_input_ids) + len(r.output_ids)
+            for r in self.scheduler.running_batch.reqs
+        )
+
+        uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
+        swa_allocatable_tokens = None
+        if self._uses_swa_reservation():
+            retractable_swa_tokens = sum(
+                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
+            )
+            full_allocatable_tokens, swa_allocatable_tokens = (
+                self._swa_aware_allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    retractable_swa_tokens=retractable_swa_tokens,
+                    count_retracted=True,
+                )
+            )
+        else:
+            retractable_swa_tokens = 0
+            full_allocatable_tokens = self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens, count_retracted=True
+            )
+        reserved_restore_tokens = self._hicache_pending_restore_tokens()
+        full_allocatable_tokens -= reserved_restore_tokens
         # HiSparse physical constraint: max requests by device buffer capacity.
         # Each admitted req needs a padded buffer plus its speculative scratch.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
@@ -3480,9 +3488,7 @@ class SchedulerDisaggregationDecodeMixin:
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
-        if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
-            # if there are still retracted requests, we do not allocate new requests
-            return
+        has_retracted = bool(self.disagg_decode_prealloc_queue.retracted_queue)
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -3490,19 +3496,23 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
-        if self.polling_count % self.polling_interval == 0:
-            if get_disagg().disaggregation_decode_host_receive_threshold == 1:
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-                self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
-            if self.enable_hisparse:
-                for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(transferred_reqs)
-            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-                # Give completed host transfers device space before new arrivals.
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-                self.disagg_decode_transfer_queue.extend(req_conns)
+        # Gate admission, not completion/failure maintenance: those requests
+        # may hold the resources needed to resume a retracted request.
+        allow_preallocation = not has_retracted and self.polling_count == 0
+        host_receive = get_disagg().disaggregation_decode_host_receive_threshold < 1
+        if not host_receive:
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                allow_preallocation=allow_preallocation
+            )
+            self.disagg_decode_transfer_queue.extend(req_conns)
+        transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
+        if self.enable_hisparse:
+            for req in transferred_reqs:
+                self.hisparse_coordinator.admit_request_direct(req)
+        self.waiting_queue.extend(transferred_reqs)
+        if host_receive:
+            # Completed host transfers get device space before new admissions.
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                allow_preallocation=allow_preallocation
+            )
+            self.disagg_decode_transfer_queue.extend(req_conns)
