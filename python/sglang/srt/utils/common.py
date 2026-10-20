@@ -51,6 +51,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from ctypes import byref
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -494,7 +495,7 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = psutil.virtual_memory().available
+        total_free_memory = get_free_cpu_memory()
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
@@ -540,7 +541,8 @@ def get_available_gpu_memory(
             # available due to not including cache memory. So we use the system available
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
-        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+        else:
+            free_gpu_memory, _ = torch.musa.mem_get_info(gpu_id)
     elif device == "mps":
         from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 
@@ -581,6 +583,10 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
@@ -591,13 +597,29 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
-    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
-    if not tensor.is_cuda:
-        return tensor.to("cpu", non_blocking=True)
+    """Enqueue an accelerator-to-pinned-host copy on the current stream."""
+    if tensor.device.type == "cpu":
+        return tensor
+    if not is_pin_memory_available(tensor.device):
+        return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
-    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
     return host
 
 
@@ -858,35 +880,51 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_instance_memory_status(cgroup_file: str) -> Optional[int]:
+    try:
+        with open(cgroup_file, "r") as f:
+            content = f.read().strip()
+            # "max" or other non memory size content will be skipped
+            if not content.isdigit():
+                raise ValueError
+
+            return int(content)
+    except (PermissionError, FileNotFoundError, ValueError):
+        return None
+
+
+def get_free_cpu_memory() -> int:
+    free_cpu_memory = psutil.virtual_memory().available
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    instance_current_cpu_memory = get_instance_memory_status(
+        "/sys/fs/cgroup/memory.current"
+    )
+    if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
+        instance_free_cpu_memory = max(
+            0, instance_max_cpu_memory - instance_current_cpu_memory
+        )
+        free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
+
+    return free_cpu_memory
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        logger.warning(
+            "SGLANG_CPU_OMP_THREADS_BIND is set for explicit control of CPU cores for each TP rank."
+            "Please beware that in this case the available memory amounts of the ranks cannot be determined in prior."
+            "You need to set proper --max-total-tokens to avoid the out-of-memory error."
+        )
         return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
-    if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+    n_numa_node = len(get_cpu_ids_by_node()) or 1
+    total_cpu_memory = psutil.virtual_memory().total
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    if instance_max_cpu_memory is not None:
+        total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
+    per_numa_mem = total_cpu_memory / n_numa_node
+    # Retrieved value in Byte, need MB
+    return float(per_numa_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():
@@ -1551,33 +1589,6 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
-# Set while a layer another pipeline stage holds is built, only for the stage
-# boundaries it declares.
-_building_neighbour_layer = False
-
-
-def is_building_neighbour_layer() -> bool:
-    """Whether the layer under construction belongs to another pipeline stage
-    and is built here only to read the stage boundaries it declares. It is
-    built on the meta device and never loaded or run, so its constructor skips
-    the host and device resources a running layer needs: tables, streams,
-    engines and communicators."""
-    return _building_neighbour_layer
-
-
-@contextmanager
-def building_neighbour_layer():
-    """Build a pipeline neighbour layer: on the meta device, with
-    is_building_neighbour_layer() true."""
-    global _building_neighbour_layer
-    outer, _building_neighbour_layer = _building_neighbour_layer, True
-    try:
-        with torch.device("meta"):
-            yield
-    finally:
-        _building_neighbour_layer = outer
-
-
 class LayerFn(Protocol):
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -1591,18 +1602,26 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
     final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function.
 
     The local layers are built inside one layer stack, so layers that declare
     stage boundaries connect in order without naming their neighbours. Across
-    a pipeline stage boundary the stack learns the neighbouring stage from the
-    layer itself, built again on the meta device. ``final_read`` is the
-    stack's terminal read when it is not a plain final norm (see layer_stack).
+    a pipeline stage boundary the stack learns the neighbouring stage from
+    ``stage_facts``: the model's shared declaration function, which returns
+    the stages the layer at a global index declares without building it (an
+    empty sequence when it declares none), and which the layer itself uses
+    for its own declarations. A model whose layers declare stages must give
+    it to run under pipeline parallelism. ``final_read`` is the stack's
+    terminal read when it is not a plain final norm (see layer_stack).
     """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
-    from sglang.srt.layers.layer_boundary.factories import layer_stack
+    from sglang.srt.layers.layer_boundary.factories import (
+        check_declared_stages,
+        layer_stack,
+    )
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1618,22 +1637,27 @@ def make_layers(
     )
 
     def neighbour(idx):
-        return functools.partial(
-            _build_neighbour_layer, layer_fn, idx, add_prefix(idx, prefix)
-        )
+        if stage_facts is not None:
+            return functools.partial(stage_facts, idx)
+        return functools.partial(_no_stage_facts, layer_fn)
+
+    def build(stack, idx):
+        appended = len(stack.appends)
+        layer = layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+        if stage_facts is not None and (pp_size or 1) > 1:
+            # Another rank binds this layer's stages from stage_facts alone.
+            check_declared_stages(stack, appended, stage_facts(idx), f"layer {idx}")
+        return layer
 
     with layer_stack(
         previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
         next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
         final_read=final_read,
-    ):
+    ) as stack:
         modules = torch.nn.ModuleList(
             [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
             + get_offloader().wrap_modules(
-                (
-                    layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                    for idx in range(start_layer, end_layer)
-                ),
+                (build(stack, idx) for idx in range(start_layer, end_layer)),
                 **(offloader_kwargs or {}),
             )
             + [
@@ -1653,10 +1677,12 @@ def make_pp_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
     final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make this pipeline stage's layers, and return them with the stage's range.
 
     Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    ``stage_facts`` is the model's shared declaration function (see make_layers).
     """
     parallel = get_parallel()
     return make_layers(
@@ -1668,22 +1694,19 @@ def make_pp_layers(
         return_tuple=return_tuple,
         offloader_kwargs=offloader_kwargs,
         final_read=final_read,
+        stage_facts=stage_facts,
     )
 
 
-def _build_neighbour_layer(layer_fn: LayerFn, idx: int, prefix: str) -> None:
-    """Build a layer another pipeline stage holds, only for the stage
-    boundaries it declares (see building_neighbour_layer). RoPE modules it
-    adds to the shared cache are meta, so they are dropped again."""
-    from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
-
-    cached = set(_ROPE_DICT)
-    try:
-        with building_neighbour_layer():
-            layer_fn(idx=idx, prefix=prefix)
-    finally:
-        for key in set(_ROPE_DICT) - cached:
-            del _ROPE_DICT[key]
+def _no_stage_facts(layer_fn: LayerFn) -> None:
+    """Stands in for the shared declaration function of a model that gives
+    none: called only if this pipeline rank's layers declare stages."""
+    module = getattr(getattr(layer_fn, "func", layer_fn), "__module__", None)
+    raise ValueError(
+        f"{module} declares stage boundaries under pipeline parallelism "
+        "without a shared declaration function: give make_layers its "
+        "stage_facts, the stages a layer declares without building it"
+    )
 
 
 def set_random_seed(seed: int) -> None:
@@ -2821,111 +2844,6 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
-class RefCountedGauge:
-    def __init__(self, gauge):
-        self._gauge = gauge
-        self._refcount: Dict[str, int] = {}
-
-    def inc(self, key: str):
-        if key in self._refcount:
-            self._refcount[key] += 1
-        else:
-            self._refcount[key] = 1
-            self._gauge.inc()
-
-    def dec(self, key: str):
-        if key in self._refcount:
-            self._refcount[key] -= 1
-            if self._refcount[key] == 0:
-                del self._refcount[key]
-                self._gauge.dec()
-
-
-def add_prometheus_track_response_middleware(
-    app, extra_labels: Optional[Dict[str, str]] = None
-):
-    from prometheus_client import Counter, Gauge
-
-    extra_labels = extra_labels or {}
-    extra_label_names = list(extra_labels.keys())
-
-    http_request_counter = Counter(
-        name="sglang:http_requests_total",
-        documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=extra_label_names + ["endpoint", "method"],
-    )
-
-    http_response_counter = Counter(
-        name="sglang:http_responses_total",
-        documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
-    )
-
-    http_requests_active = Gauge(
-        name="sglang:http_requests_active",
-        documentation="Number of currently active HTTP requests",
-        labelnames=extra_label_names + ["endpoint", "method"],
-        multiprocess_mode="livesum",
-    )
-
-    routing_keys_active = RefCountedGauge(
-        Gauge(
-            name="sglang:routing_keys_active",
-            documentation="Number of unique routing keys with active requests",
-            multiprocess_mode="livesum",
-        )
-    )
-
-    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
-    # that passes `receive` through, so request.is_disconnected() keeps working.
-    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
-
-    patch_app_http_middleware(app)
-
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
-
-        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
-        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
-        if routing_key:
-            routing_keys_active.inc(routing_key)
-
-        try:
-            response = await call_next(request)
-
-            http_response_counter.labels(
-                **extra_labels,
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
-
-            return response
-        finally:
-            http_requests_active.labels(
-                **extra_labels, endpoint=path, method=method
-            ).dec()
-            if routing_key:
-                routing_keys_active.dec(routing_key)
-
-
-# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
-def _get_fastapi_request_path(request) -> Tuple[str, bool]:
-    from starlette.routing import Match
-
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return getattr(route, "path", request.url.path), True
-
-    return request.url.path, False
-
-
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -3292,6 +3210,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
@@ -3672,15 +3591,20 @@ def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
     serving = get_serving()
     if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
         return None
+    if envs.SGLANG_RUST_SERVER.get():
+        return None
 
     from sglang.srt.rust_extensions import load_rust_extension
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 
     grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
     return grpc_native.start_metadata_server(
         host=serving.host,
         port=serving.grpc_port,
         server_info_json=json.dumps(
-            msgspec_to_builtins(build_server_info(server_args, scheduler_info)),
+            msgspec_to_builtins(
+                redact_watermark_secrets(build_server_info(server_args, scheduler_info))
+            ),
             default=str,
         ),
     )
@@ -3692,9 +3616,10 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
     from sglang.srt.utils.network import NetworkAddress
 
-    app = FastAPI()
+    app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
     @app.get("/ping")
     async def ping():
@@ -4159,8 +4084,8 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             return True
         elif moe_a2a_backend.is_none():
             return True
-        elif moe_a2a_backend.is_flashinfer():
-            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
+            # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
             # replay different-sized graphs -> geometry mismatch -> illegal memory
@@ -4169,9 +4094,12 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif moe_a2a_backend.is_mori() and get_bool_env_var(
-            "SGLANG_MORI_RECV_BOUND", "false"
-        ):
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
+        elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
             # fan-in depends on what the *peers* send. Without a DP-synchronized
@@ -4440,7 +4368,9 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-def freeze_gc(context: str):
+def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
+    if gc_threshold is not None:
+        gc.set_threshold(*gc_threshold)
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -4575,12 +4505,12 @@ def get_physical_cpus_by_numa():
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
-    cpu_ids = [
-        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
-    ]
-
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
-    return cpu_ids
+    return [
+        ",".join(map(str, sorted(cpus)))
+        for _, cpus in sorted(node_to_cpus.items())
+        if cpus
+    ]
 
 
 def is_shm_available(dtype, world_size, local_size):
@@ -5137,6 +5067,59 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``SGLANG_FORCE_CONFIDENTIAL_COMPUTE``.
+    """
+    forced = envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.get()
+    if forced is not None:
+        return forced
+    if not is_cuda():
+        return False
+
+    try:
+        import pynvml
+    except ImportError:
+        logger.warning("pynvml not available; assuming Confidential Computing is off")
+        return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except pynvml.NVMLError:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 def init_cublas():

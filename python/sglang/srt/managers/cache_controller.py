@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -43,7 +43,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -373,6 +373,7 @@ class HiCacheController:
         # Set by the scheduler to the forward stream; gates load-back H2D
         # behind in-flight forwards (see start_loading).
         self.load_fence_stream = None
+        self.write_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
@@ -831,13 +832,19 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
-    def start_writing(self) -> None:
+    def start_writing(self, *, wait_for_forward: bool = False) -> None:
         if len(self.write_queue) == 0:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
+
+        if wait_for_forward and self.write_fence_stream is not None:
+            # An evicted SWA page can belong to an unfinished checkpoint.
+            self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                self.write_fence_stream
+            )
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
@@ -1126,8 +1133,6 @@ class HiCacheController:
                         kv_derived_transfers,
                     )
                 except Exception:
-                    if not get_memory().enable_unified_memory:
-                        raise
                     logger.exception(
                         "HiCache prefetch transfer failed for request %s",
                         operation.request_id,
@@ -1288,8 +1293,6 @@ class HiCacheController:
                             operation
                         )
                 except Exception:
-                    if not get_memory().enable_unified_memory:
-                        raise
                     logger.exception(
                         "HiCache storage query failed for request %s",
                         operation.request_id,
@@ -1321,6 +1324,10 @@ class HiCacheController:
             self.prefetch_hits_sync_groups,
         )
         return int(hit_count.item())
+
+    def extend_storage_prefix(self, prefix_keys: Any, hash_values: List[str]) -> Any:
+        """Advance the backend's prefix context past omitted pages."""
+        return prefix_keys + hash_values if prefix_keys is not None else None
 
     def write_storage(
         self,
@@ -1374,6 +1381,14 @@ class HiCacheController:
                 prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
 
+    def _page_backup_or_log(self, operation):
+        try:
+            self._page_backup(operation)
+        except Exception:
+            logger.exception(
+                "HiCache backup failed after %d tokens", operation.completed_tokens
+            )
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -1385,7 +1400,7 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

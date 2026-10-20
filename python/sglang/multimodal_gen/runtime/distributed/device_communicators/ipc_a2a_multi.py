@@ -30,6 +30,7 @@ from sglang.kernels.ops.communication.ipc_a2a import load_ipc_a2a_sync
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     _Unsupported,
+    ipc_shareable_zeros,
 )
 
 logger = logging.getLogger(__name__)
@@ -253,7 +254,7 @@ class _PipelinePool:
     def __init__(self, state, dtype, in_numel: int, out_numel: int, groups: int):
         world = state.world
         self.sizes = (in_numel, out_numel, groups)
-        zeros = lambda n, dt=dtype: torch.zeros(n, dtype=dt, device="cuda")
+        zeros = lambda n, dt=dtype: ipc_shareable_zeros(n, dtype=dt)
         self.inb = state._share(zeros(in_numel), state.group)
         self.outb = state._share(zeros(out_numel), state.group)
         # fin[p]: groups peer p has delivered; fout[g, p]: calls whose group g
