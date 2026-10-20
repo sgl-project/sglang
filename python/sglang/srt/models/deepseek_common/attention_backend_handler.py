@@ -12,15 +12,8 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_parallel,
-    get_platform,
-)
-from sglang.srt.utils import (
-    is_gfx95_supported,
-    use_intel_amx_backend,
-)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
+from sglang.srt.utils import is_gfx95_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla", "aiter"]
 
@@ -169,7 +162,10 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
+    # Without chunking, BCG must retain the absorbed layout for later prefix hits.
+    if is_in_tc_piecewise_cuda_graph() or (
+        is_in_breakable_cuda_graph() and attn.disable_chunked_prefix_cache
+    ):
         return AttnForwardMethod.MLA
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
@@ -182,8 +178,6 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 
 def handle_attention_tokenspeed_mla(attn, forward_batch):
-    # tokenspeed_mla shares the trtllm_mla dispatch pattern: pure prefill goes
-    # via MHA chunked KV (TRT-LLM ragged), spec decode / decode goes via MLA.
     return handle_attention_trtllm_mla(attn, forward_batch)
 
 
