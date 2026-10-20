@@ -44,11 +44,62 @@ def build_cache_options(
     return {"enable_cache_dit": enable_cache_dit, "cache_dit_params": params or None}
 
 
-def request_cache_dit_for_run(packed, transformer_options, separate_cfg: bool) -> None:
+# DiT calls per sampler step, by k-diffusion function name; checked on CPU
+# against ComfyUI's samplers with a call-counting denoiser.
+_ONE_CALL_SAMPLERS = frozenset(
+    {
+        "sample_euler",
+        "sample_euler_ancestral",
+        "sample_lms",
+        "sample_dpmpp_2m",
+        "sample_unipc",
+    }
+)
+# Two calls per step, except one on a final step that lands on sigma 0.
+_TWO_CALL_SAMPLERS = frozenset(
+    {
+        "sample_heun",
+        "sample_dpm_2",
+        "sample_dpm_2_ancestral",
+        "sample_dpmpp_2s_ancestral",
+        "sample_dpmpp_sde",
+    }
+)
+
+
+def expected_model_calls(sampler_fn, sigmas) -> int:
+    """DiT calls one sampler run makes for ``sigmas`` (N = len(sigmas) - 1).
+
+    ``sampler_fn`` is the k-diffusion function or its ``__name__``. Unknown
+    samplers get 3 * N, an upper bound for the samplers ComfyUI ships.
+    """
+    steps = len(sigmas) - 1
+    if steps < 1:
+        return 0
+    name = (
+        sampler_fn
+        if isinstance(sampler_fn, str)
+        else getattr(sampler_fn, "__name__", None)
+    )
+    if name in _ONE_CALL_SAMPLERS:
+        return steps
+    if name in _TWO_CALL_SAMPLERS:
+        return 2 * steps - 1 if float(sigmas[-1]) == 0 else 2 * steps
+    if name == "sample_heunpp2":
+        return 1 if steps == 1 else 3 * steps - 3
+    return 3 * steps
+
+
+def request_cache_dit_for_run(
+    packed, transformer_options, separate_cfg: bool, model_calls: int | None = None
+) -> None:
     """Ask the worker to keep one Cache-DiT context for the whole sampler run.
 
     ComfyUI sends one request per DiT call. With CFG the cond and uncond calls
     alternate, which Cache-DiT counts as one step when mounted with separate CFG.
+    Cache-DiT counts DiT calls, not sampler steps, so ``model_calls`` (from
+    ``expected_model_calls``) is the step count; without it the sampler is
+    unknown and the upper bound is used.
     """
     options = transformer_options or {}
     if 1 in (options.get("cond_or_uncond") or ()) and not separate_cfg:
@@ -59,7 +110,9 @@ def request_cache_dit_for_run(packed, transformer_options, separate_cfg: bool) -
     sigmas = options.get("sample_sigmas")
     if sigmas is None or len(sigmas) < 2:
         raise ValueError("Cache-DiT through ComfyUI needs the sampler's sample_sigmas")
-    packed.extra_req["comfyui_num_steps"] = len(sigmas) - 1
+    if model_calls is None:
+        model_calls = expected_model_calls(None, sigmas)
+    packed.extra_req["comfyui_num_steps"] = model_calls
     packed.extra_req["comfyui_separate_cfg"] = separate_cfg
 
 

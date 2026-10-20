@@ -490,9 +490,14 @@ def test_cache_dit_run_sends_sampler_steps_and_cfg_mode() -> None:
     sigmas = torch.linspace(1, 0, 26)
     packed = SimpleNamespace(extra_req={})
     request_cache_dit_for_run(
+        packed, {"sample_sigmas": sigmas, "cond_or_uncond": [0]}, False, 49
+    )
+    assert packed.extra_req["comfyui_num_steps"] == 49
+    # without the sampler's call count, assume the upper bound
+    request_cache_dit_for_run(
         packed, {"sample_sigmas": sigmas, "cond_or_uncond": [0]}, False
     )
-    assert packed.extra_req["comfyui_num_steps"] == 25
+    assert packed.extra_req["comfyui_num_steps"] == 75
     assert packed.extra_req["comfyui_separate_cfg"] is False
     request_cache_dit_for_run(
         packed, {"sample_sigmas": sigmas, "cond_or_uncond": [1]}, True

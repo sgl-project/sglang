@@ -8,6 +8,7 @@ import uuid
 import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
+    expected_model_calls,
     guider_runs_cfg,
     read_cache_options,
     request_cache_dit_for_run,
@@ -164,6 +165,8 @@ class SGLDiffusionExecutor(torch.nn.Module):
     cache_dit_params: dict | None = None
     # Whether the current sampler run alternates cond and uncond requests.
     _run_separate_cfg: bool = False
+    # DiT calls the current sampler run makes; None when the wrapper saw no sigmas.
+    _run_model_calls: int | None = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -232,6 +235,16 @@ class SGLDiffusionExecutor(torch.nn.Module):
             self._ensure_runtime(self)
         model_wrap = args[0] if args else kwargs["model_wrap"]
         self._run_separate_cfg = guider_runs_cfg(model_wrap)
+        # executor wraps KSAMPLER.sample(guider, sigmas, ...)
+        sigmas = args[1] if len(args) > 1 else kwargs.get("sigmas")
+        sampler_fn = getattr(
+            getattr(executor, "class_obj", None), "sampler_function", None
+        )
+        self._run_model_calls = (
+            expected_model_calls(sampler_fn, sigmas)
+            if sigmas is not None and len(sigmas) > 1
+            else None
+        )
         desired = model_wrap.model_patcher.model_options.get("sgld_lora_input")
         if desired != self._lora_input:
             if self._lora_input is not None:
@@ -412,6 +425,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
         packed.cache_options = read_cache_options(kwargs.get("transformer_options"))
         if self.cache_dit_needs_run_steps and self._cache_dit_enabled_for(packed):
             request_cache_dit_for_run(
-                packed, kwargs.get("transformer_options"), self._run_separate_cfg
+                packed,
+                kwargs.get("transformer_options"),
+                self._run_separate_cfg,
+                self._run_model_calls,
             )
         return self._execute_packed(packed, x, timestep)
