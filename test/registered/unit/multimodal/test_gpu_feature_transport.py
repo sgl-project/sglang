@@ -428,6 +428,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport._publisher_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1
         )
+        transport._enabled = True
         started = threading.Event()
         event_loop_responsive = threading.Event()
         release = threading.Event()
@@ -484,6 +485,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport = object.__new__(CudaVmmFeatureTransport)
         transport.pool = object()
         transport._publisher_executor = MagicMock()
+        transport._enabled = True
 
         result = asyncio.run(
             transport.prepare_for_dispatch_async([None, SimpleNamespace(mm_items=[])])
@@ -625,6 +627,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         transport.pool = pool
         transport._publisher_executor = None
+        transport._pool_lock = threading.Lock()
+        transport._closing = False
         manager.cuda_vmm_feature_transport = transport
         manager._subprocess_watchdog = None
         engine = object.__new__(Engine)
@@ -655,6 +659,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool = MagicMock()
         transport.pool = pool
         transport._publisher_executor = None
+        transport._pool_lock = threading.Lock()
+        transport._closing = False
         manager.cuda_vmm_feature_transport = transport
         # A real record: the launcher publishes it partway through, and what it
         # reads after that comes out of the bags, which only project from a
@@ -708,6 +714,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         pool.shutdown.side_effect = [RuntimeError("shutdown failed"), None]
         transport.pool = pool
         transport._publisher_executor = None
+        transport._pool_lock = threading.Lock()
+        transport._closing = False
 
         with self.assertRaisesRegex(RuntimeError, "shutdown failed"):
             transport.shutdown()
@@ -1149,6 +1157,162 @@ class TestVmmConsumerCount(unittest.TestCase):
             self.assertEqual(proxy._acknowledgement_range(1), (3, 4))
             self.assertEqual(proxy._acknowledgement_range(2), (2, 4))
             self.assertEqual(proxy._acknowledgement_range(4), (0, 4))
+
+
+class _LazyFakePool:
+    instances = 0
+    made = []
+
+    def __init__(self, **kwargs):
+        _LazyFakePool.instances += 1
+        _LazyFakePool.made.append(self)
+        self.kwargs = kwargs
+        self.closed = False
+
+    def shutdown(self):
+        self.closed = True
+
+
+class _LazyCfg:
+    def __init__(self, transport="cuda_vmm", tokenizer_worker_num=32, nnodes=2):
+        self.mm_feature_transport = transport
+        self.tokenizer_worker_num = tokenizer_worker_num
+        self.nnodes = nnodes
+
+
+class TestCudaVmmLazyInit(CustomTestCase):
+    def setUp(self):
+        _LazyFakePool.instances = 0
+        _LazyFakePool.made = []
+        self._patchers = []
+
+    def tearDown(self):
+        for patcher in self._patchers:
+            patcher.stop()
+
+    def _build(self, pool_cls=None, transport="cuda_vmm"):
+        from sglang.srt.utils import cuda_vmm_transport_utils as cvt
+        from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
+
+        cfg = _LazyCfg(transport=transport)
+        patches = {
+            "get_mm": MagicMock(return_value=cfg),
+            "get_serving": MagicMock(return_value=cfg),
+            "get_parallel": MagicMock(return_value=cfg),
+            "get_vmm_feature_consumer_count": MagicMock(return_value=1),
+            "get_mm_feature_pool_size_per_worker": MagicMock(return_value=32),
+            "MM_FEATURE_CACHE_SIZE": 1024,
+            "MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL": 1.0,
+            "CudaVmmMemoryPool": pool_cls or _LazyFakePool,
+        }
+        for name, value in patches.items():
+            patcher = patch.object(cvt, name, value)
+            patcher.start()
+            self._patchers.append(patcher)
+        return CudaVmmFeatureTransport(
+            SimpleNamespace(base_gpu_id=0), mm_processor=object()
+        )
+
+    def test_enabled_startup_does_not_allocate(self):
+        transport = self._build()
+        self.assertTrue(transport._enabled)
+        self.assertIsNone(transport.pool)
+        self.assertIsNotNone(transport._pool_kwargs)
+        self.assertEqual(_LazyFakePool.instances, 0)
+
+    def test_first_async_publication_creates_pool(self):
+        transport = self._build()
+        mm_output = SimpleNamespace(
+            mm_items=[SimpleNamespace(feature=None, precomputed_embeddings=None)]
+        )
+        with patch.object(transport, "prepare_for_dispatch", return_value=[]):
+            asyncio.run(transport.prepare_for_dispatch_async([mm_output]))
+        self.assertEqual(_LazyFakePool.instances, 1)
+        transport.shutdown()
+
+    def test_repeated_ensure_pool_reuses_pool(self):
+        transport = self._build()
+        self.assertIs(transport._ensure_pool(), transport._ensure_pool())
+        self.assertEqual(_LazyFakePool.instances, 1)
+
+    def test_concurrent_ensure_pool_single_instance(self):
+        pool_init_started = threading.Event()
+        allow_pool_init = threading.Event()
+
+        class BlockingPool(_LazyFakePool):
+            def __init__(self, **kwargs):
+                pool_init_started.set()
+                if not allow_pool_init.wait(timeout=10):
+                    raise TimeoutError("pool initialization was not released")
+                super().__init__(**kwargs)
+
+        transport = self._build(pool_cls=BlockingPool)
+        first, second = [], []
+
+        def ensure(out):
+            out.append(transport._ensure_pool())
+
+        thread_a = threading.Thread(target=ensure, args=(first,))
+        thread_a.start()
+        self.assertTrue(pool_init_started.wait(timeout=10))
+
+        thread_b = threading.Thread(target=ensure, args=(second,))
+        thread_b.start()
+        allow_pool_init.set()
+        thread_a.join(timeout=10)
+        thread_b.join(timeout=10)
+        self.assertFalse(thread_a.is_alive())
+        self.assertFalse(thread_b.is_alive())
+        self.assertEqual(_LazyFakePool.instances, 1)
+        self.assertIs(first[0], second[0])
+
+    def test_shutdown_before_first_use_creates_no_pool(self):
+        transport = self._build()
+        transport.shutdown()
+        self.assertEqual(_LazyFakePool.instances, 0)
+        self.assertIsNone(transport._publisher_executor)
+
+    def test_ensure_pool_vetoed_after_shutdown(self):
+        transport = self._build()
+        transport.shutdown()
+        with self.assertRaises(RuntimeError):
+            transport._ensure_pool()
+        self.assertEqual(_LazyFakePool.instances, 0)
+
+    def test_shutdown_during_pool_creation_releases_pool(self):
+        pool_init_started = threading.Event()
+        allow_pool_init = threading.Event()
+
+        class BlockingPool(_LazyFakePool):
+            def __init__(self, **kwargs):
+                pool_init_started.set()
+                if not allow_pool_init.wait(timeout=10):
+                    raise TimeoutError("pool initialization was not released")
+                super().__init__(**kwargs)
+
+        transport = self._build(pool_cls=BlockingPool)
+        ensure_thread = threading.Thread(target=transport._ensure_pool)
+        ensure_thread.start()
+        self.assertTrue(pool_init_started.wait(timeout=10))
+
+        shutdown_thread = threading.Thread(target=transport.shutdown)
+        shutdown_thread.start()
+        allow_pool_init.set()
+        ensure_thread.join(timeout=10)
+        shutdown_thread.join(timeout=10)
+        self.assertFalse(ensure_thread.is_alive())
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertEqual(_LazyFakePool.instances, 1)
+        self.assertIs(transport.pool, _LazyFakePool.made[0])
+        self.assertTrue(transport.pool.closed)
+
+    def test_disabled_transport_is_inert(self):
+        transport = self._build(transport="cpu")
+        self.assertFalse(transport._enabled)
+        self.assertIsNone(transport.pool)
+        self.assertIsNone(transport._publisher_executor)
+        with self.assertRaises(RuntimeError):
+            transport._ensure_pool()
 
 
 if __name__ == "__main__":
