@@ -559,11 +559,6 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
                 "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 supports prefill "
                 "context parallelism only with --cp-strategy=interleave"
             )
-        if view.enable_dsa_cache_layer_split:
-            raise ValueError(
-                "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 does not yet support "
-                "--enable-dsa-cache-layer-split; use the replicated KV cache"
-            )
         if view.enable_cp_decode_attn_tp:
             raise ValueError(
                 "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 requires H64 "
@@ -727,8 +722,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             )
         if user_set_decode and view.dsa_decode_backend != "flashmla_kv":
             raise ValueError(
-                "GLM-5.2 SM100 DSA NVFP4 requires "
-                "--dsa-decode-backend=flashmla_kv"
+                "GLM-5.2 SM100 DSA NVFP4 requires " "--dsa-decode-backend=flashmla_kv"
             )
         if not user_set_prefill:
             declared["dsa_prefill_backend"] = "flashmla_sparse"

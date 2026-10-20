@@ -582,13 +582,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             _should_elide_dsa_index_k,
         )
 
-        if (
-            allocate_all_layers
-            or get_memory().enable_hisparse
-            or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
-        ):
+        if allocate_all_layers or get_memory().enable_hisparse:
+            # Draft pools remain replicated even when the target shards layers.
             num_indexer_layers = num_layers
         else:
+            elide_index_k = _should_elide_dsa_index_k(
+                is_draft_worker=kvc.is_draft_worker
+            )
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
                 get_layer_shard_range,
@@ -603,7 +603,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     for layer_id in range(
                         kvc.layer_info.start_layer, kvc.layer_info.end_layer
                     )
-                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    if not elide_index_k
+                    or not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
                 ]
                 active_set = set(active_indexer_layers)
                 max_owned = 0
@@ -619,7 +620,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 num_indexer_layers = max_owned + 1
             else:
                 num_indexer_layers = sum(
-                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    not elide_index_k
+                    or not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
 

@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
@@ -6,8 +8,41 @@ import requests
 from sglang.test.run_eval import run_eval
 from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
 from sglang.test.test_utils import is_in_amd_ci, is_in_ci, write_github_step_summary
+from sglang.utils import download_and_cache_file, read_jsonl
 
 _THRESHOLD_NOT_SET = float("nan")
+
+
+def prepare_full_gsm8k_data(destination: Path) -> str:
+    """Build 20 train demonstrations followed by all 1319 held-out questions.
+
+    The completion evaluator removes its few-shot prefix from the input file.
+    Using test.jsonl alone therefore evaluates only 1299 questions at 20 shots.
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    base_url = (
+        "https://raw.githubusercontent.com/openai/grade-school-math/"
+        "master/grade_school_math/data/"
+    )
+    splits = {}
+    for split in ("train", "test"):
+        cached = destination.parent / f"gsm8k_{split}.jsonl"
+        source = download_and_cache_file(
+            base_url + split + ".jsonl", filename=str(cached)
+        )
+        splits[split] = list(read_jsonl(source))
+    if len(splits["train"]) < 20 or len(splits["test"]) != 1319:
+        raise ValueError(
+            "Full GSM8K acceptance requires 20 train examples and 1319 test examples"
+        )
+    rows = splits["train"][:20] + splits["test"]
+    temporary = destination.with_suffix(".tmp")
+    temporary.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    )
+    temporary.replace(destination)
+    return str(destination)
 
 
 def _check_accept_length(test_case, base_url, threshold=None):

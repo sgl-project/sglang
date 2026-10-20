@@ -83,11 +83,23 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-        for index_k in self.buffer:
-            if index_k.shape[0] != 0:
-                index_k[tgt_loc_flat] = index_k[src_loc_flat]
+        page_size = self.pool.page_size
+        tgt_loc = tgt_loc.view(-1).long()
+        src_loc = src_loc.view(-1).long()
+        tgt_page, tgt_offset = tgt_loc // page_size, tgt_loc % page_size
+        src_page, src_offset = src_loc // page_size, src_loc % page_size
+        key_bytes = page_size * self.pool.index_head_dim
+        scale_bytes = self.pool.index_head_dim // self.pool.quant_block_size * 4
+        for buffer in self.buffer:
+            if buffer.shape[0] == 0:
+                continue
+            # Each page stores all FP8 keys before all FP32 scales. They are
+            # separate regions, rather than interleaved 132-byte token rows.
+            keys = buffer[:, :key_bytes].view(-1, page_size, self.pool.index_head_dim)
+            scales = buffer[:, key_bytes:].view(-1, page_size, scale_bytes)
+            keys[tgt_page, tgt_offset] = keys[src_page, src_offset]
+            scales[tgt_page, tgt_offset] = scales[src_page, src_offset]
+        self.remote_layer_id = None
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
@@ -175,6 +187,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
+        self.remote_layer_id = None
         page_indices = indices[:: self.pool.page_size] // self.pool.page_size
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
@@ -352,12 +365,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- MLA latent KV: owned-only writes, owner-broadcast reads ----------
 
     def get_kv_size_bytes(self):
-        kv_size_bytes = 0
-        for kv_cache in self.kv_buffer:
-            kv_size_bytes += get_tensor_size_bytes(kv_cache)
-        for index_k_cache in self.index_k_with_scale_buffer:
-            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
-        return kv_size_bytes
+        # The base counts owned KV/indexer layers and persistent global scales.
+        # Both remote scratch buffers are real allocations on every CP rank.
+        return (
+            super().get_kv_size_bytes()
+            + get_tensor_size_bytes(self.remote_kv_buffer)
+            + get_tensor_size_bytes(self.index_key_cache.remote_buffer)
+        )
 
     def get_contiguous_buf_infos(self):
         # Only report buffers owned by the current CP rank; non-owned layers
@@ -379,6 +393,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
+        if self.dsa_kv_cache_store_packed_fp4:
+            return kv_buffer
         if self.store_dtype != self.dtype:
             return kv_buffer.view(self.dtype)
         return kv_buffer
@@ -388,6 +404,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         kv_buffer = self._get_broadcastable_kv_buffer(layer_id)
+        if self.dsa_kv_cache_store_packed_fp4:
+            # The NVFP4 consumer reads the same packed row for K and V.
+            return kv_buffer
         if self.store_dtype != self.dtype:
             return kv_buffer[..., : self.kv_lora_rank].view(self.dtype)
         return kv_buffer[..., : self.kv_lora_rank]
@@ -403,6 +422,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_packed_fp4
         # A write invalidates any cached remote copy for this layer.
         if self.pending_remote_kv_layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
@@ -534,6 +554,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
         if tgt_loc.numel() == 0:
             return
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
         for kv_cache in self.kv_buffer:
@@ -589,6 +611,8 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     ):
         from sglang.srt.utils import current_platform
 
+        self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
+        self.remote_kv_layer_id = None
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size

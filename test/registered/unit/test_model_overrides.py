@@ -2866,9 +2866,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 cp_strategy="zigzag",
                             )
                         )
-                    with self.assertRaisesRegex(
-                        ValueError, "does not yet support.*cache-layer-split"
-                    ):
+                    self.assertEqual(
                         _dsa_kv_cache_dtype_default(
                             _view(
                                 arch="GlmMoeDsaForCausalLM",
@@ -2877,7 +2875,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 cp_strategy="interleave",
                                 enable_dsa_cache_layer_split=True,
                             )
-                        )
+                        ),
+                        {},
+                    )
                     with self.assertRaisesRegex(
                         ValueError, "requires H64 attention-DP decode"
                     ):

@@ -440,7 +440,9 @@ def test_glm52_nvfp4_sparse_decode_cuda_graph_external_metadata(b: int, sq: int)
             TOPK,
         )
     )
-    assert scheduler_metadata.shape[0] == 148
+    # Flattened H64 queries use one scheduler partition per device SM.
+    sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    assert scheduler_metadata.shape[0] == sm_count
     for _ in range(3):
         torch.ops.sgl_kernel.sparse_decode_fwd_nvfp4.default(
             q_kernel,

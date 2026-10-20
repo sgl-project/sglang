@@ -399,6 +399,50 @@ class TestDefaultConfigurator(CustomTestCase):
             fused = create_memory_pool_configurator(mr)
         self.assertEqual(fused._cell_size, 77777)
 
+    def test_pd_nvfp4_layer_split_sizes_owned_layers_and_remote_scratch(self):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        for shard_size in (2, 4):
+            with self.subTest(shard_size=shard_size):
+                mr = _make_model_runner(
+                    self,
+                    num_layers=10,
+                    page_size=64,
+                    use_mla_backend=True,
+                    disaggregation_mode="prefill",
+                )
+                _configure_dsa_model(mr)
+                _publish_config(
+                    self,
+                    kv_cache_dtype="nvfp4",
+                    enable_dsa_cache_layer_split=True,
+                )
+                mr.server_args = get_server_args()
+                with (
+                    mock_cpu_env(kv_size=1),
+                    get_parallel().override(attn_cp_size=shard_size, attn_cp_rank=0),
+                    patch(
+                        "sglang.srt.model_executor.pool_configurator."
+                        "is_float4_e2m1fn_x2",
+                        return_value=True,
+                    ),
+                ):
+                    configurator = DefaultPoolConfigurator(mr)
+                    # 416 is already a byte count. Both the main KV and the
+                    # 132-byte indexer need owned layers plus one remote layer.
+                    layers = (10 + shard_size - 1) // shard_size + 1
+                    self.assertEqual(configurator._cell_size, (416 + 132) * layers)
+                    self.assertEqual(
+                        configurator._compute_dsa_indexer_cell_size(
+                            kvc=mr, num_layers=2, allocate_all_layers=True
+                        ),
+                        132 * 2,
+                    )
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_aux_config.eagle_draft_num_layers = 2
+                    with_draft = DefaultPoolConfigurator(mr)
+                    self.assertEqual(with_draft._cell_size, (416 + 132) * (layers + 2))
+
 
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""

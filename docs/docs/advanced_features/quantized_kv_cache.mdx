@@ -132,9 +132,8 @@ fused, and ordinary decode supports CUDA Graph replay.
 
 Prefill context parallelism is supported with the CP-v2 interleave strategy.
 Each CP rank first all-gathers the BF16 latent K/RoPE rows into logical token
-order, then writes a replicated NVFP4 cache. This favors a simple correctness
-path; it does not shard KV-cache capacity or reduce the BF16 CP communication
-volume. For TP8, use:
+order. By default, each rank writes a replicated NVFP4 cache. CP alone does not
+shard KV-cache capacity or reduce the BF16 CP communication volume. For TP8, use:
 
 ```bash Command
 python3 -m sglang.launch_server \
@@ -156,11 +155,127 @@ CUDA Graph remains available.
 
 This path currently rejects non-SM100 devices, other DSA model layouts, local
 query-head counts other than 64, page sizes other than 64, DCP, non-interleave
-Prefill CP, Prefill CP decode attention-TP, and DSA cache layer splitting.
+Prefill CP, and Prefill CP decode attention-TP.
 HiSparse is not supported on this path. The native FlashMLA operator must be
 rebuilt from a source revision that includes the SM100 NVFP4 specialization; a
 missing operator is reported at backend initialization instead of silently
 falling back to an unfused decode path.
+
+#### PD layer splitting with NVFP4
+
+On NVIDIA SM100, `--enable-dsa-cache-layer-split` can shard the NVFP4 main cache
+and the DSA indexer cache across the Prefill CP ranks. Each rank stores its owned
+layers and one remote-layer scratch buffer. Per-layer FP32 global scales remain
+replicated. The main cache uses 416 bytes per token per stored layer. The indexer
+uses 132 bytes per token per stored layer. Include both scratch buffers when
+measuring memory savings.
+
+Layer splitting requires a PD Prefill worker, interleave CP, Mooncake transfer,
+and PP=1. The Decode worker receives the complete cache and uses attention DP.
+EAGLE/MTP draft workers retain their complete cache. Use the same checkpoint and
+per-layer scale calibration on both sides. The model's weight format does not
+select the KV cache format; set `--kv-cache-dtype nvfp4` explicitly on both sides.
+
+The following Linux/CUDA example targets one eight-GPU B300 node. Set
+`MODEL_PATH` to a GLM-5.2 checkpoint in both terminals. Start Prefill on GPUs 0–3:
+
+```bash Prefill
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}" \
+    --port 30001 --nccl-port 29501 \
+    --disaggregation-mode prefill \
+    --disaggregation-bootstrap-port 8998 \
+    --disaggregation-transfer-backend mooncake \
+    --tp-size 4 --dp-size 1 --base-gpu-id 0 \
+    --enable-prefill-cp --cp-strategy interleave --attn-cp-size 4 \
+    --enable-dsa-cache-layer-split \
+    --attention-backend dsa --kv-cache-dtype nvfp4 --page-size 64 \
+    --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+    --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+    --max-total-tokens 131072 --mem-fraction-static 0.85 \
+    --speculative-algorithm EAGLE --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+Start Decode on GPUs 4–7:
+
+```bash Decode
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}" \
+    --port 30002 --nccl-port 29502 \
+    --disaggregation-mode decode \
+    --disaggregation-bootstrap-port 8998 \
+    --disaggregation-transfer-backend mooncake \
+    --tp-size 4 --dp-size 4 --enable-dp-attention --base-gpu-id 4 \
+    --attention-backend dsa --kv-cache-dtype nvfp4 --page-size 64 \
+    --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+    --max-total-tokens 131072 --mem-fraction-static 0.85 \
+    --speculative-algorithm EAGLE --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+Connect both workers through the PD router described in
+[PD Disaggregation](/docs/advanced_features/pd_disaggregation).
+Prefill CP still communicates BF16 K/RoPE rows. Layer splitting reduces stored
+cache capacity per rank; measure throughput and latency separately.
+
+For acceptance, first run the local codec and layer-broadcast tests. Then run
+the full GSM8K comparison from the repository root. Do not insert a separate
+generation smoke test between these steps:
+
+```bash Full acceptance
+python3 scripts/bench_glm52_nvfp4_layersplit.py \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}" \
+    --max-total-tokens 131072 \
+    --output-dir "${RESULT_DIR:?set RESULT_DIR to a new results directory}"
+```
+
+OCI GB300 exposes four GPUs per Slurm segment. Use two segments for the same
+P4/D4 comparison. Run the following command inside an eight-GPU allocation.
+Both segments must use the same source, ARM64 kernel build, model, and container:
+
+```bash Two-segment GB300 acceptance
+export SGLANG_ACCEPTANCE_NODES
+SGLANG_ACCEPTANCE_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | paste -sd, -)
+srun --nodes=2 --ntasks=2 --ntasks-per-node=1 \
+    python3 scripts/bench_glm52_nvfp4_layersplit_slurm.py \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the shared GLM-5.2 checkpoint}" \
+    --max-total-tokens 131072 \
+    --output-dir "${RESULT_DIR:?set RESULT_DIR to a new shared results directory}"
+```
+
+If the nodes do not load `nvidia-peermem`, set `WITH_NVIDIA_PEERMEM=0` to use
+DMA-BUF for Mooncake GPU memory registration. Set `MC_GID_INDEX` to a routable
+RoCE v2 GID. If automatic topology discovery selects a management NIC, use
+`MC_CUSTOM_TOPO_JSON` to select the data NICs. Apply the same settings on both
+segments and save them with the results.
+
+The first segment runs Prefill and the evaluation client. The second runs
+Decode. Each server uses local GPUs 0–3. Run the local kernel and broadcast tests
+before this command. The runner uses health checks before the full evaluation.
+It does not send generation smoke requests. Its performance comparison applies
+to the recorded GB300 topology.
+
+Add `--performance-only` to the two-segment runner to defer dataset accuracy
+evaluation. This mode samples ShareGPT token sequences with a fixed seed. It
+repeats or truncates each sequence to the required length. It measures 8192 input
+tokens and 512 output tokens at concurrency 32 and 200. It also measures 32768
+input tokens and 512 output tokens at concurrency 8. Each workload runs three
+times per configuration. Generation warmup requests are disabled. The results
+include throughput, TTFT, TPOT, and the actual Prefill pool allocation. This
+mode reports performance changes without applying the GSM8K accuracy or
+performance gates below.
+
+The runner uses 1319 questions, 20 shots, 200 client threads, and at most 512
+output tokens per question. The 20 demonstrations come from the training split.
+All 1319 test questions remain in the evaluation. The prepared dataset and its
+SHA-256 hash are saved with the results.
+Each configuration runs three times. All runs must
+score at least 93.5%. The median output throughput must reach at least 95% of
+the replicated-cache baseline. Median total evaluation time must stay within
+105% of that baseline. The runner also checks the per-rank cache allocation
+records. It writes versions, launch arguments, server logs, and `results.json`.
+These performance gates apply only to this GSM8K workload.
 
 ### Scaling Factors
 

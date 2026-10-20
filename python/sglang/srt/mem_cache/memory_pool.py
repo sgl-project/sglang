@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import copy
 import dataclasses
+import json
 import logging
 import math
 import os
@@ -60,6 +61,8 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     NVFP4_BYTES_PER_TOKEN as DSA_NVFP4_BYTES_PER_TOKEN,
+)
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     dequantize_nvfp4_k_cache_paged,
     quantize_nvfp4_k_cache_into,
 )
@@ -4838,6 +4841,15 @@ class MLATokenToKVPool(KVCache):
         )
         self.kv_scale_buffer = None
 
+        if self.dsa_kv_cache_store_nvfp4:
+            # Subclasses can replace _create_buffers (for example, layer split).
+            # Every pool needs the same persistent per-layer scales. Keep them
+            # outside discardable KV regions so rebuilding buffers preserves
+            # both their calibrated values and CUDA-graph-captured addresses.
+            self.mla_kv_global_scale = torch.ones(
+                self.layer_num, dtype=torch.float32, device=self.device
+            )
+
         self._create_buffers()
 
         self.data_ptrs = torch.tensor(
@@ -4906,13 +4918,6 @@ class MLATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
-        if self.dsa_kv_cache_store_nvfp4 and not hasattr(self, "mla_kv_global_scale"):
-            # CUDA graphs capture this address and every encoded row depends on
-            # its value, so keep the per-layer scales outside discardable KV
-            # allocation regions.
-            self.mla_kv_global_scale = torch.ones(
-                self.layer_num, dtype=torch.float32, device=self.device
-            )
 
     def _clear_buffers(self):
         del self.kv_buffer
@@ -5490,6 +5495,33 @@ class DSATokenToKVPool(MLATokenToKVPool):
             max_running_requests=max_running_requests,
         )
         self._finalize_allocation_log(size)
+        if self.dsa_kv_cache_store_nvfp4:
+            allocation = {
+                "device": (
+                    str(self.kv_buffer[0].device)
+                    if self.kv_buffer
+                    else str(self.device)
+                ),
+                "layers": int(self.layer_num),
+                "capacity_tokens": int(self.size),
+                "layer_split": self.layer_shard_enabled,
+                "layer_shard_rank": getattr(self, "layer_shard_rank", None),
+                "main_bytes": sum(t.nbytes for t in self.kv_buffer),
+                "index_bytes": sum(t.nbytes for t in self.index_k_with_scale_buffer),
+                "remote_main_bytes": (
+                    self.remote_kv_buffer.nbytes if self.layer_shard_enabled else 0
+                ),
+                "remote_index_bytes": (
+                    self.index_key_cache.remote_buffer.nbytes
+                    if self.layer_shard_enabled
+                    else 0
+                ),
+                "global_scale_bytes": self.mla_kv_global_scale.nbytes,
+                "total_bytes": int(self.get_kv_size_bytes()),
+            }
+            logger.info(
+                "DSA NVFP4 pool bytes: %s", json.dumps(allocation, sort_keys=True)
+            )
 
     def _create_index_key_cache(self) -> IndexKeyCache:
         return IndexKeyCache(self, self.index_buf_size)
