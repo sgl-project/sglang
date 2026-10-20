@@ -8,6 +8,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
+    StandardDispatchOutput,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
@@ -439,6 +440,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
         ):
             for routing_method_type, expected in (
                 (None, MoeRunnerBackend.TRITON),
+                (RoutingMethodType.Unspecified, MoeRunnerBackend.TRITON),
                 (RoutingMethodType.Llama4, MoeRunnerBackend.FLASHINFER_TRTLLM),
             ):
                 with self.subTest(routing_method_type=routing_method_type):
@@ -470,6 +472,22 @@ class TestLayerRunnerDispatch(CustomTestCase):
                         if routing_method_type == RoutingMethodType.Llama4
                         else TopKOutputFormat.STANDARD,
                     )
+                    if expected == MoeRunnerBackend.FLASHINFER_TRTLLM:
+                        with self.assertRaisesRegex(
+                            NotImplementedError, "materialized"
+                        ):
+                            layer.quant_method.apply(
+                                layer,
+                                StandardDispatchOutput(
+                                    torch.ones((1, 4)),
+                                    None,
+                                    StandardTopKOutput(
+                                        torch.ones((1, 2)),
+                                        torch.tensor([[0, 1]], dtype=torch.int32),
+                                        None,
+                                    ),
+                                ),
+                            )
 
     def test_router_rebinding_rejects_conflicting_contract_before_mutation(self):
         for first, second in (
