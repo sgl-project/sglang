@@ -321,12 +321,10 @@ jobs:
           path: ~/.cache/bazel
           key: tair-kvcache-bazel-534df33b
 
+      # .bazeliskrc in the checkout pins bazel 6.4.0 and its download mirror;
+      # overriding BAZELISK_BASE_URL here would change bazelisk's URL layout.
       - name: Build the manager
         working-directory: ${{ runner.temp }}/tair-kvcache
-        env:
-          # The checkout pins a mirror via .bazeliskrc; point bazelisk at the
-          # official release host instead, which GitHub runners reach reliably.
-          BAZELISK_BASE_URL: https://releases.bazel.build
         run: bazelisk build //kv_cache_manager:kv_cache_manager_bin
 
       - name: Rust cache
