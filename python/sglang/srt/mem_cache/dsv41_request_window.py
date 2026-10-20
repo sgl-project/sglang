@@ -4,7 +4,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.request_window_copy import (
+from sglang.kernels.ops.kvcache.dsv4_request_window_copy import (
     commit_packed_rows,
     copy_packed_rows,
 )

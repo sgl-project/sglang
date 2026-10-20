@@ -19,15 +19,20 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    BuildPageTablePositions,
+    ExpandPrefillCausally,
+    late_layer_tail_layout,
+    late_layer_tail_lens,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
-    cast_q_fp8_for_q8kv8_prefill,
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsv4,
     fp8_dtype,
-    gather_dequant_requant_fp8_paged,
-    q8kv8_padded_num_heads,
+    gather_dequant_requant_fp8_paged_dsv4,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -35,14 +40,6 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
-)
-from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-    BuildCausalSwaPageIndices,
-    BuildPageTablePositions,
-    ExpandPrefillCausally,
-    late_layer_tail_layout,
-    late_layer_tail_lens,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
@@ -75,6 +72,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     expand_index_page_table,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
@@ -4247,14 +4245,14 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            dequantize_k_cache_paged_dsv4(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
-        dequantize_k_cache_paged(
+        dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -4291,6 +4289,11 @@ class DeepseekV4AttnBackend(
         attn_sink: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+            cast_q_fp8_for_q8kv8_prefill,
+            q8kv8_padded_num_heads,
+        )
+
         num_tokens, num_heads, head_dim = q.shape
         padded_heads = q8kv8_padded_num_heads(num_heads)
 
@@ -4420,14 +4423,14 @@ class DeepseekV4AttnBackend(
         # The Q8KV8 gather reads the 584-byte V4 layout only (its kernel is SM90).
         assert token_to_kv_pool.get_swa_key_layout() is KVLayout.V4
         if compressed_slice is not None:
-            gather_dequant_requant_fp8_paged(
+            gather_dequant_requant_fp8_paged_dsv4(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
             )
 
-        gather_dequant_requant_fp8_paged(
+        gather_dequant_requant_fp8_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -4547,11 +4550,11 @@ class DeepseekV4AttnBackend(
         )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
+            from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+                build_page_table_positions_small,
+            )
             from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
                 build_low_ratio_metadata,
-            )
-            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-                build_page_table_positions_small,
             )
 
             build_pages = build_page_table_positions_small
