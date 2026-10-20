@@ -8,6 +8,8 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942-rocm1000 -t v0.5.17-rocm10-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm1000 -t v0.5.17-rocm10-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm1000 -t v0.5.17-rocm10-mi45x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx942-rocm1010 -t v0.5.17-rocm101-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx950-rocm1010 -t v0.5.17-rocm101-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.17 --build-arg GPU_ARCH=gfx1250-rocm1010 -t v0.5.17-rocm101-mi45x -f rocm.Dockerfile .
 #
 # Flavor notes:
@@ -51,6 +53,8 @@ ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_re
 ARG BASE_IMAGE_942_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_950_ROCM1000="rocm1000-base"
 ARG BASE_IMAGE_1250_ROCM1000="rocm1000-base"
+ARG BASE_IMAGE_942_ROCM1010="rocm1000-base"
+ARG BASE_IMAGE_950_ROCM1010="rocm1000-base"
 ARG BASE_IMAGE_1250_ROCM1010="rocm1000-base"
 ARG BASE_IMAGE_ROCM1000="ubuntu:24.04"
 
@@ -346,6 +350,31 @@ ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
 # The upstream Triton the gfx1250 bring-up was validated against, carried over
 # from the ROCm 7.14 flavor this image replaced. Built from source below.
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
+# ===============================
+# Base image 942 with ROCm 10.1.0 and args (Python 3.12 + torch 2.12)
+# Like the 10.0 stages, BUILD_TRITON=0 keeps the Triton that the SDK ships.
+FROM $BASE_IMAGE_942_ROCM1010 AS gfx942-rocm1010
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
+# ===============================
+# Base image 950 with ROCm 10.1.0 and args (Python 3.12 + torch 2.12)
+FROM $BASE_IMAGE_950_ROCM1010 AS gfx950-rocm1010
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="2bb549102ba2d9e51da8ef21107361827075d8b6"
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
@@ -1026,7 +1055,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     echo "${ROCM_SYSDEPS}/lib" > /etc/ld.so.conf.d/rocm-sysdeps.conf; \
     ldconfig; \
     echo "[MORI] rocm_sysdeps prefix: ${ROCM_SYSDEPS}"; \
-  elif [ "${GPU_ARCH##*-}" = "rocm1000" ] && [ -d "${ROCM_SYSDEPS}" ]; then \
+  elif [[ "${GPU_ARCH##*-}" == rocm1000 || "${GPU_ARCH##*-}" == rocm1010 ]] && [ -d "${ROCM_SYSDEPS}" ]; then \
     export CMAKE_PREFIX_PATH="${ROCM_SYSDEPS}${CMAKE_PREFIX_PATH:+:${CMAKE_PREFIX_PATH}}"; \
     export CPATH="${ROCM_SYSDEPS}/include${CPATH:+:${CPATH}}"; \
     export LIBRARY_PATH="${ROCM_SYSDEPS}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"; \
@@ -1054,7 +1083,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       build-essential autoconf automake libtool pkg-config git \
       libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
   # Mooncake's dependencies.sh apt-installs Ubuntu's libabsl-dev (20220623 on
-  # the noble base used by rocm724 and rocm1000). NIXL's meson then
+  # the noble base used by rocm724, rocm1000 and rocm1010). NIXL's meson then
   # finds absl_base but no absl_log and refuses to fall back to its bundled
   # Abseil -- "that would result in a mix of Abseil versions at runtime" -- so
   # nixl fails at metadata generation. Drop just the -dev package (headers and
@@ -1066,7 +1095,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   if [ "${GPU_ARCH_LIST}" = "gfx1250" ]; then \
     apt-get remove -y libabsl-dev libabsl20220623 || true; \
   else \
-    case "${GPU_ARCH}" in *-rocm724|*-rocm1000) apt-get remove -y libabsl-dev ;; esac; \
+    case "${GPU_ARCH}" in *-rocm724|*-rocm1000|*-rocm1010) apt-get remove -y libabsl-dev ;; esac; \
   fi; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \

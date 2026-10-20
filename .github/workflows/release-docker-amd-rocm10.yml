@@ -21,6 +21,8 @@ on:
           - 'all'
           - gfx942-rocm1000
           - gfx950-rocm1000
+          - gfx942-rocm1010
+          - gfx950-rocm1010
   schedule:
     - cron: '0 12 * * *'
 
@@ -36,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm1000", "gfx950-rocm1000"]') }}
+        gpu_arch: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.gpu_arch != 'all' && inputs.gpu_arch != '') && format('["{0}"]', inputs.gpu_arch) || '["gfx942-rocm1000", "gfx950-rocm1000", "gfx942-rocm1010", "gfx950-rocm1010"]') }}
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -86,6 +88,8 @@ jobs:
           case "$GPU_ARCH" in
             gfx942-rocm1000) rocm_tag="rocm10-mi30x" ;;
             gfx950-rocm1000) rocm_tag="rocm10-mi35x" ;;
+            gfx942-rocm1010) rocm_tag="rocm101-mi30x" ;;
+            gfx950-rocm1010) rocm_tag="rocm101-mi35x" ;;
             *)
               echo "Unsupported GPU arch: $GPU_ARCH"
               exit 1
