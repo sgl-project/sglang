@@ -510,6 +510,20 @@ class TboForwardBatchPreparer:
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
         if batch.tbo_split_seq_index is None or is_draft_worker:
             return
+        # split_spec_info only knows EagleVerifyInput. Spec-v2 workers turn the
+        # scheduled DECODE batch into TARGET_VERIFY after the scheduler picked a
+        # split, and an idle DP rank joins that step as IDLE (or TARGET_VERIFY)
+        # carrying the same kind of verify input. When that input cannot be split
+        # (e.g. DSpark's DFlashVerifyInput), every rank of the step lands here, so
+        # they all run it without TBO and the MoE collectives still pair up.
+        if (
+            (batch.forward_mode.is_target_verify() or batch.forward_mode.is_idle())
+            and batch.spec_info is not None
+            and batch.spec_info.is_verify_input()
+            and not hasattr(batch.spec_info, "retrieve_index")
+        ):
+            batch.tbo_split_seq_index = None
+            return
 
         tbo_children_num_token_non_padded = (
             cls.compute_tbo_children_num_token_non_padded(batch)
