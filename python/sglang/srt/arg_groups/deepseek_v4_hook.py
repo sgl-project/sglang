@@ -16,7 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     run_post_process_pass,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
@@ -250,7 +250,7 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
 
@@ -363,30 +363,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
-
-    prefill_graph = cfg.cuda_graph_config.prefill
-    cp_breakable_prefill = (
-        cfg.enable_prefill_cp
-        and cfg.cp_strategy == "interleave"
-        and cfg.tp_size > 1
-        and prefill_graph.backend == Backend.BREAKABLE
-    )
-    if (
-        prefill_graph.backend != Backend.DISABLED
-        and prefill_graph.max_seq_len is None
-        and not cp_breakable_prefill
-    ):
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v41_features",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, max_seq_len=16 * 1024
-            ),
-        )
-        logger.warning(
-            "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
-            "DeepSeek-V4.1; longer contexts run eager prefill."
-        )
 
     incompatible = (
         (

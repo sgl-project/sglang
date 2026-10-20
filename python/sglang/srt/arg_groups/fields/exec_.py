@@ -192,6 +192,10 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
     ] = None
+    enable_nvidia_megakernel: A[
+        bool,
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
     monokernel_backend: A[
         Optional[str],
         "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
@@ -954,6 +958,22 @@ class ExecMoe(msgspec.Struct):
         bool,
         "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
+
+    # -------------------------------------------------------------------------
+    # Paged experts
+    # -------------------------------------------------------------------------
+    enable_paged_experts: A[
+        bool,
+        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
+        "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
+        "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
+        "prefill graphs must be breakable or disabled.",
+    ] = False
+    paged_experts_num_resident: A[
+        Optional[int],
+        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
+        "--enable-paged-experts; at least the router's top-k.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
