@@ -1,5 +1,5 @@
 # Adapted from NVIDIA TensorRT-LLM (https://github.com/NVIDIA/TensorRT-LLM)
-"""Shared double-buffer event protocol and peer-weight slice copies."""
+"""Double-buffered async prefetch of peer expert weights into the composite VA."""
 
 from __future__ import annotations
 
