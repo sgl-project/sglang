@@ -1,9 +1,17 @@
+from array import array
+from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import sglang.srt.arg_groups.speculative_hook as speculative_hook
 import torch
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.dlite_worker_v2 import DLiteWorkerV2, _commit_accept
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -107,6 +115,60 @@ def test_request_validation_enforces_dlite_contract(
         assert error is None
     else:
         assert expected in error
+
+
+def test_scheduler_rejects_invalid_dlite_request_without_queueing():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.enable_session_radix_cache = False
+    scheduler.model_config = SimpleNamespace(hf_eos_token_id={1}, vocab_size=128)
+    scheduler.disaggregation_mode = DisaggregationMode.NULL
+    scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+    scheduler.tokenizer = None
+    scheduler.dllm_config = None
+    scheduler.spec_algorithm = SimpleNamespace(
+        name="DLITE",
+        is_dflash_family=lambda: True,
+        is_uno=lambda: False,
+    )
+    scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+    scheduler._record_kv_event_lora_name = MagicMock()
+    scheduler._add_request_to_queue = MagicMock()
+    scheduler.init_req_max_new_tokens = MagicMock()
+    scheduler.output_streamer = MagicMock()
+    sender = MagicMock()
+    scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
+    recv_req = MagicMock(
+        session_params=None,
+        session_id=None,
+        input_embeds=None,
+        bootstrap_port=1,
+    )
+    req = Req(
+        "stochastic-dlite",
+        "Hello",
+        array("q", [1]),
+        SamplingParams(temperature=0.7, top_k=20),
+    )
+
+    with (
+        get_context().override_server_args(weight_version="test"),
+        get_parallel().override(tp_rank=0),
+        patch("sglang.srt.managers.scheduler.Req", return_value=req),
+        patch(
+            "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+            return_value=1,
+        ),
+    ):
+        scheduler.handle_generate_request(recv_req)
+
+    sender.send_output.assert_called_once()
+    abort, original = sender.send_output.call_args.args
+    assert isinstance(abort, AbortReq)
+    assert original is req
+    assert abort.finished_reason["status_code"] == HTTPStatus.BAD_REQUEST
+    assert "greedy decoding only" in abort.finished_reason["message"]
+    scheduler._add_request_to_queue.assert_not_called()
+    scheduler.output_streamer.stream_output.assert_not_called()
 
 
 def test_server_args_reject_non_nvidia_cuda_platform():

@@ -3083,9 +3083,16 @@ class Scheduler(
                 algorithm=self.spec_algorithm.name,
             )
             if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
+                abort_req = _make_abort_req(
+                    req,
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": error_msg,
+                    },
+                )
+                req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+                self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
                 return
 
         if self.spec_algorithm.is_uno():
