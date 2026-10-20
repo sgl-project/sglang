@@ -25,6 +25,8 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ElasticScaleUpdateReq,
+    ObserveElasticEPMembershipReqInput,
+    ObserveElasticEPMembershipReqOutput,
     RecoverElasticEPReqInput,
     RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
@@ -115,6 +117,10 @@ def _manager() -> TokenizerManager:
                 recovery_phase="restoring",
             )
         ]
+    )
+    manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
+        send=manager._dispatch_to_scheduler,
+        fan_out=manager.elastic_worker_count,
     )
     return manager
 
@@ -497,6 +503,77 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         result = await task
         self.assertTrue(result.success)
         manager._dispatch_to_scheduler.assert_called_once_with(ranks)
+
+    async def test_membership_observation_uses_active_survivor_quorum(self):
+        """Membership observations must not wait for the fenced rank."""
+        manager = _manager()
+        sent = []
+        manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
+            send=sent.append,
+            fan_out=4,
+        )
+        recovery_sent = []
+        manager.recover_elastic_ep_communicator = FanOutCommunicator(
+            send=recovery_sent.append,
+            fan_out=4,
+        )
+        manager.update_active_ranks(
+            ActiveRanksOutput(status=[True, True, False, True])
+        )
+
+        task = asyncio.create_task(
+            manager.observe_elastic_ep_membership(
+                ObserveElasticEPMembershipReqInput(
+                    runtime_instance_id="runtime-1",
+                    topology_generation=3,
+                    rank=2,
+                    failed_allocation_incarnation="pod-uid-5",
+                    membership_epoch=4,
+                )
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(len(sent), 1)
+        for _ in range(3):
+            manager.observe_elastic_ep_membership_communicator.handle_recv(
+                ObserveElasticEPMembershipReqOutput(
+                    accepted=True,
+                    message="accepted",
+                    observation_key="observation-key",
+                )
+            )
+
+        result = await task
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.observation_key, "observation-key")
+        self.assertEqual(recovery_sent, [])
+
+    async def test_membership_observation_rejects_without_active_ranks(self):
+        manager = _manager()
+        manager.recover_elastic_ep_communicator = FanOutCommunicator(
+            send=MagicMock(),
+            fan_out=4,
+        )
+        manager.update_active_ranks(
+            ActiveRanksOutput(status=[False, False, False, False])
+        )
+
+        result = await manager.observe_elastic_ep_membership(
+            ObserveElasticEPMembershipReqInput(
+                runtime_instance_id="runtime-1",
+                topology_generation=3,
+                rank=2,
+                failed_allocation_incarnation="pod-uid-5",
+                membership_epoch=4,
+            )
+        )
+
+        self.assertFalse(result.accepted)
+        self.assertEqual(
+            result.message,
+            "Membership observation requires at least one active rank.",
+        )
+        manager._dispatch_to_scheduler.assert_called_once()
 
     async def test_unknown_recovery_submission_is_reconciled(self):
         """A timed-out admission must be resubmitted with the same identity."""
