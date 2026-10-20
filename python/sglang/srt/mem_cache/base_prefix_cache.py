@@ -632,6 +632,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
 
+    def waiting_storage_span(
+        self, request: CacheRequestHandle
+    ) -> Optional[tuple[int, int]]:
+        """Expected storage-hit span in logical tokens for a waiting request."""
+        return None
+
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:

@@ -366,6 +366,8 @@ class Envs:
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+    # Comma-separated peer IPs admitted by TCP-bound IPC sockets; empty admits all.
+    SGLANG_ZMQ_ALLOWED_PEERS = EnvTuple(tuple())
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
@@ -522,12 +524,12 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
-    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # DSpark opt-in: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
-    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
-    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
-    # (hip graph) instead of falling back to the eager accept + commit path.
-    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(False)
+    # DSpark opt-in: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (CUDA/HIP graph) instead of falling back to the eager accept + commit path.
+    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(False)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -667,7 +669,7 @@ class Envs:
     # read-done fastpath event.
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
-    SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(False)
+    SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
@@ -1573,6 +1575,8 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Group replies by tokenizer worker; disable for per-request delivery.
+    SGLANG_BATCH_TOKENIZER_OUTPUTS = EnvBool(True)
     # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
     SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
     # Shorter prompts use the single-call encode; below this the gain is eaten
@@ -1743,6 +1747,9 @@ class Envs:
     # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    # gfx950 aiter MXFP8 dense route: keep the weight (16, 16)-preshuffled and run aiter's FlyDSL MXFP8
+    # GEMM (needs aiter with ROCm/aiter#5896) instead of the Triton group32 GEMM on the plain weight.
+    SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE = EnvBool(False)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
