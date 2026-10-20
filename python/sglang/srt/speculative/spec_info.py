@@ -138,8 +138,7 @@ class SpeculativeAlgorithm(Enum):
     def supports_prefill_shared_read_done(self) -> bool:
         """Whether target EXTEND has no later speculative shared-buffer reader.
 
-        The backend must still declare a pre-replay read end. Other algorithms
-        must stage their draft's shared reads before publishing the target event.
+        The backend must still declare a pre-replay read end.
         """
         # DSPARK's draft KV inject reads the SWA mapping after the target prefill.
         return self.is_none() or self.is_dflash()

@@ -329,7 +329,6 @@ class EagerRunner(BaseRunner):
             )
             maybe_publish_prefill_shared_read_done(
                 model_runner,
-                forward_batch,
                 shared_read_ends,
                 torch.get_device_module(model_runner.device),
             )

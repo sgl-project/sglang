@@ -22,16 +22,13 @@ def make_external_event(device_module) -> Optional[torch.cuda.Event]:
 
 
 def maybe_publish_prefill_shared_read_done(
-    model_runner, forward_batch, shared_read_ends: SharedReadEnds, device_module
+    model_runner, shared_read_ends: SharedReadEnds, device_module
 ) -> None:
     """Publish prefill read-done at the resolved pre-replay boundary."""
     if shared_read_ends is not SharedReadEnds.PRE_REPLAY:
         return
     if not model_runner.spec_algorithm.supports_prefill_shared_read_done():
-        # Stage the draft's shared reads before publishing the read-done event.
-        stage = getattr(model_runner, "prefill_shared_read_stager", None)
-        if stage is None or not stage(forward_batch):
-            return
+        return
     logger.info_once(
         "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,

@@ -2329,10 +2329,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # Publish after replay prep, including the chunked-prefix gather
             # above, which also reads the shared tables.
             maybe_publish_prefill_shared_read_done(
-                self.model_runner,
-                forward_batch,
-                shared_read_ends,
-                self.device_module,
+                self.model_runner, shared_read_ends, self.device_module
             )
             self._wait_for_layer_loads()
 
