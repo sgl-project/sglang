@@ -2326,8 +2326,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # The only variants this runner records are chunked-prefix ones.
             if shape_key.variant_label is not None:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
-            # Replay prep, including the optional chunked-prefix gather above,
-            # has finished every scheduler-shared read.
+            # Publish after replay prep, including the chunked-prefix gather
+            # above, which also reads the shared tables.
             maybe_publish_prefill_shared_read_done(
                 self.model_runner,
                 forward_batch,
