@@ -335,6 +335,9 @@ class SGLDiffusionGenerator:
         self.model_path = None
         self.generator = None
         self.executor = None
+        # Executor that sent the last request; differs from self.executor
+        # after a cached executor rebuilt the worker.
+        self._active_executor = None
         self.model_type = None
         self.last_options = None
         self._patcher = None
@@ -449,7 +452,7 @@ class SGLDiffusionGenerator:
         import sglang
 
         args = self.generator.server_args
-        executor = self.executor
+        executor = self._active_executor or self.executor
         pids = [proc.pid for proc in self._worker_processes()]
         loader = _loader_settings(
             args=args,
@@ -528,6 +531,7 @@ class SGLDiffusionGenerator:
 
     def ensure_executor(self, executor) -> None:
         """Rebuild the worker if this cached executor no longer owns it."""
+        self._active_executor = executor
         if self._owns_live(executor):
             return
         reload = executor._sgld_reload
@@ -579,6 +583,7 @@ class SGLDiffusionGenerator:
         self.model_path = None
         self.generator = None
         self.executor = None
+        self._active_executor = None
         self.model_type = None
         self._patcher = None
 

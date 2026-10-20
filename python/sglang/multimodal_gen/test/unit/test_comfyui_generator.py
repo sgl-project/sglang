@@ -505,3 +505,13 @@ def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
     client = server_api.SGLDiffusionServerAPI(base_url="http://host:30010/v1")
     assert client.get_model_info() == card
     assert urls == ["http://host:30010/v1/models"]
+
+
+def test_status_text_reads_executor_that_ran_after_rebuild() -> None:
+    """After a cached executor rebuilds the worker, status shows its metrics."""
+    runtime = _status_runtime()
+    running = runtime.executor
+    runtime.executor = SimpleNamespace(last_metrics=None)
+    runtime._owns_live = lambda executor: True
+    runtime.ensure_executor(running)
+    assert "123.4 ms" in runtime.status_text()
