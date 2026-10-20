@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -114,6 +116,7 @@ class TreePathNodeInfo(msgspec.Struct, frozen=True):
     path_end: int
     # Logical FULL device indices; None when the value is absent.
     full_value_len: Optional[int]
+    num_children: int
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
@@ -151,7 +154,6 @@ if TYPE_CHECKING:
     )
     from sglang.srt.mem_cache.unified_cache.components import (
         CacheTransferPhase,
-        ComponentType,
     )
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
         StorageBackupSpec,
@@ -429,6 +431,8 @@ class UnifiedTreeCoreInterface(ABC):
 
         Roots and nodes without device values are no-ops. Missing handles raise
         KeyError; disabled components raise ValueError.
+        Negative totals raise ValueError without updating the count. Rust also
+        rejects fixed-width overflow; Python integers are unbounded.
         """
         ...
 
@@ -728,7 +732,11 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
         """Return maximal missing SWA ranges within the matched [start, end) span."""
         ...
@@ -740,6 +748,7 @@ class UnifiedTreeCoreInterface(ABC):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA window to tombstoned spans, returning split actions.
 

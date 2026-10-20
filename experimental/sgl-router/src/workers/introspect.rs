@@ -72,6 +72,15 @@ pub struct ServerInfo {
     pub dp_ranks: u32,
     /// The engine's OpenAI-layer server args; `None` when `/server_info` did not report them.
     pub openai: Option<OpenAiSettings>,
+    /// The engine's native gRPC port (`--grpc-port`), served beside HTTP.
+    pub grpc_port: Option<u16>,
+    /// Whether a prefill engine computes a request before its decode peer
+    /// bootstraps: `--optimistic-prefill-attempts` above 0 or
+    /// `--disaggregation-decode-allocation-policy prefill_complete`.
+    /// `--decode-dispatch-limit` holds decode back until earlier KV has
+    /// arrived, so a prefill without either never starts. `None` when
+    /// `/server_info` predates the field or did not answer.
+    pub prefill_before_bootstrap: Option<bool>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -172,11 +181,11 @@ impl WorkerIntrospector {
         }
 
         // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
-        // token bigrams; the router must mirror that on the selection side.
+        // token bigrams, except on hybrid (Mamba/linear-attention) models.
         let is_bigram = crate::state::kv_events::classify_bigram(
             parsed.speculative_algorithm.as_deref(),
             worker_url,
-        );
+        ) && !parsed.uses_mamba_radix_cache;
         let event_config = parsed
             .kv_events
             .map(|block| resolve_event_config(block, worker_url, is_bigram));
@@ -197,6 +206,12 @@ impl WorkerIntrospector {
                 .unwrap_or(1)
                 .saturating_mul(parsed.attn_dp_size.unwrap_or(1)),
             openai,
+            grpc_port: parsed.grpc_port,
+            prefill_before_bootstrap: parsed.optimistic_prefill_attempts.map(|attempts| {
+                attempts > 0
+                    || parsed.disaggregation_decode_allocation_policy.as_deref()
+                        == Some("prefill_complete")
+            }),
         }
     }
 
@@ -386,6 +401,10 @@ struct ServerInfoBody {
     /// token bigrams. Absent on workers without speculative decoding.
     #[serde(default)]
     speculative_algorithm: Option<String>,
+    /// Hybrid (Mamba/linear-attention) models keep unigram KV keys even
+    /// under EAGLE.
+    #[serde(default)]
+    uses_mamba_radix_cache: bool,
     /// Carries the value of `ServerArgs.disaggregation_mode`
     /// (`"null"` | `"prefill"` | `"decode"`). Absent on older SGLang
     /// versions that predate the field.
@@ -407,6 +426,16 @@ struct ServerInfoBody {
     /// Absent on engines that express attention DP through `dp_size`.
     #[serde(default)]
     attn_dp_size: Option<u32>,
+    #[serde(default)]
+    grpc_port: Option<u16>,
+    /// `ServerArgs.optimistic_prefill_attempts`; absent on engines that predate it.
+    /// Signed like the engine's unvalidated `int`, so a negative value reads as
+    /// no optimistic prefill instead of failing the whole body.
+    #[serde(default)]
+    optimistic_prefill_attempts: Option<i64>,
+    /// `ServerArgs.disaggregation_decode_allocation_policy`.
+    #[serde(default)]
+    disaggregation_decode_allocation_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,6 +574,28 @@ mod tests {
             cfg.is_bigram,
             "EAGLE worker via the introspector must set is_bigram"
         );
+    }
+
+    /// A hybrid (Mamba/KDA) EAGLE worker keeps unigram KV keys, so it must
+    /// NOT be bigram.
+    #[tokio::test]
+    async fn fetch_no_bigram_for_hybrid_eagle_worker() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "speculative_algorithm": "EAGLE",
+            "uses_mamba_radix_cache": true,
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector().fetch(&url).await.event_config.unwrap();
+        assert!(!cfg.is_bigram);
     }
 
     /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.
@@ -828,6 +879,33 @@ mod tests {
         ] {
             let (url, _shutdown) = spawn_fake_worker(body).await;
             assert_eq!(fast_introspector().fetch(&url).await.dp_ranks, want);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_reports_whether_prefill_runs_before_bootstrap() {
+        for (body, want) in [
+            (json!({"optimistic_prefill_attempts": 2}), Some(true)),
+            (
+                json!({
+                    "optimistic_prefill_attempts": 0,
+                    "disaggregation_decode_allocation_policy": "prefill_complete",
+                }),
+                Some(true),
+            ),
+            (
+                json!({
+                    "optimistic_prefill_attempts": 0,
+                    "disaggregation_decode_allocation_policy": "early",
+                }),
+                Some(false),
+            ),
+            (json!({"optimistic_prefill_attempts": -1}), Some(false)),
+            (json!({}), None),
+        ] {
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.prefill_before_bootstrap, want);
         }
     }
 
