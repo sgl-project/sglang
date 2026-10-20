@@ -348,5 +348,34 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         self.assertEqual(backend.get_enum(), AttentionBackendEnum.AITER)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestTrtllmGenSageMetadata(unittest.TestCase):
+    def test_metadata_builds_inside_cuda_graph_capture(self):
+        """The DiT prepares this metadata inside its forward, which breakable
+        CUDA graphs capture; a host-to-device copy there failed the capture."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            ForwardContext,
+        )
+
+        context = ForwardContext(current_timestep=0, attn_metadata=None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qo, kv, seq_lens = context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(qo.tolist(), [0, 3, 6])
+        self.assertEqual(kv.tolist(), [0, 5, 10])
+        self.assertEqual(seq_lens.tolist(), [5, 5])
+        self.assertEqual({t.dtype for t in (qo, kv, seq_lens)}, {torch.int32})
+        self.assertIs(
+            context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )[0],
+            qo,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
