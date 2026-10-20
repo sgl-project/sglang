@@ -1582,6 +1582,28 @@ class IndexerKPool(MultiPlatformOp):
 
         return self._full_topk_for_short_sequence(metadata, x.device)
 
+    def forward_k_only(
+        self,
+        *,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> None:
+        """Write the pooled indexer K cache and tails for the batch's tokens."""
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+        if metadata is None:
+            return
+        self._forward_cuda_skip_logits(
+            x,
+            positions,
+            forward_batch,
+            layer_id,
+            act_quant=None,
+            metadata=metadata,
+            return_indices=False,
+        )
+
     def _forward_cuda_target_verify(
         self,
         x: torch.Tensor,

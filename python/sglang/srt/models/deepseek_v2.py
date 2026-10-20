@@ -2876,6 +2876,28 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return (hidden_states, topk_indices)
 
+    def forward_kv_only(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        """Write this layer's KV cache for the batch's tokens; no attention or MLP."""
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=self._resolve_gfx95_quant_format(),
+        )
+        try:
+            self.self_attn.forward_kv_only(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        finally:
+            get_attn_tp_context().clear_attn_inputs()
+
     def op_comm_prepare_attn(
         self,
         state,

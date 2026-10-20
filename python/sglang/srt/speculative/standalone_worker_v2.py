@@ -110,6 +110,8 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.dsa_seed_topk_width = None
         self.seed_dsa_topk_from_draft_extend = False
         self.dsa_extend_topk_buf = None
+        # _draft_extend_for_prefill reads this; the KV-only split is for NextN drafts.
+        self.can_split_prefill_draft_extend = False
 
     def alloc_memory_pool(
         self,

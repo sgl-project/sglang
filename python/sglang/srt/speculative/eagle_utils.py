@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -131,6 +133,98 @@ def _eagle_prefill_tail_tokens(
                 tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
+
+
+# Measured on H200 with GLM-5.3-Flash: the KV-only pass adds a fixed CPU cost (one more
+# eager draft forward) that batches of at most this many KV-only tokens did not win back.
+_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS = 4096
+
+
+def should_split_prefill_draft_extend(
+    batch: ScheduleBatch,
+    *,
+    mm_input_embeds: Optional[torch.Tensor],
+    draft_prefill_graph_max_tokens: int,
+) -> bool:
+    """Whether the draft extend after this prefill runs as a KV-only pass over
+    every request's tokens but its last, plus a pass over the last tokens."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    return (
+        batch.forward_mode == ForwardMode.EXTEND
+        and batch.input_embeds is None
+        and batch.replace_embeds is None
+        and batch.tbo_split_seq_index is None
+        # The KV-only pass embeds token ids, which do not cover image tokens.
+        and (
+            mm_input_embeds is not None
+            or all(req.multimodal_inputs is None for req in batch.reqs)
+        )
+        # The KV-only batch would get an empty extend, which the kpool planner rejects.
+        and min(batch.extend_lens) > 1
+        # DSA attends to requests no longer than this densely, which costs little to skip;
+        # the last-token pass would also read their prefixes back from the cache.
+        and batch.seq_lens_cpu.max().item()
+        > envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()
+        # A captured draft prefill graph replays the full layer for batches it fits.
+        and batch.extend_num_tokens - len(batch.extend_lens)
+        > max(_MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS, draft_prefill_graph_max_tokens)
+    )
+
+
+def split_prefill_draft_extend(
+    batch: ScheduleBatch, *, tail_tokens: torch.Tensor
+) -> Tuple[ScheduleBatch, ScheduleBatch, torch.Tensor, torch.Tensor]:
+    """Split the prefill's draft extend into a batch of every request's tokens but
+    its last and a batch of the last tokens; also return the prefill rows of each."""
+    extend_lens = batch.extend_lens
+    bs = len(extend_lens)
+    last_rows = torch.tensor(extend_lens, dtype=torch.int64).cumsum(0) - 1
+    keep = torch.ones(batch.extend_num_tokens, dtype=torch.bool)
+    keep[last_rows] = False
+    kv_rows = keep.nonzero().squeeze(1)
+
+    device = batch.input_ids.device
+    if is_pin_memory_available(device):
+        kv_rows, last_rows = kv_rows.pin_memory(), last_rows.pin_memory()
+    kv_rows = kv_rows.to(device, non_blocking=True)
+    last_rows = last_rows.to(device, non_blocking=True)
+
+    # The draft input at a prompt row is the next prompt token.
+    kv_batch = copy.copy(batch)
+    kv_batch.input_ids = batch.input_ids[kv_rows + 1]
+    kv_batch.out_cache_loc = batch.out_cache_loc[kv_rows]
+    kv_batch.extend_lens = [n - 1 for n in extend_lens]
+    kv_batch.extend_num_tokens = batch.extend_num_tokens - bs
+    kv_batch.seq_lens = batch.seq_lens - 1
+    kv_batch.seq_lens_cpu = batch.seq_lens_cpu - 1
+    kv_batch.seq_lens_sum = (
+        batch.seq_lens_sum - bs if batch.seq_lens_sum is not None else None
+    )
+
+    last_batch = copy.copy(batch)
+    last_batch.input_ids = tail_tokens
+    last_batch.out_cache_loc = batch.out_cache_loc[last_rows]
+    last_batch.prefix_lens = [
+        p + n - 1 for p, n in zip(batch.prefix_lens, extend_lens, strict=True)
+    ]
+    last_batch.extend_lens = [1] * bs
+    last_batch.extend_num_tokens = bs
+
+    for sub_batch in (kv_batch, last_batch):
+        # The draft never returns logprobs; the per-token logprob inputs
+        # describe the full prefill rows.
+        sub_batch.return_logprob = False
+        sub_batch.extend_input_logprob_token_ids = None
+        # With MLP sync but no attention DP, each list holds this rank's token
+        # count; a pass padded to the whole prefill would compute all its rows.
+        if batch.global_num_tokens is not None:
+            sub_batch.global_num_tokens = [sub_batch.extend_num_tokens]
+            sub_batch.global_num_tokens_for_logprob = [bs]
+        if batch.draft_global_num_tokens is not None:
+            sub_batch.draft_global_num_tokens = [sub_batch.extend_num_tokens]
+            sub_batch.draft_global_num_tokens_for_logprob = [bs]
+    return kv_batch, last_batch, kv_rows, last_rows
 
 
 def organize_draft_results(
