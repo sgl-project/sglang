@@ -108,3 +108,21 @@ def test_ernie_absent_pe_component_is_not_detected(monkeypatch, pe_entry, expect
         pipeline._has_pe_in_model_index(SimpleNamespace(model_path="org/ernie"))
         is expected
     )
+
+
+@pytest.mark.parametrize("legacy_order", [False, True])
+def test_diffusers_pipeline_add_stage_accepts_both_argument_orders(legacy_order):
+    from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
+        DiffusersPipeline,
+    )
+
+    pipeline = DiffusersPipeline.__new__(DiffusersPipeline)
+    pipeline._stages = []
+    pipeline._stage_name_mapping = {}
+    stage = DiffusersExecutionStage(None)
+    if legacy_order:
+        pipeline.add_stage("diffusers_execution", stage)
+    else:
+        pipeline.add_stage(stage, "diffusers_execution")
+    assert pipeline._stage_name_mapping == {"diffusers_execution": stage}
+    assert pipeline._stages == [stage]

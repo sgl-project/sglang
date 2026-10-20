@@ -723,8 +723,18 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.initialize_pipeline(self.server_args)
         self.create_pipeline_stages(self.server_args)
 
-    def add_stage(self, stage: PipelineStage, stage_name: str | None = None) -> None:
-        """Add a stage to the pipeline."""
+    def add_stage(
+        self,
+        stage: PipelineStage | str,
+        stage_name: str | PipelineStage | None = None,
+    ) -> "DiffusersPipeline":
+        """Add a stage to the pipeline.
+
+        Accepts the base-class order ``add_stage(stage, stage_name=None)`` and,
+        for backward compatibility, the legacy ``add_stage(stage_name, stage)``.
+        """
+        if isinstance(stage, str) and isinstance(stage_name, PipelineStage):
+            stage, stage_name = stage_name, stage
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)
         if stage_name in self._stage_name_mapping:
