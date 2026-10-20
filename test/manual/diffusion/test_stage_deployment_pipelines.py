@@ -110,6 +110,9 @@ def _check_pipeline(model, num_frames, kind, parallelism="single"):
         requests[1]["num_outputs_per_prompt"] = 2
     if kind in ("sana", "anima"):
         requests[1]["negative_prompt"] = "blurry, low quality"
+    if parallelism == "ulysses2":
+        # An odd patch grid exercises sequence padding across the SP boundary.
+        requests[1].update(width=528, height=528)
     if kind == "image":
         image = BytesIO()
         Image.new("RGB", (247, 239), (40, 90, 160)).save(image, format="PNG")
