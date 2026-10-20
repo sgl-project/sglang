@@ -1266,16 +1266,11 @@ class FusedMoE(torch.nn.Module):
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
-        use_flashinfer_trtllm_weight_layout = (
-            method.use_flashinfer_trtllm_weight_layout
-            if isinstance(method, ModelOptNvFp4FusedMoEMethod)
-            else self.use_flashinfer_trtllm_moe
-        )
-
-        # Flashinfer assumes w31 format for w13_weight. Same for the scales.
-        if use_flashinfer_trtllm_weight_layout and (
-            isinstance(method, ModelOptNvFp4FusedMoEMethod)
-            or isinstance(method, Fp8MoEMethod)
+        # ModelOpt NVFP4 reorders weights and block scales in _load_w13;
+        # its per-tensor global scales retain the logical [gate, up] order.
+        # These other methods also reorder their per-tensor scales.
+        if self.use_flashinfer_trtllm_moe and (
+            isinstance(method, Fp8MoEMethod)
             or isinstance(method, UnquantizedFusedMoEMethod)
             or isinstance(method, CompressedTensorsMxInt4MoE)
         ):
