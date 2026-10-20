@@ -32,7 +32,6 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
-from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
@@ -48,6 +47,7 @@ from sglang.srt.utils.common import (
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
     from sglang.srt.server_args import ServerArgs
 
 
@@ -443,9 +443,12 @@ class UnoWorkerV2(BaseSpecWorker):
     ) -> GenerationBatchResult:
         """Run UNO's F-wide proposal pass, then native EAGLE Q-node verify."""
 
+        # Linear UNO also runs on NPU without the CUDA-only FlashInfer dependency.
+        from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
+
         draft_state = batch.spec_info
 
-        if batch.seq_lens.is_cuda:
+        if batch.seq_lens.device.type != "cpu":
             batch.seq_lens.record_stream(
                 torch.get_device_module(self.device).current_stream()
             )
@@ -627,7 +630,7 @@ class UnoWorkerV2(BaseSpecWorker):
 
         draft_state = batch.spec_info
 
-        if batch.seq_lens.is_cuda:
+        if batch.seq_lens.device.type != "cpu":
             batch.seq_lens.record_stream(
                 torch.get_device_module(self.device).current_stream()
             )
@@ -774,7 +777,15 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
+        # The scheduler passes this keyword even with PP=1. UNO's startup
+        # validation forbids PP>1, so accept None but never discard real relay
+        # tensors and accidentally execute a partial model as a full model.
+        if pp_proxy_tensors is not None:
+            raise NotImplementedError(
+                "UNO requires PP=1 and does not support pipeline proxy tensors."
+            )
         del grammar_barrier
         self._validate_batch(batch)
 
@@ -828,27 +839,29 @@ class UnoWorkerV2(BaseSpecWorker):
                     need_top1=need_top1,
                 )
 
-            graph_runner = getattr(
-                self.model_runner,
-                "decode_cuda_graph_runner",
-                None,
-            )
-            # If cuda-graph is on, reuse its captured LoRA routing
-            # and replay it in _run_target_block.
-            # Else, prepare routing for eager.
-            if not (
-                forward_batch.forward_mode.is_cuda_graph()
-                and graph_runner is not None
-                and graph_runner.can_run_graph(forward_batch)
-            ):
-                self.lora_manager.prepare_lora_token_segments(
-                    lora_ids=[None, self.uno_lora_id] * batch_size,
-                    segment_lens=[1, self.num_speculative_proposals] * batch_size,
+            try:
+                graph_runner = getattr(
+                    self.model_runner,
+                    "decode_cuda_graph_runner",
+                    None,
                 )
-            result = self._run_target_block(
-                forward_batch,
-                need_top1=need_top1,
-            )
-            # Clear LoRA routing before verification
-            self.lora_manager.reset_lora_batch()
-            return result
+                # If cuda-graph is on, reuse its captured LoRA routing
+                # and replay it in _run_target_block.
+                # Else, prepare routing for eager.
+                if not (
+                    forward_batch.forward_mode.is_cuda_graph()
+                    and graph_runner is not None
+                    and graph_runner.can_run_graph(forward_batch)
+                ):
+                    self.lora_manager.prepare_lora_token_segments(
+                        lora_ids=[None, self.uno_lora_id] * batch_size,
+                        segment_lens=[1, self.num_speculative_proposals] * batch_size,
+                    )
+                return self._run_target_block(
+                    forward_batch,
+                    need_top1=need_top1,
+                )
+            finally:
+                # The target and subsequent prefills must always use base weights,
+                # including when routing setup or the draft forward raises.
+                self.lora_manager.reset_lora_batch()

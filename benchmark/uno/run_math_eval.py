@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from time import perf_counter
@@ -15,7 +16,7 @@ from benchmark.uno.math_data import (
     get_benchmark,
     prepare_benchmark_data,
 )
-from benchmark.uno.math_grader import score_math
+from benchmark.uno.math_grader import _require_math_verify, score_math
 
 CONTEXT_LENGTH = 40960
 MAX_TOKENS = 2**15
@@ -40,6 +41,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--revision")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--attention-backend", default="fa3")
+    parser.add_argument("--device", choices=("cuda", "npu"))
+    parser.add_argument("--base-gpu-id", type=int)
+    parser.add_argument("--page-size", type=int)
+    parser.add_argument("--mem-fraction-static", type=float)
+    parser.add_argument("--cuda-graph-max-bs-decode", type=int)
+    parser.add_argument("--cuda-graph-backend-decode", choices=("full", "disabled"))
+    parser.add_argument("--disable-prefill-cuda-graph", action="store_true")
+    parser.add_argument("--disable-overlap-schedule", action="store_true")
+    parser.add_argument("--warmup-requests", type=int, default=0)
+    parser.add_argument("--warmup-max-tokens", type=int, default=32)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
@@ -62,6 +73,13 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark to run; repeat to select multiple (default: all).",
     )
     parser.add_argument("--limit", type=int, help="Maximum problems per benchmark.")
+    parser.add_argument("--selection", choices=("first", "random"), default="first")
+    parser.add_argument(
+        "--dataset-seed",
+        type=int,
+        default=42,
+        help="Dataset sampling seed, independent of generation --random-seed.",
+    )
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--max-running-requests", type=int, default=4)
     parser.add_argument("--context-length", type=int, default=CONTEXT_LENGTH)
@@ -87,6 +105,19 @@ def _validate_args(
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    for name in ("page_size", "cuda_graph_max_bs_decode", "warmup_max_tokens"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.warmup_requests < 0:
+        parser.error("--warmup-requests must be non-negative")
+    if args.base_gpu_id is not None and args.base_gpu_id < 0:
+        parser.error("--base-gpu-id must be non-negative")
+    if args.mem_fraction_static is not None and not 0 < args.mem_fraction_static < 1:
+        parser.error("--mem-fraction-static must be in (0, 1)")
+    if args.device == "npu" and args.speculative_algorithm == "UNO":
+        if (args.speculative_eagle_topk or 1) != 1:
+            parser.error("UNO on NPU supports only linear mode (topk=1)")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     if not 0 < args.top_p <= 1:
@@ -168,8 +199,11 @@ def _prepare_prompts(
             output_dir=args.data_root,
         )
         rows = _read_jsonl(data_path)
-        rows = rows[: args.limit] if args.limit is not None else rows
-        for row_index, row in enumerate(rows):
+        indices = select_problem_indices(
+            len(rows), args.limit, args.selection, args.dataset_seed
+        )
+        for row_index in indices:
+            row = rows[row_index]
             input_ids, rendered = _format_prompt(
                 tokenizer=tokenizer,
                 messages=row["chat_input"],
@@ -195,6 +229,7 @@ def _prepare_prompts(
                         "row": {
                             "id": prompt_id,
                             "source_row": source,
+                            "dataset_row_index": row_index,
                             "sample_index": sample_index,
                             "problem": rendered,
                             "ground_truth": row["ground_truth"],
@@ -206,6 +241,16 @@ def _prepare_prompts(
     if not prompts:
         raise ValueError("No prompts were prepared")
     return prompts
+
+
+def select_problem_indices(
+    count: int, limit: int | None, selection: str, seed: int
+) -> list[int]:
+    """Select without replacement, preserving source order and row identity."""
+    size = min(count, limit) if limit is not None else count
+    if selection == "random" and size < count:
+        return sorted(random.Random(seed).sample(range(count), size))
+    return list(range(size))
 
 
 def _engine_options(
@@ -224,6 +269,20 @@ def _engine_options(
         "attention_backend": args.attention_backend,
         "log_level": "info",
     }
+    for name in (
+        "device",
+        "base_gpu_id",
+        "page_size",
+        "mem_fraction_static",
+        "cuda_graph_max_bs_decode",
+        "cuda_graph_backend_decode",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            options[name] = value
+    for name in ("disable_prefill_cuda_graph", "disable_overlap_schedule"):
+        if getattr(args, name):
+            options[name] = True
     if args.revision is not None:
         options["revision"] = args.revision
     for name in SPECULATIVE_OPTION_NAMES:
@@ -257,6 +316,26 @@ def _generate(
         for _ in prompts
     ]
     try:
+        if args.warmup_requests:
+            warmup_count = min(args.warmup_requests, len(prompts))
+            warmup_sampling = {
+                **sampling[0],
+                "max_new_tokens": min(args.warmup_max_tokens, args.max_tokens),
+            }
+            warmup_outputs = engine.generate(
+                input_ids=[prompt["input_ids"] for prompt in prompts[:warmup_count]],
+                sampling_params=warmup_sampling,
+                rid=[f"warmup:{index}" for index in range(warmup_count)],
+            )
+            if any(
+                (output.get("meta_info", {}).get("finish_reason") or {}).get("type")
+                == "abort"
+                for output in warmup_outputs
+            ):
+                raise RuntimeError("A warmup request aborted")
+            # Exclude warmup and its cached prefixes from the timed workload.
+            if not engine.flush_cache().success:
+                raise RuntimeError("Could not flush the cache after warmup")
         start = perf_counter()
         outputs = engine.generate(
             input_ids=[prompt["input_ids"] for prompt in prompts],
@@ -280,6 +359,8 @@ def _build_rows(
     for prompt, output in zip(prompts, outputs, strict=True):
         token_ids = list(output["output_ids"])
         metadata = output["meta_info"]
+        if (metadata.get("finish_reason") or {}).get("type") == "abort":
+            raise RuntimeError(f"Generation aborted for {prompt['id']}: {metadata}")
         verify_forwards = int(metadata.get("spec_verify_ct", 0))
         if speculative_algorithm == "UNO":
             # Both UNO pathways are full target-model forward passes.
@@ -339,6 +420,10 @@ def _benchmark_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _format_tpf(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "—"
+
+
 def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
     lines = [
         "| Dataset | Accuracy | TPF | tok/s | tok/s/request |",
@@ -358,7 +443,7 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         [
             "| **Average** | "
             f"**{summary['macro_average_accuracy']:.2%}** | "
-            f"**{summary['macro_average_tokens_per_forward']:.3f}** | "
+            f"**{_format_tpf(summary['macro_average_tokens_per_forward'])}** | "
             f"**{summary['tokens_per_second']:.2f}** | "
             f"**{summary['tokens_per_second_per_request']:.2f}** |",
             "",
@@ -432,6 +517,13 @@ def _write_results(
         "revision": args.revision,
         "dtype": args.dtype,
         "attention_backend": args.attention_backend,
+        "engine_options": engine_options,
+        "warmup_requests": min(args.warmup_requests, len(rows)),
+        "warmup_max_tokens": min(args.warmup_max_tokens, args.max_tokens),
+        "num_length_capped": sum(
+            (row["sglang_meta_info"].get("finish_reason") or {}).get("type") == "length"
+            for row in rows
+        ),
         "speculative_parameters": {
             name: engine_options[name]
             for name in SPECULATIVE_OPTION_NAMES
@@ -442,6 +534,11 @@ def _write_results(
         "context_length": args.context_length,
         "max_tokens": args.max_tokens,
         "num_samples": args.num_samples,
+        "dataset_selection": {
+            "limit": args.limit,
+            "selection": args.selection,
+            "seed": args.dataset_seed,
+        },
         "random_seed": args.random_seed,
         "sampling": {
             "temperature": args.temperature,
@@ -459,7 +556,9 @@ def _write_results(
         "tokens_per_second_per_request": tokens_per_second_per_request,
         "num_forwards": totals["forwards"],
         "tokens_per_forward": _divide(totals["tokens"], totals["forwards"]),
-        "macro_average_tokens_per_forward": sum(dataset_tpfs) / len(dataset_tpfs),
+        "macro_average_tokens_per_forward": (
+            sum(dataset_tpfs) / len(dataset_tpfs) if dataset_tpfs else None
+        ),
         "unweighted_mean_tokens_per_forward": (
             sum(request_tpfs) / len(request_tpfs) if request_tpfs else None
         ),
@@ -481,6 +580,7 @@ def _mode_name(args: argparse.Namespace) -> str:
 
 def main() -> None:
     args = parse_args()
+    _require_math_verify()
     from transformers import AutoTokenizer
 
     engine_options = _engine_options(args=args)
@@ -488,6 +588,7 @@ def main() -> None:
         engine_options["tokenizer_path"],
         use_fast=True,
         trust_remote_code=True,
+        revision=args.revision,
     )
     prompts = _prepare_prompts(
         args=args,

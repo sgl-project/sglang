@@ -27,13 +27,81 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
-from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+from sglang.srt.hardware_backend.npu.attention.ascend_backend import (  # noqa: E402
     AscendAttnBackend,
     AscendAttnMaskBuilder,
     ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+
+backend_mod = sys.modules[AscendAttnBackend.__module__]
+
+
+class TestUnoGraphKvLengths(unittest.TestCase):
+    def apply_metadata(self, kind, prefixes, host_lengths, *, capture):
+        bs = len(prefixes)
+        seq_lens = torch.tensor(prefixes, dtype=torch.int32)
+        metadata = SimpleNamespace(
+            block_tables=torch.zeros((bs, 8), dtype=torch.int32),
+            seq_lens=seq_lens,
+            seq_lens_cpu_list=list(prefixes),
+        )
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.graph_metadata = {bs: metadata}
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.speculative_num_draft_tokens = 8
+        backend.page_size = 16
+        backend.req_to_token = torch.arange(128, dtype=torch.int32).view(1, -1)
+        mode = SimpleNamespace(
+            is_target_verify=lambda: True, is_decode_or_idle=lambda: False
+        )
+        with patch.object(
+            backend_mod, "get_parallel", return_value=SimpleNamespace(dcp_enabled=False)
+        ):
+            backend._apply_cuda_graph_metadata(
+                bs=bs,
+                req_pool_indices=torch.zeros(bs, dtype=torch.int64),
+                seq_lens=seq_lens,
+                seq_lens_cpu=torch.tensor(host_lengths, dtype=torch.int32),
+                forward_mode=mode,
+                spec_info=SimpleNamespace(spec_input_type=kind),
+                in_capture=capture,
+            )
+        return metadata
+
+    def test_capture_includes_query_block_in_fia_host_lengths(self):
+        # Q=8 must be matched by KV=8, even when capture's dummy prefix is 0.
+        for kind in (
+            backend_mod.SpecInputType.UNO_DRAFT,
+            backend_mod.SpecInputType.UNO_VERIFY,
+        ):
+            for bs in (1, 64):
+                with self.subTest(kind=kind, bs=bs):
+                    metadata = self.apply_metadata(
+                        kind, [0] * bs, [0] * bs, capture=True
+                    )
+                    self.assertEqual(metadata.seq_lens_cpu_list, [8] * bs)
+                    self.assertEqual(metadata.seq_lens.tolist(), [8] * bs)
+
+    def test_replay_does_not_add_query_width_to_final_host_lengths(self):
+        for kind in (
+            backend_mod.SpecInputType.UNO_DRAFT,
+            backend_mod.SpecInputType.UNO_VERIFY,
+        ):
+            with self.subTest(kind=kind):
+                metadata = self.apply_metadata(kind, [9, 25], [17, 33], capture=False)
+                self.assertEqual(metadata.seq_lens_cpu_list, [17, 33])
+                self.assertEqual(metadata.seq_lens.tolist(), [17, 33])
+                # Host lengths and the block table must agree at page boundaries.
+                self.assertEqual(metadata.block_tables[1, :3].tolist(), [0, 1, 2])
+
+    def test_dflash_host_length_behavior_is_preserved(self):
+        metadata = self.apply_metadata(
+            backend_mod.SpecInputType.DFLASH_VERIFY, [9], [17], capture=False
+        )
+        self.assertEqual(metadata.seq_lens_cpu_list, [17])
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):

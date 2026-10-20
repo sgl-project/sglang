@@ -44,6 +44,13 @@ def create_torch_native_backend():
     return TorchNativeLoRABackend
 
 
+@register_lora_backend("uno_ascend")
+def create_uno_ascend_backend():
+    from sglang.srt.lora.backend.uno_ascend_backend import UnoAscendLoRABackend
+
+    return UnoAscendLoRABackend
+
+
 @register_lora_backend("uno_cublas")
 def create_uno_cublas_backend():
     from sglang.srt.lora.backend.uno_cublas_backend import UnoCublasLoRABackend
