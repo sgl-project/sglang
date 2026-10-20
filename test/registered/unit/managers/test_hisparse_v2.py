@@ -57,7 +57,7 @@ class TestHiSparseV2(CustomTestCase):
             index_head_dim=128,
             enable_memory_saver=False,
             kv_cache_dim=656 if dtype == torch.float8_e4m3fn else 576,
-            index_buf_size=size * 4,
+            index_buf_size=size * 3 + 64,
         )
         self.reqs = ReqToTokenPool(
             size=4, max_context_len=65536, device="cuda", enable_memory_saver=False
@@ -74,7 +74,7 @@ class TestHiSparseV2(CustomTestCase):
                 index_head_dim=128,
                 enable_memory_saver=False,
                 kv_cache_dim=656 if dtype == torch.float8_e4m3fn else 576,
-                index_buf_size=size * 4,
+                index_buf_size=size * 3 + 64,
             )
             if with_draft
             else None
@@ -149,7 +149,13 @@ class TestHiSparseV2(CustomTestCase):
                     256, (length, *view.shape[1:]), dtype=torch.uint8, device="cuda"
                 )
             for buffer in cache.pool.index_k_with_scale_buffer:
-                buffer.random_(0, 255)
+                pages = indices[::64] // 64
+                buffer[pages] = torch.randint(
+                    256,
+                    (len(pages), buffer.shape[1]),
+                    dtype=buffer.dtype,
+                    device="cuda",
+                )
         self.tree.checkpoint(req, up_to=length)
         self.live_reqs.append(req)
         return req
@@ -170,6 +176,9 @@ class TestHiSparseV2(CustomTestCase):
 
     def _check_eviction_and_reuse(self, dtype):
         self._build(dtype)
+        host = self.cache.host_pool
+        held = host.alloc(host.available_size() - 256)
+        self.addCleanup(host.free, held)
         req = self._prefill()
         rid = req.kv.req_pool_idx
         indices = self.reqs.req_to_token[rid, :256].long().clone()
@@ -193,6 +202,7 @@ class TestHiSparseV2(CustomTestCase):
             buffer[reused[::64] // 64] = 0
         req_ids = torch.tensor([rid], device="cuda")
         pages = self.cache.indexer_page_table(req_pool_indices=req_ids, num_pages=4)
+        self.assertEqual(pages.max().item(), self.cache.index_pages - 1)
         for layer_id, buffer in enumerate(self.pool.index_k_with_scale_buffer):
             torch.testing.assert_close(
                 buffer[pages[0].long()], expected_index[layer_id]
@@ -276,7 +286,10 @@ class TestHiSparseV2(CustomTestCase):
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         backend.init_forward_metadata(batch)
         table = self._shared_indexer_table(backend, batch)
-        expected = self.cache.index_table[batch.req_pool_indices[:2], :4].int()
+        expected = (
+            self.cache.base_pages
+            + self.cache.host_locs[batch.req_pool_indices[:2], :256:64] // 64
+        ).int()
         torch.testing.assert_close(table[:2, :4], expected)
 
     def test_indexer_graph_replay_refreshes_mapping_without_rebinding(self):
@@ -303,7 +316,10 @@ class TestHiSparseV2(CustomTestCase):
             current_batch.seq_lens = batch.seq_lens[:bs]
             backend.init_forward_metadata_out_graph(current_batch)
             current = self._shared_indexer_table(backend, current_batch)
-            expected = self.cache.index_table[batch.req_pool_indices[:2], :4].int()
+            expected = (
+                self.cache.base_pages
+                + self.cache.host_locs[batch.req_pool_indices[:2], :256:64] // 64
+            ).int()
             torch.testing.assert_close(current[:2, :4], expected)
             if bs == 4:
                 self.assertIs(current, table)
@@ -316,12 +332,20 @@ class TestHiSparseV2(CustomTestCase):
         for req in reqs:
             self.assertTrue(self.coordinator.admit_request(req))
         self.tree.evict(EvictParams(num_tokens=256))
+        req_ids = torch.tensor([req.kv.req_pool_idx for req in reqs], device="cuda")
+        pages = self.cache.indexer_page_table(req_pool_indices=req_ids, num_pages=4)
+        torch.testing.assert_close(pages[0], pages[1])
+        expected = [
+            buffer[pages[1].long()].clone() for buffer in self.cache.index_buffers
+        ]
         self.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", range(128)))))
         host = self.cache.host_pool
         before = host.available_size()
         self.tree.evict_host(256)
         self.assertEqual(host.available_size(), before)
         self._finish(reqs[0])
+        for buffer, wanted in zip(self.cache.index_buffers, expected):
+            torch.testing.assert_close(buffer[pages[1].long()], wanted)
         self.tree.evict_host(256)
         self.assertEqual(host.available_size(), before)
         self._finish(reqs[1])

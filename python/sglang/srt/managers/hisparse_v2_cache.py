@@ -1,4 +1,4 @@
-"""DSA index copies and the shared HiCache swap-in data plane."""
+"""DSA indexes addressed by Device/Host KV pages and the HiCache swap-in plane."""
 
 from __future__ import annotations
 
@@ -9,35 +9,6 @@ from sglang.kernels.ops.kvcache.hisparse import (
     load_cache_to_device_buffer_mla,
     load_cache_to_device_buffer_spec_mla,
 )
-
-
-class IndexPageAllocator:
-    def __init__(self, num_pages: int, device: str):
-        self._free = list(range(num_pages))
-        self._allocated: set[int] = set()
-        self.device = device
-
-    def available(self) -> int:
-        return len(self._free)
-
-    def alloc(self, count: int) -> torch.Tensor | None:
-        if count <= 0:
-            raise ValueError("Index page allocation must be positive")
-        if count > len(self._free):
-            return None
-        pages = self._free[-count:]
-        del self._free[-count:]
-        self._allocated.update(pages)
-        return torch.tensor(pages, dtype=torch.int64, device=self.device)
-
-    def free(self, pages: torch.Tensor) -> None:
-        ids = pages.tolist()
-        if len(set(ids)) != len(ids) or not set(ids) <= self._allocated:
-            raise RuntimeError(
-                "HiSparse V2 index pages freed twice or by another owner"
-            )
-        self._allocated.difference_update(ids)
-        self._free.extend(ids)
 
 
 class HiSparseV2Cache:
@@ -90,15 +61,6 @@ class HiSparseV2Cache:
         self.index_pages = self.index_buffers[0].shape[0]
         if self.index_pages <= self.base_pages:
             raise ValueError("HiSparse V2 requires expanded indexer storage")
-        self.index_allocator = IndexPageAllocator(
-            self.index_pages - self.base_pages, device
-        )
-        self.index_table = torch.full(
-            (rows, (context + self.page_size - 1) // self.page_size),
-            -1,
-            dtype=torch.int64,
-            device=device,
-        )
         self.host_locs = torch.full(
             (rows, context), -1, dtype=torch.int64, device=device
         )
@@ -161,6 +123,11 @@ class HiSparseV2Cache:
             )
 
     def attach_host_pool(self, host_pool, *, layer_offset: int = 0) -> None:
+        if self.base_pages + host_pool.size // self.page_size > self.index_pages:
+            raise ValueError(
+                "HiSparse V2 index expansion must cover the HiCache host pool; "
+                "increase expansion_ratio or reduce the host pool size"
+            )
         refs = host_pool.data_refs[layer_offset : layer_offset + self.pool.layer_num]
         if len(refs) != self.pool.layer_num:
             raise ValueError("HiSparse V2 host/device layer counts differ")
@@ -191,33 +158,14 @@ class HiSparseV2Cache:
         if self.spec_enabled:
             self.scratch_locs[:, req_id] = temp[self.buffer_tokens :].to(torch.int32)
 
-    def copy_index(self, req_id: int, tokens: torch.Tensor) -> bool:
-        count = tokens.numel() // self.page_size
-        pages = self.index_allocator.alloc(count)
-        if pages is None:
-            return False
-        destination = pages + self.base_pages
-        source = (tokens[:: self.page_size] // self.page_size).long()
-        try:
-            # A prefix loaded from HiCache may still be arriving on its IO stream.
-            for layer_id in range(
-                self.pool.start_layer, self.pool.start_layer + self.pool.layer_num
-            ):
-                buffer = self.pool.get_index_k_with_scale_buffer(layer_id)
-                if buffer.shape[0]:
-                    buffer[destination] = buffer[source]
-            self.index_table[req_id, :count] = destination
-        except Exception:
-            self.index_allocator.free(pages)
-            raise
-        return True
+    def preserve_index(self, device_tokens: torch.Tensor, host_tokens: torch.Tensor):
+        source = device_tokens[:: self.page_size] // self.page_size
+        destination = self.base_pages + host_tokens[:: self.page_size] // self.page_size
+        # Host locks keep these rows alive for every request sharing the prefix.
+        for buffer in self.index_buffers:
+            buffer[destination] = buffer[source]
 
     def release(self, req_id: int) -> None:
-        row = self.index_table[req_id]
-        pages = row[row >= 0]
-        if pages.numel():
-            self.index_allocator.free(pages - self.base_pages)
-        row.fill_(-1)
         self.protected_lens[req_id] = 0
         self.host_locs[req_id].fill_(-1)
         self.temp_locs[:, req_id].fill_(-1)
@@ -240,8 +188,11 @@ class HiSparseV2Cache:
         tokens = self.req_to_token[
             req_ids, : num_pages * self.page_size : self.page_size
         ]
-        copied = self.index_table[req_ids, :num_pages]
-        pages = torch.where(tokens < 0, copied, tokens // self.page_size)
+        hosts = self.host_locs[req_ids, : num_pages * self.page_size : self.page_size]
+        host_pages = torch.where(
+            hosts >= 0, self.base_pages + hosts // self.page_size, -1
+        )
+        pages = torch.where(tokens < 0, host_pages, tokens // self.page_size)
         starts = torch.arange(num_pages, device=self.device) * self.page_size
         protected = starts[None, :] < self.protected_lens[req_ids, None]
         valid = (pages >= 0) & (pages < self.index_pages)

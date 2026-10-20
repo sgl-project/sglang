@@ -37,6 +37,11 @@ are unsupported.
 V2 cannot be combined with `--enable-hisparse`, PD, PP/CP, hybrid SWA, mixed
 prefill/decode batches, sessions, or routed-expert recording.
 
+V2 keeps GPU indexes for Device KV pages and Host KV pages, sharing prefix
+indexes across requests. The default index capacity is `(1 + hicache_ratio)`
+times the Device KV capacity, plus page padding. A custom `expansion_ratio`
+sets the Host-addressed index region and must cover the actual HiCache host pool.
+
 The remaining sections describe `--enable-hisparse`.
 
 ## Why HiSparse?

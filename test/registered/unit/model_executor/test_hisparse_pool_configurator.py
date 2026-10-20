@@ -92,7 +92,7 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
                 self.assertEqual(cell_size, expected_cell_size)
 
     def test_v2_accounts_for_base_and_expanded_index_regions(self):
-        for ratio, expected in ((None, 2368), (0.5, 1708), (0.3, 1656)):
+        for ratio, expected in ((None, 2104), (0.5, 1708), (0.3, 1656)):
             with self.subTest(expansion_ratio=ratio):
                 self.assertEqual(
                     self._compute_cell_size(
