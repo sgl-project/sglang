@@ -594,7 +594,7 @@ def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
         method is None
         or method == RoutingMethodType.Unspecified
         or config.sqrtsoftplus_log1p
-        or config.num_fused_shared_experts != 0
+        or config.num_shared_topk_slots != 0
     ):
         return False
     plain = not config.use_grouped_topk and config.correction_bias is None
@@ -2690,6 +2690,7 @@ def select_experts(
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
+    fold_scale_after_routing = False
     num_routed_topk = top_k - num_shared_topk_slots
     # On aiter and on the per-rank shared-slot path, _post_process_topk_ids appends
     # the shared columns, so the router selects and renormalizes routed experts only.
@@ -2753,7 +2754,7 @@ def select_experts(
             "num_token_non_padded is not yet supported in fused_topk_native"
         )
         assert expert_location_dispatch_info is None
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -2763,8 +2764,7 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        if scoring_func not in ("sqrtsoftplus", "sigmoid"):
-            assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = scoring_func not in ("sqrtsoftplus", "sigmoid")
 
         # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
         _can_use_jit_kernel = not _is_cpu
@@ -2843,6 +2843,10 @@ def select_experts(
                 and expert_location_dispatch_info is None
                 and num_shared_topk_slots == 0
                 and not routing_overridden
+                and not (
+                    apply_routed_scaling_factor_on_output
+                    and routed_scaling_factor not in (None, 1.0)
+                )
             ):
                 num_experts = router_logits.shape[-1]
                 if num_experts & (num_experts - 1) == 0 and num_experts <= 512:
@@ -2872,7 +2876,10 @@ def select_experts(
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                apply_routed_scaling_factor_on_output=(
+                    apply_routed_scaling_factor_on_output
+                    and not fold_scale_after_routing
+                ),
                 **_fused_topk_kwargs,
             )
     else:
@@ -2880,13 +2887,22 @@ def select_experts(
         # padded rows is garbage. That is fine because _post_process_topk_ids
         # below masks rows >= num_token_non_padded (-1 on CUDA, 0 + zeroed
         # weights on HIP) after the logical->physical remap.
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
+        fold_scale_after_routing = True
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=top_k_for_gate,
             renormalize=renormalize,
         )
+
+    if (
+        fold_scale_after_routing
+        and apply_routed_scaling_factor_on_output
+        and routed_scaling_factor is not None
+    ):
+        # Shared columns keep their own weight; only routed experts take this scale.
+        num_routed_for_gate = top_k_for_gate - num_shared_topk_slots_for_gate
+        topk_weights[:, :num_routed_for_gate] *= routed_scaling_factor
 
     if routing_overridden:
         # Benchmark-only: override gating with a balanced expert assignment (so

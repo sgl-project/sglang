@@ -20,7 +20,6 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import ast
 import types
-import typing
 import unittest
 import unittest.mock as mock
 from enum import Enum
@@ -157,11 +156,6 @@ def _load_standard_dispatcher(get_parallel, get_backend):
         def __init__(self):
             pass
 
-    keeps_global_ids = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_keeps_global_expert_ids"
-    )
     test_class = ast.ClassDef(
         name="_StandardDispatcherUnderTest",
         bases=[ast.Name(id="_DispatcherBase", ctx=ast.Load())],
@@ -172,8 +166,6 @@ def _load_standard_dispatcher(get_parallel, get_backend):
     namespace = {
         "_DispatcherBase": _DispatcherBase,
         "MoeRunnerConfig": object,
-        "MoeRunnerBackendLike": object,
-        "Optional": typing.Optional,
         "get_parallel": get_parallel,
         "get_moe_runner_backend": get_backend,
         "get_lora": lambda: types.SimpleNamespace(enable_lora=False),
@@ -185,7 +177,18 @@ def _load_standard_dispatcher(get_parallel, get_backend):
     exec(
         compile(
             ast.fix_missing_locations(
-                ast.Module(body=[keeps_global_ids, test_class], type_ignores=[])
+                ast.Module(
+                    body=[
+                        next(
+                            n
+                            for n in tree.body
+                            if isinstance(n, ast.FunctionDef)
+                            and n.name == "_keeps_global_expert_ids"
+                        ),
+                        test_class,
+                    ],
+                    type_ignores=[],
+                )
             ),
             str(STANDARD_DISPATCHER_PATH),
             "exec",

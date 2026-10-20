@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.moe.topk as topk_module
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -20,7 +21,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_model, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

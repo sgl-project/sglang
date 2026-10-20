@@ -198,7 +198,9 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             e_score_correction_bias=torch.zeros(16) if correction_bias else None
         )
         experts = SimpleNamespace(
-            should_fuse_routed_scaling_factor_in_topk=folded_in_topk
+            should_fuse_routed_scaling_factor_in_topk=folded_in_topk,
+            runner_backend=None,
+            routing_method_type=None,
         )
         exec_config = SimpleNamespace(
             moe=SimpleNamespace(enable_waterfill=False, ep_num_redundant_experts=0)
