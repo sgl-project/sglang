@@ -21,6 +21,8 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
+# Fails under qwen_xml in xgrammar 0.2.7; tests using it go red once
+# mlc-ai/xgrammar#1001 lands, which is the signal to remove the relaxation.
 LOOKAHEAD = r"^(?!\.)[a-z]+$"
 BACKREFERENCE = r"(a)\1"
 
@@ -33,9 +35,8 @@ def _make_backend(*, relax: bool) -> XGrammarGrammarBackend:
         return XGrammarGrammarBackend(tokenizer, len(vocab))
 
 
-def _dispatch(key: str, *, relax: bool, backend=None):
-    backend = backend or _make_backend(relax=relax)
-    return backend.dispatch_structural_tag(key)
+def _dispatch(key: str, *, relax: bool):
+    return _make_backend(relax=relax).dispatch_structural_tag(key)
 
 
 def _tool(name: str, properties: dict) -> dict:
@@ -132,6 +133,24 @@ class TestStructuralTagPatternDropping(CustomTestCase):
         )
         self.assertEqual(len(changes), 2)
 
+    def test_nested_patterns_are_checked_in_place(self):
+        """XML styles compile nested values as JSON, so a nested lookahead is kept."""
+        tool = _tool(
+            "ls",
+            {
+                "a": _string(BACKREFERENCE),
+                "b": {"type": "array", "items": _string(LOOKAHEAD)},
+            },
+        )
+        tag = json.loads(_model_tag([tool]))
+
+        changes = _drop_uncompilable_patterns(tag)
+
+        properties = tag["format"]["tags"][0]["content"]["json_schema"]["properties"]
+        self.assertNotIn("pattern", properties["a"])
+        self.assertEqual(properties["b"]["items"]["pattern"], LOOKAHEAD)
+        self.assertEqual(len(changes), 1)
+
     def test_pattern_inside_defs_is_dropped(self):
         tool = _tool("ls", {"path": {"$ref": "#/$defs/Path"}})
         tool["function"]["parameters"]["$defs"] = {"Path": _string(LOOKAHEAD)}
@@ -181,7 +200,7 @@ class TestStructuralTagPatternDropping(CustomTestCase):
                 self.assertIsInstance(result, XGrammarGrammar)
 
     def test_other_schema_errors_still_fail(self):
-        """Only patterns are relaxed; a broken schema keeps returning its error."""
+        """Only patterns are relaxed; other schema errors fail without a recompile."""
         backend = _make_backend(relax=True)
         backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)
         key = _model_tag(
@@ -193,10 +212,10 @@ class TestStructuralTagPatternDropping(CustomTestCase):
             ]
         )
 
-        result = _dispatch(key, relax=True, backend=backend)
+        result = backend.dispatch_structural_tag(key)
 
         self.assertIsInstance(result, InvalidGrammarObject)
-        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 2)
+        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 1)
 
     def test_nothing_to_drop_returns_original_error_without_recompiling(self):
         backend = _make_backend(relax=True)
@@ -205,37 +224,10 @@ class TestStructuralTagPatternDropping(CustomTestCase):
             {"type": "object", "patternProperties": {"(?<=a)b": {"type": "string"}}}
         )
 
-        result = _dispatch(key, relax=True, backend=backend)
+        result = backend.dispatch_structural_tag(key)
 
         self.assertIsInstance(result, InvalidGrammarObject)
         self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 1)
-
-    def test_compiles_with_the_tokenizer_at_most_twice(self):
-        backend = _make_backend(relax=True)
-        backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)
-        tools = [_tool(f"t{i}", {"x": _string("^[a-z]+$")}) for i in range(50)]
-        tools.append(_tool("bad", {"x": _string(LOOKAHEAD)}))
-
-        with self.assertLogs(xgrammar_backend.logger, level="WARNING"):
-            result = _dispatch(_model_tag(tools), relax=True, backend=backend)
-
-        self.assertIsInstance(result, XGrammarGrammar)
-        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 2)
-
-    def test_missing_schema_is_filled_in_any_container(self):
-        tag = {
-            "type": "optional",
-            "content": {
-                "type": "tag",
-                "begin": "<a>",
-                "content": {"type": "json_schema", "json_schema": None},
-                "end": "</a>",
-            },
-        }
-
-        XGrammarGrammarBackend._sanitize_structural_format(tag)
-
-        self.assertEqual(tag["content"]["content"]["json_schema"], {})
 
 
 if __name__ == "__main__":

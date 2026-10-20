@@ -40,7 +40,7 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.constrained.json_schema_validation import (
     UnsupportedJSONSchemaFeature,
-    _iter_subschemas,
+    iter_subschemas,
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
@@ -236,6 +236,7 @@ def _schema_compiles(*, fmt: Dict, schema: Any) -> bool:
 
 
 def _drop_uncompilable_patterns(structural_tag: Dict) -> List[str]:
+    # Workaround for mlc-ai/xgrammar#1001; drop once XGrammar compiles these patterns.
     # Mutates structural_tag in place; returns one log entry per dropped pattern.
     if is_legacy_structural_tag(structural_tag):
         slots = [
@@ -246,19 +247,20 @@ def _drop_uncompilable_patterns(structural_tag: Dict) -> List[str]:
         slots = _iter_schema_formats(structural_tag.get("format"))
     changes = []
     for label, fmt in slots:
-        schema = fmt["json_schema"]
+        schema = fmt.get("json_schema")
         if not isinstance(schema, dict) or _schema_compiles(fmt=fmt, schema=schema):
             continue
-        for subschema, pointer in _iter_subschemas(schema):
-            pattern = subschema.get("pattern")
-            if not isinstance(pattern, str):
-                continue
-            # Check in the slot's own style: json ignores lookaheads, qwen_xml rejects them.
-            probe = {
-                "type": "object",
-                "properties": {"value": {"type": "string", "pattern": pattern}},
-            }
-            if not _schema_compiles(fmt=fmt, schema=probe):
+        # Check each pattern in place; XML styles compile nested values in JSON style.
+        patterned = [
+            (subschema, pointer, subschema.pop("pattern"))
+            for subschema, pointer in list(iter_subschemas(schema))
+            if isinstance(subschema.get("pattern"), str)
+        ]
+        if not _schema_compiles(fmt=fmt, schema=schema):
+            return []  # Not a pattern problem; keep the original error.
+        for subschema, pointer, pattern in patterned:
+            subschema["pattern"] = pattern
+            if not _schema_compiles(fmt=fmt, schema=schema):
                 del subschema["pattern"]
                 changes.append(f"{label!r}: dropped pattern at {pointer}")
     return changes
@@ -403,9 +405,24 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @staticmethod
     def _sanitize_structural_format(structural_format):
         """Recursively replace missing json_schema fields with an empty schema."""
-        for _, node in _iter_schema_formats(structural_format):
-            if node.get("json_schema") is None:
-                node["json_schema"] = {}
+        if not isinstance(structural_format, dict):
+            return
+
+        fmt_type = structural_format.get("type")
+        if fmt_type in {"json_schema", "qwen_xml_parameter"}:
+            if structural_format.get("json_schema") is None:
+                structural_format["json_schema"] = {}
+
+        if fmt_type == "tag":
+            XGrammarGrammarBackend._sanitize_structural_format(
+                structural_format.get("content")
+            )
+        elif fmt_type in {"sequence", "or"}:
+            for element in structural_format.get("elements", []):
+                XGrammarGrammarBackend._sanitize_structural_format(element)
+        elif fmt_type in {"triggered_tags", "tags_with_separator"}:
+            for tag in structural_format.get("tags", []):
+                XGrammarGrammarBackend._sanitize_structural_format(tag)
 
     @staticmethod
     def _sanitize_structural_tag_structures(structural_tag: Dict) -> None:

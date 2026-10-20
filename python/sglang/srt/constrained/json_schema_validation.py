@@ -96,7 +96,7 @@ def _escape_json_pointer(value: str) -> str:
     return value.replace("~", "~0").replace("/", "~1")
 
 
-def _iter_subschemas(
+def iter_subschemas(
     schema: Any, pointer: str = "#"
 ) -> Iterator[tuple[dict[str, Any], str]]:
     """Walk schema-bearing keywords without inspecting instance-valued data."""
@@ -108,32 +108,30 @@ def _iter_subschemas(
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
         if isinstance(child, (bool, dict)):
-            yield from _iter_subschemas(child, f"{pointer}/{keyword}")
+            yield from iter_subschemas(child, f"{pointer}/{keyword}")
         elif keyword == "items" and isinstance(child, list):
             for index, item in enumerate(child):
-                yield from _iter_subschemas(item, f"{pointer}/{keyword}/{index}")
+                yield from iter_subschemas(item, f"{pointer}/{keyword}/{index}")
 
     for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, list):
             for index, child in enumerate(children):
-                yield from _iter_subschemas(child, f"{pointer}/{keyword}/{index}")
+                yield from iter_subschemas(child, f"{pointer}/{keyword}/{index}")
 
     for keyword in _SUBSCHEMA_MAP_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, dict):
             for name, child in children.items():
                 escaped_name = _escape_json_pointer(name)
-                yield from _iter_subschemas(
-                    child, f"{pointer}/{keyword}/{escaped_name}"
-                )
+                yield from iter_subschemas(child, f"{pointer}/{keyword}/{escaped_name}")
 
     dependencies = schema.get("dependencies")
     if isinstance(dependencies, dict):
         for name, child in dependencies.items():
             if isinstance(child, (bool, dict)):
                 escaped_name = _escape_json_pointer(name)
-                yield from _iter_subschemas(
+                yield from iter_subschemas(
                     child, f"{pointer}/dependencies/{escaped_name}"
                 )
 
@@ -166,7 +164,7 @@ def _can_describe_string(schema: dict[str, Any]) -> bool:
 
 def validate_xgrammar_json_schema(schema: Any) -> None:
     """Reject constraints XGrammar 0.2.x accepts without fully enforcing."""
-    for subschema, pointer in _iter_subschemas(schema):
+    for subschema, pointer in iter_subschemas(schema):
         unsupported = sorted(_XGRAMMAR_UNSUPPORTED_KEYWORDS.intersection(subschema))
         if unsupported:
             _raise_unsupported(
@@ -202,7 +200,7 @@ def validate_xgrammar_json_schema(schema: Any) -> None:
 
 def validate_outlines_json_schema(schema: Any) -> None:
     """Reject constraints Outlines Core 0.1.x accepts without preserving."""
-    for subschema, pointer in _iter_subschemas(schema):
+    for subschema, pointer in iter_subschemas(schema):
         unsupported = sorted(_OUTLINES_UNSUPPORTED_KEYWORDS.intersection(subschema))
         if unsupported:
             _raise_unsupported(
