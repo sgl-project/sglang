@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     has_per_rank_fused_shared_slots,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda_alike
 
 
 def _scale_fused_shared_weights(weights, num_fused_shared_experts, scaling_factor):
@@ -40,7 +40,7 @@ def vision_topk(
         assert not has_per_rank_fused_shared_slots(num_shared_topk_slots), (
             "VL routing does not support per-rank fused shared slots"
         )
-    if is_cuda():
+    if is_cuda_alike():
         from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 

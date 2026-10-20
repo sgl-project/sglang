@@ -392,7 +392,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                         patch.object(mega_moe, "run_mega_routed_experts", run_experts),
                         # The fused padded-row fill requires Triton/GPU.
                         patch(
-                            "sglang.srt.multimodal.dsv41.vl_routing.is_cuda",
+                            "sglang.srt.multimodal.dsv41.vl_routing.is_cuda_alike",
                             return_value=False,
                         ),
                         patch.object(topk_module, "_is_cuda", False),
