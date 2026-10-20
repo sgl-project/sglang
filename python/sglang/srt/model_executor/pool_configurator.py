@@ -364,6 +364,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     use_mla_backend=kvc.use_mla_backend,
                     num_layers=num_layers,
                     element_size=kv_size,
+                    start_layer=kvc.layer_info.start_layer,
+                    is_draft_worker=kvc.is_draft_worker,
                 )
                 if offload_cell_size is not None:
                     return offload_cell_size
@@ -548,15 +550,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
                 indexer_size_per_token = index_head_dim
                 element_size = torch._utils._element_size(dtype)
-            if not is_npu_arch35():
-                allocate_all_layers = True
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

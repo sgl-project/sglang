@@ -1820,5 +1820,199 @@ class TestFusedDraftPricing(unittest.TestCase):
         )
 
 
+class TestNPUCompactDSAIndexerSizing(CustomTestCase):
+    def test_ascend_pool_builder_compacts_on_non_arch35_hardware(self):
+        import sys
+
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_head_dim=128,
+            index_topk=2048,
+            indexer_types=[
+                "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
+            ],
+        )
+        kvc = object.__new__(KVCacheConfigurator)
+        kvc.is_draft_worker = False
+        kvc.layer_info = SimpleNamespace(
+            start_layer=0, end_layer=78, num_effective_layers=78
+        )
+        kvc.model_config = SimpleNamespace(
+            hf_config=hf_config,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+        )
+        kvc.kv_cache_dtype = torch.bfloat16
+        kvc.device = "cpu"
+
+        class PoolCapture:
+            def __init__(self, size, **kwargs):
+                self.kwargs = kwargs
+
+        npu_pool_module = SimpleNamespace(NPUMLATokenToKVPool=PoolCapture)
+        with (
+            patch.dict(
+                sys.modules,
+                {"sglang.srt.hardware_backend.npu.memory_pool_npu": npu_pool_module},
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_schedule",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=False)
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+        ):
+            pool = kvc._build_ascend_mla_kv_pool(
+                max_total_num_tokens=1024, is_dsa_model=True
+            )
+
+        expected_layer_ids = (0, 1, *range(2, 78, 4))
+        self.assertEqual(pool.kwargs["indexer_layer_ids"], expected_layer_ids)
+
+    def test_ascend_pool_builder_preserves_empty_owner_range(self):
+        import sys
+
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_head_dim=128,
+            index_topk=2048,
+            indexer_types=[
+                "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
+            ],
+        )
+        kvc = object.__new__(KVCacheConfigurator)
+        kvc.is_draft_worker = False
+        kvc.layer_info = SimpleNamespace(
+            start_layer=3, end_layer=6, num_effective_layers=3
+        )
+        kvc.model_config = SimpleNamespace(
+            hf_config=hf_config,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+        )
+        kvc.kv_cache_dtype = torch.bfloat16
+        kvc.device = "cpu"
+
+        class PoolCapture:
+            def __init__(self, size, **kwargs):
+                self.kwargs = kwargs
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.hardware_backend.npu.memory_pool_npu": SimpleNamespace(
+                        NPUMLATokenToKVPool=PoolCapture
+                    )
+                },
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
+                return_value=SimpleNamespace(attn_dcp_size=1),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_schedule",
+                return_value=SimpleNamespace(page_size=64),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_memory_saver=False)
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",
+                return_value=False,
+            ),
+        ):
+            pool = kvc._build_ascend_mla_kv_pool(
+                max_total_num_tokens=1024, is_dsa_model=True
+            )
+
+        self.assertEqual(pool.kwargs["indexer_layer_ids"], ())
+
+    def test_bf16_indexer_cell_size_counts_local_owner_layers(self):
+        import torch
+
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_head_dim=128,
+            index_topk=2048,
+            indexer_types=[
+                "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
+            ],
+        )
+        kvc = SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=hf_config),
+            kv_cache_dtype=torch.bfloat16,
+            server_args=SimpleNamespace(enable_hisparse=False),
+            layer_info=SimpleNamespace(start_layer=20, end_layer=40),
+            is_draft_worker=False,
+            mambaish_config=None,
+        )
+        cfg = object.__new__(DefaultPoolConfigurator)
+        with (
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.model_executor.pool_configurator.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.cp.utils.get_glm_dsa_cp_layer_shard_info",
+                return_value=(0, 1),
+            ),
+        ):
+            self.assertEqual(
+                cfg._compute_dsa_indexer_cell_size(kvc=kvc, num_layers=20),
+                128 * 5 * torch.tensor([], dtype=torch.bfloat16).element_size(),
+            )
+            hf_config.indexer_types = [
+                "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
+            ]
+            kvc.layer_info = SimpleNamespace(start_layer=3, end_layer=6)
+            self.assertEqual(
+                cfg._compute_dsa_indexer_cell_size(kvc=kvc, num_layers=3),
+                0,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
