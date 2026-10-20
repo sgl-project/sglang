@@ -117,6 +117,7 @@ fi
 # Adapt Deepseek-V4-Flash test cases with additional environment variables.
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash || true
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash || true
+# Additional environment variables required to enable DSPARK for Deepseek-V4 in the 950 environment
 
 echo "Running test case ${test_case}"
 tc_name=${test_case##*/}
