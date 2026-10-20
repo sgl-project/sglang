@@ -1198,6 +1198,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     input_ids_global,
                     num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
                 )
             else:
                 topk_output = self.topk(
@@ -1378,6 +1379,7 @@ class DeepseekV2MoE(nn.Module):
                     router_logits,
                     input_ids_global,
                     num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=dispatch_info,
                 )
             else:
                 topk_output = self.topk(
