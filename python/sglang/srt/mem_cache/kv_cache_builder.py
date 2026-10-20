@@ -58,7 +58,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
-from sglang.srt.utils import ceil_align, is_hip
+from sglang.srt.utils import ceil_align, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -72,6 +72,8 @@ def prepare_hicache_staging(
     *, tp_worker: BaseTpWorker, draft_plan: Optional[HiCacheDraftPlan] = None
 ) -> None:
     """Materialize MHA transfer buffers before the final KV budget is measured."""
+    if is_npu():
+        return
     memory = get_memory()
     page_size = get_schedule().page_size
     if memory.hicache_mem_layout != "page_first" or not (
@@ -93,11 +95,13 @@ def prepare_hicache_staging(
             if memory.hicache_size <= 0 and not sidecar:
                 page_capacity = int(pool.size * memory.hicache_ratio) // page_size + 1
             staging = prepare_mha_write_back_staging(
-                pool,
+                pool.get_device_pool_infos()[0].buffer_info,
                 layer_num=pool.layer_num + len(packed_drafts),
                 page_size=page_size,
                 page_capacity=page_capacity,
+                staging=pool.hicache_write_back_staging,
             )
+            pool.hicache_write_back_staging = staging
             if staging is not None:
                 logger.info(
                     "HiCache staging prepared before KV sizing: %.1f MiB, %d layers",
@@ -300,6 +304,7 @@ def build_kv_cache(
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     dynamo_kv_event_format: bool = False,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
+    draft_swa_window: int = 0,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -324,6 +329,9 @@ def build_kv_cache(
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
+    assert draft_swa_window == 0 or sliding_window_size is not None, (
+        "a fused draft reads an swa sub-pool this target does not build"
+    )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
@@ -398,9 +406,17 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         swa_gates_prefix_match=swa_gates_prefix_match,
+        draft_swa_window=draft_swa_window,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
     )
+    if params.swa_retain_window != sliding_window_size:
+        logger.info(
+            "SWA eviction keeps %d tokens back: the fused draft reads past the "
+            "%d-token window.",
+            params.swa_retain_window,
+            sliding_window_size,
+        )
 
     tree_context = TreeCacheBuildContext(
         server_args=server_args,

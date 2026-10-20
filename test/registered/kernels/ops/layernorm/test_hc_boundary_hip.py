@@ -4,13 +4,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.layernorm.mhc import (
-    _hc_split_sinkhorn_torch,
-    hc_combine,
-    hc_mix_stats_sinkhorn,
-)
+from sglang.kernels.ops.layernorm.mhc import hc_combine, hc_mix_stats_sinkhorn
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.mhc import hc_split_sinkhorn_torch
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
@@ -35,7 +32,7 @@ def _ref_coefficients(residual, hc_fn, hc_scale, hc_base):
     x = residual.flatten(1).double()
     rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + RMS_EPS)
     mixes = ((x @ hc_fn.double().T) * rsqrt).float().unsqueeze(1)
-    pre, post, comb = _hc_split_sinkhorn_torch(
+    pre, post, comb = hc_split_sinkhorn_torch(
         mixes, hc_scale, hc_base, HC, ITERS, HC_EPS
     )
     return pre.squeeze(1), post.squeeze(1), comb.squeeze(1)

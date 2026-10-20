@@ -48,6 +48,7 @@ from sglang.srt.configs.dots3 import Dots3Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -126,7 +127,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     ceil_align,
     ceil_div,
-    get_bool_env_var,
     is_cuda,
     log_info_on_rank0,
     make_pp_layers,
@@ -1791,7 +1791,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
-                    and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                    and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.
                     # The issue is that when multiplying w_kc the reduction dim can not be divided

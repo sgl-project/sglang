@@ -10,43 +10,6 @@ register_amd_ci(est_time=4, suite="jit-kernel-unit-test-amd")
 DEVICE = "cuda"
 
 
-def reference_sigmoid_gate_mul(x, gate):
-    return x * torch.sigmoid(gate)
-
-
-# ── element-wise variant ──
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize(
-    "shape",
-    [
-        (1, 4096),
-        (4, 4096),
-        (8, 4096),
-        (32, 8192),
-        (1, 128),
-        (16, 16384),
-    ],
-)
-def test_sigmoid_gate_mul_correctness(shape, dtype):
-    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import sigmoid_gate_mul
-
-    torch.manual_seed(42)
-    x = torch.randn(shape, dtype=dtype, device=DEVICE)
-    gate = torch.randn(shape, dtype=dtype, device=DEVICE)
-
-    ref = reference_sigmoid_gate_mul(x, gate)
-    out = sigmoid_gate_mul(x, gate)
-
-    rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
-    atol = 2e-2 if dtype == torch.bfloat16 else 1e-3
-    torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
-
-
-# ── broadcast variant ──
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "shape",

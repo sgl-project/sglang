@@ -5,11 +5,11 @@ from sglang.test.ci.ci_register import (
     register_xpu_ci,
 )
 
-register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=7, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
 register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 # The dst layout-contract tests run on CPU (no kernel launch).
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 import unittest
 
@@ -17,6 +17,7 @@ import torch
 
 try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        _conv_multi_eligible,
         _require_entry_contiguous_dst,
         fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
@@ -450,6 +451,83 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
         get_device_module().synchronize()
         for i, (exp, (got, _)) in enumerate(zip(expect, pairs)):
             torch.testing.assert_close(got, exp, msg=f"conv type {i} mismatch")
+
+    def test_strided_envelope_commit_and_track(self):
+        """Outer strides must not disable fusion or overwrite adjacent state."""
+        layers, slots, batch, steps = 3, 16, 5, 4
+        shapes = [(3, 8), (3, 16), (3, 32)]
+        entry = layers * sum(a * b for a, b in shapes) * 2 + 64
+        raw = torch.full((slots * entry,), 0x55, dtype=torch.uint8, device=DEVICE)
+        conv, _ = build_mamba_entry_views(
+            raw,
+            layer_num=layers,
+            conv_state_shapes=shapes,
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(0, 0, 0),
+            temporal_dtype=torch.float32,
+            max_slots=slots,
+            entry_bytes=entry,
+        )
+        ref_raw = raw.clone()
+        ref, _ = build_mamba_entry_views(
+            ref_raw,
+            layer_num=layers,
+            conv_state_shapes=shapes,
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(0, 0, 0),
+            temporal_dtype=torch.float32,
+            max_slots=slots,
+            entry_bytes=entry,
+        )
+        sources = [
+            torch.randn(
+                layers, batch, steps, *shape, device=DEVICE, dtype=torch.bfloat16
+            )
+            for shape in shapes
+        ]
+        dst1 = torch.tensor([1, 3, 5, 7, 9], device=DEVICE, dtype=torch.int32)
+        dst2 = torch.tensor([2, 4, 6], device=DEVICE, dtype=torch.int32)
+        step1 = torch.tensor([0, -1, 2, 3, 1], device=DEVICE, dtype=torch.int32)
+        step2 = torch.tensor([1, 2, -1], device=DEVICE, dtype=torch.int32)
+        pairs = list(zip(conv, sources))
+        self.assertTrue(_conv_multi_eligible(pairs))
+        # Transposing the feature block is not supported by its flat store.
+        self.assertFalse(
+            _conv_multi_eligible(
+                [(conv[0].transpose(2, 3), sources[0].transpose(3, 4))]
+            )
+        )
+        for dsts, stps in [(dst1, step1), (dst2, step2)]:
+            valid = stps >= 0
+            rows = torch.arange(stps.numel(), device=DEVICE)[valid]
+            for target, src in zip(ref, sources):
+                target[:, dsts[valid].long()] = src[:, rows, stps[valid].long()]
+        fused_conv_window_scatter_multi(pairs, dst1, step1, dst2, step2)
+        torch.testing.assert_close(raw, ref_raw, rtol=0, atol=0)
+
+    def test_cached_descriptor_tracks_destination_strides(self):
+        """Rebinding the same storage with new outer strides must refresh metadata."""
+        layers, slots, dim, win = 2, 16, 8, 3
+        entry = dim * win
+        raw = torch.zeros(
+            layers * slots * 2 * entry, device=DEVICE, dtype=torch.bfloat16
+        )
+        source = torch.randn(
+            layers, 2, 3, dim, win, device=DEVICE, dtype=torch.bfloat16
+        )
+        indices = torch.tensor([3, 7], device=DEVICE, dtype=torch.int32)
+        steps = torch.tensor([0, 2], device=DEVICE, dtype=torch.int32)
+        for factor in [1, 2]:
+            raw.zero_()
+            strides = (slots * 2 * entry, factor * entry, win, 1)
+            dst = raw.as_strided((layers, slots, dim, win), strides)
+            ref_raw = raw.clone()
+            ref = ref_raw.as_strided(dst.shape, strides)
+            ref[:, indices.long()] = source[
+                :, torch.arange(2, device=DEVICE), steps.long()
+            ]
+            fused_conv_window_scatter_multi([(dst, source)], indices, steps)
+            torch.testing.assert_close(raw, ref_raw, rtol=0, atol=0)
 
     def test_single_type(self):
         self._run(num_types=1, n2=0)

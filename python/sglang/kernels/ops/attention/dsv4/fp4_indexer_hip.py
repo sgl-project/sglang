@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import functools
 import itertools
-import os
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
@@ -22,6 +21,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4_row,
 )
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.attention.dsv4.compress import (
@@ -62,9 +62,7 @@ C4_ROWGROUP_MIN_VERIFY_ROWS = 64
 # (see `logits_rows_per_chunk`), so this caps the indexer's transient footprint
 # independently of context length and chunked-prefill size; smaller budgets only
 # buy more row chunks. 2 GiB covers 4096 rows over ~512K tokens of context.
-_LOGITS_BUDGET_ELEMS = (
-    int(os.environ.get("SGLANG_DSV4_FP4_LOGITS_BUDGET_MB", "2048")) * 2**20 // 4
-)
+_LOGITS_BUDGET_ELEMS = envs.SGLANG_DSV4_FP4_LOGITS_BUDGET_MB.get() * 2**20 // 4
 _LOGITS_POOL: dict = {}
 
 

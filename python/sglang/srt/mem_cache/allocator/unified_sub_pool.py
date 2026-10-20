@@ -1187,10 +1187,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
             bs = len(prefix_lens)
-            # Snapshot the virtual pages the kernel will consume, to bind them
-            # to physical pages afterward.
+            # The free list is only rebound, not mutated in place. Retain its
+            # consumed slice for binding without launching a redundant copy.
             if num_new_pages > 0:
-                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
+                new_virtual_pages = self.free_virtual_ids[:num_new_pages]
             else:
                 new_virtual_pages = None
 
@@ -2424,10 +2424,13 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-            freed_p_pages = self.virtual_to_physical[free_v_pages]
-            # `index_fill_`, never `t[idx] = -1`: see the END free path.
-            self.virtual_to_physical.index_fill_(0, free_v_pages, -1)
-            self.physical_to_virtual.index_fill_(0, freed_p_pages, -1)
+            # The same fused lookup + tombstones as the END free path avoids
+            # three separate launches on each sliding-window retirement.
+            freed_p_pages = free_unbind_inplace(
+                free_v_pages.contiguous(),
+                self.virtual_to_physical,
+                self.physical_to_virtual,
+            )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])

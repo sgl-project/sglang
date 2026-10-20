@@ -326,7 +326,7 @@ async fn run_session(
 
     loop {
         let message = tokio::select! {
-            result = subscriber.recv() => result?,
+            result = tokio::task::unconstrained(subscriber.recv()) => result?,
             _ = tokio::signal::ctrl_c() => {
                 info!("received ctrl-c; shutting down bridge");
                 return Ok(());

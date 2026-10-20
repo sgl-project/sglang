@@ -1,10 +1,9 @@
 """Correctness tests for the Triton :func:`moe_fused_gate` router.
 
-The Triton kernel is a drop-in reimplementation of the CUDA fused gate for the
-ungrouped case (``num_expert_group == 1``). We validate it three ways:
+For the ungrouped case (``num_expert_group == 1``) we validate it two ways:
 
 * against an explicit, definition-based torch reference (documents the math),
-* against the CUDA JIT kernel it mirrors (:func:`moe_fused_gate_jit`), and
+  at small shapes and at model routing shapes, and
 * against the production ``biased_grouped_topk_impl`` for the sigmoid / no-shared
   path that the kernel actually replaces in ``topk.py``.
 
@@ -22,7 +21,7 @@ import pytest
 import torch
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate, moe_fused_gate_jit
+from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -55,7 +54,7 @@ def _reference_gate(
     routed_scaling_factor: float,
     apply_routed_scaling_factor_on_output: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Definition-based eager reference matching the CUDA fused-gate semantics."""
+    """Definition-based eager reference for the fused-gate semantics."""
     if scoring_func == "sigmoid":
         activated = scores.sigmoid()
     else:
@@ -176,10 +175,9 @@ def test_moe_fused_gate_matches_reference(
         (8192, 512, 8, 1, "sigmoid"),
     ],
 )
-def test_moe_fused_gate_matches_cuda_jit(
+def test_moe_fused_gate_matches_reference_at_model_shapes(
     M: int, num_experts: int, topk: int, num_shared: int, scoring_func: str
 ) -> None:
-    """Triton output must match the CUDA JIT kernel it reimplements."""
     scores, bias = _make_inputs(M, num_experts, seed=123)
 
     kwargs = dict(
@@ -191,13 +189,13 @@ def test_moe_fused_gate_matches_cuda_jit(
         apply_routed_scaling_factor_on_output=True,
     )
     triton_w, triton_i = moe_fused_gate(scores, bias, **kwargs)
-    cuda_w, cuda_i = moe_fused_gate_jit(scores, bias, **kwargs)
+    ref_w, ref_i = _reference_gate(scores, bias, **kwargs)
     torch.cuda.synchronize()
 
     num_columns = num_experts + num_shared
     torch.testing.assert_close(
         _scatter_by_expert(triton_w, triton_i, num_columns),
-        _scatter_by_expert(cuda_w, cuda_i, num_columns),
+        _scatter_by_expert(ref_w, ref_i, num_columns),
         rtol=1e-4,
         atol=1e-5,
     )

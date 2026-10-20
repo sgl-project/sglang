@@ -194,17 +194,6 @@ def _rebase_partition_weight_scales(
     return rebased.to(torch.float8_e4m3fn)
 
 
-def _nvfp4_uses_tma_scale_layout(
-    flashinfer_backend: str | None, *, uses_flux1_scale_layout: bool = False
-) -> bool:
-    return uses_flux1_scale_layout or flashinfer_backend in {
-        None,
-        "auto",
-        "cudnn",
-        "cutlass",
-    }
-
-
 def _dynamic_nvfp4_input_scale(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Compute the reference tensorwise activation scale.
 

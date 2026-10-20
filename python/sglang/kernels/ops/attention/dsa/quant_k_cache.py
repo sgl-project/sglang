@@ -3,57 +3,6 @@ import triton
 import triton.language as tl
 
 
-def gather_dsa_kv_scales(
-    scale_src,
-    scale_dst,
-    kv_indices,
-    kv_indptr,
-    kv_indptr_idx,
-):
-    _gather_dsa_kv_scales[(32,)](
-        scale_src,
-        scale_dst,
-        kv_indices,
-        kv_indptr,
-        scale_src.stride(0),
-        KV_INDPTR_IDX=kv_indptr_idx,
-        NUM_TILES=scale_src.shape[-1],
-        BLOCK=256,
-    )
-
-
-@triton.jit
-def _gather_dsa_kv_scales(
-    scale_src,
-    scale_dst,
-    kv_indices,
-    kv_indptr,
-    scale_src_stride,
-    KV_INDPTR_IDX: tl.constexpr,
-    NUM_TILES: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_programs = tl.num_programs(0)
-    active = tl.load(kv_indptr + KV_INDPTR_IDX)
-    block_start = pid * BLOCK
-    tiles = tl.arange(0, NUM_TILES)
-    while block_start < active:
-        offsets = block_start + tl.arange(0, BLOCK)
-        mask = offsets < active
-        rows = tl.load(kv_indices + offsets, mask=mask, other=0)
-        values = tl.load(
-            scale_src + rows[:, None] * scale_src_stride + tiles[None, :],
-            mask=mask[:, None],
-        )
-        tl.store(
-            scale_dst + rows[:, None] * NUM_TILES + tiles[None, :],
-            values,
-            mask=mask[:, None],
-        )
-        block_start += num_programs * BLOCK
-
-
 def quantize_k_cache(cache_k, dv: int | None = None):
     return _quantize_k_cache_fast_wrapped(cache_k, dv=dv)
 

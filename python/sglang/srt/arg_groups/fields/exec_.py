@@ -43,12 +43,14 @@ class ExecFeatures(msgspec.Struct):
         "If set, the LM head outputs (logits) are in FP32.",
     ] = False
     enable_tf32_matmul: A[
-        bool,
+        Optional[bool],
         Arg(
-            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only.",
+            help="Enable float32 matmuls to use TensorFloat32 precision for better performance (via torch.set_float32_matmul_precision). CUDA only. Defaults to the model's preference, otherwise disabled.",
+            action=argparse.BooleanOptionalAction,
             resolvable=True,
+            fallback=False,
         ),
-    ] = False
+    ] = None
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -382,8 +384,16 @@ class ExecKernel(msgspec.Struct):
         bool, "Not using ragged prefill wrapper when running flashinfer mla"
     ] = False
     enable_fused_qk_norm_rope: A[
-        bool, "Enable fused qk normalization and rope rotary embedding."
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Fuse q/k normalization and rope rotary embedding into one "
+            "kernel. By default this is enabled on XPU and disabled elsewhere. "
+            "Pass --enable-fused-qk-norm-rope or --no-enable-fused-qk-norm-rope "
+            "to force it either way.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
     enable_precise_embedding_interpolation: A[
         bool,
         "Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values.",

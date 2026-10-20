@@ -31,10 +31,8 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
     def _run_combine_test(
         self, N, B, H_local, D, is_base_e, dtype=torch.bfloat16, atol=1e-2
     ):
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
 
         torch.manual_seed(42)
 
@@ -49,7 +47,7 @@ class TestLSECombineTritonVsCPU(CustomTestCase):
                 * 5.0
             )
 
-        cpu_result = _lse_weighted_combine_cpu(
+        cpu_result = lse_weighted_combine_cpu(
             partial_outputs.cpu(),
             partial_lses.cpu(),
             is_lse_base_on_e=is_base_e,
@@ -197,10 +195,8 @@ class TestLSECombineEdgeCases(CustomTestCase):
 
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
-        from sglang.kernels.ops.attention.dcp_kernels import (
-            _lse_weighted_combine_cpu,
-            dcp_lse_combine_triton,
-        )
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
 
         N, B, H_local, D = 2, 1, 1, 64
         partial_outputs = torch.randn(
@@ -213,7 +209,7 @@ class TestLSECombineEdgeCases(CustomTestCase):
         triton_result, _ = dcp_lse_combine_triton(
             partial_outputs, partial_lses, is_lse_base_on_e=True
         )
-        cpu_result = _lse_weighted_combine_cpu(
+        cpu_result = lse_weighted_combine_cpu(
             partial_outputs.cpu(), partial_lses.cpu(), is_lse_base_on_e=True
         )
 

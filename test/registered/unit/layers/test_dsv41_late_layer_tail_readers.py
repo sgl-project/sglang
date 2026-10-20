@@ -1,9 +1,9 @@
-"""Decoder SWA bounded replay: requests that read prompt rows (prompt logprobs,
-every hidden state) run their whole extend through the late layers. CPU only."""
+"""Decoder SWA bounded replay: the rows the late layers run (whole extends for
+requests that read prompt rows) and how DP ranks learn each other's. CPU only."""
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -14,10 +14,23 @@ from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
     DeepseekV4AttnBackend,
+    DSV4Metadata,
     late_layer_whole_extend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import SparseTableBackend
+from sglang.srt.model_executor import forward_batch_info
+from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.models.deepseek_common import decoder_swa_bounded_replay
+from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
+    late_layer_dp_counts,
+)
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -171,6 +184,152 @@ class TestTailReadersCheck(CustomTestCase):
             self._check(_batch([300], starts=[0]), [128])
         with self.assertRaises(ValueError):
             self._check(_batch([300], capture=CaptureHiddenMode.FULL), [128])
+
+
+class TestLateLayerRowsUnderDpAttention(CustomTestCase):
+    """A rank replaying the prefill graph never runs the model's late-layer code,
+    so its eager peers learn its late-layer rows before the forward."""
+
+    def setUp(self):
+        override = get_context().override_server_args(
+            tp_size=2,
+            dp_size=2,
+            enable_dp_attention=True,
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _dp_rank(self, rank):
+        return get_parallel().override(
+            attn_tp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=rank,
+            tp_group=SimpleNamespace(cpu_group=None),
+        )
+
+    def test_rows_are_exchanged_before_the_forward(self):
+        # Rank 0 prefills 300 rows; rank 1 is idle.
+        n = 300
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(n),
+            req_pool_indices=torch.tensor([1]),
+            seq_lens=torch.tensor([n]),
+            out_cache_loc=torch.arange(n),
+            seq_lens_sum=n,
+            positions=torch.arange(n),
+            seq_lens_cpu=torch.tensor([n]),
+            extend_num_tokens=n,
+            extend_seq_lens=torch.tensor([n]),
+            extend_seq_lens_cpu=[n],
+            extend_prefix_lens_cpu=[0],
+            is_extend_in_batch=True,
+        )
+        fb.init_mlp_sync_metadata(
+            SimpleNamespace(
+                global_num_tokens=[n, 0],
+                global_num_tokens_for_logprob=[1, 0],
+                dp_spec_prefill_coordination_applied=False,
+                draft_global_num_tokens=None,
+                can_run_decode_cuda_graph=False,
+                can_run_dp_draft_cuda_graph=False,
+            ),
+            CPU,
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.enable_decoder_swa_bounded_replay = True
+        backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
+        backend.get_cpu_graph_seq_len_fill_value = lambda: 1
+        runner = MagicMock(attn_backend=backend, is_draft_worker=False)
+        runner.attn_tp_sequence_sharded.return_value = False
+
+        def idle_peer(out, local, group):
+            out.copy_(torch.cat([local, local.new_zeros(1)]))
+
+        with (
+            self._dp_rank(0),
+            # CPU runners have no driver to pin the synced token counts with.
+            patch.object(forward_batch_info, "_is_cpu", True),
+            patch.object(
+                forward_batch_info, "all_gather_single", side_effect=idle_peer
+            ),
+        ):
+            fb.prepare_mlp_sync_batch(runner)
+        self.assertEqual(fb.global_late_layer_num_tokens_cpu, [SWA_WINDOW, 0])
+
+        for rank, local_rows in ((0, SWA_WINDOW), (1, 0)):
+            with (
+                self.subTest(rank=rank),
+                self._dp_rank(rank),
+                patch.object(
+                    decoder_swa_bounded_replay,
+                    "all_gather_single",
+                    side_effect=AssertionError("a collective inside the forward"),
+                ),
+            ):
+                counts = late_layer_dp_counts(fb, local_rows, in_graph=False)
+            self.assertEqual(counts, [SWA_WINDOW, 0])
+
+
+def _prefill_graph_replay(*, any_context, seq_len):
+    """The backend's default replayed-context limit and the widths a replay gives
+    the full-row and tail metadata, for one request of ``seq_len`` tokens."""
+    seen = {}
+
+    def build_full(forward_batch, *, max_seq_len_override, use_prefill_cuda_graph):
+        seen["full"] = max_seq_len_override
+
+    def build_tail(forward_batch, max_seq_len):
+        seen["tail"] = max_seq_len
+
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+    backend.low_ratios = (1, 2)
+    backend.prefill_candidates = object.__new__(SparseTableBackend)
+    backend._build_forward_metadata = build_full
+    backend._prefill_graph_tail_metadata = build_tail
+    backend._activate_request_window = lambda: None
+    backend._prefill_graph_replays_any_context = lambda: any_context
+    capture = object.__new__(DSV4Metadata)
+    capture.prefill_graph_tail = True
+    with (
+        patch.object(
+            deepseek_v4_backend,
+            "get_parallel",
+            return_value=SimpleNamespace(attn_cp_size=1),
+        ),
+        patch.object(
+            deepseek_v4_backend, "_prefill_graph_max_seq_len", return_value=None
+        ),
+        patch.object(DSV4Metadata, "refresh_for_breakable_cuda_graph_replay_"),
+    ):
+        seen["limit"] = backend.prefill_cuda_graph_default_max_seq_len
+        DeepseekV4AttnBackend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            backend,
+            capture,
+            SimpleNamespace(
+                seq_lens_cpu=torch.tensor([seq_len]), max_seq_len_override=1 << 20
+            ),
+        )
+    return seen
+
+
+class TestPrefillGraphReplayContext(CustomTestCase):
+    """DeepSeek-V4.1's prefill graph replays past its captured indexer width only
+    when the replay is exact, and then its metadata spans the live context."""
+
+    def test_limit_and_metadata_width(self):
+        for any_context, seq_len, expected in (
+            (True, 155648 + 1024, {"limit": None, "full": 156672, "tail": 156672}),
+            (False, 8192 + 1024, {"limit": 16384, "full": 16384, "tail": 16384}),
+        ):
+            with self.subTest(any_context=any_context):
+                self.assertEqual(
+                    _prefill_graph_replay(any_context=any_context, seq_len=seq_len),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

@@ -575,9 +575,9 @@ fn tokenize_goes_to_the_pool_without_detok_registration() {
 /// The detok entry is dropped either way — that is the half that must not
 /// depend on the channel.
 ///
-/// Channel capacity 1: the first abort pushes, the second finds it full.
+/// Request-ring capacity does not limit the reserved abort lane.
 #[test]
-fn abort_deregisters_even_when_the_channel_push_is_dropped() {
+fn abort_deregisters_and_bypasses_request_ring_capacity() {
     let (tok_tx, _tok_rx) = flume::unbounded();
     let (detok_tx, detok_rx) = flume::unbounded();
     let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
@@ -587,7 +587,7 @@ fn abort_deregisters_even_when_the_channel_push_is_dropped() {
         tokenizer_tx: tok_tx,
         detokenizer_tx: vec![detok_tx],
     };
-    let (producer, _consumer) = to_scheduler(1);
+    let (producer, consumer) = to_scheduler(1);
     let (_tm_tx, tm_rx) = flume::unbounded();
     let (sd_tx, sd_rx) = flume::unbounded::<()>();
     std::mem::forget(sd_tx);
@@ -611,6 +611,7 @@ fn abort_deregisters_even_when_the_channel_push_is_dropped() {
             "{expected}: the detok entry must be dropped even when the to_scheduler channel is full",
         );
     }
+    assert_eq!(consumer.drain(8).len(), 2, "both aborts must be delivered");
 }
 
 /// The rid keys the detok table and rides on every chunk of every decode step,

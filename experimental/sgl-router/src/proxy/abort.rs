@@ -6,7 +6,8 @@ use reqwest::{Client, RequestBuilder, Url};
 use std::time::Duration;
 
 /// Cancels unfinished engine work without delaying request cleanup.
-pub(super) struct AbortOnDrop(Option<RequestBuilder>);
+#[derive(Default)]
+pub struct AbortOnDrop(Option<RequestBuilder>);
 
 impl AbortOnDrop {
     // Only router-minted IDs are safe: the engine aborts by prefix.
@@ -28,7 +29,7 @@ impl AbortOnDrop {
         }))
     }
 
-    pub(super) fn disarm(&mut self) {
+    pub fn disarm(&mut self) {
         self.0 = None;
     }
 }

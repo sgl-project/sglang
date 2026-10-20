@@ -677,6 +677,10 @@ class TboForwardBatchPreparer:
         assert end_token_index >= start_token_index, (
             f"{end_token_index=}, {start_token_index=}, batch={batch}"
         )
+        assert batch.logical_forward_mode == batch.forward_mode, (
+            "Two-batch overlap does not support hybrid-SSM decode batches "
+            "relabeled as extend for DP padding."
+        )
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 

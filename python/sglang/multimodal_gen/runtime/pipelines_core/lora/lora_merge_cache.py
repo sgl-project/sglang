@@ -42,16 +42,18 @@ def lora_merge_cache_key(
 
     `base_paths` are the component checkpoint paths (HF snapshot paths carry
     the revision hash); `adapters` are ordered (lora_path, strength, alpha)
-    triples — order matters, merges compose in order.
+    triples — order matters, merges compose in order. Include adapter file
+    modification times so same-size local checkpoint updates invalidate the cache.
     """
     parts = [os.path.realpath(p) for p in sorted(base_paths)]
     for path, strength, alpha in adapters:
         real = os.path.realpath(path)
         try:
-            size = os.path.getsize(real)
+            stat = os.stat(real)
+            size, mtime_ns = stat.st_size, stat.st_mtime_ns
         except OSError:
-            size = -1
-        parts.append(f"{real}|{size}|{strength}|{alpha}")
+            size, mtime_ns = -1, -1
+        parts.append(f"{real}|{size}|{mtime_ns}|{strength}|{alpha}")
     return hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
 
 

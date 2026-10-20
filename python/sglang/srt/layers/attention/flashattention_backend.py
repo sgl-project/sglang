@@ -463,7 +463,39 @@ class FlashAttentionBackend(AttentionBackend):
         k_sf, v_sf = self.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
         return {"sfq": q_descale, "sfk": k_sf, "sfv": v_sf}
 
+    def _capture_unified_verify_metadata(self, forward_batch: ForwardBatch) -> bool:
+        # Fixed-width verify uses only capture-stable request/length buffers.
+        # Ragged layouts and encoder offsets still use their eager builders.
+        return (
+            forward_batch.forward_mode.is_target_verify()
+            and self.fa_impl_ver == 4
+            and self.kv_index_translator.reads_are_translated
+            and self.topk <= 1
+            and forward_batch.encoder_lens is None
+            and getattr(forward_batch.spec_info, "ragged_verify_layout", None) is None
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        if self._capture_unified_verify_metadata(forward_batch):
+            metadata = self.target_verify_metadata[forward_batch.batch_size]
+            translator = self.kv_index_translator
+            swa = translator.space(IdSpaceKind.SLIDING_WINDOW)
+            normal_decode_set_metadata(
+                metadata.cache_seqlens_int32,
+                metadata.cu_seqlens_k,
+                metadata.page_table,
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                self.max_num_pages,
+                forward_batch.seq_lens,
+                self.speculative_num_draft_tokens,
+                self.page_size,
+                metadata.swa_page_table,
+                full_v2p=translator.space(IdSpaceKind.FULL).read_v2p,
+                swa_v2p=None if swa is None else swa.read_v2p,
+                zero_tail=True,
+            )
+            return
         # Single-CG has no Python between steps, so one capturable kernel updates
         # the persistent metadata.
         if not forward_batch.forward_mode.is_draft_extend_v2():
@@ -593,6 +625,23 @@ class FlashAttentionBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_out_cache_loc)
+
+        if self._capture_unified_verify_metadata(forward_batch):
+            if in_capture:
+                self._bind_metadata_buffers(
+                    bs,
+                    forward_batch.positions.numel(),
+                    encoder_lens,
+                    forward_mode,
+                    spec_info,
+                    seq_lens.device,
+                )
+            self.forward_metadata = self.target_verify_metadata[bs]
+            self.forward_metadata_spec_decode_expand = None
+            # The runner records the device-side update at the start of the
+            # model graph. Do not populate a live plan's read-table cache with
+            # this graph-owned buffer: another bucket can overwrite it later.
+            return
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -2926,7 +2975,11 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len_delta,
             self.page_size,
             metadata.swa_page_table,
-            self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
+            full_to_swa_index_mapping=(
+                self.token_to_kv_pool.full_to_swa_index_mapping
+                if self.use_sliding_window_kv_pool
+                else None
+            ),
             skip_page_table=translated,
         )
         if translated:

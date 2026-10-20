@@ -117,9 +117,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     TCPCG_FAILURE_HINT,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.model_executor.runner_utils import (
-    maybe_publish_prefill_shared_read_done,
-)
 from sglang.srt.model_executor.runner_utils.buffers import (
     PrefillInputBuffers,
 )
@@ -127,6 +124,10 @@ from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mo
 from sglang.srt.model_executor.runner_utils.forward_batch import set_forward_batch
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
@@ -374,6 +375,16 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.max_bs = model_runner.req_to_token_pool.size
         self.max_context_size = prefill_config.max_context_size
         self.max_seq_len = prefill_config.max_seq_len
+        if self.max_seq_len is None:
+            self.max_seq_len = (
+                model_runner.attn_backend.prefill_cuda_graph_default_max_seq_len
+            )
+            if self.max_seq_len is not None:
+                logger.info(
+                    "Prefill CUDA graph replays contexts up to %d tokens, the "
+                    "attention backend's default; longer contexts run eager prefill.",
+                    self.max_seq_len,
+                )
         self._validate_max_context_capacity(
             max_context_size=self.max_context_size,
             table_width=model_runner.req_to_token_pool.req_to_token.shape[1],
@@ -803,6 +814,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     ):
         with (
             set_forward_batch(forward_batch),
+            prefill_graph_scope(
+                full_graph=self._is_full_backend, raw_num_tokens=raw_num_tokens
+            ),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -936,6 +950,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         with (
             set_forward_batch(fb),
+            prefill_graph_scope(full_graph=self._is_full_backend),
             forward_context(
                 ForwardContext(attn_backend=self.model_runner.attn_backend)
             ),
@@ -1704,6 +1719,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        # Recapture can follow decode replay, which may change model-owned storage.
+        prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -1999,6 +2018,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # The encoder replay fold: a replay builds the same window floors and
+        # compressor slots as an eager prefill.
+        static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay
+        static_forward_batch.encoder_swa_row_floor = forward_batch.encoder_swa_row_floor
+        static_forward_batch.encoder_swa_compress_rows = (
+            forward_batch.encoder_swa_compress_rows
+        )
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )

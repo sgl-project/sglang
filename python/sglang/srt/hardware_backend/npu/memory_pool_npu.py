@@ -190,6 +190,33 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         """Return contiguous all-layer KV tensors for NPU HiCache IO."""
         return self._hicache_k_buffer, self._hicache_v_buffer
 
+    def _mha_buffer_info(self):
+        from sglang.srt.mem_cache.device_pool_info import (
+            KVBufferLayout,
+            KVBuffers,
+            MHABufferInfo,
+        )
+
+        return MHABufferInfo(
+            buffers=KVBuffers(
+                k=tuple(self.k_buffer),
+                v=tuple(self.v_buffer),
+                k_data_ptrs=None,
+                v_data_ptrs=None,
+                layout=KVBufferLayout.PAGED_NHD,
+            ),
+            page_size=self.page_size,
+            head_num=self.row_dim // self.head_dim
+            if self.head_dim == self.v_head_dim
+            else self.head_num,
+            head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
+            dtype=self.store_dtype,
+            # self.device is the bare backend name; tensors carry the rank index.
+            device=self._hicache_k_buffer.device,
+            transfer_buffers=self.get_hicache_transfer_buffers,
+        )
+
     def _init_kv_copy_and_warmup(self):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
@@ -610,6 +637,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             end_layer=end_layer,
         )
 
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
@@ -730,6 +760,45 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
 
         self._finalize_allocation_log(size)
+
+    def _mla_buffer_info(self):
+        from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
+
+        return MLABufferInfo(
+            buffers=self._mla_native_buffers(),
+            native_buffers=self._mla_native_buffers,
+            data_ptrs=None,
+            layer_indices=tuple(range(self.layer_num)),
+            device_layer_num=self.layer_num,
+            page_size=self.page_size,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            kv_cache_dim=self.kv_cache_dim + self.kr_cache_dim,
+            dtype=self.store_dtype,
+            # self.device is the bare backend name; tensors carry the rank index.
+            device=next(
+                buffer.device
+                for buffer in (self.k_buffer, self.index_k_buffer)
+                if buffer is not None
+            ),
+            packed_fp8=self.dsa_kv_cache_store_fp8,
+        )
+
+    def _mla_native_buffers(self):
+        from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
+
+        return MLASplitBuffers(
+            k=self.k_buffer,
+            v=self.v_buffer,
+            index_k=self.index_k_buffer,
+            index_scales=self.index_k_scale_buffer,
+            index_layer_indices=tuple(
+                i - self.start_layer for i in self.indexer_layer_ids
+            ),
+            k_width=self.kv_cache_dim,
+            v_width=self.kr_cache_dim,
+            index_width=self.index_head_dim or 0,
+        )
 
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:

@@ -134,6 +134,7 @@ Several norms look interchangeable and are not. Start here.
 | `flydsl_norm_scale_shift` / `flydsl_fused_residual_norm_scale_shift` | FlyDSL | close | **ROCm gfx950 only** |
 | `try_fused_scale_residual_norm_scale_shift_nvfp4` | JIT CUDA | matches the selected NVFP4 producer contract | Qwen residual LayerNorm/modulation + FC1 NVFP4 quantization |
 | `fuse_layernorm_scale_shift_gate_select01_kernel` | Triton | close | per-token select between two modulation rows (Qwen-Image) |
+| `indexed_scale_shift_bf16_` / `indexed_scale_shift_fp32_` | Triton | bit-exact vs `x * (1 + scale[idx]) + shift[idx]`, in place | bf16 rows, per-row index into `[n, D]` shift/scale tables; fp32 tables are serialized INT8 MiniMax-H3 |
 | `norm_infer` / `rms_norm_fn` | Triton (+torch/NPU/MPS fallbacks) | close | the generic entry point; use when nothing above fits |
 
 ### Norm variants
@@ -158,6 +159,7 @@ Several norms look interchangeable and are not. Start here.
 | `bias_residual_add` | JIT CUDA | bit-exact `(y + bias[c]) + h` with aten's per-op bf16 rounding, for a conv that skipped its bias pass | channels_last-dense (`C % 8 == 0`) or NCHW/NCDHW contiguous (spatial `% 8 == 0`) bf16; `h` shares `y`'s layout (Qwen-Image 2.1 VAE residual blocks) |
 | `residual_gate_add` | JIT CUDA (contiguous), Triton (transposed) | bit-exact `residual + update * gate` | contiguous tensors, or a transposed-dense `[B, tokens, hidden]` residual/output with contiguous update and row-broadcast gate (SANA-Video) |
 | `residual_gate_fp32` | Triton | separate FP32 multiply/add, then cast to input dtype | contiguous `[B,S,D]`, strided `[B or 1,1,D]` gate; Kandinsky6 |
+| `indexed_gate_bf16` / `indexed_gate_fp32` (`_` in place) | Triton | bit-exact vs `x + gate[idx] * other`: bf16 rounds the product, fp32 keeps a separate FP32 multiply/add | bf16 rows, per-row index into a `[n, D]` gate table (MiniMax-H3) |
 
 These contracts differ: `residual_gate_fp32` does not round the product to
 BF16/FP16, and disables FMA to preserve the eager FP32 rounding boundary.

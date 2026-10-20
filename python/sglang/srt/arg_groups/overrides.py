@@ -306,6 +306,28 @@ def collect_model_override_declarations(
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
+@_register_for(
+    "MuseSparkForConditionalGeneration",
+)
+def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    overrides: Dict[str, Any] = {}
+    if cfg.enable_tf32_matmul is None:
+        overrides["enable_tf32_matmul"] = True
+        logger.info("Enable TF32 matmul by default for Muse Spark")
+    if cfg.kv_cache_dtype == "auto":
+        logger.info("Use fp8_e4m3 KV cache by default for Muse Spark")
+        overrides["kv_cache_dtype"] = "fp8_e4m3"
+    if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
+        # NaViT shards over the full TP group only, so attention TP narrower
+        # than TP needs the replicated (data-parallel) encoder.
+        logger.info(
+            "Enable the data-parallel mm encoder for Muse Spark under attention DP"
+        )
+        overrides["mm_enable_dp_encoder"] = True
+    return overrides
+
+
 @register_model_override_predicate(
     lambda arch: (
         "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch

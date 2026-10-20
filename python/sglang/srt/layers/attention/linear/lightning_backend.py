@@ -297,7 +297,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             track_lens=track_lens,
             track_state_indices=track_state_indices,
             softmax_scale=layer.scaling,
-            decouple=True,
         )
         return hidden
 
