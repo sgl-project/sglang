@@ -1148,7 +1148,9 @@ class TestGroupedVerifyRows(CustomTestCase):
         )
         self.assertEqual(tuple(q.shape), (2, 6, 2, 64))
         self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4[6:18]))
-        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens[6:18].view(2, 6)))
+        self.assertTrue(
+            torch.equal(lens, metadata.compressed_seq_lens[6:18].view(2, 6))
+        )
         self.assertTrue(torch.equal(table, per_request_table[1:]))
 
 
