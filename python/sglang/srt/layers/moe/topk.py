@@ -107,6 +107,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackendLike,
+    RoutingMethodType,
     has_per_rank_fused_shared_slots,
 )
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
@@ -269,6 +270,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     runner_backend: Optional[MoeRunnerBackendLike] = None
+    routing_method_type: Optional[RoutingMethodType] = None
     scoring_func: str = "softmax"
     # sqrtsoftplus through log1p with NaNs ranked first (DeepSeek-V4.1 routing).
     sqrtsoftplus_log1p: bool = False
@@ -665,15 +667,22 @@ class TopK(BaseFusedOp):
         )
 
     def bind_runner_backend(
-        self, runner_backend: Optional[MoeRunnerBackendLike]
+        self,
+        runner_backend: Optional[MoeRunnerBackendLike],
+        *,
+        routing_method_type: Optional[RoutingMethodType] = None,
     ) -> None:
         """Associate the owning experts once; repeating the same association is safe."""
         if self._runner_backend_bound:
-            if runner_backend != self.topk_config.runner_backend:
+            if (
+                runner_backend != self.topk_config.runner_backend
+                or routing_method_type != self.topk_config.routing_method_type
+            ):
                 raise RuntimeError("TopK cannot bind a different MoE runner backend.")
             return
         self._runner_backend_bound = True
         self.topk_config.runner_backend = runner_backend
+        self.topk_config.routing_method_type = routing_method_type
         self.topk_config.fused_gate_packed_ids &= (
             runner_backend is not None and runner_backend.is_flashinfer_mxfp4()
         )
@@ -683,6 +692,14 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif runner_backend is not None and (
             runner_backend.is_flashinfer_trtllm()
+            and routing_method_type is not None
+            and routing_method_type != RoutingMethodType.Unspecified
+            and self.topk_config.scoring_func in ("softmax", "sigmoid")
+            and not self.topk_config.sqrtsoftplus_log1p
+            and (
+                self.topk_config.custom_routing_function is None
+                or routing_method_type == RoutingMethodType.Llama4
+            )
             or runner_backend.is_flashinfer_mxfp4()
             and not self.is_fp4_experts
         ):

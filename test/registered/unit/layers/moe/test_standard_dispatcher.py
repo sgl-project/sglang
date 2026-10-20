@@ -3,13 +3,18 @@ from unittest.mock import patch
 
 import torch
 
+import sglang.srt.layers.moe.topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -86,7 +91,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
             top_k=2,
         )
 
-    def _build_layer(self, method):
+    def _build_layer(self, method, *, routing_method_type=None):
         with patch.object(method, "create_weights"):
             return FusedMoE(
                 num_experts=4,
@@ -95,6 +100,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 intermediate_size=96,
                 layer_id=0,
                 quant_method=method,
+                routing_method_type=routing_method_type,
             )
 
     def _assert_local_routes(self, config):
@@ -228,11 +234,16 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 get_flags().moe.override(runner_backend=backend),
             ):
                 method = object.__new__(method_type)
-                layer = self._build_layer(method)
+                layer = self._build_layer(
+                    method, routing_method_type=RoutingMethodType.DeepSeekV3
+                )
                 self.assertEqual(layer.runner_backend, backend)
                 self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
                 topk = TopK(top_k=2, layer_id=0, is_fp4_experts=fp4)
-                topk.bind_runner_backend(layer.runner_backend)
+                topk.bind_runner_backend(
+                    layer.runner_backend,
+                    routing_method_type=layer.routing_method_type,
+                )
                 self.assertEqual(
                     topk.topk_config.output_format,
                     TopKOutputFormat.STANDARD if fp4 else TopKOutputFormat.BYPASSED,
@@ -335,10 +346,106 @@ class TestLayerRunnerDispatch(CustomTestCase):
     def test_topk_does_not_re_read_the_target_backend(self):
         """A constructed router keeps its layer's format across draft scopes."""
         topk = TopK(top_k=2, layer_id=0, allow_routed_experts_capture=False)
-        topk.bind_runner_backend(MoeRunnerBackend.FLASHINFER_TRTLLM)
+        topk.bind_runner_backend(
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            routing_method_type=RoutingMethodType.Renormalize,
+        )
         with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON):
             output = topk.forward_cuda(torch.ones((1, 4)), torch.ones((1, 4)))
         self.assertEqual(output.format, TopKOutputFormat.BYPASSED)
+
+    def test_auto_nvfp4_preserves_undeclared_routing_policy(self):
+        """An AUTO-selected FP4 kernel must preserve renormalization and custom routes."""
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
+        hidden = torch.ones((1, 4))
+        custom_ids = torch.tensor([[3, 1]], dtype=torch.int32)
+        custom_weights = torch.tensor([[0.25, 0.75]])
+
+        def custom_router(**kwargs):
+            return custom_weights.clone(), custom_ids.clone()
+
+        def cpu_router(hidden_states, gating_output, topk, renormalize, **kwargs):
+            return topk_module.fused_topk_torch_native(
+                hidden_states,
+                gating_output,
+                topk,
+                renormalize,
+                correction_bias=kwargs["correction_bias"],
+                scoring_func=kwargs["scoring_func"],
+            )
+
+        for custom in (None, custom_router):
+            with (
+                self.subTest(custom=custom is not None),
+                get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
+                patch(
+                    "sglang.srt.layers.quantization.modelopt_quant.is_cuda",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
+                    return_value=(10, 0),
+                ),
+                patch.object(topk_module, "fused_topk", side_effect=cpu_router),
+            ):
+                method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+                layer = self._build_layer(method)
+                self.assertEqual(
+                    layer.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM
+                )
+                self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
+                topk = TopK(
+                    top_k=2,
+                    layer_id=0,
+                    renormalize=True,
+                    custom_routing_function=custom,
+                    allow_routed_experts_capture=False,
+                )
+                topk.bind_runner_backend(layer.runner_backend)
+                output = topk.forward_cuda(hidden, logits)
+                self.assertEqual(output.format, TopKOutputFormat.STANDARD)
+                expected_ids = (
+                    logits.topk(2, dim=-1).indices.to(torch.int32)
+                    if custom is None
+                    else custom_ids
+                )
+                expected_weights = (
+                    torch.softmax(logits[:, :2], dim=-1)
+                    if custom is None
+                    else custom_weights
+                )
+                self.assertTrue(torch.equal(output.topk_ids, expected_ids))
+                torch.testing.assert_close(output.topk_weights, expected_weights)
+
+    def test_per_tensor_fp8_undeclared_router_selects_local_layout(self):
+        """A router the per-tensor kernel cannot represent must not use its packed weights."""
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8MoEMethod
+
+        with get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM
+        ):
+            for routing_method_type, expected in (
+                (None, MoeRunnerBackend.TRITON),
+                (RoutingMethodType.Llama4, MoeRunnerBackend.FLASHINFER_TRTLLM),
+            ):
+                with self.subTest(routing_method_type=routing_method_type):
+                    layer = self._build_layer(
+                        object.__new__(ModelOptFp8MoEMethod),
+                        routing_method_type=routing_method_type,
+                    )
+                    self.assertEqual(layer.runner_backend, expected)
+                    self.assertEqual(
+                        layer.dispatcher.skip_local_expert_mapping,
+                        expected == MoeRunnerBackend.FLASHINFER_TRTLLM,
+                    )
+                    self.assertEqual(
+                        layer.use_flashinfer_trtllm_moe,
+                        expected == MoeRunnerBackend.FLASHINFER_TRTLLM,
+                    )
 
     def test_router_rebinding_rejects_conflicting_contract_before_mutation(self):
         for first, second in (
@@ -360,6 +467,21 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 self.assertEqual(vars(topk.topk_config), original)
                 topk.bind_runner_backend(first)
                 self.assertEqual(vars(topk.topk_config), original)
+
+    def test_router_rebinding_rejects_a_different_native_policy(self):
+        topk = TopK(top_k=2, layer_id=0)
+        topk.bind_runner_backend(
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            routing_method_type=RoutingMethodType.Renormalize,
+        )
+        with self.assertRaisesRegex(RuntimeError, "different MoE runner"):
+            topk.bind_runner_backend(
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+                routing_method_type=RoutingMethodType.Default,
+            )
+        self.assertEqual(
+            topk.topk_config.routing_method_type, RoutingMethodType.Renormalize
+        )
 
     def test_implicit_router_without_a_layer_contract_fails_closed(self):
         """A forgotten model association must fail before invoking a wrong kernel."""

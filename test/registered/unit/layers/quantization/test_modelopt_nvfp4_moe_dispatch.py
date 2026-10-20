@@ -14,9 +14,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
+import sys
 import unittest
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -32,7 +33,9 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 
 # isort: on
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 8
@@ -173,6 +176,97 @@ class TestNvFp4MoeDispatch(CustomTestCase):
 
                 ((_, quant_info),) = method.runner.calls
                 self.assertIsInstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo)
+
+    def test_materialized_router_weights_reach_fp8_and_bf16_routed_kernels(self):
+        """Materialized custom weights must not be sent to a logits router or normalized again."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as kernels
+        from sglang.srt.runtime_context import get_parallel
+
+        ids = torch.tensor([[3, 1]], dtype=torch.int32)
+        weights = torch.tensor([[0.25, 0.5]])
+        hidden = torch.zeros((1, 4), dtype=torch.bfloat16)
+        dispatch = StandardDispatchOutput(
+            hidden, None, StandardTopKOutput(weights, ids, None)
+        )
+        config = MoeRunnerConfig(
+            top_k=2,
+            activation="silu",
+            num_local_experts=4,
+            num_fused_shared_experts=0,
+            intermediate_size_per_partition=128,
+        )
+        expected = (ids.float() * weights).sum(dim=-1, keepdim=True).expand_as(hidden)
+        fake_flashinfer = ModuleType("flashinfer.fused_moe")
+        fake_flashinfer.Fp8QuantizationType = SimpleNamespace(MxFp8=1, DeepSeekFp8=0)
+
+        def routed_result(kwargs):
+            self.assertEqual(kwargs["routing_method_type"], RoutingMethodType.TopK)
+            seen_ids, seen_weights = kwargs["topk_ids"]
+            torch.testing.assert_close(seen_ids, ids)
+            torch.testing.assert_close(seen_weights, weights)
+            return (
+                (seen_ids.float() * seen_weights)
+                .sum(dim=-1, keepdim=True)
+                .expand_as(hidden)
+                .to(hidden.dtype)
+            )
+
+        def fp8_kernel(**kwargs):
+            kwargs["output"].copy_(routed_result(kwargs))
+
+        def bf16_kernel(**kwargs):
+            return routed_result(kwargs)
+
+        fake_flashinfer.trtllm_bf16_routed_moe = bf16_kernel
+        common = dict(
+            w13_weight=torch.zeros((4, 256, 4)),
+            w2_weight=torch.zeros((4, 4, 128)),
+            global_num_experts=4,
+            local_num_experts=4,
+            local_expert_offset=0,
+            routing_method_type=None,
+            intermediate_size=128,
+        )
+        quant_info = SimpleNamespace(
+            **common,
+            block_quant=True,
+            use_mxfp8=False,
+            weight_block_k=128,
+            w13_weight_scale_inv=torch.ones((4, 2, 1)),
+            w2_weight_scale_inv=torch.ones((4, 1, 1)),
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            activation_type=None,
+        )
+        bf16_info = SimpleNamespace(
+            gemm1_weights=common["w13_weight"],
+            gemm2_weights=common["w2_weight"],
+            global_num_experts=4,
+            local_expert_offset=0,
+        )
+        with (
+            get_parallel().override(tp_group=None),
+            mock.patch.dict(sys.modules, {"flashinfer.fused_moe": fake_flashinfer}),
+            mock.patch.object(kernels, "is_allocation_symmetric", return_value=False),
+            mock.patch.object(kernels, "trtllm_moe_enable_pdl", return_value=False),
+            mock.patch.object(
+                kernels,
+                "per_token_group_quant_fp8",
+                return_value=(hidden, torch.ones((1, 1))),
+            ),
+            mock.patch.object(
+                kernels, "trtllm_fp8_block_scale_routed_moe_out_wrapper", fp8_kernel
+            ),
+        ):
+            fp8_output = kernels.fused_experts_none_to_flashinfer_trtllm_fp8(
+                dispatch, quant_info, config
+            )
+            bf16_output = kernels.fused_experts_none_to_flashinfer_trtllm_bf16(
+                dispatch, bf16_info, config
+            )
+        torch.testing.assert_close(fp8_output.hidden_states, expected.to(hidden.dtype))
+        torch.testing.assert_close(bf16_output.hidden_states, expected.to(hidden.dtype))
 
     def test_missing_trtllm_prep_names_the_missing_field(self):
         method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED)

@@ -2918,7 +2918,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
         else:
-            # Direct kernels still declare the layout they consume.
+            # Direct kernels declare the layout they consume.
             self._moe_runner_backend = moe_runner_backend
 
     def get_moe_runner_backend(self, layer):

@@ -293,7 +293,10 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             # The decoder reads this buffer on another stream, so in-place races it.
             inplace=False,
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         num_shared_experts = getattr(config, "num_shared_experts", 0)
         self.num_shared_experts = num_shared_experts

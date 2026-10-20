@@ -1352,9 +1352,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        # Per-tensor TRT-LLM FP8 has no materialized-routing API. An undeclared
+        # router must keep Triton's weight layout and local expert IDs.
         self._moe_runner_backend = (
             moe_runner_backend
             if moe_runner_backend.is_flashinfer_trtllm()
+            and moe_runner_config.routing_method_type is not None
             else self.runner.runner_backend
         )
 

@@ -1,8 +1,5 @@
 """With AITER on, a block-FP8 MoE that the Triton runner serves must compute what
 it computes with AITER off: AITER's expert layout is for AITER's kernels only.
-
-Adapted from https://github.com/sgl-project/sglang/pull/41636 at
-3db8229ac8bf49a6f32282ace7faa6b41da3cf4d for the current runtime context API.
 """
 
 import unittest

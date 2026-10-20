@@ -43,6 +43,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -124,9 +125,13 @@ class Llama4MoE(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
+            routing_method_type=RoutingMethodType.Llama4,
             prefix=add_prefix("experts", prefix),
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.shared_expert = LlamaMLP(
             hidden_size=config.hidden_size,
