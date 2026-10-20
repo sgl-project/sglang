@@ -844,6 +844,35 @@ bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
 )
 
 
+def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
+    # Without the in-graph low-ratio path (SM90) the source compressor reads
+    # per-request rows on the host, so it runs as an eager break over live rows.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    backend = get_attn_backend()
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens == 0:
+        backend.tail_source_kv_layer_id = layer.layer_id
+        return
+    backend.write_tail_source_kv(
+        layer=layer,
+        x=x[:real_num_tokens],
+        positions=positions[:real_num_tokens],
+        forward_batch=forward_batch,
+    )
+
+
+def _write_tail_source_kv_capture_stub(layer, x, positions) -> None:
+    # Same contract as _low_ratio_sources_capture_stub.
+    if not in_replay_tail_graph():
+        deepseek_v4_write_tail_source_kv(layer, x, positions)
+
+
+bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
+    deepseek_v4_write_tail_source_kv,
+    capture_stub=_write_tail_source_kv_capture_stub,
+)
+
+
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -3933,12 +3962,19 @@ class DeepseekV4Model(nn.Module):
                         source_x = fused_boundary_attn_input(source, state)
                     else:
                         source_x = mhc.combine(source.attn_hc, state)
-                    attn_backend.write_tail_source_kv(
-                        layer=source.self_attn,
-                        x=source_x,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                    )
+                    if is_in_breakable_cuda_graph() and not getattr(
+                        attn_backend, "low_ratio_prefill_graph", False
+                    ):
+                        bcg_deepseek_v4_write_tail_source_kv(
+                            source.self_attn, source_x, positions
+                        )
+                    else:
+                        attn_backend.write_tail_source_kv(
+                            layer=source.self_attn,
+                            x=source_x,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                        )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
