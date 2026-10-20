@@ -129,6 +129,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
                 head_dim=4,
                 rope_head_dim=2,
                 skip_rope=skip_rope,
+                fuse_hadamard_quant=False,
                 index_kpool_compress_gate=torch.ones(4, 8),
             )
 
@@ -236,11 +237,13 @@ class TestKPoolStreamScheduling(unittest.TestCase):
             index_kpool_compress=True,
             block_size=128,
             scale_fmt=None,
+            fuse_hadamard_quant=False,
             _get_q_k_bf16=prepare_qk,
         )
         indexer._can_overlap_prefill = MethodType(
             IndexerKPool._can_overlap_prefill, indexer
         )
+        indexer._quant_query = MethodType(IndexerKPool._quant_query, indexer)
 
         def compress(**kwargs):
             streams.record("compress")

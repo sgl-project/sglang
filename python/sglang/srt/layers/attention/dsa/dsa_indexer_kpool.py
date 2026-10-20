@@ -242,7 +242,6 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.fuse_hadamard_quant = (
             envs.SGLANG_DSA_FUSE_HADAMARD_QUANT.get()
-            and is_hip()
             and is_gfx95_supported()
             and self.head_dim == self.block_size
             and (self.head_dim & (self.head_dim - 1)) == 0
@@ -273,7 +272,7 @@ class IndexerKPool(MultiPlatformOp):
         return self._get_logits_head_gate(x, q_scale)
 
     def _quant_query(self, query, act_quant, x, head_weights=None):
-        if not getattr(self, "fuse_hadamard_quant", False):
+        if not self.fuse_hadamard_quant:
             q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             weights = self._resolve_head_gate_weights(x, q_scale, head_weights)
             return q_fp8, q_scale, weights
@@ -714,7 +713,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
             if precompute_head_gate:
                 head_weights = self._project_and_scale_head_gates(x)
-            if not apply_rope and not getattr(self, "fuse_hadamard_quant", False):
+            if not apply_rope and not self.fuse_hadamard_quant:
                 query = rotate_activation(query)
             with torch.cuda.stream(self.alt_stream):
                 key, _ = self.wk(x)
@@ -749,9 +748,7 @@ class IndexerKPool(MultiPlatformOp):
             query[..., : self.rope_head_dim] = q_rope
             key[..., : self.rope_head_dim] = k_rope
 
-        if (apply_rope or not enable_dual_stream) and not getattr(
-            self, "fuse_hadamard_quant", False
-        ):
+        if (apply_rope or not enable_dual_stream) and not self.fuse_hadamard_quant:
             query = rotate_activation(query)
 
         return query, key, gate_score, head_weights
@@ -1661,8 +1658,8 @@ class IndexerKPool(MultiPlatformOp):
                 assert self.compress_gate_stream is not None
                 self.alt_stream.wait_stream(self.compress_gate_stream)
             if return_indices:
-                q_fp8, q_scale, weights = IndexerKPool._quant_query(
-                    self, query, act_quant, x, head_weights
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
                 )
             with torch.cuda.stream(self.alt_stream):
                 _compress_write()
@@ -1670,8 +1667,8 @@ class IndexerKPool(MultiPlatformOp):
         else:
             _compress_write()
             if return_indices:
-                q_fp8, q_scale, weights = IndexerKPool._quant_query(
-                    self, query, act_quant, x, head_weights
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
                 )
 
         if not return_indices:
@@ -1841,14 +1838,14 @@ class IndexerKPool(MultiPlatformOp):
             with torch.cuda.stream(self.alt_stream):
                 kpool_extend_cache = compress_write()
             if return_indices:
-                q_fp8, q_scale, weights = IndexerKPool._quant_query(
-                    self, query, act_quant, x, head_weights
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
                 )
             current_stream.wait_stream(self.alt_stream)
         else:
             if return_indices:
-                q_fp8, q_scale, weights = IndexerKPool._quant_query(
-                    self, query, act_quant, x, head_weights
+                q_fp8, q_scale, weights = self._quant_query(
+                    query, act_quant, x, head_weights
                 )
             kpool_extend_cache = compress_write()
 
