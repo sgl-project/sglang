@@ -688,6 +688,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                     self.assertEqual(
                         _local_prefill_cuda_graph_vote(
                             local_batch=schedule_batch,
+                            num_tokens=4,
                             prefill_graph_runner=runner,
                             coordinated_prefill=True,
                             breakable_prefill=backend == Backend.BREAKABLE,

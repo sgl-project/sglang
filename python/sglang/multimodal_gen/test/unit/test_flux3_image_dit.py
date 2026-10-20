@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.flux3_fused_ops import (
     flux3_qkv_qknorm_rope,
     flux3_shared_activation,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization import flux3_prims_ts
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
@@ -430,6 +431,15 @@ class _StubLinear:
         return self.output, None
 
 
+def _stub_lora(base_layer, delta):
+    """A LoRA wrapper around a FLUX.3 linear whose adapter adds ``delta``."""
+    stub = mock.NonCallableMock(spec=BaseLayerWithLoRA)
+    stub.base_layer = base_layer
+    stub.lora_active = True
+    stub.fused_lora_delta.return_value = delta
+    return stub
+
+
 class TestFlux3FusedOps(unittest.TestCase):
     _CUDA_X = SimpleNamespace(is_cuda=True)
 
@@ -530,6 +540,71 @@ class TestFlux3FusedOps(unittest.TestCase):
         self.assertEqual(result, "down_from_packed")
         swiglu.assert_called_with(mlp_in, self._CUDA_X, "shared", packed_output=True)
         from_packed.assert_called_once_with(mlp_out, hidden)
+
+    def test_lora_wrapped_layers_pass_their_delta_to_the_prims_ts_epilogue(self):
+        x = self._CUDA_X
+        linear = mock.Mock(return_value="prims_ts")
+        planned = _StubLinear(Flux3PrimsTsRole.LINEAR, apply_prims_ts_linear=linear)
+        epilogue = mock.Mock(return_value=torch.randn(1, 3, 3 * 2 * 4))
+        qkv = _StubLinear(
+            Flux3PrimsTsRole.QKV_QKNORM_ROPE, apply_prims_ts_qkv_qknorm_rope=epilogue
+        )
+        norm = SimpleNamespace(
+            query_norm=SimpleNamespace(weight="q_w"),
+            key_norm=SimpleNamespace(weight="k_w"),
+        )
+        wrapped = _stub_lora(planned, "delta")
+        with self._platform(10, 0):
+            self.assertEqual(flux3_linear(wrapped, x, "shared"), "prims_ts")
+            flux3_qkv_qknorm_rope(_stub_lora(qkv, "qkv_delta"), x, norm, "c", "p", 2)
+            # A zero runtime LoRA scale adds nothing: the plain kernel runs.
+            flux3_linear(_stub_lora(planned, None), x)
+        wrapped.fused_lora_delta.assert_called_once_with(x, swiglu_rows=False)
+        self.assertEqual(
+            linear.call_args_list,
+            [
+                mock.call(planned, x, "shared", delta="delta"),
+                mock.call(planned, x, None),
+            ],
+        )
+        epilogue.assert_called_once_with(
+            qkv, x, "q_w", "k_w", "c", "p", None, delta="qkv_delta"
+        )
+
+    def test_gated_mlp_with_lora_skips_the_packed_handoff(self):
+        """Either projection's LoRA needs the BF16 SwiGLU output: MLP-up adds its
+        delta in SwiGLU column order, MLP-down computes its delta from it."""
+        x, hidden = self._CUDA_X, SimpleNamespace(is_cuda=True)
+        swiglu = mock.Mock(return_value=hidden)
+        down = mock.Mock(return_value="down")
+        from_packed = mock.Mock(return_value="down_from_packed")
+        mlp_in = _StubLinear(Flux3PrimsTsRole.SWIGLU, apply_prims_ts_swiglu=swiglu)
+        mlp_out = _StubLinear(
+            Flux3PrimsTsRole.LINEAR,
+            apply_prims_ts_linear=down,
+            apply_prims_ts_linear_from_packed=from_packed,
+        )
+        for layer in (mlp_in, mlp_out):
+            layer.quant_method.packed_activation_format = "nvfp4"
+        up_lora = _stub_lora(mlp_in, "up_delta")
+        down_lora = _stub_lora(mlp_out, "down_delta")
+        with self._platform(10, 0):
+            self.assertEqual(flux3_gated_mlp(up_lora, mlp_out, x), "down")
+            self.assertEqual(flux3_gated_mlp(mlp_in, down_lora, x), "down")
+        up_lora.fused_lora_delta.assert_called_once_with(x, swiglu_rows=True)
+        down_lora.fused_lora_delta.assert_called_once_with(hidden, swiglu_rows=False)
+        self.assertEqual(
+            swiglu.call_args_list,
+            [mock.call(mlp_in, x, None, delta="up_delta"), mock.call(mlp_in, x, None)],
+        )
+        self.assertEqual(
+            down.call_args_list,
+            [
+                mock.call(mlp_out, hidden, None),
+                mock.call(mlp_out, hidden, None, delta="down_delta"),
+            ],
+        )
+        from_packed.assert_not_called()
 
     def test_shared_activation_requires_matching_prims_ts_consumers(self):
         x = self._CUDA_X
