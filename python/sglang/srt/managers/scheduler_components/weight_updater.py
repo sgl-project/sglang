@@ -345,8 +345,19 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        repeated_tags = [tag for tag in tags if tag in self.offload_tags]
+        if repeated_tags:
+            logger.warning(
+                f"release_memory_occupation: tags {repeated_tags} were already "
+                f"released; skipping them to avoid clobbering their CPU backups."
+            )
+        tags = [tag for tag in tags if tag not in self.offload_tags]
+
         for tag in tags:
             self.offload_tags.add(tag)
+
+        # Synchronize before pausing
+        torch.get_device_module().synchronize()
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
