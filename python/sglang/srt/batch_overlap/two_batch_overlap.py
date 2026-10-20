@@ -352,13 +352,19 @@ def _verify_input_blocks_split(batch) -> bool:
 
 
 class TboCudaGraphRunnerPlugin:
-    def __init__(self):
+    def __init__(self, is_draft_worker: bool = False):
         self._tbo_children_num_token_non_padded = torch.zeros(
             (2,), dtype=torch.int32, device=get_device().device
         )
+        # A draft worker never runs TBO, so its graphs are captured unsplit.
+        self._is_draft_worker = is_draft_worker
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled() or _verify_input_blocks_split(batch):
+        if (
+            not is_tbo_enabled()
+            or self._is_draft_worker
+            or _verify_input_blocks_split(batch)
+        ):
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
