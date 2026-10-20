@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.speculative.dspark.draft_params import fill_draft_params
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
@@ -164,14 +163,6 @@ def resolve_draft_params(
         temperatures.fill_(1.0)
         greedy_mask.fill_(True)
         step_temperatures.zero_()
-    elif sampling_info.temperatures.is_cuda and sampling_info.top_ks.is_cuda:
-        fill_draft_params(
-            sampling_info.temperatures.view(-1),
-            sampling_info.top_ks.view(-1),
-            temperatures,
-            greedy_mask,
-            step_temperatures,
-        )
     else:
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
@@ -235,9 +226,11 @@ def _draft_step(
                 w2_weight=w2_weight,
             )
             return tokens, state
-    bias, state = markov_head.step_bias(
-        prev_tokens, hidden_states=hidden_states, state=state
-    )
+    bias = markov_head.bias_gemv(prev_tokens)
+    if bias is None:
+        bias, state = markov_head.step_bias(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
     shard = markov_head.vocab_shard
     sharded = (
         {}

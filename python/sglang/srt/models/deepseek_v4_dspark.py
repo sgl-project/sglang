@@ -12,6 +12,7 @@ from torch import nn
 
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovBiasGemv
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
@@ -426,6 +427,7 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             self.vocab_size, self.markov_rank, enable_tp=False
         )
         self._opt_markov_w2_bf16 = envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get()
+        self._fused_bias_gemv = envs.SGLANG_OPT_DSV41_DSPARK_MARKOV_FUSED_BIAS.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
         markov_w2_dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
         self.markov_w2 = nn.Linear(
@@ -525,6 +527,20 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             # Keep the bias in BF16; the step add upcasts it to FP32.
             return F.linear(latent.to(weight_local.dtype), weight_local), state
         return F.linear(latent.float(), weight_local), state
+
+    def bias_gemv(self, prev_tokens: torch.Tensor) -> Optional[MarkovBiasGemv]:
+        w1 = self.markov_w1.weight
+        if (
+            not self._fused_bias_gemv
+            or not self._opt_markov_w2_bf16
+            or w1.dtype != torch.bfloat16
+        ):
+            return None
+        w2 = self.markov_w2.weight
+        shard = self._tp_shard
+        if shard is not None:
+            w2 = w2[shard.org_vocab_start : shard.org_vocab_end]
+        return MarkovBiasGemv(prev_tokens=prev_tokens.long(), w1=w1, w2=w2)
 
     def step_logits_dtype(self, base_dtype: torch.dtype) -> torch.dtype:
         # The bias is FP32 or upcast into an FP32 add, sharded or not.

@@ -2,9 +2,10 @@
 argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
 import functools
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional, Union
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -24,6 +25,27 @@ _NO_INDEX = tl.constexpr(2147483647)
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
 _PHILOX_ROUNDS = 10
 _ROUND_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
+# The bias GEMV's tile: rows in MFMA blocks of 16, a CTA per column block.
+_GEMV_BLOCK_M = 16
+_GEMV_BLOCK_V = 64
+_GEMV_BLOCK_R = 64
+
+
+class MarkovBiasGemv(NamedTuple):
+    """The step bias ``w2 @ w1[prev_tokens]``, rounded to BF16, left for the step
+    to compute where it adds it: ``w1`` is ``[vocab, rank]``, ``w2`` the
+    ``[width, rank]`` rows of the shard, both BF16."""
+
+    prev_tokens: torch.Tensor
+    w1: torch.Tensor
+    w2: torch.Tensor
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.prev_tokens.shape[0], self.w2.shape[0]
+
+    def materialize(self) -> torch.Tensor:
+        return F.linear(F.embedding(self.prev_tokens, self.w1), self.w2)
 
 
 @triton.jit
@@ -168,6 +190,94 @@ def _markov_sample_finish_kernel(
     tl.store(OUT + row, result.to(tl.int64))
 
 
+@triton.jit
+def _markov_bias_partial_kernel(
+    PREV,
+    W1,
+    W2,
+    X,
+    T,
+    OFFSET,
+    L,
+    P,
+    ROWS,
+    W1S,
+    W2S,
+    XS,
+    LS,
+    WIDTH,
+    PADDED,
+    VOCAB_START,
+    PARTS,
+    KEY,
+    STEP,
+    RANK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    ROUND: tl.constexpr,
+    STORE: tl.constexpr,
+    SELECT: tl.constexpr,
+    SAMPLE: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+):
+    # _markov_sample_partial_kernel over a block of rows, its bias the GEMV of
+    # W1[PREV] with this block's W2 rows, which each row block reads once.
+    part = tl.program_id(0)
+    row = tl.program_id(1) * BLOCK_M + tl.arange(0, BLOCK_M)
+    i = part * BLOCK_V + tl.arange(0, BLOCK_V)
+    has_row = row < ROWS
+    valid = i < WIDTH
+    in_shard = i < PADDED
+    prev = tl.load(PREV + row, has_row, 0)
+    acc = tl.zeros([BLOCK_M, BLOCK_V], tl.float32)
+    for r0 in tl.static_range(0, RANK, BLOCK_R):
+        r = r0 + tl.arange(0, BLOCK_R)
+        embed = tl.load(W1 + prev[:, None] * W1S + r[None, :], has_row[:, None], 0)
+        w2 = tl.load(W2 + i[None, :] * W2S + r[:, None], valid[None, :], 0)
+        acc = tl.dot(embed, w2, acc)
+    keep = has_row[:, None] & in_shard[None, :]
+    value = tl.load(X + row[:, None] * XS + i[None, :], keep, 0).to(tl.float32)
+    # The unfused step adds the BF16 output of F.linear.
+    value += tl.where(valid[None, :], acc.to(tl.bfloat16).to(tl.float32), 0)
+    value = _round_to_step_dtype(value, ROUND)
+    if STORE:
+        tl.store(L + row[:, None] * LS + i[None, :], value.to(L.dtype.element_ty), keep)
+    if SELECT:
+        key = value
+        if SAMPLE:
+            temperature = tl.load(T + row, has_row, 0.0)
+            sampled = temperature != 0.0
+            # a block of greedy rows draws no noise
+            if tl.max(sampled.to(tl.int32), 0) > 0:
+                # _select_block's noise: word k of a Philox call goes to token 4 q + k.
+                quad = (part * BLOCK_V + VOCAB_START) // 4 + tl.arange(0, BLOCK_V // 4)
+                lane = tl.zeros([BLOCK_M, BLOCK_V // 4], tl.int64)
+                p0, p1, p2, p3 = tl.philox(
+                    KEY,
+                    (lane + quad[None, :]).to(tl.uint32),
+                    (lane + row[:, None]).to(tl.uint32),
+                    (lane + STEP).to(tl.uint32),
+                    ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
+                    PHILOX_ROUNDS,
+                )
+                bits = tl.interleave(tl.interleave(p0, p2), tl.interleave(p1, p3))
+                uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
+                exp_noise = -libdevice.log1p(-uniform)
+                safe = tl.where(sampled, temperature, 1.0)
+                noised = value / safe[:, None] - tl.log(exp_noise)
+                key = tl.where(sampled[:, None], noised, value)
+        live = has_row[:, None] & valid[None, :]
+        nan = live & (key != key)
+        has_nan = tl.max(nan.to(tl.int32), 1) > 0
+        maximum = tl.max(tl.where(live & ~nan, key, -float("inf")), 1)
+        wins = tl.where(has_nan[:, None], nan, live & (key == maximum[:, None]))
+        idx = tl.min(tl.where(wins, i[None, :] + VOCAB_START, _NO_INDEX), 1)
+        maximum = tl.where(has_nan, float("nan"), maximum)
+        out = P + (row * PARTS + part) * 2
+        tl.store(out, maximum, has_row)
+        tl.store(out + 1, idx.to(tl.float32, bitcast=True), has_row)
+
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
     # (high, low) 32-bit words of a * b; b splits in halves so int64 never overflows.
     product_lo = a * (b & 0xFFFF)
@@ -205,6 +315,21 @@ def _launch_partial(
     select=True,
 ):
     # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
+    if isinstance(bias, MarkovBiasGemv):
+        return _launch_bias_partial(
+            base_logits,
+            bias,
+            width=width,
+            store=store,
+            temperatures=temperatures,
+            key=key,
+            offset=offset,
+            step=step,
+            step_dtype=step_dtype,
+            has_sampled_rows=has_sampled_rows,
+            vocab_start=vocab_start,
+            select=select,
+        )
     rows, padded = base_logits.shape
     # The padded width fixes the transport shape on every rank; WIDTH masks padding.
     parts = triton.cdiv(padded, _BLOCK)
@@ -240,12 +365,71 @@ def _launch_partial(
     return partial.view(rows, parts * 2)
 
 
+def _launch_bias_partial(
+    base_logits,
+    bias,
+    *,
+    width,
+    store,
+    temperatures,
+    key,
+    offset,
+    step,
+    step_dtype,
+    has_sampled_rows,
+    vocab_start,
+    select,
+):
+    rows, padded = base_logits.shape
+    w1, w2 = bias.w1, bias.w2
+    assert w1.dtype == w2.dtype == torch.bfloat16
+    assert w1.stride(1) == w2.stride(1) == 1 and w1.shape[1] == w2.shape[1]
+    # An even count keeps a row of candidates a multiple of 16 bytes, as the
+    # custom all-gather needs; a tile past the shard leaves no candidate.
+    parts = triton.cdiv(padded, 2 * _GEMV_BLOCK_V) * 2
+    partial = torch.empty(
+        (rows, parts, 2), device=base_logits.device, dtype=torch.float32
+    )
+    _markov_bias_partial_kernel[(parts, triton.cdiv(rows, _GEMV_BLOCK_M))](
+        bias.prev_tokens,
+        w1,
+        w2,
+        base_logits,
+        temperatures,
+        offset,
+        base_logits if store is None else store,
+        partial,
+        rows,
+        w1.stride(0),
+        w2.stride(0),
+        base_logits.stride(0),
+        0 if store is None else store.stride(0),
+        width,
+        padded,
+        vocab_start,
+        parts,
+        key,
+        step,
+        w2.shape[1],
+        _GEMV_BLOCK_M,
+        _GEMV_BLOCK_V,
+        _GEMV_BLOCK_R,
+        _ROUND_CODE[step_dtype],
+        store is not None,
+        select,
+        has_sampled_rows is not False,
+        _PHILOX_ROUNDS,
+        num_warps=4,
+    )
+    return partial.view(rows, parts * 2)
+
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
-    the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
-    per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
-    without ``gather_logits`` the kept logits stay on the shard.
-    ``has_sampled_rows=False`` argmaxes every row."""
+    the rank's padded shard ``base_logits``; a ``MarkovBiasGemv`` is computed in
+    the launch that adds it. Sharded, ``gather`` exchanges per-block candidates,
+    or ``gather_logits`` the kept ``logits_out`` whole; without ``gather_logits``
+    the kept logits stay on the shard. ``has_sampled_rows=False`` argmaxes every
+    row."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -265,10 +449,13 @@ class MarkovSampleStep:
         gather_logits,
         logits_out,
     ):
-        assert base_logits.ndim == bias.ndim == 2
+        assert base_logits.ndim == 2 and base_logits.stride(1) == 1
+        if isinstance(bias, MarkovBiasGemv):
+            assert bias.prev_tokens.dtype == torch.int64
+        else:
+            assert bias.ndim == 2 and bias.stride(1) == 1
         assert bias.shape[0] == base_logits.shape[0]
         assert bias.shape[1] <= base_logits.shape[1]
-        assert bias.stride(1) == base_logits.stride(1) == 1
         assert temperatures.shape == (base_logits.shape[0],)
         assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
         assert offset.dtype == torch.int64 and offset.numel() == 1
@@ -288,7 +475,7 @@ class MarkovSampleStep:
         cls,
         *,
         base_logits: torch.Tensor,
-        bias: torch.Tensor,
+        bias: Union[torch.Tensor, MarkovBiasGemv],
         temperatures: torch.Tensor,
         key: int,
         offset: torch.Tensor,
@@ -356,7 +543,7 @@ class MarkovSampleStep:
         cls,
         *,
         base_logits: torch.Tensor,
-        bias: torch.Tensor,
+        bias: Union[torch.Tensor, MarkovBiasGemv],
         temperatures: torch.Tensor,
         key: int,
         offset: torch.Tensor,
@@ -381,6 +568,8 @@ class MarkovSampleStep:
             gather_logits,
             logits_out,
         )
+        if isinstance(bias, MarkovBiasGemv):
+            bias = bias.materialize()
         rows, width = bias.shape
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()

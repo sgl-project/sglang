@@ -592,6 +592,12 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_NOTAIL_VERIFY_GRAPH = EnvBool(
         SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
     )
+    # DSpark Markov head (BF16 W2): a draft step's bias GEMV runs in the launch that
+    # adds it. It sums in another order than the separate GEMV, so near ties can
+    # draft differently; the accept verifies either way.
+    SGLANG_OPT_DSV41_DSPARK_MARKOV_FUSED_BIAS = EnvBool(
+        SGLANG_ENABLE_AMD_MONO_RUNTIME_OPTIMIZATION.get
+    )
     # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
     # greedy accept and its bookkeeping as one kernel.
     SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(
