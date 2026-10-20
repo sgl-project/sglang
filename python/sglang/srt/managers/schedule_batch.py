@@ -1323,6 +1323,10 @@ class Req(ReqDllmMixin):
         # its host-pool row kept; resume must re-admit without a prefill
         # retransfer. See HiSparseCoordinator.retract_req_state_preserving.
         self.hisparse_retraction_pending = False
+        # Indexer-K CPU sidecar captured at state-preserving retraction time
+        # (DSV4: the indexer K lives in device logical-slot space, not in the
+        # HiSparse host pool). None unless a backup exists.
+        self.hisparse_indexer_backup = None
 
     @property
     def seqlen(self) -> int:
