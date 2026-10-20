@@ -77,7 +77,9 @@ def output_files(history_entry):
     """List (type, subfolder, filename) of saved outputs in a /history entry."""
     files = []
     for out in history_entry.get("outputs", {}).values():
-        for item in out.get("images", []) + out.get("gifs", []):
+        # SaveAudio and friends report under "audio".
+        saved = out.get("images", []) + out.get("gifs", []) + out.get("audio", [])
+        for item in saved:
             if item.get("type") == "output":
                 files.append(
                     (item["type"], item.get("subfolder", ""), item["filename"])
@@ -103,6 +105,18 @@ class ComfyServer:
         if with_plugin and not link.exists():
             link.symlink_to(workflow_check.PLUGIN_DIR, target_is_directory=True)
             self.link = link
+        elif not with_plugin and (link.is_symlink() or link.exists()):
+            # The native baseline must not load the plugin. Drop a symlink
+            # this harness made; never delete a real install.
+            plugin_dir = Path(workflow_check.PLUGIN_DIR).resolve()
+            if link.is_symlink() and link.resolve() == plugin_dir:
+                link.unlink()
+            else:
+                raise RuntimeError(
+                    f"{link} is not a symlink made by this harness, so the "
+                    "native baseline would load it. Move it out of "
+                    "custom_nodes and rerun."
+                )
         cmd = [
             sys.executable,
             "main.py",
