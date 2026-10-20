@@ -61,6 +61,11 @@ class DeferredContextCommit:
         self.state_slot = torch.zeros((rows,), dtype=torch.int64, device=device)
         # Host, set at the first staging: the injector writes a per-request SWA ring.
         self._with_state_slot = False
+        # SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE: stage() in one Triton launch.
+        self._one_launch_stage = (
+            envs.SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE.get()
+            and torch.device(device).type == "cuda"
+        )
         # Side streams and events, made at the first use.
         self._proj_stream: Optional[torch.cuda.Stream] = None
         self._proj_done: Optional[torch.cuda.Event] = None
@@ -137,11 +142,26 @@ class DeferredContextCommit:
         """Recorded in a static verify graph of ``commit_lens.shape[0]`` requests."""
         bs = commit_lens.shape[0]
         n = bs * self.stride
+        self._with_state_slot = state_slot is not None
+        if self._one_launch_stage:
+            from sglang.kernels.ops.speculative.dspark.stage_commit import stage_commit
+
+            stage_commit(
+                cache_loc_dst=self.cache_loc,
+                positions_dst=self.positions,
+                commit_lens_dst=self.commit_lens,
+                state_slot_dst=self.state_slot if state_slot is not None else None,
+                cache_loc=cache_loc,
+                positions=positions,
+                commit_lens=commit_lens,
+                state_slot=state_slot,
+                rows=n,
+            )
+            return
         self.cache_loc[:n].copy_(cache_loc[:n])
         self.positions[:n].copy_(positions[:n])
         self.commit_lens[:bs].copy_(commit_lens)
         self.commit_lens[bs:].zero_()
-        self._with_state_slot = state_slot is not None
         if state_slot is not None:
             self.state_slot[:n].copy_(state_slot[:n])
 
