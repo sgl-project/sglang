@@ -92,6 +92,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.megakernels.runtime import install_megakernel
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -726,6 +727,13 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+        # after every post-load change to the model, before the KV cache is sized
+        install_megakernel(
+            model=self.model,
+            hf_config=self.model_config.hf_config,
+            capture_tail_hooks=self.capture_tail_hooks,
+            is_draft=self.is_draft_worker,
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1189,6 +1197,11 @@ class ModelRunner:
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
+        # Reuse startup decode graphs on a subsequent PD role switch.
+        self.decode_cuda_graph_captured = self.decode_cuda_graph_runner is not None
+        self.decode_cuda_graph_capture_bs = list(
+            getattr(self.decode_cuda_graph_runner, "capture_bs", []) or []
+        )
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
 
@@ -1781,7 +1794,10 @@ class ModelRunner:
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        with device_timer_ctx(self.device_timer, "split_prefill"):
+        with (
+            get_model().override(shared_experts=self.model.shared_experts_config),
+            device_timer_ctx(self.device_timer, "split_prefill"),
+        ):
             ret = self.model.forward_split_prefill(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -1948,11 +1964,17 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        prepare = getattr(self.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+        with (
+            get_model().override(shared_experts=self.model.shared_experts_config),
+            ctx_mgr,
+        ):
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
