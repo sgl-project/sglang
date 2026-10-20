@@ -43,7 +43,7 @@ def run_partition(scheduler, req):
             req.extra["_deployment_result"] = result
     except Exception as exc:
         error = str(exc)
-    peak = torch.cuda.max_memory_allocated() / (1024**2)
+    peak = torch.cuda.max_memory_reserved() / (1024**2)
     if scheduler._is_multi_rank():
         group = get_world_group()
         statuses = [None] * len(group.ranks)
@@ -137,7 +137,7 @@ class DeploymentWorker:
         ready.record()
         peak = max(
             req.extra["_deployment_peak_memory_mb"],
-            torch.cuda.max_memory_allocated() / (1024**2),
+            torch.cuda.max_memory_reserved() / (1024**2),
         )
         return values, ready, req.metrics, peak
 

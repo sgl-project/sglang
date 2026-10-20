@@ -97,7 +97,7 @@ def test_contracts_compile_and_tensor_tree_round_trip():
 def test_worker_retains_reusable_model_outputs(monkeypatch):
     for method in ("set_device", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, method, lambda *args: None)
-    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
     monkeypatch.setattr(
         torch.cuda, "Event", lambda: SimpleNamespace(record=lambda: None)
     )

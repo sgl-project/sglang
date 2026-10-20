@@ -195,6 +195,8 @@ registration and completion contract.
   `--disagg-max-slots-per-instance`; receive pools are separate from model memory.
   Cached stage tensors own their storage so reused model buffers cannot overwrite
   earlier results. Budget for retained outputs as well as weights and transfer pools.
+  The head reports the maximum per-worker peak reserved memory, not the sum of
+  memory used by processes sharing a GPU.
   Pending work is also bounded; overload returns an explicit error rather than
   accumulating an unbounded queue of raw media in host memory.
 - A result is retained through fan-out until consumers finish or its lease
