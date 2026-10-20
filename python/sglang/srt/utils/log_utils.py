@@ -36,12 +36,17 @@ def _create_log_target_file(directory: str, name_prefix: str) -> logging.Logger:
     os.makedirs(directory, exist_ok=True)
     hostname = socket.gethostname()
     rank = dist.get_rank() if dist.is_initialized() else 0
-    filename = os.path.join(directory, f"{hostname}_{rank}.log")
+    # Include the pid: processes without a distributed rank (e.g. the workers of
+    # --tokenizer-worker-num > 1) all report rank 0, and TimedRotatingFileHandler does
+    # not support several processes rotating the same file (rotations overwrite each
+    # other and the losers keep writing into an unlinked file).
+    stem = f"{hostname}_{rank}_{os.getpid()}"
+    filename = os.path.join(directory, f"{stem}.log")
     handler = TimedRotatingFileHandler(
         filename, when="H", backupCount=0, encoding="utf-8"
     )
     return _create_logger_with_handler(
-        f"{name_prefix}.file.{directory}.{hostname}_{rank}", handler
+        f"{name_prefix}.file.{directory}.{stem}", handler
     )
 
 

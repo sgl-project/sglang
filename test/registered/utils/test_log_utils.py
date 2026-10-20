@@ -1,5 +1,6 @@
 import io
 import json
+import multiprocessing
 import re
 import tempfile
 import unittest
@@ -61,6 +62,32 @@ class TestLogUtils(unittest.TestCase):
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
             self.assertEqual(stdout_data["x"], file_data["x"])
+
+    def test_file_per_process(self):
+        # Several processes logging to one directory (e.g. --tokenizer-worker-num > 1)
+        # must not share a file: each rotates its own TimedRotatingFileHandler.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = multiprocessing.get_context("fork")
+            procs = [
+                ctx.Process(target=_log_one_event, args=(temp_dir, i)) for i in range(3)
+            ]
+            for p in procs:
+                p.start()
+            for p in procs:
+                p.join()
+                self.assertEqual(p.exitcode, 0)
+            log_files = sorted(Path(temp_dir).glob("*.log"))
+            self.assertEqual(len(log_files), 3)
+            workers = sorted(
+                _parse_log_json(f.read_text().strip())["worker"] for f in log_files
+            )
+            self.assertEqual(workers, [0, 1, 2])
+
+
+def _log_one_event(temp_dir: str, worker: int) -> None:
+    loggers = create_log_targets(targets=[temp_dir], name_prefix="test_per_process")
+    log_json(loggers, "proc.event", {"worker": worker})
+    _flush_all(loggers)
 
 
 def _parse_log_json(line: str) -> dict:
