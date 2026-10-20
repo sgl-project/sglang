@@ -30,6 +30,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    collect_full_cuda_graph_owners,
+)
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    note_cuda_graphs_captured,
+    note_cuda_graphs_released,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -109,7 +116,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         reuse_output_buffer: bool = False,
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
+        self._liveness_noted = False
         self._outputs: Dict[Any, Any] = {}
+        self._capture_owners: Dict[Any, tuple[Any, ...]] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -196,6 +205,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph_ctx = self._device_module.graph
 
         with (
+            collect_full_cuda_graph_owners() as capture_owners,
             graph_pool_capture_scope(),
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
@@ -214,6 +224,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        if not self._liveness_noted:
+            # One note per backend instance: re-capturing the sole shape must
+            # not re-fire the liveness counter (it would leak upward and keep
+            # the empty_cache gates closed forever).
+            self._liveness_noted = True
+            note_cuda_graphs_captured()
+        if capture_inputs is not None:
+            capture_owners.append(capture_inputs)
+        self._capture_owners[shape_key] = tuple(capture_owners)
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -233,9 +252,13 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
+        if self._liveness_noted:
+            self._liveness_noted = False
+            note_cuda_graphs_released()
         for graph in self._graphs.values():
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_owners.clear()
         self._output_buffer = None
         self._pool = None

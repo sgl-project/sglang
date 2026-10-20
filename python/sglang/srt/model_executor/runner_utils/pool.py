@@ -28,6 +28,9 @@ from typing import Any, Iterator, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.runtime_context import get_resources, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.cuda_vmm_utils import BumpArenaStub
@@ -142,7 +145,14 @@ class GraphPoolPrecarve:
         # footprint. Reserved (not allocated) is the stat to use: allocated
         # peak is the live-byte sum and undershoots by exactly the packing
         # holes the carved span has to absorb.
-        torch.cuda.empty_cache()
+        if have_live_cuda_graphs():
+            logger.info(
+                "Skipping empty_cache: CUDA graphs are captured; "
+                "releasing pooled allocator segments could free memory "
+                "the captured graphs reference."
+            )
+        else:
+            torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         base = torch.cuda.memory_stats()["reserved_bytes.all.current"]
         yield

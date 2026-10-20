@@ -13,6 +13,9 @@ from torch.cuda.streams import ExternalStream
 
 from sglang.srt.distributed.parallel_state import pdmux_prefill_tp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.multiplex.pdmux_context import (
     get_current_stream_idx,
     get_sm_counts,
@@ -107,7 +110,14 @@ class SchedulerMultiplexMixin:
         stream_group = self.stream_groups[stream_idx]
         prefill_stream = stream_group[0]
         decode_stream = stream_group[1]
-        torch.cuda.empty_cache()
+        if have_live_cuda_graphs():
+            logger.info(
+                "Skipping empty_cache: CUDA graphs are captured; "
+                "releasing pooled allocator segments could free memory "
+                "the captured graphs reference."
+            )
+        else:
+            torch.cuda.empty_cache()
 
         logger.debug("Starting event loop for pd multiplexing...")
 

@@ -376,6 +376,13 @@ def _kpool_plan_to_gpu(
             pool_pool_id_t, index_page_size, rounding_mode="floor"
         )
         token_page_row = pool_page_group * kpool
+        # Mirror the captured plan kernel's row clamp. Threat model: a stale
+        # or garbage pool id outside the current page-table extent would make
+        # an unclamped ATen 2-D index an OOB read; clamped, the worst case is
+        # an in-bounds wrong row, never an illegal address.
+        token_page_row = torch.clamp(
+            token_page_row, min=0, max=full_real_page_table.shape[1] - 1
+        )
         packed_page = (
             full_real_page_table[pool_batch_idx_t, token_page_row].to(torch.int64)
             // kpool

@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.graph_buffer_lifetime import (
+    register_graph_buffer,
+)
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -61,6 +64,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.runner_utils import capture_mode
+from sglang.srt.model_executor.runner_utils.capture_owner import (
+    retain_full_cuda_graph_owner,
+)
 from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
@@ -244,11 +250,15 @@ class IndexerKPool(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
-    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+    def _get_logits_head_gate_compiled(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
+        weights = self._get_logits_head_gate_compiled(x, q_scale)
+        return self._retain_logits_head_gate_capture_owner(weights)
 
     @torch.compile(dynamic=True)
     def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
@@ -261,10 +271,26 @@ class IndexerKPool(MultiPlatformOp):
     ) -> torch.Tensor:
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
+    @torch.compiler.disable
+    def _retain_logits_head_gate_capture_owner(
+        self, weights: torch.Tensor
+    ) -> torch.Tensor:
+        retain_full_cuda_graph_owner(weights)
+        return weights
+
+    @torch.compiler.disable
+    def _retain_paged_logits_capture_owner(
+        self, logits: torch.Tensor, layer_id: int
+    ) -> torch.Tensor:
+        register_graph_buffer(logits, f"kpool-logits-layer-{layer_id}")
+        retain_full_cuda_graph_owner(logits)
+        return logits
+
     def _resolve_head_gate_weights(self, x, q_scale, head_weights):
-        if head_weights is not None:
-            return self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
-        return self._get_logits_head_gate(x, q_scale)
+        if head_weights is None:
+            return self._get_logits_head_gate(x, q_scale)
+        weights = self._apply_q_scale_and_softmax_scale(head_weights, q_scale)
+        return self._retain_logits_head_gate_capture_owner(weights)
 
     def _can_overlap_prefill(
         self,
@@ -1087,6 +1113,7 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
 
+        logits = self._retain_paged_logits_capture_owner(logits, layer_id)
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         topk_result = self._topk_from_kpool_logits(
             logits=logits,

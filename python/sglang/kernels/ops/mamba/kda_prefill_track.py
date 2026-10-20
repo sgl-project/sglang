@@ -84,9 +84,9 @@ def _kda_track_ssm_kernel(
         # triton >=3.8 make_ir asserts a type match for ANY same-named variable
         # assigned in both arms of a runtime if -- even when it is never read
         # after the join ("Mismatched type for val between then block and else
-        # block"); per-branch stores alone are not enough (the D2-5 boot-7
-        # attempt failed on this same shape with the stores already per-arm),
-        # and 3.7 accepted even the shared-name join.
+        # block"); per-branch stores alone are not enough -- a reproducer on
+        # this shape failed even with the stores already per-arm -- and 3.7
+        # accepted even the shared-name join.
         val_ssm = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
         tl.store(ssm_pool + dst * stride_ssm_slot + offs, val_ssm, mask=mask)
     else:
