@@ -4,7 +4,7 @@ import math
 import torch
 
 from sglang.kernels.ops.attention.linear.lightning_attn import (
-    BailingLinearKernel,
+    lightning_attention,
     linear_decode_forward_triton,
 )
 from sglang.kernels.ops.attention.linear.seg_la import SegLaMeta, seg_la_fwd
@@ -21,6 +21,46 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class BailingLinearKernel:
+    """
+    Linear attention kernel implementation for Bailing models.
+
+    This class is adapted from MiniMaxText01LinearKernel in vllm:
+    https://github.com/vllm-project/vllm/blob/a9138e85b14047e06300685b48e3485b995425fb/vllm/model_executor/models/minimax_text_01.py#L289
+
+    The implementation maintains the same functionality while being renamed to
+    match our Bailing model naming convention.
+    """
+
+    @staticmethod
+    def jit_linear_forward_prefix(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_caches: torch.Tensor,
+        slope_rate: torch.Tensor,
+        block_size: int,
+        layer_idx: int = None,
+        **kwargs,
+    ) -> torch.Tensor:
+
+        slope_rate = slope_rate.to(torch.float32)
+        should_pad_dim = q.dim() == 3
+        if should_pad_dim:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        b, h, n, d = q.shape
+        e = d
+        kv_history = kv_caches.reshape(1, h, d, e).contiguous()
+        output, kv_history = lightning_attention(
+            q, k, v, slope_rate, block_size=block_size, kv_history=kv_history
+        )
+        kv_caches.copy_(kv_history[:, :, -1, :, :].reshape(h, d, e))
+        assert output.shape[0] == 1, "batch size must be 1"
+        return output.squeeze(0).transpose(0, 1).reshape([n, h * d]).contiguous()
 
 
 class LightningAttentionBackend(MambaAttnBackendBase):
@@ -297,7 +337,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             track_lens=track_lens,
             track_state_indices=track_state_indices,
             softmax_scale=layer.scaling,
-            decouple=True,
         )
         return hidden
 

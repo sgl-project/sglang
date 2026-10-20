@@ -18,7 +18,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -50,12 +50,20 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
+_has_fused_qk_norm_rope = False
 if _use_aiter:
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 
         _has_fused_qk_norm_mrope = True
         logger.info("aiter fused_qk_norm_mrope_3d kernel available")
+    except ImportError:
+        pass
+    try:
+        from aiter import fused_qk_norm_rope_cache_pts_quant_shuffle
+
+        _has_fused_qk_norm_rope = True
+        logger.info("aiter fused_qk_norm_rope kernel available")
     except ImportError:
         pass
 
@@ -69,7 +77,7 @@ def aiter_fused_qk_norm_rope_set_kv(
     qkv: torch.Tensor,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
-    rotary_emb: MRotaryEmbedding,
+    rotary_emb: RotaryEmbedding,
     positions: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -80,7 +88,8 @@ def aiter_fused_qk_norm_rope_set_kv(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> torch.Tensor:
-    """QK-norm + 3D mRoPE + KV cache write in one aiter HIP kernel.
+    """QK-norm + RoPE (1D, or 3D mRoPE for MRotaryEmbedding) + KV cache write in
+    one aiter HIP kernel.
 
     ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV
     projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,
@@ -91,36 +100,42 @@ def aiter_fused_qk_norm_rope_set_kv(
     q_out = torch.empty(
         num_tokens, num_heads, head_dim, dtype=qkv.dtype, device=qkv.device
     )
-    # The kernel reads cache strides as (block, token, head); an NHD buffer is
-    # one-slot blocks addressed with block_size=0.
-    fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-        qkv.view(num_tokens, -1, head_dim),
-        q_norm.weight,
-        k_norm.weight,
-        rotary_emb.cos_sin_cache_as(qkv.dtype),
-        positions,
-        num_tokens,
-        num_heads,
-        num_kv_heads,
-        num_kv_heads,
-        head_dim,
-        rotary_emb.is_neox_style,
-        rotary_emb.mrope_section,
-        rotary_emb.mrope_interleaved,
-        q_norm.variance_epsilon,
-        q_out,
-        k_cache.unsqueeze(1),
-        v_cache.unsqueeze(1),
-        out_cache_loc,
-        k_scale,
-        v_scale,
-        None,
-        None,
-        False,
-        False,
-        0,
-        0,
+    kernel_kwargs = dict(
+        qkv=qkv.view(num_tokens, -1, head_dim),
+        qw=q_norm.weight,
+        kw=k_norm.weight,
+        cos_sin=rotary_emb.cos_sin_cache_as(qkv.dtype),
+        positions=positions,
+        num_tokens=num_tokens,
+        num_heads_q=num_heads,
+        num_heads_k=num_kv_heads,
+        num_heads_v=num_kv_heads,
+        head_size=head_dim,
+        is_neox_style=rotary_emb.is_neox_style,
+        eps=q_norm.variance_epsilon,
+        q_out=q_out,
+        # The kernel reads cache strides as (block, token, head); an NHD buffer
+        # is one-slot blocks addressed with block_size=0.
+        k_cache=k_cache.unsqueeze(1),
+        v_cache=v_cache.unsqueeze(1),
+        slot_mapping=out_cache_loc,
+        per_tensor_k_scale=k_scale,
+        per_tensor_v_scale=v_scale,
+        k_out=None,
+        v_out=None,
+        return_kv=False,
+        use_shuffle_layout=False,
+        block_size=0,
+        x=0,
     )
+    if isinstance(rotary_emb, MRotaryEmbedding):
+        fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
+            **kernel_kwargs,
+            mrope_section_=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+        )
+    else:
+        fused_qk_norm_rope_cache_pts_quant_shuffle(**kernel_kwargs)
     return q_out.view(num_tokens, -1)
 
 
@@ -220,7 +235,17 @@ class Qwen3Attention(nn.Module):
             and isinstance(self.rotary_emb, MRotaryEmbedding)
             and getattr(self.rotary_emb, "mrope_section", None) is not None
         )
-        if self.use_fused_qk_norm_mrope:
+        # The 1D kernel is instantiated for these head sizes, indexes
+        # cos_sin_cache as [pos, rotary_dim] and takes one eps for both norms;
+        # scaled-RoPE subclasses stay on the unfused path.
+        self.use_fused_qk_norm_rope = (
+            _has_fused_qk_norm_rope
+            and type(self.rotary_emb) is RotaryEmbedding
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.head_dim in (64, 128, 256, 512)
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        )
+        if self.use_fused_qk_norm_mrope or self.use_fused_qk_norm_rope:
             # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
             # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph capture.
             # Explicit device='cpu' is required because SGLang constructs models inside
@@ -262,7 +287,7 @@ class Qwen3Attention(nn.Module):
         )
         return q, k, v
 
-    def forward_prepare_aiter_fused_mrope(
+    def forward_prepare_aiter_fused(
         self, positions, hidden_states, forward_batch, k_cache, v_cache
     ):
         """Decode-only fused path; KV is already in the paged cache when this
@@ -297,7 +322,7 @@ class Qwen3Attention(nn.Module):
         save_kv_cache = True
         use_aiter_fused = False
         can_try_aiter_fused = (
-            self.use_fused_qk_norm_mrope
+            (self.use_fused_qk_norm_mrope or self.use_fused_qk_norm_rope)
             and forward_batch.forward_mode.is_decode()
             and get_exec().deterministic.rl_on_policy_target is None
         )
@@ -310,7 +335,7 @@ class Qwen3Attention(nn.Module):
             )
 
         if use_aiter_fused:
-            q, k, v = self.forward_prepare_aiter_fused_mrope(
+            q, k, v = self.forward_prepare_aiter_fused(
                 positions, hidden_states, forward_batch, k_cache, v_cache
             )
             save_kv_cache = False
