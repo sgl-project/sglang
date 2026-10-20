@@ -95,6 +95,9 @@ class InklingReasoningEffortTest(unittest.TestCase):
 
 class InklingPromptTest(unittest.TestCase):
     def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.serving = _inkling_serving()
 
     def _encode(self, messages, **request_kwargs) -> list[int]:
