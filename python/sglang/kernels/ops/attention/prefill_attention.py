@@ -27,7 +27,7 @@ from sglang.srt.utils import is_cuda, is_hip
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
-if _is_cuda or _is_hip:
+if _is_cuda or (_is_hip and torch.cuda.is_available()):
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 

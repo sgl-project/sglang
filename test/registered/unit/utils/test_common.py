@@ -15,6 +15,9 @@ from sglang.srt.utils.common import (
     freeze_gc,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_gfx1250_supported,
 )
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -251,6 +254,31 @@ class TestGetDeviceSmViaNvml(CustomTestCase):
         ):
             self.assertIsNone(_get_device_sm_via_nvml())
         self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+
+class TestGfxArchProbesWithoutDevice(CustomTestCase):
+    """The gfx probes run at import time; a ROCm build with no visible GPU
+    (CPU-only workers, routers) must get False instead of a CUDA init error."""
+
+    PROBES = (is_gfx95_supported, is_gfx942_supported, is_gfx1250_supported)
+
+    def setUp(self):
+        for probe in self.PROBES:
+            probe.cache_clear()
+            self.addCleanup(probe.cache_clear)
+
+    def test_returns_false_without_querying_the_device(self):
+        def boom(device):
+            raise RuntimeError("No CUDA GPUs are available")
+
+        with (
+            mock.patch.object(torch.version, "hip", "7.2.0"),
+            mock.patch.object(torch.cuda, "is_available", lambda: False),
+            mock.patch.object(torch.cuda, "get_device_properties", boom),
+        ):
+            for probe in self.PROBES:
+                with self.subTest(probe=probe.__name__):
+                    self.assertFalse(probe())
 
 
 class TestFreezeGc(CustomTestCase):
