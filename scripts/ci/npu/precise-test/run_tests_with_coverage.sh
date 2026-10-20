@@ -40,12 +40,69 @@ mkdir -p "${COV_ROOT}"
 # of one test land in the same per-test directory and are attributed to
 # that test by the existing find/combine/map logic unchanged.
 export COVERAGE_PROCESS_START="${SCRIPT_DIR}/coveragerc"
-# Install the .pth next to the installed coverage package: that directory
-# is guaranteed writable (pip put coverage there) and on sys.path for the
-# same interpreter that runs the servers below.
+# Install a guard module + .pth next to the installed coverage package:
+# that directory is guaranteed writable (pip put coverage there) and on
+# sys.path for the same interpreter that runs the servers below. The
+# .pth imports the guard in every python process; the guard no-ops
+# unless COVERAGE_PROCESS_START is set, so it stays inert for later
+# non-coverage jobs on the same runner.
+#
+# Besides calling process_startup(), the guard hardens coverage's
+# SIGTERM shutdown (coverage 7.8): mp children (forkserver/pool
+# workers) can receive the teardown SIGTERM after their coverage was
+# already stopped, and the stock handler then dies on
+# `assert self._collectors` (collector.py:348) -- a scary multi-process
+# traceback lands in the test log (tests still pass) and the worker
+# survives until the SIGKILL backstop. Patched handler: flush via the
+# stock _atexit path (with the assert defused into a no-op), then
+# always restore SIG_DFL and re-raise so the worker dies quietly on
+# the first SIGTERM.
 SITE_PACKAGES="$(python -c 'import coverage, os; print(os.path.dirname(os.path.dirname(coverage.__file__)))')"
-echo "import os; os.environ.get('COVERAGE_PROCESS_START') and __import__('coverage').process_startup()" \
-  > "${SITE_PACKAGES}/sglang_ci_subprocess_coverage.pth"
+cat > "${SITE_PACKAGES}/sglang_ci_cov_guard.py" <<'PYEOF'
+"""Loaded by sglang_ci_subprocess_coverage.pth in every python process.
+
+No-op unless COVERAGE_PROCESS_START is set. Starts subprocess coverage
+and hardens coverage's SIGTERM shutdown for mp workers that already
+stopped collecting (see run_tests_with_coverage.sh for the rationale).
+"""
+import os
+
+if os.environ.get("COVERAGE_PROCESS_START"):
+    import signal
+
+    import coverage
+    import coverage.collector
+
+    try:
+        # Second stop on an empty collector stack is a no-op, not an
+        # assert: mp workers SIGTERMed after their coverage already
+        # stopped must not die on `assert self._collectors`.
+        _collector_stop = coverage.collector.Collector.stop
+
+        def _idempotent_stop(self):
+            if self._collectors:
+                return _collector_stop(self)
+
+        coverage.collector.Collector.stop = _idempotent_stop
+
+        # Flush exactly like the stock handler, then ALWAYS die by the
+        # default disposition: no traceback, no handler re-entry, no
+        # lingering until the SIGKILL backstop.
+        def _on_sigterm(self, signum=None, frame=None):
+            try:
+                self._atexit("sigterm")
+            finally:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        coverage.Coverage._on_sigterm = _on_sigterm
+    except Exception:
+        # Unexpected coverage version: keep stock behavior.
+        pass
+
+    coverage.process_startup()
+PYEOF
+echo "import sglang_ci_cov_guard" > "${SITE_PACKAGES}/sglang_ci_subprocess_coverage.pth"
 
 # Traced subprocesses can only flush on a graceful stop (SIGKILL skips
 # atexit). Load the CI-owned pytest plugin that wraps kill_process_tree
@@ -54,7 +111,7 @@ echo "import os; os.environ.get('COVERAGE_PROCESS_START') and __import__('covera
 # lives only in the pytest process. Scheduler/detokenizer flush via
 # coveragerc sigterm=True; the server drains via its own SIGTERM path.
 export SGLANG_KILL_PROCESS_TREE_GRACEFUL=1
-export SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT="${SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT:-20}"
+export SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT="${SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT:-5}"
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTEST_PLUGINS="precise_test_coverage_plugin"
 
