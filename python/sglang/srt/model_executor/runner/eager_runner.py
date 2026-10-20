@@ -209,20 +209,21 @@ class EagerRunner(BaseRunner):
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
-        mode = forward_batch.forward_mode
-        if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
-            # A mixed batch is extend-shaped (decode tails are 1-token
-            # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
-            # kernel; CP keeps it to skip the zigzag split.
-            forward_batch.forward_mode = ForwardMode.EXTEND
-            mode = ForwardMode.EXTEND
-        if mode.is_decode():
-            return self._execute_decode(forward_batch, pp_proxy_tensors)
-        if mode.is_idle():
-            return self._execute_idle(forward_batch, pp_proxy_tensors)
-        if mode.is_extend(include_draft_extend_v2=True):
-            return self._execute_extend(forward_batch, pp_proxy_tensors)
-        raise ValueError(f"Invalid forward mode for eager runner: {mode}")
+        with self.model_context():
+            mode = forward_batch.forward_mode
+            if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
+                # A mixed batch is extend-shaped (decode tails are 1-token
+                # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
+                # kernel; CP keeps it to skip the zigzag split.
+                forward_batch.forward_mode = ForwardMode.EXTEND
+                mode = ForwardMode.EXTEND
+            if mode.is_decode():
+                return self._execute_decode(forward_batch, pp_proxy_tensors)
+            if mode.is_idle():
+                return self._execute_idle(forward_batch, pp_proxy_tensors)
+            if mode.is_extend(include_draft_extend_v2=True):
+                return self._execute_extend(forward_batch, pp_proxy_tensors)
+            raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _resolve_decode_pdmux(
         self,

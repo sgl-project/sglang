@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_parallel,
+    get_platform,
     get_schedule,
     get_serving,
     get_spec,
@@ -1710,7 +1711,6 @@ class Req(ReqDllmMixin):
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
-            self.determine_dllm_phase()
         else:
             self.refresh_fill_ids()
 
@@ -1760,6 +1760,9 @@ class Req(ReqDllmMixin):
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
+        if self.is_dllm():
+            self.determine_dllm_phase()
+
         if (
             self.is_retracted
             and self.multimodal_inputs is not None
@@ -1785,6 +1788,15 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.is_dllm():
+            # Appended masks and a partial prompt/output block are not reusable
+            # KV: bidirectional attention depends on the rest of that block.
+            # Bound the lookup by real tokens, even if another cached prompt
+            # happens to contain the same token IDs as our synthetic masks.
+            block_size = self.dllm_config.block_size
+            committed_len = len(self.origin_input_ids) + len(self.output_ids)
+            max_prefix_len = min(max_prefix_len, committed_len)
+            max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -2855,20 +2867,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if get_exec().features.enable_encoder_swa_bounded_replay:
             for req in reqs:
+                if req.multimodal_inputs is not None and (
+                    not get_platform().is_cuda
+                    or any(
+                        item.modality != Modality.IMAGE
+                        for item in req.multimodal_inputs.mm_items
+                    )
+                ):
+                    raise ValueError(
+                        "encoder SWA replay supports multimodal inputs only for "
+                        "image requests on CUDA"
+                    )
                 if (
-                    req.multimodal_inputs is not None
-                    or req.input_embeds is not None
+                    req.input_embeds is not None
                     or req.positional_embed_overrides is not None
                 ):
                     raise ValueError(
-                        "encoder SWA replay currently supports token-only text requests"
-                    )
-                if req.return_logprob and req.logprob_start_len not in (
-                    -1,
-                    len(req.origin_input_ids),
-                ):
-                    raise ValueError(
-                        "encoder SWA replay cannot return cached prompt logprobs"
+                        "encoder SWA replay does not support input_embeds or "
+                        "positional_embed_overrides"
                     )
             self.encoder_swa_reset = [resets_swa_window(r) for r in reqs]
         # Allocate memory
@@ -2927,6 +2943,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # flag will always True
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
+                if req.is_dllm():
+                    # Denoising revisits the current block while only earlier
+                    # blocks are a reusable prefix. Recomputing that block must
+                    # not subtract its size from cross-request cache hits.
+                    new_cached = max(0, new_cached)
                 req.cached_tokens += new_cached
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
