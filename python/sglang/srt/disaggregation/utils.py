@@ -403,6 +403,10 @@ class CustomizedInfoError(ValueError):
 
 
 class MetadataBuffers:
+    # Positions of output_customized_info and output_customized_info_len in
+    # get_buf_infos; the PD layout check compares only these strides.
+    CUSTOMIZED_INFO_SLOTS = slice(6, 8)
+
     def __init__(
         self,
         size: int,
@@ -569,6 +573,10 @@ class MetadataBuffers:
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
         bufs = [buf for buf in bufs if buf is not None]
+        assert bufs[self.CUSTOMIZED_INFO_SLOTS] == [
+            self.output_customized_info,
+            self.output_customized_info_len,
+        ]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
