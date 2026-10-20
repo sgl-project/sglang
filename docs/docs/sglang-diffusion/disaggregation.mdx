@@ -97,6 +97,10 @@ pipeline order and communicate through the local request context, without a
 network hop. Cross-role edges transfer only the declared fields their consumers
 need. Independent requests can use different replicas of a role.
 
+Stage workers skip standalone warmup because their inputs come from upstream
+stages. Send representative requests through the coordinator before measuring
+steady-state performance; warm up each input mode and worker replica you use.
+
 ### Encoding for training
 
 For encoder-only serving, use a deployment containing just the `prompt` and
@@ -144,6 +148,8 @@ Native pipelines can expose `stage_specs` using `StageSpec`, or deployments can
 provide the same contracts in their top-level `stages` array:
 
 ```python
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import StageSpec
+
 StageSpec(
     "vae_encode",
     inputs=("image_path",),
