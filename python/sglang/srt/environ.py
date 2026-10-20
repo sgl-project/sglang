@@ -368,6 +368,8 @@ class Envs:
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
     # Comma-separated peer IPs admitted by TCP-bound IPC sockets; empty admits all.
     SGLANG_ZMQ_ALLOWED_PEERS = EnvTuple(tuple())
+    # Source IP for outgoing TCP IPC connects, so an allowlisting peer sees it.
+    SGLANG_ZMQ_SOURCE_IP = EnvStr(None)
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
