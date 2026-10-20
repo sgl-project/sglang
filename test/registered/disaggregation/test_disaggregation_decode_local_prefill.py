@@ -15,7 +15,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, try_cached_model
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=150, stage="base-b", runner_config="2-gpu-large")
 
 CHUNK_SIZE = 128
 

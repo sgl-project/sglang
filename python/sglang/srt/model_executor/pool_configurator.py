@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.overrides import resolving_view, runs_prefill_of
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -929,18 +929,14 @@ def compute_swa_request_cap(
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
     num_reqs = max(1, max_running_requests // attn_dp_size)
-    if get_disagg().disaggregation_mode == "decode":
-        return (
-            per_request * num_reqs
-            + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
-        )
-    else:
+    cap = per_request * num_reqs
+    disagg = get_disagg()
+    if disagg.disaggregation_mode == "decode":
+        cap += (window + page_size) * disagg.disaggregation_decode_extra_slots
+    if runs_prefill_of(disagg):
         chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
-        return (
-            per_request * num_reqs
-            + chunks_in_flight * get_schedule().chunked_prefill_size
-            + page_size
-        )
+        cap += chunks_in_flight * get_schedule().chunked_prefill_size + page_size
+    return cap
 
 
 class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):

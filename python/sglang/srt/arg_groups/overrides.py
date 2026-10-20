@@ -191,6 +191,15 @@ def resolution_result(server_args: Any, field: str, default: Any = None) -> Any:
     return with_fallback(type(server_args), field, getattr(server_args, field, default))
 
 
+def runs_prefill_of(cfg: Any) -> bool:
+    """Whether this server runs prefill forwards; a PD decode server only does
+    with --disaggregation-decode-enable-local-prefill."""
+    return (
+        cfg.disaggregation_mode != "decode"
+        or cfg.disaggregation_decode_enable_local_prefill
+    )
+
+
 def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> float:
     """Return the activation reserve in MB before CUDA graph capture."""
     if cfg.disaggregation_mode == "decode":
@@ -1839,7 +1848,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
-    if cfg.disaggregation_mode != "decode":
+    if runs_prefill_of(cfg):
         prefill_cfg = cfg.cuda_graph_config.prefill
         # We can only skip eager activation headroom when the largest
         # prefill forward batch size is already graph-captured. Otherwise,
