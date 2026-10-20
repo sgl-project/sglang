@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional, Union
 import torch
 import triton
 
-from sglang.kernels.ops.attention.dcp_kernels import fill_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.kernels.ops.attention.fixup_zero_kv import (
     _jit_fixup_module,
     fixup_zero_kv_rows,
@@ -389,16 +389,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         pages_per_block = get_num_page_per_block_flashmla(self.page_size)
         # None on a static pool, whose collapsed page is already physical.
         v2p = self.kv_index_translator.full_v2p_table
-        fill_mla_kv_page_table_for_dcp(
+        create_mla_kv_page_table_for_dcp[
+            (
+                block_kv_indices.shape[0],
+                get_num_kv_index_blocks_flashmla(
+                    block_kv_indices.shape[1], self.page_size
+                ),
+            )
+        ](
             self.req_to_token,
             req_pool_indices,
             local_seq_lens,
             block_kv_indices,
-            physical_page_size=self.page_size,
-            dcp_size=parallel.dcp_size,
-            dcp_rank=parallel.dcp_rank,
-            pages_per_block=pages_per_block,
-            v2p=v2p,
+            v2p,
+            self.req_to_token.stride(0),
+            block_kv_indices.stride(0),
+            PHYSICAL_PAGE_SIZE=self.page_size,
+            DCP_SIZE=parallel.dcp_size,
+            DCP_RANK=parallel.dcp_rank,
+            PAGES_PER_BLOCK=pages_per_block,
+            HAS_V2P=v2p is not None,
         )
 
     def _create_block_kv_indices(

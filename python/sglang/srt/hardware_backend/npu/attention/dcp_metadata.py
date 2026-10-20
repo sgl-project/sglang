@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import triton
 
-from sglang.kernels.ops.attention.dcp_kernels import fill_mla_kv_page_table_for_dcp
+from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
 
 if TYPE_CHECKING:
@@ -166,15 +167,19 @@ def update_mla_dcp_graph_metadata(
     metadata.seq_lens.copy_(local_seq_lens)
     metadata.block_tables.zero_()
     if req_pool_indices[:bs].numel():
-        fill_mla_kv_page_table_for_dcp(
+        create_mla_kv_page_table_for_dcp[(bs, triton.cdiv(active_num_pages, 128))](
             req_to_token,
             req_pool_indices[:bs],
             metadata.seq_lens,
             metadata.block_tables[:, :active_num_pages],
-            physical_page_size=page_size,
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
-            pages_per_block=128,
+            None,
+            req_to_token.stride(0),
+            metadata.block_tables.stride(0),
+            PHYSICAL_PAGE_SIZE=page_size,
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+            PAGES_PER_BLOCK=128,
+            HAS_V2P=False,
         )
     # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
     if in_capture:
@@ -229,15 +234,21 @@ def build_mla_dcp_local_block_tables(
     )
     if not req_pool_indices.numel():
         return block_tables, local_seq_lens
-    fill_mla_kv_page_table_for_dcp(
+    create_mla_kv_page_table_for_dcp[
+        (req_pool_indices.numel(), triton.cdiv(num_pages, 128))
+    ](
         req_to_token,
         req_pool_indices,
         local_seq_lens,
         block_tables,
-        physical_page_size=physical_page_size,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        pages_per_block=128,
+        None,
+        req_to_token.stride(0),
+        block_tables.stride(0),
+        PHYSICAL_PAGE_SIZE=physical_page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        PAGES_PER_BLOCK=128,
+        HAS_V2P=False,
     )
     return block_tables, local_seq_lens
 
