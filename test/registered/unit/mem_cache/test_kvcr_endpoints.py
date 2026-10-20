@@ -34,6 +34,7 @@ class TestKVCRRankEndpoints(CustomTestCase):
         for source, offset, expected in (
             ("tcp://127.0.0.1:32100", 0, "tcp://127.0.0.1:32100"),
             ("tcp://source.example:32100", 2, "tcp://source.example:32102"),
+            ("tcp://source.example:32102", -2, "tcp://source.example:32100"),
             ("tcp://[2001:db8::1]:32100", 2, "tcp://[2001:db8::1]:32102"),
             ("tcp://source.example:65535", 0, "tcp://source.example:65535"),
         ):
@@ -58,7 +59,8 @@ class TestKVCRRankEndpoints(CustomTestCase):
             with self.subTest(source=source):
                 self.assertIsNone(rank_endpoint(source, 1))
         self.assertIsNone(rank_endpoint("tcp://source.example:65535", 1))
-        for offset in (-1, True, 0.5, "1"):
+        self.assertIsNone(rank_endpoint("tcp://source.example:1", -1))
+        for offset in (True, 0.5, "1"):
             with self.subTest(offset=offset):
                 self.assertIsNone(rank_endpoint("tcp://source.example:32100", offset))
 

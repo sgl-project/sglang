@@ -18,7 +18,7 @@ def rank_offset(config) -> int:
 
 def rank_endpoint(endpoint: str, offset: int) -> str | None:
     """Offset an advertised TCP endpoint, or reject an ambiguous address."""
-    if not isinstance(endpoint, str) or type(offset) is not int or offset < 0:
+    if not isinstance(endpoint, str) or type(offset) is not int:
         return None
     try:
         source = urlsplit(endpoint)
@@ -27,7 +27,8 @@ def rank_endpoint(endpoint: str, offset: int) -> str | None:
             source.scheme != "tcp"
             or not source.hostname
             or port is None
-            or not 0 < port <= port + offset <= 65535
+            or not 1 <= port <= 65535
+            or not 1 <= port + offset <= 65535
             or source.path
             or source.query
             or source.fragment
