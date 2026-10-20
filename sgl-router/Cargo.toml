@@ -31,7 +31,7 @@ dynamo-renderer = "=7.1.1"
 # `OAIChatLikeRequest` speaks minijinja values.
 minijinja = "2.24"
 # SGLang chat rendering shared with the Rust server; DeepSeek-V4 renders through it.
-sglang-processor = { path = "../../rust/sglang-processor", default-features = false, features = ["render", "openai"] }
+sglang-processor = { path = "../rust/sglang-processor", default-features = false, features = ["render", "openai"] }
 
 # Async runtime + http
 tokio = { version = "1.42", features = ["full"] }
@@ -57,7 +57,7 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2
 hyper = "1"
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
 # Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
-sglang-api-types = { path = "../../rust/sglang-api-types" }
+sglang-api-types = { path = "../rust/sglang-api-types" }
 tonic = { version = "0.14.6", features = ["transport"] }
 
 # Serialization

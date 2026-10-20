@@ -232,7 +232,7 @@ work_dirs/
 Cargo.lock
 !rust/Cargo.lock
 !rust/sglang-radix-tree/Cargo.lock
-!experimental/sgl-router/Cargo.lock
+!sgl-router/Cargo.lock
 
 # Other repos
 lmms-eval

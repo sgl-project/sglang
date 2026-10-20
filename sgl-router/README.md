@@ -60,7 +60,7 @@ header).
 Build:
 
 ```bash
-cd experimental/sgl-router
+cd sgl-router
 cargo build --release
 ```
 

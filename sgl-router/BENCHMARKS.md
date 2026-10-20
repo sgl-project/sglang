@@ -1,6 +1,6 @@
 # sgl-router microbench harness + SMG comparison
 
-This file pairs with `experimental/sgl-router/benches/` and the SMG
+This file pairs with `sgl-router/benches/` and the SMG
 Criterion harnesses at:
 
 - `~/smg_workspace/smg/model_gateway/benches/radix_tree_benchmark.rs`
@@ -19,7 +19,7 @@ this file; it requires a real GPU cluster and is tracked separately.
 
 sgl-router:
 ```bash
-cd experimental/sgl-router
+cd sgl-router
 cargo bench --bench tree_lookup     -- --sample-size 30 --measurement-time 3
 cargo bench --bench policy_select   -- --sample-size 30 --measurement-time 3
 ```

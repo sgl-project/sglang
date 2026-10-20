@@ -1,6 +1,6 @@
 """Regenerate Kimi IDs with SGLang and the pinned checkpoint tokenizer.
 
-Run from experimental/sgl-router in a SGLang Python environment.
+Run from sgl-router in a SGLang Python environment.
 """
 
 import base64

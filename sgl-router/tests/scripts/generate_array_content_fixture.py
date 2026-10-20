@@ -1,6 +1,6 @@
 """Regenerate the array-only template regression using SGLang's content processor.
 
-Run: PYTHONPATH=../../python python tests/scripts/generate_array_content_fixture.py
+Run: PYTHONPATH=../python python tests/scripts/generate_array_content_fixture.py
 """
 
 import json

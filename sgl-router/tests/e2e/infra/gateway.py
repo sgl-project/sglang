@@ -1,7 +1,7 @@
 """Minimal sgl-router Gateway class for e2e tests.
 
 sgl-router is a Rust binary
-(`experimental/sgl-router/target/release/sgl-router`) configured entirely
+(`sgl-router/target/release/sgl-router`) configured entirely
 through CLI flags. This Gateway execs the binary with `--worker-urls <...>`
 (static discovery) plus the model + policy flags.
 
@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 
 # Repo-relative path to the release binary. Set ``SGL_ROUTER_BINARY`` to
 # override (e.g. a debug build, or a non-default ``CARGO_TARGET_DIR``).
-# This file is at `experimental/sgl-router/tests/e2e/infra/gateway.py`,
+# This file is at `sgl-router/tests/e2e/infra/gateway.py`,
 # so four `.parent` hops to reach the sgl-router workspace root
 # (infra → e2e → tests → sgl-router). Cargo lands the binary at
-# `experimental/sgl-router/target/release/sgl-router`. A previous
+# `sgl-router/target/release/sgl-router`. A previous
 # version used three hops and pointed at `tests/target/`, which
 # would have broken any test that actually launches the router via
 # this helper.
@@ -332,7 +332,7 @@ class Gateway:
         if not self.binary.exists():
             raise RuntimeError(
                 f"sgl-router binary not found at {self.binary}. "
-                "Build it first: `cd experimental/sgl-router && cargo build --release` "
+                "Build it first: `cd sgl-router && cargo build --release` "
                 "or set SGL_ROUTER_BINARY to the binary path."
             )
         logger.info("sgl-router args: %s", args)

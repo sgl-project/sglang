@@ -1,4 +1,4 @@
-"""Pytest fixtures for ``experimental/sgl-router/tests/e2e/``.
+"""Pytest fixtures for ``sgl-router/tests/e2e/``.
 
 Two flavors of fixtures coexist here:
 
@@ -51,15 +51,15 @@ SGLANG_PORT = 30000
 ROUTER_PORT = 8090
 
 # Path to the release binary. This file lives at
-# `experimental/sgl-router/tests/e2e/conftest.py`, so:
+# `sgl-router/tests/e2e/conftest.py`, so:
 #   parent             = tests/e2e/
 #   parent.parent      = tests/
-#   parent.parent.parent = experimental/sgl-router/   ← cargo workspace root
+#   parent.parent.parent = sgl-router/   ← cargo workspace root
 # A previous version used `parent.parent / "target"`, which pointed at
-# `experimental/sgl-router/tests/target/` and silently broke every
+# `sgl-router/tests/target/` and silently broke every
 # fixture that tries to launch the router binary (CI's
 # `cargo build --release` lands the artifact at
-# `experimental/sgl-router/target/release/sgl-router`, not under
+# `sgl-router/target/release/sgl-router`, not under
 # `tests/`).
 _SGL_ROUTER_ROOT = Path(__file__).parent.parent.parent
 _BINARY = (
@@ -387,7 +387,7 @@ def router_binary() -> Path:
     pytest.skip(
         "sgl-router release binary not found at any of: "
         + ", ".join(str(c) for c in candidates)
-        + ". Build with `cargo build --release` in experimental/sgl-router/."
+        + ". Build with `cargo build --release` in sgl-router/."
     )
 
 
