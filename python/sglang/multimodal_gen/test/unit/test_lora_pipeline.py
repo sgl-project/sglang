@@ -581,7 +581,7 @@ def test_set_lora_skip_requires_every_target_module_to_match():
     assert pipeline.cur_adapter_name["transformer_2"] == "hi"
 
 
-def test_merge_without_strength_keeps_per_adapter_strengths():
+def test_merge_with_explicit_none_strength_keeps_per_adapter_strengths():
     pipeline, layers = _two_layer_pipeline()
     with patch(_RANK_PATCH, return_value=0):
         pipeline._apply_lora_to_layers(
@@ -596,7 +596,7 @@ def test_merge_without_strength_keeps_per_adapter_strengths():
     pipeline.is_lora_merged["transformer"] = False
     pipeline.cur_adapter_config["transformer"] = (["a", "b"], [0.25, 0.75])
     pipeline._temporarily_disable_offload = lambda *a, **k: nullcontext([])
-    pipeline.merge_lora_weights("transformer")
+    pipeline.merge_lora_weights("transformer", strength=None)
     assert [e[3] for e in layers["attn"].lora_weights_list] == [0.25, 0.75]
     assert pipeline.cur_adapter_config["transformer"][1] == [0.25, 0.75]
     pipeline.merge_lora_weights("transformer", strength=0.5)

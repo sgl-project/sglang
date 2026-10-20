@@ -289,6 +289,38 @@ def _convert_non_diffusers_sd_simple(
     return out
 
 
+def _convert_with_diffusers_utils_if_available(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Use diffusers.lora_conversion_utils if available."""
+    try:
+        if hasattr(lcu, "maybe_convert_state_dict"):
+            converted = lcu.maybe_convert_state_dict(  # type: ignore[attr-defined]
+                state_dict
+            )
+        else:
+            converted = dict(state_dict)
+
+        if not isinstance(converted, dict):
+            converted = dict(converted)
+
+        sample = _sample_keys(converted.keys(), 20)
+        log.info(
+            "[LoRAFormatAdapter] diffusers.lora_conversion_utils converted keys, "
+            "sample keys (<=20): %s",
+            ", ".join(sample),
+        )
+        return converted
+    except Exception as exc:  # pragma: no cover
+        log.warning(
+            "[LoRAFormatAdapter] diffusers lora_conversion_utils failed, "
+            "falling back to internal converters. Error: %s",
+            exc,
+        )
+        return None
+
+
 def _convert_via_diffusers_candidates(
     state_dict: Mapping[str, torch.Tensor],
     candidate_names: tuple[str, ...],
@@ -572,11 +604,15 @@ def convert_lora_state_dict_by_format(
         return _convert_non_diffusers_sd_simple(converted, log)
 
     if fmt == LoRAFormat.WAN:
-        maybe = dict(state_dict)
+        maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
+        if maybe is None:
+            maybe = dict(state_dict)
         return _convert_non_diffusers_sd_simple(maybe, log)
 
     if fmt == LoRAFormat.STANDARD:
-        maybe = dict(state_dict)
+        maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
+        if maybe is None:
+            maybe = dict(state_dict)
 
         if _looks_like_qwen_image(maybe):
             return _convert_qwen_image_standard(maybe, log)
@@ -584,7 +620,9 @@ def convert_lora_state_dict_by_format(
         return maybe
 
     if fmt == LoRAFormat.NON_DIFFUSERS_SD:
-        maybe = dict(state_dict)
+        maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
+        if maybe is None:
+            maybe = dict(state_dict)
         return _convert_non_diffusers_sd_simple(maybe, log)
 
     log.info(
