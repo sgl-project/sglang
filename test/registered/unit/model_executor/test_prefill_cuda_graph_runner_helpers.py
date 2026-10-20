@@ -135,6 +135,11 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         self.assertTrue(within(9, 16, [4, 16]))
         self.assertFalse(within(5, 16, [4, 16]))
         self.assertFalse(within(100, 512, [4, 512]))
+        # Sparse large buckets keep the cap even below the smallest bucket
+        # (the case the 2x cap was added for).
+        self.assertFalse(within(1, 2816, [2816, 3072, 8192]))
+        self.assertFalse(within(100, 2816, [2816, 3072, 8192]))
+        self.assertTrue(within(1500, 2816, [2816, 3072, 8192]))
 
     def test_qwen_hc_restore_round_trip(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)

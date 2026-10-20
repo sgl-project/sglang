@@ -72,6 +72,21 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
 
+    def test_accepts_single_token_padding_to_tiny_smallest_bucket(self):
+        # A full prefix-cache hit leaves a 1-token extend; 1 -> 4 is cheaper
+        # than an eager forward.
+        runner = self._make_runner()
+
+        self.assertTrue(runner.can_run_graph(self._make_forward_batch(1)))
+
+    def test_rejects_tiny_extend_into_large_smallest_bucket(self):
+        runner = self._make_runner()
+        runner.capture_num_tokens = [2816, 3072, 8192]
+        runner.max_num_tokens = 8192
+
+        self.assertFalse(runner.can_run_graph(self._make_forward_batch(1)))
+        self.assertFalse(runner.can_run_graph(self._make_forward_batch(100)))
+
     def test_mixed_batch_uses_scoped_runner_policy(self):
         runner = self._make_runner()
         batch = self._make_forward_batch(8, mode=ForwardMode.MIXED)
