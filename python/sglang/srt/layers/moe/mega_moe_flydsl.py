@@ -312,8 +312,10 @@ def _run_mega_routed(
                 if forward_batch is not None
                 else None
             ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+                if moe.experts.uses_expert_location
+                else None
             ),
             **topk_kwargs,
         )
