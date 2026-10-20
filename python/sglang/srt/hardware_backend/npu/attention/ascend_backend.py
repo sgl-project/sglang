@@ -357,19 +357,7 @@ class AscendAttnBackend(AttentionBackend):
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
         self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
         self.dcp_interleave_size = self.page_size if self.use_dsa else 1
-        if self.dcp_size > 1 and not self.use_dsa:
-            supported_architectures = {
-                "KimiK3ForConditionalGeneration",
-                "KimiK3LinearForCausalLM",
-            }
-            architectures = set(model_runner.model_config.hf_config.architectures or [])
-            if not self.use_mla or not architectures.intersection(
-                supported_architectures
-            ):
-                raise NotImplementedError(
-                    "Ascend DCP currently supports only Kimi-K3 MLA models; "
-                    f"got architectures={sorted(architectures)!r}."
-                )
+        if self._use_dense_mla_dcp_target():
             if model_runner.kv_cache_dtype not in (torch.float16, torch.bfloat16):
                 raise NotImplementedError(
                     "Kimi-K3 Ascend DCP currently supports only FP16/BF16 MLA "
@@ -534,7 +522,6 @@ class AscendAttnBackend(AttentionBackend):
         self, forward_batch: ForwardBatch, *, bs: int, query_len: int
     ) -> list[int]:
         """Build FIA's Host lengths independently of captured device buffers."""
-        assert self._use_dense_mla_dcp_target()
         seq_lens_cpu = forward_batch.seq_lens.cpu()
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_cpu = seq_lens_cpu + query_len
@@ -1621,10 +1608,6 @@ class AscendAttnBackend(AttentionBackend):
         parallel = get_parallel()
         if parallel.dcp_enabled:
             metadata = forward_batch.attn_dcp_metadata
-            if metadata is None or metadata.dcp_local_prefix_kv_indices is None:
-                raise RuntimeError(
-                    "Kimi-K3 NPU DCP prefix extend requires attn_dcp_metadata."
-                )
             kv_cached, k_rope_cached = self.token_to_kv_pool.get_mla_kv_buffer(
                 layer,
                 metadata.dcp_local_prefix_kv_indices,

@@ -53,52 +53,8 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.dcp_size > 1:
         overrides = {}
-        if get_platform().is_npu:
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "Kimi-K3 NPU DCP currently supports speculative decoding "
-                    "only with DSPARK."
-                )
-            if cfg.speculative_algorithm == "DSPARK":
-                from sglang.srt.speculative.ragged_verify import (
-                    RaggedVerifyMode,
-                    read_ragged_verify_mode,
-                )
-
-                ragged_mode = read_ragged_verify_mode()
-                if ragged_mode is not RaggedVerifyMode.STATIC:
-                    raise ValueError(
-                        "Kimi-K3 NPU DCP + DSPARK currently requires "
-                        "SGLANG_RAGGED_VERIFY_MODE=static; compact/cap-accept "
-                        f"are not validated under DCP (got {ragged_mode.value!r})."
-                    )
-                overrides["speculative_attention_mode"] = "decode"
-            if cfg.dcp_replicate_q_proj:
-                raise ValueError(
-                    "Kimi-K3 NPU DCP does not support --dcp-replicate-q-proj "
-                    "yet; the Ascend path uses an HCCL Q AllGather."
-                )
-            if cfg.enable_symm_mem:
-                logger.warning(
-                    "Kimi-K3 NPU DCP disables --enable-symm-mem; the initial "
-                    "Ascend path uses ordinary HCCL collectives."
-                )
-                overrides["enable_symm_mem"] = False
-            logger.info(
-                "Kimi-K3 NPU DCP selects the HCCL A2A communication path and "
-                "disables replicated Q projection."
-            )
-            overrides.update(
-                dcp_comm_backend="a2a",
-                dcp_replicate_q_proj=False,
-            )
-            return overrides
-
         if cfg.enable_symm_mem:
-            logger.warning(
-                "Kimi-K3 DCP disables --enable-symm-mem due to decode CUDA "
-                "graph correctness issues."
-            )
+            logger.warning("Kimi-K3 DCP disables --enable-symm-mem.")
             overrides["enable_symm_mem"] = False
 
         if cfg.speculative_algorithm == "DSPARK":
@@ -115,12 +71,23 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
-            # DSPARK target-verify + draft-extend must run on the decode
-            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
+            # Use each device's decode backend for DSPARK verification. On GPU,
+            # cutedsl_mla's _run_decode_kernel implements the DCP
             # signature (causal_seqs / cp_world / cp_rank). The default
             # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
+
+        if get_platform().is_npu:
+            logger.info(
+                "Kimi-K3 NPU DCP selects the HCCL A2A communication path and "
+                "disables replicated Q projection."
+            )
+            overrides.update(
+                dcp_comm_backend="a2a",
+                dcp_replicate_q_proj=False,
+            )
+            return overrides
 
         prefill_backend, decode_backend = attention_backends_of(cfg)
         if decode_backend == "cutedsl_mla" or decode_backend is None:

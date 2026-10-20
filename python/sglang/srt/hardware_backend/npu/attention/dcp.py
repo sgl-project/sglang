@@ -87,11 +87,6 @@ def mask_empty_mla_dcp_shards_npu(
     num_lengths = local_seq_lens.numel()
     if num_lengths == 0:
         return partial_output, partial_lse
-    if num_rows % num_lengths != 0:
-        raise ValueError(
-            "DCP attention rows must be divisible by local sequence lengths: "
-            f"rows={num_rows}, lengths={num_lengths}."
-        )
     rows_per_length = num_rows // num_lengths
     valid = (local_seq_lens > 0).repeat_interleave(rows_per_length).view(-1, 1, 1)
     return (
@@ -123,11 +118,6 @@ def merge_mla_dcp_output_npu(
 
     dcp_size = parallel.dcp_size
     batch_size, total_heads, head_dim = partial_output.shape
-    if total_heads % dcp_size != 0:
-        raise ValueError(
-            f"DCP query heads ({total_heads}) must be divisible by "
-            f"dcp_size ({dcp_size})."
-        )
     local_heads = total_heads // dcp_size
     if batch_size == 0:
         # All ranks in a DCP group share the same DP batch.  An idle DSpark DP

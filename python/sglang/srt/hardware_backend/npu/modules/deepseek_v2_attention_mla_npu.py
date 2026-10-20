@@ -167,17 +167,6 @@ def forward_mla_prepare_npu(
     input_on_attn_tp_slices: bool,
 ):
     parallel = get_parallel()
-    if parallel.dcp_enabled and forward_batch.forward_mode.is_draft_extend_v2():
-        raise NotImplementedError(
-            "Kimi-K3 NPU DCP does not support draft-extend-v2 attention; "
-            "DSPARK uses the supported static target-verify path."
-        )
-    if parallel.dcp_enabled and forward_batch.forward_mode.is_mixed():
-        raise NotImplementedError(
-            "Kimi-K3 NPU DCP does not support mixed-chunk attention yet. "
-            "Use separate eager prefill/extend and decode batches."
-        )
-
     # The fused MLA preprocess writes cache rows using the global virtual loc.
     # Keep DCP on the explicit path until that operator accepts owner-filtered
     # physical locations.
