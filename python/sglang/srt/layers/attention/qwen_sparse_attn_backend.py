@@ -596,6 +596,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        prefill_sequence_lengths_cpu = None
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -664,6 +665,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                         "QSA extend request mapping exceeds token rows: "
                         f"mapping={token_to_batch_idx.numel()}, "
                         f"positions={num_position_tokens}"
+                    )
+                if forward_batch.seq_lens_cpu is not None:
+                    # Lets the indexer size its prefill inputs without a sync.
+                    prefill_sequence_lengths_cpu = tuple(
+                        int(length)
+                        for length in forward_batch.seq_lens_cpu[:batch_size]
                     )
         decode_page_table = None
         decode_lengths = None
@@ -751,6 +758,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
