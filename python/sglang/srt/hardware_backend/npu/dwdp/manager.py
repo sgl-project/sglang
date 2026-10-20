@@ -15,6 +15,7 @@ import torch.distributed as dist
 from sglang.srt.layers.moe.dwdp.layer_utils import (
     collect_moe_layers,
     gather_per_expert_tensors,
+    validate_moe_layers,
 )
 from sglang.srt.layers.moe.dwdp.layout import WeightSpec, build_remote_slices
 from sglang.srt.layers.moe.dwdp.weight_manager import (
@@ -27,14 +28,6 @@ from .vmm import NPUWeightVMM, _check, tensor_from_pointer
 
 logger = logging.getLogger(__name__)
 _WEIGHTS = ("w13_weight", "w2_weight")
-
-
-def validate_dwdp_args(cfg):
-    # Validate loaded MoE kernels/layouts in setup, not the model-wide quant label.
-    if cfg.enable_lora:
-        raise ValueError("NPU DWDP does not support LoRA")
-    if cfg.enable_pdmux:
-        raise ValueError("NPU DWDP does not support PDMux layer-split execution")
 
 
 class NPUDwdpManager(DwdpPrefetch):
@@ -59,63 +52,26 @@ class NPUDwdpManager(DwdpPrefetch):
 
     _collect_moe_layers = staticmethod(collect_moe_layers)
 
-    def _validate(self, layers):
-        from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-            NPUUnquantMoEMethod,
-            NPUW8A8Int8MoEMethod,
-        )
-
-        supported = {
-            NPUUnquantMoEMethod: (torch.bfloat16, torch.float16),
-            NPUW8A8Int8MoEMethod: (torch.int8,),
-        }
-        if not layers:
-            raise ValueError("NPU DWDP requires at least one FusedMoE layer")
-        for li, layer in layers:
-            if layer.moe_ep_size != self.dwdp_size or layer.moe_tp_size != 1:
-                raise ValueError("NPU DWDP requires EP=DWDP=TP and MoE TP=1")
-            for name in _WEIGHTS:
-                kernel = type(getattr(layer, name.replace("_weight", "_kernel"), None))
-                weight = getattr(layer, name, None)
-                if (
-                    not isinstance(weight, torch.Tensor)
-                    or weight.device != self.device
-                    or weight.dtype not in supported.get(kernel, ())
-                    or weight.ndim != 3
-                    or weight.shape[0] * self.dwdp_size
-                    != layer.num_global_routed_experts
-                ):
-                    raise ValueError(
-                        f"NPU DWDP layer {li}: incompatible kernel/device/dtype/shape for {name}"
-                    )
-
     def setup(self, model):
         if self._state == "ready":
             return
-        if self._state != "new":
-            raise RuntimeError(
-                "DWDP setup cannot be retried; clean up and reload weights"
-            )
         layers = self._collect_moe_layers(model)
-        error = None
-        try:
-            self._validate(layers)
-        except ValueError as exc:
-            error = str(exc)
-        errors = self._gather(error)
-        if any(errors):
-            raise ValueError(f"NPU DWDP model validation failed: {errors}")
+        num_routed = validate_moe_layers(layers, self.dwdp_size, model)
         self._specs.clear()
         for li, layer in layers:
             for name in _WEIGHTS:
                 weight = getattr(layer, name)
-                count = layer.num_global_routed_experts
                 self._specs[li, name] = WeightSpec(
-                    count, tuple(weight.shape), (count, *weight.shape[1:]), weight.dtype
+                    num_routed,
+                    tuple(weight.shape),
+                    (num_routed, *weight.shape[1:]),
+                    weight.dtype,
                 )
-        metadata = {key: vars(spec) for key, spec in self._specs.items()}
-        if any(peer != metadata for peer in self._gather(metadata)):
-            raise ValueError("NPU DWDP ranks have different expert weight layouts")
+        key_counts = self._gather(len(self._specs))
+        if any(count != len(self._specs) for count in key_counts):
+            raise RuntimeError(
+                f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
+            )
         pid, ret = self.acl.rt.device_get_bare_tgid()
         _check(ret, "device_get_bare_tgid")
         peer_pids = [
@@ -236,11 +192,6 @@ class NPUDwdpManager(DwdpPrefetch):
             self._peer_views,
             self._peer_ranges[layer_idx],
         )
-
-    def prefetch_first_layers(self):
-        if self._state != "ready":
-            raise RuntimeError("NPU DWDP manager has not been initialized")
-        super().prefetch_first_layers()
 
     def cleanup(self):
         if self._state == "closed":

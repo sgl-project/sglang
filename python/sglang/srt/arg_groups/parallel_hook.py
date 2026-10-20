@@ -439,11 +439,6 @@ def handle_dwdp(server_args: Any):
         "DWDP's prefetch event protocol does not support two-batch overlap"
     )
 
-    if cfg.device == "npu":
-        from sglang.srt.hardware_backend.npu.dwdp.manager import validate_dwdp_args
-
-        validate_dwdp_args(cfg)
-
     if cfg.disaggregation_mode == "null":
         logger.warning(
             "DWDP with --disaggregation-mode null: decode steps re-fetch all "

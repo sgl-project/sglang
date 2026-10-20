@@ -11,6 +11,7 @@ from torch import nn
 from sglang.srt.layers.moe.dwdp.layer_utils import (
     collect_moe_layers,
     gather_per_expert_tensors,
+    validate_moe_layers,
 )
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
@@ -49,25 +50,8 @@ class DwdpManager:
             return
 
         moe_layers = self._collect_moe_layers(model)
-        if not moe_layers:
-            raise RuntimeError(
-                f"DWDP is enabled but no FusedMoE layers were found in "
-                f"{type(model).__name__}"
-            )
+        num_routed = validate_moe_layers(moe_layers, self.dwdp_size, model)
         self._moe_layer_indices = [li for li, _ in moe_layers]
-
-        expert_counts = {e.num_global_routed_experts for _, e in moe_layers}
-        if len(expert_counts) != 1:
-            raise RuntimeError(
-                f"DWDP requires a uniform routed expert count across MoE layers, "
-                f"got {sorted(expert_counts)}"
-            )
-        num_routed = expert_counts.pop()
-        if num_routed % self.dwdp_size != 0:
-            raise ValueError(
-                f"DWDP requires num_routed_experts ({num_routed}) to be divisible "
-                f"by dwdp_size ({self.dwdp_size})"
-            )
         self.layout = DwdpExpertLayout(
             num_routed_experts=num_routed,
             dwdp_size=self.dwdp_size,
