@@ -639,23 +639,31 @@ class SGLDiffusionGenerateMesh:
         guidance_scale: float = -1.0,
     ):
         """Generate a mesh from the first image of the batch."""
-        job = sgld_client.generate_mesh(
-            image_path=get_image_path(image[:1]),
-            output_format=output_format,
-            seed=seed,
-            num_inference_steps=steps,
-            guidance_scale=guidance_scale,
-        )
-        roots = os.environ.get("SGLD_SERVER_OUTPUT_DIRS", "")
-        mesh_path = sgld_client.fetch_mesh(
-            job,
-            mesh_dest_path(
-                os.path.join(folder_paths.get_output_directory(), "mesh"),
+        image_path = get_image_path(image[:1])
+        try:
+            job = sgld_client.generate_mesh(
+                image_path=image_path,
+                output_format=output_format,
+                seed=seed,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+            )
+            roots = os.environ.get("SGLD_SERVER_OUTPUT_DIRS", "")
+            mesh_path = sgld_client.fetch_mesh(
                 job,
-                output_format,
-            ),
-            local_roots=[r for r in roots.split(os.pathsep) if r],
-        )
+                mesh_dest_path(
+                    os.path.join(folder_paths.get_output_directory(), "mesh"),
+                    job,
+                    output_format,
+                ),
+                local_roots=[r for r in roots.split(os.pathsep) if r],
+            )
+        finally:
+            # get_image_path wrote this PNG for this request only.
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
         return (_as_file_3d(mesh_path), mesh_path)
 
 
