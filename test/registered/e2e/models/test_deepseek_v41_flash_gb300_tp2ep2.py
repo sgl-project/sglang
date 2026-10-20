@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=600, stage="base-c", runner_config="2-gpu-gb300")
 
 
-class TestDSV41FlashTP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
+class TestDSV41FlashTP2EP2DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
     """Tensor-parallel attention and expert-parallel MoE, without DP attention."""
 
     parallel_args = TP2_EP2_ARGS

@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=600, stage="base-c", runner_config="2-gpu-gb300")
 
 
-class TestDSV41FlashDP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
+class TestDSV41FlashDP2EP2DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
     """DP attention and EP MoE using the built-in gather/reduce path.
 
     DSPARK with DP attention does not support the DeepEP backend.
