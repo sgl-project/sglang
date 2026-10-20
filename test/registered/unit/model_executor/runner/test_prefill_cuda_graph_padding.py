@@ -100,7 +100,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         attn_backend.resolve_prefill_shared_read_ends.assert_called_once_with(
             forward_batch,
             num_qo_tokens=16,
-            allow_prepare=True,
+            build_snapshot=True,
         )
 
     def test_full_replay_pads_request_slot_cpu_mirror(self):

@@ -190,9 +190,9 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         *,
         num_qo_tokens: int,
-        allow_prepare: bool = True,
+        build_snapshot: bool = True,
     ) -> SharedReadEnds:
-        """Return this batch's prefill read end, running the snapshot hook if allowed.
+        """Return this batch's prefill read end, building a snapshot when asked.
 
         Spec algorithms with a later draft reader are gated at publish time.
         """
@@ -203,7 +203,7 @@ class AttentionBackend(ABC):
             return SharedReadEnds.UNKNOWN
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return SharedReadEnds.UNKNOWN
-        if allow_prepare:
+        if build_snapshot:
             return self._prepare_prefill_shared_reads(
                 forward_batch, num_qo_tokens=num_qo_tokens
             )

@@ -1260,7 +1260,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         real seq_lens / prefix_lens; the captured kernels read the
         updated state at replay."""
         attn_backend = self.model_runner.attn_backend
-        prepare_late_reads = False
+        build_snapshot = False
         if self._is_full_backend:
             # Slot-padded shallow view: plan() must see exactly req_slots
             # entries (real values in [:bs], sentinels in [bs:req_slots]
@@ -1286,7 +1286,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(padded_view)
         elif not self.use_captured_attn_metadata:
             attn_backend.init_forward_metadata(forward_batch)
-            prepare_late_reads = True
+            build_snapshot = True
         else:
             assert self.attn_metadata_buffers is not None
             metadata = self.attn_metadata_buffers[shape_key]
@@ -1299,7 +1299,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return attn_backend.resolve_prefill_shared_read_ends(
             forward_batch,
             num_qo_tokens=shape_key.size,
-            allow_prepare=prepare_late_reads,
+            build_snapshot=build_snapshot,
         )
 
     @staticmethod
