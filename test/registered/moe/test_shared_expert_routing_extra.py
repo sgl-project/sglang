@@ -71,21 +71,10 @@ class TestSelectExpertsPerRankSharedSlots(CustomTestCase):
             get_parallel().override(
                 tp_size=self.EP_SIZE,
                 tp_rank=self.EP_RANK,
-                tp_group=None,
                 attn_tp_size=self.EP_SIZE,
                 attn_tp_rank=self.EP_RANK,
-                attn_tp_group=None,
-                attn_dp_size=1,
-                attn_dp_rank=0,
-                attn_cp_size=1,
-                attn_cp_rank=0,
                 moe_ep_size=self.EP_SIZE,
                 moe_ep_rank=self.EP_RANK,
-                moe_ep_group=None,
-                moe_tp_size=1,
-                moe_tp_rank=0,
-                moe_dp_size=1,
-                moe_dp_rank=0,
             ),
         ):
             out = select_experts(
