@@ -67,13 +67,17 @@ FULL, SWA = ComponentType.FULL, ComponentType.SWA
 
 
 def _python_inspector(params, components):
-    from unified_tree_core_inspector import UnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
+        UnifiedTreeCoreInspector,
+    )
 
     return UnifiedTreeCoreInspector(params, components)
 
 
 def _rust_inspector(params, _components):
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     return RustUnifiedTreeCoreInspector(params)
 
@@ -164,13 +168,13 @@ def _record_moves(allocator, log: list) -> None:
     """Log every compaction copy on either side into `log`, then perform it."""
     for side in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
         kvcache = side._kvcache
-        move = kvcache.move_kv_cache
+        move = kvcache.move_physical_pages
 
-        def recorded(dst, src, *, move=move, name=side.sub_pool_name):
+        def recorded(dst, src, page_size, *, move=move, name=side.sub_pool_name):
             log.append(("move", name))
-            return move(dst, src)
+            return move(dst, src, page_size)
 
-        kvcache.move_kv_cache = recorded
+        kvcache.move_physical_pages = recorded
 
 
 class _ConfigCase(unittest.TestCase):
