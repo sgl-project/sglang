@@ -112,10 +112,10 @@ def dequantize_k_cache_paged_v41(
     if is_hip_runtime():
         supported = is_gfx95_supported()
     else:
-        supported = get_jit_cuda_arch().major >= 10
+        supported = get_jit_cuda_arch().major >= 9
     if not supported:
         raise RuntimeError(
-            "DeepSeek V4.1 KV cache dequantization requires CUDA SM100 or newer, or gfx950"
+            "DeepSeek V4.1 KV cache dequantization requires CUDA SM90 or newer, or gfx950"
         )
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
