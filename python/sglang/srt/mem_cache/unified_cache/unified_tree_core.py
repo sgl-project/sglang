@@ -2901,10 +2901,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[component_type]
         if node is self.root_node or cd.value is None:
             return
-        if cd.lock_ref > 0:
-            self.component_protected_size_[component_type] += delta
-        else:
-            self.component_evictable_size_[component_type] += delta
+        protected = cd.lock_ref > 0
+        sizes = (
+            self.component_protected_size_
+            if protected
+            else self.component_evictable_size_
+        )
+        current = sizes[component_type]
+        if current + delta < 0:
+            raise ValueError(
+                f"invalid size delta {delta} for node {node_id} component "
+                f"{component_type}: current={current}, protected={protected}"
+            )
+        sizes[component_type] = current + delta
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType

@@ -429,7 +429,8 @@ class UnifiedTreeCoreInterface(ABC):
         """Adjust protected/evictable tokens after the component backing changes.
 
         Roots and nodes without device values are no-ops. Missing handles raise
-        KeyError; disabled components raise ValueError.
+        KeyError; disabled components and a delta that would drive the ledger
+        negative raise ValueError, leaving both ledgers unchanged.
         """
         ...
 
