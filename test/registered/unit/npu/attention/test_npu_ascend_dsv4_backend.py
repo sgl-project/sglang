@@ -371,13 +371,17 @@ class TestNPUDecodeCompressionMetadata(CustomTestCase):
         for key, values in expected.items():
             self.assertEqual(getattr(fm, key).cpu().tolist(), values, key)
 
-    def test_reference_covers_boundaries_padding_and_absent_ratios(self):
+    @unittest.skipUnless(
+        hasattr(torch, "npu") and torch.npu.is_available(), "requires an NPU"
+    )
+    def test_npu_decode_covers_boundaries_padding_and_absent_ratios(self):
         for ratios in ((), (4,), (128,), (4, 128)):
             for missing in (False, True):
                 with self.subTest(ratios=ratios, missing=missing):
                     fm, expected = self._refresh(
                         [0, 128, 129, 132, 256, 131072, 1],
                         ratios,
+                        device="npu",
                         missing=missing,
                         strided=True,
                         loc_dtype=torch.int32,

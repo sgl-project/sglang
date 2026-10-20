@@ -1638,31 +1638,7 @@ class DeepseekV4AscendAttnBackend(
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         bundle = getattr(ctx.forward_batch, "out_cache_loc_dsv4", None)
-        if ctx.live_seq_lens.device.type == "npu":
-            self._refresh_graph_decode_compress_1d_fused(ctx.live_seq_lens, fm, bundle)
-            return
-        for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
-                continue
-            loc = None
-            if bundle is not None:
-                loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
-            self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
-
-        valid = ctx.live_seq_lens > 0
-        positions_last = torch.clamp(ctx.live_seq_lens - 1, min=0)
-        for ratio in self._dsv4_unique_compress_ratios:
-            if ratio not in (4, 128):
-                continue
-            should_compress = ((ctx.live_seq_lens % ratio) == 0) & valid
-            dst = getattr(fm, f"positions_cmp_padding_c{ratio}")
-            self._stable_compact_1d(
-                dst,
-                positions_last.to(torch.int64) + (1 - ratio),
-                should_compress,
-            )
-        fm.start_pos.copy_(positions_last.to(torch.int32))
-        fm.seqused.copy_(valid.to(torch.int32))
+        self._refresh_graph_decode_compress_1d_fused(ctx.live_seq_lens, fm, bundle)
 
     def _refresh_graph_decode_compress_1d_fused(self, seq_lens, fm, bundle) -> None:
         refresh_dsv4_decode_metadata(
