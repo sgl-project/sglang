@@ -63,13 +63,13 @@ logger = logging.getLogger(__name__)
 
 
 def pp_sync_polls(
-    polls: Optional[List[int]],
+    polls: Optional[list],
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
     send_window: PPSyncSendWindow,
     p2p_tag: P2PTag,
-) -> List[int]:
+) -> list:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
@@ -133,14 +133,62 @@ def poll_and_all_reduce_prefill_pp(
     stages. With release, a transfer concludes only once every stage has."""
     polls: List[int] = []
     if pp_rank == 0:
-        polls = _poll_with_failure_injection_pp(pollers, release=release)
-        polls = _all_reduce_polls(polls, attn_tp_cpu_group)
-        polls = _all_reduce_polls(polls, attn_cp_cpu_group)
+        polls = _poll_prefill_pp0(
+            pollers, attn_cp_cpu_group, attn_tp_cpu_group, release=release
+        )
     # Propagate PP0's data to other ranks
     polls = pp_sync_polls(
         polls, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
     )
     return polls
+
+
+def poll_and_all_reduce_prefill_pp_sections(
+    sections: List[List[CommonKVSender]],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    pp_group: GroupCoordinator,
+    pp_rank: int,
+    pp_size: int,
+    pp_poll_send_window: PPSyncSendWindow,
+    p2p_tag: P2PTag,
+) -> List[List[int]]:
+    """PP0's consensus polls, one list per section, in a single PP sync.
+
+    Carrying each section's bootstrap rooms lets a stage whose sections differ
+    from PP0's, in membership or order, fail instead of applying a poll to
+    another request.
+    """
+    rooms = [[poller.bootstrap_room for poller in section] for section in sections]
+    payload = None
+    if pp_rank == 0:
+        flat = iter(
+            _poll_prefill_pp0(
+                [poller for section in sections for poller in section],
+                attn_cp_cpu_group,
+                attn_tp_cpu_group,
+            )
+        )
+        payload = [rooms, [[next(flat) for _ in section] for section in sections]]
+    pp0_rooms, polls = pp_sync_polls(
+        payload, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
+    )
+    assert pp0_rooms == rooms, (
+        f"PP stages disagree on polled requests: PP0 polled rooms {pp0_rooms}, "
+        f"PP{pp_rank} holds {rooms}"
+    )
+    return polls
+
+
+def _poll_prefill_pp0(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    release: bool = False,
+) -> List[int]:
+    polls = _poll_with_failure_injection_pp(pollers, release=release)
+    polls = _all_reduce_polls(polls, attn_tp_cpu_group)
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:

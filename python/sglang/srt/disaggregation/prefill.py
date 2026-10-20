@@ -65,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
     kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
+    poll_and_all_reduce_prefill_pp_sections,
     prepare_abort,
     record_network_transfer,
     setup_page_row_kv_args,
@@ -1461,10 +1462,20 @@ class SchedulerDisaggregationPrefillMixin:
 
         done_reqs = []
 
+        parallel = get_parallel()
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
+        if parallel.pp_size > 1:
+            # Parked requests resolve on the bootstrap consensus poll instead
+            # (move_bootstrapped_and_resolve_parked_pp): none has started
+            # sending, so a failure on any stage fails them at once. Every
+            # stage parks and finalizes the same requests on that poll.
+            transfer_queue = [
+                req for req in transfer_queue if not req.pending_bootstrap
+            ]
+            if not transfer_queue:
+                return []
         senders = [req.disagg_kv_sender for req in transfer_queue]
-        parallel = get_parallel()
         if parallel.pp_size > 1:
             # PP0 decides from every stage's status and forwards the decision,
             # so every stage releases the same requests the same way.
@@ -1699,7 +1710,7 @@ class SchedulerDisaggregationPrefillMixin:
     def move_bootstrapped_and_resolve_parked_pp(
         self: Scheduler, dst: ReqList
     ) -> List[Req]:
-        """Move bootstrapped requests into `dst` and resolve parked ones on one
+        """Move bootstrapped requests into `dst` and resolve pending ones on one
         PP consensus poll.
 
         One poll sync per loop iteration: pp_poll_send_window keeps the PP
@@ -1707,32 +1718,45 @@ class SchedulerDisaggregationPrefillMixin:
         would halve that depth and tie the stages together again.
         """
         bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        # A pending chunked_req resolves once parked: freeing it here would race
+        # its earlier chunks still queued on the forward stream.
+        waiting = [
+            req
+            for req in self.waiting_queue
+            if req.pending_bootstrap and not is_aborted(req)
+        ]
         parked = [
             req for req in self.disagg_prefill_transfer_queue if req.pending_bootstrap
         ]
-        reqs = list(bootstrap_queue.queue) + parked
-        if not reqs:
+        if not (bootstrap_queue.queue or waiting or parked):
             return []
-        polls = poll_and_all_reduce_prefill_pp(
-            [req.disagg_kv_sender for req in reqs],
-            self.attn_cp_cpu_group,
-            self.attn_tp_cpu_group,
-            self.pp_group,
-            bootstrap_queue.pp_rank,
-            bootstrap_queue.pp_size,
-            bootstrap_queue.pp_poll_send_window,
-            P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+        queued_polls, waiting_polls, parked_polls = (
+            poll_and_all_reduce_prefill_pp_sections(
+                [
+                    [req.disagg_kv_sender for req in reqs]
+                    for reqs in (bootstrap_queue.queue, waiting, parked)
+                ],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                self.pp_group,
+                bootstrap_queue.pp_rank,
+                bootstrap_queue.pp_size,
+                bootstrap_queue.pp_poll_send_window,
+                P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            )
         )
-        assert len(polls) == len(reqs), (
-            f"PP stages disagree on bootstrapping requests: {len(polls)} polls "
-            f"for {len(reqs)} requests"
-        )
-        num_queued = len(bootstrap_queue.queue)
-        bootstrapped = bootstrap_queue.move_bootstrapped(
-            dst, polls=polls[:num_queued]
-        )
-        self._resolve_parked_bootstrap(parked=parked, polls=polls[num_queued:])
+        self._drop_failed_waiting_bootstrap(waiting=waiting, polls=waiting_polls)
+        bootstrapped = bootstrap_queue.move_bootstrapped(dst, polls=queued_polls)
+        self._resolve_parked_bootstrap(parked=parked, polls=parked_polls)
         return bootstrapped
+
+    def _drop_failed_waiting_bootstrap(
+        self: Scheduler, *, waiting: List[Req], polls: List[int]
+    ) -> None:
+        # A failed request leaves the waiting queue through the retirer.
+        for req, poll in zip(waiting, polls, strict=True):
+            if poll == KVPoll.Failed:
+                self.handle_bootstrap_failure(req)
 
     def _resolve_parked_bootstrap(
         self: Scheduler, *, parked: List[Req], polls: List[int]
