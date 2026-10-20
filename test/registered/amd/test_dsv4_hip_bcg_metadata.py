@@ -927,12 +927,15 @@ class TestEncoderReplayRequestWindowHip(CustomTestCase):
     class _Stop(Exception):
         pass
 
-    def _floor_passed(self, *, encoder_replay, swa_replay_start=None):
+    def _floor_passed(
+        self, *, encoder_replay, swa_replay_start=None, encoder_row_floor=None
+    ):
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.token_to_kv_pool = SimpleNamespace(
             request_window=SimpleNamespace(capacity=256)
         )
         backend.encoder_replay = encoder_replay
+        backend.encoder_row_floor = encoder_row_floor
         seen = {}
 
         def fake_window_layout(req, pos, **kwargs):
@@ -964,6 +967,18 @@ class TestEncoderReplayRequestWindowHip(CustomTestCase):
         self.assertIs(self._floor_passed(encoder_replay=False), None)
         self.assertIs(
             self._floor_passed(encoder_replay=False, swa_replay_start=start), start
+        )
+
+    def test_folded_replay_floors_rows_and_pads_with_zero(self):
+        row_floor = torch.tensor([8, 8, 8, 0])
+        floor = self._floor_passed(encoder_replay=False, encoder_row_floor=row_floor)
+        self.assertEqual(floor.tolist(), [8, 8, 8, 0, 0])
+        start = torch.tensor([4, 4, 4, 7, 7])
+        self.assertIs(
+            self._floor_passed(
+                encoder_replay=False, swa_replay_start=start, encoder_row_floor=row_floor
+            ),
+            start,
         )
 
 

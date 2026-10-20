@@ -884,6 +884,10 @@ class DeepseekV4HipRadixBackend(
 
     forward = DeepseekV4AttnBackend.forward
 
+    @property
+    def folds_encoder_swa_replay(self) -> bool:
+        return envs.SGLANG_HIP_FOLD_ENCODER_SWA_REPLAY.get()
+
     # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
@@ -991,6 +995,7 @@ class DeepseekV4HipRadixBackend(
         # exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
+        self.encoder_row_floor = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -2099,6 +2104,7 @@ class DeepseekV4HipRadixBackend(
         use_prefill_cuda_graph: bool = False,
     ):
         self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -2261,6 +2267,14 @@ class DeepseekV4HipRadixBackend(
             device=device,
             whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
         )
+        if self.encoder_row_floor is not None:
+            # Folded hits: a tail row never reads below its request's replay start.
+            row_floor = _cuda_backend._pad_rows(
+                self.encoder_row_floor, num_rows=forward_batch.out_cache_loc.shape[0]
+            )
+            swa_replay_start = torch.maximum(
+                swa_replay_start, row_floor[token_indices].to(swa_replay_start.dtype)
+            )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
@@ -3559,6 +3573,12 @@ class DeepseekV4HipRadixBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
+            elif swa_replay_start is None and self.encoder_row_floor is not None:
+                # Folded replay: hits floor every row at their replay start;
+                # MLP-sync padding rows follow the real ones with floor 0.
+                swa_replay_start = _cuda_backend._pad_rows(
+                    self.encoder_row_floor, num_rows=raw_positions.shape[0]
+                )
             request_layout = window_layout(
                 req_pool_indices_repeated,
                 raw_positions,
