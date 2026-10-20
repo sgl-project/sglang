@@ -1206,7 +1206,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
     fi
 
 # torch 2.11 still Requires-Dist: triton-rocm after the swap above.
-RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^ ;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
+RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
 # Performance environment variable.
