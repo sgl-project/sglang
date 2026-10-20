@@ -17,6 +17,9 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import fork_request
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
+from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
+    VAE_CHANNELS_LAST_3D_ENV,
+)
 from sglang.multimodal_gen.test.single_test_file.test_disagg_server import (
     HOST,
     DisaggCluster,
@@ -47,13 +50,32 @@ def test_external_contracts_match_monolithic(model, num_frames, kind):
     _check_pipeline(model, num_frames, kind)
 
 
-@pytest.mark.parametrize("parallelism", ["tp2", "ulysses2"])
-def test_multirank_workers_match_monolithic(parallelism):
-    _check_pipeline("Tongyi-MAI/Z-Image-Turbo", 1, "standard", parallelism)
+@pytest.mark.parametrize(
+    "model,num_frames,parallelism",
+    [
+        ("Tongyi-MAI/Z-Image-Turbo", 1, "tp2"),
+        ("Tongyi-MAI/Z-Image-Turbo", 1, "ulysses2"),
+        ("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 5, "tp2_ulysses2"),
+    ],
+)
+def test_multirank_workers_match_monolithic(
+    monkeypatch, model, num_frames, parallelism
+):
+    # Automatic VAE memory format depends on the worker's local GPU count.
+    monkeypatch.setenv(VAE_CHANNELS_LAST_3D_ENV, "false")
+    _check_pipeline(model, num_frames, "standard", parallelism)
 
 
 def _check_pipeline(model, num_frames, kind, parallelism="single"):
-    _require_gpus(3)
+    tp, sp = {
+        "single": (1, 1),
+        "tp2": (2, 1),
+        "ulysses2": (1, 2),
+        "tp2_ulysses2": (2, 2),
+    }[parallelism]
+    ranks = tp * sp
+    _require_gpus(max(3, ranks))
+    topology = dict(tp_size=tp, sp_degree=sp, ulysses_degree=sp, ring_degree=1)
     contracts = [
         {"name": "InputValidationStage"},
         {
@@ -120,12 +142,6 @@ def _check_pipeline(model, num_frames, kind, parallelism="single"):
             "data:image/png;base64,"
             + base64.b64encode(image.getvalue()).decode("ascii")
         ]
-    topology = dict(tp_size=1, sp_degree=1, ulysses_degree=1, ring_degree=1)
-    if parallelism == "tp2":
-        topology["tp_size"] = 2
-    elif parallelism == "ulysses2":
-        topology.update(sp_degree=2, ulysses_degree=2)
-    ranks = topology["tp_size"] * topology["sp_degree"]
     common_args = {
         "encoder_parallel": "replicate",
         "vae_config.use_parallel_decode": False,
@@ -186,15 +202,14 @@ def _check_pipeline(model, num_frames, kind, parallelism="single"):
     }
     for key, value in topology.items():
         role_args["denoiser"] += ["--" + key.replace("_", "-"), str(value)]
-    if parallelism == "tp2":
-        role_args["encoder"] += ["--tp-size", "2", "--sp-degree", "1"]
-    layout = {"encoder": [0], "denoiser": [1], "decoder": [2]}
-    if ranks > 1:
-        layout = {
-            "encoder": [0, 1] if parallelism == "tp2" else [0],
-            "denoiser": [1, 2],
-            "decoder": [0],
-        }
+    if tp > 1:
+        role_args["encoder"] += ["--tp-size", str(tp), "--sp-degree", "1"]
+    first_denoiser_gpu = 1 if ranks < 4 else 0
+    layout = {
+        "encoder": list(range(tp)),
+        "denoiser": list(range(first_denoiser_gpu, first_denoiser_gpu + ranks)),
+        "decoder": [0] if ranks > 1 else [2],
+    }
     with _StageCluster(
         model=model,
         name="external_" + parallelism + "_" + model.split("/")[-1],
