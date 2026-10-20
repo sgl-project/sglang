@@ -674,9 +674,7 @@ def _sparse_mla_fused_kernel(
         num_tiles = tl.cdiv(tl.load(topk_length_ptr + t), BLOCK_K)
     else:
         if USE_TOPK_LENGTH:
-            valid_topk = tl.minimum(
-                tl.maximum(tl.load(topk_length_ptr + t), 0), topk
-            )
+            valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
         num_tiles = tl.cdiv(valid_topk, BLOCK_K)
 
     for j in tl.range(0, num_tiles, num_stages=PIPE_STAGES):
