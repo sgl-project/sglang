@@ -5,15 +5,17 @@
       "type": "GenerateRequest",
       "name": "empty labels are omitted while image options default to an empty prefix",
       "input": {
+        "text": "hi",
         "custom_labels": {},
         "images_config": {}
       },
-      "canonical": "{\"stream\":false,\"images_config\":{\"prefix\":\"\"},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"images_config\":{\"prefix\":\"\"},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
     },
     {
       "type": "GenerateRequest",
       "name": "custom labels and typed image options round-trip",
       "input": {
+        "text": "hi",
         "custom_labels": {
           "tenant": "team"
         },
@@ -22,7 +24,7 @@
           "prefix": "OCR: "
         }
       },
-      "canonical": "{\"stream\":false,\"custom_labels\":{\"tenant\":\"team\"},\"images_config\":{\"image_mode\":\"base\",\"prefix\":\"OCR: \"},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
+      "canonical": "{\"text\":\"hi\",\"stream\":false,\"custom_labels\":{\"tenant\":\"team\"},\"images_config\":{\"image_mode\":\"base\",\"prefix\":\"OCR: \"},\"return_prompt_token_ids\":false,\"routed_experts_start_len\":0}"
     },
     {
       "type": "GenerateResponse",
