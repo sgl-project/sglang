@@ -55,6 +55,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
+    aiter_mxfp8_gfx1250_block_fp8_linear,
     apply_fp8_linear,
     block_fp8_scale_to_e8m0_128,
     block_fp8_scale_to_mxfp8_e8m0,
@@ -66,6 +67,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_block_fp8_mxfp8_linear,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    gfx1250_mxfp8_prepare_weight,
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -906,6 +908,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.aiter_bpreshuffled = True
                 layer.weight.is_shuffled = True
                 self._maybe_prepare_dense_mxscale(layer)
+
+        # gfx1250 mxfp8_128 GEMM: (16, 16)-shuffled weight and e8m0 scales. A layer
+        # it cannot take keeps its fp32 scales, which routes it to the Triton GEMM.
+        if (
+            self.w8a8_block_fp8_linear is aiter_mxfp8_gfx1250_block_fp8_linear
+            and not getattr(layer, "keep_plain_weight_layout", False)
+            and not getattr(layer, "block_fp8_mxfp8_ready", False)
+        ):
+            prepared = gfx1250_mxfp8_prepare_weight(
+                layer.weight.data, layer.weight_scale_inv.data, self.weight_block_size
+            )
+            if prepared is not None:
+                t, scale = prepared
+                layer.weight.copy_(t)
+                del t
+                layer.weight_scale_inv.data = scale
+                layer.aiter_bpreshuffled = True
+                layer.weight.is_shuffled = True
 
         if (
             is_xpu()
