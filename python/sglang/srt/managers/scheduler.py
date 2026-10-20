@@ -1576,6 +1576,9 @@ class Scheduler(
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
             )
+            if get_disagg().disaggregation_decode_enable_local_prefill:
+                # waiting_queue then holds only the requests prefilled here.
+                self.disagg_decode_prebuilt_queue = []
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
@@ -2552,6 +2555,7 @@ class Scheduler(
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
+            get_disagg_decode_prebuilt_queue=lambda: self.disagg_decode_prebuilt_queue,
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
             ),
@@ -2948,6 +2952,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
+                disagg_local_prefill=recv_req.disagg_local_prefill,
                 kv_hints=recv_req.kv_hints,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
@@ -2982,7 +2987,15 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
-                if (
+                error_msg = None
+                if req.disagg_local_prefill:
+                    if self.disagg_decode_prebuilt_queue is None:
+                        error_msg = (
+                            f"Invalid request: disagg_local_prefill requires a "
+                            f"decode server with "
+                            f"--disaggregation-decode-enable-local-prefill. {req.rid=}"
+                        )
+                elif (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
                 ):
@@ -2990,6 +3003,7 @@ class Scheduler(
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
                     )
+                if error_msg is not None:
                     logger.error(error_msg)
                     if not envs.SGLANG_RUST_SERVER.get():
                         recv_req.time_stats.trace_ctx.abort(
@@ -3420,7 +3434,10 @@ class Scheduler(
             req.storage_prefetch_retry_attempts = 0
             req.storage_prefetch_last_match_len = None
             req.staged_prefetch_plan = None
-        if self.disaggregation_mode == DisaggregationMode.NULL:
+        if self.disaggregation_mode == DisaggregationMode.NULL or (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and req.disagg_local_prefill
+        ):
             if self._abort_on_queued_limit(req):
                 self._release_aborted_request(req)
                 return
@@ -3539,7 +3556,10 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            for req in self.waiting_queue:
+            for req in (
+                *self.waiting_queue,
+                *(self.disagg_decode_prebuilt_queue or ()),
+            ):
                 entry_time = req.time_stats.wait_queue_entry_time
                 if 0 < entry_time < deadline:
                     aborts.append(
@@ -5277,6 +5297,8 @@ class Scheduler(
             # A PD-decode request waiting with its transferred KV still owns
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
+        # Transferred requests own their KV, like the ones above.
+        idle &= not self.disagg_decode_prebuilt_queue
 
         if (
             for_health_check
@@ -5516,6 +5538,7 @@ class Scheduler(
         live_reqs = {
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
+            *(self.disagg_decode_prebuilt_queue or ()),
             *([self.chunked_req] if self.chunked_req is not None else []),
         }
         if self.hisparse_coordinator is not None:
@@ -5555,44 +5578,49 @@ class Scheduler(
         if self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)
 
-        # Delete requests in the waiting queue
-        to_del = []
-        for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                to_del.append(i)
+        # Delete requests in the waiting queue, and in the prebuilt queue of a
+        # decode server that also prefills locally
+        for queue in (self.waiting_queue, self.disagg_decode_prebuilt_queue or []):
+            to_del = []
+            for i, req in enumerate(queue):
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    to_del.append(i)
 
-        # Sort in reverse order to avoid index issues when deleting
-        for i in reversed(to_del):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
-            req = self.waiting_queue.pop(i)
-            self._release_aborted_request(req)
-            self.beam_coordinator.retire_group(req)
-            # Without the initiator's reason the tokenizer falls back to a
-            # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
-            )
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-                    discard_kv_cache_backup(req, self.tree_cache, "host_pool")
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                if req.finished_reason is None:
-                    req.finished_reason = FINISH_ABORT()
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.release_aborted_prefill_waiting_req(req)
+            # Sort in reverse order to avoid index issues when deleting
+            for i in reversed(to_del):
+                # Abort method 1: directly pop from the queue
+                # This only works for requests that have not started anything.
+                # We still need to send something back to TokenizerManager to clean up the state.
+                req = queue.pop(i)
+                self._release_aborted_request(req)
+                self.beam_coordinator.retire_group(req)
+                # Without the initiator's reason the tokenizer falls back to a
+                # generic abort message.
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
+                )
+                # A PD decode request that is not prefilled locally has KV allocated.
+                if (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and not req.disagg_local_prefill
+                ):
+                    if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+                        discard_kv_cache_backup(req, self.tree_cache, "host_pool")
+                    if self.enable_hisparse:
+                        self.hisparse_coordinator.request_finished(req)
+                    if req.finished_reason is None:
+                        req.finished_reason = FINISH_ABORT()
+                    release_kv_cache(req, self.tree_cache, checkpoint=True)
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.release_aborted_prefill_waiting_req(req)
 
-            # For mamba radix cache
-            if req.kv.holds_mamba and self.disaggregation_mode not in (
-                DisaggregationMode.PREFILL,
-                DisaggregationMode.DECODE,
-            ):
-                release_kv_cache(req, self.tree_cache, checkpoint=False)
-            logger.debug(f"Abort queued request. {req.rid=}")
+                # For mamba radix cache
+                if req.kv.holds_mamba and self.disaggregation_mode not in (
+                    DisaggregationMode.PREFILL,
+                    DisaggregationMode.DECODE,
+                ):
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                logger.debug(f"Abort queued request. {req.rid=}")
 
         if self.dllm_config is not None:
             for req in self.dllm_manager.pop_aborted_reqs(
@@ -5743,11 +5771,10 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
-            staged = [r for r in self.waiting_queue if r.kv.holds_kv]
+            prebuilt_reqs = self.get_disagg_decode_prebuilt_reqs()
+            staged = [r for r in prebuilt_reqs if r.kv.holds_kv]
             if staged:
-                self.waiting_queue = [
-                    r for r in self.waiting_queue if not r.kv.holds_kv
-                ]
+                prebuilt_reqs[:] = [r for r in prebuilt_reqs if not r.kv.holds_kv]
                 retract_reqs += staged
 
         self.last_batch = None
@@ -5772,7 +5799,10 @@ class Scheduler(
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and not req.disagg_local_prefill
+            ):
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True

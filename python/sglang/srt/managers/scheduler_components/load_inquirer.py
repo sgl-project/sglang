@@ -49,6 +49,7 @@ class SchedulerLoadInquirer:
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
     get_disagg_decode_transfer_queue: Callable
+    get_disagg_decode_prebuilt_queue: Callable = lambda: None
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
     get_total_prefill_uncached_tokens: Callable
@@ -77,7 +78,10 @@ class SchedulerLoadInquirer:
 
     def get_num_waiting_uncached_tokens(self) -> int:
         """Estimate input tokens waiting for prefill compute."""
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.get_disagg_decode_prebuilt_queue() is None
+        ):
             return 0
         waiting_queue_prefix_matched = self.waiting_queue_prefix_matched()
         cache_miss_rate = 1.0 - self.get_recent_cache_hit_rate()
@@ -117,6 +121,11 @@ class SchedulerLoadInquirer:
             # waiting-queue requests have already pre-allocated decode-side KV
             # slots, so they are already included in num_used_tokens.
             pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
+            prebuilt_queue = self.get_disagg_decode_prebuilt_queue()
+            if prebuilt_queue is not None:
+                # waiting_queue holds the requests this decode server prefills.
+                waiting_queues.append(prebuilt_queue)
+                pending_token_queues.append(self.get_waiting_queue())
             # KV not yet arrived from the prefill side.
             awaiting_kv_tokens = sum(
                 req.seqlen

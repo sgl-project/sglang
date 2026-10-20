@@ -73,6 +73,7 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         req = MagicMock()
         req.priority = priority
         req.rid = "req"
+        req.disagg_local_prefill = False
         req.output_ids = []
         req.weight_version_events = []
         req.time_stats = MagicMock()
@@ -538,6 +539,8 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         scheduler.enable_hisparse = False
         scheduler.enable_lora = False
         scheduler.waiting_queue = []
+        scheduler.disagg_decode_prebuilt_queue = None
+        scheduler.chunked_req = None
         scheduler.last_batch = None
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler

@@ -3106,6 +3106,12 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-enable-local-prefill`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let the decode server (PD mode) prefill requests marked with <code>disagg_local_prefill</code> itself, with chunked prefill, instead of receiving their KV from a prefill server. Meant for requests whose prefix is mostly cached on this decode server; pair with --disaggregation-decode-enable-radix-cache. See <a href="/docs/advanced_features/pd_disaggregation#decode-local-prefill">decode local prefill</a>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--optimistic-prefill-attempts`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of optimistic prefill forward passes that skip the bootstrap wait.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>

@@ -48,7 +48,11 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     bootstrap_port=1,
                     bootstrap_room=9,
                 )
-                req = MagicMock(return_sampling_mask=True, return_logprob=False)
+                req = MagicMock(
+                    return_sampling_mask=True,
+                    return_logprob=False,
+                    disagg_local_prefill=False,
+                )
                 with (
                     patch(
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",

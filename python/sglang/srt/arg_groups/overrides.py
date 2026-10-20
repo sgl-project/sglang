@@ -200,6 +200,8 @@ def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> 
         activation_tokens = max(
             running_requests * (cfg.speculative_num_draft_tokens or 1), 2048
         )
+        if cfg.disaggregation_decode_enable_local_prefill:
+            activation_tokens = max(activation_tokens, cfg.chunked_prefill_size or 0)
     elif cfg.chunked_prefill_size > 0:
         activation_tokens = max(cfg.chunked_prefill_size, 2048)
     else:

@@ -74,6 +74,38 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Decode local prefill
+
+In multi-turn and agentic workloads, the decode server's radix cache often
+holds most of the next prompt: the previous prompt plus the tokens it decoded.
+Sending such a request through a prefill server costs a bootstrap handshake and
+a KV transfer for a prefill of a few hundred tokens. With
+`--disaggregation-decode-enable-local-prefill`, a decode server prefills the
+requests the router marks with `disagg_local_prefill: true` itself:
+
+```bash
+--disaggregation-mode decode \
+--disaggregation-decode-enable-radix-cache \
+--disaggregation-decode-enable-local-prefill \
+--chunked-prefill-size 1024
+```
+
+The router sends a marked request to the decode server only, without bootstrap
+fields. The decode server matches it against its radix cache and runs the
+uncached part with chunked prefill, interleaved with its decode batches like an
+aggregated server. Requests without the marker keep the normal PD path, so one
+decode server serves both. `--chunked-prefill-size` bounds the tokens of one
+local prefill step, and with it the decode steps that step delays;
+`--enable-mixed-chunk` lets running requests decode in the same step.
+
+The decode server reserves the remaining chunks of an in-flight local prefill
+when it admits transferred requests. A locally prefilled request that is
+retracted is prefilled again on the decode server rather than resumed from a
+host backup.
+
+This version does not support pipeline parallelism, DP attention, MoE
+all-to-all backends, HiSparse, or decode host KV buffering.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

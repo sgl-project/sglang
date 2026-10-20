@@ -644,9 +644,11 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         req.kv.kv_committed_len = 4
         req_to_token[0, :5] = torch.tensor([50, 51, 52, 53, 54], dtype=torch.int64)
 
+        waiting_queue = [req]
         scheduler = SimpleNamespace(
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
-            waiting_queue=[req],
+            waiting_queue=waiting_queue,
+            get_disagg_decode_prebuilt_reqs=lambda: waiting_queue,
             enable_priority_scheduling=False,
             req_to_token_pool=SimpleNamespace(size=4),
             max_running_requests=4,

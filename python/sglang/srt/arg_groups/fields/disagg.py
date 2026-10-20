@@ -89,6 +89,10 @@ class Disagg(msgspec.Struct):
     disaggregation_decode_enable_offload_kvcache: A[
         bool, "Enable async KV cache offloading on decode server (PD mode)."
     ] = False
+    disaggregation_decode_enable_local_prefill: A[
+        bool,
+        "Let the decode server (PD mode) prefill requests marked with disagg_local_prefill itself, with chunked prefill, instead of receiving their KV from a prefill server. Meant for requests whose prefix is mostly cached on this decode server; pair with --disaggregation-decode-enable-radix-cache.",
+    ] = False
     disaggregation_decode_retraction_backup: A[
         Optional[str],
         Arg(

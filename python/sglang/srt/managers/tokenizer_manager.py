@@ -1625,6 +1625,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
+                disagg_local_prefill=obj.disagg_local_prefill,
                 priority=obj.priority,
                 kv_hints=obj.kv_hints,
                 extra_key=obj.extra_key,

@@ -195,6 +195,37 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 )
 
 
+def validate_decode_local_prefill(server_args: ServerArgs) -> None:
+    """Reject decode-side local prefill on configs it does not support yet."""
+    cfg = resolving_view(server_args)
+    if not cfg.disaggregation_decode_enable_local_prefill:
+        return
+    if cfg.disaggregation_mode != "decode":
+        raise ValueError(
+            "--disaggregation-decode-enable-local-prefill requires "
+            "--disaggregation-mode decode"
+        )
+    unsupported = []
+    if cfg.pp_size > 1:
+        unsupported.append("pipeline parallelism")
+    if attn_dp_enabled_of(resolved_view(server_args)):
+        unsupported.append("DP attention")
+    if cfg.moe_a2a_backend != "none":
+        # The all-to-all buffers of a decode server are sized for decode batches.
+        unsupported.append(f"--moe-a2a-backend {cfg.moe_a2a_backend}")
+    if cfg.enable_hisparse:
+        unsupported.append("HiSparse")
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
+        unsupported.append("decode host KV buffering")
+    if cfg.chunked_prefill_size <= 0:
+        unsupported.append("disabled chunked prefill")
+    if unsupported:
+        raise ValueError(
+            "--disaggregation-decode-enable-local-prefill does not yet support "
+            + ", ".join(unsupported)
+        )
+
+
 def _validate_prefill_complete(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     unsupported = []

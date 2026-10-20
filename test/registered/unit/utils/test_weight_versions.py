@@ -314,6 +314,7 @@ class _SchedulerStub:
         self.running_batch = SimpleNamespace(reqs=running)
         self.last_batch = last_batch
         self.waiting_queue = waiting
+        self.disagg_decode_prebuilt_queue = None
         self.chunked_req = chunked
         self.hisparse_coordinator = hisparse
 

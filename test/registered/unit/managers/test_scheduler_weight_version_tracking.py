@@ -44,11 +44,12 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         return serving
 
     def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
+        self, *, inflight=(), waiting=(), prebuilt=None, chunked=None, staging=()
     ) -> SimpleNamespace:
         return SimpleNamespace(
             collect_inflight_reqs=lambda: set(inflight),
             waiting_queue=list(waiting),
+            disagg_decode_prebuilt_queue=prebuilt,
             chunked_req=chunked,
             hisparse_coordinator=(
                 SimpleNamespace(
@@ -86,9 +87,13 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def test_every_source_of_live_requests_is_stamped(self):
         """A request missed here keeps attributing its next tokens to the superseded version."""
         self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
+        inflight, queued, prebuilt, chunked, staged = (object() for _ in range(5))
         scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
+            inflight=[inflight],
+            waiting=[queued],
+            prebuilt=[prebuilt],
+            chunked=chunked,
+            staging=[staged],
         )
 
         with patch(
@@ -98,7 +103,8 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
         self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
+            set(recorder.call_args.args[0]),
+            {inflight, queued, prebuilt, chunked, staged},
         )
 
 

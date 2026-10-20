@@ -347,6 +347,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)
+    # Needs the final chunked prefill, DP attention and MoE all-to-all settings.
+    from sglang.srt.arg_groups.pd_disaggregation_hook import (
+        validate_decode_local_prefill,
+    )
+
+    run_hook(validate_decode_local_prefill, server_args)
 
     # needs the resolved CUDA-graph, attention-backend and speculative settings
     from sglang.srt.megakernels.guards import handle_nvidia_megakernel

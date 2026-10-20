@@ -1083,6 +1083,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        disagg_local_prefill: bool = False,
         kv_hints: Optional[KvHintsEnvelope] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
@@ -1403,6 +1404,9 @@ class Req(ReqDllmMixin):
             self.time_stats = SchedulerReqTimeStats.new_from_obj(time_stats)
         else:
             self.time_stats = SchedulerReqTimeStats(disagg_mode=disagg_mode)
+        if disagg_local_prefill:
+            # Staged like an aggregated request: queue, prefill, then decode.
+            self.time_stats.disagg_mode = DisaggregationMode.NULL
         self.time_stats.set_metrics_collector(metrics_collector)
         self.time_stats.set_scheduler_recv_time()
         self.has_log_time_stats: bool = False
@@ -1427,6 +1431,8 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        # PD decode prefills this request locally; it has no prefill peer.
+        self.disagg_local_prefill = disagg_local_prefill
         # Orchestrator KV hints, forwarded to the HiCache storage backends.
         self.kv_hints: Optional[KvHintsEnvelope] = kv_hints
 
@@ -2365,10 +2371,15 @@ def release_req(
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-    # pass offload_kv=False to skip the wasteful device->host copy.
+    # pass offload_kv=False to skip the wasteful device->host copy. A request
+    # prefilled on the decode server is recomputed there, like in aggregated mode.
     backup_saved = True
     # The config bag reflects role flips; server_args keeps the launch role.
-    if get_disagg().disaggregation_mode == "decode" and offload_kv:
+    if (
+        get_disagg().disaggregation_mode == "decode"
+        and offload_kv
+        and not req.disagg_local_prefill
+    ):
         backup_saved = backup_kv_cache(
             req,
             tree_cache,
