@@ -320,6 +320,8 @@ POSITIONAL_FIELD_ORDER = (
     "eplb_algorithm",
     "eplb_rebalance_num_iterations",
     "eplb_rebalance_layers_per_chunk",
+    "eplb_async_rebalance",
+    "eplb_async_passes_per_layer",
     "eplb_min_rebalancing_utilization_threshold",
     "expert_distribution_recorder_mode",
     "expert_distribution_recorder_buffer_size",
