@@ -14,7 +14,10 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+from sglang.srt.models.deepseek_v4_dspark import (
+    DeepseekV4ForCausalLMDSpark,
+    _dspark_stage_config,
+)
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -250,6 +253,7 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
 
             def __init__(self):
                 self.config = config
+                self.stage_config = _dspark_stage_config(config)
 
             def named_parameters(self):
                 return [("stages.0.mlp.experts.w13_weight", Param())]
