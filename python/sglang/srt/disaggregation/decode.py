@@ -1010,6 +1010,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.tree_cache,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            if self.scheduler.enable_hisparse and getattr(
+                req, "hisparse_retraction_pending", False
+            ):
+                coordinator = self.scheduler.hisparse_coordinator
+                assert coordinator is not None
+                coordinator.discard_retracted_request(req)
         self.retracted_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -1068,7 +1074,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
+            hisparse_resume = getattr(req, "hisparse_retraction_pending", False)
+            self._pre_alloc(req, skip_host_alloc=hisparse_resume)
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
@@ -1079,19 +1086,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
-            if self.scheduler.enable_overlap:
-                # A request that finished last step can still have its forward in
-                # flight, writing slots this request was just given.
-                self.scheduler.schedule_stream.wait_stream(
-                    self.scheduler.forward_stream
+            if hisparse_resume:
+                # HiSparse state-preserving retraction: the retained
+                # req_to_host_pool row already covers every committed token;
+                # re-admit with a fresh device buffer (all-miss -> swap-in
+                # from host on demand) instead of retransferring from prefill.
+                coordinator = self.scheduler.hisparse_coordinator
+                assert coordinator is not None
+                coordinator.resume_after_retraction(req)
+            else:
+                if self.scheduler.enable_overlap:
+                    # A request that finished last step can still have its
+                    # forward in flight, writing slots this request was just
+                    # given.
+                    self.scheduler.schedule_stream.wait_stream(
+                        self.scheduler.forward_stream
+                    )
+                restore_kv_cache(
+                    req,
+                    self.tree_cache,
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    get_disagg().disaggregation_decode_retraction_backup,
                 )
-            restore_kv_cache(
-                req,
-                self.tree_cache,
-                self.req_to_token_pool,
-                self.token_to_kv_pool_allocator,
-                get_disagg().disaggregation_decode_retraction_backup,
-            )
 
         self.retracted_queue = [
             entry
@@ -2240,6 +2257,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
         total_prefix_len: Optional[int] = None,
+        skip_host_alloc: bool = False,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -2248,13 +2266,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix committed to prefill as ``decode_prefix_len`` (L1 + L2 + L3);
         the ``[prefix_len, total_prefix_len)`` gap is filled later by HiCache
         loadback.
+
+        ``skip_host_alloc`` serves HiSparse state-preserving retraction: the
+        request keeps its req_to_token row and its host-pool row across the
+        retraction, so neither is re-allocated here.
         """
         if prefix_len is None:
             prefix_len = 0
         if total_prefix_len is None:
             total_prefix_len = prefix_len
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
+        if skip_host_alloc:
+            # Retained row: req_pool_idx is already valid and its host-pool
+            # row is still keyed by it.
+            req_pool_indices = [req.kv.req_pool_idx]
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert req_pool_indices is not None, (
             "req_pool_indices is full! There is a bug in memory estimation."
@@ -2326,6 +2353,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
+            assert coordinator is not None
             kv_loc = alloc_for_decode_prealloc_hisparse(
                 allocator,
                 req=req,
@@ -2333,14 +2361,38 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 uses_swa_tail=uses_swa_tail,
                 swa_tail_len=swa_tail_len,
             )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.kv.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            # Allocate host indices for the RDMA transfer target. A resumed
+            # state-preserving retraction keeps its host-pool row; extending
+            # alloc_paged_token_slots from the retained length covers the
+            # tokens generated since the retraction.
+            host_start = 0
+            if skip_host_alloc:
+                host_start = int(
+                    coordinator.req_to_host_pool_allocated_len[
+                        req.kv.req_pool_idx
+                    ]
+                )
+                if host_start < coordinator.host_token_len(fill_len):
+                    host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                        coordinator.req_to_host_pool,
+                        coordinator.req_to_host_pool_allocated_len,
+                        req.kv.req_pool_idx,
+                        host_start,
+                        coordinator.host_token_len(fill_len) - host_start,
+                    )
+                else:
+                    host_indices = coordinator.req_to_host_pool[
+                        req.kv.req_pool_idx,
+                        host_start : coordinator.host_token_len(fill_len),
+                    ]
+            else:
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.kv.req_pool_idx,
+                    0,
+                    coordinator.host_token_len(fill_len),
+                )
         else:
             kv_loc = self._alloc_for_decode_prealloc(
                 allocator,
