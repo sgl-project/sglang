@@ -3,40 +3,26 @@
   "cases": [
     {
       "type": "GenerateRequest",
-      "name": "empty custom labels are omitted",
+      "name": "empty labels are omitted while empty image options survive",
       "input": {
-        "custom_labels": {}
+        "custom_labels": {},
+        "images_config": {}
       },
-      "canonical": "{\"stream\":false}"
+      "canonical": "{\"stream\":false,\"images_config\":{}}"
     },
     {
       "type": "GenerateRequest",
-      "name": "custom labels retain string values",
+      "name": "custom labels and typed image options round-trip",
       "input": {
         "custom_labels": {
           "tenant": "team"
-        }
-      },
-      "canonical": "{\"stream\":false,\"custom_labels\":{\"tenant\":\"team\"}}"
-    },
-    {
-      "type": "GenerateRequest",
-      "name": "typed image options retain mode and prefix",
-      "input": {
+        },
         "images_config": {
           "image_mode": "base",
           "prefix": "OCR: "
         }
       },
-      "canonical": "{\"stream\":false,\"images_config\":{\"image_mode\":\"base\",\"prefix\":\"OCR: \"}}"
-    },
-    {
-      "type": "GenerateRequest",
-      "name": "empty image options leave processor defaults unset",
-      "input": {
-        "images_config": {}
-      },
-      "canonical": "{\"stream\":false,\"images_config\":{}}"
+      "canonical": "{\"stream\":false,\"custom_labels\":{\"tenant\":\"team\"},\"images_config\":{\"image_mode\":\"base\",\"prefix\":\"OCR: \"}}"
     },
     {
       "type": "GenerateResponse",
@@ -52,7 +38,7 @@
     },
     {
       "type": "GenerateResponse",
-      "name": "zero-token output retains its weight span",
+      "name": "zero-length weight spans survive serialization",
       "input": {
         "text": "",
         "meta_info": {
