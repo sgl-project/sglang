@@ -110,18 +110,19 @@ class TestAliceAI(CustomTestCase):
                         (128, config.shared_expert_intermediate_size // tp_size),
                     )
 
-    def test_unsupported_expert_dispatch_is_rejected(self):
+    def test_unsupported_runtime_modes_are_rejected(self):
         config = AliceAIConfig()
-        for options in (
-            {"enable_eplb": True},
-            {"ep_num_redundant_experts": 2},
-            {"init_expert_location": "random"},
+        for options, error in (
+            ({"enable_eplb": True}, "expert-location trivial"),
+            ({"ep_num_redundant_experts": 2}, "expert-location trivial"),
+            ({"init_expert_location": "random"}, "expert-location trivial"),
+            ({"cpu_offload_gb": 1}, "does not support --cpu-offload-gb"),
         ):
             with (
                 self.subTest(options=options),
                 get_context().override_server_args(tp_size=2, ep_size=2, **options),
                 get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
-                self.assertRaisesRegex(NotImplementedError, "expert-location trivial"),
+                self.assertRaisesRegex(NotImplementedError, error),
             ):
                 alice_ai.AliceAISparseMoeBlock(config, 0, None, "model.layers.0.mlp")
 

@@ -7,6 +7,7 @@ Supports ordinary generation and checkpoint MTP through NEXTN/EAGLE.
 Tensor and expert parallelism use the standard all-reduce MoE path.
 Expert placement is fixed; EPLB and redundant experts are not supported.
 Pipeline parallelism, DP attention and all-to-all MoE backends are not supported.
+CPU weight offloading via --cpu-offload-gb is not supported.
 The companion AliceAI MTP model loads the checkpoint's mtp.* weights.
 """
 
@@ -201,6 +202,11 @@ class AliceAISparseMoeBlock(nn.Module):
     ):
         super().__init__()
         self.alt_stream = alt_stream
+        # Per-forward parameter replacement leaves TopK's cached bias on CPU.
+        if get_exec().offload.cpu_offload_gb > 0:
+            raise NotImplementedError(
+                "AliceAI does not support --cpu-offload-gb; set it to 0."
+            )
         if not get_moe_a2a_backend().is_none():
             raise NotImplementedError(
                 "AliceAI requires MoE A2A backend 'none' for both target and draft"
