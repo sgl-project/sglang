@@ -25,10 +25,24 @@ class DwdpPrefetch:
         self._copy_stream = device_module.Stream(device=device)
         self._prefetch_events = [device_module.Event() for _ in range(2)]
         self._consume_events = [device_module.Event() for _ in range(2)]
-        # Pre-record consume events so the first prefetch doesn't stall.
+        # pre-record consume events so the first prefetch doesn't stall
         current = device_module.current_stream(device)
-        for event in self._consume_events:
-            event.record(current)
+        for ev in self._consume_events:
+            ev.record(current)
+
+    def next_moe_layer(self, layer_idx: int) -> Optional[int]:
+        pos = bisect.bisect_right(self._moe_layer_indices, layer_idx)
+        if pos < len(self._moe_layer_indices):
+            return self._moe_layer_indices[pos]
+        return None
+
+    def prefetch_layer(self, layer_idx: int) -> None:
+        buf_idx = self._buffer_index_for_layer(layer_idx)
+        with self._device_module.stream(self._copy_stream):
+            # WAR: wait for compute to finish reading this slot before overwriting
+            self._copy_stream.wait_event(self._consume_events[buf_idx])
+            self._prefetch_layer_per_slice(layer_idx)
+            self._prefetch_events[buf_idx].record(self._copy_stream)
 
     def _prefetch_layer_per_slice(self, layer_idx: int) -> None:
         for name in self._weight_names:
@@ -51,20 +65,6 @@ class DwdpPrefetch:
                     dst_offset += n
                     cursor = chunk_end
 
-    def next_moe_layer(self, layer_idx: int) -> Optional[int]:
-        pos = bisect.bisect_right(self._moe_layer_indices, layer_idx)
-        if pos < len(self._moe_layer_indices):
-            return self._moe_layer_indices[pos]
-        return None
-
-    def prefetch_layer(self, layer_idx: int) -> None:
-        buf_idx = self._buffer_index_for_layer(layer_idx)
-        with self._device_module.stream(self._copy_stream):
-            # WAR: wait for compute to finish reading this slot before overwriting.
-            self._copy_stream.wait_event(self._consume_events[buf_idx])
-            self._prefetch_layer_per_slice(layer_idx)
-            self._prefetch_events[buf_idx].record(self._copy_stream)
-
     def wait_prefetch(self, layer_idx: int) -> None:
         buf_idx = self._buffer_index_for_layer(layer_idx)
         compute_stream = self._device_module.current_stream(self._prefetch_device)
@@ -74,7 +74,7 @@ class DwdpPrefetch:
         buf_idx = self._buffer_index_for_layer(layer_idx)
         compute_stream = self._device_module.current_stream(self._prefetch_device)
         self._consume_events[buf_idx].record(compute_stream)
-        # The layer two ahead reuses this slot. Preserve CUDA's sparse-ID lookup.
+        # prefetch the layer 2 ahead — it reuses the same buffer slot
         next_layer = self.next_moe_layer(layer_idx)
         if next_layer is not None:
             next_next = self.next_moe_layer(next_layer)
