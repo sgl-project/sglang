@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -51,6 +52,12 @@ class TestAscendMlaHicache(CustomTestCase):
                     model,
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    env={
+                        **os.environ,
+                        "PYTORCH_NPU_ALLOC_CONF": (
+                            "expandable_segments:True,pin_memory_expandable_segments:True"
+                        ),
+                    },
                     other_args=[
                         *self.common_args,
                     ],

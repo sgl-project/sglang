@@ -28,6 +28,10 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     sparse_buffers,
     widen_pair_i64,
 )
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    late_layer_tail_layout,
+)
 from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     CandidateBlocks,
     slice_candidate_blocks,
@@ -44,7 +48,9 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     SOFTMAX_SCALE as SWAPAB_SOFTMAX_SCALE,
 )
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged_dsv4,
+)
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
@@ -55,10 +61,6 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     opus_sparse_prefill,
 )
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-    BuildCausalSwaPageIndices,
-    late_layer_tail_layout,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as _cuda_backend
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -66,8 +68,9 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     LateLayerTail,
     _as_int_list,
-    _prefill_graph_max_seq_len,
     _tail_rows,
+    late_layer_num_tokens,
+    late_layer_whole_extend,
 )
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -105,6 +108,8 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.monokernels.runtime import is_metadata_unread
+from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -886,6 +891,13 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     can_run_prefill_cuda_graph = DeepseekV4AttnBackend.can_run_prefill_cuda_graph
+    prefill_cuda_graph_default_max_seq_len = (
+        DeepseekV4AttnBackend.prefill_cuda_graph_default_max_seq_len
+    )
+    _prefill_graph_replays_any_context = (
+        DeepseekV4AttnBackend._prefill_graph_replays_any_context
+    )
+    _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
     _low_ratio_compress = DeepseekV4AttnBackend._low_ratio_compress
     _low_ratio_compress_decode = DeepseekV4AttnBackend._low_ratio_compress_decode
@@ -905,6 +917,7 @@ class DeepseekV4HipRadixBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
@@ -962,7 +975,7 @@ class DeepseekV4HipRadixBackend(
         )
         if self.enable_decoder_swa_bounded_replay:
             # both read the store target off the full batch, not the tail metadata
-            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+            from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
                 is_unified_kv_triton,
             )
 
@@ -972,6 +985,9 @@ class DeepseekV4HipRadixBackend(
                 )
         # the model switches onto it after the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Read by the shared forward_low_ratio_sources; the ROCm tail starts after
+        # the source layer, so nothing sets it.
+        self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -1171,7 +1187,7 @@ class DeepseekV4HipRadixBackend(
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
 
-        from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+        from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
             ExpandPrefillCausally,
         )
 
@@ -1416,7 +1432,7 @@ class DeepseekV4HipRadixBackend(
         """Whether the V4.1 DSpark draft block takes the block-window metadata; DSv4's
         draft keeps the causal verify indices, and unified_kv addresses its ring by
         (slot, position) and keeps its own path."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -1762,6 +1778,11 @@ class DeepseekV4HipRadixBackend(
                         # Identity rows are not scored, so they need no schedule.
                         if not low_ratio_decode_rows_are_identity(
                             self, forward_batch, ratio
+                        )
+                        and not is_metadata_unread(
+                            self.model_runner.model,
+                            forward_batch,
+                            StepMetadata.LOW_RATIO_DECODE_SCHEDULE,
                         )
                     },
                     max_context_len=self.max_context_len,
@@ -2172,6 +2193,11 @@ class DeepseekV4HipRadixBackend(
             else None
         )
 
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
+            return None
+        return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
+
     def _init_forward_metadata_prefill_from_batch(
         self,
         forward_batch: ForwardBatch,
@@ -2215,7 +2241,8 @@ class DeepseekV4HipRadixBackend(
         self, forward_batch: ForwardBatch
     ) -> DSV4Metadata:
         """Metadata for the layers after the last kv_source layer under decoder SWA bounded
-        replay: each request's last SWA_WINDOW extend tokens."""
+        replay: each request's last SWA_WINDOW extend tokens, or its whole extend
+        when it reads prompt rows (late_layer_whole_extend)."""
         extend_lens_cpu = forward_batch.extend_seq_lens_cpu
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert extend_lens_cpu is not None and seq_lens_cpu is not None
@@ -2225,6 +2252,7 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu.tolist(),
             tail_len=SWA_WINDOW,
             device=device,
+            whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
         )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
@@ -2372,14 +2400,13 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu=seq_lens_cpu,
         )
 
-    @staticmethod
-    def _graph_metadata_max_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
+    def _graph_metadata_max_seq_len(self, forward_batch: ForwardBatch) -> Optional[int]:
         """
         Capture and replay build the metadata at this fixed context length, so a
         replay's metadata is never larger than the captured one. Longer contexts run
         eager.
         """
-        return forward_batch.max_seq_len_override or _prefill_graph_max_seq_len()
+        return forward_batch.max_seq_len_override or self._prefill_graph_seq_limit()
 
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
@@ -2395,7 +2422,7 @@ class DeepseekV4HipRadixBackend(
             self._refresh_fp4_prefill_workspace(forward_batch)
             assert isinstance(self.forward_metadata, DSV4Metadata)
             return self.forward_metadata
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2543,7 +2570,7 @@ class DeepseekV4HipRadixBackend(
         """fp8 unified_kv asm decode: per-stream KV bound for the split plan
         and, at init (outside capture, before warmup), the constant split
         table and the HCA persistent workspace."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
         )
 
@@ -2578,7 +2605,7 @@ class DeepseekV4HipRadixBackend(
     ) -> None:
         # state_slot maps each query token to its request slot;
         # target-verify repeats request slots for the draft tokens.
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -2712,7 +2739,7 @@ class DeepseekV4HipRadixBackend(
         num_tokens: int,
         exact_num_tokens: bool = True,
     ) -> None:
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -2780,6 +2807,7 @@ class DeepseekV4HipRadixBackend(
         wo_a_quant_freqs (fp8 decode): return the inverse-RoPE'd wo_a mxfp8
         operands instead of the attention output."""
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 
         pool = self.token_to_kv_pool
         layer_id = layer.layer_id
@@ -2812,7 +2840,7 @@ class DeepseekV4HipRadixBackend(
             if save_kv_cache:
                 # Only verify reaches this under fp8; plain decode's rows are
                 # written by the fused kernel itself, which leaves kv None.
-                runtime.store_swa_into_unified(
+                dsv4_unified_kv_store.store_swa_into_unified(
                     kv=kv,
                     state_slot=state_slot,
                     positions=positions,
@@ -2926,7 +2954,7 @@ class DeepseekV4HipRadixBackend(
                     ),
                 )
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
-                _kv_splits_for_stream,
+                kv_splits_for_stream,
             )
 
             return runtime.decode(
@@ -2938,7 +2966,7 @@ class DeepseekV4HipRadixBackend(
                 softmax_scale=self.softmax_scale,
                 # Only this call site knows compress_ratio, and it is the one
                 # thing that separates the ragged stream from the clamped ones.
-                kv_splits=_kv_splits_for_stream(compress_ratio),
+                kv_splits=kv_splits_for_stream(compress_ratio),
             )
 
         # prefill / extend
@@ -3024,7 +3052,7 @@ class DeepseekV4HipRadixBackend(
             n_real = kv.shape[0] if _cp_active else state_slot_full.shape[0]
             # the store launches one program per kv row and never checks these lengths
             assert min(state_slot_full.shape[0], positions_full.shape[0]) >= n_real
-            runtime.store_swa_into_unified(
+            dsv4_unified_kv_store.store_swa_into_unified(
                 kv=kv[:n_real],
                 state_slot=state_slot_full[:n_real],
                 positions=positions_full[:n_real],
@@ -3193,7 +3221,7 @@ class DeepseekV4HipRadixBackend(
         cache = state.cache
         num_swa_rows = cache.swa_token_ids.shape[0]
         swa_rows = self.opus_prefill_workspace.get(num_swa_rows)
-        dequantize_k_cache_paged(
+        dequantize_k_cache_paged_dsv4(
             pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -3242,7 +3270,7 @@ class DeepseekV4HipRadixBackend(
             )
             num_rows = gather.flat_token_ids.shape[0]
             rows = self.opus_compressed_workspaces[compress_ratio].get(num_rows)
-            dequantize_k_cache_paged(
+            dequantize_k_cache_paged_dsv4(
                 c_cache,
                 gather.flat_token_ids,
                 page_size=c_page_size,
@@ -3296,7 +3324,7 @@ class DeepseekV4HipRadixBackend(
         token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

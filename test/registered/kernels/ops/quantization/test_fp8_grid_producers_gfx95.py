@@ -12,13 +12,13 @@ from sglang.kernels.ops.activation.silu_and_mul_clamp_hip import (
 from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
     batched_gemm_bf16_fp8_grid,
 )
+from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
+    rmsnorm_fake_quant_fp8,
+)
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     _mxfp8_e4m3_quantize_torch,
     dequant_mxfp8_to_bf16,
     fake_quant_fp8_activation,
-)
-from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
-    rmsnorm_fake_quant_fp8,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
