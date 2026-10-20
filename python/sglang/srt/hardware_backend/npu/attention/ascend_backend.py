@@ -2552,7 +2552,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         return (
             attn_output.view(num_tokens, num_heads * self.kv_lora_rank),
-            softmax_lse,
+            softmax_lse.squeeze(-1).to(torch.float32).contiguous(),
         )
 
     def forward_mtp(
@@ -2602,7 +2602,7 @@ class AscendAttnBackend(AttentionBackend):
                 # local DCP attention work on those ranks; skip FIA.
                 return (
                     q.new_zeros((num_tokens, num_heads * self.kv_lora_rank)),
-                    q.new_zeros((num_tokens, num_heads, 1)),
+                    q.new_zeros((num_tokens, num_heads), dtype=torch.float32),
                 )
             block_table = self.forward_metadata.block_tables[:batch_size]
             if self.forward_metadata.seq_lens_cpu_int is None:

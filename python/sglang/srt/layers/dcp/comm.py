@@ -489,15 +489,19 @@ def dcp_a2a_lse_reduce(
     if cp_group.world_size == 1:
         return cp_attn_out
 
+    N = cp_group.world_size
+    B, H, D = cp_attn_out.shape
+    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
+    H_per_rank = H // N
+    if B == 0:
+        # DCP peers share the same batch; an idle group has no partials to send.
+        return cp_attn_out.new_empty((0, H_per_rank, D))
+
     if comm_backend == "fi_a2a":
         return _dcp_fi_a2a_lse_reduce(
             cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
         )
 
-    N = cp_group.world_size
-    B, H, D = cp_attn_out.shape
-    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
-    H_per_rank = H // N
     out_dtype = cp_attn_out.dtype
     lpd = _lse_pack_dim(out_dtype)  # 2 for bf16/fp16
 
@@ -560,7 +564,6 @@ def _dcp_fi_a2a_lse_reduce(
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
-    assert H % N == 0, f"num_heads ({H}) must be divisible by dcp_size ({N})"
     H_per_rank = H // N
 
     # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and

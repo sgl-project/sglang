@@ -143,11 +143,11 @@ def set_mla_kv_buffer_naive(
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
 
     loc = loc.to(torch.int64)
-    if has_rope:
+    if has_rope or dcp_world_size > 1:
         is_valid = loc != reserved_skip_index
     else:
         # set_mla_kv_buffer_kernel_norope takes no skip index and writes every
-        # loc; keep the two paths bit-identical rather than fixing it here.
+        # loc in the non-DCP path; preserve that legacy behavior.
         is_valid = torch.ones_like(loc, dtype=torch.bool)
     if dcp_world_size > 1:
         is_valid &= loc % dcp_world_size == dcp_rank
@@ -218,12 +218,11 @@ def _set_mla_kv_buffer_impl(
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
 
-    if not has_rope:
+    supports_pdl = current_platform.is_cuda() and is_arch_support_pdl()
+    if not has_rope and dcp_world_size == 1:
         BLOCK = triton.next_power_of_2(nope_dim)
         grid = (n_loc, 1)
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if supports_pdl else {}
         set_mla_kv_buffer_kernel_norope[grid](
             kv_buffer,
             cache_k_nope,
@@ -236,48 +235,48 @@ def _set_mla_kv_buffer_impl(
         )
         return
 
-    from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
-        can_use_set_mla_kv_buffer,
-    )
-    from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
-        set_mla_kv_buffer as jit_set_mla_kv_buffer,
-    )
-
-    nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
-    rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
-    if (
-        is_arch_support_pdl()
-        and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and dcp_world_size == 1
-    ):
-        jit_set_mla_kv_buffer(
-            kv_buffer,
-            loc,
-            cache_k_nope,
-            cache_k_rope,
-            reserved_skip_index=reserved_skip_index,
+    if has_rope and supports_pdl and dcp_world_size == 1:
+        from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
+            can_use_set_mla_kv_buffer,
         )
-        return
+        from sglang.kernels.ops.kvcache.set_mla_kv_buffer import (
+            set_mla_kv_buffer as jit_set_mla_kv_buffer,
+        )
+
+        nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
+        rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
+        if can_use_set_mla_kv_buffer(nope_bytes, rope_bytes):
+            jit_set_mla_kv_buffer(
+                kv_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                reserved_skip_index=reserved_skip_index,
+            )
+            return
 
     # Fallback: Triton with BLOCK = next_pow2(total_dim). One CTA per loc; the
     # whole row in one tile (the existing 3-way nope/rope/boundary branch in
     # ``set_mla_kv_buffer_kernel`` handles the over-allocation past total_dim
     # via the offs<total_dim mask). Beats BLOCK=128 by 60-2700 ns across the
     # 2 <= bs <= 512 range on GB300.
-    rope_dim = cache_k_rope.shape[-1]
+    # DCP must use the owner-aware kernel even when writing a single component
+    # of a split cache. A zero-width RoPE component reuses the NoPE pointer.
+    rope_dim = cache_k_rope.shape[-1] if has_rope else 0
+    rope_source = cache_k_rope if has_rope else cache_k_nope
     total_dim = nope_dim + rope_dim
     BLOCK = triton.next_power_of_2(total_dim)
     grid = (n_loc, 1)
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if supports_pdl else {}
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
-        cache_k_rope,
+        rope_source,
         loc,
         reserved_skip_index,
         kv_buffer.stride(0),
         cache_k_nope.stride(0),
-        cache_k_rope.stride(0),
+        rope_source.stride(0),
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
@@ -291,7 +290,7 @@ def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor] = None,
     *,
     reserved_skip_index: int = 0,
 ):
@@ -312,7 +311,7 @@ def set_mla_kv_buffer_dcp_sharded_triton(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
-    cache_k_rope: torch.Tensor,
+    cache_k_rope: Optional[torch.Tensor] = None,
     *,
     reserved_skip_index: int = 0,
 ):

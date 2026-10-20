@@ -68,7 +68,13 @@ def forward_mla_attention_npu(
                 attn_output, lse, get_parallel().dcp_group
             )
         else:
-            attn_output = merge_mla_dcp_output_npu(attn_output, lse)
+            attn_output = dcp_a2a_lse_reduce(
+                attn_output,
+                lse,
+                get_parallel().dcp_group,
+                is_lse_base_on_e=True,
+                comm_backend="a2a",
+            )
     return attn_output.view(-1, module.num_local_heads, module.kv_lora_rank)
 
 
@@ -96,40 +102,4 @@ def mask_empty_mla_dcp_shards_npu(
             partial_lse,
             torch.full_like(partial_lse, float("-inf")),
         ),
-    )
-
-
-def merge_mla_dcp_output_npu(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-) -> torch.Tensor:
-    """Compactly exchange and merge DCP partial attention states.
-
-    ``partial_output`` is ``[B, H_local * N, D]``.  AllToAll routes the same
-    ``H_local`` head slice from every KV-shard rank to its owner.  The local
-    Triton combine kernel then reads BF16/FP16 output and FP32 LSE directly from
-    the packed receive buffer and returns ``[B, H_local, D]``.  This reuses the
-    common DCP A2A path, avoids expanding every output element to FP32 for HCCL,
-    and does not materialize an unpacked intermediate tensor.
-    """
-    parallel = get_parallel()
-    if not parallel.dcp_enabled:
-        return partial_output
-
-    dcp_size = parallel.dcp_size
-    batch_size, total_heads, head_dim = partial_output.shape
-    local_heads = total_heads // dcp_size
-    if batch_size == 0:
-        # All ranks in a DCP group share the same DP batch.  An idle DSpark DP
-        # group therefore has no peer communication to perform; avoid both the
-        # ambiguous empty LSE reshape and a zero-sized HCCL all-to-all.
-        return partial_output.new_empty((0, local_heads, head_dim))
-
-    partial_lse = partial_lse.squeeze(-1).to(torch.float32).contiguous()
-    return dcp_a2a_lse_reduce(
-        partial_output,
-        partial_lse,
-        parallel.dcp_group,
-        is_lse_base_on_e=True,
-        comm_backend="a2a",
     )
