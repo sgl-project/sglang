@@ -859,12 +859,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         cpu_weight.weight_loader = self.weight_loader
         self.register_parameter("weight", cpu_weight)
         self._npu_uva_table = None
-        self.npu_uva_enabled = False
         if _is_npu:
             from sglang.srt.hardware_backend.npu.ple import create_ple_uva_table
 
             self._npu_uva_table = create_ple_uva_table(self.weight, backend=backend)
-            self.npu_uva_enabled = True
             logger.info("NPU PLE lookup route: uva (backend=%s)", backend)
         # The CUDA file kernel can issue CPU prefetch hints; NPU UVA lookup
         # keeps IDs on the device and needs no CPU prefetch worker or ID copy.

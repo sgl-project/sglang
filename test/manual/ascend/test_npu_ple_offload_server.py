@@ -101,6 +101,8 @@ class ObserverLoader(importlib.abc.Loader):
                 embedding = instance.ngram_embedding
                 weight = embedding.weight
                 cpu = weight.device.type == "cpu"
+                uva_table = getattr(embedding, "_npu_uva_table", None)
+                uva_tensor = None if uva_table is None else uva_table.tensor
                 data = {
                     "pid": os.getpid(),
                     "tp_rank": module.get_parallel().tp_rank,
@@ -113,8 +115,8 @@ class ObserverLoader(importlib.abc.Loader):
                     "shape": list(weight.shape),
                     "start": embedding.shard_indices.org_vocab_start_index,
                     "end": embedding.shard_indices.org_vocab_end_index,
-                    "npu_uva_enabled": bool(
-                        getattr(embedding, "npu_uva_enabled", False)
+                    "uva_device": (
+                        uva_tensor.device.type if uva_tensor is not None else None
                     ),
                 }
                 os.write(1, ("PLE_TEST_TABLE " + json.dumps(data) + "\n").encode())
@@ -368,7 +370,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
                 # Validate file storage through its real /proc/self/maps path.
                 if backend == "pinned":
                     self.assertTrue(record["pinned"])
-                self.assertTrue(record["npu_uva_enabled"])
+                self.assertEqual(record["uva_device"], "npu")
                 self.assertEqual(record["dtype"], "bfloat16")
                 if backend == "file":
                     self.assertIsNotNone(record["mapping"])
@@ -380,7 +382,7 @@ class TestNpuPleOffloadServer(CustomTestCase):
             else:
                 self.assertEqual(record["embedding_class"], "VocabParallelEmbedding")
                 self.assertEqual(record["device"], "npu")
-                self.assertFalse(record["npu_uva_enabled"])
+                self.assertIsNone(record["uva_device"])
         self.assertEqual(
             {int(record["tp_rank"]) for record in records}, set(range(int(TP_SIZE)))
         )

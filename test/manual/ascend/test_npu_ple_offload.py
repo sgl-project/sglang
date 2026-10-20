@@ -125,7 +125,7 @@ class TestNpuPleOffload(unittest.TestCase):
             self.assertEqual(len(files), 1)
             self.assertTrue(os.path.samefile(filename, files[0]))
         self.assertIs(embedding.weight_scale, source.weight_scale)
-        self.assertTrue(embedding.npu_uva_enabled)
+        self.assertEqual(embedding._npu_uva_table.tensor.device.type, "npu")
         self.assertEqual(dtype, torch.bfloat16)
         self.assertIsNone(embedding._file_prefetcher)
         return embedding, rows, table_dir
