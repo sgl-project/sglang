@@ -1062,6 +1062,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        self.post_load_weights()
 
     def post_load_weights(self, is_nextn=False, weight_names=None):
         for stage in self.stages:
