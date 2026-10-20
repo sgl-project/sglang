@@ -132,7 +132,7 @@ class TestDsaTokenShardPlan(CustomTestCase):
         )
         self.assertEqual(
             dsa_token_shard_key_lens(
-                forward_batch, plan15, torch.device("cpu")
+                types.SimpleNamespace(), plan15, torch.device("cpu")
             ).tolist(),
             [seq],
         )
