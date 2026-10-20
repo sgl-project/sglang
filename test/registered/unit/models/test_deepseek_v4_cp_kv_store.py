@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
-_ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+_ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 _PREFILL = SimpleNamespace(
     forward_mode=SimpleNamespace(
         is_decode_or_idle=lambda: False,

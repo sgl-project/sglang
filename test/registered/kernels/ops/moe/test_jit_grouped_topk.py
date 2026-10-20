@@ -16,6 +16,7 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -37,7 +38,7 @@ def _jit_routed(monkeypatch, logits, hidden, bias, groups):
         renormalize=True,
         use_grouped_topk=True,
         num_expert_group=groups,
-        num_fused_shared_experts=SHARED,
+        shared_experts=SharedExpertsConfig(num_fused_shared_experts=SHARED),
         topk_group=1,
         scoring_func="sigmoid",
         correction_bias=bias,
@@ -179,6 +180,36 @@ def test_router_is_asked_for_the_total_width(monkeypatch, use_aiter):
         f"_use_aiter={use_aiter}: caller passed topk={topk_in}, kernel was asked "
         f"for {seen['topk']} slots, expected {TOPK_ROUTED + SHARED} "
         f"(routed {TOPK_ROUTED} + shared {SHARED})"
+    )
+
+
+@pytest.mark.parametrize("use_aiter", [True, False])
+def test_routed_weights_carry_the_factor_where_later_steps_skip_it(
+    monkeypatch, use_aiter
+):
+    """AITER routing must fold the scale even without shared slots."""
+    from sglang.srt.layers.moe import topk as topk_mod
+
+    monkeypatch.setenv("SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK", "1")
+    monkeypatch.setattr(topk_mod, "_use_aiter", use_aiter, raising=False)
+
+    hidden, bias, logits = _inputs(48)
+    weights, _ = topk_mod.biased_grouped_topk_gpu(
+        hidden_states=hidden,
+        gating_output=logits,
+        correction_bias=bias,
+        topk=TOPK_ROUTED,
+        renormalize=True,
+        num_expert_group=8,
+        topk_group=1,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=SCALE,
+        apply_routed_scaling_factor_on_output=False,
+    )
+
+    want = SCALE if use_aiter else 1.0
+    torch.testing.assert_close(
+        weights.sum(-1), torch.full_like(weights[:, 0], want), rtol=1e-5, atol=1e-5
     )
 
 
