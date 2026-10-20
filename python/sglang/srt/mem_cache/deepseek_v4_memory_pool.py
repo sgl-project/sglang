@@ -15,16 +15,10 @@ from typing import (
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
-    clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
     fused_store_cache,
 )
-from sglang.kernels.ops.attention.dsv4 import (
-    index_buf_accessor as dsv4_index_buf_accessor,
-)
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.kernels.ops.attention.dsv4.kv_layout import (
     KVLayout,
     is_valid_kv_layout_pair,
@@ -33,6 +27,11 @@ from sglang.kernels.ops.attention.dsv4.kv_norm_rope_store import (
     fused_k_norm_rope_uniform_fp8,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import layout
+from sglang.kernels.ops.kvcache import dsa_index_k_cache, dsv4_main_kv_store
+from sglang.kernels.ops.kvcache.dsv4_c128_cleanup import (
+    clear_unaccepted_c128_draft_states,
+)
+from sglang.kernels.ops.kvcache.dsv4_main_kv_store import NopeFp8RopeBf16Pack
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backend
@@ -157,7 +156,7 @@ def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
 def resolve_unified_kv_fp8(unified_fp8: Optional[bool] = None) -> bool:
     """Per-pool fp8 layout; None follows SGLANG_DSV4_UNIFIED_KV_FP8. False keeps this
     pool bf16 while target fused-Q still keys off the global switch."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_fp8,
     )
 
@@ -339,7 +338,7 @@ class DeepSeekV4SingleKVPool(KVCache):
             "the (fp8 nope, bf16 rope, 7 scales) pack is the V4 layout; "
             f"a {self.kv_layout.value} pool is written through set_key_buffer_fused"
         )
-        dsv4_index_buf_accessor.SetKAndS.execute(
+        dsv4_main_kv_store.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
             loc=loc,
@@ -675,7 +674,7 @@ class DeepSeekV4IndexerPool(KVCache):
         max_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         buf = self.index_k_with_scale_buffer[layer_id]
-        return index_buf_accessor.GetKAndS.execute(
+        return dsa_index_k_cache.GetKAndS.execute(
             self,
             buf,
             page_indices=page_indices,
@@ -692,7 +691,7 @@ class DeepSeekV4IndexerPool(KVCache):
         index_k_scale: torch.Tensor,
     ) -> None:
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
-        index_buf_accessor.SetKAndS.execute(
+        dsa_index_k_cache.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
@@ -719,7 +718,7 @@ class DeepSeekV4IndexerPool(KVCache):
         if self.uses_aiter_fp4_layout:
             # the FlyDSL kernels read the fp4 payload and the packed ue8m0 scales
             # from two buffers
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
                 store_fp4_index_k_cache_split,
             )
 
@@ -732,7 +731,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 rne=self.index_k_rne,
                 page8=self.index_k_page8,
             )
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
             store_fp4_index_k_cache,
         )
 
@@ -752,7 +751,7 @@ class DeepSeekV4IndexerPool(KVCache):
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if buf.is_cuda:
-            from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
                 gather_fp4_index_k,
             )
 
@@ -1008,7 +1007,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -1987,7 +1986,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             f"a {self.kv_layout.value} pool is written through the fused setters"
         )
         if self.request_window is not None:
-            dsv4_index_buf_accessor.SetKAndS.execute(
+            dsv4_main_kv_store.SetKAndS.execute(
                 pool=self.request_window.state,
                 buf=self.get_swa_raw_buffer(layer_id),
                 loc=loc,
@@ -2242,10 +2241,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         """unified_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope; rows
         with swa_loc < 0 (uncommitted verify tokens) are skipped by the scatter."""
         from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.kvcache.dsv4_unified_kv_store import (
+            scatter_bf16_into_unified,
+        )
 
         fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
-        runtime.scatter_bf16_into_unified(
+        scatter_bf16_into_unified(
             kv=kv,
             loc=swa_loc,
             unified_kv=self.get_unified_kv(layer_id),

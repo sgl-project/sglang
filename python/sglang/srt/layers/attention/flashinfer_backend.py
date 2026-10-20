@@ -24,9 +24,9 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
-    spec_kv_index_token_blocks,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs

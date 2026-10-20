@@ -4,7 +4,7 @@ from typing import Callable, List, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import spec_kv_index_token_blocks
+from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
