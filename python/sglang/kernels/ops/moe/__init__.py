@@ -65,11 +65,7 @@ register_kernel(
         op="moe.shuffle_weighted_sum",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True, description="masked routed-row reduction"
-        ),
-        description="Reduce permuted expert outputs, skipping inactive routes.",
+        capabilities=CUDA_ONLY,
     )
 )
 
