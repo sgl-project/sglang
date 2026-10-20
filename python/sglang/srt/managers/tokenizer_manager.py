@@ -3701,8 +3701,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.elastic_active_rank_status = list(ranks.status)
-        self.recover_elastic_ep_communicator.set_fan_out(
-            sum(self.elastic_active_rank_status)
+        active_rank_count = sum(self.elastic_active_rank_status)
+        self.recover_elastic_ep_communicator.set_fan_out(active_rank_count)
+        self.observe_elastic_ep_membership_communicator.set_fan_out(
+            active_rank_count
         )
         self._dispatch_to_scheduler(ranks)
 
@@ -3918,6 +3920,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: ObserveElasticEPMembershipReqInput
     ) -> ObserveElasticEPMembershipReqOutput:
         """Fan out a CPU-only membership observation to schedulers."""
+        if not any(self.elastic_active_rank_status):
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Membership observation requires at least one active rank.",
+            )
         scheduler_obj = ObserveElasticEPMembershipReqInput(
             runtime_instance_id=obj.runtime_instance_id,
             topology_generation=obj.topology_generation,
@@ -3926,7 +3933,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             membership_epoch=obj.membership_epoch,
         )
         self.auto_create_handle_loop()
-        responses = await self.recover_elastic_ep_communicator(scheduler_obj)
+        responses = await self.observe_elastic_ep_membership_communicator(
+            scheduler_obj
+        )
         if not responses:
             raise RuntimeError(
                 "Membership observation returned no scheduler responses."
