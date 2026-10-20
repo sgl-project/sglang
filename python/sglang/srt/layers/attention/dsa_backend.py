@@ -306,6 +306,7 @@ class DSAMetadata:
     pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
     pooled_real_page_table: Optional[torch.Tensor] = None
     pooled_paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    pooled_topk_v2_plan: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
 
