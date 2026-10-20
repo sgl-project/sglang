@@ -55,7 +55,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import run_with_deadline
+from sglang.srt.utils.common import is_xpu, run_with_deadline
 
 try:
     from nixl._bindings import (
@@ -71,6 +71,8 @@ try:
     )
 except ImportError:
     _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -1740,6 +1742,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                 # pick it up again on the next pop.
                                 staging_deferred = True
                                 break
+                            # NIXL reads the staging buffer asynchronously, and the next
+                            # decode rank's gather overwrites it from offset 0. Gated to
+                            # XPU, where this corrupted KV under concurrent requests.
+                            if _is_xpu and kv_xfer_handle is not None:
+                                self._await_handles(
+                                    [kv_xfer_handle], failure_seen=False
+                                )
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
