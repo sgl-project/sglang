@@ -291,7 +291,11 @@ Tuned session HBM: median chip sampled peak 50392.5 MiB vs baseline
 57068.0 MiB (11.70% lower). The worst-device sampled peak is 51849 MiB
 vs baseline 57229 MiB (9.40% lower). These are whole-device observations
 including the fixed model/configuration overhead, not just resident KV.
-All occupancy samples showed only processes belonging to this test.
+An archive audit found four foreign-process samples in the original tuned
+32K/512 and 8K/concurrency-4 windows. Those tuned performance/peak results
+are contaminated and must not be used as final isolated measurements;
+they are retained for audit and superseded by guarded reruns. Earlier
+baseline/reference/original-LIM measurement windows had no foreign samples.
 
 Tuned custom task score: 29/32, with zero truncations; baseline 29/32,
 same-policy reference 28/32, original LIM 30/32. Only 7/32 complete tuned
@@ -323,3 +327,7 @@ and isolate the first numerical divergence under fixed batch/teacher-forced
 prefixes with captured TopK sets, selected payloads and SFA inputs. Full-model
 cache-hit-rate telemetry was not collected, so fixture hit rates must not be
 substituted for actual checkpoint hit rates.
+
+Audit correction: the original tuned 32K and concurrency-4 rows above are
+invalid due to competing AFS NPU jobs. The original tuned 8K/concurrency-1
+rows and quality interval were not affected. Guarded reruns follow below.
