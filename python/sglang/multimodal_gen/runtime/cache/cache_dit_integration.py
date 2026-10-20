@@ -23,7 +23,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 import cache_dit
-from cache_dit.caching.block_adapters import FakeDiffusionPipeline
+
+try:
+    from cache_dit.caching.block_adapters import FakeDiffusionPipeline
+except ImportError:
+    # Only needed for the cache-dit 1.5.1 _is_cached workaround below; other
+    # versions may not expose it here.
+    FakeDiffusionPipeline = None
 
 try:
     from cache_dit import (
@@ -71,7 +77,10 @@ def disable_cache_on_transformer(transformer: torch.nn.Module) -> torch.nn.Modul
     # cache-dit 1.5.1 marks the FakeDiffusionPipeline class as cached when it
     # wraps a bare transformer, and disable_cache(transformer) never clears it,
     # so the next enable skips building a context and asserts.
-    if "_is_cached" in FakeDiffusionPipeline.__dict__:
+    if (
+        FakeDiffusionPipeline is not None
+        and "_is_cached" in FakeDiffusionPipeline.__dict__
+    ):
         del FakeDiffusionPipeline._is_cached
     for name in ("_is_parallelized", "_parallelism_config"):
         if hasattr(transformer, name):
@@ -589,6 +598,13 @@ def enable_cache_on_transformer(
         )
 
     # Build cache config (including SCM fields if provided)
+    # None keeps cache-dit's own default (the registered adapter's choice for
+    # its diffusers pipeline), so the key is only passed when set.
+    separate_cfg_kwargs = (
+        {}
+        if separate_cfg_override is None
+        else {"enable_separate_cfg": separate_cfg_override}
+    )
     cache_config = DBCacheConfig(
         num_inference_steps=config.num_inference_steps,
         Fn_compute_blocks=config.Fn_compute_blocks,
@@ -599,8 +615,7 @@ def enable_cache_on_transformer(
         # SCM fields
         steps_computation_mask=config.steps_computation_mask,
         steps_computation_policy=config.steps_computation_policy,
-        # None keeps the registered adapter's default for its diffusers pipeline.
-        enable_separate_cfg=separate_cfg_override,
+        **separate_cfg_kwargs,
     )
 
     # Build calibrator config. DMD and TaylorSeer are mutually exclusive
