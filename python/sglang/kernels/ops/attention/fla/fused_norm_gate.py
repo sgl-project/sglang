@@ -7,6 +7,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
 from sglang.kernels.jit.utils import get_jit_cuda_arch, is_arch_support_pdl
 from sglang.srt.utils import (
     cdiv,
