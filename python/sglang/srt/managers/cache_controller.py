@@ -35,6 +35,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.mem_cache.mla_host_dedup import MLAHostDedupContext
+    from sglang.srt.mem_cache.mla_host_shared import SharedCPUHostDedupContext
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
 from sglang.srt.layers.dp_attention import (
@@ -81,13 +83,20 @@ class LayerLoadingEvent:
 
 
 class LayerDoneCounter:
-    def __init__(self, num_layers: int):
+    def __init__(
+        self,
+        num_layers: int,
+        on_layer_ready: Optional[Callable[[int, int], None]] = None,
+        pending_layerwise_load: Optional[Callable[[int], bool]] = None,
+    ):
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        self.on_layer_ready = on_layer_ready
+        self.pending_layerwise_load = pending_layerwise_load
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -103,6 +112,20 @@ class LayerDoneCounter:
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
+        if self.on_layer_ready is not None:
+            self.on_layer_ready(self.consumer_index, threshold)
+
+    def finish_consumer(self):
+        if self.consumer_index >= 0 and self.on_layer_ready is not None:
+            # Finish layers that the model did not read during this forward.
+            self.wait_until(self.num_layers - 1)
+
+    def needs_layerwise_restore(self) -> bool:
+        return (
+            self.consumer_index >= 0
+            and self.pending_layerwise_load is not None
+            and self.pending_layerwise_load(self.consumer_index)
+        )
 
     def reset(self):
         self.producer_index = -1
@@ -196,6 +219,10 @@ class HiCacheAck(NamedTuple):
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
+    # A layer-wise broadcast may not have been submitted yet. CUDA events
+    # alone report an unrecorded event as ready, so check submission first.
+    ready_check: Optional[Callable[[], bool]] = None
+    consumer_index: int = -1
 
 
 @dataclass
@@ -311,7 +338,11 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mla_dedup_context: Optional[
+            MLAHostDedupContext | SharedCPUHostDedupContext
+        ] = None,
     ):
+        self.mla_dedup = mla_dedup_context
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
         self.attn_cp_group = attn_cp_group
@@ -327,6 +358,22 @@ class HiCacheController:
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
+        if self.mla_shared_enabled:
+            pools = [
+                entry.host_pool for entry in getattr(mem_pool_host, "entries", ())
+            ] or [mem_pool_host]
+            shared_pools = [
+                pool
+                for pool in pools
+                if getattr(getattr(pool, "allocator", None), "is_shared", False)
+            ]
+            if not shared_pools or any(
+                pool.allocator.process_group is not mla_dedup_context.process_group
+                for pool in shared_pools
+            ):
+                raise ValueError(
+                    "Shared MLA restore requires a shared pool on the same TP group."
+                )
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
@@ -356,7 +403,19 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
+        self.layer_done_counter = LayerDoneCounter(
+            self.transfer_layer_id_max,
+            on_layer_ready=(
+                mla_dedup_context.broadcast_ready_layers
+                if mla_dedup_context is not None and mla_dedup_context.layerwise_overlap
+                else None
+            ),
+            pending_layerwise_load=(
+                mla_dedup_context.has_pending_layerwise_load
+                if mla_dedup_context is not None and mla_dedup_context.layerwise_overlap
+                else None
+            ),
+        )
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -392,6 +451,24 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+    @property
+    def mla_dedup_enabled(self) -> bool:
+        return getattr(self, "mla_dedup", None) is not None
+
+    @property
+    def mla_shared_enabled(self) -> bool:
+        return getattr(getattr(self, "mla_dedup", None), "is_shared", False) is True
+
+    def set_mla_producer_stream(self, stream) -> None:
+        if self.mla_dedup_enabled:
+            self.mla_dedup.producer_stream = stream
+
+    def wait_mla_write_on_stream(self, stream) -> None:
+        if self.mla_dedup_enabled:
+            event = self.mla_dedup.last_write_finish_event
+            if event is not None:
+                stream.wait_event(event)
+
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
         """Derive CP rank/size from the attn_cp process group."""
         if self.attn_cp_group is not None:
@@ -402,6 +479,14 @@ class HiCacheController:
         return 0, 1
 
     def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
+        if self.mla_dedup_enabled:
+            from sglang.srt.mem_cache.mla_host_dedup import (
+                _prebuild_prefetch_sync_groups,
+            )
+
+            return _prebuild_prefetch_sync_groups(
+                self.tp_group, self.attn_cp_group, self.attn_tp_group, self.pp_group
+            )
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         groups: List[torch.distributed.ProcessGroup] = []
@@ -427,6 +512,16 @@ class HiCacheController:
                 )
             )
         return groups
+
+    def _take_or_create_sync_groups(self, field: str):
+        if self.mla_dedup_enabled:
+            groups = getattr(self.mla_dedup, field)
+            if groups is not None:
+                # Controller detach/rollback now owns destruction. A later
+                # attach creates fresh groups rather than reusing freed ones.
+                setattr(self.mla_dedup, field, None)
+                return groups
+        return self._create_sync_groups()
 
     def _destroy_sync_groups(
         self, groups: List[torch.distributed.ProcessGroup]
@@ -542,6 +637,12 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
+        if self.mla_shared_enabled:
+            raise ValueError(
+                "Shared MLA host restore currently supports L2 cache only."
+            )
+        if self.mla_dedup_enabled and storage_backend != "file":
+            raise ValueError("MLA host dedup currently supports only file storage.")
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
 
@@ -597,8 +698,12 @@ class HiCacheController:
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            self.prefetch_hits_sync_groups = self._take_or_create_sync_groups(
+                "prefetch_hits_sync_groups"
+            )
+            self.prefetch_completion_sync_groups = self._take_or_create_sync_groups(
+                "prefetch_completion_sync_groups"
+            )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
@@ -763,6 +868,9 @@ class HiCacheController:
         )
 
     def reset(self):
+        self.drain_shared_transfers()
+        if self.mla_dedup is not None and self.mla_dedup.layerwise_overlap:
+            self.mla_dedup.reset_layerwise_loads()
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
@@ -811,6 +919,30 @@ class HiCacheController:
             or self.ack_load_queue
         )
 
+    def drain_shared_transfers(self, *, synchronize_peers: bool = True) -> None:
+        """Keep shared rows alive until every submitted reader is finished.
+
+        Normal completion is gated by the tree's TP-MIN acknowledgement. Reset
+        bypasses that path, so it must explicitly drain copies before dropping
+        acknowledgements or clearing the shared host allocator. Process teardown
+        only drains local users: other processes retain their own mappings.
+        """
+        if not self.mla_shared_enabled:
+            return
+        failure = None
+        try:
+            self.l2_transfer_engine.device_to_host_stream.synchronize()
+            self.l2_transfer_engine.host_to_device_stream.synchronize()
+            for ack in (*self.ack_write_queue, *self.ack_load_queue):
+                ack.finish_event.synchronize()
+        except Exception as error:
+            if not synchronize_peers:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+        if synchronize_peers:
+            self.mla_dedup.synchronize_error(failure, operation="reset drain")
+            self.mla_dedup.synchronize_readers()
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -836,24 +968,64 @@ class HiCacheController:
         if len(self.write_queue) == 0:
             return
 
-        op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
-        self.write_queue.clear()
-
-        if wait_for_forward and self.write_fence_stream is not None:
-            # An evicted SWA page can belong to an unfinished checkpoint.
-            self.l2_transfer_engine.device_to_host_stream.wait_stream(
-                self.write_fence_stream
+        transfers = []
+        failure = None
+        try:
+            op = CacheOperation.merge_ops(self.write_queue)
+            host_indices, device_indices, pool_transfers = self._move_write_operation(
+                op
             )
+            self.write_queue.clear()
 
-        completion = self.l2_transfer_engine.submit_device_to_host(
-            self._l2_transfers(host_indices, device_indices, pool_transfers)
-        )
+            if wait_for_forward and self.write_fence_stream is not None:
+                # An evicted SWA page can belong to an unfinished checkpoint.
+                self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                    self.write_fence_stream
+                )
+
+            transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+            if self.mla_dedup_enabled is True:
+                transfers = [
+                    transfer
+                    for transfer in transfers
+                    if not getattr(transfer.host_pool, "_is_dummy", False)
+                ]
+                if self.mla_dedup.producer_stream is not None:
+                    self.l2_transfer_engine.device_to_host_stream.wait_stream(
+                        self.mla_dedup.producer_stream
+                    )
+        except Exception as error:
+            if not self.mla_shared_enabled:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+        if self.mla_shared_enabled:
+            # Only the owner writes shared KV. Every rank still backs up its
+            # private state; those rows do not need matching physical indices.
+            self.mla_dedup.validate_host_rows(transfers, failure=failure)
+            transfers = [
+                transfer
+                for transfer in transfers
+                if not getattr(transfer.host_pool.allocator, "is_shared", False)
+                or transfer.host_pool.allocator.is_owner
+            ]
+            failure = None
+            try:
+                completion = self.l2_transfer_engine.submit_device_to_host(transfers)
+                # Publish CPU-visible KV only after the owner's D2H finishes.
+                completion.finish_event.synchronize()
+            except Exception as error:
+                failure = f"{type(error).__name__}: {error}"
+            self.mla_dedup.synchronize_error(failure, operation="D2H publication")
+        else:
+            completion = self.l2_transfer_engine.submit_device_to_host(transfers)
+        if self.mla_dedup_enabled is True:
+            self.mla_dedup.last_write_finish_event = completion.finish_event
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "write"), completion.finish_event
         )
 
+        stats_kwargs = {"transfers": transfers} if self.mla_shared_enabled else {}
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
@@ -861,15 +1033,32 @@ class HiCacheController:
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
-                num_tokens_by_pool=self._num_tokens_by_pool(op),
-                num_bytes=self._transfer_num_bytes(op),
+                num_tokens_by_pool=(
+                    self._num_tokens_by_pool(op, **stats_kwargs) if transfers else {}
+                ),
+                num_bytes=(
+                    self._transfer_num_bytes(op, **stats_kwargs) if transfers else 0
+                ),
             )
         )
 
-    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+    def _transfer_num_bytes(
+        self, op: CacheOperation, *, transfers: Optional[list[L2Transfer]] = None
+    ) -> int:
+        if getattr(self.mem_pool_host, "_is_dummy", False) or (
+            transfers is not None
+            and not any(t.host_pool is self.mem_pool_host for t in transfers)
+        ):
+            return 0
         return len(op.device_indices) * self.mem_pool_host.size_per_token
 
-    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+    def _num_tokens_by_pool(
+        self, op: CacheOperation, *, transfers: Optional[list[L2Transfer]] = None
+    ) -> dict[str, int]:
+        if transfers is not None and not any(
+            t.host_pool is self.mem_pool_host for t in transfers
+        ):
+            return {}
         return {PoolName.KV.value: len(op.device_indices)}
 
     def load(
@@ -976,27 +1165,77 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
-        producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
-        self.load_queue.clear()
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
+        transfers = []
+        failure = None
+        try:
+            producer_id = self.layer_done_counter.update_producer()
+            op = CacheOperation.merge_ops(self.load_queue)
+            host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+            self.load_queue.clear()
+            producer_event = self.layer_done_counter.events[producer_id]
+            producer_event.start_event.record()
 
-        if self.load_fence_stream is not None:
-            # in overlap scheduling, reclaimed pages might still be written by the forward thread
-            # therefore a fence is needed for loading thread to prevent memory corruption
-            # todo: it's possible to use a finer-grained fence
-            self.l2_transfer_engine.host_to_device_stream.wait_stream(
-                self.load_fence_stream
+            if self.load_fence_stream is not None:
+                # A reclaimed GPU row may still be used by the forward thread.
+                self.l2_transfer_engine.host_to_device_stream.wait_stream(
+                    self.load_fence_stream
+                )
+            transfers = self._l2_load_transfers(
+                host_indices, device_indices, pool_transfers
             )
+        except Exception as error:
+            if not self.mla_shared_enabled:
+                raise
+            failure = f"{type(error).__name__}: {error}"
 
-        completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
-            start_event=producer_event.start_event,
-            on_layer_done=producer_event.complete,
-            transfer_layer_id_max=self.transfer_layer_id_max,
+        if self.mla_shared_enabled:
+            # Even a rank whose local index/event preparation failed must enter
+            # the common verdict, so peers do not wait forever for its metadata.
+            self.mla_dedup.validate_host_rows(transfers, failure=failure)
+
+        layerwise = self.mla_dedup_enabled and (
+            getattr(self.mla_dedup, "layerwise_overlap", False) is True
         )
+        load_kwargs = {}
+        if self.mla_dedup_enabled and not layerwise and not self.mla_shared_enabled:
+            load_kwargs["load_layer"] = self._mla_layer_loader(op.device_indices)
+        if layerwise:
+            transfers = [
+                transfer
+                for transfer in transfers
+                if not getattr(transfer.host_pool, "_is_dummy", False)
+            ]
+        failure = None
+        try:
+            completion = self.l2_transfer_engine.submit_host_to_device(
+                transfers,
+                start_event=producer_event.start_event,
+                on_layer_done=producer_event.complete,
+                transfer_layer_id_max=self.transfer_layer_id_max,
+                **load_kwargs,
+            )
+        except Exception as error:
+            if not self.mla_shared_enabled:
+                raise
+            failure = f"{type(error).__name__}: {error}"
+        if self.mla_shared_enabled:
+            self.mla_dedup.synchronize_error(failure, operation="H2D submission")
+        if self.mla_dedup_enabled and not layerwise and not self.mla_shared_enabled:
+            # Match #26691: finish the dedicated communicator's work before
+            # allowing the next forward to issue model-TP collectives.
+            self.l2_transfer_engine.host_to_device_stream.synchronize()
+
+        finish_event = completion.finish_event
+        ready_check = None
+        if layerwise:
+            kwargs = {"enable_timing": True} if completion.timing_enabled else {}
+            finish_event = device_module.Event(**kwargs)
+            self.mla_dedup.begin_layerwise_load(
+                producer_id, op.device_indices, finish_event
+            )
+            ready_check = lambda index=producer_id: (
+                self.mla_dedup.is_layerwise_load_done(index)
+            )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
             (id(self), "load"), completion.finish_event
@@ -1005,15 +1244,68 @@ class HiCacheController:
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=completion.start_event,
-                finish_event=completion.finish_event,
+                finish_event=finish_event,
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
                 timing_enabled=completion.timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
                 num_bytes=self._transfer_num_bytes(op),
+                ready_check=ready_check,
+                consumer_index=producer_id if layerwise else -1,
             )
         )
         return producer_id
+
+    def _mla_layer_loader(self, device_indices: torch.Tensor):
+        from sglang.srt.mem_cache.mla_host_dedup import V4HostDedupBroadcaster
+
+        broadcaster = self.mla_dedup.broadcaster
+        prepared_broadcast = None
+
+        def load_layer(transfers: list[L2Transfer], layer_id: int) -> None:
+            nonlocal prepared_broadcast
+            # This callback runs after the producer event and index preparation,
+            # under the engine's host-layout leases.
+            real_transfers = [
+                transfer
+                for transfer in transfers
+                if not getattr(transfer.host_pool, "_is_dummy", False)
+            ]
+            self.l2_transfer_engine._load_layer(real_transfers, layer_id)
+            if isinstance(broadcaster, V4HostDedupBroadcaster):
+                # V4 has multiple physical side pools behind a logical anchor.
+                # Each transfer already carries its translated indices and
+                # global-to-pool layer mapping. Draft pools remain rank-local.
+                for transfer in transfers:
+                    if not transfer.is_draft:
+                        broadcaster.broadcast_transfer(transfer, layer_id)
+                return
+            # Hybrid models interleave MLA with rank-local state layers.
+            # Use the same global-to-pool mapping as the physical H2D copy.
+            target = next(
+                (
+                    transfer
+                    for transfer in transfers
+                    if transfer.device_pool is broadcaster.device_pool
+                    and not transfer.is_draft
+                ),
+                None,
+            )
+            if target is None:
+                return
+            local_layer_id = (
+                target.layer_mapper(layer_id)
+                if target.layer_mapper is not None
+                else layer_id
+            )
+            if local_layer_id is not None and local_layer_id < broadcaster.layer_num:
+                if prepared_broadcast is None:
+                    prepared_broadcast = broadcaster.prepare_broadcast(
+                        device_indices, self.l2_transfer_engine.host_to_device_stream
+                    )
+                broadcaster.broadcast_loaded_layer(local_layer_id, prepared_broadcast)
+
+        return load_layer
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:
@@ -1133,6 +1425,8 @@ class HiCacheController:
                         kv_derived_transfers,
                     )
                 except Exception:
+                    # Keep emitting the remaining batch ACKs after a read
+                    # failure so peer ranks can finish their completion MINs.
                     logger.exception(
                         "HiCache prefetch transfer failed for request %s",
                         operation.request_id,
@@ -1152,6 +1446,12 @@ class HiCacheController:
             self.prefetch_sync_queue.put(ack)
         return completed_pages
 
+    def _skip_storage_pool_io(self, pool_name: PoolName) -> bool:
+        """Keep logical prefetch progress on ranks without a physical mirror."""
+        return pool_name == PoolName.KV and bool(
+            getattr(getattr(self, "storage_host_pool", None), "_is_dummy", False)
+        )
+
     def _page_transfer_kv_batch(
         self,
         operation: PrefetchOperation,
@@ -1167,9 +1467,14 @@ class HiCacheController:
 
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
-        # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
+        # Dummy ranks have no host buffer. Their optimistic count is reduced
+        # with the owner's actual result by the existing batch ACK protocol.
+        kv_hits = (
+            len(batch_hashes)
+            if self._skip_storage_pool_io(PoolName.KV)
+            else self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
         )
 
         # Read from KV-derived sidecar pools, if any.
@@ -1182,11 +1487,13 @@ class HiCacheController:
                     keys=batch_hashes,
                 )
                 for transfer in kv_derived_transfers
+                if not self._skip_storage_pool_io(transfer.name)
             ]
-            sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers, extra_info=extra_info
-            )
-            sidecar_hits = count_pool_hits(sidecar_results)
+            if current_kv_derived_transfers:
+                sidecar_results = self.storage_backend.batch_get_v2(
+                    current_kv_derived_transfers, extra_info=extra_info
+                )
+                sidecar_hits = count_pool_hits(sidecar_results)
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])
@@ -1293,6 +1600,9 @@ class HiCacheController:
                             operation
                         )
                 except Exception:
+                    # A failed rank must still join the hit-count MIN below;
+                    # otherwise peers can wait forever and this worker stops
+                    # processing subsequent prefetch requests.
                     logger.exception(
                         "HiCache storage query failed for request %s",
                         operation.request_id,

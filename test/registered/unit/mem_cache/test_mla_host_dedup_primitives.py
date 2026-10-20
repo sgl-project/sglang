@@ -1,10 +1,12 @@
 import unittest
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import HiCacheAck, LayerDoneCounter
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
@@ -17,6 +19,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -33,7 +36,522 @@ class _FakeStream:
     pass
 
 
-class TestMLAHostDedupPrimitives(unittest.TestCase):
+class TestMLAHostDedupPrimitives(CustomTestCase):
+    def test_grouped_dsa_preserves_pages_zero_indexer_and_tail_layers(self):
+        class DSAPool(SimpleNamespace):
+            pass
+
+        def make(rank):
+            pool = DSAPool(
+                layer_num=7,
+                device=torch.device("cpu"),
+                page_size=2,
+                kv_cache_dim=3,
+                kv_buffer=[
+                    torch.full((14, 1, 3), -1, dtype=torch.bfloat16) for _ in range(7)
+                ],
+                index_k_with_scale_buffer=[
+                    torch.full(
+                        (0 if layer in (0, 3, 6) else 7, 2, 4), 255, dtype=torch.uint8
+                    )
+                    for layer in range(7)
+                ],
+            )
+            with (
+                envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(1),
+                mock.patch(
+                    "sglang.srt.mem_cache.mla_host_dedup.DSATokenToKVPool", DSAPool
+                ),
+                mock.patch(
+                    "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                    return_value=(rank, 2),
+                ),
+            ):
+                return MLAHostDedupBroadcaster(pool, object(), 0)
+
+        owner, peer = make(0), make(1)
+        source = torch.tensor([4, 5, 0, 1, 10, 11, 6, 7, 2, 3])
+        destination = torch.tensor([8, 9, 6, 7, 12, 13, 2, 3, 0, 1])
+        for layer in range(7):
+            owner.device_pool.kv_buffer[layer].copy_(
+                torch.arange(42).view(14, 1, 3) + layer
+            )
+            if owner.idx_bufs[layer].numel():
+                owner.idx_bufs[layer].copy_(torch.arange(56).view(7, 2, 4) + layer)
+        for n in (10, 4):
+            for first, stop in ((0, 4), (4, 7)):
+                with self.subTest(tokens=n, first=first, stop=stop):
+                    packets = []
+                    with mock.patch.object(
+                        torch.distributed,
+                        "broadcast",
+                        side_effect=lambda tensor, **kwargs: packets.append(
+                            tensor.clone()
+                        ),
+                    ):
+                        owner.broadcast_loaded_layers(
+                            first, stop, (source[:n], source[:n:2] // 2)
+                        )
+                    self.assertEqual(len(packets), (n + 5) // 6)
+                    for layer in range(first, stop):
+                        peer.device_pool.kv_buffer[layer].fill_(-1)
+                        peer.idx_bufs[layer].fill_(255)
+                    with mock.patch.object(
+                        torch.distributed,
+                        "broadcast",
+                        side_effect=lambda tensor, **kwargs: tensor.copy_(
+                            packets.pop(0)
+                        ),
+                    ):
+                        peer.broadcast_loaded_layers(
+                            first, stop, (destination[:n], destination[:n:2] // 2)
+                        )
+                    self.assertEqual(packets, [])
+                    for layer in range(first, stop):
+                        torch.testing.assert_close(
+                            peer.device_pool.kv_buffer[layer][destination[:n]],
+                            owner.device_pool.kv_buffer[layer][source[:n]],
+                        )
+                        untouched = torch.ones(14, dtype=torch.bool)
+                        untouched[destination[:n]] = False
+                        self.assertTrue(
+                            (peer.device_pool.kv_buffer[layer][untouched] == -1).all()
+                        )
+                        if owner.idx_bufs[layer].numel():
+                            torch.testing.assert_close(
+                                peer.idx_bufs[layer][destination[:n:2] // 2],
+                                owner.idx_bufs[layer][source[:n:2] // 2],
+                            )
+
+    def test_grouped_layerwise_waits_for_h2d_and_cross_stream_consumers(self):
+        trace = []
+        stream = [mock.Mock(name="forward-A")]
+        first_stream = stream[0]
+        first_stream.wait_event.side_effect = lambda event: trace.append(
+            ("gpu_wait", "A")
+        )
+        second_stream = mock.Mock(name="forward-B")
+        second_stream.wait_event.side_effect = lambda event: trace.append(
+            ("gpu_wait", "B")
+        )
+        prepared = (mock.Mock(is_cuda=True), mock.Mock(is_cuda=True))
+        copied = SimpleNamespace(wait=lambda layer: trace.append(("h2d", layer)))
+        broadcaster = SimpleNamespace(
+            layer_num=7,
+            layerwise_group_size=4,
+            device_pool=SimpleNamespace(
+                layer_transfer_counter=SimpleNamespace(events=[copied])
+            ),
+            prepare_broadcast=lambda indices, stream: prepared,
+            broadcast_loaded_layers=lambda first, stop, prepared: trace.append(
+                ("group", first, stop)
+            ),
+        )
+        context = MLAHostDedupContext(broadcaster, None, None, layerwise_overlap=True)
+        finish = mock.Mock()
+        finish.query.return_value = False
+        context.begin_layerwise_load(0, torch.tensor([0, 1]), finish)
+        with (
+            mock.patch.object(
+                torch.cuda, "current_stream", side_effect=lambda: stream[0]
+            ),
+            mock.patch.object(torch.cuda, "Event", side_effect=lambda: mock.Mock()),
+            mock.patch(
+                "sglang.srt.utils.get_device_module",
+                return_value=SimpleNamespace(current_stream=lambda: stream[0]),
+            ),
+        ):
+            context.broadcast_ready_layers(0, 0)
+            for tensor in prepared:
+                tensor.record_stream.assert_not_called()
+            self.assertEqual(trace[:2], [("h2d", 3), ("group", 0, 4)])
+            self.assertFalse(context.is_layerwise_load_done(0))
+            stream[0] = second_stream
+            context.broadcast_ready_layers(0, 1)
+            for tensor in prepared:
+                tensor.record_stream.assert_not_called()
+            self.assertEqual(trace[-1], ("gpu_wait", "B"))
+            self.assertEqual(sum(item[0] == "group" for item in trace), 1)
+            context.broadcast_ready_layers(0, 4)
+            for tensor in prepared:
+                tensor.record_stream.assert_called_once_with(second_stream)
+            self.assertEqual(trace[-2:], [("h2d", 6), ("group", 4, 7)])
+            finish.record.assert_called_once()
+            self.assertFalse(context.is_layerwise_load_done(0))
+            with self.assertRaisesRegex(RuntimeError, "unfinished"):
+                context.release_layerwise_load(0)
+            stream[0] = first_stream
+            context.broadcast_ready_layers(0, 6)
+            first_stream.wait_event.assert_called_once_with(finish)
+        finish.query.return_value = True
+        context.release_layerwise_load(0)
+        self.assertFalse(context.layerwise_finish_streams)
+
+    def test_packed_dsa_broadcast_preserves_rank_local_rows_and_pages(self):
+        class DSAPool(SimpleNamespace):
+            pass
+
+        def make(rank, chunk_tokens):
+            pool = DSAPool(
+                layer_num=1,
+                device=torch.device("cpu"),
+                page_size=2,
+                kv_cache_dim=3,
+                kv_buffer=[torch.full((14, 1, 3), -1, dtype=torch.bfloat16)],
+                index_k_with_scale_buffer=[
+                    torch.full((7, 2, 4), 255, dtype=torch.uint8)
+                ],
+            )
+            with (
+                envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(chunk_tokens),
+                mock.patch(
+                    "sglang.srt.mem_cache.mla_host_dedup.DSATokenToKVPool", DSAPool
+                ),
+                mock.patch(
+                    "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                    return_value=(rank, 2),
+                ),
+            ):
+                return MLAHostDedupBroadcaster(pool, object(), 0)
+
+        source_rows = torch.tensor([4, 5, 0, 1, 10, 11, 6, 7, 2, 3])
+        peer_rows = torch.tensor([8, 9, 6, 7, 12, 13, 2, 3, 0, 1])
+        for chunk_tokens in (8, 1):
+            owner = make(0, chunk_tokens)
+            peer = make(1, chunk_tokens)
+            owner.device_pool.kv_buffer[0].copy_(torch.arange(42).view(14, 1, 3))
+            owner.idx_bufs[0].copy_(torch.arange(56).view(7, 2, 4))
+            for n in (10, 4):
+                with self.subTest(chunk_tokens=chunk_tokens, tokens=n):
+                    packets = []
+                    with mock.patch.object(
+                        torch.distributed,
+                        "broadcast",
+                        side_effect=lambda tensor, **kwargs: packets.append(
+                            tensor.clone()
+                        ),
+                    ):
+                        owner.broadcast_loaded_layer(
+                            0, (source_rows[:n], source_rows[:n:2] // 2)
+                        )
+                    self.assertEqual(
+                        len(packets), (n + 7) // 8 if chunk_tokens == 8 else n + n // 2
+                    )
+                    if chunk_tokens == 8:
+                        self.assertTrue(all(p.dtype == torch.uint8 for p in packets))
+                        self.assertEqual(
+                            sum(p.numel() for p in packets), n * 6 + n // 2 * 8
+                        )
+                    peer.device_pool.kv_buffer[0].fill_(-1)
+                    peer.idx_bufs[0].fill_(255)
+                    with mock.patch.object(
+                        torch.distributed,
+                        "broadcast",
+                        side_effect=lambda tensor, **kwargs: tensor.copy_(
+                            packets.pop(0)
+                        ),
+                    ):
+                        peer.broadcast_loaded_layer(
+                            0, (peer_rows[:n], peer_rows[:n:2] // 2)
+                        )
+                    self.assertEqual(packets, [])
+                    torch.testing.assert_close(
+                        peer.device_pool.kv_buffer[0][peer_rows[:n]],
+                        owner.device_pool.kv_buffer[0][source_rows[:n]],
+                    )
+                    torch.testing.assert_close(
+                        peer.idx_bufs[0][peer_rows[:n:2] // 2],
+                        owner.idx_bufs[0][source_rows[:n:2] // 2],
+                    )
+                    untouched = torch.ones(14, dtype=torch.bool)
+                    untouched[peer_rows[:n]] = False
+                    self.assertTrue(
+                        (peer.device_pool.kv_buffer[0][untouched] == -1).all()
+                    )
+                    untouched = torch.ones(7, dtype=torch.bool)
+                    untouched[peer_rows[:n:2] // 2] = False
+                    self.assertTrue((peer.idx_bufs[0][untouched] == 255).all())
+
+    def test_reset_waits_for_submitted_broadcasts(self):
+        context = MLAHostDedupContext(
+            mock.Mock(layer_num=1), None, None, layerwise_overlap=True
+        )
+        event = mock.Mock()
+        context.begin_layerwise_load(0, torch.tensor([1]), event)
+        with self.assertRaisesRegex(RuntimeError, "forward completes"):
+            context.reset_layerwise_loads()
+        event.synchronize.assert_not_called()
+        with mock.patch(
+            "sglang.srt.utils.get_device_module",
+            return_value=SimpleNamespace(current_stream=lambda: None),
+        ):
+            context.broadcast_ready_layers(0, 0)
+        context.reset_layerwise_loads()
+        event.synchronize.assert_called_once()
+        self.assertFalse(context.layerwise_finish_events)
+        context.begin_layerwise_load(0, torch.tensor([2]), mock.Mock())
+
+    def test_layerwise_slot_is_owned_until_acknowledged(self):
+        context = MLAHostDedupContext(
+            mock.Mock(layer_num=1), None, None, layerwise_overlap=True
+        )
+        event = mock.Mock()
+        event.query.return_value = True
+        context.begin_layerwise_load(0, torch.tensor([1]), event)
+        with self.assertRaisesRegex(RuntimeError, "broadcast completed"):
+            context.begin_layerwise_load(0, torch.tensor([2]), mock.Mock())
+        with self.assertRaisesRegex(RuntimeError, "unfinished"):
+            context.release_layerwise_load(0)
+        with mock.patch(
+            "sglang.srt.utils.get_device_module",
+            return_value=SimpleNamespace(current_stream=lambda: None),
+        ):
+            context.broadcast_ready_layers(0, 0)
+        with self.assertRaisesRegex(RuntimeError, "acknowledgement"):
+            context.begin_layerwise_load(0, torch.tensor([2]), mock.Mock())
+        event.query.return_value = False
+        self.assertFalse(context.is_layerwise_load_done(0))
+        with self.assertRaisesRegex(RuntimeError, "unfinished"):
+            context.release_layerwise_load(0)
+        event.query.return_value = True
+        context.release_layerwise_load(0)
+        context.begin_layerwise_load(0, torch.tensor([2]), mock.Mock())
+
+    def test_layerwise_rejects_hybrid_layer_mapping(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _create_mla_dedup_context,
+        )
+
+        pool = object()
+        params = SimpleNamespace(token_to_kv_pool_allocator=mock.Mock())
+        params.token_to_kv_pool_allocator.get_kvcache.return_value = object()
+        with mock.patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+            return_value=SimpleNamespace(enable_mla_hicache_layerwise_overlap=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "hybrid layer mappings"):
+                _create_mla_dedup_context(pool, params, None)
+
+    def test_layerwise_broadcast_follows_each_forward_wait(self):
+        trace = []
+
+        class Event:
+            def record(self):
+                trace.append("record")
+
+            def wait(self, stream):
+                trace.append(("wait", stream))
+
+            def query(self):
+                return True
+
+        broadcaster = SimpleNamespace(
+            layer_num=3,
+            is_src=True,
+            prepare_broadcast=mock.Mock(
+                side_effect=lambda indices, stream: (indices, None)
+            ),
+            broadcast_loaded_layer=mock.Mock(
+                side_effect=lambda layer, prepared: trace.append(("broadcast", layer))
+            ),
+        )
+        context = MLAHostDedupContext(broadcaster, None, None, layerwise_overlap=True)
+        with (
+            mock.patch(
+                "sglang.srt.managers.cache_controller.device_module.Event",
+                side_effect=Event,
+            ),
+            mock.patch(
+                "sglang.srt.utils.get_device_module",
+                return_value=SimpleNamespace(current_stream=lambda: "forward"),
+            ),
+        ):
+            counter = LayerDoneCounter(
+                3, context.broadcast_ready_layers, context.has_pending_layerwise_load
+            )
+            counter.set_consumer(0)
+            self.assertFalse(counter.needs_layerwise_restore())
+            finish = Event()
+            context.begin_layerwise_load(0, torch.tensor([2, 3]), finish)
+            self.assertTrue(counter.needs_layerwise_restore())
+            self.assertFalse(context.is_layerwise_load_done(0))
+            counter.wait_until(0)
+            counter.wait_until(0)  # Repeated reads must not rebroadcast.
+            self.assertTrue(counter.needs_layerwise_restore())
+            self.assertEqual(
+                [
+                    item
+                    for item in trace
+                    if isinstance(item, tuple) and item[0] == "broadcast"
+                ],
+                [("broadcast", 0)],
+            )
+            counter.finish_consumer()  # Model may not read every pool layer.
+            # A retained consumer index must not disable later decode graphs.
+            self.assertEqual(counter.consumer_index, 0)
+            self.assertFalse(counter.needs_layerwise_restore())
+
+        self.assertEqual(
+            [
+                item
+                for item in trace
+                if isinstance(item, tuple) and item[0] == "broadcast"
+            ],
+            [("broadcast", 0), ("broadcast", 1), ("broadcast", 2)],
+        )
+        self.assertEqual(trace[-1], "record")
+        self.assertTrue(context.is_layerwise_load_done(0))
+        self.assertEqual(broadcaster.prepare_broadcast.call_count, 1)
+
+    def test_unrecorded_layerwise_event_is_not_a_successful_ack(self):
+        # CUDA reports an event that has never been recorded as ready.
+        broadcaster = SimpleNamespace(
+            layer_num=1,
+            is_src=True,
+            prepare_broadcast=lambda indices, stream: (indices, None),
+            broadcast_loaded_layer=lambda layer, prepared: None,
+        )
+        context = MLAHostDedupContext(broadcaster, None, None, layerwise_overlap=True)
+        finish = mock.Mock()
+        finish.query.return_value = True
+        context.begin_layerwise_load(0, torch.tensor([1]), finish)
+        ack = HiCacheAck(
+            start_event=mock.Mock(),
+            finish_event=finish,
+            node_ids=[1],
+            ready_check=lambda: context.is_layerwise_load_done(0),
+            consumer_index=0,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        self.assertEqual(UnifiedRadixCache._count_ready_acks(None, [ack]), 0)
+        with mock.patch(
+            "sglang.srt.utils.get_device_module",
+            return_value=SimpleNamespace(current_stream=lambda: None),
+        ):
+            context.broadcast_ready_layers(0, 0)
+        finish.record.assert_called_once()
+        self.assertEqual(UnifiedRadixCache._count_ready_acks(None, [ack]), 1)
+
+    def test_storage_sync_groups_cover_pp_and_deduplicate_rank_sets(self):
+        from sglang.srt.distributed import parallel_state
+        from sglang.srt.mem_cache.mla_host_dedup import _prebuild_prefetch_sync_groups
+
+        rank_sets = {"tp": [0, 1, 2, 3], "cp": [0, 1], "attn": [0, 1], "pp": [0, 2]}
+        cpu_group = object()
+        with (
+            mock.patch.object(
+                torch.distributed,
+                "get_world_size",
+                side_effect=lambda group: len(rank_sets[group]),
+            ),
+            mock.patch.object(
+                torch.distributed,
+                "get_process_group_ranks",
+                side_effect=rank_sets.__getitem__,
+            ),
+            mock.patch.object(
+                parallel_state,
+                "get_world_group",
+                return_value=SimpleNamespace(cpu_group=cpu_group),
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.get_server_args",
+                return_value=SimpleNamespace(dist_timeout=1200),
+            ),
+            mock.patch.object(
+                parallel_state,
+                "create_custom_parallel_group",
+                side_effect=["hit-attn", "hit-pp"],
+            ) as create,
+        ):
+            groups = _prebuild_prefetch_sync_groups("tp", "cp", "attn", "pp")
+        self.assertEqual(groups, ["hit-attn", "hit-pp"])
+        self.assertEqual(
+            create.call_args_list,
+            [
+                mock.call(
+                    group_ranks=[0, 1],
+                    backend="gloo",
+                    metadata_group=cpu_group,
+                    timeout=timedelta(seconds=1200),
+                ),
+                mock.call(
+                    group_ranks=[0, 2],
+                    backend="gloo",
+                    metadata_group=cpu_group,
+                    timeout=timedelta(seconds=1200),
+                ),
+            ],
+        )
+
+    def test_storage_group_handoff_does_not_reuse_or_double_destroy(self):
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        context = MLAHostDedupContext(mock.Mock(), ["hits"], ["completion"])
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mla_dedup = context
+        controller._create_sync_groups = mock.Mock(return_value=["reattached"])
+        owned = controller._take_or_create_sync_groups("prefetch_hits_sync_groups")
+        owned += controller._take_or_create_sync_groups(
+            "prefetch_completion_sync_groups"
+        )
+        self.assertEqual(owned, ["hits", "completion"])
+        controller._create_sync_groups.assert_not_called()
+        with mock.patch.object(torch.distributed, "destroy_process_group") as destroy:
+            controller._destroy_sync_groups(owned)
+            context.destroy()
+            self.assertEqual(
+                destroy.call_args_list,
+                [mock.call("hits"), mock.call("completion")],
+            )
+        rebuilt = controller._take_or_create_sync_groups("prefetch_hits_sync_groups")
+        self.assertEqual(rebuilt, ["reattached"])
+        controller._create_sync_groups.assert_called_once()
+
+    def test_broadcast_preparation_translates_rank_local_physical_indices(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.device = "cpu"
+        broadcaster.idx_bufs = [torch.empty(1)]
+        broadcaster.device_pool = SimpleNamespace(
+            page_size=2,
+            host_transfer_translate=lambda indices: indices + 4,
+        )
+        indices, pages = broadcaster.prepare_broadcast(torch.tensor([2, 3, 0, 1]), None)
+        self.assertEqual(indices.tolist(), [6, 7, 4, 5])
+        self.assertEqual(pages.tolist(), [3, 2])
+
+    def test_shared_topk_skips_empty_indexer_but_broadcasts_kv(self):
+        broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)
+        broadcaster.is_src = True
+        broadcaster.src_global_rank = 0
+        broadcaster.group = object()
+        broadcaster.device_pool = SimpleNamespace(
+            kv_cache_dim=2,
+            kv_buffer=[torch.full((4, 1, 2), float(i)) for i in range(3)],
+        )
+        broadcaster.kv_staging = torch.empty(8)
+        broadcaster.idx_bufs = [
+            torch.full((2, 4), 10.0),
+            torch.empty(0, 4),
+            torch.full((2, 4), 12.0),
+        ]
+        broadcaster.idx_elem = 4
+        broadcaster.idx_staging = torch.empty(8)
+        payloads = []
+        with mock.patch.object(
+            torch.distributed,
+            "broadcast",
+            side_effect=lambda tensor, **kw: payloads.append(tensor.clone()),
+        ):
+            for layer in range(3):
+                broadcaster.broadcast_loaded_layer(
+                    layer, (torch.tensor([0, 1]), torch.tensor([0]))
+                )
+        self.assertEqual(len(payloads), 5)
+        for payload, expected in zip(payloads, (0, 10, 1, 2, 12)):
+            torch.testing.assert_close(payload, torch.full_like(payload, expected))
+
     def test_disabled_flag_is_a_noop(self):
         with mock.patch(
             "sglang.srt.mem_cache.mla_host_dedup.mla_host_dedup_eligible"
@@ -244,7 +762,51 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             )
 
         self.assertEqual(broadcaster.chunk_tokens, 7)
-        self.assertEqual(broadcaster.kv_staging.numel(), 2 * 7 * 4)
+        self.assertEqual(broadcaster.kv_staging.numel(), 3 * 4)
+
+    def test_indexer_staging_is_bounded_by_physical_pages(self):
+        class DSAPool(SimpleNamespace):
+            pass
+
+        pool = DSAPool(
+            layer_num=3,
+            device=torch.device("cpu"),
+            page_size=8,
+            kv_cache_dim=4,
+            kv_buffer=[torch.empty(16, 1, 4) for _ in range(3)],
+            index_k_with_scale_buffer=[
+                torch.empty(0, 8),
+                torch.empty(2, 8),
+                torch.empty(2, 8),
+            ],
+        )
+        with (
+            envs.SGLANG_MLA_DEDUP_CHUNK_TOKENS.override(1024),
+            mock.patch("sglang.srt.mem_cache.mla_host_dedup.DSATokenToKVPool", DSAPool),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                return_value=(0, 2),
+            ),
+        ):
+            broadcaster = MLAHostDedupBroadcaster(pool, object(), 0)
+        self.assertEqual(broadcaster.kv_staging.numel(), 16 * 4)
+        self.assertEqual(broadcaster.idx_staging.numel(), 2 * 8)
+        # A shared-topk placeholder at layer zero must not suppress later pages.
+        indices = torch.tensor([1, 0])
+        pool.index_k_with_scale_buffer[1].copy_(torch.arange(16).view(2, 8))
+        with mock.patch.object(torch.distributed, "broadcast") as broadcast:
+            broadcaster._bcast_layer(
+                pool.index_k_with_scale_buffer,
+                broadcaster.idx_staging,
+                indices,
+                broadcaster.idx_elem,
+                1,
+            )
+        broadcast.assert_called_once()
+        torch.testing.assert_close(
+            broadcaster.idx_staging.view(2, 8),
+            pool.index_k_with_scale_buffer[1][indices],
+        )
 
     def test_chunk_tokens_must_be_positive(self):
         device_pool = _device_pool_stub(
@@ -267,6 +829,7 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
     def test_build_eagerly_warms_dedicated_nccl_group(self):
         tp_group = object()
         dedicated_group = object()
+        cpu_group = object()
         device_pool = _device_pool_stub(
             layer_num=2,
             device=torch.device("cpu"),
@@ -292,6 +855,14 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                 "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
                 return_value=dedicated_group,
             ) as create_group,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.get_world_group",
+                return_value=SimpleNamespace(cpu_group=cpu_group),
+            ),
+            mock.patch(
+                "sglang.srt.mem_cache.mla_host_dedup.get_server_args",
+                return_value=SimpleNamespace(dist_timeout=1200),
+            ),
             mock.patch.object(torch.distributed, "broadcast") as broadcast,
             mock.patch.object(torch.cuda, "synchronize") as synchronize,
         ):
@@ -299,13 +870,73 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                 device_pool, tp_group, attn_tp_group=None
             )
 
-        create_group.assert_called_once_with(group_ranks=[4, 5], backend="nccl")
+        create_group.assert_called_once_with(
+            group_ranks=[4, 5],
+            backend="nccl",
+            metadata_group=cpu_group,
+            timeout=timedelta(seconds=1200),
+        )
         broadcast.assert_called_once()
         self.assertEqual(broadcast.call_args.args[0].numel(), 1)
         self.assertIs(broadcast.call_args.kwargs["group"], dedicated_group)
         self.assertEqual(broadcast.call_args.kwargs["src"], 4)
         synchronize.assert_called_once_with(device_pool.device)
         self.assertIs(broadcaster.group, dedicated_group)
+
+    def test_custom_group_uses_cpu_metadata_and_preserves_partition_order(self):
+        from sglang.srt.distributed import parallel_state
+
+        cpu_group = object()
+        first, second = object(), object()
+
+        def gather(output, config, *, group):
+            self.assertIs(group, cpu_group)
+            self.assertEqual(config, [2, 3])
+            output[:] = [[0, 1], [0, 1], [2, 3], [2, 3]]
+
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_world_size", return_value=4),
+            mock.patch.object(torch.distributed, "get_rank", return_value=2),
+            mock.patch.object(torch.distributed, "get_backend", return_value="gloo"),
+            mock.patch.object(
+                torch.distributed, "all_gather_object", side_effect=gather
+            ),
+            mock.patch.object(torch.distributed, "monitored_barrier") as barrier,
+            mock.patch.object(
+                torch.distributed,
+                "new_group",
+                side_effect=[first, second, first, second],
+            ) as create,
+            mock.patch.object(parallel_state, "_is_npu", False),
+        ):
+            result = parallel_state.create_custom_parallel_group(
+                [3, 2], "nccl", metadata_group=cpu_group
+            )
+            timed_result = parallel_state.create_custom_parallel_group(
+                [3, 2],
+                "nccl",
+                metadata_group=cpu_group,
+                timeout=timedelta(seconds=1200),
+            )
+        self.assertIs(result, second)
+        self.assertIs(timed_result, second)
+        barrier.assert_called_once_with(
+            group=cpu_group, timeout=timedelta(seconds=1200), wait_all_ranks=True
+        )
+        self.assertEqual(
+            create.call_args_list,
+            [
+                mock.call(ranks=[0, 1], backend="nccl"),
+                mock.call(ranks=[2, 3], backend="nccl"),
+                mock.call(
+                    ranks=[0, 1], backend="nccl", timeout=timedelta(seconds=1200)
+                ),
+                mock.call(
+                    ranks=[2, 3], backend="nccl", timeout=timedelta(seconds=1200)
+                ),
+            ],
+        )
 
     def test_indexer_pages_preserve_logical_order(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)

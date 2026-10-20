@@ -211,11 +211,18 @@ class MambaPoolHost(HostKVCache):
             for layers in self.conv_device_layers
         ]
 
-        self.kv_buffer = self.init_kv_buffer()
-        self._configure_npu_mamba_io()
-        self._init_write_back_staging_buffers()
-        self.lock = threading.RLock()
-        self.clear()
+        # Keep each successful registration visible to destroy() even when a
+        # later state tensor or metadata initialization fails.
+        self.kv_buffer = []
+        try:
+            self.kv_buffer = self.init_kv_buffer()
+            self._configure_npu_mamba_io()
+            self._init_write_back_staging_buffers()
+            self.lock = threading.RLock()
+            self.clear()
+        except Exception:
+            self.destroy()
+            raise
 
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()
@@ -250,7 +257,7 @@ class MambaPoolHost(HostKVCache):
             # 0-element temporal buffer, so hand back a plain empty tensor.
             if np.prod(dims) == 0:
                 return torch.empty(dims, dtype=dtype, device=device)
-            return _host_alloc(
+            buffer = _host_alloc(
                 dims,
                 dtype=dtype,
                 device=device,
@@ -260,6 +267,8 @@ class MambaPoolHost(HostKVCache):
                     int(np.prod(dims[1:])) * dtype.itemsize
                 ),
             )
+            self.kv_buffer.append(buffer)
+            return buffer
 
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous

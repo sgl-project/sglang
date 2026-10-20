@@ -2147,6 +2147,77 @@ class TestSSLArgs(unittest.TestCase):
 
 
 class TestHiCacheArgs(CustomTestCase):
+    def test_layerwise_overlap_rejects_unordered_forward_paths(self):
+        for overrides, message in (
+            ({"pp_size": 2}, "PP=1"),
+            ({"attn_dp_size": 2}, "attention DP"),
+            ({"attn_cp_size": 2}, "attention DP/CP"),
+            ({"speculative_algorithm": "EAGLE"}, "speculative decoding"),
+            ({"disaggregation_mode": "decode"}, "disaggregated serving"),
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_host_dedup=True,
+                    enable_mla_hicache_layerwise_overlap=True,
+                    **overrides,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_hicache(args)
+
+    def test_layerwise_overlap_requires_host_dedup(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_layerwise_overlap=True,
+        )
+        with self.assertRaisesRegex(ValueError, "requires.*host-dedup"):
+            handle_hicache(args)
+
+    def test_layerwise_overlap_accepts_plain_tp(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            enable_mla_hicache_layerwise_overlap=True,
+            tp_size=2,
+        )
+        handle_hicache(args)
+        self.assertTrue(resolution_result(args, "enable_mla_hicache_layerwise_overlap"))
+
+    def test_mla_host_dedup_rejects_sharded_dcp(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            dcp_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "distinct KV shards"):
+            handle_hicache(args)
+
+    def test_mla_host_dedup_accepts_replicated_l2(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            enable_mla_hicache_host_dedup=True,
+            dcp_size=1,
+        )
+        handle_hicache(args)
+        self.assertTrue(resolution_result(args, "enable_mla_hicache_host_dedup"))
+
+    def test_mla_host_dedup_storage_backend_boundary(self):
+        for backend in (None, "file", "mooncake"):
+            with self.subTest(backend=backend):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    enable_mla_hicache_host_dedup=True,
+                    hicache_storage_backend=backend,
+                )
+                if backend == "mooncake":
+                    with self.assertRaisesRegex(ValueError, "only file storage"):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+                    self.assertEqual(
+                        resolution_result(args, "hicache_storage_backend"), backend
+                    )
+
     def test_host_receive_speculative_uses_shared_retraction_pool(self):
         """Speculation must still resolve host receive to the shared host pool."""
         for algorithm, threshold in (

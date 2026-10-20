@@ -1975,13 +1975,33 @@ class ModelRunner:
             get_model().override(shared_experts=self.model.shared_experts_config),
             ctx_mgr,
         ):
+            layer_counter = getattr(
+                self.token_to_kv_pool, "layer_transfer_counter", None
+            )
+            memory = get_memory()
+            # Captured graphs cannot pick up this restore's per-layer waits.
+            # A shared-host reader must execute its getters outside the graph.
+            shared_restore = bool(
+                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                and getattr(memory, "enable_mla_hicache_host_dedup", False)
+                and getattr(memory, "mla_hicache_host_dedup_mode", "broadcast")
+                == "shared"
+                and layer_counter is not None
+                and layer_counter.consumer_index >= 0
+            )
+            layerwise_restore = shared_restore or bool(
+                getattr(memory, "enable_mla_hicache_layerwise_overlap", False)
+                and layer_counter is not None
+                and getattr(layer_counter, "needs_layerwise_restore", lambda: False)()
+            )
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
             can_run_graph = bool(
-                mode_check()
+                not layerwise_restore
+                and mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
@@ -2026,7 +2046,8 @@ class ModelRunner:
                     forward_count=split_forward_count,
                 )
             elif (
-                forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+                not layerwise_restore
+                and forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
