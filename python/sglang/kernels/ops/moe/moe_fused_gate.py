@@ -284,15 +284,6 @@ def _router_triton_kernel(
         :, None
     ]  # [BLOCK_M, 1]
 
-    # Fill fused-shared-expert slots: weight = routed_sum / routed_scaling_factor,
-    # id = num_experts + (slot - K_ROUTED).
-    if K_ROUTED < K:
-        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
-        shared_weight = routed_sum / routed_scaling_factor  # [BLOCK_M, 1]
-        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]  # [1, BLOCK_K]
-        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
-        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
-
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -304,6 +295,13 @@ def _router_triton_kernel(
         selected_vals = selected_vals / norm
     if APPLY_SCALE:
         selected_vals = selected_vals * routed_scaling_factor
+    if K_ROUTED < K:
+        # The shared expert's contribution is independent of routed normalization.
+        is_shared = (offs_k[None, :] >= K_ROUTED) & mask_k_total[None, :]
+        shared_weight = 1.0 if APPLY_SCALE else 1.0 / routed_scaling_factor
+        shared_idx = (N + (offs_k - K_ROUTED)).to(tl.int32)[None, :]
+        selected_vals = tl.where(is_shared, shared_weight, selected_vals)
+        selected_idx = tl.where(is_shared, shared_idx, selected_idx)
     if HAS_PADDING:
         selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
         selected_idx = tl.where(live_m[:, None], selected_idx, -1)
