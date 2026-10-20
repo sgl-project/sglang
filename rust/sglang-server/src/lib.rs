@@ -18,8 +18,8 @@ mod tokenizer_manager;
 mod utils;
 
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
-    RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
+    ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::MmData;
@@ -38,7 +38,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
-use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
+use crate::utils::startup::{advertise_listener_ports, grpc_listen_addr, listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
@@ -304,6 +304,7 @@ impl Server {
             .map_err(|e| value_error("bad listen address", e))?;
         let grpc_addr = grpc_listen_addr(&server_args, port_offset)
             .map_err(|e| value_error("bad gRPC listen address", e))?;
+        let server_args = advertise_listener_ports(server_args, http_addr, grpc_addr);
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
@@ -314,6 +315,7 @@ impl Server {
                 from_scheduler_cap,
                 stage_channel_cap,
                 cores,
+                metrics_listener: port_offset.unwrap_or(0) == 0,
             },
             server_args: std::sync::Arc::new(server_args),
         };
@@ -357,6 +359,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DisaggregationMode>()?;
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
+    m.add_class::<MetricsConfig>()?;
     m.add_class::<ServerArgs>()?;
     m.add_class::<MmFamily>()?;
     m.add_class::<MmResample>()?;

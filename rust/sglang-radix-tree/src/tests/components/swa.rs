@@ -6443,7 +6443,7 @@ fn buffer_mode_backup_window_is_the_target_alone_at_both_call_sites() {
 }
 
 #[test]
-fn write_back_reinsert_still_backs_up_an_unbacked_swa_window() {
+fn write_back_reinsert_defers_swa_backup_while_write_through_publishes() {
     let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(
         CacheInitParams {
             is_write_back: true,
@@ -6462,6 +6462,15 @@ fn write_back_reinsert_still_backs_up_an_unbacked_swa_window() {
     tc.commit_backup(leaf, Tensor::from_slice(&[100i64, 101]), HashMap::new())
         .expect("live test node");
 
+    let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
+    assert!(
+        !result
+            .cache_actions
+            .iter()
+            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+    );
+
+    tc.is_write_back = false;
     let result = tc.insert(&insert_params_swa(&key, &[20, 21], 0, 0));
     let backups: Vec<_> = result
         .cache_actions

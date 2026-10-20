@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.third_party import pynvml
+from sglang.srt.environ import envs as srt_envs
 
 logger = init_logger(__name__)
 
@@ -154,15 +155,21 @@ class _SageAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        try:
-            from sageattention import sageattn  # noqa: F401
-        except ImportError:
-            logger.info(
-                "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
-            )
-            return AttentionBackendEnum.FA
+        trtllm_gen = srt_envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower() in {
+            "trtllm_gen",
+            "trtllm-gen",
+        }
 
-        if platform.is_hopper():
+        if not trtllm_gen:
+            try:
+                from sageattention import sageattn  # noqa: F401
+            except ImportError:
+                logger.info(
+                    "Sage Attention backend is not installed (To install it, run `pip install git+https://github.com/thu-ml/SageAttention.git@d9704247a5139ab4c03bf7fc6b35cc0e2cbb5ea4 --no-build-isolation`). Falling back to Flash Attention."
+                )
+                return AttentionBackendEnum.FA
+
+        if not trtllm_gen and platform.is_hopper():
             try:
                 # fixed SM90 bindings retain the fake implementation under its own name
                 from sageattention.sm90_compile import (  # noqa: F401
@@ -258,8 +265,11 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
 
 
 # The vendored Triton tile-64 kernel is written against Hopper and Blackwell
-# block-sparse geometry; older architectures fail closed.
-VSA_H3_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
+# block-sparse geometry. sm80 (A100) is supported too: there the kernel selects
+# a raw-pointer load path, because Triton does not lower TMA descriptor loads
+# natively before Hopper (see vsa_h3_kernels.py). Older architectures still
+# fail closed.
+VSA_H3_CAPABILITIES = frozenset({(8, 0), (9, 0), (10, 0), (10, 3)})
 
 
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
@@ -275,9 +285,9 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
-                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
-                f"this device reports {found}."
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 8.0 "
+                "(A100), 9.0 (Hopper), 10.0 (B200 / GB200) or 10.3 "
+                f"(B300 / GB300); this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
@@ -589,19 +599,16 @@ class CudaPlatformBase(Platform):
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
+    def synchronize(cls) -> None:
+        torch.cuda.synchronize()
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
+    def empty_cache(cls) -> None:
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        raise NotImplementedError
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -855,6 +862,9 @@ class CudaPlatformBase(Platform):
             from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_vae_cuda_opt import (
                 maybe_optimize_minimax_h3_vae,
             )
+            from sglang.multimodal_gen.runtime.models.vaes.qwen_image21_vae_cuda_opt import (
+                maybe_optimize_qwen_image21_vae,
+            )
             from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
                 maybe_optimize_qwen_image_vae,
                 maybe_optimize_wan_vae,
@@ -864,6 +874,7 @@ class CudaPlatformBase(Platform):
             vae = maybe_optimize_autoencoder_kl(vae)
             vae = maybe_optimize_wan_vae(vae)
             vae = maybe_optimize_qwen_image_vae(vae)
+            vae = maybe_optimize_qwen_image21_vae(vae)
             vae = maybe_optimize_minimax_h3_vae(vae)
         except Exception:
             logger.warning(

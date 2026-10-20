@@ -22,13 +22,8 @@ if "SGLANG_DIFFUSION_TRACE_FUNCTION" in os.environ:
 
 if TYPE_CHECKING:
     SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
-    LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
-    CUDA_VISIBLE_DEVICES: str | None = None
     SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
-    SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
-    SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
-    SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
     SGLANG_DIFFUSION_DISABLE_EARLY_VAE_DECODER_CAST: bool = False
     SGLANG_DIFFUSION_DISABLE_VAE_DECODER_STORE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_WILLNEED: bool = False
@@ -36,15 +31,9 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_DEBUG_HOST_MEMORY: bool = False
     SGLANG_DIFFUSION_DEBUG_LAYERWISE_TIMING: bool = False
     SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE: bool = False
-    SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
-    MAX_JOBS: str | None = None
-    NVCC_THREADS: str | None = None
-    CMAKE_BUILD_TYPE: str | None = None
-    VERBOSE: bool = False
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
-    SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
         "~/.cache/sglang/diffusion/host_spill"
@@ -125,6 +114,10 @@ if TYPE_CHECKING:
     SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES: int | None = None
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
+    SGLANG_ENABLE_FUSED_QKNORM_ROPE: bool = True
+    MINIMAX_H3_VAE_DECODER_FUSED_NORM: bool = True
+    MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM: bool = True
+    MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT: bool = True
     SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
     SGLANG_DIFFUSION_FP8_WEIGHT_DEQUANT_CACHE: bool = True
     SGLANG_DIFFUSION_ENABLE_COSMOS3_STEP_MIXED_PRECISION: bool = True
@@ -135,19 +128,13 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
+    SGLANG_USE_ROCM_AITER_TGEMM: bool = False
 
 
 def get_default_cache_root() -> str:
     return os.getenv(
         "XDG_CACHE_HOME",
         os.path.join(os.path.expanduser("~"), ".cache"),
-    )
-
-
-def get_default_config_root() -> str:
-    return os.getenv(
-        "XDG_CONFIG_HOME",
-        os.path.join(os.path.expanduser("~"), ".config"),
     )
 
 
@@ -202,34 +189,6 @@ def _lazy_path(
 # begin-env-vars-definition
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # ================== Installation Time Env Vars ==================
-    # Target device of sglang-diffusion, supporting [cuda (by default),
-    # rocm, neuron, cpu, openvino]
-    "SGLANG_DIFFUSION_TARGET_DEVICE": _lazy_str(
-        "SGLANG_DIFFUSION_TARGET_DEVICE", "cuda"
-    ),
-    # Maximum number of compilation jobs to run in parallel.
-    # By default this is the number of CPUs
-    "MAX_JOBS": _lazy_str("MAX_JOBS"),
-    # Number of threads to use for nvcc
-    # By default this is 1.
-    # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
-    "NVCC_THREADS": _lazy_str("NVCC_THREADS"),
-    # CMake build type
-    # If not set, defaults to "Debug" or "RelWithDebInfo"
-    # Available options: "Debug", "Release", "RelWithDebInfo"
-    "CMAKE_BUILD_TYPE": _lazy_str("CMAKE_BUILD_TYPE"),
-    # If set, sgl_diffusion will print verbose logs during installation
-    "VERBOSE": _lazy_bool("VERBOSE"),
-    # Root directory for SGL-diffusion configuration files
-    # Defaults to `~/.config/sgl_diffusion` unless `XDG_CONFIG_HOME` is set
-    # Note that this not only affects how sgl_diffusion finds its configuration files
-    # during runtime, but also affects how sgl_diffusion installs its configuration
-    # files during **installation**.
-    "SGLANG_DIFFUSION_CONFIG_ROOT": _lazy_path(
-        "SGLANG_DIFFUSION_CONFIG_ROOT",
-        lambda: os.path.join(get_default_config_root(), "sgl_diffusion"),
-    ),
     # ================== Runtime Env Vars ==================
     # Root directory for SGL-diffusion cache files
     # Defaults to `~/.cache/sgl_diffusion` unless `XDG_CACHE_HOME` is set
@@ -240,28 +199,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "SGLANG_DIFFUSION_NCCL_SO_PATH": _lazy_str("SGLANG_DIFFUSION_NCCL_SO_PATH"),
-    # when `SGLANG_DIFFUSION_NCCL_SO_PATH` is not set, sgl_diffusion will try to find the nccl
-    # library file in the locations specified by `LD_LIBRARY_PATH`
-    "LD_LIBRARY_PATH": _lazy_str("LD_LIBRARY_PATH"),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
     "LOCAL_RANK": _lazy_int("LOCAL_RANK", 0),
-    # used to control the visible devices in the distributed setting
-    "CUDA_VISIBLE_DEVICES": _lazy_str("CUDA_VISIBLE_DEVICES"),
-    # this is used for configuring the default logging level
-    "SGLANG_DIFFUSION_LOGGING_LEVEL": _lazy_str(
-        "SGLANG_DIFFUSION_LOGGING_LEVEL", "INFO"
-    ),
-    # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
-    "SGLANG_DIFFUSION_LOGGING_PREFIX": _lazy_str("SGLANG_DIFFUSION_LOGGING_PREFIX", ""),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
     "SGLANG_DIFFUSION_ATTENTION_CONFIG": _lazy_path(
         "SGLANG_DIFFUSION_ATTENTION_CONFIG"
     ),
-    # Optional override to force a specific attention backend (e.g. "aiter")
-    "SGLANG_DIFFUSION_ATTENTION_BACKEND": _lazy_str(
-        "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+    # Cosmos3 Multiview-AV attention backend for masked exports: "auto" (default;
+    # FA4 block-sparse on Hopper and Blackwell, FlexAttention Triton elsewhere), "triton" or
+    # "fa4". An explicit pipeline-config multiview_attention_backend wins over it.
+    # Both kernels compute the same attention.
+    "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND": _lazy_str(
+        "SGLANG_DIFFUSION_COSMOS3_MULTIVIEW_ATTENTION_BACKEND"
+    ),
+    # Debug: under Ulysses, recompute each layer's attention on the gathered
+    # full sequence and log the difference to the sharded result (exactness
+    # check of the collectives; slow, first denoising step only).
+    "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DEBUG_COSMOS3_MULTIVIEW_SP_CHECK"
+    ),
+    "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
+        "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
     ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
@@ -297,10 +257,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": _lazy_path(
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR"
     ),
-    # If set, sgl_diffusion will run in development mode, which will enable
-    # some additional endpoints for developing and debugging,
-    # e.g. `/reset_prefix_cache`
-    "SGLANG_DIFFUSION_SERVER_DEV_MODE": _lazy_bool("SGLANG_DIFFUSION_SERVER_DEV_MODE"),
     # Kill-switch for the courier thread that ships checkpoint-mapped layers to
     # the device off the compute thread. The courier already falls back to the
     # synchronous copy on any failure; this forces that path up front.
@@ -504,6 +460,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM": _lazy_bool(
         "SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM"
     ),
+    # Kill-switch for the fused QK RMSNorm + RoPE kernels in diffusion DiTs.
+    # Only 0/false/off/no disable it; any other value keeps it on.
+    "SGLANG_ENABLE_FUSED_QKNORM_ROPE": lambda: (
+        os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
+        not in {"0", "false", "off", "no"}
+    ),
+    # MiniMax-H3 VAE decoder: fused RMSNorm / QK RMSNorm+RoPE kernels in the
+    # ViT blocks (NVIDIA only). Only 1/true/yes/on keep it enabled.
+    "MINIMAX_H3_VAE_DECODER_FUSED_NORM": lambda: (
+        os.getenv("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # MiniMax-H3 VAE decoder: run the ViT norms in FP32 (the released recipe).
+    # Only 1/true/yes/on keep it enabled.
+    "MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM": lambda: (
+        os.getenv("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1").strip().lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # MiniMax-H3 VAE: stitch temporal decode chunks into a preallocated output
+    # as they finish instead of concatenating at the end.
+    "MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT": lambda: (
+        os.getenv("MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT", "1").strip().lower()
+        not in ("0", "false", "no", "off", "disable", "disabled")
+    ),
     # Dequantize storage-only FP8 linear weights to the compute dtype once,
     # at first use (bit-identical outputs; trades weight VRAM for skipping
     # the per-forward dequant pass). Weights are kept FP8-resident when free
@@ -536,6 +516,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_ROCM_VAE_CONV2D": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D"),
     # ROCm: use BF16 compute for the Conv2D replacement (implies CONV2D=true)
     "SGLANG_USE_ROCM_VAE_CONV2D_BF16": _lazy_bool("SGLANG_USE_ROCM_VAE_CONV2D_BF16"),
+    # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
+    # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
+    "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
