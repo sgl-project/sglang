@@ -315,7 +315,7 @@ def _get_epv1_launch_configs(
 
 
 def _get_epv2_launch_config(tbo_enabled: bool) -> _MoriEPv2LaunchConfig:
-    if not tbo_enabled:
+    if not tbo_enabled or not envs.SGLANG_MORI_EPV2_TBO_GRID_CAP.get():
         # MORI picks its own schedule.
         return _MoriEPv2LaunchConfig(None, None, None, None)
     # Under TBO a sibling batch computes while this one communicates, so cap the
@@ -768,6 +768,9 @@ class _MoriEPDispatcherImplBase:
         self._comm_stream = None
         self.async_finish = False
         self._tbo_enabled = is_tbo_enabled()
+        # Whether the current call belongs to a TBO micro-batch; set by
+        # MoriEPDispatcher._get_impl before every stage.
+        self._in_tbo_subbatch = False
         self._trim_recv = envs.SGLANG_MORI_RECV_BOUND.get()
         self._manual_recv_cap = envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.get()
         self._recv_cap_pow2_buckets = False
@@ -799,7 +802,8 @@ class _MoriEPDispatcherImplBase:
             self._recv_cap = min(self._manual_recv_cap, self._get_physical_recv_rows())
         elif (
             self._trim_recv
-            and not self._tbo_enabled
+            # The DP token counts describe the whole batch, not a micro-batch.
+            and not self._in_tbo_subbatch
             and self._is_recv_layout_verified()
         ):
             bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
@@ -1626,6 +1630,16 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         # halves back to back.
         return self.enable_sdma
 
+    def _use_comm_stream(self) -> bool:
+        # Only a TBO micro-batch has a sibling to overlap with; other forwards of
+        # a TBO-enabled server run the transfer on the compute stream.
+        return self._comm_stream is not None and self._in_tbo_subbatch
+
+    def _capture_event_if_async(self):
+        if not self._use_comm_stream():
+            return None
+        return super()._capture_event_if_async()
+
     def _dispatch_transport(
         self, hidden_states, topk_weights, topk_ids, scale, ready_event
     ):
@@ -1646,7 +1660,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 hidden_states, topk_weights, scale, topk_ids, return_routing=True
             )
             self.mori_op.dispatch_recv()
-        elif self._comm_stream is None:
+        elif not self._use_comm_stream():
             result = self.mori_op.dispatch(
                 hidden_states, topk_weights, scale, topk_ids, **kwargs
             )
@@ -1672,7 +1686,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 hidden_states, None, self._recv_topk_ids, routing=self._routing
             )
             self.mori_op.combine_recv()
-        elif self._comm_stream is None:
+        elif not self._use_comm_stream():
             out, _ = self.mori_op.combine(
                 hidden_states, None, self._recv_topk_ids, routing=self._routing
             )
@@ -1775,6 +1789,8 @@ class MoriEPDispatcher(BaseDispatcher):
         instance_id: int = 0,
     ):
         super().__init__()
+        # Set per call by MaybeTboDeepEPDispatcher; stays False outside TBO.
+        self.tbo_subbatch_active = False
 
         self._is_epv2 = envs.SGLANG_MORI_EP_V2.get()
         if self._is_epv2 and deepep_mode == DeepEPMode.AUTO:
@@ -1912,11 +1928,13 @@ class MoriEPDispatcher(BaseDispatcher):
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
-            return self._normal_dispatcher
+            impl = self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
-            return self._low_latency_dispatcher
+            impl = self._low_latency_dispatcher
         else:
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
+        impl._in_tbo_subbatch = self.tbo_subbatch_active
+        return impl
 
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage

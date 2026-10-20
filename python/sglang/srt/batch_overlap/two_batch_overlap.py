@@ -1201,7 +1201,11 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         return self._inners[0].expert_mask_gpu
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
-        return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
+        inner = self._inners[tbo_subbatch_index or 0]
+        # Tells the dispatcher whether this call belongs to a TBO micro-batch, so
+        # TBO-only settings stay off the ordinary forwards of a TBO-enabled server.
+        inner.tbo_subbatch_active = tbo_subbatch_index is not None
+        return getattr(inner, name)(**kwargs)
 
     def dispatch(self, **kwargs) -> DispatchOutput:
         return self._execute("dispatch", **kwargs)

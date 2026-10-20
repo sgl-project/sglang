@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.token_dispatcher import moriep
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import get_flags, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -112,13 +112,14 @@ class _MoriEPv2TestCase(CustomTestCase):
             item.stop()
         reset_context()
 
-    def _make_dispatcher(self, deepep_mode):
+    def _make_dispatcher(self, deepep_mode, async_finish=False):
         dispatcher = MoriEPDispatcher(
             group=None,
             router_topk=_TOPK,
             hidden_size=_HIDDEN,
             params_dtype=torch.bfloat16,
             deepep_mode=deepep_mode,
+            async_finish=async_finish,
         )
         dispatcher._get_impl()._mori_op = _FakeOp(self.log)
         return dispatcher
@@ -169,6 +170,57 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
                 os.environ["MORI_ENABLE_SDMA"] = "1" if sdma else "0"
                 impl = self._make_dispatcher(deepep_mode)._get_impl()
                 self.assertEqual(impl._is_recv_layout_verified(), verified)
+
+
+class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
+    """--enable-two-batch-overlap must only change the calls that belong to a TBO
+    micro-batch; decode, verify and unsplit prefill forwards of the same server
+    keep the ordinary transfer settings."""
+
+    def _make_tbo_dispatcher(self):
+        stream = object()
+        with (
+            get_flags().moe.override(tbo_enabled=True),
+            patch.object(
+                moriep.CommStreamPool, "get_stream_from_pool", return_value=stream
+            ),
+        ):
+            dispatcher = self._make_dispatcher(DeepEPMode.NORMAL, async_finish=True)
+        self.assertIs(dispatcher._get_impl()._comm_stream, stream)
+        return dispatcher
+
+    def test_maybe_tbo_dispatcher_marks_micro_batch_calls(self):
+        from sglang.srt.batch_overlap.two_batch_overlap import (
+            MaybeTboDeepEPDispatcher,
+        )
+
+        inners = [SimpleNamespace(dispatch_a=lambda **kw: kw) for _ in range(2)]
+        wrapper = MaybeTboDeepEPDispatcher.__new__(MaybeTboDeepEPDispatcher)
+        wrapper._inners = inners
+        self.assertEqual(wrapper.dispatch_a(tbo_subbatch_index=1, x=1), {"x": 1})
+        self.assertTrue(inners[1].tbo_subbatch_active)
+        wrapper.dispatch_a(tbo_subbatch_index=0)
+        self.assertTrue(inners[0].tbo_subbatch_active)
+        wrapper.dispatch_a()
+        self.assertFalse(inners[0].tbo_subbatch_active)
+
+    def test_comm_stream_only_for_micro_batches(self):
+        dispatcher = self._make_tbo_dispatcher()
+        dispatcher.tbo_subbatch_active = True
+        self.assertTrue(dispatcher._get_impl()._use_comm_stream())
+
+        # An ordinary forward runs the transfer on the compute stream: no event,
+        # no comm-stream hop.
+        dispatcher.tbo_subbatch_active = False
+        impl = dispatcher._get_impl()
+        self.assertFalse(impl._use_comm_stream())
+        self.assertIsNone(impl._capture_event_if_async())
+        hidden, topk_output = self._inputs()
+        dispatched = dispatcher.dispatch(hidden, topk_output)
+        dispatcher.combine(
+            (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
+        )
+        self.assertEqual(self.log, ["dispatch", "combine"])
 
 
 if __name__ == "__main__":

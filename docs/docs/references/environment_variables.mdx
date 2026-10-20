@@ -521,8 +521,13 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_EPV2_TBO_GRID_CAP</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-two-batch-overlap</code>, cap the native MORI EPv2 dispatch/combine grid (32 / 48 blocks) to leave compute units to the sibling micro-batch. Set to <code>false</code> to keep MORI's own launch geometry. AsyncLL (<code>--deepep-mode low_latency</code> or <code>MORI_ENABLE_SDMA=1</code>) always keeps MORI's geometry.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_RECV_BOUND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts, missing metadata and two-batch overlap keep the full view.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Hand the MoE only the receive rows the per-rank DP token counts can fill (rounded up) instead of the full MORI receive buffer. Unverified layouts, missing metadata and two-batch overlap micro-batches keep the full view; the other forwards of a server with <code>--enable-two-batch-overlap</code> are still bounded.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
 <tr>
