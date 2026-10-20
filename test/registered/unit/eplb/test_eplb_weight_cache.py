@@ -77,6 +77,13 @@ class TestEPLBWithWeightCache(unittest.TestCase):
             patcher = patch(f"{_MODULE}.{name}", replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # A commit waits for the moves to land. CPU CI has a CUDA build of
+        # torch and no driver, so a real device sync would raise there.
+        device = Mock()
+        device.synchronize.side_effect = lambda: self.calls.append(("sync",))
+        patcher = patch.object(torch, "get_device_module", return_value=device)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         patcher = patch.object(
             EPLBManager, "_compute_expert_location_metadata", return_value=None
         )
@@ -131,9 +138,11 @@ class TestEPLBWithWeightCache(unittest.TestCase):
             [
                 ("begin", [0]),
                 ("move", [0]),
+                ("sync",),
                 ("commit", [0], [[1] * 4, [0] * 4]),
                 ("begin", [1]),
                 ("move", [1]),
+                ("sync",),
                 ("commit", [1], [[1] * 4, [2] * 4]),
             ],
         )
@@ -151,6 +160,7 @@ class TestEPLBWithWeightCache(unittest.TestCase):
             [
                 ("begin", [0]),
                 ("move", [0]),
+                ("sync",),
                 ("commit", [0], [[1] * 4, [0] * 4]),
                 ("begin", [1]),
             ],
