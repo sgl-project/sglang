@@ -1,6 +1,6 @@
 // Official Ornith-1.5 model-card baselines; no GPU runs or benchmarks verified here.
 // FP8 cells use the actual FP8 repos, whose READMEs currently show BF16 repo IDs.
-// The 122B recipe is author-provided; its model card requires access in this environment.
+// The 122B recipe is author-provided; its model card currently contains only license metadata.
 // Do not infer its precision or architecture from its parameter count.
 export const config = {
   modelName: "Ornith-1.5",
@@ -74,7 +74,7 @@ export const config = {
     {
       match: { hw: "h100", variant: "122b", quant: "original", strategy: "balanced", nodes: "single" },
       verified: false,
-      warn: "Author-provided recipe for 8× H100. Set the 122B model path before launching; model-card access and checkpoint precision remain to be confirmed.",
+      warn: "Author-provided recipe for 8× H100. Set the 122B model path before launching; checkpoint precision remains to be confirmed.",
       env: [],
       flags: [
         "--model-path {{MODEL_PATH}}",

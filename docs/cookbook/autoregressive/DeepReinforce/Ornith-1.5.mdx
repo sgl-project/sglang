@@ -41,7 +41,7 @@ Choose your hardware, model size, and checkpoint format. The 9B recipe uses one 
 For 122B, select **H100 → 122B → Original (122B)**. The model author's recipe uses eight H100 GPUs, tensor parallelism 8, a 262,144-token context window, and `--mem-fraction-static 0.80`. Set **122B model path** to your downloaded checkpoint. The default port is **9001** for all recipes and examples on this page.
 
 <Note>
-The 9B, 35B-A3B, and 397B baselines follow the linked official model cards. The 122B command was supplied by the model author; its official model card requires access from this environment. “Original (122B)” does not assert a weight precision. These recipes have not been verified with GPU inference runs here, and no measured performance is claimed.
+The 9B, 35B-A3B, and 397B baselines follow the linked official model cards. The 122B command was supplied by the model author; its official model card currently contains only MIT license metadata, without architecture, precision, or deployment details. “Original (122B)” does not assert a weight precision. These recipes have not been verified with GPU inference runs here, and no measured performance is claimed.
 </Note>
 
 <Deployment config={config} />
@@ -92,7 +92,7 @@ Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingfa
   </tbody>
 </table>
 
-The public [9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B), [35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B), and [397B](https://huggingface.co/ornith-ai/Ornith-1.5-397B) model cards declare the MIT license. Check the 122B model card and license when you obtain access to that checkpoint.
+The official [9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B), [35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B), [122B](https://huggingface.co/ornith-ai/Ornith-1.5-122B), and [397B](https://huggingface.co/ornith-ai/Ornith-1.5-397B) model cards declare the MIT license.
 
 ## 2. Configuration tips
 
