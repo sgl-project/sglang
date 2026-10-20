@@ -397,11 +397,12 @@ def _attention_verify_megakernel(
             seen, run_max + torch.log2(run_sum), float("-inf")
         )
 
-    # MERGE reads every split of its KV head, so it runs after all of them.
+    # MERGE waits only for its KV head's splits: it reads the row views ATTEND
+    # writes, so the scheduler matches the two instead of barriering all of ATTEND.
     # MERGE. Stock: trtllm_batch_decode's split merge, then rms_norm_gate.
-    for m_g, m_t in hl.tile([num_kv_heads, tokens], block_size=[1, 1]):
+    for m_g, m_r in hl.tile([num_kv_heads, att_rows], block_size=[1, heads_per_kv]):
         mg = m_g.begin
-        mt = m_t.begin
+        mt = m_r.begin // heads_per_kv
         m_cols = hl.arange(head_dim)
         heads = mg * heads_per_kv + hl.arange(heads_per_kv)
         head_idx = (heads * head_dim)[:, None] + m_cols[None, :]
@@ -409,9 +410,9 @@ def _attention_verify_megakernel(
         gate_factor = rcp_approx_ftz_f32(
             1.0 + exp2_approx_ftz_f32(gate.to(torch.float32) * -LOG2E)
         )
-        m_lse = lse_ws[mg, :, mt, :]
+        m_lse = lse_rows_ws[mg, :, m_r]
         weight = exp2_approx_ftz_f32(m_lse - torch.amax(m_lse, dim=0)[None, :])
-        merged = torch.sum(att_ws[mg, :, mt, :, :] * weight[:, :, None], dim=0)
+        merged = torch.sum(att_rows_ws[mg, :, m_r, :] * weight[:, :, None], dim=0)
         attn = _cvt_rn_satfinite_bf16(merged / torch.sum(weight, dim=0)[:, None]).to(
             torch.float32
         )
