@@ -125,6 +125,7 @@ def test_scheduler_rejects_invalid_dlite_request_without_queueing():
     scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
     scheduler.tokenizer = None
     scheduler.dllm_config = None
+    scheduler.enable_overlap = True
     scheduler.spec_algorithm = SimpleNamespace(
         name="DLITE",
         is_dflash_family=lambda: True,
