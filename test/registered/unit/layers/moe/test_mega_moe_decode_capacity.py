@@ -30,6 +30,7 @@ def _layer(value=0):
     return SimpleNamespace(
         num_experts=EXPERTS,
         should_fuse_routed_scaling_factor_in_topk=True,
+        uses_expert_location=False,
         **{
             name: torch.full((48, 4), value, dtype=torch.uint8)
             for name in ("_mega_w1", "_mega_w1_scale", "_mega_w2", "_mega_w2_scale")
