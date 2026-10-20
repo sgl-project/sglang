@@ -83,7 +83,13 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
-**LM-head precision.** Inkling uses FP32 logits by default so BF16 rounding does not turn distinct token scores into ties during greedy decoding.
+**LM-head precision.** Inkling preserves FP32 LM-head projection output by default. This can change greedy choices when BF16 output rounding would tie distinct scores. In the BF16 CUDA head path, hidden states and head weights remain BF16; final sampler logits are FP32 in either mode.
+
+To select BF16 projection output, add the following override and omit `--enable-fp32-lm-head`:
+
+```bash
+--json-model-override-args '{"text_config":{"enable_lm_head_fp32":false}}'
+```
 
 **Multimodal.** The recipes pass `--enable-multimodal` so the server accepts image and audio inputs alongside text — drop it for text-only serving.
 

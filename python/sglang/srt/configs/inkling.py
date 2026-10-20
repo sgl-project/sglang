@@ -185,7 +185,7 @@ class InklingModelConfig(PretrainedConfig):
         self.log_scaling_alpha = log_scaling_alpha
         self.unpadded_vocab_size = self.vocab_size
         self.logits_mup_width_multiplier = logits_mup_width_multiplier
-        # BF16 logits can tie distinct scores and change the greedy winner.
+        # Preserve projection scores before BF16 output rounding creates ties.
         self.enable_lm_head_fp32 = enable_lm_head_fp32
         self.final_logit_softcapping = final_logit_softcapping
         self.num_nextn_predict_layers = num_nextn_predict_layers
