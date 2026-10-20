@@ -11,7 +11,7 @@ from sglang.srt.utils import is_gfx95_supported
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
-# v4 KV cache layout (see dsv4.index_buf_accessor._set_k_and_s_triton_kernel):
+# v4 KV cache layout (see kvcache.dsv4_main_kv_store._set_k_and_s_triton_kernel):
 #   per-token: 448 fp8 nope + 64 bf16 rope (= 576 contiguous bytes) +
 #              7 ue8m0 scales padded to 8 bytes.
 #   per-page:  [token 0..P-1 nope+rope (P*576 bytes)] [token 0..P-1 scale (P*8 bytes)]
@@ -24,7 +24,7 @@ NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 
-def dequantize_k_cache_paged(
+def dequantize_k_cache_paged_dsv4(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     page_size: int,
@@ -163,7 +163,7 @@ def dequantize_k_cache_paged_v41(
     return out
 
 
-def gather_dequant_requant_fp8_paged(
+def gather_dequant_requant_fp8_paged_dsv4(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
     page_size: int,
@@ -227,74 +227,6 @@ def gather_dequant_requant_fp8_paged(
         S_OFFSET_BYTES=s_offset_bytes,
     )
     return out
-
-
-def q8kv8_padded_num_heads(num_heads: int) -> int:
-    """Return a Q-head count supported by the SM90 Q8KV8 kernel."""
-    if num_heads <= 0:
-        raise ValueError(f"num_heads must be positive, got {num_heads}")
-    if num_heads <= 64:
-        return 64
-    if num_heads <= 128:
-        return 128
-    raise ValueError(
-        "DeepSeek-V4 Q8KV8 sparse prefill supports at most 128 local "
-        f"query heads, got {num_heads}"
-    )
-
-
-def cast_q_fp8_for_q8kv8_prefill(
-    q: torch.Tensor,
-    padded_num_heads: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cast DeepSeek-V4 sparse-prefill Q to the Q8KV8 kernel format.
-
-    The incoming Q is the model-produced BF16/FP16 tensor already shaped as
-    ``(num_tokens, num_heads, 512)`` after removing the singleton MQA axis.
-
-    The SM90 kernel processes query heads in 64-head blocks. Tensor parallelism
-    commonly leaves fewer than 64 local heads, so the active heads are copied
-    into a zero-padded 64/128-head FP8 tensor.
-    """
-    assert q.ndim == 3
-    assert q.shape[-1] == DIM_NOPE + DIM_ROPE
-
-    num_tokens, num_heads, head_dim = q.shape
-    if padded_num_heads is None:
-        padded_num_heads = q8kv8_padded_num_heads(num_heads)
-
-    if padded_num_heads not in (64, 128) or padded_num_heads < num_heads:
-        raise ValueError(
-            f"invalid padded_num_heads={padded_num_heads} for num_heads={num_heads}"
-        )
-
-    expected_shape = (num_tokens, padded_num_heads, head_dim)
-
-    if out is None:
-        q_fp8 = torch.zeros(
-            expected_shape,
-            dtype=fp8_dtype,
-            device=q.device,
-        )
-    else:
-        if (
-            out.shape != expected_shape
-            or out.dtype != fp8_dtype
-            or out.device != q.device
-        ):
-            raise ValueError(
-                "Q8KV8 Q output must have shape/dtype/device "
-                f"{expected_shape}/{fp8_dtype}/{q.device}, got "
-                f"{tuple(out.shape)}/{out.dtype}/{out.device}"
-            )
-        q_fp8 = out
-        if padded_num_heads > num_heads:
-            q_fp8[:, num_heads:].zero_()
-
-    q_fp8[:, :num_heads].copy_(q)
-    q_scale = torch.ones((), dtype=torch.float32, device=q.device)
-    return q_fp8, q_scale
 
 
 @triton.jit
@@ -509,86 +441,3 @@ def _gather_dequant_requant_fp8_paged_kernel(
         output_ptr + out_row_base + DIM_NOPE + rope_offs,
         rope_data.to(output_ptr.dtype.element_ty),
     )
-
-
-def dequantize_k_cache_paged_ref(
-    quant_k_cache: torch.Tensor,
-    page_table_1_flattened: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    """Pure-torch reference for :func:`dequantize_k_cache_paged`.
-
-    Decodes the same v4 paged layout with vectorized torch indexing instead of
-    a Triton kernel. Used to validate the kernel (see the ``__main__`` block
-    below); not on any hot path.
-    """
-    assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
-    u8 = quant_k_cache.view(torch.uint8)
-    bytes_per_page = u8.shape[-1]
-    s_offset_bytes = page_size * NOPE_ROPE_BYTES
-
-    flat_u8 = u8.reshape(-1)
-    flat_fp8 = u8.view(fp8_dtype).reshape(-1)
-    flat_bf16 = u8.view(torch.bfloat16).reshape(-1)
-
-    loc = page_table_1_flattened.to(torch.int64)
-    page_idx = loc // page_size
-    in_page = loc % page_size
-    page_byte_base = page_idx * bytes_per_page
-    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
-    token_scale_base = (
-        page_byte_base + s_offset_bytes + in_page * PADDED_SCALE_PER_TOKEN
-    )
-
-    device = quant_k_cache.device
-    nope_byte = (
-        token_data_base[:, None] + torch.arange(DIM_NOPE, device=device)[None, :]
-    )
-    nope_fp8 = flat_fp8[nope_byte].to(torch.float32)
-    scale_byte = (
-        token_scale_base[:, None]
-        + torch.arange(NUM_SCALE_TILES, device=device)[None, :]
-    )
-    scale_u8 = flat_u8[scale_byte].to(torch.int32)
-    scale_pow2 = torch.exp2((scale_u8 - 127).to(torch.float32))
-    scale_pow2 = torch.where(
-        scale_pow2 < (2.0**-126), torch.zeros_like(scale_pow2), scale_pow2
-    )
-    scale_full = scale_pow2.repeat_interleave(TILE_SIZE, dim=1)
-    nope = nope_fp8 * scale_full
-
-    rope_bf16_base = (token_data_base + DIM_NOPE) // 2
-    rope_idx = rope_bf16_base[:, None] + torch.arange(DIM_ROPE, device=device)[None, :]
-    rope = flat_bf16[rope_idx]
-
-    out = torch.empty(
-        (loc.shape[0], 1, DIM_NOPE + DIM_ROPE),
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    out[:, 0, :DIM_NOPE] = nope.to(torch.bfloat16)
-    out[:, 0, DIM_NOPE:] = rope
-    return out
-
-
-def gather_dequant_requant_fp8_paged_ref(
-    quant_k_cache: torch.Tensor,
-    page_table_1_flattened: torch.Tensor,
-    page_size: int,
-    extra_rows: int = 0,
-) -> torch.Tensor:
-    """Torch reference for :func:`gather_dequant_requant_fp8_paged`."""
-    active = dequantize_k_cache_paged_ref(
-        quant_k_cache,
-        page_table_1_flattened,
-        page_size,
-    ).to(fp8_dtype)
-    if extra_rows == 0:
-        return active
-    out = torch.zeros(
-        (active.shape[0] + extra_rows, 1, DIM_NOPE + DIM_ROPE),
-        dtype=fp8_dtype,
-        device=active.device,
-    )
-    out[: active.shape[0]] = active
-    return out
