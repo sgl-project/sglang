@@ -114,6 +114,8 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
+    separate_postprocess: bool = False
+
     @property
     def role_affinity(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType

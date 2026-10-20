@@ -11,6 +11,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.disaggregation.deployment import client
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
     pack_fields,
     unpack_fields,
@@ -161,6 +162,45 @@ def test_coordinator_parallel_join_and_cleanup():
             context.term()
 
     asyncio.run(run())
+
+
+def test_client_failure_cancels_outstanding_rpc(monkeypatch):
+    closed = []
+
+    class NoGpuTransport:
+        def __init__(self, *args):
+            pass
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(client, "TensorTransport", NoGpuTransport)
+
+    async def run():
+        context = zmq.asyncio.Context()
+        socket = context.socket(zmq.REP)
+        socket.setsockopt(zmq.LINGER, 0)
+        port = socket.bind_to_random_port("tcp://127.0.0.1")
+
+        async def peer():
+            await socket.recv()
+            await socket.send_pyobj({"error": "invalid encoder input"})
+            await socket.recv()
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(peer())
+        try:
+            with pytest.raises(RuntimeError, match="invalid encoder input"):
+                async with client.EncodingClient(f"tcp://127.0.0.1:{port}") as encoder:
+                    await asyncio.gather(encoder.encode({}), encoder.encode({}))
+            assert closed
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            socket.close()
+            context.term()
+
+    asyncio.run(asyncio.wait_for(run(), 5))
 
 
 if __name__ == "__main__":
