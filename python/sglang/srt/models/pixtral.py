@@ -38,8 +38,8 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -68,18 +68,32 @@ class VisionEncoderArgs:
     mm_projector_id: str = ""
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    text_config = hf_config.text_config
+    if getattr(text_config, "model_type", "") != "deepseek_v3":
+        return None
+    return text_config
+
+
 class PixtralForConditionalGeneration(nn.Module):
     merge_by_field_config = True
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        text_config = hf_config.text_config
-        if getattr(text_config, "model_type", "") != "deepseek_v3":
-            # The GQA text config builds the dense Mistral backbone.
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return MistralLarge3ForCausalLM.shared_experts_fusion_disable_reason(
             text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return MistralLarge3ForCausalLM.num_fusable_shared_experts(text_config)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -136,8 +150,7 @@ class PixtralForConditionalGeneration(nn.Module):
         )
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
@@ -857,7 +870,7 @@ class PixtralHFVisionModel(nn.Module):
     DEFAULT_IMAGE_TOKEN_ID = 10
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return self.input_padder.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def __init__(
         self,
@@ -902,7 +915,6 @@ class PixtralHFVisionModel(nn.Module):
 
         # Initialize patch position embedding
         self.patch_positional_embedding = PixtralVisionRotaryEmbedding(config)
-        self.input_padder = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
     def dtype(self):
