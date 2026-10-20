@@ -14,8 +14,8 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.models.deepseek_v4 as deepseek_v4
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4 import unified_kv_gate
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -138,8 +138,8 @@ def _run(fp8, mode=ForwardMode.DECODE, cp=False, fused_verify=True):
     with (
         envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.override(False),
         envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.override(fused_verify),
-        patch.object(env_gate, "is_unified_kv_triton", return_value=True),
-        patch.object(env_gate, "is_unified_kv_fp8", return_value=fp8),
+        patch.object(unified_kv_gate, "is_unified_kv_triton", return_value=True),
+        patch.object(unified_kv_gate, "is_unified_kv_fp8", return_value=fp8),
         patch.object(deepseek_v4, "get_token_to_kv_pool", return_value=_Pool(fp8)),
         patch.object(
             deepseek_v4,

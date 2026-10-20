@@ -15,17 +15,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.utils import (
-    assert_buffer_fits,
+from sglang.kernels.ops.attention.aiter_unified_page_table import (
+    scatter_ragged_to_page_table_kernel,
+    scatter_req_to_token_to_page_table_kernel,
+)
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
     kv_indices_num_token_blocks,
 )
-from sglang.kernels.ops.kvcache.aiter_unified_attention import (
-    scatter_ragged_to_page_table_kernel,
-    scatter_req_to_token_to_page_table_kernel,
-)
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
@@ -77,10 +77,8 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_mla_kv_page_table_for_dcp,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
-from sglang.kernels.ops.attention.utils import (
-    launch_reshape_and_cache_flash,
-    pad_sequence_with_mask,
-)
+from sglang.kernels.ops.attention.pad import pad_sequence_with_mask
+from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
