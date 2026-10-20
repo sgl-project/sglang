@@ -2,6 +2,7 @@
 """Declared layouts, Mooncake bindings, CPU reshard copies and manifest exchange."""
 
 import ctypes
+import importlib.util
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -36,6 +37,13 @@ from sglang.srt.weight_cache.weight_runtime_manifest import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+# Check each parent before looking up its child. Do not swallow import errors
+# from an installed module: broken dependencies and incompatible APIs must fail.
+HAS_MOONCAKE_RESHARD = all(
+    importlib.util.find_spec(name) is not None
+    for name in ("mooncake", "mooncake.reshard", "mooncake.reshard.weight")
+)
 
 
 def _manifest(model, plan, *, worker="source", topology=None, endpoint="127.0.0.1:1"):
@@ -96,6 +104,7 @@ def _target_transfer(source_uuid):
 
 
 class TestMooncakeWeightAdapter(unittest.TestCase):
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_native_gqa_replica_groups_and_vocab_padding_reshard(self):
         import msgspec
         from sglang.srt.layers.linear import QKVParallelLinear
@@ -251,6 +260,13 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                             65 * 4 * torch.float32.itemsize,  # Unpadded vocabulary.
                         )
 
+    @unittest.skipUnless(
+        all(
+            importlib.util.find_spec(name) is not None
+            for name in ("mooncake", "mooncake.engine")
+        ),
+        "requires mooncake.engine",
+    )
     def test_transfer_engine_uses_normal_mooncake_endpoint_discovery(self):
         engine = MagicMock()
         engine.initialize.return_value = 0
@@ -279,6 +295,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
             "10.0.0.8", "P2PHANDSHAKE", "rdma", "mlx5_0"
         )
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_daemon_manifest_adapts_to_immutable_runtime_binding(self):
         class Model(torch.nn.Module):
             def __init__(self):
@@ -383,6 +400,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 quantization="fp8",
             )
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_parallel_axes_use_declared_process_semantics(self):
         from mooncake.reshard.weight import ReplicatedAxis, SplitAxis
 
@@ -415,6 +433,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 (SplitAxis("tp", dim=2),) if split else (ReplicatedAxis("tp"),),
             )
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_replicated_internal_fragments_are_not_tp_shards(self):
         from mooncake.reshard.weight import ReplicatedAxis
 
@@ -444,6 +463,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
         self.assertEqual(placement.tensors[0].parallel_axes, (ReplicatedAxis("tp"),))
         self.assertEqual(placement.tensors[0].shard_dims, ())
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_ep_moe_tp_manifest_reshards_to_different_ep_layout(self):
         from math import prod
 
@@ -618,6 +638,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                     parameter, expected[manifest.instance_id, name], rtol=0, atol=0
                 )
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_gqa_groups_share_both_sides_mapping_and_preserve_bindings(self):
         from sglang.srt.layers.linear import QKVParallelLinear
 
@@ -760,6 +781,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                     ):
                         torch.testing.assert_close(actual, want, rtol=0, atol=0)
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_invalid_partition_declarations_fail_before_transfer(self):
         import msgspec
 
@@ -795,6 +817,7 @@ class TestMooncakeWeightAdapter(unittest.TestCase):
                 target_parallel_layout=WeightParallelLayout(2),
             )
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_padding_only_rank_preserves_declaration_and_fails_before_io(self):
         from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 

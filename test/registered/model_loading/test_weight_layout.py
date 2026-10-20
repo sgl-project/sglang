@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Layout declarations must agree with native loaders, not just with themselves."""
 
+import importlib.util
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,6 +24,11 @@ from sglang.srt.weight_cache.weight_runtime_manifest import WeightManifestError
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+
+HAS_MOONCAKE_RESHARD = all(
+    importlib.util.find_spec(name) is not None
+    for name in ("mooncake", "mooncake.reshard", "mooncake.reshard.weight")
+)
 
 
 def write_declared_regions(plan, checkpoint):
@@ -277,6 +283,7 @@ class TestWeightLayout(unittest.TestCase):
         with self.assertRaisesRegex(WeightManifestError, "overlapping registered"):
             builder.build()
 
+    @unittest.skipUnless(HAS_MOONCAKE_RESHARD, "requires mooncake.reshard.weight")
     def test_incompatible_layout_does_not_write_target_or_padding(self):
         from unittest.mock import MagicMock
 
