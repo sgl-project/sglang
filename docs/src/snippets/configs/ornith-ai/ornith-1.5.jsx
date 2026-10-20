@@ -43,7 +43,7 @@ export const config = {
 
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
 -H 'Content-Type: application/json' \\
--d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Write a compact Python is_prime function."}], "temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_tokens": 1024 }'`,
+-d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Write a compact Python is_prime function."}], "temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0, "repetition_penalty": 1.0, "max_tokens": 1024 }'`,
 
   benchmarkCommands: {
     speed:
