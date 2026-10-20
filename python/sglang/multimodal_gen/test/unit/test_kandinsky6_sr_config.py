@@ -5,6 +5,7 @@ import argparse
 import re
 
 import pytest
+from kandinsky6_sr_tiny_components import TINY_DIT
 
 from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
     Kandinsky6SRArchConfig,
@@ -25,85 +26,10 @@ from sglang.multimodal_gen.configs.sample.kandinsky6_sr import (
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
-TINY_DIT = dict(
-    in_visual_dim=4,
-    in_text_dim=8,
-    in_text_dim2=8,
-    time_dim=16,
-    out_visual_dim=4,
-    patch_size=[1, 2, 2],
-    model_dim=32,
-    ff_dim=64,
-    num_text_blocks=0,
-    num_visual_blocks=2,
-    axes_dims=[8, 4, 4],
-    visual_cond=False,
-    instruct_type="noise",
-    attention_params={"512": {"type": "flash"}},
-    use_text=False,
-)
-TINY_PIFLOW = dict(
-    nfe=2,
-    num_policy_substeps=8,
-    final_step_size_scale=0.5,
-    shift=5.0,
-    n_grid=3,
-    eps=1e-6,
-)
-SR_PARAMS = dict(
-    scale_factor={"512": [1.0, 1.0, 1.0]},
-    visual_size=[512],
-    scheduler_scale=5.0,
-    lq_noise_scale=0.7,
-    lq_noise_type="ddpm",
-    lq_channel_noise_scale=0.0,
-    cap_noise_timestep=False,
-    fps=24,
-)
 
-
-def flat_config(**changes):
-    """A converted ``transformer/config.json`` (pi-Flow DX head) with ``changes`` applied."""
-    flat = dict(TINY_DIT, _class_name="Kandinsky6SRTransformer3DModel", n_grid=3)
-    flat.update(
-        piflow_nfe=2,
-        piflow_num_policy_substeps=8,
-        piflow_final_step_size_scale=0.5,
-        piflow_shift=5.0,
-        piflow_eps=1e-6,
-        attribute_overrides={"instruct_type": "noise"},
-        sr_visual_size=[512],
-        sr_scale_factor={"512": [1.0, 1.0, 1.0]},
-        sr_scheduler_scale=5.0,
-        sr_lq_noise_scale=0.7,
-        sr_lq_noise_type="ddpm",
-        sr_lq_channel_noise_scale=0.0,
-        sr_cap_noise_timestep=False,
-        sr_fps=24,
-    )
-    flat.update(changes)
-    return flat
-
-
-def official_config(**changes):
-    """An official ``transformer/config.json``: constructor kwargs, ``sr_params``, the TOTAL DX head
-    width in ``out_visual_dim`` (``base * n_grid``) and no ``n_grid`` / ``piflow_*`` keys.
-    """
-    official = {
-        key: value for key, value in TINY_DIT.items() if key not in ("out_visual_dim",)
-    }
-    official.update(
-        out_visual_dim=TINY_DIT["out_visual_dim"] * TINY_PIFLOW["n_grid"],
-        attribute_overrides=None,
-        sr_params=dict(SR_PARAMS),
-    )
-    official.update(changes)
-    return official
-
-
-def parse(flat):
+def parse(**changes):
     config = Kandinsky6SRDitConfig()
-    config.update_model_arch(flat)
+    config.update_model_arch(dict(TINY_DIT, **changes))
     return config.arch_config
 
 
@@ -111,8 +37,7 @@ def parse(flat):
 # DiT arch config
 # --------------------------------------------------------------------------- #
 def test_arch_config_parses_an_official_config_and_maps_checkpoint_names():
-    arch = parse(official_config())
-    assert arch.n_grid == 1 and not arch.is_piflow  # pi-Flow lives in the scheduler
+    arch = parse()
     assert arch.out_visual_dim == 12 and arch.attribute_overrides == {}
     assert arch.patch_size == (1, 2, 2) and arch.axes_dims == (8, 4, 4)
     assert (arch.hidden_size, arch.num_attention_heads) == (32, 2)
@@ -146,7 +71,7 @@ def test_arch_config_parses_an_official_config_and_maps_checkpoint_names():
 
 def test_unknown_sr_params_keys_are_rejected():
     with pytest.raises(ValueError, match="sr_params has unsupported keys"):
-        parse(official_config(sr_params={"fps": 24, "new_knob": 1}))
+        parse(sr_params={"fps": 24, "new_knob": 1})
 
 
 @pytest.mark.parametrize(
@@ -159,6 +84,7 @@ def test_unknown_sr_params_keys_are_rejected():
         ({"attribute_overrides": {"n_grid": 2}}, ValueError, "n_grid"),
         ({"attribute_overrides": {"instruct_type": "bogus"}}, ValueError, "bogus"),
         ({"piflow_eps": None}, ValueError, "piflow_eps"),
+        ({"n_grid": 3}, ValueError, "n_grid"),
         ({"patch_size": [2, 2, 2]}, ValueError, "patch_size"),
         ({"sr_lq_noise_type": "gauss"}, ValueError, "gauss"),
     ],
@@ -171,25 +97,28 @@ def test_unsupported_or_unknown_config_fails_loudly_naming_the_key(
     keys raise ValueError (``update_model_arch`` alone would park unknown keys in
     ``extra_attrs``)."""
     with pytest.raises(error, match=flag):
-        parse(flat_config(**changes))
+        parse(**changes)
 
 
 def test_sparse_attention_request_is_detected_from_attention_params():
-    assert parse(flat_config()).requested_sparse_attention() is None
-    nabla = flat_config(attention_params={"512": {"type": "nabla", "P": 0.9}})
-    assert parse(nabla).requested_sparse_attention() == "nabla"
-    # an override can switch it off again
-    overridden = flat_config(
+    assert parse().requested_sparse_attention() is None
+    assert (
+        parse(
+            attention_params={"512": {"type": "nabla", "P": 0.9}}
+        ).requested_sparse_attention()
+        == "nabla"
+    )
+    overridden = parse(
         attention_params={"512": {"type": "nabla"}},
         attribute_overrides={"attention_params": {"512": {"type": "flash"}}},
     )
-    assert parse(overridden).requested_sparse_attention() is None
+    assert overridden.requested_sparse_attention() is None
 
 
 def test_default_arch_config_is_valid_and_text_free():
     """Registry / ``PipelineConfig.from_kwargs`` instantiate the default config."""
     arch = Kandinsky6SRArchConfig()
-    assert arch.use_text is False and not arch.is_piflow and arch.n_grid == 1
+    assert arch.use_text is False
 
 
 # --------------------------------------------------------------------------- #

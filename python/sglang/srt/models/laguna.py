@@ -32,6 +32,7 @@ from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    LinearParallelGroup,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -68,8 +69,8 @@ class LagunaMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
+        *,
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
@@ -82,8 +83,7 @@ class LagunaMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -92,8 +92,7 @@ class LagunaMLP(nn.Module):
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=add_prefix("down_proj", prefix),
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            parallel_group=parallel_group,
         )
         self.act_fn = SiluAndMul()
 
@@ -188,7 +187,7 @@ class LagunaMoE(nn.Module):
             quant_config=quant_config,
             reduce_results=False,
             prefix=add_prefix("shared_expert", prefix),
-            **(dict(tp_rank=0, tp_size=1) if self._shared_expert_tp1 else {}),
+            **(dict(parallel_group="replicated") if self._shared_expert_tp1 else {}),
         )
 
     def get_moe_weights(self):
@@ -256,7 +255,6 @@ class LagunaAttention(nn.Module):
         self.gating = gating != "disabled"
         self.gate_per_head = gating == "per-head"
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -279,8 +277,7 @@ class LagunaAttention(nn.Module):
             self.total_num_kv_heads,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -288,8 +285,7 @@ class LagunaAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -306,8 +302,7 @@ class LagunaAttention(nn.Module):
                 bias=False,
                 gather_output=False,
                 quant_config=quant_config,
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
+                parallel_group="attn_tp",
                 prefix=add_prefix("g_proj", prefix),
             )
         else:
@@ -423,12 +418,8 @@ class LagunaDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        mlp_types = config.mlp_layer_types
-        self.is_layer_sparse = mlp_types[layer_id] == "sparse"
-        is_next_layer_sparse = (
-            layer_id + 1 < config.num_hidden_layers
-            and mlp_types[layer_id + 1] == "sparse"
-        )
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = LagunaMoE(
@@ -453,13 +444,25 @@ class LagunaDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: LagunaConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        mlp_types = config.mlp_layer_types
+        is_layer_sparse = mlp_types[layer_id] == "sparse"
+        is_next_layer_sparse = (
+            layer_id + 1 < config.num_hidden_layers
+            and mlp_types[layer_id + 1] == "sparse"
+        )
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -524,6 +527,7 @@ class LagunaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
