@@ -486,11 +486,9 @@ class TestRequestTimePerOutputToken(CustomTestCase):
 
 
 class TestHiCacheHostMambaStats(CustomTestCase):
-    """Regression for sgl-project/sglang#33713: on hybrid-SSM models the host
-    Mamba pool fills long before host KV and its LRU drops the states that make
-    the host KV matchable, but only the KV pool was exported, so the resulting
-    misses looked like a radix-tree bug. The host Mamba pool must be reported
-    next to host KV, and only for models that have one."""
+    """The host Mamba pool of a hybrid-SSM model must be exported next to host KV,
+    and only for models that have one: it fills long before host KV, and its
+    unexported misses looked like a radix-tree bug."""
 
     def setUp(self):
         self.labels = {"model_name": "test"}
@@ -563,8 +561,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
 
     def test_idle_report_refreshes_the_host_pools(self):
         # /flush_cache empties the host pools while no batch runs; the idle
-        # publisher must re-read them instead of republishing the last batch's
-        # values.
+        # publisher must re-read them, not republish the last batch's values.
         mamba_pool = SimpleNamespace(logical_size=138, available_size=lambda: 138)
         reporter = self._reporter(
             {PoolName.MAMBA: SimpleNamespace(host_pool=mamba_pool)}
