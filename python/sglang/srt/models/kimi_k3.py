@@ -160,7 +160,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import get_device_module, is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
@@ -4350,13 +4350,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
 
             device_index = device.index
-            if device.type == "cuda" and device_index is None:
-                device_index = torch.cuda.current_device()
+            dest_device_type = "npu" if is_npu() else "cuda"
+            if device.type == dest_device_type and device_index is None:
+                device_index = get_device_module().current_device()
 
             selected_items = []
             for image_index in image_indices:
                 item = items[image_index]
-                if device.type == "cuda":
+                if device.type == dest_device_type:
                     item.reconstruct(device_index)
                 selected_items.append(item)
 

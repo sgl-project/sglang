@@ -19,7 +19,7 @@ from sglang.srt.utils import envs, logger
 
 def keeps_mm_features_on_device(mm_feature_transport: str) -> bool:
     """Whether a feature transport expects processor outputs to stay on GPU."""
-    return mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+    return mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc")
 
 
 class MultimodalFeatureTransport:
@@ -33,10 +33,10 @@ class MultimodalFeatureTransport:
     ):
         self.mm_feature_transport = (
             mm_feature_transport
-            if mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
+            if mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_cuda_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
         self.keep_mm_features_on_device = keeps_mm_features_on_device(
             self.mm_feature_transport
         )
@@ -44,7 +44,7 @@ class MultimodalFeatureTransport:
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
         self.cudaipc_mmfeature_pool = (
-            _create_cuda_ipc_pool(base_gpu_id)
+            _create_cuda_ipc_pool(base_gpu_id, self.mm_feature_transport)
             if self.use_cuda_ipc and not skip_mm_pool
             else None
         )
@@ -109,7 +109,7 @@ class MultimodalFeatureTransport:
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
         """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        if tensor.device.type not in ("cuda", "npu"):
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
@@ -119,7 +119,9 @@ class MultimodalFeatureTransport:
         return proxy if proxy is not None else tensor.cpu()
 
 
-def _create_cuda_ipc_pool(base_gpu_id: int) -> MmItemMemoryPool:
+def _create_cuda_ipc_pool(
+    base_gpu_id: int, mm_feature_transport: str
+) -> MmItemMemoryPool:
     # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
     # tokenizer workers. Each worker gets an equal share so that adding
     # workers doesn't multiply the GPU-side footprint.
@@ -129,9 +131,10 @@ def _create_cuda_ipc_pool(base_gpu_id: int) -> MmItemMemoryPool:
     )
     total_pool_size = per_worker_pool_size * worker_num
     logger.info(
-        "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-        "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
+        "%s multimodal feature pools reserve %.0f MiB total on "
+        "device %d (%.0f MiB per tokenizer worker × %d; configured "
         "budget %.0f MiB).",
+        "NPU IPC" if mm_feature_transport == "npu_ipc" else "CUDA IPC",
         total_pool_size / (1024 * 1024),
         base_gpu_id,
         per_worker_pool_size / (1024 * 1024),
