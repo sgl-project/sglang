@@ -296,7 +296,7 @@ class TestHiSparseV2SpecOwnership(CustomTestCase):
         )
 
         def make_cache():
-            buffers = [torch.arange(129 * 64).view(129, 64).clone() for _ in range(2)]
+            buffers = [torch.arange(194 * 64).view(194, 64).clone() for _ in range(2)]
             pool = SimpleNamespace(
                 size=4096,
                 page_size=64,
@@ -371,26 +371,36 @@ class TestHiSparseV2SpecOwnership(CustomTestCase):
         coordinator.request_finished(req)
         self.assertEqual(coordinator.reserved_temp_tokens(), 0)
         self.assertEqual(coordinator.allocator.available_size(), before)
-        self.assertTrue(torch.all(cache.index_table == -1))
-        self.assertTrue(torch.all(draft.index_table == -1))
+        self.assertTrue(torch.all(cache.host_locs == -1))
+        self.assertTrue(torch.all(draft.host_locs == -1))
         coordinator.allocator.free(prefix)
         self.assertEqual(coordinator.allocator.available_size(), 4096)
 
-    def test_draft_index_exhaustion_rolls_back_target_and_temp(self):
+    def test_target_and_draft_indexes_follow_host_pages_after_device_reuse(self):
         coordinator, cache, draft, req, prefix = self._fixture()
-        initial_pages = cache.index_allocator.available()
-        before = coordinator.allocator.available_size()
-        lock = req.lock
         self.assertTrue(coordinator.reserve_prefill(req, max_new_tokens=16))
-        held = draft.index_allocator.alloc(draft.index_allocator.available())
-        self.assertFalse(coordinator.admit_request(req))
-        self.assertIs(req.lock, lock)
-        self.assertFalse(req.hisparse_v2_active)
-        self.assertEqual(cache.index_allocator.available(), initial_pages)
-        self.assertEqual(coordinator.allocator.available_size(), before)
-        self.assertEqual(coordinator.reserved_temp_tokens(), 0)
-        torch.testing.assert_close(cache.req_to_token[0, :320], prefix.int())
-        draft.index_allocator.free(held)
+        self.assertTrue(coordinator.admit_request(req))
+        hosts = torch.arange(8192 - 320, 8192)
+        for current in (cache, draft):
+            expected = [
+                buffer[prefix[::64] // 64].clone() for buffer in current.index_buffers
+            ]
+            current.preserve_index(prefix, hosts)
+            current.host_locs[0, :320] = hosts
+            for buffer in current.index_buffers:
+                buffer[prefix[::64] // 64] = -1
+            current.req_to_token[0, :320] = -1
+            pages = current.indexer_page_table(
+                req_pool_indices=torch.tensor([0]), num_pages=5
+            )
+            for buffer, wanted in zip(current.index_buffers, expected):
+                torch.testing.assert_close(buffer[pages[0].long()], wanted)
+        coordinator.request_finished(req)
+
+    def test_host_address_space_must_fit_the_index_expansion(self):
+        _, cache, _, _, _ = self._fixture()
+        with self.assertRaisesRegex(ValueError, "cover the HiCache host pool"):
+            cache.attach_host_pool(SimpleNamespace(size=130 * 64))
 
     def test_speculative_index_tables_expand_queries_and_refresh_in_place(self):
         from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
@@ -416,13 +426,15 @@ class TestHiSparseV2SpecOwnership(CustomTestCase):
                 page_table_1=torch.empty((4, 320), dtype=torch.int32),
             )
             pointer = table.data_ptr()
+            hosts = torch.arange(8192 - 320, 8192)
+            cache.host_locs[0, :320] = hosts
             cache.req_to_token[0, :320] = -1
             backend._refresh_hisparse_v2_indexer_page_table(
                 metadata, forward_mode=mode, req_pool_indices=torch.tensor([0])
             )
             self.assertEqual(table.data_ptr(), pointer)
             torch.testing.assert_close(
-                table, cache.index_table[0, :5].int().expand(4, -1)
+                table, (cache.base_pages + hosts[::64] // 64).int().expand(4, -1)
             )
             cache.req_to_token[0, :320] = prefix.int()
         coordinator.request_finished(req)

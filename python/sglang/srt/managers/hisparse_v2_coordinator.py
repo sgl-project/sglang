@@ -1,7 +1,7 @@
 """HiSparse V2 request ownership over the DSA device pool and HiCache.
 
-Active prefixes retain private GPU index copies. Their attention KV can be
-demoted by the tree, which pins the host copy before publishing device sentinels.
+Active prefixes retain GPU indexes addressed by their Device or Host KV pages.
+The tree pins the host copy before publishing device sentinels on demotion.
 Decode tails stay request-owned; temporary swap slots are never inserted in the tree.
 """
 
@@ -113,10 +113,6 @@ class HiSparseV2Coordinator:
             * self.cache.page_size
         )
         pending_tokens = sum(p.prefix_len for p in self.pending.values())
-        pages_left = (
-            min(cache.index_allocator.available() for cache in self.caches)
-            - pending_tokens // self.cache.page_size
-        )
         claimed = {
             node.id: len(node.key)
             for state in self.requests.values()
@@ -126,10 +122,7 @@ class HiSparseV2Coordinator:
         # active prefix one home across the device and host tiers.
         capacity = self.cache.host_pool.size + int(self.cache.pool.size * 0.95)
         used = sum(claimed.values()) + pending_tokens + self.reserved_temp_tokens()
-        if (
-            prefix_len // self.cache.page_size > pages_left
-            or prefix_len + needed > capacity - used
-        ):
+        if prefix_len + needed > capacity - used:
             return False
         from sglang.srt.mem_cache.common import evict_from_tree_cache
 
@@ -163,27 +156,6 @@ class HiSparseV2Coordinator:
                 "HiSparse V2 keeps request %s resident: no swap slots", req.rid
             )
             return False
-        copied_caches = []
-        try:
-            tokens = self.cache.req_to_token[req_id, :prefix_len]
-            for cache in self.caches:
-                if not cache.copy_index(req_id, tokens):
-                    break
-                copied_caches.append(cache)
-        except Exception:
-            for cache in copied_caches:
-                cache.release(req_id)
-            self.allocator.free(temp)
-            raise
-        if len(copied_caches) != len(self.caches):
-            for cache in copied_caches:
-                cache.release(req_id)
-            self.allocator.free(temp)
-            logger.debug(
-                "HiSparse V2 keeps request %s resident: index pool full", req.rid
-            )
-            return False
-
         for cache in self.caches:
             cache.assign_temp_locations(req_id, temp)
             cache.protected_lens[req_id] = prefix_len
@@ -236,6 +208,13 @@ class HiSparseV2Coordinator:
         self._wait_for_forward()
         device_rows, order = component.value.to(self.cache.device).long().sort()
         host_rows = component.host_value.to(self.cache.device).long()[order]
+        for _, state in affected:
+            if node.id not in state.host_locks:
+                state.host_locks[node.id] = self.tree_cache.inc_host_lock_ref(
+                    node.id
+                ).to_dec_params()
+        for cache in self.caches:
+            cache.preserve_index(device_rows, host_rows)
         for req_id, state in affected:
             row = self.cache.req_to_token[req_id, : state.prefix_len]
             lookup = torch.searchsorted(device_rows, row.long()).clamp(
@@ -244,10 +223,6 @@ class HiSparseV2Coordinator:
             positions = ((row >= 0) & (device_rows[lookup] == row)).nonzero().flatten()
             if not positions.numel():
                 continue
-            if node.id not in state.host_locks:
-                state.host_locks[node.id] = self.tree_cache.inc_host_lock_ref(
-                    node.id
-                ).to_dec_params()
             # Publish both maps before the allocator can hand these rows to another request.
             for cache in self.caches:
                 cache.host_locs[req_id, positions] = host_rows[lookup[positions]]

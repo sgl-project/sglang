@@ -2163,6 +2163,8 @@ class KVCacheConfigurator:
                 + int(max_total_num_tokens * config.expansion_ratio)
                 // self.pool_page_size
                 * self.pool_page_size
+                # HiCache rounds host capacity up by one page.
+                + self.pool_page_size
             )
         elif dsa_cp_layer_shard_rank is not None:
             reject_out_of_tree_path(

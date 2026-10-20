@@ -72,7 +72,7 @@ def resolve_hisparse_v2_config(
         raise ValueError(
             "HiSparse V2 swap_in_block_size must be a warp multiple <= 1024"
         )
-    expansion = raw.get("expansion_ratio", 1 + hicache_ratio)
+    expansion = raw.get("expansion_ratio", hicache_ratio)
     if isinstance(expansion, bool) or not isinstance(expansion, (int, float)):
         raise ValueError("HiSparse V2 expansion_ratio must be numeric")
     if not math.isfinite(expansion) or expansion <= 0:
