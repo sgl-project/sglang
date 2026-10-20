@@ -9,7 +9,7 @@ import { config } from "/src/snippets/configs/ornith-ai/ornith-1.5.jsx";
 
 ## Deployment
 
-These recipes target a single Linux node with NVIDIA CUDA GPUs. The public 9B, 35B-A3B, and 397B model cards recommend SGLang `>=0.5.9`. Both parsers are included in every launch command: `qwen3` separates reasoning from the answer, and `qwen3_coder` parses tool calls.
+These recipes target a single Linux node with NVIDIA CUDA GPUs. The 9B, 35B-A3B, and 397B model cards recommend SGLang `>=0.5.9`. Both parsers are included in every launch command: `qwen3` separates reasoning from the answer, and `qwen3_coder` parses tool calls.
 
 <Accordion title="Install SGLang">
 
@@ -29,26 +29,20 @@ Run the Python command from the deployment panel in this environment. See the [i
 docker pull lmsysorg/sglang:latest
 ```
 
-Select Docker in the deployment panel to generate the container command. For the 122B local checkpoint, mount its directory into the container and set **122B model path** to the path inside the container.
+Select Docker in the deployment panel to generate the container command.
 
 </Tab>
 </Tabs>
 
 </Accordion>
 
-Choose your hardware, model size, and checkpoint format. The 9B recipe uses one GPU, 35B-A3B uses two, and 397B uses eight. BF16 397B requires H200 in this matrix; its FP8 checkpoint is also available on H100.
-
-For 122B, select **H100 → 122B → Original (122B)**. The model author's recipe uses eight H100 GPUs, tensor parallelism 8, a 262,144-token context window, and `--mem-fraction-static 0.80`. Set **122B model path** to your downloaded checkpoint. The default port is **9001** for all recipes and examples on this page.
-
-<Note>
-The 9B, 35B-A3B, and 397B baselines follow the linked official model cards. The 122B command was supplied by the model author; its official model card currently contains only MIT license metadata, without architecture, precision, or deployment details. “Original (122B)” does not assert a weight precision. These recipes have not been verified with GPU inference runs here, and no measured performance is claimed.
-</Note>
+Choose your hardware, model size, and checkpoint format. The 9B recipe uses one GPU, 35B-A3B uses two, and 122B and 397B use eight. BF16 397B requires H200 in this matrix; its FP8 checkpoint is also available on H100. Select **Original** for the original checkpoint or **FP8** for an FP8 checkpoint. All commands use Hugging Face repository IDs and default to port **30000**.
 
 <Deployment config={config} />
 
 ## 1. Model introduction
 
-Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingface.co/ornith-ai). The public 9B, 35B-A3B, and 397B checkpoints use Qwen3.5 architectures. The table lists the checkpoints covered by this recipe, including the author-provided 122B deployment.
+Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingface.co/ornith-ai). The 9B, 35B-A3B, and 397B checkpoints use Qwen3.5 architectures. The table lists the checkpoints covered by this recipe.
 
 <table style={{width: "100%", borderCollapse: "collapse"}}>
   <thead>
@@ -76,8 +70,8 @@ Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingfa
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/ornith-ai/Ornith-1.5-122B">Ornith-1.5-122B</a></td>
-      <td style={{padding: "9px 12px"}}>Original checkpoint; precision unconfirmed</td>
-      <td style={{padding: "9px 12px"}}>8× H100; author-provided local-path recipe</td>
+      <td style={{padding: "9px 12px"}}>Original</td>
+      <td style={{padding: "9px 12px"}}>8× H100</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/ornith-ai/Ornith-1.5-397B">Ornith-1.5-397B</a></td>
@@ -97,11 +91,10 @@ The official [9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B), [35B-A3B](htt
 ## 2. Configuration tips
 
 - **Model IDs:** use the `ornith-ai` namespace. The 35B repository includes the `-A3B` suffix. FP8 selections use the actual `-FP8` repository rather than the BF16 repository shown in their model-card quickstarts.
-- **Context and memory:** every recipe uses `--context-length 262144`. The public 9B, 35B-A3B, and 397B quickstarts use `--mem-fraction-static 0.85`; the supplied 122B recipe uses `0.80`. Lower the context length if you need more memory headroom.
+- **Context and memory:** every recipe uses `--context-length 262144`. The deployment panel sets `--mem-fraction-static` for each checkpoint. Lower the context length if you need more memory headroom.
 - **Reasoning:** `--reasoning-parser qwen3` exposes reasoning as `message.reasoning_content`, with the answer in `message.content`.
 - **Tool calling:** `--tool-call-parser qwen3_coder` exposes parsed calls in `message.tool_calls`. Your application executes the requested function and submits its result in a follow-up tool message.
 - **Sampling:** 35B-A3B and 397B recommend `temperature=0.6`, `top_p=0.95`, and `top_k=20`. For 9B, the model card recommends `temperature=1.0` and `presence_penalty=1.5` for general tasks, or `temperature=0.6` and `presence_penalty=0.0` for precise coding; both use `top_p=0.95`, `top_k=20`, `min_p=0.0`, and `repetition_penalty=1.0`. These settings are distinct from benchmark-specific settings. The panel's cURL example uses the precise-coding temperature.
-- **Local 122B checkpoint:** replace `/path/to/Ornith-1.5-122B` with the directory containing the downloaded weights and tokenizer files. The recipe retains the supplied `--tp-size 8` flag.
 
 ## 3. Usage examples
 
@@ -112,7 +105,7 @@ These requests assume you launched 9B with the default port and served model nam
 ```python Example
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:9001/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Ornith-1.5-9B",
     messages=[{"role": "user", "content": "Write a compact Python is_prime function."}],
@@ -134,7 +127,7 @@ print("Answer:", message.content)
 ```python Example
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:9001/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 response = client.chat.completions.create(
     model="Ornith-1.5-9B",
     messages=[{"role": "user", "content": "Run the parser module's unit tests."}],

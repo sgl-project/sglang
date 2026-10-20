@@ -1,7 +1,5 @@
 // Official Ornith-1.5 model-card baselines; no GPU runs or benchmarks verified here.
 // FP8 cells use the actual FP8 repos, whose READMEs currently show BF16 repo IDs.
-// The 122B recipe is author-provided; its model card currently contains only license metadata.
-// Do not infer its precision or architecture from its parameter count.
 export const config = {
   modelName: "Ornith-1.5",
 
@@ -15,9 +13,8 @@ export const config = {
   ],
 
   quantizations: [
-    { id: "bf16",  label: "BF16" },
+    { id: "bf16",  label: "Original" },
     { id: "fp8",   label: "FP8" },
-    { id: "original", label: "Original (122B)" },
   ],
 
   strategies: [
@@ -29,7 +26,7 @@ export const config = {
   ],
 
   modelNames: {
-    "122b|original": "Ornith-1.5-122B",
+    "122b|bf16": "Ornith-1.5-122B",
     "397b|bf16":     "Ornith-1.5-397B",
     "397b|fp8":      "Ornith-1.5-397B-FP8",
     "35b|bf16":      "Ornith-1.5-35B-A3B",
@@ -38,11 +35,10 @@ export const config = {
   },
 
   placeholders: {
-    MODEL_PATH: { target: "command", label: "122B model path", default: "/path/to/Ornith-1.5-122B" },
     HOST_IP:   { target: "command", label: "Bind host",         default: "0.0.0.0"         },
-    PORT:      { target: "command", label: "Bind port",         default: "9001"           },
+    PORT:      { target: "command", label: "Bind port",         default: "30000"           },
     CURL_HOST: { target: "curl",    label: "Server host",       default: "localhost"       },
-    CURL_PORT: { target: "curl",    label: "Server port",       default: "9001"           },
+    CURL_PORT: { target: "curl",    label: "Server port",       default: "30000"           },
   },
 
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions \\
@@ -72,12 +68,10 @@ export const config = {
 
   cells: [
     {
-      match: { hw: "h100", variant: "122b", quant: "original", strategy: "balanced", nodes: "single" },
-      verified: false,
-      warn: "Author-provided recipe for 8× H100. Set the 122B model path before launching; checkpoint precision remains to be confirmed.",
+      match: { hw: "h100", variant: "122b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
-        "--model-path {{MODEL_PATH}}",
+        "--model-path ornith-ai/Ornith-1.5-122B",
         "--served-model-name {{MODEL_NAME}}",
         "--tp-size 8",
         "--context-length 262144",
