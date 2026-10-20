@@ -57,6 +57,7 @@ impl SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         leaf_id: NodeIdx_,
+        cache_actions: &mut Vec<CacheAction>,
     ) -> Option<NodeIdx_> {
         let leaf = tree_core.arena.node(leaf_id);
         if leaf.is_root() || leaf.device_lock_ref(SWA) > 0 {
@@ -79,9 +80,18 @@ impl SwaComponent {
 
         let (new_parent, action) = tree_core.split_node_(leaf_id, split_at);
         assert!(
-            action.is_none(),
+            !matches!(
+                action,
+                Some(CacheAction::UpdatePendingBackupOnNodeSplit {
+                    ack_id: Some(_),
+                    ..
+                })
+            ),
             "fresh SWA leaf cannot be write-through-pending"
         );
+        if let Some(action) = action {
+            cache_actions.push(action);
+        }
         Some(new_parent)
     }
 
@@ -115,14 +125,6 @@ impl SwaComponent {
             node.dec_host_lock_ref(SWA);
         } else {
             node.dec_device_lock_ref(SWA);
-        }
-    }
-
-    fn value_len<K: ChildKeyType>(node: &Node<K>, host: bool) -> usize {
-        if host {
-            node.host_value_len(SWA)
-        } else {
-            node.device_value_len(SWA)
         }
     }
 
@@ -595,14 +597,16 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // Node straddles the boundary: split into an out-of-window parent
                 // (tombstone) and an in-window child; `node` becomes the child.
                 let (_, action) = tree_core.split_node_(node_id, split_pos);
-                assert!(action.is_none(), "new leaf cannot be write-through-pending");
+                if let Some(action) = action {
+                    cache_actions.push(action);
+                }
             }
         }
         result.record_adopted_range(SWA, node_start.max(params.swa_evicted_seqlen), node_end);
         // Cap the in-window leaf at one window for lock granularity, then rebuild SWA
         // onto the in-window node(s) at apply time; rebuild the older prefix first so
         // the in-window tail lands more-MRU.
-        let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id);
+        let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id, cache_actions);
         if let Some(capped_parent) = capped_parent {
             cache_actions.push(CacheAction::SwaRebuild {
                 node_id: tree_core.arena.node(capped_parent).id,
@@ -682,7 +686,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .entry(ct)
                 .or_default()
                 .push(node.device_value(FULL).shallow_clone());
-            freed = node.device_value_len(SWA);
+            freed = node.device_reclaimable_value_len(SWA);
             let _ = node.take_device_value(SWA);
             tree_core.dec_evictable_size(SWA, freed);
         }
@@ -1172,7 +1176,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let parent = node.parent();
             let key_len = node.key.atom_len();
             let has_value = Self::has_value(node, lock_host);
-            let value_len = Self::value_len(node, lock_host);
+            let value_len = node.device_reclaimable_value_len(SWA);
             let newly_locked = Self::lock_ref(node, lock_host) == 0;
             Self::inc_lock_ref(node, lock_host);
             if newly_locked && has_value {
@@ -1225,7 +1229,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 if lock_host { "host_" } else { "" }
             );
             let has_value = Self::has_value(node, lock_host);
-            let value_len = Self::value_len(node, lock_host);
+            let value_len = node.device_reclaimable_value_len(SWA);
             if lock_ref == 1 && has_value {
                 if lock_host {
                     if !node.has_device_value(SWA) {
@@ -1288,7 +1292,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 "SWA window release hit lock_ref=0 on node {cur}"
             );
             let has_value = node.has_device_value(SWA);
-            let value_len = node.device_value_len(SWA);
+            let value_len = node.device_reclaimable_value_len(SWA);
             node.dec_device_lock_ref(SWA);
             let now_unlocked = node.device_lock_ref(SWA) == 0;
             if now_unlocked {

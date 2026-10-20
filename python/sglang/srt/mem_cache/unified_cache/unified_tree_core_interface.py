@@ -116,6 +116,7 @@ class TreePathNodeInfo(msgspec.Struct, frozen=True):
     path_end: int
     # Logical FULL device indices; None when the value is absent.
     full_value_len: Optional[int]
+    num_children: int
 
 
 class InsertStepResult(msgspec.Struct, frozen=True):
@@ -430,6 +431,8 @@ class UnifiedTreeCoreInterface(ABC):
 
         Roots and nodes without device values are no-ops. Missing handles raise
         KeyError; disabled components raise ValueError.
+        Negative totals raise ValueError without updating the count. Rust also
+        rejects fixed-width overflow; Python integers are unbounded.
         """
         ...
 
