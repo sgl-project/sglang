@@ -78,6 +78,10 @@ message GenerateRequest {
   optional string routing_key = 31;
   optional uint64 max_thinking_tokens = 32;
   KvHintsEnvelopeOrList kv_hints = 29;
+  // The caller's W3C trace context, one for every batch item. Only
+  // `traceparent` and `tracestate` are read; with --enable-trace the
+  // scheduler parents this request's spans on it.
+  map<string, string> external_trace_header = 33;
 }
 
 message KvHintsEnvelopeOrList {

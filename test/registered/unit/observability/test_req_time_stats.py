@@ -15,14 +15,41 @@ set_finished_time() closes the trace root span, so they have to be derived
 inside that call rather than by the caller.
 """
 
+import contextlib
 import pickle
 import unittest
+from array import array
+from http import HTTPStatus
+from types import SimpleNamespace
 from unittest import mock
 
-import sglang.srt.observability.req_time_stats as rts
-from sglang.srt.observability.trace import SpanAttributes
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
+import sglang.srt.observability.req_time_stats as rts
+import sglang.srt.observability.trace as trace_mod
+import sglang.srt.observability.trace_async as trace_async
+from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.observability.trace import SpanAttributes
+from sglang.srt.runtime_context import get_parallel, get_resources
+from sglang.srt.sampling.sampling_params import SamplingParams
+
+try:
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+        InMemorySpanExporter,
+    )
+    from opentelemetry.trace import StatusCode
+
+    _has_otel = True
+except ImportError:
+    _has_otel = False
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -376,6 +403,214 @@ class TestStorageAdmissionWait(CustomTestCase):
             meta = stats.convert_to_output_meta_info()
             self.assertNotIn("storage_prefetch_wait", meta)
             self.assertNotIn("storage_staging_wait", meta)
+
+
+class _RecordingSocket:
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, msg, flags=0):
+        self.sent.append(msg)
+
+
+class _RecordingScheduler(Scheduler):
+    def _create_generation_req(self, recv_req, *args, **kwargs):
+        self.req = super()._create_generation_req(recv_req, *args, **kwargs)
+        return self.req
+
+
+@unittest.skipUnless(_has_otel, "opentelemetry not installed")
+class TestExternalTraceHeaderParentsSchedulerSpans(CustomTestCase):
+    """A frontend that sends a W3C trace context but no time_stats (the Rust
+    server) gets the scheduler's spans in the caller's trace, the thread span a
+    direct child of the caller's span, and no SGLang root span; the async
+    exporter, which learns the root only from the ops it is sent, agrees.
+    Requests enter through Scheduler.handle_generate_request, which picks the
+    seed."""
+
+    TRACE_ID = 0x0AF7651916CD43DD8448EB211C80319C
+    SPAN_ID = 0xB7AD6B7169203331
+    BOOTSTRAP_ROOM = 0x2A
+    HEADER = {
+        "traceparent": f"00-{TRACE_ID:032x}-{SPAN_ID:016x}-01",
+        "tracestate": "v=1",
+    }
+
+    def setUp(self):
+        self.orig_initialized = trace_mod.opentelemetry_initialized
+        self.orig_tracer = trace_mod.tracer
+        self.orig_threads = trace_mod.threads_info.copy()
+        self.orig_level = get_resources().trace_level
+
+        otel_trace._TRACER_PROVIDER_SET_ONCE._done = False
+        otel_trace._TRACER_PROVIDER = None
+        # The async exporter presets span ids, which only this generator consumes.
+        provider = TracerProvider(id_generator=trace_mod.TraceCustomIdGenerator())
+        self.exporter = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+        otel_trace.set_tracer_provider(provider)
+        trace_mod.opentelemetry_initialized = True
+        trace_mod.tracer = otel_trace.get_tracer("test")
+        trace_mod.set_global_trace_level(3)
+
+    def tearDown(self):
+        trace_mod.opentelemetry_initialized = self.orig_initialized
+        trace_mod.tracer = self.orig_tracer
+        trace_mod.threads_info.clear()
+        trace_mod.threads_info.update(self.orig_threads)
+        get_resources().trace_level = self.orig_level
+
+    def _seed(self, external_trace_header):
+        return rts.time_stats_from_external_trace_header(
+            rid="req-1",
+            bootstrap_room=None,
+            disagg_mode=rts.DisaggregationMode.NULL,
+            external_trace_header=external_trace_header,
+        )
+
+    def _admit(
+        self,
+        *,
+        time_stats=None,
+        disagg_mode=rts.DisaggregationMode.NULL,
+        bootstrap_room=None,
+    ):
+        """Build the request's Req through Scheduler.handle_generate_request,
+        from a header the Rust server sends with time_stats=None by default."""
+        scheduler = Scheduler.__new__(_RecordingScheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.disaggregation_mode = disagg_mode
+        scheduler.transfer_backend = TransferBackend.MOONCAKE
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id=None, vocab_size=128)
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.kv_events_publisher = SimpleNamespace(enable_kv_cache_events=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler._maybe_namespace_elastic_radix_cache = lambda req: None
+        scheduler.init_req_max_new_tokens = lambda req: None
+        scheduler._add_request_to_queue = lambda req: None
+        scheduler.output_streamer = mock.MagicMock()
+        recv = TokenizedGenerateReqInput(
+            rid="req-1",
+            input_text=None,
+            input_ids=array("q", [1, 2, 3]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=4),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            bootstrap_port=1,
+            bootstrap_room=bootstrap_room,
+            time_stats=time_stats,
+            external_trace_header=self.HEADER,
+        )
+        # An mm_input_error ends admission right after the Req is queued.
+        with get_parallel().override(tp_rank=0):
+            scheduler.handle_generate_request(recv, mm_input_error="stop")
+        return scheduler
+
+    def _run_scheduler_side(self):
+        stats = self._admit(bootstrap_room=self.BOOTSTRAP_ROOM).req.time_stats
+        stats.trace_ctx.trace_slice_start("prefill_forward", level=1)
+        stats.trace_ctx.trace_slice_end("prefill_forward", level=1)
+        stats.set_completion_time()
+
+    def _assert_parented_on_header(self):
+        spans = {span.name: span for span in self.exporter.get_finished_spans()}
+        self.assertEqual(len(spans), 2, list(spans))
+        slice_span = spans.pop("prefill_forward")
+        (thread_span,) = spans.values()
+        self.assertEqual(thread_span.context.trace_id, self.TRACE_ID)
+        self.assertEqual(slice_span.context.trace_id, self.TRACE_ID)
+        self.assertEqual(thread_span.parent.span_id, self.SPAN_ID)
+        self.assertTrue(thread_span.parent.is_remote)
+        self.assertEqual(slice_span.parent.span_id, thread_span.context.span_id)
+        # No SGLang span above it carries the ids a trace backend filters by.
+        self.assertEqual(thread_span.attributes["rid"], "req-1")
+        self.assertEqual(thread_span.attributes["bootstrap_room"], "0x2a")
+
+    def test_sync_tracing(self):
+        self._run_scheduler_side()
+        self._assert_parented_on_header()
+
+    @contextlib.contextmanager
+    def _async_tracing(self):
+        socket = _RecordingSocket()
+        with (
+            mock.patch.object(rts, "is_async_tracing_available", return_value=True),
+            mock.patch.object(
+                trace_async, "is_async_tracing_available", return_value=True
+            ),
+            mock.patch.object(trace_async, "_get_zmq_socket", return_value=socket),
+        ):
+            yield socket
+
+    def test_async_tracing_replays_to_the_same_tree(self):
+        with self._async_tracing() as socket:
+            self._run_scheduler_side()
+        self.assertEqual(len(self.exporter.get_finished_spans()), 0)
+
+        exporter = trace_async._TraceExporterProcess.__new__(
+            trace_async._TraceExporterProcess
+        )
+        contexts = {}
+        for msg in socket.sent:
+            exporter._replay_batch(
+                msg,
+                contexts,
+                trace_mod.threads_info,
+                trace_mod.TraceCustomIdGenerator,
+                trace_mod.TraceReqContext,
+                trace_mod.TraceSliceContext,
+                trace_mod.TraceEvent,
+            )
+        self._assert_parented_on_header()
+
+    def _python_frontend_time_stats(self):
+        # What the tokenizer pickles to the scheduler for the same request.
+        stats = rts.APIServerReqTimeStats()
+        stats.init_trace_ctx("req-1", None, self.HEADER)
+        stats.trace_ctx.trace_req_start()
+        return pickle.loads(pickle.dumps(stats))
+
+    def test_frontend_time_stats_take_precedence_over_the_header(self):
+        """The Python frontend's time_stats already parent on the caller under
+        its root span; the scheduler must not re-seed them from the header."""
+        sent = self._python_frontend_time_stats()
+        req = self._admit(time_stats=sent).req
+        self.assertIs(req.time_stats.trace_ctx, sent.trace_ctx)
+        # The frontend's root span carries the ids, so its thread spans do not.
+        req.time_stats.trace_ctx.abort()
+        thread_spans = self.exporter.get_finished_spans()
+        self.assertTrue(thread_spans)
+        for span in thread_spans:
+            self.assertNotIn("rid", span.attributes)
+
+    def test_pd_reject_without_bootstrap_room_closes_the_seeded_trace(self):
+        """A PD request without a bootstrap room gets a 400 abort. With no
+        frontend time_stats the refusal must end the seeded thread span with
+        the reason rather than fail on a missing trace context."""
+        scheduler = self._admit(disagg_mode=rts.DisaggregationMode.PREFILL)
+        req = scheduler.req
+        scheduler.output_streamer.stream_output.assert_called_once_with([req], False)
+        self.assertEqual(req.finished_reason.status_code, HTTPStatus.BAD_REQUEST)
+        (thread_span,) = self.exporter.get_finished_spans()
+        self.assertEqual(thread_span.parent.span_id, self.SPAN_ID)
+        self.assertEqual(thread_span.status.status_code, StatusCode.ERROR)
+        self.assertIn("without bootstrap room id", thread_span.attributes["reason"])
+        self.assertEqual(thread_span.attributes["rid"], "req-1")
+        self.assertNotIn("bootstrap_room", thread_span.attributes)
+
+    def test_no_seed_without_a_valid_context_or_tracing(self):
+        # A context the propagator rejects would give each rank its own root.
+        self.assertIsNone(self._seed({"traceparent": "garbage"}))
+        self.assertIsNone(self._seed({"traceparent": f"00-{0:032x}-{0:016x}-01"}))
+        trace_mod.opentelemetry_initialized = False
+        self.assertIsNone(self._seed(self.HEADER))
 
 
 if __name__ == "__main__":

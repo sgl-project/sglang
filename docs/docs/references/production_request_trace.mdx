@@ -70,6 +70,12 @@ This section explains how to configure the request tracing and export the trace 
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
+## Rust Server Mode
+
+With `SGLANG_RUST_SERVER=1`, the Rust frontend creates no spans of its own. To get scheduler spans, pass the W3C trace context as `external_trace_header`, an object of string values (`{"traceparent": ..., "tracestate": ...}`), in the `/generate` body or the `sglang.api.v1` gRPC `GenerateRequest`. Each scheduler rank's spans then join the caller's trace. A request without it, or with an invalid `traceparent`, is not traced.
+
+Unlike the Python frontend there is no `Req` root span (so no `gen_ai.*` attributes) and no tokenizer spans; the scheduler thread spans carry `rid` (and `bootstrap_room` when set) instead. The trace level comes from `SGLANG_TRACE_LEVEL` only.
+
 ## Async Tracing (Reducing Performance Overhead)
 
 When batch sizes are large, synchronous OTel span creation can degrade inference throughput due to thread-safe locking and background export threads. Async tracing moves all span creation to a dedicated exporter process via ZMQ, keeping the scheduler and tokenizer hot paths free of OTel overhead.

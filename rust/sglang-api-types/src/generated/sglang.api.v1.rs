@@ -411,6 +411,12 @@ pub struct GenerateRequest {
     pub max_thinking_tokens: ::core::option::Option<u64>,
     #[prost(message, optional, tag = "29")]
     pub kv_hints: ::core::option::Option<KvHintsEnvelopeOrList>,
+    /// The caller's W3C trace context, one for every batch item. Only
+    /// `traceparent` and `tracestate` are read; with --enable-trace the
+    /// scheduler parents this request's spans on it.
+    #[prost(map = "string, string", tag = "33")]
+    pub external_trace_header:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KvHintsEnvelopeOrList {

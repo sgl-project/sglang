@@ -308,6 +308,7 @@ from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
+    time_stats_from_external_trace_header,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -2971,7 +2972,16 @@ class Scheduler(
                 cache_salt=recv_req.cache_salt,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
-                time_stats=recv_req.time_stats,
+                time_stats=(
+                    recv_req.time_stats
+                    if recv_req.time_stats is not None
+                    else time_stats_from_external_trace_header(
+                        rid=recv_req.rid,
+                        bootstrap_room=recv_req.bootstrap_room,
+                        disagg_mode=self.disaggregation_mode,
+                        external_trace_header=recv_req.external_trace_header,
+                    )
+                ),
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
                 token_indices_to_pool=recv_req.token_indices_to_pool,
             )
@@ -3001,10 +3011,7 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    if not envs.SGLANG_RUST_SERVER.get():
-                        recv_req.time_stats.trace_ctx.abort(
-                            abort_info={"reason": error_msg}
-                        )
+                    req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.output_streamer.stream_output([req], req.return_logprob)
                     return

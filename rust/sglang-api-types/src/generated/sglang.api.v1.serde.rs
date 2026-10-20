@@ -1637,6 +1637,13 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.max_thinking_tokens {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_thinking_tokens", v)?;
         }
+        if !self.external_trace_header.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "external_trace_header",
+                &self.external_trace_header,
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1684,6 +1691,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_kv_hints = None;
                 let mut f_routing_key = None;
                 let mut f_max_thinking_tokens = None;
+                let mut f_external_trace_header = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -1902,6 +1910,22 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_max_thinking_tokens = Some(map.next_value::<Option<u64>>()?);
                         }
+                        "external_trace_header" => {
+                            if f_external_trace_header.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "external_trace_header",
+                                ));
+                            }
+                            f_external_trace_header = Some(
+                                map.next_value::<Option<
+                                    ::std::collections::HashMap<
+                                        String,
+                                        ::prost::alloc::string::String,
+                                    >,
+                                >>()?
+                                .unwrap_or_default(),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -1939,6 +1963,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     kv_hints: f_kv_hints.flatten(),
                     routing_key: f_routing_key.flatten(),
                     max_thinking_tokens: f_max_thinking_tokens.flatten(),
+                    external_trace_header: f_external_trace_header.unwrap_or_default(),
                 })
             }
         }

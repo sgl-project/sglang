@@ -490,6 +490,8 @@ class _TraceExporterProcess(multiprocessing.Process):
 
                         trace_ctx.root_span_context = otel_propagate.extract(carrier)
                         trace_ctx.is_copy = True
+                    if op.get("adopted_external_root"):
+                        trace_ctx.adopted_external_root = True
                     lsc = op.get("init_last_span_context")
                     if lsc:
                         from opentelemetry import trace
@@ -545,6 +547,9 @@ class TraceReqContextAsync:
       This allows the caller to track last_span_context (trace_id + span_id)
       for cross-process propagation without waiting for actual span creation.
     """
+
+    # See TraceReqContext.adopted_external_root; the exporter applies it.
+    adopted_external_root: bool = False
 
     def __init__(
         self,
@@ -868,10 +873,24 @@ class TraceReqContextAsync:
         # so it needs the carrier to set up root_span_context.
         if self.is_copy and self._root_span_carrier:
             op["root_span_carrier"] = self._root_span_carrier
+        if self.adopted_external_root:
+            op["adopted_external_root"] = True
         if self._init_last_span_context:
             op["init_last_span_context"] = self._init_last_span_context
             self._init_last_span_context = None
         self._append_op(op)
+
+    def adopt_external_root(self) -> None:
+        """See TraceReqContext.adopt_external_root. The exporter receives the
+        carrier with the next rebuild_thread_context op."""
+        if not self.tracing_enable:
+            return
+        self.is_copy = True
+        self.adopted_external_root = True
+        self._root_span_carrier = dict(self._init_args["external_trace_header"] or {})
+        self.root_span_context = _trace_mod._trace_context_propagator.extract(
+            self._root_span_carrier
+        )
 
     def abort(
         self, ts: Optional[int] = None, abort_info: Optional[Dict] = None

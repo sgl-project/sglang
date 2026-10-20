@@ -3,6 +3,8 @@
 //! Each is a msgspec `array_like=True` struct, so **field order is wire order**
 //! and `rmp_serde`'s default struct-as-array encoding reproduces it.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::Serialize;
 
@@ -43,8 +45,8 @@ wire_struct! {
         lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
-        /// PD-disaggregation block. Everything after `kv_hints` (the last
-        /// field emitted) has a msgspec default in Python and is omitted.
+        /// PD-disaggregation block. Everything after `external_trace_header`
+        /// (the last field emitted) has a msgspec default in Python and is omitted.
         bootstrap_host: Option<&'a str>,
         bootstrap_port: Option<i64>,
         bootstrap_room: Option<i64>,
@@ -67,6 +69,12 @@ wire_struct! {
         time_stats: (),
         cache_salt: Option<&'a str>,
         kv_hints: Option<&'a super::request::KvHintsEnvelope>,
+        /// Python-defaulted slots, sent at those defaults to reach
+        /// `external_trace_header`.
+        pp_prefetch_ticketed: bool,
+        sampling_logprobs_mode: &'static str,
+        lora_name: (),
+        external_trace_header: Option<&'a BTreeMap<String, String>>,
     }
 }
 
@@ -172,6 +180,10 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             time_stats: (),
             cache_salt: req.cache_salt.as_deref(),
             kv_hints: req.kv_hints.as_ref(),
+            pp_prefetch_ticketed: false,
+            sampling_logprobs_mode: "selected",
+            lora_name: (),
+            external_trace_header: req.external_trace_header.as_deref(),
         }
     }
 }
@@ -338,8 +350,8 @@ mod tests {
         let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
         let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
         let arr = val.as_array().expect("array");
-        // The orchestrator controls extend the array through `kv_hints`.
-        assert_eq!(arr.len(), 47, "header ends at kv_hints");
+        // The orchestrator controls extend the array through `external_trace_header`.
+        assert_eq!(arr.len(), 51, "header ends at external_trace_header");
         assert_eq!(arr[0].as_str(), Some("TokenizedGenerateReqInput"));
         assert_eq!(arr[1].as_str(), Some("r1"));
         assert!(arr[5].is_nil(), "idx 5 must be input_embeds (nil)");
@@ -461,5 +473,34 @@ mod tests {
             assert!(slot.is_nil(), "idx {i} must be a nil default");
         }
         assert_eq!(arr[45].as_str(), Some("pepper"), "cache_salt at 45");
+    }
+
+    /// The trace context lands on Python's `external_trace_header` (idx 50)
+    /// as a map, behind the tail slots it forces out: those must decode to the
+    /// defaults Python gives a shorter array, or every request would silently
+    /// change its PP prefetch, logprob mode or KV-event namespace.
+    #[test]
+    fn header_tail_slots_carry_defaults_and_the_trace_context() {
+        const TRACEPARENT: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let req = GenerateRequest {
+            rid: "r1".into(),
+            input_ids: Some(vec![1]),
+            external_trace_header: Some(std::sync::Arc::new(BTreeMap::from([(
+                "traceparent".to_owned(),
+                TRACEPARENT.to_owned(),
+            )]))),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert_eq!(arr[47].as_bool(), Some(false), "pp_prefetch_ticketed");
+        assert_eq!(arr[48].as_str(), Some("selected"), "sampling_logprobs_mode");
+        assert!(arr[49].is_nil(), "lora_name");
+        assert_eq!(
+            arr[50],
+            rmpv::Value::Map(vec![("traceparent".into(), TRACEPARENT.into())]),
+            "external_trace_header"
+        );
     }
 }
