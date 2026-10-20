@@ -2140,9 +2140,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
     ),
-    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
-        note="The unified radix tree is the default tree cache now; unset this env."
-    ),
 }
 
 
