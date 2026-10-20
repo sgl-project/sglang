@@ -1,4 +1,4 @@
-"""Two gloo ranks on CPU drive the asynchronous expert migrator through one rebalance; no server, no model."""
+"""Expert migration tests: the planner issues no device op, the synchronous updater keeps its order, and two gloo ranks on CPU migrate one layer at a time."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -13,6 +13,7 @@ import torch
 import torch.distributed
 import torch.multiprocessing as mp
 
+from sglang.srt.eplb import expert_location_updater as updater
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 _WORLD_SIZE = 2
@@ -140,6 +141,55 @@ def _run_rank(rank, master_port, writer):
     except Exception:
         traceback.print_exc()
         writer.send(False)
+
+
+def _single_rank_weights(physical_to_logical_map):
+    return [
+        torch.tensor([[float(e)] * 3 for e in physical_to_logical_map[:_NUM_LOCAL]])
+        for _ in range(2)
+    ]
+
+
+class TestExpertLocationUpdaterPlan(CustomTestCase):
+    def test_plan_issues_no_device_op(self):
+        """Plans are built on a worker thread while staging buffers may still be
+        read by an install, so planning must not copy anything."""
+        old = [0, 1, 2, 0]
+        new = [1, 0, 2, 1]
+        weights = _single_rank_weights(old)
+        buffers = updater.create_temp_buffers(weights)
+        weights_before = [w.clone() for w in weights]
+        buffers_before = [b.clone() for b in buffers]
+        plan = updater.plan_expert_weights_single_layer(
+            routed_experts_weights=weights,
+            temp_buffers=buffers,
+            old_physical_to_logical_map=old,
+            new_physical_to_logical_map=new,
+            num_local_physical_experts=_NUM_LOCAL,
+            num_gpu_per_node=2,
+            rank=0,
+        )
+        self.assertTrue(plan.weight2buffer_copy_infos)
+        for before, after in zip(weights_before, weights, strict=True):
+            self.assertTrue(torch.equal(before, after))
+        for before, after in zip(buffers_before, buffers, strict=True):
+            self.assertTrue(torch.equal(before, after))
+
+    def test_synchronous_update_reaches_target_map(self):
+        old = [0, 1]
+        new = [1, 0]
+        weights = _single_rank_weights(old)
+        updater.update_expert_weights_single_layer(
+            routed_experts_weights=weights,
+            temp_buffers=updater.create_temp_buffers(weights),
+            old_physical_to_logical_map=old,
+            new_physical_to_logical_map=new,
+            num_local_physical_experts=_NUM_LOCAL,
+            num_gpu_per_node=1,
+            rank=0,
+        )
+        for expected, actual in zip(_single_rank_weights(new), weights, strict=True):
+            self.assertTrue(torch.equal(expected, actual))
 
 
 class TestEplbAsyncMigrator(CustomTestCase):
