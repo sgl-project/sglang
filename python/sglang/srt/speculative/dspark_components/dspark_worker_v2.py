@@ -71,6 +71,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_sampling_accept_graph import (
+    DsparkSamplingAcceptGraph,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -149,6 +152,9 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
 
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
+
+    _sampling_accept_graph = None
+    _rejection_noise = None
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
     _prepare_inputs_once = False
@@ -364,6 +370,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
+        self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
+        # Counter-based rejection draws from the server seed: every TP rank draws the
+        # same coins from the same logits, with no accept broadcast needed. The eager
+        # accept and the sampling-accept region share it.
+        self._rejection_noise = (
+            make_rejection_noise(self.target_worker.random_seed, self.device)
+            if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
+            else None
+        )
         target_is_dsv41 = (
             getattr(
                 self.target_worker.model_runner.model_config.hf_text_config,
@@ -436,6 +451,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            if (
+                envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
+                and static_epilogue_supported
+                and is_cuda()
+            ):
+                self._sampling_accept_graph = DsparkSamplingAcceptGraph(
+                    epilogue=self._verify_epilogue,
+                    resolve_draft_sampler=lambda: self._draft_sampler,
+                    tp_sync=self._tp_sync,
+                    fused_argmax=target_is_dsv41,
+                    block_verification=get_spec().speculative_use_block_verification,
+                    device=self.device,
+                    rejection_noise=self._rejection_noise,
+                )
 
         self._simulate_acc_greedy = (
             self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
@@ -469,13 +498,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
-            # Counter-based rejection draws from the server seed: every TP rank draws the
-            # same coins from the same logits, with no accept broadcast needed.
-            rejection_noise=(
-                make_rejection_noise(self.target_worker.random_seed, self.device)
-                if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
-                else None
-            ),
+            rejection_noise=self._rejection_noise,
         )
 
         self._forced_budget_frac: Optional[float] = None
@@ -1171,21 +1194,48 @@ class DSparkWorkerV2(BaseSpecWorker):
             and can_run_cuda_graph
             and (run_compact or self._verify_planner.mode_value == "static")
         )
-        accept = self._verify_executor.accept_and_finalize(
-            folded_accept=folded_accept,
-            bs=bs,
-            verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
-            draft_block=draft_block,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            layout=layout,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
-            simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+        region_accept = None
+        if (
+            not folded_accept
+            and can_run_cuda_graph
+            and not run_compact
+            and self._sampling_graph_eligible(
+                batch=batch,
+                proposal_folded=proposal.folded,
+                sampling_info=sampling_info,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        ):
+            region_accept = self._sampling_accept_graph.run(
+                bs=bs, target_logits=logits_output.next_token_logits
+            )
+        # The accept and its commits ran in a graph: the verify graph's fold or the
+        # sampling-accept region replayed right after it.
+        graph_accept = folded_accept or region_accept is not None
+        if region_accept is not None:
+            epilogue.note_static_verify(bs)
+            accept = region_accept
+        else:
+            accept = self._verify_executor.accept_and_finalize(
+                folded_accept=folded_accept,
+                bs=bs,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                draft_block=draft_block,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
+        engram_in_graph = (
+            folded_accept and not run_compact and epilogue.folds_engram_commit
+        ) or (
+            region_accept is not None and self._sampling_accept_graph.committed_engram
         )
         # The static verify graph committed the engram history when it folded the accept.
-        if not (folded_accept and not run_compact and epilogue.folds_engram_commit):
+        if not engram_in_graph:
             self.model_runner.ngram_embedding_manager.update_after_verify(
                 verify_ids_2d=verify_ids_2d,
                 req_pool_indices=batch.req_pool_indices,
@@ -1213,7 +1263,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         relay = self._future_relay_in_graph(
-            run_compact=run_compact, folded_accept=folded_accept
+            run_compact=run_compact, folded_accept=graph_accept
         )
         if relay is not None:
             relay.published_seq_lens = accept.new_seq_lens
@@ -1230,7 +1280,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             commit_lens=accept.commit_lens,
         )
 
-        folded_commit = folded_accept and epilogue.folds_commit
+        folded_commit = graph_accept and epilogue.folds_commit
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         if not folded_commit:
@@ -1281,7 +1331,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
             block_accept_lens=self._block_accept_lens(
-                accept=accept, folded_accept=folded_accept, bs=bs
+                accept=accept, folded_accept=graph_accept, bs=bs
             ),
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
@@ -1290,6 +1340,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _sampling_graph_eligible(
+        self,
+        *,
+        batch: ScheduleBatch,
+        proposal_folded: bool,
+        sampling_info,
+        simulate_bonus_sampling_info,
+    ) -> bool:
+        """An all-sampled static step the sampling-accept region reproduces exactly."""
+        return (
+            self._sampling_accept_graph is not None
+            and proposal_folded
+            and self._verify_planner.mode_value == "static"
+            and sampling_info is not None
+            and not sampling_info.is_any_greedy
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+            and verify_logits_adjustments_are_noop(sampling_info)
+            and simulate_bonus_sampling_info is None
+            and not batch.has_grammar
         )
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):

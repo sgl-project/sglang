@@ -553,6 +553,18 @@ class AcceptOuts(msgspec.Struct):
     out_tokens: torch.Tensor
 
 
+class StaticVerifyIO(msgspec.Struct, frozen=True):
+    """A static verify graph's input and output tensors for one captured batch size."""
+
+    candidates: torch.Tensor
+    logits: torch.Tensor
+    hidden: torch.Tensor
+    seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
+    out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+
+
 class DsparkVerifyEpilogue:
     def __init__(
         self,
@@ -647,6 +659,8 @@ class DsparkVerifyEpilogue:
         self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
+        # Per captured static batch size; the sampling-accept region's replays read them.
+        self.static_io: dict[int, StaticVerifyIO] = {}
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -705,68 +719,111 @@ class DsparkVerifyEpilogue:
 
     def _static_epilogue(self, out, forward_batch) -> None:
         bs = forward_batch.batch_size
+        io = StaticVerifyIO(
+            candidates=forward_batch.input_ids.view(bs, self.stride),
+            logits=out.next_token_logits,
+            hidden=out.hidden_states,
+            seq_lens=forward_batch.seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            out_cache_loc=forward_batch.out_cache_loc,
+            positions=forward_batch.positions,
+        )
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if capturing:
+            self.static_io[bs] = io
+        committed_engram = self.run_static(
+            io, accept=self._accept_static_greedy, gate=self.inject_gate_buf
+        )
+        if committed_engram and capturing:
+            self.folds_engram_commit = True
+
+    def run_static(
+        self, io: StaticVerifyIO, *, accept, gate: torch.Tensor, kv_projected=False
+    ) -> bool:
+        """``accept(io, verify_lens=, gate=, gated=)`` fills the accept buffers and returns
+        the gated commit lengths (None when not ``gated``); the engram history, future
+        relay and KV commits follow, gated by ``gate``. ``kv_projected``: the deferred
+        commit's projection was already joined (by the verify graph this step replayed).
+        Returns whether the engram history was committed."""
+        bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
-        candidates = forward_batch.input_ids.view(bs, self.stride)
         folds = self.folds_commit
+        gated_commit_lens = accept(io, verify_lens=verify_lens, gate=gate, gated=folds)
+        # Both accept branches leave the ungated commit lengths in commit_lens_buf.
+        committed_engram = self._commit_engram_history(
+            io.candidates,
+            io.req_pool_indices,
+            self.commit_lens_buf[:bs],
+            verify_lens,
+            gate,
+        )
+        if self._post_fold:
+            self._scatter_future_relay(io.req_pool_indices, bs)
+        if not folds:
+            return committed_engram
+        cache_loc = io.out_cache_loc
+        state_slot = None
+        if self.commit_ctx.kv_injector.swa_ring_size is not None:
+            state_slot = (
+                io.req_pool_indices.view(-1, 1).expand(bs, self.stride).reshape(-1)
+            )
+        commit = self.deferred_commit
+        if commit is not None and (kv_projected or commit.join_projection()):
+            commit.stage(
+                cache_loc=cache_loc,
+                positions=io.positions,
+                commit_lens=gated_commit_lens,
+                state_slot=state_slot,
+            )
+            return committed_engram
+        self.commit_ctx.kv_injector.inject_target_hidden(
+            target_hidden=io.hidden,
+            cache_loc=cache_loc,
+            cache_loc_2d=cache_loc.view(bs, self.stride),
+            positions=io.positions,
+            commit_lens=gated_commit_lens,
+            state_slot=state_slot,
+        )
+        return committed_engram
+
+    def _accept_static_greedy(
+        self, io: StaticVerifyIO, *, verify_lens, gate, gated: bool
+    ) -> Optional[torch.Tensor]:
+        bs = io.candidates.shape[0]
         if self._serves_accept_tail(bs):
             gated_commit_lens = self._static_accept_tail(
-                candidates=candidates,
-                logits=out.next_token_logits,
-                seq_lens=forward_batch.seq_lens,
+                candidates=io.candidates,
+                logits=io.logits,
+                seq_lens=io.seq_lens,
                 verify_lens=verify_lens,
-                gated=folds,
+                gated=gated,
             )
             block = self.read_block_accept_lens(bs)
             if block is not None:
                 # The static tail never cap-trims (it writes cap_trim_lens 0).
                 block.copy_(self.commit_lens_buf[:bs])
-        else:
-            commit_lens = self._accept(
-                candidates=candidates,
-                logits=out.next_token_logits,
-                draft_tokens=candidates[:, 1:].contiguous(),
-                seq_lens=forward_batch.seq_lens,
-            )
-            # Same staged locations as target verify; padded and fallback rows skip KV.
-            gated_commit_lens = (
-                torch.minimum(commit_lens, verify_lens.to(torch.int32))
-                * self.inject_gate_buf
-                if folds
-                else None
-            )
-        # Both accept branches leave the ungated commit lengths in commit_lens_buf.
-        self._commit_engram_history(
-            candidates, forward_batch, self.commit_lens_buf[:bs], verify_lens
+            return gated_commit_lens
+        commit_lens = self._accept(
+            candidates=io.candidates,
+            logits=io.logits,
+            draft_tokens=io.candidates[:, 1:].contiguous(),
+            seq_lens=io.seq_lens,
         )
-        if self._post_fold:
-            self._scatter_future_relay(forward_batch.req_pool_indices, bs)
-        if not folds:
-            return
-        cache_loc = forward_batch.out_cache_loc
-        state_slot = None
-        if self.commit_ctx.kv_injector.swa_ring_size is not None:
-            state_slot = (
-                forward_batch.req_pool_indices.view(-1, 1)
-                .expand(bs, self.stride)
-                .reshape(-1)
-            )
-        commit = self.deferred_commit
-        if commit is not None and commit.join_projection():
-            commit.stage(
-                cache_loc=cache_loc,
-                positions=forward_batch.positions,
-                commit_lens=gated_commit_lens,
-                state_slot=state_slot,
-            )
-            return
-        self.commit_ctx.kv_injector.inject_target_hidden(
-            target_hidden=out.hidden_states,
-            cache_loc=cache_loc,
-            cache_loc_2d=cache_loc.view(bs, self.stride),
-            positions=forward_batch.positions,
-            commit_lens=gated_commit_lens,
-            state_slot=state_slot,
+        # Same staged locations as target verify; padded and fallback rows skip KV.
+        return (
+            torch.minimum(commit_lens, verify_lens.to(torch.int32)) * gate
+            if gated
+            else None
         )
+
+    def engram_history(self) -> Optional[torch.Tensor]:
+        """The engram history the static epilogue commits into, or None."""
+        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
+            return None
+        hasher = self.commit_ctx.resolve_engram_hasher()
+        return None if hasher is None else hasher.history
 
     def _serves_accept_tail(self, bs: int) -> bool:
         low, high = self._accept_tail_bs
@@ -850,25 +907,22 @@ class DsparkVerifyEpilogue:
             self.deferred_commit.note_static_verify(bs)
 
     def _commit_engram_history(
-        self, candidates, forward_batch, commit_lens, verify_lens
-    ) -> None:
+        self, candidates, req_pool_indices, commit_lens, verify_lens, gate
+    ) -> bool:
         """The post-verify engram history commit, gated per row: padded rows
         (verify_lens 0) and steps the graph does not commit (gate 0) are skipped."""
-        if self.commit_ctx is None or self.commit_ctx.resolve_engram_hasher is None:
-            return
-        hasher = self.commit_ctx.resolve_engram_hasher()
-        if hasher is None or hasher.history is None:
-            return
+        history = self.engram_history()
+        if history is None:
+            return False
         engram_commit_history(
-            hasher.history,
+            history,
             candidates,
-            forward_batch.req_pool_indices,
+            req_pool_indices,
             commit_lens,
             live_rows=verify_lens,
-            gate=self.inject_gate_buf,
+            gate=gate,
         )
-        if torch.cuda.is_current_stream_capturing():
-            self.folds_engram_commit = True
+        return True
 
     def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
         """Unconditional: a step that takes another accept publishes and stashes on

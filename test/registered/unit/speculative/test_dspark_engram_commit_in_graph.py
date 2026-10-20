@@ -14,31 +14,6 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
-def _epilogue(resolve):
-    epi = dspark_verify.DsparkVerifyEpilogue.__new__(dspark_verify.DsparkVerifyEpilogue)
-    epi.commit_ctx = SimpleNamespace(resolve_engram_hasher=resolve)
-    epi.inject_gate_buf = torch.ones(1, dtype=torch.int32)
-    epi.folds_engram_commit = False
-    return epi
-
-
-@pytest.mark.parametrize("capturing", [False, True])
-def test_commit_recorded_only_under_capture(monkeypatch, capturing):
-    calls = []
-    monkeypatch.setattr(
-        dspark_verify, "engram_commit_history", lambda *a, **k: calls.append(k)
-    )
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
-    epi = _epilogue(lambda: SimpleNamespace(history=torch.zeros(4, 3)))
-    fb = SimpleNamespace(req_pool_indices=torch.arange(2))
-    lens = torch.tensor([6, 0])
-    epi._commit_engram_history(torch.zeros(2, 6), fb, torch.ones(2), lens)
-    assert len(calls) == 1
-    assert calls[0]["live_rows"] is lens and calls[0]["gate"] is epi.inject_gate_buf
-    # Only a captured commit lets the worker skip its eager one.
-    assert epi.folds_engram_commit == capturing
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_gated_kernel_skips_dead_rows_and_closed_gate():
     from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
@@ -101,6 +76,7 @@ def _epilogue_for_accept(*, fused, bs, stride, history):
     epi._accept_tail_logged = set()
     epi._tp_sync = SimpleNamespace(sync=lambda site, t: None, enabled=lambda s: False)
     epi.folds_engram_commit = False
+    epi.static_io = {}
     epi._post_fold = False
     # No fused-norm pool: the epilogue returns right after the engram commit.
     epi.commit_ctx = SimpleNamespace(
@@ -132,6 +108,8 @@ def test_engram_history_fused_accept_tail_matches_unfused(monkeypatch):
         input_ids=candidates.reshape(-1),
         seq_lens=torch.randint(10, 100, (bs,), generator=g),
         req_pool_indices=torch.tensor([4, 0, 6, 2, 1]),
+        out_cache_loc=torch.zeros(bs * stride, dtype=torch.int64),
+        positions=torch.zeros(bs * stride, dtype=torch.int64),
     )
     out = SimpleNamespace(next_token_logits=logits, hidden_states=None)
     base = torch.randint(0, vocab, (8, 3), generator=g, dtype=torch.int64)
@@ -145,6 +123,33 @@ def test_engram_history_fused_accept_tail_matches_unfused(monkeypatch):
     assert not torch.equal(results[False][0], base)
     assert torch.equal(results[True][1], results[False][1])
     assert bool((results[True][1] > 0).all())
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_folds_engram_commit_only_under_capture(monkeypatch, capturing):
+    """Only a captured commit lets the worker skip its eager one; a captured static
+    epilogue also records its graph IO for the sampling-accept region."""
+    monkeypatch.setattr(dspark_verify, "engram_commit_history", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    bs, stride, vocab = 2, 6, 16
+    epi = _epilogue_for_accept(
+        fused=False, bs=bs, stride=stride, history=torch.zeros(4, 3, dtype=torch.int64)
+    )
+    fb = SimpleNamespace(
+        batch_size=bs,
+        input_ids=torch.zeros(bs * stride, dtype=torch.int64),
+        seq_lens=torch.full((bs,), 10),
+        req_pool_indices=torch.arange(bs),
+        out_cache_loc=torch.zeros(bs * stride, dtype=torch.int64),
+        positions=torch.zeros(bs * stride, dtype=torch.int64),
+    )
+    out = SimpleNamespace(
+        next_token_logits=torch.randn(bs * stride, vocab), hidden_states=None
+    )
+    epi._static_epilogue(out, fb)
+    assert epi.folds_engram_commit == capturing
+    assert (bs in epi.static_io) == capturing
 
 
 if __name__ == "__main__":
