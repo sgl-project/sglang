@@ -17,12 +17,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     EvictLayer,
     PrepareLoadBackResult,
+    PreparePrefetchResult,
     TreeComponent,
 )
 
@@ -40,11 +43,12 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedTreeNode
 
 
 class C128SidecarComponent(TreeComponent):
     component_type = ComponentType.C128
+    pool_name = PoolName.DEEPSEEK_V4_C128
 
     # Bound by _apply_stack_result (hybrid_pool_assembler) on the NPU path:
     # C128 is an independent-index pool whose host values live in this pool.
@@ -102,6 +106,122 @@ class C128SidecarComponent(TreeComponent):
         value = pages.clone()
         self.tree_core.set_component_device_value(node.id, ct, value)
         self.allocator.retain_c128_pages(value)
+
+    # ---- L3 (storage) residency -------------------------------------------
+    #
+    # C128 pages are far coarser than a FULL page: one page holds
+    # ``kernel_page_size`` compressed groups, so a block covers
+    # ``128 * kernel_page_size`` tokens and there is exactly one page -- and one
+    # storage key -- per block. That is why the pool reports its own verdict
+    # (``BLOCK_GROUPS``) instead of gating the KV prefix: the keys it owns are
+    # the block boundaries, not every FULL page.
+
+    def block_pages(self) -> int:
+        """FULL pages spanned by one C128 page."""
+        return self.allocator.c128_attn_allocator.page_size
+
+    def _kernel_page_size(self) -> int:
+        return self.allocator.c128_attn_allocator.page_size
+
+    def _group_tokens(self) -> int:
+        return self.tree_core.page_size * self._kernel_page_size()
+
+    def _block_transfer(self, blocks: int) -> PoolTransfer:
+        return PoolTransfer(
+            name=self.pool_name,
+            keys=["__placeholder__"] * blocks,
+            hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+            block_pages=self.block_pages(),
+            group_pages=1,
+        )
+
+    def prepare_prefetch(
+        self,
+        node_id: NodeId,
+        *,
+        prefetch_tokens: int = 0,
+    ) -> PreparePrefetchResult:
+        if self._c128_kv_pool_host is None:
+            return PreparePrefetchResult()
+        blocks = prefetch_tokens // self._group_tokens()
+        if blocks == 0:
+            return PreparePrefetchResult()
+        return PreparePrefetchResult(staging_tokens=blocks * self._group_tokens())
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        if self._c128_kv_pool_host is None:
+            return None
+        host_indices = self._c128_kv_pool_host.alloc(num_tokens)
+        if host_indices is None:
+            self.cache.evict_host(num_tokens, self.component_type)
+            host_indices = self._c128_kv_pool_host.alloc(num_tokens)
+        return host_indices
+
+    def _attach_host_value(self, node: UnifiedTreeNode, host_value: torch.Tensor) -> None:
+        """Publish fetched C128 host slots on a node and refresh tree state."""
+        ct = self.component_type
+        cd = node.component_data[ct]
+        cd.host_value = host_value.clone()
+        host_lru = self.tree_core.host_lru_lists[ct]
+        if cd.value is None and not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+        self.tree_core._update_evictable_leaf_sets(node)
+        if node.parent is not None:
+            self.tree_core._update_evictable_leaf_sets(node.parent)
+
+    def _commit_prefetch(
+        self,
+        anchor: UnifiedTreeNode,
+        transfers: list[PoolTransfer],
+        *,
+        cache_actions: list[CacheAction | ComponentAction],
+        insert_result: Optional[InsertResult] = None,
+        pool_storage_result: Optional[PoolTransferResult] = None,
+    ) -> None:
+        """Publish the prefetched C128 pages onto the inserted leaf.
+
+        All-or-nothing on the block verdict so every TP rank ends with the same
+        tree. The whole span lands on one node: the load-back and match paths
+        both concatenate host values leaf->root, so keeping the span's pages
+        together preserves their order.
+        """
+        if not transfers:
+            return
+        ct = self.component_type
+        kernel_page_size = self._kernel_page_size()
+        host_indices = transfers[0].host_indices
+        if host_indices is None or host_indices.numel() == 0:
+            return
+        blocks_required = host_indices.numel() // kernel_page_size
+        loaded_blocks = (
+            pool_storage_result.extra_pool_hit_pages.get(self.pool_name, 0)
+            if pool_storage_result is not None
+            else 0
+        )
+        target = (
+            self.tree_core.node_by_id(insert_result.inserted_host_node)
+            if insert_result is not None
+            and insert_result.inserted_host_node is not None
+            else None
+        )
+        if (
+            target is None
+            or blocks_required == 0
+            or loaded_blocks < blocks_required
+        ):
+            cache_actions.append(
+                FreeComponentHostSlot([host_indices], component_type=ct)
+            )
+            return
+        cd = target.component_data[ct]
+        if cd.host_value is None:
+            self._attach_host_value(
+                target, host_indices[: blocks_required * kernel_page_size]
+            )
+        else:
+            cache_actions.append(
+                FreeComponentHostSlot([host_indices], component_type=ct)
+            )
 
     def create_match_validator(
         self, match_device_only: bool = False
@@ -433,6 +553,34 @@ class C128SidecarComponent(TreeComponent):
                 )
             ]
 
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None or not node.hash_value:
+                return None
+            blocks = cd.host_value.numel() // page_size
+            if blocks == 0:
+                return None
+            # The node's C128 pages end at its own group boundaries, so they are
+            # keyed by the trailing FULL page hashes of the node.
+            return [
+                PoolTransfer(
+                    name=self.pool_name,
+                    host_indices=cd.host_value[-blocks * page_size :],
+                    keys=node.hash_value[-blocks:],
+                    hit_policy=PoolHitPolicy.BLOCK_GROUPS,
+                    block_pages=self.block_pages(),
+                    group_pages=1,
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            blocks = min(staging_tokens, prefetch_tokens) // self._group_tokens()
+            if blocks == 0:
+                return None
+            # Placeholder keys: the controller rewrites them to the span's block
+            # boundary hashes once the KV hit length is known.
+            return [self._block_transfer(blocks)]
+
         if phase == CacheTransferPhase.LOAD_BACK:
             # Collect host values from complete-group endpoints on the evicted path.
             # For example, G groups produce G * page_size host and device indices.
@@ -485,6 +633,16 @@ class C128SidecarComponent(TreeComponent):
                     host_lru = self.tree_core.host_lru_lists[ct]
                     if not host_lru.in_list(node):
                         host_lru.insert_mru(node)
+            return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            self._commit_prefetch(
+                node,
+                transfers,
+                cache_actions=cache_actions,
+                insert_result=insert_result,
+                pool_storage_result=pool_storage_result,
+            )
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
