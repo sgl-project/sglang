@@ -848,6 +848,11 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         counts = [sum(image[0].shape[0] for image, _ in group) for group in images]
         for req, latent, group in zip(batches, latents.split(counts), images):
             req.latents, req.latent_ids = latent, group[0][1]
+            if server_args.disagg_role == RoleType.DENOISER:
+                # The decoder needs latents and crop, not the encoding payload.
+                req.extra.pop("flux3_text", None)
+                req.extra.pop("flux3_condition", None)
+                req.image_path = None
         return batches
 
 

@@ -1106,9 +1106,9 @@ class DiffusionServer:
         elif msg_type == TransferMsgType.STAGED:
             self._handle_transfer_staged(msg, role)
         elif msg_type == TransferMsgType.ALLOCATED:
-            self._handle_transfer_allocated(msg)
+            self._handle_transfer_allocated(msg, role)
         elif msg_type == TransferMsgType.PUSHED:
-            self._handle_transfer_pushed(msg)
+            self._handle_transfer_pushed(msg, role)
         elif msg_type == TransferMsgType.DONE:
             self._handle_transfer_done(msg, role)
         else:
@@ -1174,7 +1174,12 @@ class DiffusionServer:
     def _handle_transfer_staged(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         assignments = self._assignments.get(request_id, {})
-        if role not in assignments:
+        record = self._tracker.get(request_id)
+        if (
+            role not in assignments
+            or record is None
+            or record.state != self._pools[role].running
+        ):
             # Ignore late results after timeout/failure, without returning a slot twice.
             return
         old_transfer = self._transfer_state.get(request_id)
@@ -1307,10 +1312,10 @@ class DiffusionServer:
                 source_role=p2p.sender_role.value,
             )
 
-    def _handle_transfer_allocated(self, msg: dict) -> None:
+    def _handle_transfer_allocated(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         p2p = self._transfer_state.get(request_id)
-        if p2p is None:
+        if p2p is None or role != p2p.receiver_role:
             logger.warning(
                 "DiffusionServer transfer: no state for allocated %s", request_id
             )
@@ -1332,14 +1337,17 @@ class DiffusionServer:
             encode_transfer_msg(push_msg)
         )
 
-    def _handle_transfer_pushed(self, msg: dict) -> None:
+    def _handle_transfer_pushed(self, msg: dict, role: RoleType) -> None:
         request_id = msg["request_id"]
         logger.debug("DiffusionServer transfer: pushed %s", request_id)
         p2p = self._transfer_state.get(request_id)
-        if p2p is None:
+        if p2p is None or role != p2p.sender_role:
             logger.warning(
                 "DiffusionServer transfer: no state for pushed %s", request_id
             )
+            return
+
+        if role not in self._assignments.get(request_id, {}):
             return
 
         self._release_assignment(request_id, p2p.sender_role)

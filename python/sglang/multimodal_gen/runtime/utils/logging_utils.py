@@ -302,6 +302,8 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         if key_hint in ("prompt", "negative_prompt"):
             if isinstance(obj, str):
                 return f"<redacted, len={len(obj)}>"
+        if isinstance(obj, str) and obj.startswith("data:"):
+            return f"<inline media, len={len(obj)}>"
         return obj
 
     if isinstance(obj, Enum):

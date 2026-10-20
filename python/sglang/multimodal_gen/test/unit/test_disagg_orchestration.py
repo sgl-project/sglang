@@ -138,6 +138,16 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated):
                         )
                     )
                 )
+                if sender.is_input_encoder:
+                    # A duplicate must not enqueue a second transfer or kill the head.
+                    result[sender].send_multipart(
+                        encode_transfer_msg(
+                            dict(
+                                msg_type="transfer_staged",
+                                request_id=request_id,
+                            )
+                        )
+                    )
                 if not preallocated:
                     alloc = decode_transfer_msg(work[receiver].recv_multipart())
                     assert alloc["source_role"] == sender.value
@@ -154,6 +164,14 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated):
                     )
                 push = decode_transfer_msg(work[sender].recv_multipart())
                 assert push["dest_session_id"] == receiver.value
+                result[sender].send_multipart(
+                    encode_transfer_msg(
+                        dict(
+                            msg_type="transfer_pushed",
+                            request_id=request_id,
+                        )
+                    )
+                )
                 result[sender].send_multipart(
                     encode_transfer_msg(
                         dict(

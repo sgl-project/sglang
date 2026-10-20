@@ -28,6 +28,7 @@ import os
 import subprocess
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -404,8 +405,13 @@ class TestDisaggFlux3Image(_DisaggTestBase):
         cluster = self.cluster
         assert cluster is not None
         kwargs = self.warmup_kwargs
-        generated = _generate_image(cluster.api_port, self.model, **kwargs)
-        repeated = _generate_image(cluster.api_port, self.model, **kwargs)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            generated, repeated = list(
+                executor.map(
+                    lambda _: _generate_image(cluster.api_port, self.model, **kwargs),
+                    range(2),
+                )
+            )
         np.testing.assert_array_equal(
             np.asarray(Image.open(BytesIO(generated))),
             np.asarray(Image.open(BytesIO(repeated))),
