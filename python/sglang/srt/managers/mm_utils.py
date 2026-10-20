@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     assert_int64_array,
     flatten_nested_list,
+    get_device_module,
     print_warning_once,
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -944,7 +945,9 @@ def hash_feature(f):
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        reconstruct_t = f.reconstruct_on_target_device(
+            get_device_module().current_device()
+        )
         return tensor_hash([reconstruct_t])
     elif isinstance(f, ShmPointerMMData):
         if f.precomputed_hash is not None:

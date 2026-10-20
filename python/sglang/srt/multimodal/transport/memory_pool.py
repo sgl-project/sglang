@@ -1,4 +1,12 @@
-"""Shared stream-ordered lifecycle for GPU multimodal feature pools."""
+"""Shared stream-ordered lifecycle for GPU and NPU multimodal feature pools.
+
+Both accelerators stamp ready/ack words inside the pool allocation and order
+them on device streams with memory value operations: CUDA through the driver's
+32-bit ``cuStreamWriteValue32``/``cuStreamWaitValue32``, NPU through the
+CANN runtime's 64-bit ``aclrtValueWrite``/``aclrtValueWait``
+(``acl.rt.value_write``/``acl.rt.value_wait``), which is why NPU control words
+are twice as wide and 8-byte aligned.
+"""
 
 import logging
 import threading
@@ -8,10 +16,18 @@ from typing import Optional
 import torch
 
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import get_device_module, is_npu
 
 logger = logging.getLogger(__name__)
 
-CONTROL_WORD_BYTES = 4
+_is_npu = is_npu()
+
+# CANN's aclrtValueWrite/aclrtValueWait have a 64-bit effective width and
+# require 8-byte-aligned device addresses; the CUDA driver value ops the pool
+# uses are 32-bit.
+CONTROL_WORD_BYTES = 8 if _is_npu else 4
+CONTROL_WORD_DTYPE = torch.int64 if _is_npu else torch.int32
+_DEVICE_TYPE = "npu" if _is_npu else "cuda"
 DATA_ALIGNMENT = 256
 DEFAULT_MAX_INFLIGHT_SLICES = 4096
 
@@ -36,9 +52,26 @@ def _driver_modules():
     return cuda, check_drv
 
 
-def stream_wait_value32(
+def _acl_module():
+    import acl
+
+    return acl
+
+
+def stream_wait_value(
     device_id: int, address: int, value: int, transport_name: str
 ) -> None:
+    """Enqueue a stream-ordered wait until the pool word at ``address`` equals ``value``."""
+    if _is_npu:
+        acl = _acl_module()
+        stream = get_device_module().current_stream(device_id).npu_stream
+        # 0x1 is CANN's ACL_VALUE_WAIT_EQ
+        ret = acl.rt.value_wait(address, value, 0x1, stream)
+        if ret != 0:
+            raise RuntimeError(
+                f"acl.rt.value_wait failed (ret={ret}, mm {transport_name})"
+            )
+        return
     cuda, check_drv = _driver_modules()
     stream = torch.cuda.current_stream(device_id)
     check_drv(
@@ -47,9 +80,19 @@ def stream_wait_value32(
     )
 
 
-def stream_write_value32(
+def stream_write_value(
     device_id: int, address: int, value: int, transport_name: str
 ) -> None:
+    """Enqueue a stream-ordered write of ``value`` to the pool word at ``address``."""
+    if _is_npu:
+        acl = _acl_module()
+        stream = get_device_module().current_stream(device_id).npu_stream
+        ret = acl.rt.value_write(address, value, 0, stream)
+        if ret != 0:
+            raise RuntimeError(
+                f"acl.rt.value_write failed (ret={ret}, mm {transport_name})"
+            )
+        return
     cuda, check_drv = _driver_modules()
     stream = torch.cuda.current_stream(device_id)
     check_drv(
@@ -106,7 +149,7 @@ class StreamOrderedPoolConsumerMixin:
         self._consumer_acknowledged = False
 
     def _wait_until_ready(self, base_address: int, device_id: int) -> None:
-        stream_wait_value32(
+        stream_wait_value(
             device_id,
             base_address + self.ready_byte_offset,
             self.generation,
@@ -140,7 +183,7 @@ class StreamOrderedPoolConsumerMixin:
             )
 
         for rank in consumer_ranks:
-            stream_write_value32(
+            stream_write_value(
                 device_id,
                 base_address + self.ack_byte_offset + rank * CONTROL_WORD_BYTES,
                 self.generation,
@@ -161,7 +204,7 @@ class PoolLease:
 
 
 class StreamOrderedMmFeaturePool:
-    """Bounded GPU pool with generation-safe producer/consumer leases."""
+    """Bounded device pool with generation-safe producer/consumer leases."""
 
     def __init__(
         self,
@@ -184,7 +227,7 @@ class StreamOrderedMmFeaturePool:
         if recycle_interval <= 0:
             raise ValueError("recycle_interval must be positive")
         if (
-            not byte_tensor.is_cuda
+            byte_tensor.device.type != _DEVICE_TYPE
             or byte_tensor.device.index != device_id
             or byte_tensor.dtype != torch.uint8
             or not byte_tensor.is_contiguous()
@@ -192,7 +235,7 @@ class StreamOrderedMmFeaturePool:
         ):
             raise ValueError(
                 "byte_tensor must be a sufficiently large contiguous uint8 tensor "
-                f"on cuda:{device_id}"
+                f"on {_DEVICE_TYPE}:{device_id}"
             )
 
         self.memory_size = memory_size
@@ -216,11 +259,11 @@ class StreamOrderedMmFeaturePool:
         control_word_count = max_inflight_slices * self.control_words_per_slot
         self._control_words = (
             byte_tensor[: control_word_count * CONTROL_WORD_BYTES]
-            .view(torch.int32)
+            .view(CONTROL_WORD_DTYPE)
             .view(max_inflight_slices, self.control_words_per_slot)
         )
         self._control_words.zero_()
-        torch.cuda.synchronize(device_id)
+        get_device_module().synchronize(device_id)
 
         self._available_ranges = [(self.data_start, memory_size)]
         self._available_slots = list(reversed(range(max_inflight_slices)))
@@ -303,12 +346,12 @@ class StreamOrderedMmFeaturePool:
         slot_indices = torch.tensor(
             [lease.slot for lease in leases],
             dtype=torch.long,
-            device=f"cuda:{self.device_id}",
+            device=f"{_DEVICE_TYPE}:{self.device_id}",
         )
         expected = torch.tensor(
             [lease.generation for lease in leases],
-            dtype=torch.int32,
-            device=f"cuda:{self.device_id}",
+            dtype=CONTROL_WORD_DTYPE,
+            device=slot_indices.device,
         ).unsqueeze(1)
         completed = (
             (self._control_words.index_select(0, slot_indices) == expected)
@@ -322,10 +365,10 @@ class StreamOrderedMmFeaturePool:
         self._merge_ranges_locked()
 
     def _recycle_loop(self) -> None:
-        torch.cuda.set_device(self.device_id)
+        get_device_module().set_device(self.device_id)
         while not self._recycler_stop_event.is_set():
             try:
-                with self._lock, torch.cuda.device(self.device_id):
+                with self._lock, get_device_module().device(self.device_id):
                     self._recycle_ready_leases_locked()
             except Exception:
                 logger.warning(
@@ -338,8 +381,10 @@ class StreamOrderedMmFeaturePool:
     def copy_tensor(
         self, tensor: torch.Tensor
     ) -> tuple[Optional[PoolLease], Optional[torch.Tensor]]:
-        if not tensor.is_cuda:
-            raise ValueError(f"{self.transport_name} requires a CUDA tensor")
+        if tensor.device.type != _DEVICE_TYPE:
+            raise ValueError(
+                f"{self.transport_name} requires a tensor on {_DEVICE_TYPE}"
+            )
         source = tensor.contiguous()
         nbytes = source.numel() * source.element_size()
         if nbytes == 0:
@@ -350,12 +395,12 @@ class StreamOrderedMmFeaturePool:
             return None, None
 
         try:
-            with torch.cuda.device(self.device_id):
+            with get_device_module().device(self.device_id):
                 destination = self.byte_tensor[lease.start : lease.start + lease.nbytes]
                 destination.copy_(
                     source.view(torch.uint8).reshape(-1), non_blocking=True
                 )
-                stream_write_value32(
+                stream_write_value(
                     self.device_id,
                     self.base_address + lease.ready_byte_offset,
                     lease.generation,
@@ -397,15 +442,15 @@ class StreamOrderedMmFeaturePool:
                     f"(slot={slot}, generation={generation})"
                 )
 
-            with torch.cuda.device(self.device_id):
-                stream_wait_value32(
+            with get_device_module().device(self.device_id):
+                stream_wait_value(
                     self.device_id,
                     self.base_address + ready_byte_offset,
                     generation,
                     self.transport_name,
                 )
                 for rank in range(self.consumer_count):
-                    stream_write_value32(
+                    stream_write_value(
                         self.device_id,
                         self.base_address + ack_byte_offset + rank * CONTROL_WORD_BYTES,
                         generation,
