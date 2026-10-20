@@ -68,6 +68,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+    gfx1250_fp8_linear,
+    try_flux2_gfx1250_fp8_swiglu_linear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -923,6 +927,9 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             and isinstance(self.to_out.quant_method, ModelOptFp4LinearMethod)
         ):
             self._enable_nvfp4_token_cat = True
+        self._enable_gfx1250_fp8_token_cat = self.tp_size == 1 and gfx1250_fp8_linear(
+            self.to_out
+        )
         if self.tp_size > 1:
             self._patch_to_out_weight_loader()
 
@@ -1034,6 +1041,19 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
+
+        # The gfx1250 FP8 path keeps the SwiGLU unmaterialized: it quantizes
+        # the activation straight out of the gate/up projection and feeds the
+        # two halves to the output GEMM as separately scaled segments, so
+        # neither the activated half nor the concatenation reaches HBM.
+        if self._enable_gfx1250_fp8_token_cat:
+            fused = try_flux2_gfx1250_fp8_swiglu_linear(
+                attn_out=hidden_states,
+                mlp_gate_up=mlp_hidden_states,
+                linear=self.to_out,
+            )
+            if fused is not None:
+                return fused
 
         # Handle the feedforward (FF) logic
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)

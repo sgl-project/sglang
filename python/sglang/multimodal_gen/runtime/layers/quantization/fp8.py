@@ -8,9 +8,12 @@ from torch.nn import Module
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.gemm.fp8_gfx1250 import (
+    gfx1250_fp8_2seg_supported,
     gfx1250_fp8_scaled_mm,
+    gfx1250_fp8_scaled_mm_2seg,
     gfx1250_fp8_scaled_mm_supported,
     per_token_quant_fp8_gfx1250,
+    swiglu_quant_fp8_gfx1250,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
@@ -109,6 +112,57 @@ def _apply_gfx1250_triton_fp8(
         qx, weight, x_scale, weight_scale, out_dtype=x.dtype, bias=bias
     )
     return output.view(*x.shape[:-1], weight.shape[1])
+
+
+def gfx1250_fp8_linear(layer: torch.nn.Module) -> bool:
+    """Whether ``layer`` runs on the gfx1250 Triton FP8 tile."""
+    method = getattr(layer, "quant_method", None)
+    return isinstance(method, Fp8LinearMethod) and method.use_gfx1250_triton_fp8
+
+
+def try_flux2_gfx1250_fp8_swiglu_linear(
+    *,
+    attn_out: torch.Tensor,
+    mlp_gate_up: torch.Tensor,
+    linear: torch.nn.Module,
+) -> Optional[torch.Tensor]:
+    """``linear(cat(attn_out, silu(gate) * up))`` without materializing either.
+
+    The activated half is quantized straight out of the gate/up projection and
+    the two halves go to the GEMM as separately scaled K segments, so the bf16
+    activation and the concatenation never reach HBM. Returns ``None`` when the
+    shapes fall outside the tile, leaving the caller on its existing path.
+    """
+    # gate/up is a column slice of the fused qkv+mlp projection, so flatten it
+    # with a view rather than reshape: a copy here costs more than the fusion
+    # saves, and the quant kernel reads strided rows natively.
+    attn_2d = attn_out.reshape(-1, attn_out.shape[-1])
+    gate_up_2d = mlp_gate_up.flatten(0, -2)
+    M, K1 = attn_2d.shape
+    K2 = gate_up_2d.shape[1] // 2
+    N = linear.weight.shape[1]
+    if (
+        gate_up_2d.shape[0] != M
+        or gate_up_2d.shape[1] % 2
+        or gate_up_2d.stride(1) != 1
+        or linear.weight.shape[0] != K1 + K2
+        or not gfx1250_fp8_2seg_supported(M=M, N=N, K1=K1, K2=K2)
+    ):
+        return None
+
+    q_attn, attn_scale = per_token_quant_fp8_gfx1250(attn_2d)
+    q_act, act_scale = swiglu_quant_fp8_gfx1250(gate_up_2d)
+    output = gfx1250_fp8_scaled_mm_2seg(
+        q_attn,
+        q_act,
+        linear.weight,
+        attn_scale,
+        act_scale,
+        linear.weight_scale,
+        out_dtype=attn_out.dtype,
+        bias=linear.bias,
+    )
+    return output.view(*attn_out.shape[:-1], N)
 
 
 class Fp8Config(SRTFp8Config, QuantizationConfig):
