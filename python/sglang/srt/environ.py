@@ -971,6 +971,8 @@ class Envs:
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
+    SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
+    SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
@@ -1022,6 +1024,10 @@ class Envs:
     # go back to the unfused chain on the verify path.
     SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY = EnvBool(True)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    # Pooled prefill-logits budget of the HIP FP4 indexer, in MiB.
+    SGLANG_DSV4_FP4_LOGITS_BUDGET_MB = EnvInt(2048)
+    # Split-K for HCA streams in the HIP unified-KV paged decode; 0 keeps the heuristic.
+    SGLANG_MLA_HCA_KV_SPLITS = EnvInt(4)
 
     # ===================================================================
     # Apple Silicon and MLX
@@ -1062,6 +1068,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
+    # can increase memory usage during NPU compiled graph capture.
+    SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
@@ -1069,6 +1078,8 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
+    SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
 
     # ===================================================================
     # MUSA
@@ -1080,7 +1091,6 @@ class Envs:
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
-    SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
@@ -1152,6 +1162,9 @@ class Envs:
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
+    # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
+    SGLANG_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
+    SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1268,7 +1281,6 @@ class Envs:
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
-    SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
@@ -1319,6 +1331,12 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
+    # cannot read CUDA sources, so they are converted by sailify first).
+    # One of: native, all, all-ppu,
+    # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
+    # device only, matching how the nvcc path pins -gencode to this GPU.
+    SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1333,10 +1351,6 @@ class Envs:
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
-    # A5 DSV4 FP4 + DeepEP low-latency dispatch wire format. This is read only
-    # by the model-specific dispatcher configuration; all other paths retain
-    # their existing behavior.
-    SGLANG_NPU_DSV4_DEEPEP_LL_DISPATCH_QUANT_MODE = EnvStr("mxfp8")
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
@@ -1388,7 +1402,7 @@ class Envs:
 
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
-    # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
+    # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
@@ -1453,6 +1467,10 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
+    # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
+    # avoiding a second blocking readback after generating the same indptr.
+    SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
+    SGLANG_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
@@ -1623,6 +1641,12 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # Decoder SWA bounded replay: eager prefill steps with up to this many tail rows
+    # run the tail layers from CUDA graphs (buckets of 128 rows); 0 keeps them eager.
+    SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = EnvInt(2048)
+    # Prefill-graph shapes of at least this many tokens run the tail from the tail
+    # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
+    SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
@@ -1862,6 +1886,16 @@ class Envs:
     # "cuda" = the hand-written SM90 WGMMA kernel (bitwise identical to the
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
+
+    # ===================================================================
+    # Muse Spark
+    # ===================================================================
+    SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR = EnvBool(True)
+    # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
+    SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
+    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
+    )
 
     # ===================================================================
     # MiniMax M3
@@ -2113,9 +2147,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
-    ),
-    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
-        note="The unified radix tree is the default tree cache now; unset this env."
     ),
 }
 
