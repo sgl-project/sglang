@@ -560,7 +560,7 @@ jobs:
     name: Recommend tests from coverage
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     outputs:
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
       only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
@@ -667,7 +667,9 @@ jobs:
         env:
           # Precision-test switch: 'true' = the a3 suites run only the
           # recommended subset, 'false' = full suites.
-          PRECISION_MODE: 'true'
+          # TEMP: forced 'false' so the job runs in coverage mode too
+          # without gating the collection jobs (keeps the baseline full).
+          PRECISION_MODE: 'false'
         run: |
           set -euo pipefail
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
