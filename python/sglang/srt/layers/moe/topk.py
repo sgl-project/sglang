@@ -284,6 +284,8 @@ class TopKConfig:
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
+    # Lazy materialization still needs the producer's solver and capture slot.
+    layer_id: Optional[int] = None
     _correction_bias_dtype_cache: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False, compare=False
     )
@@ -426,7 +428,7 @@ class BypassedTopKOutput(NamedTuple):
             hidden_states=self.hidden_states,
             router_logits=self.raw_router_logits,
             topk_config=self.topk_config,
-            layer_id=layer_id,
+            layer_id=self.topk_config.layer_id if layer_id is None else layer_id,
             num_token_non_padded=self.num_token_non_padded,
             expert_location_dispatch_info=self.expert_location_dispatch_info,
         )
@@ -722,6 +724,7 @@ class TopK(BaseFusedOp):
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k + num_shared_slots,
+            layer_id=layer_id,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,

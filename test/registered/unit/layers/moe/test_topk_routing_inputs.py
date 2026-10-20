@@ -5,12 +5,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from sglang.srt.runtime_context import get_model
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 
 from sglang.srt.batch_overlap.operations import (
     ExecutionOperation,
     _StageExecutor,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
@@ -18,6 +21,8 @@ from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutputPacked,
     TopK,
@@ -69,17 +74,21 @@ def _batch(real):
     return batch
 
 
-def _placement():
-    logical_to_physical = torch.tensor([[2, 0, 3, 1]], dtype=torch.int64)
+def _placement(num_layers=1):
+    logical_to_physical = torch.tensor([[2, 0, 3, 1]], dtype=torch.int64).repeat(
+        num_layers, 1
+    )
     physical_to_logical = logical_to_physical.argsort(dim=-1)
-    all_physical = torch.full((1, 4, 4), -1, dtype=torch.int64)
+    all_physical = torch.full((num_layers, 4, 4), -1, dtype=torch.int64)
     all_physical[:, :, 0] = logical_to_physical
     return ExpertLocationMetadata(
         physical_to_logical_map=physical_to_logical,
         physical_to_logical_map_cpu=physical_to_logical.clone(),
         logical_to_all_physical_map=all_physical,
         logical_to_all_physical_map_cpu=all_physical.clone(),
-        logical_to_all_physical_map_num_valid=torch.ones((1, 4), dtype=torch.int64),
+        logical_to_all_physical_map_num_valid=torch.ones(
+            (num_layers, 4), dtype=torch.int64
+        ),
         ep_size=1,
         logical_to_rank_dispatch_physical_map=logical_to_physical,
     )
@@ -110,12 +119,17 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.logits = torch.tensor([[9.0, 8.0, 1.0, 0.0]]).repeat(4, 1)
 
     def _router(self, **kwargs):
-        return TopK(
-            top_k=2,
-            layer_id=0,
-            custom_routing_function=fused_topk_torch_native,
-            **kwargs,
-        )
+        shared_slots = kwargs.pop("num_fused_shared_experts", 0)
+        layer_id = kwargs.pop("layer_id", 0)
+        with get_model().override(
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=shared_slots)
+        ):
+            return TopK(
+                top_k=2 - shared_slots,
+                layer_id=layer_id,
+                custom_routing_function=fused_topk_torch_native,
+                **kwargs,
+            )
 
     def test_target_and_draft_remap_only_the_target_and_keep_mask(self):
         """Draft routes must not use the target placement or lose every live row."""
@@ -582,6 +596,89 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(len(solved), 1)
         self.assertEqual(output_ids.tolist(), [[2, 4], [0, 4], [-1, -1], [-1, -1]])
         torch.testing.assert_close(output_weights[:2], weights[:2])
+
+    def test_lazy_lp_materialization_uses_its_owner_or_explicit_override(self):
+        """Lazy dispatcher materialization must retain the layer's solver and capture slot."""
+        get_resources().expert_location_metadata = _placement(num_layers=8)
+        hidden = self.hidden.to(torch.bfloat16)
+        group = SimpleNamespace(all_gatherv=lambda tensors, sizes: tensors)
+        dispatcher = object.__new__(FlashinferDispatcher)
+        dispatcher.ep_size = 1
+        dispatcher.ep_rank = 0
+        with get_parallel().override(moe_ep_size=1, moe_ep_rank=0):
+            dispatcher.prefill_dispatcher = StandardDispatcher(
+                SimpleNamespace(
+                    runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
+                    num_experts=4,
+                    num_local_experts=4,
+                    num_fused_shared_experts=0,
+                )
+            )
+        for owner, override, expected_owner in (
+            (7, None, 7),
+            (0, None, 0),
+            (7, 0, 0),
+            (0, 7, 7),
+        ):
+            with self.subTest(owner=owner, override=override):
+                solved = []
+                captured = {}
+
+                def solver(layer_id):
+                    def solve(ids):
+                        self.assertEqual(ids.tolist(), [[0, 1]] * 4)
+                        solved.append(layer_id)
+                        return torch.ones((4, 1))
+
+                    return SimpleNamespace(solve=solve)
+
+                class Capture:
+                    def capture(self, *, layer_id, topk_indices):
+                        captured[layer_id] = topk_indices.clone()
+
+                def dispatch_probability(ids, info, probability):
+                    return info.partial_logical_to_rank_dispatch_physical_map[ids]
+
+                with (
+                    get_exec().moe.override(ep_dispatch_algorithm="lp"),
+                    get_parallel().override(
+                        tp_group=group, moe_ep_size=1, moe_ep_rank=0
+                    ),
+                    patch.dict(
+                        get_resources().lplb_solvers,
+                        {0: solver(0), 7: solver(7)},
+                        clear=True,
+                    ),
+                    patch.object(get_resources(), "experts_capturer", Capture()),
+                    patch.object(topk_module, "_is_cuda", True),
+                    patch.object(
+                        expert_location_dispatch,
+                        "_topk_ids_logical_to_physical_probability",
+                        dispatch_probability,
+                    ),
+                    patch(
+                        "sglang.srt.layers.moe.token_dispatcher.flashinfer.get_dp_global_num_tokens",
+                        return_value=None,
+                    ),
+                ):
+                    router = self._router(
+                        layer_id=owner, output_format=TopKOutputFormat.BYPASSED
+                    )
+                    output = router.forward_cuda(
+                        hidden, self.logits, num_token_non_padded=torch.tensor(2)
+                    )
+                    self.assertEqual(len(output), 5)
+                    if override is not None:
+                        output = output.to_standard(layer_id=override)
+                    dispatched = dispatcher._dispatch_prefill_allgather(hidden, output)
+                self.assertEqual(solved, [expected_owner])
+                self.assertEqual(set(captured), {expected_owner})
+                self.assertEqual(captured[expected_owner].tolist(), [[0, 1]] * 4)
+                self.assertEqual(
+                    dispatched.topk_output.topk_ids.tolist(),
+                    [[2, 0], [2, 0], [-1, -1], [-1, -1]],
+                )
+                self.assertIs(dispatched.hidden_states, hidden)
 
     def test_empty_target_participates_in_lp_without_caller_layer_id(self):
         class Solver:
