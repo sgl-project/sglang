@@ -48,7 +48,16 @@ logger = logging.getLogger(__name__)
 
 # HF architecture -> the "module:attribute" path of the binding its megakernel gets;
 # every other architecture gets MegakernelBinding
-_BINDINGS: dict[str, str] = {}
+_BINDINGS: dict[str, str] = {
+    arch: "sglang.srt.megakernels.eagle_binding:EagleBinding"
+    for arch in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLMMTP",
+    )
+}
 
 
 def megakernel_enabled() -> bool:
@@ -267,9 +276,8 @@ def _model_disable_reasons(
 class _Dispatch:
     """The installed forward: covered steps run the built megakernel."""
 
-    def __init__(
-        self, *, built: BuiltMegakernel, original: Callable, binding: MegakernelBinding
-    ):
+    def __init__(self, *, built: BuiltMegakernel, original: Callable, binding: Any):
+        # MegakernelBinding, or the binding _BINDINGS names for the architecture
         self.built, self.original, self.binding = built, original, binding
         # batch size -> the step planned while capturing its decode graphs; plan reads
         # only the mode and rows, so every graph variant of a batch size plans alike

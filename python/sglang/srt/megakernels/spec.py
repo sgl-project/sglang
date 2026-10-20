@@ -120,7 +120,8 @@ class BuiltMegakernel(Protocol):
     with its own buffers: like draft_sampler, they return bs -> None (SGLang's code
     at that batch size) or the step to run there, and every rank must serve the same
     sizes. A draft's begin_draft_round is called as it is. The entries a built object
-    offers must agree on every rank.
+    offers must agree on every rank. megakernels/eagle_binding.py holds the binding
+    of the Qwen3.5 architectures and the structs these entries get.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
