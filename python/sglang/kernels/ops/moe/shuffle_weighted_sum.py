@@ -5,19 +5,19 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows", "weight_stride0", "weight_stride1"])
 def _shuffle_weighted_sum_kernel(
     inputs,
     output,
     permutation,
     weights,
     width: tl.constexpr,
-    rows: tl.constexpr,
+    rows,
     topk: tl.constexpr,
     input_stride: tl.constexpr,
     output_stride: tl.constexpr,
-    weight_stride0: tl.constexpr,
-    weight_stride1: tl.constexpr,
+    weight_stride0,
+    weight_stride1,
     BLOCK: tl.constexpr,
 ):
     token = tl.program_id(0)

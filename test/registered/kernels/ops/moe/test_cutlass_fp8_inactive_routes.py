@@ -1,11 +1,15 @@
 """CUTLASS FP8 maps and reductions skip inactive expert routes."""
 
 import unittest
+from collections import defaultdict
 from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.moe.shuffle_weighted_sum import shuffle_weighted_sum
+from sglang.kernels.ops.moe.shuffle_weighted_sum import (
+    _shuffle_weighted_sum_kernel,
+    shuffle_weighted_sum,
+)
 from sglang.srt.layers.moe import cutlass_moe
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -35,6 +39,76 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                     :, None
                 ].expand_as(output)
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+    def test_reduction_reuses_kernels_across_token_counts(self):
+        """New lengths reuse the reduction and preserve mixed/empty route results."""
+        kernel = _shuffle_weighted_sum_kernel
+        lengths = (1, 3, 7, 8, 15, 16, 17, 31, 32, 33, 64, 65)
+        for dtype in (torch.float16, torch.bfloat16):
+            with (
+                self.subTest(dtype=dtype),
+                patch.object(
+                    kernel, "device_caches", defaultdict(kernel.create_binder)
+                ),
+            ):
+                cache = kernel.device_caches[torch.cuda.current_device()][0]
+                specialization_count = None
+                for strided_weights in (False, True):
+                    for tokens in lengths:
+                        with self.subTest(
+                            tokens=tokens, strided_weights=strided_weights
+                        ):
+                            copies = (tokens + 2) // 3
+                            inputs = torch.full(
+                                (tokens * 2, 257),
+                                float("nan"),
+                                device="cuda",
+                                dtype=dtype,
+                            )
+                            inputs[0].fill_(2)
+                            inputs[1].fill_(4)
+                            mapping = (
+                                torch.tensor(
+                                    [[0, 1], [1, -1], [-1, -1]],
+                                    device="cuda",
+                                    dtype=torch.int32,
+                                )
+                                .repeat(copies, 1)[:tokens]
+                                .flatten()
+                            )
+                            weights = torch.tensor(
+                                [
+                                    [0.25, 0.75],
+                                    [0.5, float("nan")],
+                                    [float("nan"), float("nan")],
+                                ],
+                                device="cuda",
+                                dtype=dtype,
+                            ).repeat(copies, 1)[:tokens]
+                            if strided_weights:
+                                weights = weights.t().contiguous().t()
+                            output = torch.empty(
+                                (tokens, 257), device="cuda", dtype=dtype
+                            )
+                            shuffle_weighted_sum(inputs, output, mapping, weights)
+                            expected = (
+                                torch.tensor([3.5, 2, 0], device="cuda", dtype=dtype)
+                                .repeat(copies)[:tokens, None]
+                                .expand_as(output)
+                            )
+                            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                            if specialization_count is None:
+                                specialization_count = len(cache)
+                            self.assertEqual(len(cache), specialization_count)
+
+                            mapping.fill_(-1)
+                            inputs.fill_(float("nan"))
+                            weights.fill_(float("nan"))
+                            output.fill_(float("nan"))
+                            shuffle_weighted_sum(inputs, output, mapping, weights)
+                            self.assertTrue(bool(torch.isfinite(output).all()))
+                            self.assertEqual(int(torch.count_nonzero(output)), 0)
+                            self.assertEqual(len(cache), specialization_count)
 
     def test_native_fp8_padding_survives_graph_replay(self):
         if torch.cuda.get_device_capability()[0] not in (9, 10, 12):
