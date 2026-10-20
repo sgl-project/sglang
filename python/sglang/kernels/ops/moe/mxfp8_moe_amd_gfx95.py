@@ -9,7 +9,8 @@ gather, a materialized intermediate, a separate activation quant, and a
   * tokens are sorted by expert with ``moe_align_block_size``;
   * GEMM1 reads the activation by token-id indirection (``a_row = token // top_k``)
     so the hidden states are MXFP8-quantized exactly ONCE (not top_k times);
-  * the SwiGLU-OAI activation is the fused fp32 Triton kernel (split layout);
+  * the activation (SiLU-and-mul, or the fused fp32 SwiGLU-OAI Triton kernel)
+    reads the split gate/up layout;
   * GEMM2 applies the top-k weight inside the kernel and writes each route to a
     distinct output row (no atomics); the final reduction is a strided sum.
 """
@@ -253,7 +254,7 @@ def fused_moe_mxfp8_native(
     topk_weights: torch.Tensor,  # [T, top_k]
     topk_ids: torch.Tensor,  # [T, top_k] (local expert ids; -1 for non-local EP)
     *,
-    alpha: float,
+    alpha: Optional[float],
     beta: float,
     limit: Optional[float],
     no_combine: bool = False,
@@ -262,6 +263,7 @@ def fused_moe_mxfp8_native(
 ) -> torch.Tensor:
     # Lazy import: the jit_kernel package pulls in Triton at first use; importing
     # at call time avoids any import-time cycle with the moe runner package.
+    from sglang.kernels.ops.activation import silu_and_mul
     from sglang.kernels.ops.activation.minimax_m3_swiglu import (
         swiglu_oai_mxfp8_quant,
         swiglu_oai_split,
@@ -310,7 +312,9 @@ def fused_moe_mxfp8_native(
         a_div=top_k,
     )  # [M, 2I]
 
-    if envs.SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8.get():
+    if alpha is None:
+        act_q, act_s = mxfp8_e4m3_quantize(silu_and_mul(g1))
+    elif envs.SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8.get():
         # SwiGLU-OAI (split layout) + MiniMax MXFP8 quant in one kernel, fp32 all
         # the way to the E8M0 scale (no bf16 activation round-trip; matches the
         # vLLM/ame fused kernel). Opt-in until full-model accuracy is re-qualified.
@@ -389,14 +393,13 @@ def fused_experts_mxfp8(
     """Native MXFP8 MoE entry (CDNA4 ``dot_scaled``).
 
     Keeps the SGLang ``fused_experts_mxfp8`` call contract but routes to the
-    single grouped-GEMM kernel. Only the MiniMax-M3 SwiGLU-OAI (split,
-    uninterleaved, gated silu with ``gemm1_alpha``/``gemm1_limit``) configuration
-    is supported -- the unsupported cases below never occur on the M3 path.
+    single grouped-GEMM kernel. Supports gated silu: plain ``silu(gate) * up``
+    when neither ``gemm1_alpha`` nor ``gemm1_limit`` is set, otherwise the
+    MiniMax-M3 SwiGLU-OAI (split, uninterleaved) configuration.
     """
     if not (activation == "silu" and is_gated):
         raise NotImplementedError(
-            f"native MXFP8 MoE only supports gated swiglu-oai, got "
-            f"{activation=} {is_gated=}."
+            f"native MXFP8 MoE only supports gated silu, got {activation=} {is_gated=}."
         )
     if b1 is not None or b2 is not None:
         raise NotImplementedError("native MXFP8 MoE does not support expert bias.")
@@ -404,15 +407,22 @@ def fused_experts_mxfp8(
         raise NotImplementedError(
             "native MXFP8 MoE does not support apply_router_weight_on_input."
         )
-    if gate_up_interleaved:
-        raise NotImplementedError(
-            "native MXFP8 MoE expects uninterleaved (split) gate/up layout."
-        )
-
-    # SwiGLU-OAI default activation alpha (gpt-oss); M3 may override via gemm1_alpha.
-    alpha = 1.702 if gemm1_alpha is None else float(gemm1_alpha)
+    if gemm1_alpha is None and gemm1_limit is None:
+        # gate_up_interleaved only describes swiglu weights; plain silu w13 is
+        # [gate; up], as in the triton fused_moe silu_and_mul path.
+        if swiglu_limit is not None:
+            raise NotImplementedError("native MXFP8 MoE does not support swiglu_limit.")
+        alpha = None
+        limit = None
+    else:
+        if gate_up_interleaved:
+            raise NotImplementedError(
+                "native MXFP8 MoE expects uninterleaved (split) gate/up layout."
+            )
+        # SwiGLU-OAI default activation alpha (gpt-oss); M3 may override via gemm1_alpha.
+        alpha = 1.702 if gemm1_alpha is None else float(gemm1_alpha)
+        limit = None if gemm1_limit is None else float(gemm1_limit)
     beta = 1.0
-    limit = None if gemm1_limit is None else float(gemm1_limit)
     # NOTE: routed_scaling_factor is intentionally NOT re-applied here. For M3
     # (sigmoid routing with apply_routed_scaling_factor_on_output=True) it is
     # already folded into topk_weights by the topk kernel; re-applying would
