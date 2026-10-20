@@ -14,18 +14,18 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
-    Fp8GridActivation,
-    Mxfp8Activation,
-    bf16_dequant_blockscaled_linear,
-    dequant_block_fp8_weight_to_bf16,
-    dequant_mxfp8_to_bf16,
-    mxfp8_operand,
-)
-from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import bf16_dequant_blockscaled_linear
+from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
     native_route_supports,
     prepare_mxfp8_native_weight,
     ue8m0_weight_scale,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+    dequant_block_fp8_weight_to_bf16,
+    dequant_mxfp8_to_bf16,
+    mxfp8_operand,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import copy_or_rebind_param
@@ -55,7 +55,7 @@ def process_dense_weights(method, layer: torch.nn.Module, scale_u8) -> None:
         _prepare_flydsl_mxfp8(layer)
         from aiter.ops.shuffle import shuffle_weight
 
-        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import (
             aiter_preshuffle_supported,
         )
 
@@ -156,7 +156,7 @@ def apply_dense(
 def _flydsl_mxfp8_module():
     """The mxfp8_flydsl_gfx95 module, or None when FlyDSL is missing."""
     try:
-        from sglang.kernels.ops.quantization import mxfp8_flydsl_gfx95
+        from sglang.kernels.ops.gemm import mxfp8_flydsl_gfx95
     except ImportError as e:
         logger.warning("SGLANG_OPT_HIP_FLYDSL_MXFP8 ignored, FlyDSL unavailable: %s", e)
         return None
