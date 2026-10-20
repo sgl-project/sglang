@@ -337,7 +337,11 @@ class TestNixlTransferWorker(CustomTestCase):
     ):
         room = 21
         mgr = self._make_manager(room)
-        mgr.send_aux = MagicMock(return_value="aux_handle")
+        mgr.send_aux = MagicMock(
+            side_effect=lambda *args, handles: (
+                handles.append("aux_handle") or "aux_handle"
+            )
+        )
         chunk = self._make_chunk(room, [], is_last_chunk=True)
 
         self._run_worker_once(mgr, chunk)
@@ -840,12 +844,14 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         # leaves its KV handle posted.
         disconnect = {"dropped"}
 
-        def send_aux(peer, *args):
+        def send_aux(peer, *args, handles):
             if peer in disconnect:
                 disconnect.discard(peer)
                 mgr.agent.remove_remote_agent(peer)
                 raise RuntimeError("NIXL_ERR_REMOTE_DISCONNECT")
-            return peer, mgr.agent.sections[peer]
+            handle = (peer, mgr.agent.sections[peer])
+            handles.append(handle)
+            return handle
 
         mgr.send_aux = send_aux
         # The sender clears a room as soon as it sees it failed.
