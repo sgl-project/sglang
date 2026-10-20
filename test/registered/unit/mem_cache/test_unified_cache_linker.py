@@ -1298,10 +1298,10 @@ def test_check_hicache_events_commits_common_rank_results():
 def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     monkeypatch, swa_req_ring, enable_hicache
 ):
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+    from sglang.srt.layers.attention.dsv4 import unified_kv_gate
 
     unified_kv = swa_req_ring is True
-    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
+    monkeypatch.setattr(unified_kv_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
     component.gates_prefix_match = not unified_kv

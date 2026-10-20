@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.moe.dsv4 import (
+from sglang.kernels.ops.activation.silu_and_mul_clamp import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
@@ -351,7 +351,7 @@ class DeepseekV2MLP(nn.Module):
             and self.swiglu_limit is None
             and not isinstance(x, tuple)
         ):
-            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 nvfp4_gemm_swiglu_nvfp4_quant,
             )
             from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
