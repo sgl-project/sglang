@@ -268,7 +268,11 @@ def _run_mega_routed(
             if forward_batch is not None
             else None
         )
-        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+            if moe.experts.uses_expert_location
+            else None
+        )
         if (
             not moe.is_hash
             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
