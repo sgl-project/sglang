@@ -1107,6 +1107,34 @@ class MqaAttentionBase(nn.Module):
         # Other FlashMLA implementations retain their existing padded shape.
         return 64 if self.n_local_heads <= 64 else self.n_heads
 
+    def _zero_padded_q(self, x, kernel_num_heads, attn_backend) -> torch.Tensor:
+        # One zeroed buffer per metadata, grown to the most rows it has served; each
+        # call takes a row slice. A graph that keeps the metadata keeps the buffer,
+        # so the buffer must not grow once a graph has captured it.
+        meta = getattr(attn_backend, "forward_metadata", None)
+        buf = getattr(meta, "q_pad_buffer", None)
+        if (
+            buf is None
+            or buf.shape[0] < x.shape[0]
+            or buf.shape[1:] != (kernel_num_heads, self.head_dim)
+            or buf.dtype != x.dtype
+        ):
+            assert not getattr(meta, "q_pad_captured", False), (
+                "the padded query buffer grew after a CUDA graph captured it"
+            )
+            buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
+            if meta is not None:
+                try:
+                    meta.q_pad_buffer = buf
+                except (AttributeError, TypeError):
+                    pass
+        if meta is not None and torch.cuda.is_current_stream_capturing():
+            try:
+                meta.q_pad_captured = True
+            except (AttributeError, TypeError):
+                pass
+        return buf[: x.shape[0]]
+
     def _wo_a_quant_freqs(
         self, forward_batch: ForwardBatch, q_rope: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
@@ -2555,22 +2583,8 @@ class MQALayer(MqaAttentionBase):
                 # Backends without an exact-head specialization retain the existing
                 # padded shape. attn_sink is sliced to this rank and padded to match.
                 if self.is_dsv41:
-                    # V4.1 kernels read all padded heads, so the padding must be
-                    # zero. The buffer is reused per layer; no consumer may keep it.
-                    want = (x.shape[0], kernel_num_heads, self.head_dim)
-                    meta = getattr(attn_backend, "forward_metadata", None)
-                    q_padded = getattr(meta, "q_pad_buffer", None)
-                    if (
-                        q_padded is None
-                        or tuple(q_padded.shape) != want
-                        or q_padded.dtype != x.dtype
-                    ):
-                        q_padded = x.new_zeros(*want)
-                        if meta is not None:
-                            try:
-                                meta.q_pad_buffer = q_padded
-                            except (AttributeError, TypeError):
-                                pass
+                    # V4.1 kernels read all padded heads, so the padding must be zero.
+                    q_padded = self._zero_padded_q(x, kernel_num_heads, attn_backend)
                 elif _is_gfx942_supported:
                     # Uninitialized padded TP heads inject NaN into attention on gfx942
                     # (fnuz), so zero-init there; other archs tolerate new_empty and skip
