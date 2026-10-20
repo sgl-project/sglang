@@ -81,14 +81,11 @@ class NPUOnlineW8A8DiffusionConfig(QuantizationConfig):
 
 
 class NPUOnlineW8A8DiffusionLinearMethod(LinearMethodBase):
+    accepts_int8_input = True
+
     def __init__(self, quant_config: NPUOnlineW8A8DiffusionConfig) -> None:
         self.quant_config = quant_config
         self.kernel = NPUW8A8Int8DynamicLinearMethod(online_weights=True)
-
-    def quantize_add_rmsnorm(
-        self, x: torch.Tensor, residual: torch.Tensor, norm: torch.nn.RMSNorm
-    ):
-        return self.kernel.quantize_add_rmsnorm(x, residual, norm)
 
     def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
         return self.kernel.quantize_swiglu(x)

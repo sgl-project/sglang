@@ -147,29 +147,9 @@ def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) 
         return False
 
 
-@lru_cache(maxsize=None)
-def _supports_add_rmsnorm_int8(device: torch.device, dtype: torch.dtype, width: int):
-    try:
-        x = torch.zeros((1, width), device=device, dtype=dtype)
-        weight = torch.ones(width, device=device, dtype=dtype)
-        data, _, residual, scale, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
-            x, x, weight, epsilon=1e-6
-        )
-        return (
-            data.dtype == torch.int8
-            and data.shape == x.shape
-            and residual.dtype == dtype
-            and residual.shape == x.shape
-            and scale.dtype == torch.float32
-            and scale.shape == (1,)
-        )
-    except torch.OutOfMemoryError:
-        raise
-    except (AttributeError, NotImplementedError, RuntimeError):
-        return False
-
-
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+    accepts_int8_input = True
+
     def __init__(
         self,
         quant_config: Optional["QuantizationConfig"] = None,
@@ -178,31 +158,6 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     ):
         super().__init__(quant_config)
         self.online_weights = online_weights
-
-    def quantize_add_rmsnorm(
-        self, x: torch.Tensor, residual: torch.Tensor, norm: torch.nn.RMSNorm
-    ):
-        if (
-            x.device.type != "npu"
-            or x.dtype not in (torch.float16, torch.bfloat16)
-            or x.ndim != 2
-            or x.numel() == 0
-            or residual.shape != x.shape
-            or residual.dtype != x.dtype
-            or residual.device != x.device
-            or norm.weight is None
-            or norm.weight.shape != (x.shape[-1],)
-            or norm.weight.dtype != x.dtype
-            or norm.weight.device != x.device
-        ):
-            return None
-        if not _supports_add_rmsnorm_int8(x.device, x.dtype, x.shape[-1]):
-            return None
-        eps = norm.eps if norm.eps is not None else torch.finfo(x.dtype).eps
-        data, _, residual_out, scales, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
-            x, residual, norm.weight, epsilon=eps
-        )
-        return _INT8Activation(data, scales, x.dtype), residual_out
 
     def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
         if (

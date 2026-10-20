@@ -1573,6 +1573,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cube_sparse_capable=False,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
+        self.norm2.fuse_input_quant(self.mlp.fc1)
 
     def forward(
         self,
@@ -1589,17 +1590,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        quantize_add_norm = getattr(
-            self.mlp.fc1.quant_method, "quantize_add_rmsnorm", None
-        )
-        if quantize_add_norm is not None:
-            norm_quant = quantize_add_norm(h, x, self.norm2)
-            if norm_quant is not None:
-                quantized, residual = norm_quant
-                return residual + self.mlp(quantized)
-        x = x + h
-        x = x + self.mlp(self.norm2(x))
-        return x
+        h, x = self.norm2(h, x)
+        return x + self.mlp(h)
 
 
 class MiniMaxH3TokenRefiner(nn.Module):

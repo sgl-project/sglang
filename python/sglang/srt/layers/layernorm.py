@@ -448,6 +448,28 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     return False
 
 
+@lru_cache(maxsize=None)
+def _supports_add_rmsnorm_int8(device: torch.device, dtype: torch.dtype, width: int):
+    try:
+        x = torch.zeros((1, width), device=device, dtype=dtype)
+        weight = torch.ones(width, device=device, dtype=dtype)
+        data, _, residual, scale, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+            x, x, weight, epsilon=1e-6
+        )
+        return (
+            data.dtype == torch.int8
+            and data.shape == x.shape
+            and residual.dtype == dtype
+            and residual.shape == x.shape
+            and scale.dtype == torch.float32
+            and scale.shape == (1,)
+        )
+    except torch.OutOfMemoryError:
+        raise
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return False
+
+
 class RMSNorm(BaseFusedOp):
     # The projection that consumes this norm's output; see fuse_input_quant().
     _quant_linear: Optional[nn.Module] = None
@@ -503,9 +525,10 @@ class RMSNorm(BaseFusedOp):
             self._forward_method = self.forward_native
 
     def fuse_input_quant(self, linear: nn.Module) -> None:
-        """Fuse the static per-tensor FP8 input quantization of ``linear``, the
-        projection that consumes this norm's output, whenever forward_cuda can.
-        The projection stays out of this module's children."""
+        """Fuse supported input quantization for the consuming projection.
+
+        The projection stays out of this module's children.
+        """
         self.__dict__["_quant_linear"] = linear
 
     def forward_cuda(
@@ -631,6 +654,49 @@ class RMSNorm(BaseFusedOp):
             return result.reshape(original_shape)
         return result
 
+    def _forward_npu_quant(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        quant_linear: Optional[nn.Module] = None,
+    ):
+        if quant_linear is None:
+            quant_linear = self._quant_linear
+        if (
+            not getattr(
+                getattr(quant_linear, "quant_method", None), "accepts_int8_input", False
+            )
+            or self.variance_size_override is not None
+            or self.cast_x_before_out_mul
+            or self.fp32_residual
+            or self.override_orig_dtype is not None
+            or x.device.type != "npu"
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or x.ndim != 2
+            or x.numel() == 0
+            or residual.shape != x.shape
+            or residual.dtype != x.dtype
+            or residual.device != x.device
+            or self.weight is None
+            or self.weight.shape != (x.shape[-1],)
+            or self.weight.dtype != x.dtype
+            or self.weight.device != x.device
+        ):
+            return None
+        if not _supports_add_rmsnorm_int8(x.device, x.dtype, x.shape[-1]):
+            return None
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            _INT8Activation,
+        )
+
+        eps = self.variance_epsilon
+        if eps is None:
+            eps = torch.finfo(x.dtype).eps
+        data, _, residual_out, scales, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+            x, residual, self.weight, epsilon=eps
+        )
+        return _INT8Activation(data, scales, x.dtype), residual_out
+
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -641,6 +707,9 @@ class RMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
+            quantized = self._forward_npu_quant(x, residual, quant_linear)
+            if quantized is not None:
+                return quantized
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )
