@@ -286,7 +286,7 @@ def _live_generator(monkeypatch, responses=None):
     sent = []
 
     class _Gen:
-        def _send_to_scheduler_and_wait_for_response(self, reqs):
+        def _send_to_scheduler_and_wait_for_response(self, reqs, timeout_ms=None):
             sent.append(type(reqs[0]).__name__)
             return types.SimpleNamespace(
                 error=None, output={"success": True, "sleeping": True}
@@ -444,10 +444,12 @@ def test_worker_gpu_topology(monkeypatch):
 
 def test_release_worker_cache_records_resident_bytes(monkeypatch):
     gen, sent = _live_generator(monkeypatch)
-    gen.generator._send_to_scheduler_and_wait_for_response = lambda reqs: (
-        sent.append(type(reqs[0]).__name__)
-        or types.SimpleNamespace(
-            error=None, output={"success": True, "resident_bytes": 123}
+    gen.generator._send_to_scheduler_and_wait_for_response = (
+        lambda reqs, timeout_ms=None: (
+            sent.append(type(reqs[0]).__name__)
+            or types.SimpleNamespace(
+                error=None, output={"success": True, "resident_bytes": 123}
+            )
         )
     )
     gen.release_worker_cache()

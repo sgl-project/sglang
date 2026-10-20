@@ -26,6 +26,10 @@ from .preflight import check_model_options, check_sgld_options
 logger = logging.getLogger(__name__)
 
 
+# Worker memory RPCs (release/sleep/wake) must not block ComfyUI forever.
+_MEMORY_RPC_TIMEOUT_MS = 30_000
+
+
 class _HeaderTensor:
     """Shape-only stand-in so detect_unet_config does not load 66GB weights."""
 
@@ -472,8 +476,10 @@ class SGLDiffusionGenerator:
     def _memory_occupation_request(self, req_name: str) -> dict:
         from sglang.multimodal_gen.runtime.entrypoints.post_training import io_struct
 
+        # Bounded wait: this runs in sampler-wrapper finally blocks, so an
+        # unresponsive worker must surface as an error, not hang ComfyUI.
         out = self.generator._send_to_scheduler_and_wait_for_response(
-            [getattr(io_struct, req_name)()]
+            [getattr(io_struct, req_name)()], timeout_ms=_MEMORY_RPC_TIMEOUT_MS
         )
         if out.error:
             raise RuntimeError(out.error)
