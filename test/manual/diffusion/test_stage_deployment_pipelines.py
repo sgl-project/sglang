@@ -31,15 +31,27 @@ class _StageCluster(DisaggCluster):
 
 
 @pytest.mark.parametrize(
-    "model,num_frames,image_conditioning",
+    "model,num_frames,kind",
     [
-        ("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 5, False),
-        ("Tongyi-MAI/Z-Image-Turbo", 1, False),
-        ("Qwen/Qwen-Image", 1, False),
-        ("black-forest-labs/FLUX.2-klein-4B", 1, True),
+        ("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 5, "standard"),
+        ("Tongyi-MAI/Z-Image-Turbo", 1, "standard"),
+        ("Qwen/Qwen-Image", 1, "standard"),
+        ("black-forest-labs/FLUX.2-klein-4B", 1, "image"),
+        ("black-forest-labs/FLUX.1-schnell", 1, "flux"),
+        ("Efficient-Large-Model/Sana_600M_512px_diffusers", 1, "sana"),
+        ("circlestone-labs/Anima-Base-v1.0-Diffusers", 1, "anima"),
     ],
 )
-def test_external_contracts_match_monolithic(model, num_frames, image_conditioning):
+def test_external_contracts_match_monolithic(model, num_frames, kind):
+    _check_pipeline(model, num_frames, kind)
+
+
+@pytest.mark.parametrize("parallelism", ["tp2", "ulysses2"])
+def test_multirank_workers_match_monolithic(parallelism):
+    _check_pipeline("Tongyi-MAI/Z-Image-Turbo", 1, "standard", parallelism)
+
+
+def _check_pipeline(model, num_frames, kind, parallelism="single"):
     _require_gpus(3)
     contracts = [
         {"name": "InputValidationStage"},
@@ -62,8 +74,22 @@ def test_external_contracts_match_monolithic(model, num_frames, image_conditioni
         },
         {"name": "decoding_stage_postprocess"},
     ]
-    if image_conditioning:
+    if kind in ("flux", "sana"):
+        contracts[1]["name"] = "prompt_encoding_stage_primary"
+    if kind == "flux":
+        contracts[1]["components"] += ["text_encoder_2", "tokenizer_2"]
+    if kind in ("sana", "anima"):
+        contracts[2:4] = reversed(contracts[2:4])
+    if kind == "image":
         contracts.insert(2, {"name": "ImageVAEEncodingStage", "components": ["vae"]})
+    if kind == "anima":
+        contracts.insert(
+            2,
+            {
+                "name": "AnimaTextConditioningStage",
+                "components": ["text_conditioner", "t5_tokenizer"],
+            },
+        )
     requests = [
         dict(
             prompt="A mountain landscape in daylight",
@@ -79,21 +105,37 @@ def test_external_contracts_match_monolithic(model, num_frames, image_conditioni
         )
         for index, width in enumerate((256, 320) if num_frames > 1 else (512, 640))
     ]
-    if image_conditioning:
+    if kind in ("flux", "sana", "anima"):
+        requests[1]["num_outputs_per_prompt"] = 2
+    if kind in ("sana", "anima"):
+        requests[1]["negative_prompt"] = "blurry, low quality"
+    if kind == "image":
         image = BytesIO()
         Image.new("RGB", (247, 239), (40, 90, 160)).save(image, format="PNG")
         requests[0]["image_path"] = [
             "data:image/png;base64,"
             + base64.b64encode(image.getvalue()).decode("ascii")
         ]
+    topology = dict(tp_size=1, sp_degree=1, ulysses_degree=1, ring_degree=1)
+    if parallelism == "tp2":
+        topology["tp_size"] = 2
+    elif parallelism == "ulysses2":
+        topology.update(sp_degree=2, ulysses_degree=2)
+    ranks = topology["tp_size"] * topology["sp_degree"]
+    common_args = {
+        "encoder_parallel": "replicate",
+        "vae_config.use_parallel_decode": False,
+    }
     prepared, expected = [], []
     with DiffGenerator.from_pretrained(
         model_path=model,
-        num_gpus=1,
+        num_gpus=ranks,
         base_gpu_id=0,
         scheduler_port=find_free_port(HOST),
         master_port=find_free_port(HOST),
         warmup_mode="off",
+        **topology,
+        **common_args,
     ) as generator:
         for request in requests:
             req = prepare_request(
@@ -118,21 +160,42 @@ def test_external_contracts_match_monolithic(model, num_frames, image_conditioni
             expected.append(result.output.cpu())
 
     groups = {
-        "encoder": [0, 1, 2] if image_conditioning else [0, 1],
+        "encoder": list(range(3 if kind in ("image", "anima") else 2)),
         "denoiser": [
-            "LatentPreparationStage",
-            "TimestepPreparationStage",
-            "denoising_stage",
+            stage["name"]
+            for stage in contracts
+            if stage["name"]
+            in ("LatentPreparationStage", "TimestepPreparationStage", "denoising_stage")
         ],
         "decoder": ["decoding_stage", "decoding_stage_postprocess"],
     }
+    role_args = {
+        role: [
+            "--warmup-mode",
+            "off",
+            "--encoder-parallel",
+            "replicate",
+            "--vae-config.use-parallel-decode",
+            "false",
+        ]
+        for role in (*groups, "server")
+    }
+    for key, value in topology.items():
+        role_args["denoiser"] += ["--" + key.replace("_", "-"), str(value)]
+    if parallelism == "tp2":
+        role_args["encoder"] += ["--tp-size", "2", "--sp-degree", "1"]
+    layout = {"encoder": [0], "denoiser": [1], "decoder": [2]}
+    if ranks > 1:
+        layout = {
+            "encoder": [0, 1] if parallelism == "tp2" else [0],
+            "denoiser": [1, 2],
+            "decoder": [0],
+        }
     with _StageCluster(
         model=model,
-        name="external_" + str(num_frames) + "_" + model.split("/")[-1],
-        gpu_layout={"encoder": [0], "denoiser": [1], "decoder": [2]},
-        extra_role_args={
-            role: ["--warmup-mode", "off"] for role in (*groups, "server")
-        },
+        name="external_" + parallelism + "_" + model.split("/")[-1],
+        gpu_layout=layout,
+        extra_role_args=role_args,
         stage_groups=groups,
         stage_contracts=contracts,
     ) as cluster:
