@@ -266,6 +266,94 @@ jobs:
           echo "## Tier-2 results" >> "$GITHUB_STEP_SUMMARY"
           echo "- Build duration: \`${tier_2_build_duration_seconds:-(not recorded)}\` s" >> "$GITHUB_STEP_SUMMARY"
 
+  # Tier-2b — the Tair KVCache backend's live suite. The memory backend's
+  # tests run inside tier-2 through `cargo test --workspace`; this suite is
+  # `#[ignore]`d because it needs a real Tair KVCache Manager, so this job
+  # builds one from a pinned commit and runs the ignored tests against it.
+  # The manager build is cached on its pinned SHA; the whole job sits behind
+  # the same gate as the other tiers (path filter + `run-ci` label).
+  sgl-router-tair-kvcache-live:
+    name: tier-2b — tair_kvcache live
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # g++ is required by the manager's bazel build (protobuf et al.);
+      # python3-requests is imported by the setup script.
+      - name: Install OS deps (g++, libssl, pkg-config, python requests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libssl-dev pkg-config python3-requests
+
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      # The backend's live suite runs against the exact manager revision it was
+      # verified with; bump this SHA together with the live tests. A blobless
+      # clone keeps the checkout out of the workspace (actions/checkout only
+      # allows paths under it) and still lands on an arbitrary commit.
+      - name: Checkout Tair KVCache Manager (pinned)
+        run: |
+          set -euo pipefail
+          MANAGER="$RUNNER_TEMP/tair-kvcache"
+          git clone -q --filter=blob:none --no-checkout \
+            https://github.com/alibaba/tair-kvcache.git "$MANAGER"
+          git -C "$MANAGER" checkout -q 534df33b
+          echo "manager=$(git -C "$MANAGER" rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install bazelisk
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/bazelisk" \
+            "https://github.com/bazelbuild/bazelisk/releases/download/v1.25.0/bazelisk-linux-amd64"
+          chmod +x "$RUNNER_TEMP/bazelisk"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Cache bazel state
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/bazel
+          key: tair-kvcache-bazel-534df33b
+
+      - name: Build the manager
+        working-directory: ${{ runner.temp }}/tair-kvcache
+        env:
+          # The checkout pins a mirror via .bazeliskrc; point bazelisk at the
+          # official release host instead, which GitHub runners reach reliably.
+          BAZELISK_BASE_URL: https://releases.bazel.build
+        run: bazelisk build //kv_cache_manager:kv_cache_manager_bin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: experimental/sgl-router
+          shared-key: "sgl-router-cache"
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run the live suite against the manager
+        working-directory: experimental/sgl-router
+        run: |
+          set -euo pipefail
+          python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py start \
+            --manager-repo "${{ runner.temp }}/tair-kvcache"
+          set -a
+          source /tmp/tair_kvcache-live/tair_kvcache_live.env
+          set +a
+          cargo test --locked --release -p sgl-kv-indexer \
+            --test test_tair_kvcache_live -- --ignored
+
+      - name: Stop the manager
+        if: always()
+        working-directory: experimental/sgl-router
+        run: |
+          if [ -f /tmp/tair_kvcache-live/tair_kvcache_live.json ]; then
+            python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py \
+              stop --workdir /tmp/tair_kvcache-live || true
+          fi
+
   sgl-router-docker-build-test:
     name: tier-3 — docker (placeholder)
     needs: [sgl-router-gate, sgl-router-build-and-test]
@@ -397,6 +485,7 @@ jobs:
       - sgl-router-gate
       - sgl-router-lint
       - sgl-router-build-and-test
+      - sgl-router-tair-kvcache-live
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e

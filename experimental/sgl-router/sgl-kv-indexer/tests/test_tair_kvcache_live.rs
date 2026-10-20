@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Live integration tests for the Tair KVCache backend against a real Tair
-//! KVCache Manager (KVCM). `tests/tair_kvcache_live/setup_tair_kvcache_manager.py`
+//! KVCache Manager (KVCM). `tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py`
 //! builds and provisions one, the env file it writes points the backend at it,
 //! and `--ignored` runs this suite; the script's docstring carries the commands.
 //!
@@ -89,7 +89,7 @@ fn live_env() -> Option<LiveEnv> {
             !live_suite_requested(),
             "--ignored was requested but {ENV_ENDPOINT} is not set, so the live Tair KVCache suite would verify nothing. \
              Start the manager and source its environment first:\n  \
-             python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py start --workdir /tmp/tair_kvcache-live\n  \
+             python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py start --workdir /tmp/tair_kvcache-live\n  \
              source /tmp/tair_kvcache-live/tair_kvcache_live.env"
         );
         return None;
@@ -114,7 +114,7 @@ fn live_env() -> Option<LiveEnv> {
             std::env::var(ENV_WORKDIR).unwrap_or_else(|_| DEFAULT_LIVE_WORKDIR.to_string());
         panic!(
             "{} is not reachable ({reason}); check the manager with \
-             `python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py status --workdir {workdir}` \
+             `python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py status --workdir {workdir}` \
              and restart it with `start`",
             env.endpoint
         );

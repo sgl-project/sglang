@@ -495,11 +495,14 @@ MetaService, including one end-to-end pass behind the real `KVIndexer` service.
 
 ## Live Tair KVCache integration
 
-`tests/tair_kvcache_live.rs` runs the backend against a real Tair KVCache
+`tests/test_tair_kvcache_live.rs` runs the backend against a real Tair KVCache
 Manager. It is `#[ignore]`d and gated on `TAIR_KVCACHE_LIVE_ENDPOINT`, so a
-normal `cargo test` never touches it.
+normal `cargo test` never touches it. CI runs it in the `tier-2b — tair_kvcache
+live` job of `pr-test-sgl-router.yml`, which builds the manager at a pinned
+commit and executes the harness below; the other backend's tests need no such
+job because the in-memory backend has no external dependency.
 
-`tests/tair_kvcache_live/setup_tair_kvcache_manager.py` starts
+`tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py` starts
 `kv_cache_manager_bin`, provisions two event-report storages (L1P5 and L2) with
 an instance group listing them, and registers an instance declaring the
 `full,swa,mamba` spec names. It needs a Tair KVCache checkout: `--manager-repo`
@@ -511,11 +514,11 @@ neither):
 bazelisk build //kv_cache_manager:kv_cache_manager_bin
 
 # in experimental/sgl-router
-python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py start \
+python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py start \
     --workdir /tmp/tair_kvcache-live --manager-repo <tair-kvcache checkout>
 source /tmp/tair_kvcache-live/tair_kvcache_live.env
-cargo test -p sgl-kv-indexer --test tair_kvcache_live -- --ignored
-python3 sgl-kv-indexer/tests/tair_kvcache_live/setup_tair_kvcache_manager.py stop --workdir /tmp/tair_kvcache-live
+cargo test -p sgl-kv-indexer --test test_tair_kvcache_live -- --ignored
+python3 sgl-kv-indexer/tests/test_tair_kvcache_live/setup_tair_kvcache_manager.py stop --workdir /tmp/tair_kvcache-live
 ```
 
 With `--ignored`, a missing `TAIR_KVCACHE_LIVE_ENDPOINT` fails every test instead
