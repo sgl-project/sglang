@@ -4,9 +4,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.model_executor import model_runner
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,6 +26,12 @@ class _CopyEvent:
 
 
 class TestHiCacheSharedGraphGate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
+
     def _forward(
         self,
         mode,
@@ -34,6 +42,7 @@ class TestHiCacheSharedGraphGate(CustomTestCase):
         broadcast_overlap=False,
         broadcast_pending=False,
         copy_ready=False,
+        fail_forward=False,
     ):
         # Construct no CUDA events, model weights, or actual graph runners.
         counter = LayerDoneCounter.__new__(LayerDoneCounter)
@@ -43,24 +52,38 @@ class TestHiCacheSharedGraphGate(CustomTestCase):
         counter.events = [SimpleNamespace(finish_event=event) for _ in range(3)]
 
         runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
-        runner.model = SimpleNamespace()
+        ambient = get_model().shared_experts
+        runner.model = SimpleNamespace(
+            shared_experts_config=SharedExpertsConfig(num_fused_shared_experts=1)
+        )
+
+        def execute(kind, *args, **kwargs):
+            self.assertIs(
+                get_model().shared_experts, runner.model.shared_experts_config
+            )
+            if fail_forward:
+                raise RuntimeError("injected forward failure")
+            return kind
+
         runner.device = "cuda"
         runner.attn_backend = None
         runner.token_to_kv_pool = SimpleNamespace(layer_transfer_counter=counter)
         runner.hisparse_coordinator = None
         runner.decode_cuda_graph_runner = SimpleNamespace(
             can_run_graph=lambda batch: True,
-            execute=lambda *args, **kwargs: "decode_graph",
+            execute=lambda *args, **kwargs: execute("decode_graph"),
         )
         runner.prefill_cuda_graph_runner = SimpleNamespace(
             can_run_graph=lambda batch: True,
-            execute=lambda *args, **kwargs: "prefill_graph",
+            execute=lambda *args, **kwargs: execute("prefill_graph"),
         )
-        runner.eager_runner = SimpleNamespace(execute=lambda *args, **kwargs: "eager")
+        runner.eager_runner = SimpleNamespace(
+            execute=lambda *args, **kwargs: execute("eager")
+        )
         runner._prepare_eager_forward_batch = lambda batch: None
         runner._maybe_execute_deferred_mamba_cow_and_clear = lambda batch: None
         runner._extend_forward_kwargs = lambda *args: {}
-        runner.forward_split_prefill = lambda *args, **kwargs: "split_prefill"
+        runner.forward_split_prefill = lambda *args, **kwargs: execute("split_prefill")
         runner.device_timer = None
         runner.pp_group = SimpleNamespace(is_last_rank=True)
         batch = SimpleNamespace(
@@ -83,7 +106,10 @@ class TestHiCacheSharedGraphGate(CustomTestCase):
                 return_value=True,
             ),
         ):
-            result = runner._forward_raw(batch, pp_proxy_tensors=None)
+            try:
+                result = runner._forward_raw(batch, pp_proxy_tensors=None)
+            finally:
+                self.assertIs(get_model().shared_experts, ambient)
         return result, event
 
     def test_shared_decode_and_idle_keep_graphs_with_retained_restore_slot(self):
@@ -136,6 +162,19 @@ class TestHiCacheSharedGraphGate(CustomTestCase):
                     output.logits_output, "eager" if pending else "decode_graph"
                 )
                 self.assertEqual(output.can_run_graph, not pending)
+
+    def test_model_config_is_restored_when_forward_fails(self):
+        for mode, settings in (
+            (ForwardMode.DECODE, {}),
+            (ForwardMode.EXTEND, {}),
+            (ForwardMode.EXTEND, {"enabled": False}),
+            (ForwardMode.SPLIT_PREFILL, {}),
+        ):
+            with (
+                self.subTest(mode=mode, settings=settings),
+                self.assertRaisesRegex(RuntimeError, "injected forward failure"),
+            ):
+                self._forward(mode, fail_forward=True, **settings)
 
     def test_rank_local_copy_readiness_does_not_change_graph_selection(self):
         for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
