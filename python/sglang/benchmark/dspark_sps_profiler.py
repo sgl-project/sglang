@@ -916,12 +916,15 @@ def postprocess_round(
     offdiag = frac is not None
     batch_size = batch_size_per_rank * dp_size
     expected_tokens = batch_size_per_rank * verify_num_draft_tokens
-    expected_logical = (
-        batch_size_per_rank
-        + int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
+    # Match HostConfidenceBudgetPlanner's integer full-budget multiplication.
+    # Reassociating frac * B * gamma can round below an integer (e.g. 0.7,
+    # B=12, gamma=5 gives 41 instead of the server's 42 after truncation).
+    budget = (
+        int(frac * (batch_size_per_rank * (verify_num_draft_tokens - 1)))
         if offdiag
-        else expected_tokens
+        else 0
     )
+    expected_logical = batch_size_per_rank + budget if offdiag else expected_tokens
 
     if len(rank_rows) != dp_size:
         raise RuntimeError(
@@ -1039,14 +1042,13 @@ def postprocess_round(
                 "records."
             )
         graph_tier = aligned_verify_tokens.pop()
-        budget = int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
         batch_tokens = batch_size_per_rank + budget
         if graph_tier < batch_tokens:
             raise RuntimeError(
                 f"Round bs={batch_size} frac={frac}: replayed graph tier "
                 f"{graph_tier} is smaller than the pinned M={batch_tokens} "
-                f"(= {batch_size_per_rank} + int({frac} * {batch_size_per_rank} "
-                f"* {verify_num_draft_tokens - 1})); the budget pin did not take."
+                f"(= {batch_size_per_rank} + int({frac} * ({batch_size_per_rank} "
+                f"* {verify_num_draft_tokens - 1}))); the budget pin did not take."
             )
     else:
         batch_tokens = expected_tokens

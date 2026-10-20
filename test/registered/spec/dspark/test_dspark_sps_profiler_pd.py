@@ -192,6 +192,44 @@ class TestPdProfilerExecution(CustomTestCase):
                 ),
             )
 
+    def test_fraction_rounding_matches_server_full_budget(self):
+        for logical_rows in (54, 53):
+            with self.subTest(logical_rows=logical_rows):
+                rows = [
+                    mod.SpsRow(
+                        forward_ct=i,
+                        num_running_reqs=12,
+                        num_verify_tokens=60,
+                        step_time=0.1,
+                        verify_tokens_logical=logical_rows,
+                        verify_tokens_actual=60,
+                        verify_used_cuda_graph=True,
+                    )
+                    for i in range(16)
+                ]
+                kwargs = dict(
+                    rank_rows=[rows],
+                    batch_size_per_rank=12,
+                    dp_size=1,
+                    verify_num_draft_tokens=6,
+                    min_steady_steps=2,
+                    frac=0.7,
+                    load_info=mod.LoadInfo(
+                        num_requests=12,
+                        max_new_tokens=100,
+                        wall_seconds=2.0,
+                        reached_target=True,
+                    ),
+                )
+                if logical_rows == 54:
+                    outcome = mod.postprocess_round(**kwargs)
+                    self.assertEqual(outcome.batch_tokens, 54)
+                else:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "requested M=54, observed logical=53"
+                    ):
+                        mod.postprocess_round(**kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()
