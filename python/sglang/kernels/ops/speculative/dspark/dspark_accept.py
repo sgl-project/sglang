@@ -344,45 +344,75 @@ def softmax_temp(
 
 
 @triton.jit
-def _softmax_temp_kernel(
+def _softmax_temp_chunk_stats_kernel(
     logits_ptr,
     temp_ptr,
+    max_ptr,
+    sum_ptr,
+    vocab,
+    rows_per_request,
+    logits_row_stride,
+    CHUNK: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    base = logits_ptr + row.to(tl.int64) * logits_row_stride
+
+    m = -float("inf")
+    s = 0.0
+    for v0 in range(chunk * CHUNK, (chunk + 1) * CHUNK, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        m_new = tl.maximum(m, tl.max(x, axis=0))
+        # A chunk can be fully masked (-inf); keep its stats at (-inf, 0).
+        alpha = tl.where(m_new == -float("inf"), 0.0, tl.exp(m - m_new))
+        e = tl.where(x == -float("inf"), 0.0, tl.exp(x - m_new))
+        s = s * alpha + tl.sum(e, axis=0)
+        m = m_new
+    n_chunks = tl.num_programs(1)
+    tl.store(max_ptr + row * n_chunks + chunk, m)
+    tl.store(sum_ptr + row * n_chunks + chunk, s)
+
+
+@triton.jit
+def _softmax_temp_normalize_kernel(
+    logits_ptr,
+    temp_ptr,
+    max_ptr,
+    sum_ptr,
     out_ptr,
     vocab,
     rows_per_request,
     logits_row_stride,
+    CHUNK: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    N_CHUNKS_P2: tl.constexpr,
 ):
     row = tl.program_id(0)
+    chunk = tl.program_id(1)
+    n_chunks = tl.num_programs(1)
     temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
     base = logits_ptr + row.to(tl.int64) * logits_row_stride
     out_base = out_ptr + row.to(tl.int64) * vocab
 
-    row_max = -float("inf")
-    for v0 in range(0, vocab, BLOCK_V):
-        offs = v0 + tl.arange(0, BLOCK_V)
-        vmask = offs < vocab
-        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
-        x = x / temp
-        row_max = tl.maximum(row_max, tl.max(x, axis=0))
+    c = tl.arange(0, N_CHUNKS_P2)
+    cmask = c < n_chunks
+    cm = tl.load(max_ptr + row * n_chunks + c, mask=cmask, other=-float("inf"))
+    cs = tl.load(sum_ptr + row * n_chunks + c, mask=cmask, other=0.0)
+    row_max = tl.max(cm, axis=0)
+    scale = tl.where(cm == -float("inf"), 0.0, tl.exp(cm - row_max))
+    inv_sum = 1.0 / tl.sum(cs * scale, axis=0)
 
-    sum_exp = 0.0
-    for v0 in range(0, vocab, BLOCK_V):
+    for v0 in range(chunk * CHUNK, (chunk + 1) * CHUNK, BLOCK_V):
         offs = v0 + tl.arange(0, BLOCK_V)
         vmask = offs < vocab
         x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
         x = x / temp
-        e = tl.exp(x - row_max)
-        e = tl.where(vmask, e, 0.0)
-        sum_exp += tl.sum(e, axis=0)
-
-    for v0 in range(0, vocab, BLOCK_V):
-        offs = v0 + tl.arange(0, BLOCK_V)
-        vmask = offs < vocab
-        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
-        x = x / temp
-        e = tl.exp(x - row_max)
-        tl.store(out_base + offs, e / sum_exp, mask=vmask)
+        tl.store(out_base + offs, tl.exp(x - row_max) * inv_sum, mask=vmask)
 
 
 def softmax_temp_triton(
@@ -398,15 +428,34 @@ def softmax_temp_triton(
     )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    BLOCK_V = 4096
-    _softmax_temp_kernel[(num_rows,)](
+    BLOCK_V = 2048
+    CHUNK = 4 * BLOCK_V
+    n_chunks = triton.cdiv(vocab, CHUNK)
+    stats = torch.empty((2, num_rows, n_chunks), dtype=torch.float32, device=logits.device)
+    grid = (num_rows, n_chunks)
+    _softmax_temp_chunk_stats_kernel[grid](
         logits,
         temperatures,
+        stats[0],
+        stats[1],
+        vocab,
+        rows_per_request,
+        logits.stride(0),
+        CHUNK=CHUNK,
+        BLOCK_V=BLOCK_V,
+    )
+    _softmax_temp_normalize_kernel[grid](
+        logits,
+        temperatures,
+        stats[0],
+        stats[1],
         out,
         vocab,
         rows_per_request,
         logits.stride(0),
+        CHUNK=CHUNK,
         BLOCK_V=BLOCK_V,
+        N_CHUNKS_P2=triton.next_power_of_2(n_chunks),
     )
     return out
 
