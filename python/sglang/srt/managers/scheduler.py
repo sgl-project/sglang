@@ -303,6 +303,9 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -5528,7 +5531,14 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                current_platform.empty_cache()
+                if have_live_cuda_graphs():
+                    logger.info(
+                        "Skipping empty_cache: CUDA graphs are captured; "
+                        "releasing pooled allocator segments could free memory "
+                        "the captured graphs reference."
+                    )
+                else:
+                    current_platform.empty_cache()
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
@@ -5930,14 +5940,20 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
-            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            torch.cuda.empty_cache()
-            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            logger.info(
-                f"[continue_generation] torch.cuda.empty_cache() called: "
-                f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(freed {before_mb - after_mb:.1f} MB)"
-            )
+            if have_live_cuda_graphs():
+                logger.info(
+                    "[continue_generation] Skipping torch.cuda.empty_cache(): "
+                    "CUDA graphs are captured."
+                )
+            else:
+                before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+                torch.cuda.empty_cache()
+                after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+                logger.info(
+                    f"[continue_generation] torch.cuda.empty_cache() called: "
+                    f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                    f"(freed {before_mb - after_mb:.1f} MB)"
+                )
         # Enqueue any rebootstrap requests that were staged during a
         # retract-mode pause. Deferring until resume keeps the preallocation
         # queue empty during the pause window (so an intervening weight update

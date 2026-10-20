@@ -80,6 +80,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -1255,7 +1258,14 @@ class Glm4MoeForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
+        if have_live_cuda_graphs():
+            logger.info(
+                "Skipping empty_cache after hot weight reload: CUDA graphs "
+                "are captured; releasing pooled allocator segments could "
+                "free memory the captured graphs reference."
+            )
+        else:
+            torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
     @classmethod

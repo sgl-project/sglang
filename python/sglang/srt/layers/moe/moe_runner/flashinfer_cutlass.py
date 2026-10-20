@@ -130,15 +130,25 @@ def _run_flashinfer_b12x_w4a16(
         )
 
     x = dispatch_output.hidden_states
+    if x.dtype != torch.bfloat16:
+        # The route is validated end-to-end for bf16 activations only; the
+        # fixed bf16 output allocation below would silently disagree with an
+        # fp16 caller. Fail closed instead of guessing.
+        raise ValueError(
+            f"FlashInfer b12x W4A16 expects bf16 activations, got {x.dtype}"
+        )
     topk_output = dispatch_output.topk_output
     if output is None:
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             if runner_config.moe_ep_size > 1:
-                # EP: tokens routed only to foreign experts get no write from
-                # this rank; zero the buffer so the layer all-reduce sums
-                # clean partials.
+                # EP zero-fill: each rank writes only the tokens routed to its
+                # local experts, so unwritten rows would carry allocator
+                # garbage into the layer all-reduce, which sums the per-rank
+                # partials into the final output. zeros_like guarantees the
+                # foreign rows contribute exactly zero; with EP disabled this
+                # rank writes every row, so empty_like skips the zeroing cost.
                 output = torch.zeros_like(x, dtype=torch.bfloat16)
             else:
                 output = torch.empty_like(x, dtype=torch.bfloat16)
@@ -151,6 +161,16 @@ def _run_flashinfer_b12x_w4a16(
     # layer all-reduces the partial outputs across ranks.
     expert_map: Optional[torch.Tensor] = None
     if runner_config.moe_ep_size > 1:
+        # The contiguous-split map below relies on the EP chunk covering the
+        # whole expert range: a non-divisible split would silently clip the
+        # slice (torch slicing clamps), leaving trailing experts unroutable.
+        assert (
+            runner_config.moe_ep_size * runner_config.num_local_experts
+            == runner_config.num_experts
+        ), (
+            f"b12x W4A16 expects a divisible EP split: {runner_config.moe_ep_size}"
+            f" * {runner_config.num_local_experts} != {runner_config.num_experts}"
+        )
         expert_map = torch.full(
             (runner_config.num_experts,), -1, dtype=torch.int32, device=x.device
         )

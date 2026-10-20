@@ -1978,6 +1978,10 @@ class Envs:
     SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION = EnvBool(True)
     SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC = EnvBool(False)
     SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK = EnvStr(None)
+    # DSA graph-buffer lifetime probe (graph_buffer_lifetime.py):
+    # off | probe | retain — records captured DSA buffer ranges so CUDA-graph
+    # memory faults can be diagnosed via describe_graph_buffer_overlap().
+    SGLANG_DSA_GRAPH_BUFFER_LIFETIME = EnvStr(None)
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)

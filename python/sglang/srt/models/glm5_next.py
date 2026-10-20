@@ -1354,6 +1354,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
         param = next(self.model.parameters(), None)
         if param is None:
             return
+        logger.info(
+            "Precompiling b12x W4A16 prefill route-pack: %d experts, top_k %d, "
+            "7 token-capacity shapes on %s",
+            n_routed_experts,
+            top_k,
+            param.device,
+        )
         # Route packing specializes on both token capacity and the selected
         # routed block size. Cover the shape regimes used by tool/vision
         # prefills and 4K chunked long-context work while memory is still

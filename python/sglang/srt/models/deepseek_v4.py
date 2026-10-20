@@ -141,6 +141,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import (
     RUNAI_STREAMER_TENSOR_ATTR,
@@ -5644,7 +5647,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.lm_head.weight = head
         # Hot weight reload (RL workflows). Use the device-agnostic module
         # accessor so this works on both CUDA/HIP and NPU.
-        torch.get_device_module().empty_cache()
+        if have_live_cuda_graphs():
+            logger.info(
+                "Skipping empty_cache after hot weight reload: CUDA graphs "
+                "are captured; releasing pooled allocator segments could "
+                "free memory the captured graphs reference."
+            )
+        else:
+            torch.get_device_module().empty_cache()
         torch.get_device_module().synchronize()
 
     @classmethod

@@ -41,6 +41,9 @@ from sglang.srt.model_executor.runner import (
     get_batch_sizes_to_capture,
     set_global_graph_memory_pool,
 )
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import require_out_of_tree_impl
@@ -385,7 +388,14 @@ def drop_elastic_cuda_graph_state(
         current_platform.synchronize()
     set_global_graph_memory_pool(None)
     gc.collect()
-    current_platform.empty_cache()
+    if have_live_cuda_graphs():
+        logger.info(
+            "Skipping empty_cache: CUDA graphs are captured; "
+            "releasing pooled allocator segments could free memory "
+            "the captured graphs reference."
+        )
+    else:
+        current_platform.empty_cache()
 
 
 def capture_cuda_graphs(
