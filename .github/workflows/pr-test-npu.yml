@@ -291,6 +291,7 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        shell: bash
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -363,6 +364,7 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        shell: bash
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
