@@ -1054,23 +1054,32 @@ def test_path_order_namespaces_and_detached_snapshots(backend, is_eagle):
     other = insert(tokens, "second")
     before = core.collect_path_info((other, root, leaf, other))
     assert before == (
-        (TreePathNodeInfo(other, root, 0, length, length),),
+        (TreePathNodeInfo(other, root, 0, length, length, 0),),
         (),
-        (TreePathNodeInfo(leaf, root, 0, length, length),),
-        (TreePathNodeInfo(other, root, 0, length, length),),
+        (TreePathNodeInfo(leaf, root, 0, length, length, 0),),
+        (TreePathNodeInfo(other, root, 0, length, length, 0),),
     )
     with pytest.raises(AttributeError):
         before[0][0].path_end = 99
+
+    core.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(array("q", tokens[:3]), extra_key="first", is_bigram=is_eagle)
+        )
+    )
+    chain = core.collect_path_info([leaf])[0]
+    assert [node.num_children for node in chain] == [1, 0]
 
     insert([1, 2, 3, 7, 8, 9], "first")
     path = core.collect_path_info([leaf])[0]
     split = 3 - int(is_eagle)
     assert len(path) == 2
-    assert path[0] == TreePathNodeInfo(path[0].node_id, root, 0, split, split)
+    assert path[0] == TreePathNodeInfo(path[0].node_id, root, 0, split, split, 2)
     assert path[1] == TreePathNodeInfo(
-        leaf, path[0].node_id, split, length, length - split
+        leaf, path[0].node_id, split, length, length - split, 0
     )
-    assert before[2] == (TreePathNodeInfo(leaf, root, 0, length, length),)
+    assert [node.num_children for node in chain] == [1, 0]
+    assert before[2] == (TreePathNodeInfo(leaf, root, 0, length, length, 0),)
     core.reset()
     with pytest.raises(KeyError):
         core.collect_path_info([leaf])
@@ -1091,7 +1100,7 @@ def test_host_only_and_root_adjustments_are_noops(backend, is_eagle):
         root, key, torch.arange(100, 100 + len(key)), ["hash"] * len(key)
     ).inserted_host_node
     assert core.collect_path_info([host]) == (
-        (TreePathNodeInfo(host, root, 0, len(key), None),),
+        (TreePathNodeInfo(host, root, 0, len(key), None, 0),),
     )
     for node in (root, host):
         for delta in (-10, 0, 10):
