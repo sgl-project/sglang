@@ -18,7 +18,7 @@ class StageSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 
 
 class RoleSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    stages: tuple[str, ...]
+    stages: tuple[str | int, ...]
     endpoints: tuple[str, ...]
     node: str = "local"
     server_args: dict = {}
@@ -77,7 +77,17 @@ class ExecutionPlan:
                         f"Invalid or duplicate worker endpoint: {endpoint}"
                     )
                 endpoints.add(endpoint)
-            for stage in role.stages:
+            for selector in role.stages:
+                if type(selector) is int:
+                    if not 0 <= selector < len(names):
+                        raise ValueError(
+                            f"Stage index {selector} is outside [0, {len(names)})"
+                        )
+                    stage = names[selector]
+                elif isinstance(selector, str):
+                    stage = selector
+                else:
+                    raise ValueError("Stage selectors must be names or integer indices")
                 if stage not in specs or stage in owner:
                     raise ValueError(f"Unknown or multiply assigned stage: {stage}")
                 owner[stage] = name

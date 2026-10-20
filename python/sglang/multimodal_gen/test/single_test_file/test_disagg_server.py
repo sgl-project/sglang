@@ -103,8 +103,9 @@ class DisaggCluster:
         extra_role_args: dict[str, list[str]] | None = None,
         startup_timeout: float = _STARTUP_TIMEOUT_S,
         warmup_kwargs: dict | None = None,
-        stage_groups: dict[str, list[str]] | None = None,
+        stage_groups: dict[str, list[str | int]] | None = None,
         stage_outputs: tuple[str, ...] | None = None,
+        stage_contracts: list[dict] | None = None,
     ) -> None:
         self.model = model
         self.name = name
@@ -114,6 +115,7 @@ class DisaggCluster:
         self.warmup_kwargs = warmup_kwargs or {}
         self.stage_groups = stage_groups
         self.stage_outputs = stage_outputs
+        self.stage_contracts = stage_contracts
         self._procs: list[subprocess.Popen] = []
         self._fhs: list = []
         self._logs: dict[str, Path] = {}
@@ -136,6 +138,8 @@ class DisaggCluster:
             }
             if self.stage_outputs is not None:
                 deployment["outputs"] = self.stage_outputs
+            if self.stage_contracts is not None:
+                deployment["stages"] = self.stage_contracts
             self.deployment_path.write_text(json.dumps(deployment))
 
     # -- context manager -----------------------------------------------------

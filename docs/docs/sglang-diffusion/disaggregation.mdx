@@ -130,6 +130,14 @@ IDs for new contracts; neither a model prefix nor `snake_case` is enforced.
 Role names are independent deployment labels. Grouping stages does not reorder
 them: the contract list must already be in topological order.
 
+In each role's `stages`, you can also use zero-based integer indices, such as
+`[0, 1, "denoise"]`. An index selects from the full contract list (the deployment's
+top-level `stages`, if provided, otherwise the pipeline's `stage_specs`), before
+role filtering. Names and indices may be mixed, but each stage can only be
+assigned once. Negative indices, booleans, and out-of-range indices are rejected;
+`"0"` is a name, not an index. Prefer names for configurations that must survive
+pipeline updates, because inserting or reordering contracts changes indices.
+
 `inputs` and `outputs` name request fields, `extra.<key>` fields, or
 `result.<field>` outputs. The planner binds reads to their latest preceding
 writer. By default a stage also depends on its predecessor; `after=()` removes

@@ -2,6 +2,7 @@
 """Contracts, placement, and real coordinator fan-out/join without model weights."""
 
 import asyncio
+import json
 import pickle
 import sys
 from graphlib import CycleError
@@ -92,6 +93,54 @@ def test_contracts_compile_and_tensor_tree_round_trip():
         unpack_fields({}, scalar)
     with pytest.raises(TypeError):
         pack_fields({"required": object()})
+
+
+@pytest.mark.parametrize("selectors", [(0, 1, 2, 3), ("text", 1, "denoise", 3)])
+def test_stage_indices_resolve_to_registered_names(tmp_path, selectors):
+    path = tmp_path / "deployment.json"
+    path.write_text(
+        json.dumps(
+            {
+                "roles": {
+                    stage.name: {
+                        "stages": [selector],
+                        "endpoints": [f"tcp://localhost:{19000 + index}"],
+                    }
+                    for index, (stage, selector) in enumerate(zip(specs(), selectors))
+                }
+            }
+        )
+    )
+    plan = ExecutionPlan.compile(Deployment.load(path), specs())
+    assert [role.stages for role in plan.roles.values()] == [
+        (stage.name,) for stage in specs()
+    ]
+    assert plan.roles["denoise"].dependencies == {"text", "image"}
+    # indices refer to the full contract list, not the selected subgraph
+    subset = ExecutionPlan.compile(
+        Deployment(
+            {"image": RoleSpec((1,), ("tcp://localhost:1",))},
+            outputs=("extra.image",),
+        ),
+        specs(),
+    )
+    assert subset.roles["image"].stages == ("image",)
+    grouped = ExecutionPlan.compile(
+        Deployment({"worker": RoleSpec((3, 1, 0, 2), ("tcp://localhost:1",))}),
+        specs(),
+    )
+    assert grouped.roles["worker"].stages == tuple(stage.name for stage in specs())
+
+
+@pytest.mark.parametrize(
+    "selectors", [(-1,), (4,), (True,), (1.0,), ("0",), (0, "text")]
+)
+def test_invalid_stage_indices_rejected(selectors):
+    with pytest.raises(ValueError):
+        ExecutionPlan.compile(
+            Deployment({"worker": RoleSpec(selectors, ("tcp://localhost:1",))}),
+            specs(),
+        )
 
 
 def test_worker_retains_reusable_model_outputs(monkeypatch):
