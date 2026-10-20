@@ -45,6 +45,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
+    DeferredContextCommit,
     defer_context_kv_refusal,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -378,7 +379,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
                 accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
                 accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
-                defer_context_kv=self._defer_context_kv_eligible(
+                deferred_commit=self._maybe_build_deferred_commit(
                     static_epilogue_supported
                 ),
                 post_fold=(
@@ -395,7 +396,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     kv_injector=self._kv_injector,
                     resolve_engram_hasher=(
                         (
-                            lambda: self.model_runner.ngram_embedding_manager.engram_hasher
+                            lambda: (
+                                self.model_runner.ngram_embedding_manager.engram_hasher
+                            )
                         )
                         if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
                         else None
@@ -587,6 +590,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             return False
         return True
+
+    def _maybe_build_deferred_commit(
+        self, static_epilogue_supported: bool
+    ) -> Optional[DeferredContextCommit]:
+        if not self._defer_context_kv_eligible(static_epilogue_supported):
+            return None
+        commit = DeferredContextCommit(
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            stride=self.verify_num_draft_tokens,
+            device=self.device,
+            kv_injector=self._kv_injector,
+        )
+        # The target's logits processor: SGLang's forward and a megakernel's head
+        # both call it, with the DSpark hidden, once the hidden is final.
+        self.model_runner.model.logits_processor.register_forward_pre_hook(
+            commit.logits_pre_hook, with_kwargs=True
+        )
+        return commit
 
     def _deferred_commit(self):
         epilogue = self._verify_epilogue
@@ -1093,9 +1114,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
         # The static verify graph committed the engram history when it folded the accept.
-        if not (
-            folded_accept and not run_compact and epilogue.folds_engram_commit
-        ):
+        if not (folded_accept and not run_compact and epilogue.folds_engram_commit):
             self.model_runner.ngram_embedding_manager.update_after_verify(
                 verify_ids_2d=verify_ids_2d,
                 req_pool_indices=batch.req_pool_indices,
