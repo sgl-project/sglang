@@ -86,9 +86,26 @@ def init_mla_dcp_metadata(
                 dim=-1,
             )
         metadata.dcp_mtp_attn_mask = mask.contiguous()
-    # Submit all device-side preparation before the existing Host length copy.
-    # Graph capture/replay uses its fixed-buffer updater instead.
-    metadata.seq_lens_cpu_int = local_seq_lens.cpu().int()
+    # Derive FIA's Host lengths from the CPU mirror without a device readback.
+    effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
+    if forward_batch.forward_mode.is_target_verify():
+        spec_algorithm = forward_batch.spec_algorithm
+        if spec_algorithm is not None and spec_algorithm.is_dflash_family():
+            # Active Host lengths already include verify tokens; Ascend's
+            # zero-filled DP padding rows still need the verify block.
+            effective_seq_lens_cpu = torch.where(
+                effective_seq_lens_cpu == 0, query_len, effective_seq_lens_cpu
+            )
+        else:
+            effective_seq_lens_cpu = effective_seq_lens_cpu + query_len
+    elif (
+        forward_batch.forward_mode.is_decode_or_idle()
+        and forward_batch.spec_info is not None
+    ):
+        effective_seq_lens_cpu = effective_seq_lens_cpu + int(speculative_step_id + 1)
+    metadata.seq_lens_cpu_int = get_dcp_lens(
+        effective_seq_lens_cpu, dcp_size, dcp_rank
+    ).int()
     return local_seq_lens
 
 
