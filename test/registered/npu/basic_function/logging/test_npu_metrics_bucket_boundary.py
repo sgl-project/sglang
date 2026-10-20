@@ -268,7 +268,6 @@ class TestNPUMetricsCustomBucketBoundary(TestNPULoggingBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.other_args.extend(["--enable-metrics"])
-        cls.other_args.extend(["--collect-tokens-histogram"])
         cls.set_custom_bucket()
         cls.other_args.extend(["--bucket-time-to-first-token", *cls.my_bucket])
         cls.other_args.extend(["--bucket-inter-token-latency", *cls.my_bucket])
