@@ -160,36 +160,6 @@ def _c128_transfer_num_pages(transfers: Sequence[PoolTransfer], page_size: int) 
     return num_pages
 
 
-def _rebase_anchor_index_parts(
-    comp_xfers: dict[ComponentType, list[PoolTransfer]],
-    *,
-    loaded_full: dict[NodeId, torch.Tensor],
-    last_step: PoolTransfer,
-) -> dict[ComponentType, list[PoolTransfer]]:
-    """Re-point anchor slices from one whole-chain Full load to per-node loads.
-
-    Earlier nodes already hold their device rows; the last node's rows are the
-    whole of the final load.
-    """
-    rows: dict[NodeId, torch.Tensor | slice] = dict(loaded_full)
-    if last_step.nodes_to_load:
-        (last_id,) = last_step.nodes_to_load
-        rows[last_id] = slice(0, len(last_step.host_indices))
-
-    def rebase(xfer: PoolTransfer) -> PoolTransfer:
-        if not xfer.anchor_index_parts:
-            return xfer
-        parts = zip(xfer.nodes_to_load, xfer.anchor_index_parts, strict=True)
-        return replace(
-            xfer,
-            anchor_index_parts=[
-                rows[nid] if isinstance(part, slice) else part for nid, part in parts
-            ],
-        )
-
-    return {ct: [rebase(x) for x in xfers] for ct, xfers in comp_xfers.items()}
-
-
 # The component class that keeps each slot family; a slot's family comes from
 # the KV storage that owns its sub-pool.
 COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
