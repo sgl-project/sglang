@@ -240,7 +240,23 @@ _FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
 _MAX_UPSCALING_SCALE = 8
 
 
+_POSTPROCESS_MODEL_PATH_FIELDS = (
+    "upscaling_model_path",
+    "frame_interpolation_model_path",
+)
+
+
+def check_local_model_path(name: str, value) -> None:
+    """Reject URL model paths so a client cannot make the server fetch them (SSRF)."""
+    if isinstance(value, str) and "://" in value:
+        raise ValueError(
+            f"{name} must be a local path or a HuggingFace repo id, not a URL"
+        )
+
+
 def _check_postprocess_controls(params: "SamplingParams") -> None:
+    for name in _POSTPROCESS_MODEL_PATH_FIELDS:
+        check_local_model_path(name, getattr(params, name, None))
     scale = params.frame_interpolation_scale
     low, high = _FRAME_INTERPOLATION_SCALE_RANGE
     if (

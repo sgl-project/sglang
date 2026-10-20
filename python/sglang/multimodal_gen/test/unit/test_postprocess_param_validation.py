@@ -38,3 +38,22 @@ def test_out_of_range_postprocess_controls_are_rejected(field, value):
 )
 def test_supported_postprocess_controls_are_accepted(kwargs):
     SamplingParams(**kwargs)._validate()
+
+
+@pytest.mark.parametrize(
+    "field", ["upscaling_model_path", "frame_interpolation_model_path"]
+)
+@pytest.mark.parametrize(
+    "value", ["http://169.254.169.254/latest/x.pth", "https://internal.svc/w.pth"]
+)
+def test_url_model_paths_are_rejected_by_validate(field, value):
+    """Every path into SamplingParams, not just the HTTP API, must reject URLs."""
+    with pytest.raises(ValueError, match=field):
+        SamplingParams(**{field: value})._validate()
+
+
+def test_local_model_paths_are_accepted_by_validate():
+    SamplingParams(
+        upscaling_model_path="/models/realesrgan.pth",
+        frame_interpolation_model_path="org/rife-repo",
+    )._validate()

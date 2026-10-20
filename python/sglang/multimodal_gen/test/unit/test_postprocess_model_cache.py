@@ -60,3 +60,28 @@ def test_rife_model_cache_is_bounded(monkeypatch):
         rife_interpolator.FrameInterpolator(model_path=f"m{i}")._ensure_model_loaded()
     assert len(rife_interpolator._MODEL_CACHE) == limit
     rife_interpolator._MODEL_CACHE.clear()
+
+
+def test_cache_is_thread_safe_under_concurrent_access():
+    import threading
+    from collections import OrderedDict
+
+    from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+        cache_get,
+        cache_put,
+    )
+
+    cache = OrderedDict()
+
+    def worker(i):
+        for j in range(500):
+            key = f"k{(i + j) % 7}"
+            cache_put(cache, key, j, max_size=3)
+            cache_get(cache, key)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(cache) <= 3

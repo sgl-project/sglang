@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
+    check_local_model_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
@@ -233,15 +234,13 @@ _MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
 
 
 def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
-    """Client-supplied model paths must not make the server fetch arbitrary URLs."""
+    """Early HTTP 400 for URL model paths; SamplingParams._validate enforces the
+    same rule for every other entry point."""
     for name in _MODEL_PATH_FIELDS:
-        value = kwargs.get(name)
-        if isinstance(value, str) and "://" in value:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{name} must be a local path or a HuggingFace repo id, "
-                "not a URL",
-            )
+        try:
+            check_local_model_path(name, kwargs.get(name))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
