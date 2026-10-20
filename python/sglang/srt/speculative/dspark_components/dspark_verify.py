@@ -8,6 +8,10 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.embeddings.engram_hash import engram_commit_history
+from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
+    BlockwiseRejection,
+    RejectionNoise,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -118,6 +122,8 @@ def candidate_request_length_bound(
 
 
 class TargetVerifyExecutor:
+    _rejection_noise = None
+
     def __init__(
         self,
         *,
@@ -131,6 +137,7 @@ class TargetVerifyExecutor:
         simulate_acc_len: float = 0.0,
         simulated_correct_len: Optional[torch.Tensor] = None,
         block_verification: bool = False,
+        rejection_noise: Optional[RejectionNoise] = None,
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
@@ -151,6 +158,8 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._block_verification = block_verification
+        # Block-wise rejection draws (blockwise_rejection.py); None keeps the classic kernel.
+        self._rejection_noise = rejection_noise
         self._simulated_correct_len = simulated_correct_len
 
     def accept_and_finalize(
@@ -194,6 +203,7 @@ class TargetVerifyExecutor:
             cutoff_layout=layout,
             fused_argmax=self._target_is_dsv41,
             block_verification=self._block_verification,
+            rejection_noise=self._rejection_noise,
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -1133,6 +1143,49 @@ def sample_simulated_bonus(
     return bonus.to(greedy_bonus.dtype).view_as(greedy_bonus)
 
 
+_blockwise_rejection_noted = False
+
+
+def _note_blockwise_rejection() -> None:
+    global _blockwise_rejection_noted
+    if not _blockwise_rejection_noted:
+        _blockwise_rejection_noted = True
+        logger.info("DSpark: sampled verify accepts use block-wise rejection")
+
+
+def _blockwise_rejection_applies(
+    *,
+    sampling_info,
+    rejection_noise: Optional[RejectionNoise],
+    block_verification: bool,
+) -> bool:
+    return (
+        rejection_noise is not None
+        and not block_verification
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+    )
+
+
+def _draft_probs(draft_block: DraftBlockResult, vocab: int, device) -> torch.Tensor:
+    if draft_block.greedy_draft:
+        # An argmax draft is one-hot: rejection accepts at the target probability.
+        draft_tokens = draft_block.draft_tokens
+        draft_probs = torch.zeros(
+            (*draft_tokens.shape, vocab), dtype=torch.float32, device=device
+        )
+        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
+        return draft_probs
+    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    draft_probs = SoftmaxTemp.execute(
+        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+        temperatures=draft_block.temperatures,
+        rows_per_request=gamma_rows,
+    ).view(bs, gamma_rows, vocab)
+    expect(_VERIFY_DRAFT_PROBS, draft_probs)
+    return draft_probs
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -1145,6 +1198,7 @@ def accept_draft_tokens(
     cutoff_layout: Optional[RaggedVerifyLayout] = None,
     fused_argmax: bool = False,
     block_verification: bool = False,
+    rejection_noise: Optional[RejectionNoise] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
@@ -1157,28 +1211,30 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             fused_argmax=fused_argmax,
         )
-    if draft_block.greedy_draft:
-        # An argmax draft is one-hot: rejection accepts at the target probability.
-        draft_tokens = draft_block.draft_tokens
-        draft_probs = torch.zeros(
-            (*draft_tokens.shape, target_logits.shape[-1]),
-            dtype=torch.float32,
-            device=target_logits.device,
-        )
-        draft_probs.scatter_(-1, draft_tokens.unsqueeze(-1), 1.0)
-    else:
-        bs, gamma_rows, vocab = draft_block.corrected_logits.shape
-        draft_probs = SoftmaxTemp.execute(
-            logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
-            temperatures=draft_block.temperatures,
-            rows_per_request=gamma_rows,
-        ).view(bs, gamma_rows, vocab)
-        expect(_VERIFY_DRAFT_PROBS, draft_probs)
-    if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+    if _blockwise_rejection_applies(
+        sampling_info=sampling_info,
+        rejection_noise=rejection_noise,
+        block_verification=block_verification,
+    ):
+        _note_blockwise_rejection()
+        sampled = BlockwiseRejection.execute(
             candidates=candidates,
             target_logits=target_logits,
-            draft_probs=draft_probs,
+            draft_logits=(
+                None if draft_block.greedy_draft else draft_block.corrected_logits
+            ),
+            target_temperatures=sampling_info.temperatures,
+            draft_temperatures=draft_block.temperatures,
+            noise=rejection_noise,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+    else:
+        sampled = AcceptSampling.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=_draft_probs(
+                draft_block, target_logits.shape[-1], target_logits.device
+            ),
             sampling_info=sampling_info,
             draft_input=draft_input,
             gamma=gamma,
@@ -1186,6 +1242,8 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
         )
+    if not sampling_info.is_any_greedy:
+        return sampled
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,
         target_logits=target_logits,
@@ -1193,17 +1251,7 @@ def accept_draft_tokens(
         cutoff_verify_lens=cutoff_verify_lens,
         fused_argmax=fused_argmax,
     )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
-        sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
-        block_verification=block_verification,
-    )
+    sampling_len, sampling_bonus, sampling_trim = sampled
     selected = SelectMixedAccept.execute(
         greedy_mask=greedy_mask,
         greedy_len=greedy_len,

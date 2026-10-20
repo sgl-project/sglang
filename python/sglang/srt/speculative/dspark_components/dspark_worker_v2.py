@@ -3,6 +3,9 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
+from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
+    make_rejection_noise,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -466,6 +469,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
             simulated_correct_len=self._simulated_correct_len,
             block_verification=get_spec().speculative_use_block_verification,
+            # Counter-based rejection draws from the server seed: every TP rank draws the
+            # same coins from the same logits, with no accept broadcast needed.
+            rejection_noise=(
+                make_rejection_noise(self.target_worker.random_seed, self.device)
+                if is_cuda() and envs.SGLANG_OPT_DSV41_BLOCKWISE_REJECTION.get()
+                else None
+            ),
         )
 
         self._forced_budget_frac: Optional[float] = None
