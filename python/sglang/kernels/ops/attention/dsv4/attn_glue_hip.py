@@ -539,3 +539,30 @@ def widen_pair_i64(
             a, b, oa, ob, n, repeat, BLOCK=block, num_warps=4
         )
     return oa, ob
+
+
+@triton.jit
+def _gather_i32_kernel(table_ptr, idx_ptr, out_ptr, n, table_len, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = i < n
+    idx = tl.load(idx_ptr + i, mask=mask, other=0).to(tl.int64)
+    # torch indexing: a negative index counts from the end
+    idx = tl.where(idx < 0, idx + table_len, idx)
+    tl.store(out_ptr + i, tl.load(table_ptr + idx, mask=mask).to(tl.int32), mask=mask)
+
+
+def gather_i32(table: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    """table[idx].to(torch.int32) in one launch (a 1-D integer table and index vector)."""
+    assert table.dim() == idx.dim() == 1 and table.stride(0) == 1, (
+        table.shape,
+        idx.shape,
+    )
+    idx = idx.contiguous()
+    n = idx.shape[0]
+    out = torch.empty(n, dtype=torch.int32, device=idx.device)
+    if n:
+        block = min(1024, triton.next_power_of_2(n))
+        _gather_i32_kernel[(triton.cdiv(n, block),)](
+            table, idx, out, n, table.shape[0], BLOCK=block, num_warps=4
+        )
+    return out

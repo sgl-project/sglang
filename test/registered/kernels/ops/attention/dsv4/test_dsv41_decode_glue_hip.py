@@ -386,6 +386,22 @@ def test_widen_pair_i64_repeats_the_slots(repeat):
     assert torch.equal(out_pos, positions.to(torch.int64))
 
 
+def test_gather_i32_matches_torch_indexing():
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import gather_i32
+
+    _seed(15)
+    # the full-to-SWA mapping: int64, its trailing -1 what a -1 location reads
+    table = torch.randint(0, 1 << 30, (4097,), dtype=torch.int64, device=DEVICE)
+    table[-1] = -1
+    for idx_dtype in (torch.int32, torch.int64):
+        idx = torch.randint(0, 4096, (300,), device=DEVICE).to(idx_dtype)
+        idx[::7] = -1
+        out = gather_i32(table, idx)
+        assert out.dtype is torch.int32
+        assert torch.equal(out, table[idx].to(torch.int32))
+    assert gather_i32(table, idx[:0]).shape == (0,)
+
+
 @pytest.mark.parametrize("ratios", [(1,), (2,), (1, 2)], ids=["c1", "c2", "c1c2"])
 def test_sparse_buffers_fill_low_ratio_raw_indices(ratios):
     from sglang.kernels.ops.attention.dsv4.attn_glue_hip import sparse_buffers

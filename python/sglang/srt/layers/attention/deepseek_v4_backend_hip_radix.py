@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     expand_same_length,
+    gather_i32,
     low_ratio_compression_metadata,
     mask_indices_by_length,
     page_table_from_req_to_token,
@@ -1757,10 +1758,8 @@ class DeepseekV4HipRadixBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
-                )
+            metadata.core_attn_metadata.swa_out_cache_loc = self._swa_loc_i32(
+                out_cache_loc
             )
 
         if self._fp4_workspaces_enabled(metadata):
@@ -2337,9 +2336,7 @@ class DeepseekV4HipRadixBackend(
         swa_out_cache_loc = (
             request_layout.write_loc
             if request_layout is not None
-            else self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                torch.int32
-            )
+            else self._swa_loc_i32(out_cache_loc)
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         metadata.low_ratio_req_indices = torch.repeat_interleave(
@@ -3107,9 +3104,19 @@ class DeepseekV4HipRadixBackend(
             and cached.shape[0] == out_cache_loc.shape[0]
         ):
             return cached
-        return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-            torch.int32
-        )
+        return self._swa_loc_i32(out_cache_loc)
+
+    def _swa_loc_i32(self, out_cache_loc: torch.Tensor) -> torch.Tensor:
+        """out_cache_loc's SWA locations, int32 as FlashMLA indexes them."""
+        pool = self.token_to_kv_pool
+        if (
+            type(pool).translate_loc_from_full_to_swa
+            is DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa
+            and out_cache_loc.is_cuda
+        ):
+            # the pool's mapping lookup and the cast in one launch
+            return gather_i32(pool.full_to_swa_index_mapping, out_cache_loc)
+        return pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int32)
 
     def get_unified_swa_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         # Cached slots use committed positions; draft steps need live positions.
