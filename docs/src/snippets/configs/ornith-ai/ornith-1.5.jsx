@@ -85,6 +85,21 @@ export const config = {
       ],
     },
     {
+      match: { hw: "h200", variant: "122b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path ornith-ai/Ornith-1.5-122B",
+        "--served-model-name {{MODEL_NAME}}",
+        "--tp-size 8",
+        "--context-length 262144",
+        "--mem-fraction-static 0.80",
+        "--tool-call-parser qwen3_coder",
+        "--reasoning-parser qwen3",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
       match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
       flags: [
