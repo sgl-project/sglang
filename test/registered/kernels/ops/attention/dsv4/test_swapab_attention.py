@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
+from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
