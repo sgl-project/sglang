@@ -55,6 +55,15 @@ def _refresh_mla_kv_shadow_kernel(
             if i < n_live:
                 row = tl.load(idx_ptr + i).to(tl.int64)
                 vals = tl.load(src_ptr + row * src_stride + offs, mask=mask)
+                if (
+                    vals.dtype == tl.float8e5
+                    and dst_ptr.dtype.element_ty == tl.bfloat16
+                ):
+                    # E5M2 is the high byte of FP16. Decode that exact layout to
+                    # preserve Inf/NaN; direct E5M2 -> BF16 lowering can rebias
+                    # these encodings into finite values.
+                    bits = vals.to(tl.uint8, bitcast=True).to(tl.uint16) << 8
+                    vals = bits.to(tl.uint16).to(tl.float16, bitcast=True)
                 tl.store(
                     dst_ptr + row * dst_stride + offs,
                     vals.to(dst_ptr.dtype.element_ty),
