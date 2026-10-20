@@ -235,6 +235,7 @@ def _moe_stub(rank, *, dual, shared_tp1):
         _fuse_shared_experts_inside_sbo=False,
         num_fused_shared_experts=0,
         routed_scaling_factor=1.0,
+        routed_scaling_factor_fused_in_topk=True,
         experts=experts,
         gate=gate,
         alt_stream=torch.cuda.Stream(),

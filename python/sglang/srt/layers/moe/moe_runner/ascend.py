@@ -36,6 +36,8 @@ def _uses_fused_gmm1(kernel, config: MoeRunnerConfig) -> bool:
     # applied (NPUSwigluMxfp8Quant / NPUSwigluStepAndMul below).
     has_clamp = config.swiglu_limit is not None and config.swiglu_limit > 0
 
+    if config.activation == "situ":
+        return False
     if not isinstance(kernel, (NPUMXFP8MoEMethod, NPUW4A8MXFP4MoEMethod)):
         return False
     if has_clamp:

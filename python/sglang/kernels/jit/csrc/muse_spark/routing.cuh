@@ -1,7 +1,7 @@
 // Fused MuseSpark MoE routing: normalize -> bias -> iterative top-k -> renormalize.
 //
 // Drop-in replacement for the Triton `fused_muse_spark_routing_kernel_topk8`
-// (python/sglang/kernels/ops/muse_spark/fused_muse_spark_routing.py). One warp owns one token
+// (python/sglang/kernels/ops/moe/muse_spark_routing.py). One warp owns one token
 // row; the whole row lives in registers (kExpertsPerLane per lane), each lane
 // sorts its slice once, and each of the kTopK rounds pops one head.
 //

@@ -39,10 +39,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsa.quant_k_cache import (
-    quantize_k_cache,
-    quantize_k_cache_separate,
-)
 from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
@@ -50,6 +46,10 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -3004,7 +3004,7 @@ class MHATokenToKVPool(KVCache):
         # and viewed as ``store_dtype`` by ``set_kv_buffer``.
         if self.kv_cache_layout == "vectorized_5d":
             # Late-import to keep the NHD path import-clean.
-            from sglang.kernels.ops.attention.utils import (
+            from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
                 launch_reshape_and_cache_shuffle_5d,
             )
 
@@ -4020,7 +4020,9 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             # payload and the interleaved UE8M0 scales.
             if not self.mxfp8_sf_interleaved or cache_k.dtype == self.store_dtype:
                 raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
-            from sglang.kernels.ops.quantization.mxfp8_quant import quant_store_kv_mxfp8
+            from sglang.kernels.ops.kvcache.mxfp8_quant_store_kv import (
+                quant_store_kv_mxfp8,
+            )
 
             quant_store_kv_mxfp8(
                 cache_k,
@@ -4061,7 +4063,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         """Write per-token UE8M0 K/V scales — interleaved into the FA4
         BlockScaledBasicChunk layout for page_size==128, flat otherwise."""
         if self.mxfp8_sf_interleaved:
-            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
+            from sglang.kernels.ops.kvcache.mxfp8_interleave_sf import (
                 store_sf_interleaved,
             )
 
@@ -4103,7 +4105,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         # scale rows must travel with their fp8 payload or dequant reads
         # mismatched exponents.
         if self.mxfp8_sf_interleaved:
-            from sglang.kernels.ops.quantization.mxfp8_interleave_sf import (
+            from sglang.kernels.ops.kvcache.mxfp8_interleave_sf import (
                 store_sf_interleaved,
             )
 
