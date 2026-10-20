@@ -13,7 +13,7 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import einops
 import msgspec
@@ -183,15 +183,9 @@ def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
-class P2PDesc(msgspec.Struct):
-    op: Callable
-    tensor: torch.Tensor
-    peer: int
-
-
 class LayerUpdatePlan(msgspec.Struct):
     weight2buffer_copy_infos: List[Tuple[int, int]]
-    p2p_op_infos: List[Tuple[int, List[P2PDesc]]]
+    p2p_op_infos: List[Tuple[int, List[P2POp]]]
     buffer2weight_copy_infos: List[Tuple[int, int]]
     num_physical_experts: int
     num_local_physical_experts: int
@@ -253,6 +247,7 @@ def plan_expert_weights_single_layer(
     rank: int,
     missing_logical_experts_info: Optional[List[int]] = None,
     debug: bool = False,
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> LayerUpdatePlan:
     assert all(
         tensor.shape[0] == num_local_physical_experts
@@ -396,10 +391,11 @@ def plan_expert_weights_single_layer(
             (
                 logical_expert_id,
                 [
-                    P2PDesc(
+                    P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
                         peer=src_rank,
+                        group=group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -442,12 +438,13 @@ def plan_expert_weights_single_layer(
             (
                 logical_expert_id,
                 [
-                    P2PDesc(
+                    P2POp(
                         op=torch.distributed.isend,
                         tensor=_get_tensor(
                             routed_experts_weights, i, src_expert_location
                         ),
                         peer=dst_rank,
+                        group=group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)
@@ -542,17 +539,8 @@ def execute_weight2buffer_copies(
             )
 
 
-def execute_p2p_ops(
-    plan: LayerUpdatePlan, group: Optional[torch.distributed.ProcessGroup] = None
-):
+def execute_p2p_ops(plan: LayerUpdatePlan):
     sorted_infos = sorted(plan.p2p_op_infos, key=lambda info: info[0])
-    sorted_infos = [
-        (
-            eid,
-            [P2POp(op=d.op, tensor=d.tensor, peer=d.peer, group=group) for d in descs],
-        )
-        for eid, descs in sorted_infos
-    ]
     if sum(len(ops) for _, ops in sorted_infos) == 0:
         return
 
@@ -643,7 +631,7 @@ def _deduplicate_ordered(arr: List[int]):
 
 
 def _log_p2p_op_metrics(
-    p2p_op_infos: List[Tuple[int, List[P2PDesc]]],
+    p2p_op_infos: List[Tuple[int, List[P2POp]]],
     num_gpu_per_node: int,
     world_size: int,
     self_node_id: int,
@@ -677,7 +665,7 @@ def _log_p2p_op_metrics(
     logger.info(f"[ExpertLocationUpdater] {text}")
 
 
-def _get_direction_from_op(op: P2PDesc):
+def _get_direction_from_op(op: P2POp):
     if op.op == torch.distributed.isend:
         return "isend"
     if op.op == torch.distributed.irecv:

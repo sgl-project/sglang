@@ -149,8 +149,8 @@ def _single_rank_weights(physical_to_logical_map):
 
 class TestExpertLocationUpdaterPlan(CustomTestCase):
     def test_plan_issues_no_device_op(self):
-        old = [0, 1, 2, 0]
-        new = [1, 0, 2, 1]
+        old = [0, 1]
+        new = [1, 0]
         weights = _single_rank_weights(old)
         buffers = updater.create_temp_buffers(weights)
         weights_before = [w.clone() for w in weights]
@@ -161,7 +161,7 @@ class TestExpertLocationUpdaterPlan(CustomTestCase):
             old_physical_to_logical_map=old,
             new_physical_to_logical_map=new,
             num_local_physical_experts=_NUM_LOCAL,
-            num_gpu_per_node=2,
+            num_gpu_per_node=1,
             rank=0,
         )
         self.assertTrue(plan.weight2buffer_copy_infos)

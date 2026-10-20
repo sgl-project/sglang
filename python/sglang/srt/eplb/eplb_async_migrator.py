@@ -181,6 +181,7 @@ class AsyncExpertMigrator:
                     num_local_physical_experts=job.old_metadata.num_local_physical_experts,
                     num_gpu_per_node=num_gpu_per_node,
                     rank=rank,
+                    group=self._group,
                 )
         except BaseException as e:
             job.error = e
@@ -199,7 +200,7 @@ class AsyncExpertMigrator:
         with self._device_module.stream(self._stream):
             self._stream.wait_event(self._install_event)
             execute_weight2buffer_copies(plan, weights, self._temp_buffers)
-            execute_p2p_ops(plan, group=self._group)
+            execute_p2p_ops(plan)
             transfer_event.record(self._stream)
         job.transfer_event = transfer_event
         job.layers_issued += 1
