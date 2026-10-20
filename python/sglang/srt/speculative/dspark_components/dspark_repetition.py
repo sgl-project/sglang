@@ -13,16 +13,18 @@ class RepetitionDraftFallback:
     _min_verify = 32
 
     def __init__(self):
-        self._active: set[str] = set()
+        self._active: dict[str, object] = {}
 
     def select_patterns(self, reqs):
-        self._active.intersection_update(req.rid for req in reqs)
+        self._active = {
+            req.rid: req for req in reqs if self._active.get(req.rid) is req
+        }
         rows = []
         any_active = False
         for req in reqs:
             period = 0
             history = req.output_ids
-            eligible = req.rid in self._active or (
+            eligible = self._active.get(req.rid) is req or (
                 req.spec_verify_ct >= self._min_verify
                 and req.spec_num_correct_drafts * 4 <= req.spec_verify_ct
             )
@@ -36,7 +38,7 @@ class RepetitionDraftFallback:
                         period = candidate
                         break
             if period:
-                self._active.add(req.rid)
+                self._active[req.rid] = req
                 any_active = True
                 # Overlap output history can trail the live GPU prefix.
                 start = len(req.origin_input_ids) + len(history) - len(tail)
@@ -49,7 +51,7 @@ class RepetitionDraftFallback:
                     ]
                 )
             else:
-                self._active.discard(req.rid)
+                self._active.pop(req.rid, None)
                 rows.append([0] * (self._max_period + 2))
         return rows if any_active else None
 

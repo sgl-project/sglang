@@ -176,6 +176,17 @@ class TestRepetitionDraftFallback(CustomTestCase):
         replacement = self._req(verify=0)
         self.assertIsNone(fallback.select_patterns([replacement]))
 
+    def test_reused_request_id_does_not_inherit_recovery(self):
+        """A replacement request must establish its own low-acceptance history."""
+        from sglang.srt.speculative.dspark_components.dspark_repetition import (
+            RepetitionDraftFallback,
+        )
+
+        fallback = RepetitionDraftFallback()
+        self.assertIsNotNone(fallback.select_patterns([self._req()]))
+        replacement = self._req(correct=100)
+        self.assertIsNone(fallback.select_patterns([replacement]))
+
     def test_healthy_and_insufficient_history_keep_learned_candidates(self):
         """Leave learned proposals intact until repeated rejection is established."""
         from sglang.srt.speculative.dspark_components.dspark_repetition import (
