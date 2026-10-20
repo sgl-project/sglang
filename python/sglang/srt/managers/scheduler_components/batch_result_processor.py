@@ -949,6 +949,9 @@ class SchedulerBatchResultProcessor:
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
+        self.metrics_reporter.report_idle_forward_stats(
+            batch=batch, can_run_cuda_graph=result.can_run_cuda_graph
+        )
 
     def process_batch_result_decode(
         self,

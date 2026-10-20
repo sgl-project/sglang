@@ -593,6 +593,16 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(len(scheduler.waiting_queue), 0)
         self.assertEqual(scheduler.running_batch.reqs, [])
 
+    def test_retract_zeroes_the_exported_gen_throughput(self):
+        """A paused loop skips on_idle, so no idle stats line replaces the gauge
+        until resume; the export forced by the pause must already carry 0."""
+        scheduler = self._new_scheduler()
+        scheduler.metrics_reporter.stats.gen_throughput = 50.0
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(scheduler.metrics_reporter.stats.gen_throughput, 0.0)
+
     def test_retract_disagg_prefill_keeps_live_chunked_req(self):
         """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
         scheduler = self._new_scheduler()

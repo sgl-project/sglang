@@ -207,6 +207,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             scheduler.on_idle.call_count,
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
+                        # Idle stats lines still run where transfers suppress housekeeping.
+                        self.assertEqual(
+                            scheduler.metrics_reporter.maybe_report_idle_stats.call_count,
+                            1 + (pattern == "idle_cycle") if pending_transfer else 0,
+                        )
 
     def test_pdmux_idle_gap(self):
         for idle_iterations in (0, 1, 2):
@@ -611,7 +616,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler._poll_timeout_aborts = Mock(return_value=[])
         scheduler.scheduler_stage_metrics = None
-        scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        scheduler.metrics_reporter = SimpleNamespace(
+            record_scheduler_active=Mock(), maybe_report_idle_stats=Mock()
+        )
         scheduler.scripted_scheduler_hook = SimpleNamespace(
             on_run_batch=Mock(side_effect=_BeforeModelForward)
         )
