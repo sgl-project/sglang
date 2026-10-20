@@ -9,8 +9,13 @@ yanked = "warn"
 # `instant` via kube-runtime, `rustls-pemfile` via kube-client) pose no
 # security risk; revisit when the upstream crates drop them.
 unmaintained = "workspace"
-# `ignore` left empty — we want to be notified of new CVEs.
-ignore = []
+# We want to be notified of new CVEs, so this stays empty except where the
+# advisory cannot be fixed from here:
+#   * RUSTSEC-2026-0381 (distrusted emSign intermediates in bundled roots)
+#     reaches us only through `ureq 2.x` (hf-hub/dynamo-tokenizers downloads);
+#     there is no fixed 0.26 release and the fix is the `ureq 3` migration in
+#     those upstream crates. Drop this entry once that lands.
+ignore = ["RUSTSEC-2026-0381"]
 
 [licenses]
 allow = [
