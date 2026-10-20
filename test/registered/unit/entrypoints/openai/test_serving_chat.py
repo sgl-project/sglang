@@ -4145,6 +4145,98 @@ class ServingChatTestCase(CustomTestCase):
             return chunks
         return [c for c in self._parse_chunks(chunks) if "sglext" in c]
 
+    def test_dsv41_reasoning_ends_only_on_the_think_end_token(self):
+        """Chat responses pass the output ids to the reasoning parser, so a
+        `</think>` the model spells with ordinary tokens stays reasoning."""
+        from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        def byte_level_tokenizer(*added_tokens):
+            alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+            backend = Tokenizer(models.BPE({c: i for i, c in enumerate(alphabet)}, []))
+            backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+            backend.decoder = decoders.ByteLevel()
+            backend.add_tokens(list(added_tokens))
+            return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+        tokenizer = byte_level_tokenizer("<think>", "</think>")
+        plain = byte_level_tokenizer()
+        reasoning = "Split on the string '</think>' and keep the tail."
+        ids = (
+            plain.encode(reasoning)
+            + [tokenizer.convert_tokens_to_ids("</think>")]
+            + plain.encode("Final answer.")
+        )
+        self.tm.tokenizer = tokenizer
+        self.chat.reasoning_parser = "deepseek-v41"
+        self.template_manager.force_reasoning = True
+
+        ret = self._output_ids_ret(ids)
+        ret[0]["text"] = tokenizer.decode(ids)
+        request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        message = self.chat._build_chat_response(request, ret, 123).choices[0].message
+        self.assertEqual(
+            (message.reasoning_content, message.content), (reasoning, "Final answer.")
+        )
+
+        for incremental in (True, False):
+            with self.subTest(incremental=incremental):
+                enter_override(
+                    self,
+                    get_context().override_server_args(
+                        incremental_streaming_output=incremental
+                    ),
+                )
+
+                async def generate():
+                    for i in range(len(ids)):
+                        text = tokenizer.decode(ids[: i + 1])
+                        yield {
+                            "text": (
+                                text[len(tokenizer.decode(ids[:i])) :]
+                                if incremental
+                                else text
+                            ),
+                            "output_ids": ids[i : i + 1]
+                            if incremental
+                            else ids[: i + 1],
+                            "meta_info": {
+                                "id": "chatcmpl-think-end",
+                                "prompt_tokens": 3,
+                                "completion_tokens": i + 1,
+                                "cached_tokens": 0,
+                                "finish_reason": (
+                                    {"type": "stop", "matched": None}
+                                    if i == len(ids) - 1
+                                    else None
+                                ),
+                            },
+                            "index": 0,
+                        }
+
+                self.tm.generate_request.return_value = generate()
+                stream_request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    stream=True,
+                )
+                deltas = [
+                    chunk["choices"][0]["delta"]
+                    for chunk in self._parse_chunks(
+                        self._run_chat_stream(Mock(), stream_request)
+                    )
+                    if chunk["choices"]
+                ]
+                self.assertEqual(
+                    "".join(d.get("reasoning_content") or "" for d in deltas),
+                    reasoning,
+                )
+                self.assertEqual(
+                    "".join(d.get("content") or "" for d in deltas), "Final answer."
+                )
+
     def test_streaming_output_ids_incremental_accumulates_deltas(self):
         sglext_chunks = self._run_output_ids_stream([[5, 6], [7]], incremental=True)
 

@@ -118,6 +118,19 @@ class BaseReasoningFormatDetector:
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
+    @property
+    def wants_output_ids(self) -> bool:
+        """Whether ``observe_output_ids`` can still change how this detector parses."""
+        return False
+
+    def observe_output_ids(self, token_ids: List[int]) -> None:
+        """Take the token ids generated since the last call, before the text
+        they decode to is parsed."""
+
+    def _think_end_index(self, text: str) -> int:
+        """Index in ``text`` of the think_end_token that ends reasoning, or -1."""
+        return text.find(self.think_end_token)
+
     def get_answer_frame(self) -> Optional[AnswerFrame]:
         return None
 
@@ -166,10 +179,8 @@ class BaseReasoningFormatDetector:
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
 
-        if (
-            self.think_end_token not in processed_text
-            and self.think_end_token not in self.previous_content
-        ):
+        end_idx = self._think_end_index(processed_text)
+        if end_idx == -1 and self.think_end_token not in self.previous_content:
             # Check for tool_start_token interruption
             tool_idx = self._find_tool_start(processed_text) if in_reasoning else -1
             if tool_idx != -1:
@@ -185,10 +196,9 @@ class BaseReasoningFormatDetector:
             )
 
         # Extract reasoning content
-        if self.think_end_token in processed_text:
-            splits = processed_text.split(self.think_end_token, maxsplit=1)
-            reasoning_text = splits[0]
-            normal_text = splits[1]
+        if end_idx != -1:
+            reasoning_text = processed_text[:end_idx]
+            normal_text = processed_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
@@ -240,9 +250,8 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = True
 
         # Handle end of reasoning block
-        if self._in_reasoning and self.think_end_token in current_text:
-            end_idx = current_text.find(self.think_end_token)
-
+        end_idx = self._think_end_index(current_text) if self._in_reasoning else -1
+        if end_idx != -1:
             reasoning_text = current_text[:end_idx]
 
             self._buffer = ""
@@ -1522,6 +1531,10 @@ class _DeepSeekV3Detector(Qwen3Detector):
 
 
 class DeepSeekV4Detector(BaseReasoningFormatDetector):
+    """With the output token ids, only the `</think>` token ends reasoning; the
+    same text spelled with ordinary tokens stays reasoning text, as in
+    DeepSeek's reference output parser (deepseek-recipe)."""
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -1529,6 +1542,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
     ):
         super().__init__(
             dsv4_thinking_start_token,
@@ -1547,14 +1561,66 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+        self._tokenizer = tokenizer
+        self._think_end_token_id = _single_token_id(tokenizer, self.think_end_token)
+        # Output ids up to the `</think>` token; None until ids are observed.
+        self._output_ids: Optional[List[int]] = None
+        # Spelled-out think_end_tokens in the text before the `</think>` token,
+        # known once that token is generated, and how many were already emitted.
+        self._spelled_ends_before_token: Optional[int] = None
+        self._spelled_ends_emitted = 0
+
+    @property
+    def wants_output_ids(self) -> bool:
+        return (
+            self._think_end_token_id is not None
+            and self._spelled_ends_before_token is None
+        )
+
+    def observe_output_ids(self, token_ids: List[int]) -> None:
+        if not self.wants_output_ids:
+            return
+        if self._output_ids is None:
+            self._output_ids = []
+        start = len(self._output_ids)
+        self._output_ids.extend(token_ids)
+        try:
+            end = self._output_ids.index(self._think_end_token_id, start)
+        except ValueError:
+            return
+        before = self._tokenizer.decode(
+            self._output_ids[:end], skip_special_tokens=True
+        )
+        self._spelled_ends_before_token = before.count(self.think_end_token)
+        self._output_ids = []
+
+    def _think_end_index(self, text: str) -> int:
+        if self._output_ids is None:
+            return super()._think_end_index(text)
+        if self._spelled_ends_before_token is None:
+            return -1
+        skip = max(self._spelled_ends_before_token - self._spelled_ends_emitted, 0)
+        idx, start = -1, 0
+        for _ in range(skip + 1):
+            idx = text.find(self.think_end_token, start)
+            if idx == -1:
+                return -1
+            start = idx + len(self.think_end_token)
+        return idx
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        ret = super().parse_streaming_increment(new_text)
+        if self._in_reasoning:
+            self._spelled_ends_emitted += ret.reasoning_text.count(self.think_end_token)
+        return ret
 
 
 class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
     """V4.1 emits the calls block with a spaced tag name (`<｜DSML｜ calls>`),
     so the unspaced V4 tool-start anchor never interrupts its reasoning."""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, tokenizer: Optional[PreTrainedTokenizerBase] = None, **kwargs):
+        super().__init__(tokenizer=tokenizer, **kwargs)
         self.tool_start_token = f"<{dsv4_dsml_token} calls>"
 
 
@@ -2387,9 +2453,15 @@ class ReasoningParser:
                 kwargs["tool_call_parser_active"] = True
 
         self.detector = detector_class(**kwargs)
+        self._stream_output_ids_seen = 0
 
-    def parse_non_stream(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
-        """Non-streaming call: one-time parsing"""
+    def parse_non_stream(
+        self, full_text: str, output_ids: Optional[List[int]] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Non-streaming call: one-time parsing. ``output_ids`` are the token ids
+        that decode to ``full_text``, when the caller has them."""
+        if output_ids is not None and self.detector.wants_output_ids:
+            self.detector.observe_output_ids(output_ids)
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
@@ -2413,8 +2485,32 @@ class ReasoningParser:
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
 
+    def observe_stream_output_ids(
+        self, output_ids: Optional[List[int]], *, cumulative: bool
+    ) -> None:
+        """Pass a stream chunk's output ids to the detector before its text:
+        only the new ids, or every id so far when ``cumulative`` is set."""
+        if output_ids is None or not self.detector.wants_output_ids:
+            return
+        if cumulative:
+            output_ids = output_ids[self._stream_output_ids_seen :]
+        self._stream_output_ids_seen += len(output_ids)
+        self.detector.observe_output_ids(output_ids)
+
     def parse_stream_end(self) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: flush any detector-specific buffered state once
         the stream ends."""
         ret = self.detector.finish()
         return ret.reasoning_text, ret.normal_text
+
+
+def _single_token_id(
+    tokenizer: Optional[PreTrainedTokenizerBase], token: str
+) -> Optional[int]:
+    """The id of ``token`` if the tokenizer encodes it as one token, else None."""
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        return None
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if isinstance(token_id, int) and tokenizer.convert_ids_to_tokens(token_id) == token:
+        return token_id
+    return None

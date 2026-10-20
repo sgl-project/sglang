@@ -1058,6 +1058,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 chat_tools,
                 custom_names,
                 require_reasoning=require_reasoning,
+                output_ids=output_ids,
             )
 
         output_items = []
@@ -1098,6 +1099,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         custom_names: set[str],
         *,
         require_reasoning: bool,
+        output_ids: Optional[list[int]] = None,
     ) -> tuple[
         Optional[str],
         Any,
@@ -1120,7 +1122,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                     and request.tool_choice != "none"
                 ),
             )
-            reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            reasoning_content, content = reasoning_parser.parse_non_stream(
+                final_output, output_ids=output_ids
+            )
         else:
             reasoning_content = None
             content = final_output
@@ -2406,6 +2410,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         delta = text[stream_offset:]
                         stream_offset = len(text)
+                    if reasoning_parser_obj is not None:
+                        # Every chunk's ids, even one whose text is still held back.
+                        reasoning_parser_obj.observe_stream_output_ids(
+                            chunk.get("output_ids"), cumulative=not incremental
+                        )
                     if not delta and finish_reason is None:
                         continue
                     # finish_reason is sticky, so it would otherwise re-flush.

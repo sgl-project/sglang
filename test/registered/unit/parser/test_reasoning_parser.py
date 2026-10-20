@@ -2,6 +2,9 @@
 
 import unittest
 
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
+
 from sglang.srt.parser.reasoning_parser import (
     Apertus2509Detector,
     BaseReasoningFormatDetector,
@@ -311,6 +314,111 @@ class TestDeepSeekV4Detector(CustomTestCase):
 
         self.assertEqual(
             (streamed.reasoning_text or "") + (flushed.reasoning_text or ""), text
+        )
+
+
+def _byte_level_tokenizer(*added_tokens):
+    """One token per byte, plus ``added_tokens`` as single tokens."""
+    alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+    backend = Tokenizer(models.BPE({c: i for i, c in enumerate(alphabet)}, []))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.add_tokens(list(added_tokens))
+    return PreTrainedTokenizerFast(tokenizer_object=backend)
+
+
+class TestDeepSeekV4ThinkEndTokenId(CustomTestCase):
+    """A `</think>` the model spells with ordinary tokens inside its reasoning
+    must not end the reasoning; only the `</think>` token does, as in
+    DeepSeek's reference output parser."""
+
+    REASONING = (
+        "I will split the raw output on the string '</think>' and keep the tail."
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.tokenizer = _byte_level_tokenizer("<think>", "</think>")
+        plain = _byte_level_tokenizer()
+        self.ids = (
+            plain.encode(self.REASONING)
+            + [self.tokenizer.convert_tokens_to_ids("</think>")]
+            + plain.encode("Final answer.")
+        )
+        self.text = self.tokenizer.decode(self.ids)
+        self.expected = (self.REASONING, "Final answer.")
+
+    def _parser(self, model, **kwargs):
+        return ReasoningParser(
+            model, force_reasoning=True, tokenizer=self.tokenizer, **kwargs
+        )
+
+    def _stream(self, parser, steps, cumulative):
+        """Feed (new ids, new text) steps; return (reasoning, content)."""
+        reasoning = content = ""
+        seen = []
+        for new_ids, new_text in steps:
+            seen += new_ids
+            parser.observe_stream_output_ids(
+                list(seen) if cumulative else new_ids, cumulative=cumulative
+            )
+            r, c = parser.parse_stream_chunk(new_text)
+            reasoning, content = reasoning + r, content + c
+        r, c = parser.parse_stream_end()
+        return reasoning + r, content + c
+
+    def _token_steps(self):
+        prev = ""
+        for i, token_id in enumerate(self.ids):
+            text = self.tokenizer.decode(self.ids[: i + 1])
+            yield [token_id], text[len(prev) :]
+            prev = text
+
+    def test_spelled_think_end_stays_in_reasoning(self):
+        for model in ("deepseek-v4", "deepseek-v41"):
+            with self.subTest(model=model, mode="non-stream"):
+                self.assertEqual(
+                    self._parser(model).parse_non_stream(self.text, self.ids),
+                    self.expected,
+                )
+            for stream_reasoning in (True, False):
+                for cumulative in (True, False):
+                    with self.subTest(
+                        model=model,
+                        stream_reasoning=stream_reasoning,
+                        cumulative=cumulative,
+                    ):
+                        parser = self._parser(model, stream_reasoning=stream_reasoning)
+                        self.assertEqual(
+                            self._stream(parser, self._token_steps(), cumulative),
+                            self.expected,
+                        )
+
+    def test_think_end_text_arriving_after_its_token(self):
+        """The detokenizer can hold text back, so the `</think>` token can be
+        observed before the spelled-out one reaches the parser."""
+        end = self.ids.index(self.tokenizer.convert_tokens_to_ids("</think>"))
+        steps = [
+            (self.ids[: end + 1], self.text[:20]),
+            ([], self.text[20:45]),
+            (self.ids[end + 1 :], self.text[45:]),
+        ]
+        self.assertEqual(
+            self._stream(self._parser("deepseek-v41"), steps, cumulative=False),
+            self.expected,
+        )
+
+    def test_ids_are_ignored_without_a_think_end_token(self):
+        """A tokenizer without a single `</think>` token cannot tell the two
+        apart, so the text decides, as without ids."""
+        tokenizer = _byte_level_tokenizer()
+        text_only = ReasoningParser("deepseek-v41", force_reasoning=True)
+        with_ids = ReasoningParser(
+            "deepseek-v41", force_reasoning=True, tokenizer=tokenizer
+        )
+        self.assertEqual(
+            with_ids.parse_non_stream(self.text, tokenizer.encode(self.text)),
+            text_only.parse_non_stream(self.text),
         )
 
 
