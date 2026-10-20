@@ -278,8 +278,8 @@ jobs:
   # the same gate as the other tiers (path filter + `run-ci` label).
   sgl-router-tair-kvcache-live:
     name: tier-2b — tair_kvcache live
-    needs: [sgl-router-gate, sgl-router-build-and-test]
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
