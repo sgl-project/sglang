@@ -40,13 +40,6 @@ def init_mla_dcp_metadata(
             dcp_rank,
             interleave_size=1,
         )
-        metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
-            forward_batch.seq_lens,
-            query_len,
-            dcp_size,
-            dcp_rank,
-            local_query_lens=metadata.dcp_spec_seq_lens,
-        )
     else:
         metadata.dcp_spec_seq_lens = None
         metadata.dcp_mtp_attn_mask = None
@@ -65,21 +58,17 @@ def init_mla_dcp_metadata(
         dcp_rank,
     )
     metadata.seq_lens = local_seq_lens
-    if metadata.dcp_mtp_attn_mask is not None:
+    if metadata.dcp_spec_seq_lens is not None:
         # FIA checks S2 against the full paged capacity, not just valid KV.
         required_mask_width = metadata.block_tables.shape[1] * page_size
-        mask = metadata.dcp_mtp_attn_mask
-        if mask.shape[-1] < required_mask_width:
-            mask = torch.cat(
-                [
-                    mask,
-                    mask.new_ones(
-                        *mask.shape[:-1], required_mask_width - mask.shape[-1]
-                    ),
-                ],
-                dim=-1,
-            )
-        metadata.dcp_mtp_attn_mask = mask.contiguous()
+        metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
+            forward_batch.seq_lens,
+            query_len,
+            dcp_size,
+            dcp_rank,
+            max_local_kv_len=required_mask_width,
+            local_query_lens=metadata.dcp_spec_seq_lens,
+        )
     # Derive FIA's Host lengths from the CPU mirror without a device readback.
     effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
     if forward_batch.forward_mode.is_target_verify():
@@ -171,18 +160,22 @@ def update_mla_dcp_graph_metadata(
         metadata.block_tables.shape[1],
         max(1, (max_local_len + page_size - 1) // page_size),
     )
-    dcp_block_tables, local_seq_lens = build_mla_dcp_local_block_tables(
-        req_to_token,
-        req_pool_indices[:bs],
-        effective_seq_lens,
-        page_size,
-        dcp_size,
-        dcp_rank,
-        num_pages=active_num_pages,
+    local_seq_lens = get_dcp_lens(effective_seq_lens, dcp_size, dcp_rank).to(
+        torch.int32
     )
-    metadata.block_tables[:, :active_num_pages].copy_(dcp_block_tables)
-    metadata.block_tables[:, active_num_pages:].zero_()
     metadata.seq_lens.copy_(local_seq_lens)
+    metadata.block_tables.zero_()
+    if req_pool_indices[:bs].numel():
+        fill_mla_kv_page_table_for_dcp(
+            req_to_token,
+            req_pool_indices[:bs],
+            metadata.seq_lens,
+            metadata.block_tables[:, :active_num_pages],
+            physical_page_size=page_size,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            pages_per_block=128,
+        )
     # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
     if in_capture:
         metadata.seq_lens_cpu_list = local_seq_lens.cpu().int().tolist()
@@ -260,26 +253,29 @@ def build_mla_dcp_mtp_mask(
 ) -> torch.Tensor:
     """Adapt common per-query DCP frontiers to FIA's fixed verify mask."""
     prefix_lens = prefix_lens.to(torch.int64)
-    total_lens = prefix_lens + query_len
-    local_seq_lens = get_dcp_lens(total_lens, dcp_size, dcp_rank).to(torch.int32)
-
     if max_local_kv_len is None:
+        local_seq_lens = get_dcp_lens(prefix_lens + query_len, dcp_size, dcp_rank).to(
+            torch.int32
+        )
         max_local_kv_len = (
             int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
         )
 
     # FIA rejects a zero-width mask, including for an empty local shard.
-    mask = torch.ones(
-        (prefix_lens.numel(), max(1, query_len), max(1, max_local_kv_len)),
-        dtype=torch.bool,
-        device=prefix_lens.device,
-    )
     if query_len == 0 or max_local_kv_len == 0:
-        return mask.contiguous()
+        return torch.ones(
+            (prefix_lens.numel(), max(1, query_len), max(1, max_local_kv_len)),
+            dtype=torch.bool,
+            device=prefix_lens.device,
+        ).contiguous()
 
     if local_query_lens is None:
         local_query_lens = get_dcp_chain_spec_lens(
-            total_lens, query_len, dcp_size, dcp_rank, interleave_size=1
+            prefix_lens + query_len,
+            query_len,
+            dcp_size,
+            dcp_rank,
+            interleave_size=1,
         )
     k_idx = torch.arange(max_local_kv_len, device=prefix_lens.device, dtype=torch.int64)
     mask = k_idx[None, None, :] >= local_query_lens.view(

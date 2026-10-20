@@ -1048,11 +1048,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             return
 
         parallel = get_parallel()
-        if (
-            parallel.dcp_enabled
-            and self.index_head_dim is None
-            and not self.is_draft_worker
-        ):
+        if parallel.dcp_enabled and self.dcp_localizes_write_indices:
             # Separate NPU latent/RoPE buffers share the DCP-aware Triton body,
             # not the CUDA host wrapper or its non-DCP no-RoPE specialization.
             loc = loc.contiguous()
