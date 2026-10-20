@@ -477,12 +477,16 @@ def maybe_flashinfer_autotune_extend(
     )
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
-    except torch.OutOfMemoryError:
+    except torch.OutOfMemoryError as e:
         if sync_group is not None:
-            # Tuning is collective: this rank has stopped reducing while its
-            # peers wait on the next tactic, so skipping the pass would hang
-            # them. Fail instead of degrading alone.
-            raise
+            # Peers that did not OOM stay blocked in this forward's collectives,
+            # so skipping the pass on this rank alone would hang them; fail instead.
+            raise torch.OutOfMemoryError(
+                f"FlashInfer extend autotune ran out of memory on a {num_tokens}-token "
+                "dummy forward; a real prefill of this size likely would too. Lower "
+                "--chunked-prefill-size (or --max-prefill-tokens) or "
+                "--mem-fraction-static, or pass --disable-flashinfer-autotune."
+            ) from e
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
         log_info_on_rank0(
