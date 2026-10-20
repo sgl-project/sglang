@@ -1677,6 +1677,9 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
+        # two spawned ranks on a tiny random-init transformer, no model load;
+        # measured 48 s in CI
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py": 60.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 60.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
