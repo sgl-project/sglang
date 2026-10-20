@@ -640,9 +640,10 @@ def forward_layer_fused_boundary(
 
 
 def fused_boundary_attn_input(layer, state):
-    """Layer's attention input on every row through the same boundary launch as
-    forward_hc_pre_from_prev_fused_boundary, for writing the tail source layer's KV
-    before the rows narrow; returns the state with the previous post applied."""
+    """This layer's attention input on every row, from the same boundary launch that
+    starts forward_hc_pre_from_prev_fused_boundary, so the tail source layer can write
+    its KV before the rows narrow. Returns the state with the pending previous post
+    applied, and the input."""
     from sglang.srt.models.deepseek_v4_mhc import HcPending, HcState
 
     if isinstance(state.streams, HcPending):

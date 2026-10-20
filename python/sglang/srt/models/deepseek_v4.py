@@ -3863,8 +3863,9 @@ class DeepseekV4Model(nn.Module):
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
                     if _is_hip and source.hc_boundary_fused:
-                        # Out of the fused boundary, state holds the previous FFN's
-                        # pending post and pre-mix, not this layer's attention pre.
+                        # The gfx950 fused boundary leaves the previous FFN hc_post
+                        # pending for this layer's boundary launch, which also builds
+                        # the attention input: run that launch on every row.
                         state, source_x = fused_boundary_attn_input(source, state)
                     else:
                         source_x = mhc.combine(source.attn_hc, state)

@@ -28,10 +28,6 @@ from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     sparse_buffers,
     widen_pair_i64,
 )
-from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
-    CandidateBlocks,
-    slice_candidate_blocks,
-)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     HEAD_DIM as SWAPAB_HEAD_DIM,
 )
@@ -975,7 +971,8 @@ class DeepseekV4HipRadixBackend(
                 )
         # the model switches onto it at the last kv_source layer (enter_late_layer_tail)
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
-        # Set by write_tail_source_kv until exit_late_layer_tail.
+        # The source layer whose KV write_tail_source_kv wrote for every row; cleared in
+        # exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -2293,63 +2290,18 @@ class DeepseekV4HipRadixBackend(
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
-        return value. Unless the source layer runs inside the tail, each request's
-        candidate mask is cut to its tail rows and its top-k carried over."""
+        return value. The source layer runs inside the tail and publishes its top-k and
+        candidates on the tail rows, so nothing is carried over from the full rows."""
+        assert (
+            self.tail_source_kv_layer_id is not None
+        ), "write_tail_source_kv must run before enter_late_layer_tail"
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (self.forward_metadata, self.candidate_masks)
-        tail = tail_metadata.late_layer_tail
-        tail_lens_cpu = tail.extend_seq_lens_cpu
-        # after write_tail_source_kv the source layer publishes both on the tail rows
-        source_in_tail = self.tail_source_kv_layer_id is not None
-        if (
-            not source_in_tail
-            and isinstance(self.candidate_masks, list)
-            and self.candidate_masks
-        ):
-            # the last tail_len rows of each request's candidate publication
-            self.candidate_masks = [
-                (
-                    None
-                    if mask is None
-                    else (
-                        slice_candidate_blocks(
-                            mask, slice(mask.ids.shape[0] - t, mask.ids.shape[0])
-                        )
-                        if isinstance(mask, CandidateBlocks)
-                        else mask[mask.shape[0] - t :]
-                    )
-                )
-                for mask, t in zip(self.candidate_masks, tail_lens_cpu)
-            ]
-        # the consumers after the switch read the tail buffers, so carry the last source's rows over
-        full_core = saved[0].core_attn_metadata
-        tail_core = tail_metadata.core_attn_metadata
-        for ratio in () if source_in_tail else tail_core.low_ratios:
-            for full_buf, tail_buf in (
-                (
-                    full_core.sparse_page_indices(ratio),
-                    tail_core.sparse_page_indices(ratio),
-                ),
-                (
-                    full_core.sparse_topk_lengths(ratio),
-                    tail_core.sparse_topk_lengths(ratio),
-                ),
-                (
-                    full_core.sparse_raw_indices(ratio),
-                    tail_core.sparse_raw_indices(ratio),
-                ),
-            ):
-                if full_buf is None or tail_buf is None:
-                    continue
-                rows = tail.real_rows(full_buf)
-                tail_buf[: rows.shape[0]].copy_(rows)
-                if tail.pad_rows:
-                    tail_buf[rows.shape[0] :].fill_(0 if tail_buf.ndim == 1 else -1)
         self.forward_metadata = tail_metadata
         window = self.token_to_kv_pool.request_window
         if window is not None:
-            window.activate(tail_core.request_window_layout)
+            window.activate(tail_metadata.core_attn_metadata.request_window_layout)
         return saved
 
     def exit_late_layer_tail(self, saved: tuple, forward_batch: ForwardBatch) -> None:
