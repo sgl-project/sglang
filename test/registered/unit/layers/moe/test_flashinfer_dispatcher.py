@@ -160,7 +160,7 @@ class TestFlashinferRunnerDispatchFormats(CustomTestCase):
             StandardCombineInput,
             StandardDispatchOutput,
         )
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_context, get_parallel
 
         layer = SimpleNamespace(
             moe_tp_size=1, moe_tp_rank=0, moe_ep_size=4, moe_ep_rank=0
@@ -190,6 +190,7 @@ class TestFlashinferRunnerDispatchFormats(CustomTestCase):
                     return (kwargs["output"],)
 
                 with (
+                    get_context().override_server_args(model_path="dummy"),
                     get_parallel().override(tp_group=None),
                     patch.object(
                         runner,
