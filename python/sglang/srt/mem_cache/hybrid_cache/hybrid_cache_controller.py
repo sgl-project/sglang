@@ -297,6 +297,10 @@ class HybridCacheController(BaseHiCacheController):
         """Only opt in backends whose FULL object is the complete shared page."""
         return storage_backend is None or storage_backend == "mori"
 
+    # The per-pool v2 burst runs after super() returns; on_host_pools_registered()
+    # fires at its end, so the base class leaves the firing to us.
+    _registers_host_pools_after_super_attach = True
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -343,6 +347,7 @@ class HybridCacheController(BaseHiCacheController):
 
         for entry in host_pools or []:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        self.storage_backend.on_host_pools_registered()
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
