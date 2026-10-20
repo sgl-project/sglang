@@ -378,9 +378,13 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 scoring_func=kwargs["scoring_func"],
             )
 
-        for custom in (None, custom_router):
+        for custom, routing_method_type in (
+            (None, None),
+            (custom_router, None),
+            (custom_router, RoutingMethodType.Renormalize),
+        ):
             with (
-                self.subTest(custom=custom is not None),
+                self.subTest(custom=custom is not None, native=routing_method_type),
                 get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
                 patch(
                     "sglang.srt.layers.quantization.modelopt_quant.is_cuda",
@@ -393,7 +397,9 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 patch.object(topk_module, "fused_topk", side_effect=cpu_router),
             ):
                 method = object.__new__(ModelOptNvFp4FusedMoEMethod)
-                layer = self._build_layer(method)
+                layer = self._build_layer(
+                    method, routing_method_type=routing_method_type
+                )
                 self.assertEqual(
                     layer.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM
                 )
@@ -405,7 +411,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
                     custom_routing_function=custom,
                     allow_routed_experts_capture=False,
                 )
-                topk.bind_runner_backend(layer.runner_backend)
+                topk.bind_runner_backend(
+                    layer.runner_backend,
+                    routing_method_type=layer.routing_method_type,
+                )
                 output = topk.forward_cuda(hidden, logits)
                 self.assertEqual(output.format, TopKOutputFormat.STANDARD)
                 expected_ids = (
@@ -445,6 +454,21 @@ class TestLayerRunnerDispatch(CustomTestCase):
                     self.assertEqual(
                         layer.use_flashinfer_trtllm_moe,
                         expected == MoeRunnerBackend.FLASHINFER_TRTLLM,
+                    )
+                    topk = TopK(
+                        top_k=2,
+                        layer_id=0,
+                        custom_routing_function=lambda **kwargs: None,
+                    )
+                    topk.bind_runner_backend(
+                        layer.runner_backend,
+                        routing_method_type=layer.routing_method_type,
+                    )
+                    self.assertEqual(
+                        topk.topk_config.output_format,
+                        TopKOutputFormat.BYPASSED
+                        if routing_method_type == RoutingMethodType.Llama4
+                        else TopKOutputFormat.STANDARD,
                     )
 
     def test_router_rebinding_rejects_conflicting_contract_before_mutation(self):
