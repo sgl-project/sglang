@@ -33,6 +33,7 @@ def build_mlp(group=None, *, width=16, quant_config=None):
 
 
 class _RoutedExperts(torch.nn.Module):
+    routing_method_type = None
     runner_backend = MoeRunnerBackend.TRITON
     should_fuse_routed_scaling_factor_in_topk = False
 

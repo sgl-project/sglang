@@ -97,17 +97,6 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 if _use_aiter_gfx95:
     pass
 
-if _is_cuda:
-    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from sglang.kernels.ops.quantization.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
-else:
-    from vllm._custom_ops import awq_dequantize
-
 if _is_hip:
     pass
 
@@ -1113,6 +1102,19 @@ class BailingMoELinearForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                if _is_cuda:
+                    from sglang.kernels.ops.quantization.awq_dequantize import (
+                        awq_dequantize,
+                    )
+                elif _is_cpu and _is_cpu_amx_available:
+                    pass
+                elif _is_hip:
+                    from sglang.kernels.ops.quantization.awq_triton import (
+                        awq_dequantize_triton as awq_dequantize,
+                    )
+                else:
+                    from vllm._custom_ops import awq_dequantize
+
                 # AWQ compatible
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(
