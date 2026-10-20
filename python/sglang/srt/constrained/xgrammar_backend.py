@@ -240,6 +240,7 @@ def _schema_compiles(*, fmt: Dict, schema: Any) -> bool:
 def _drop_uncompilable_patterns(structural_tag: Dict) -> List[str]:
     # Workaround for mlc-ai/xgrammar#1001; drop once XGrammar compiles these patterns.
     # Mutates structural_tag in place; returns one log entry per dropped pattern.
+    # An empty result may leave the tag partly modified; discard it then.
     if is_legacy_structural_tag(structural_tag):
         slots = [
             (s["begin"], {"type": "json_schema", "json_schema": s["schema"]})
