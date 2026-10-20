@@ -53,6 +53,7 @@ from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
+    RequestFuncInput,
     _finite_positive_float,
     async_request_openai_embeddings,
     flush_server_cache,
@@ -568,6 +569,122 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             if tools:
                 expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
             self.assertEqual(row.prompt_len, expected_prompt_len)
+
+    def test_embedding_dataset_filters_records_and_counts_batch_tokens(self):
+        path = self.tmpdir_path / "embedding.jsonl"
+        invalid = [
+            None,
+            [],
+            {},
+            {"input": 3},
+            {"input": [1, 2]},
+            {"input": []},
+            {"input": " "},
+            {"input": ["text", None]},
+            {"input": ["text", ""]},
+        ]
+        valid = [
+            {"input": "hello 世界", "dimensions": 2, "model": "ignored"},
+            {"input": ["hello world", "bonjour 世界"], "encoding_format": "float"},
+        ]
+        with path.open("w", encoding="utf-8") as f:
+            f.write("\nnot json\n")
+            for record in invalid + valid + [{"input": "not selected"}]:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.tokenizer.chat_template = None
+        args = make_args(
+            dataset_name="embedding",
+            dataset_path=str(path),
+            num_prompts=2,
+            sharegpt_output_len=999,
+        )
+        rows = get_dataset(args, self.tokenizer)
+        self.assertEqual([row.prompt for row in rows], [row["input"] for row in valid])
+        self.assertEqual([row.output_len for row in rows], [0, 0])
+        expected_lengths = [
+            len(self.tokenizer.encode(valid[0]["input"])),
+            sum(len(self.tokenizer.encode(x)) for x in valid[1]["input"]),
+        ]
+        self.assertEqual([row.prompt_len for row in rows], expected_lengths)
+        self.assertEqual(rows[0].extra_request_body, {"dimensions": 2})
+        self.assertEqual(rows[1].extra_request_body, {"encoding_format": "float"})
+
+    def test_embedding_dataset_parameters_reach_embedding_http_endpoint(self):
+        records = [
+            {"input": "hello 世界", "dimensions": 2, "encoding_format": "float"},
+            {
+                "input": ["hello world", "bonjour 世界"],
+                "dimensions": 3,
+                "encoding_format": "base64",
+            },
+        ]
+        path = self.tmpdir_path / "embedding.jsonl"
+        path.write_text(
+            "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in records),
+            encoding="utf-8",
+        )
+        rows = get_dataset(
+            make_args(dataset_name="embedding", dataset_path=str(path)), self.tokenizer
+        )
+        received = []
+
+        class EmbeddingHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(
+                    (
+                        self.path,
+                        json.loads(
+                            self.rfile.read(int(self.headers["Content-Length"]))
+                        ),
+                    )
+                )
+                body = b'{"data": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), EmbeddingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        async def send_requests():
+            for row in rows:
+                request = RequestFuncInput(
+                    prompt=row.prompt,
+                    api_url=f"http://127.0.0.1:{server.server_port}/v1/embeddings",
+                    prompt_len=row.prompt_len,
+                    output_len=row.output_len,
+                    model="local-model",
+                    lora_name="",
+                    image_data=None,
+                    extra_request_body=row.extra_request_body,
+                )
+                result = await async_request_openai_embeddings(request)
+                self.assertTrue(result.success, result.error)
+                self.assertEqual(result.output_len, 0)
+                self.assertEqual(result.prompt_len, row.prompt_len)
+
+        try:
+            with patch(
+                "sglang.benchmark.serving.args", SimpleNamespace(header=[]), create=True
+            ):
+                asyncio.run(send_requests())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertEqual(
+            received,
+            [
+                ("/v1/embeddings", {**record, "model": "local-model"})
+                for record in records
+            ],
+        )
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)

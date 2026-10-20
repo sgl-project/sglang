@@ -2326,6 +2326,7 @@ def cli_main():
             "sharegpt",
             "custom",
             "openai",
+            "embedding",
             "random",
             "random-ids",
             "generated-shared-prefix",
