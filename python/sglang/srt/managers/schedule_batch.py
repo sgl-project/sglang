@@ -408,10 +408,14 @@ class ReqKvInfo:
         """Prefill-aware windows: no window evicts [0, extend_end)."""
         self.window_evict_floor = extend_end
 
-    def reset_for_retract(self) -> None:
+    def reset_for_retract(self, *, allow_held_row: bool = False) -> None:
         """A retracted request, its row already released, starts over: the tree
-        prefix, the committed length and the mamba state are reset."""
-        assert not self.holds_kv, "expect it is already released"
+        prefix, the committed length and the mamba state are reset.
+
+        ``allow_held_row`` covers HiSparse state-preserving retraction, which
+        intentionally keeps the req_to_token row (the retained host-pool row
+        is keyed by it) while only the logical slots were released."""
+        assert allow_held_row or not self.holds_kv, "expect it is already released"
         self.clear_tree_prefix()
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -855,6 +859,10 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # HiSparse state-preserving retraction: the request was retracted with
+        # its host-pool row kept; resume must re-admit without a prefill
+        # retransfer. See HiSparseCoordinator.retract_req_state_preserving.
+        self.hisparse_retraction_pending = False
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
@@ -1515,7 +1523,13 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
-        self.kv.reset_for_retract()
+        # HiSparse state-preserving retraction keeps the req_to_token row
+        # (the retained host-pool row is keyed by it); only the logical
+        # slots were released, so holds_kv stays true and the assert inside
+        # reset_for_retract must not fire.
+        self.kv.reset_for_retract(
+            allow_held_row=getattr(self, "hisparse_retraction_pending", False)
+        )
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
