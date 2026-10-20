@@ -457,6 +457,8 @@ def _handle_dlite(server_args: ServerArgs) -> None:
         raise ValueError("DLite currently does not support two-batch overlap.")
     if cfg.enable_mixed_chunk:
         raise ValueError("DLite currently does not support mixed chunked prefill.")
+    if cfg.enable_pdmux:
+        raise ValueError("DLite currently does not support PDMux.")
     if cfg.speculative_adaptive:
         raise ValueError("DLite currently does not support adaptive draft lengths.")
     if cfg.speculative_use_rejection_sampling:

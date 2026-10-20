@@ -1220,7 +1220,14 @@ def build_speculative_verify_target_probs(
 def validate_dflash_request(
     req: Req, enable_overlap: bool, algorithm: str = "DFLASH"
 ) -> Optional[str]:
-    if enable_overlap and req.return_hidden_states:
+    is_dlite = algorithm.upper() == "DLITE"
+    if is_dlite and req.sampling_params.top_k > 1:
+        return (
+            "DLITE speculative decoding supports greedy decoding only. "
+            "Use temperature=0 or top_k=1."
+        )
+
+    if req.return_hidden_states and (enable_overlap or is_dlite):
         return (
             f"{algorithm} speculative decoding does not support "
             "return_hidden_states yet."
