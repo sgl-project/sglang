@@ -17,7 +17,7 @@ export const config = {
           label: "High Throughput",
           subtitle: "Spec decode off",
           disabled: (s) => s.hw === "tpu7x",
-          disableReason: "The TPU7x recipe is qualified for Low Latency (MTP 5/1/6) only.",
+          disableReason: "The TPU7x recipe is qualified for Low Latency only.",
         },
       ],
     },
@@ -446,7 +446,7 @@ sgl-eval run gsm8k \\
             },
             {
               when: { hw: ["tpu7x"] },
-              reason: "TPU7x runs MTP 5-1-6 through the NEXTN flags its Low Latency recipe already carries.",
+              reason: "TPU7x runs MTP through the NEXTN flags its Low Latency recipe already carries.",
             },
           ],
         },
