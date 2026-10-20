@@ -1,6 +1,7 @@
 """Field order preserving the ServerArgs positional constructor signature.
 
-``collect_input_fields`` appends unlisted fields after these entries.
+Append new built-in fields to this tuple; inserting or regrouping changes existing
+calls. ``collect_input_fields`` appends unlisted extension fields after these entries.
 """
 
 # fmt: off
@@ -541,5 +542,9 @@ POSITIONAL_FIELD_ORDER = (
     "watermark_default_enabled",
     "watermark_enforce_all",
     "grpc_response_timeout_secs",
+    "enable_paged_experts",
+    "paged_experts_num_resident",
+    "enable_nvidia_megakernel",
+    "enable_megamoe_for_layernorm_sp",
 )
 # fmt: on
