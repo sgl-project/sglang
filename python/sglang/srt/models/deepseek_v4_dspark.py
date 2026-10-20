@@ -941,6 +941,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             assert x.dim() == 2, "V4.1 draft hidden states leave forward() collapsed"
             return x
         last = self.stages[-1]
+        if x.is_cuda and x.numel() > 0:
+            from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                last.hc_head_fn,
+                last.hc_head_scale,
+                last.hc_head_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         return hc_head_torch(
             x,
             last.hc_head_fn,
