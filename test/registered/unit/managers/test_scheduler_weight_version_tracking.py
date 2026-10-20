@@ -11,6 +11,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -140,8 +141,8 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         self.addCleanup(patcher.stop)
         self.recorded = []
 
-    def _manager(self, target, draft=None, *, session=True):
-        manager = SchedulerWeightUpdaterManager(
+    def _build_manager(self, target, draft):
+        return SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(
                 model_runner=target,
                 weight_update_runners=lambda: [("target", target)],
@@ -152,7 +153,6 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
                 if draft is None
                 else SimpleNamespace(weight_update_runners=lambda: [("draft", draft)])
             ),
-            tp_cpu_group=None,
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
@@ -162,6 +162,10 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
                 )
             ),
         )
+
+    def _manager(self, target, draft=None, *, session=True):
+        with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
+            manager = self._build_manager(target, draft)
         if session:
             # update_weights_from_* require an open session
             manager._session = _WeightUpdateSession(selector="all")

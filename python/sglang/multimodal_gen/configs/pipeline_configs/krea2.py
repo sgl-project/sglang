@@ -6,6 +6,9 @@ from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.krea2 import Krea2DitConfig
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    get_channelwise_decode_scale_and_shift,
+)
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -146,16 +149,9 @@ class Krea2PipelineConfig(ImagePipelineConfig):
 
     # --- VAE decode (same as Qwen-Image: latents * std + mean) ---
     def get_decode_scale_and_shift(self, device, dtype, vae):
-        vae_arch = self.vae_config.arch_config
-        scaling_factor = 1.0 / torch.tensor(vae_arch.latents_std, device=device).view(
-            1, vae_arch.z_dim, 1, 1, 1
-        ).to(device, dtype)
-        shift_factor = (
-            torch.tensor(vae_arch.latents_mean)
-            .view(1, vae_arch.z_dim, 1, 1, 1)
-            .to(device, dtype)
+        return get_channelwise_decode_scale_and_shift(
+            self.vae_config.arch_config, device, dtype
         )
-        return scaling_factor, shift_factor
 
     def post_denoising_loop(self, latents, batch):
         latents, batch_size, channels, height, width = self._unpad_and_unpack_latents(

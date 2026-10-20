@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass
 
 import pytest
@@ -12,12 +13,10 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
+pytest.importorskip("aiter")
 
 from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
-    flydsl_kimi_k3_kda_decode,
     flydsl_kimi_k3_kda_decode_with_f_b,
     is_flydsl_kimi_k3_kda_decode_supported,
 )
@@ -27,12 +26,9 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
-    if not torch.cuda.is_available() or not is_flydsl_available():
+    if importlib.util.find_spec("flydsl") is None:
         return False
-    try:
-        return get_gfx() == "gfx950"
-    except (AssertionError, KeyError, RuntimeError):
-        return False
+    return is_flydsl_kimi_k3_kda_decode_supported()
 
 
 pytestmark = pytest.mark.skipif(
@@ -275,25 +271,6 @@ def _relative_rmse(
     )
 
 
-def _run(inputs: Inputs) -> torch.Tensor:
-    return flydsl_kimi_k3_kda_decode(
-        x=inputs.x,
-        conv_weight=inputs.conv_weight,
-        conv_bias=None,
-        conv_state=inputs.conv_state,
-        raw_g=inputs.raw_g,
-        raw_beta=inputs.raw_beta,
-        A_log=inputs.A_log,
-        dt_bias=inputs.dt_bias,
-        lower_bound=_LOWER_BOUND,
-        state=inputs.state,
-        state_indices=inputs.state_indices,
-        output_gate=inputs.output_gate,
-        norm_weight=inputs.norm_weight,
-        norm_eps=_NORM_EPS,
-    )
-
-
 def _make_fb_inputs(
     batch: int,
     seed: int = 20260728,
@@ -351,7 +328,6 @@ def _run_with_f_b(
 def test_public_api_and_support_predicate() -> None:
     import sglang.kernels.ops.attention.kda_flydsl as flydsl_ops
 
-    assert flydsl_ops.flydsl_kimi_k3_kda_decode is flydsl_kimi_k3_kda_decode
     assert (
         flydsl_ops.is_flydsl_kimi_k3_kda_decode_supported
         is is_flydsl_kimi_k3_kda_decode_supported
@@ -380,46 +356,6 @@ def test_f_b_batch_two_dispatch_is_guarded() -> None:
         "fused_norm_reduce": True,
         "projection_fdot2": True,
     }
-
-
-@pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
-    seed = _make_inputs(batch)
-    reference_inputs = _copy_inputs(seed)
-    actual_inputs = _copy_inputs(seed)
-
-    reference = _reference(reference_inputs)
-    actual = _run(actual_inputs)
-    torch.cuda.synchronize()
-
-    assert is_flydsl_kimi_k3_kda_decode_supported(_DEVICE)
-    assert not torch.isnan(actual).any()
-    assert _relative_rmse(reference, actual) < 1e-3
-    assert (
-        _relative_rmse(
-            reference_inputs.state,
-            actual_inputs.state,
-        )
-        < 1e-3
-    )
-    assert torch.equal(
-        reference_inputs.conv_state,
-        actual_inputs.conv_state,
-    )
-
-
-def test_non_positive_slots_do_not_modify_caches() -> None:
-    inputs = _make_inputs(batch=2)
-    inputs.state_indices.copy_(torch.tensor([0, -1], dtype=torch.int32, device=_DEVICE))
-    conv_before = inputs.conv_state.clone()
-    state_before = inputs.state.clone()
-
-    actual = _run(inputs)
-    torch.cuda.synchronize()
-
-    assert torch.count_nonzero(actual) == 0
-    assert torch.equal(inputs.conv_state, conv_before)
-    assert torch.equal(inputs.state, state_before)
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
@@ -508,20 +444,12 @@ def test_f_b_api_rejects_invalid_projection_inputs() -> None:
         _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
 
 
-def test_decode_api_rejects_invalid_input_rank() -> None:
-    inputs = _make_inputs(batch=1)
-    inputs.x = inputs.x.unsqueeze(0)
-
-    with pytest.raises(ValueError, match="`x` must have rank 2"):
-        _run(inputs)
-
-
 def test_fused_kda_backend_is_opt_in(monkeypatch):
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    monkeypatch.delenv("SGLANG_K3_KDA_FUSED_BACKEND", raising=False)
+    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
     assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_K3_KDA_FUSED_BACKEND", "aiter")
+    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
     assert kda_fused_decode_aiter_hip.enabled()
 
 
