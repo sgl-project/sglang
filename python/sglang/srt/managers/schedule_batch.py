@@ -1898,7 +1898,8 @@ class Req(ReqDllmMixin):
         *,
         stop_str: Optional[str] = None,
         stop_regex: Optional[str] = None,
-    ) -> int:
+        full_window_matched: bool = True,
+    ) -> Optional[int]:
         """Map a matched stop string/regex to output_ids length (stop included)."""
 
         def matched(text: str) -> bool:
@@ -1917,6 +1918,8 @@ class Req(ReqDllmMixin):
             if matched(self.tokenizer.decode(token_window[:token_count])):
                 return start + token_count
 
+        if not full_window_matched:
+            return None
         # The full tail window is already known to match by the caller.
         return len(self.output_ids)
 
@@ -1964,12 +1967,24 @@ class Req(ReqDllmMixin):
                         )
                         break
                     if matched:
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_regex=stop_regex_str
+                        )
+                    elif new_accepted_len > 1:
+                        # An end-anchored pattern can match after a token
+                        # accepted mid-step but not after the last one.
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len,
+                            stop_regex=stop_regex_str,
+                            full_window_matched=False,
+                        )
+                    else:
+                        finished_len = None
+                    if finished_len is not None:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
-                        self.finished_len = self._locate_str_stop_finished_len(
-                            new_accepted_len, stop_regex=stop_regex_str
-                        )
+                        self.finished_len = finished_len
                         return True
 
         return False
