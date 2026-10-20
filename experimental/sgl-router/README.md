@@ -346,7 +346,8 @@ unset fields inherit the CLI flags. See
 - **Chat rendering**: use the same model files and chat-template settings on
   router and workers, or set `--disable-input-ids-forwarding`.
   `--tokenizer-backend fast` and `--tokenizer-l1-cache-mb N` speed up
-  tokenization.
+  tokenization. `--chat-encoding-backend recipe` renders DeepSeek-V4 / V4.1
+  through deepseek-recipe and must match the workers' flag.
 - **HTTP/2**: no configuration. h2c is used inbound when the client speaks it,
   and outbound to workers that report `enable_http2`; see
   [HTTP/2](REFERENCE.md#http2).

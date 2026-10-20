@@ -953,6 +953,12 @@ class ChatCompletionRequest(PDRoutingFields):
     stop_regex: Optional[Union[str, List[str]]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    thinking: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="DeepSeek API thinking control, e.g. {'type': 'disabled'}. Read by "
+        "the deepseek-recipe chat encoding backend; the builtin encoders take the "
+        "toggle from chat_template_kwargs.",
+    )
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None

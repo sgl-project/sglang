@@ -219,6 +219,16 @@ class Serving(msgspec.Struct):
         "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
     ] = False
     tool_call_parser: Optional[str] = None
+    chat_encoding_backend: A[
+        str,
+        Arg(
+            help="Which encoder renders DeepSeek-V4 / V4.1 chat prompts. 'builtin' is "
+            "SGLang's copy of the checkpoint encoder; 'recipe' is deepseek-recipe, "
+            "which matches the official API and requires the deepseek-recipe package. "
+            "Other models ignore it.",
+            choices=["builtin", "recipe"],
+        ),
+    ] = "builtin"
     tool_server: A[
         Optional[str],
         "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",

@@ -14,6 +14,7 @@ class InklingChatEncodingAdapter:
 
     collects_openai_media = True
     output = None
+    strict_tool_call_arguments = True
 
     def __init__(self, *, tokenizer: Any):
         self._tokenizer = tokenizer
@@ -65,3 +66,13 @@ class InklingChatEncodingAdapter:
                 *inkling_tokenizer.encode_text(assistant_prefix),
             ]
         return prompt_ids
+
+    def apply_sampling(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        sampling_params: dict[str, Any],
+        prompt_tokens: int,
+        context_length: int,
+    ) -> None:
+        """Inkling resolves nothing beyond ``to_sampling_params``."""

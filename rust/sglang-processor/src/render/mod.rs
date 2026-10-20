@@ -22,11 +22,15 @@ mod thinking;
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
+#[cfg(feature = "recipe")]
+pub use self::models::{RecipeFormatter, RecipeModel, RecipeRender};
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
     render_deepseek_v4, render_deepseek_v41, render_glm53, render_kimi_k3, render_qwen38,
     takes_content_parts,
 };
+#[cfg(feature = "recipe")]
+use self::models::{deepseek_recipe_thinking, render_deepseek_recipe};
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::thinking::ThinkingTemplates;
@@ -52,6 +56,9 @@ pub enum ChatFormatter {
     },
     DeepSeekV4(DeepSeekV4Profile),
     DeepSeekV41,
+    /// DeepSeek-V4 / V4.1 rendered by deepseek-recipe (`--chat-encoding-backend recipe`).
+    #[cfg(feature = "recipe")]
+    DeepSeekRecipe(RecipeFormatter),
     /// GLM-5.3's Jinja template, which `render_request` renders as SGLang does.
     Glm53(PromptFormatter),
     /// Dynamo's K3 formatter: [`Self::render_prompt`] keeps Dynamo's request
@@ -136,7 +143,33 @@ impl ChatFormatter {
                     RenderedSegment::new(prefix, true),
                 ]))
             }
+            #[cfg(feature = "recipe")]
+            ChatFormatter::DeepSeekRecipe(_) => {
+                let body = deepseek_request_body(request)?;
+                self.render_request(body, &HashMap::new())
+                    .map(|(prompt, _)| prompt)
+            }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
+        }
+    }
+
+    /// Render an SGLang chat request body with deepseek-recipe: the prompt, its
+    /// special-token ranges, and the sampling, constraint and parsing settings
+    /// recipe resolved. Only [`ChatFormatter::DeepSeekRecipe`] renders this way.
+    #[cfg(feature = "recipe")]
+    pub fn render_recipe(
+        &self,
+        request: Value,
+        default_kwargs: &HashMap<String, Value>,
+    ) -> Result<RecipeRender, TemplateError> {
+        match self {
+            ChatFormatter::DeepSeekRecipe(formatter) => {
+                render_deepseek_recipe(formatter, request, default_kwargs)
+                    .map_err(|message| TemplateError::Renderer { message })
+            }
+            _ => Err(TemplateError::Renderer {
+                message: "this formatter does not render through deepseek-recipe".into(),
+            }),
         }
     }
 
@@ -157,6 +190,11 @@ impl ChatFormatter {
                 render_deepseek_v4(*profile, request, default_kwargs).map(text)
             }
             ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs).map(text),
+            #[cfg(feature = "recipe")]
+            ChatFormatter::DeepSeekRecipe(formatter) => {
+                render_deepseek_recipe(formatter, request, default_kwargs)
+                    .map(|render| (RenderedPrompt::segmented(render.segments), String::new()))
+            }
             ChatFormatter::Glm53(formatter) => {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
@@ -184,6 +222,8 @@ impl ChatFormatter {
             | ChatFormatter::Glm53(_)
             | ChatFormatter::KimiK3
             | ChatFormatter::Qwen38 { .. } => None,
+            #[cfg(feature = "recipe")]
+            ChatFormatter::DeepSeekRecipe(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -226,11 +266,44 @@ impl ChatFormatter {
                     .insert("thinking".into(), Value::Bool(enabled));
                 Some(enabled)
             }
+            #[cfg(feature = "recipe")]
+            ChatFormatter::DeepSeekRecipe(_) => {
+                let enabled = deepseek_recipe_thinking(
+                    &serde_json::json!({ "chat_template_kwargs": args }),
+                    &HashMap::new(),
+                );
+                args.get_or_insert_default()
+                    .insert("thinking".into(), Value::Bool(enabled));
+                Some(enabled)
+            }
             // `template_detection`'s `glm53_always_think`.
             ChatFormatter::Glm53(_) => Some(true),
             ChatFormatter::Legacy(_) => None,
         }
     }
+}
+
+/// The SGLang request body the recipe formatter reads, built from a Dynamo
+/// request the way the DeepSeek-V4 `render_prompt` arm builds its body.
+#[cfg(feature = "recipe")]
+fn deepseek_request_body(request: &dyn OAIChatLikeRequest) -> Result<Value, TemplateError> {
+    let messages = match request.typed_messages() {
+        Some(messages) => serde_json::to_value(messages),
+        None => serde_json::to_value(request.messages()),
+    }
+    .map_err(|error| TemplateError::Renderer {
+        message: format!("failed to serialize messages: {error}"),
+    })?;
+    let mut body = serde_json::json!({
+        "tools": request.tools(),
+        "tool_choice": request.tool_choice(),
+        "response_format": request.response_format(),
+        "reasoning_effort": request.reasoning_effort(),
+        "chat_template_kwargs": request.chat_template_args(),
+        "continue_final_message": !request.should_add_generation_prompt(),
+    });
+    body["messages"] = messages;
+    Ok(body)
 }
 
 fn render_oai(

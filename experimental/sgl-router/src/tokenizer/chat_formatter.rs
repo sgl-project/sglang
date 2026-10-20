@@ -19,7 +19,9 @@ use dynamo_renderer::{
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
 use minijinja::Value;
 use serde_json::Value as JsonValue;
-use sglang_processor::{ChatFormatter as ProcessorFormatter, DeepSeekV4Profile};
+use sglang_processor::{
+    ChatFormatter as ProcessorFormatter, DeepSeekV4Profile, RecipeFormatter, RecipeModel,
+};
 
 pub type ChatTemplateKwargs = HashMap<String, JsonValue>;
 
@@ -283,6 +285,44 @@ impl ChatFormatter {
         matches!(self.processor, Some(ProcessorFormatter::KimiK3))
     }
 
+    /// `--chat-encoding-backend recipe`: DeepSeek-V4 / V4.1 render through
+    /// deepseek-recipe, which also tokenizes its prompts when the checkpoint's
+    /// `tokenizer.json` is given. Any other model keeps its formatter, as the
+    /// engine does.
+    pub fn with_recipe_backend(mut self, tokenizer_json: Option<&str>) -> Self {
+        let model = match self.processor {
+            Some(ProcessorFormatter::DeepSeekV41) => RecipeModel::V41,
+            Some(ProcessorFormatter::DeepSeekV4(_)) => RecipeModel::V4,
+            _ => return self,
+        };
+        let formatter =
+            match tokenizer_json.map(|json| RecipeFormatter::from_tokenizer_json(model, json)) {
+                Some(Ok(formatter)) => formatter,
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        %error,
+                        "deepseek-recipe cannot use this tokenizer.json; its prompts are \
+                         encoded with the router tokenizer instead"
+                    );
+                    RecipeFormatter::new(model)
+                }
+                None => {
+                    tracing::warn!(
+                        "no tokenizer.json for deepseek-recipe; its prompts are encoded with \
+                         the router tokenizer instead"
+                    );
+                    RecipeFormatter::new(model)
+                }
+            };
+        self.processor = Some(ProcessorFormatter::DeepSeekRecipe(formatter));
+        self
+    }
+
+    /// Whether prompts render through deepseek-recipe, which the workers must match.
+    pub fn is_recipe(&self) -> bool {
+        matches!(self.processor, Some(ProcessorFormatter::DeepSeekRecipe(_)))
+    }
+
     /// Apply the workers' `--default-chat-template-kwargs`; they fill keys the
     /// request leaves unset, and a default `reasoning_effort` acts as the request's.
     pub fn with_defaults(mut self, defaults: &ChatTemplateKwargs) -> Self {
@@ -400,6 +440,24 @@ impl ChatFormatter {
     }
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
+        if let Some(formatter @ ProcessorFormatter::DeepSeekRecipe(_)) = &self.processor {
+            // recipe tokenizes its own prompt (special tokens by id, plain text as
+            // plain BPE); without its tokenizer the segments go to the router's.
+            let render = formatter
+                .render_recipe(request.clone(), &self.worker_defaults)
+                .context("render chat")?;
+            return match render.token_ids {
+                Some(ids) => Ok(ids),
+                None => {
+                    let segments: Vec<EncodeSegment<'_>> = render
+                        .segments
+                        .iter()
+                        .map(|segment| EncodeSegment::new(&segment.text, segment.allow_special))
+                        .collect();
+                    Ok(tokenizer.encode_segments(&segments)?.token_ids().to_vec())
+                }
+            };
+        }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
             Some(segments) if self.is_kimi_k3() => super::kimi::encode(tokenizer, &segments)?,
@@ -780,6 +838,36 @@ mod tests {
     #[test]
     fn missing_messages_is_an_error() {
         assert!(deepseek_v4().render(&json!({"model": "m"})).is_err());
+    }
+
+    /// `--chat-encoding-backend recipe` swaps only the DeepSeek-V4 family's encoder.
+    #[test]
+    fn recipe_backend_applies_to_deepseek_v4_only() {
+        let v41 = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias")
+            .unwrap()
+            .with_recipe_backend(None);
+        assert!(v41.is_recipe());
+        assert_eq!(
+            v41.forwarding_scope(),
+            super::super::ForwardingScope::AllText
+        );
+        let v4 = ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias")
+            .unwrap()
+            .with_recipe_backend(None);
+        assert!(v4.is_recipe());
+        let v32 = ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2")
+            .unwrap()
+            .with_recipe_backend(None);
+        assert!(!v32.is_recipe());
+        // The recipe_parity fixture's `a1_empty_chat`: recipe's own prompt, not Dynamo's.
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": ""}],
+            "chat_template_kwargs": {"thinking": false},
+        });
+        assert_eq!(
+            v41.render(&request).unwrap(),
+            "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>"
+        );
     }
 
     #[test]

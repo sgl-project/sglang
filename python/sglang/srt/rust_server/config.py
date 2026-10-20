@@ -125,6 +125,7 @@ def _build_server_args(
         chat_template=get_serving().chat_template,
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
+        chat_encoding_backend=get_serving().chat_encoding_backend,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,

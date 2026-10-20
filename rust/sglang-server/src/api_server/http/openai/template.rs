@@ -22,18 +22,24 @@ pub(super) use super::template_legacy::LegacyFormatter;
 pub(super) use super::template_legacy::LegacySpec;
 #[cfg(test)]
 use super::template_loader::infer_legacy_template_from_model_path;
-pub(super) use super::template_loader::load_chat_formatter;
+pub(super) use super::template_loader::{load_chat_formatter, load_recipe_formatter};
 
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
 /// A chat prompt formatter: either the model's HuggingFace Jinja template (or
-/// Dynamo's built-in encoder for models that ship none) or a legacy SGLang
-/// conversation template.
+/// Dynamo's built-in encoder for models that ship none), a legacy SGLang
+/// conversation template, or deepseek-recipe for DeepSeek-V4 / V4.1 under
+/// `--chat-encoding-backend recipe`.
 #[derive(Clone)]
 pub enum ChatFormatter {
     HuggingFace(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
+    /// `sglang_processor::ChatFormatter::DeepSeekRecipe`. The prompt is submitted
+    /// as text and encoded in one pass, so unlike the Python and router hosts this
+    /// one does not keep user-typed special-token spellings as plain text, and
+    /// recipe's sampling defaults are not applied here (see REFERENCE.md).
+    Recipe(sglang_processor::ChatFormatter),
 }
 
 impl ChatFormatter {
@@ -50,6 +56,29 @@ impl ChatFormatter {
                     message: error.to_string(),
                 }),
             ChatFormatter::Legacy(formatter) => formatter.render(request),
+            ChatFormatter::Recipe(formatter) => {
+                // The typed request plus what the protocol type does not carry:
+                // `chat_template_kwargs` (recipe's thinking toggle) and the
+                // continuation flag Dynamo expresses as "no generation prompt".
+                let mut body =
+                    serde_json::to_value(request).map_err(|error| TemplateError::Renderer {
+                        message: format!("failed to serialize the request: {error}"),
+                    })?;
+                if let Some(kwargs) = kwargs.filter(|kwargs| !kwargs.is_empty()) {
+                    body["chat_template_kwargs"] =
+                        serde_json::to_value(kwargs).map_err(|error| TemplateError::Renderer {
+                            message: format!("failed to serialize chat_template_kwargs: {error}"),
+                        })?;
+                }
+                body["continue_final_message"] =
+                    serde_json::Value::Bool(!request.should_add_generation_prompt());
+                formatter
+                    .render_request(body, &HashMap::new())
+                    .map(|(prompt, _prefix)| prompt.into_text())
+                    .map_err(|error| TemplateError::Renderer {
+                        message: error.to_string(),
+                    })
+            }
         }
     }
 
@@ -59,7 +88,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(_) | ChatFormatter::Recipe(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }

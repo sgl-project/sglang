@@ -70,6 +70,10 @@ class ChatEncodingAdapter(Protocol):
     """Whether media still has to be collected from the OpenAI messages after
     ``encode_messages`` returns prompt ids."""
 
+    strict_tool_call_arguments: bool
+    """Whether history tool-call ``arguments`` must parse as JSON before
+    ``encode_messages`` sees them; False when the encoding serializes them itself."""
+
     @property
     def output(self) -> Optional[ChatEncodingOutputAdapter]:
         """None when the configured parsers leave output to the text parsers."""
@@ -83,6 +87,19 @@ class ChatEncodingAdapter(Protocol):
         tools: Optional[list[dict]],
     ) -> list[int]: ...
 
+    def apply_sampling(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        sampling_params: dict[str, Any],
+        prompt_tokens: int,
+        context_length: int,
+    ) -> None:
+        """Overlay what the encoding resolved for sampling (defaults, clamps, an
+        output constraint) on the params ``to_sampling_params`` built; most
+        encodings resolve nothing and leave them as they are."""
+        ...
+
 
 class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     """Everything a builder may read; a builder takes only what its encoding needs.
@@ -93,6 +110,8 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
       hf_config: config-dependent encoding (DeepSeek V4.1 image_token_id).
       model_path, revision: checkpoint files (DeepSeek tokenizer.json and the
         encoder file for effort-profile detection).
+      default_chat_template_kwargs: the workers' --default-chat-template-kwargs
+        (deepseek-recipe's thinking and effort defaults).
       backend: selects the builder; "recipe" is an explicit opt-in.
     """
 
@@ -104,6 +123,7 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     hf_config: Any
     model_path: str
     revision: Optional[str]
+    default_chat_template_kwargs: Optional[dict[str, Any]] = None
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -122,16 +142,38 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     return InklingChatEncodingAdapter(tokenizer=ctx.tokenizer)
 
 
+def _build_deepseek_recipe(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
+    from sglang.srt.entrypoints.openai.serving_deepseek_recipe import (
+        DeepSeekRecipeChatEncodingAdapter,
+    )
+
+    return DeepSeekRecipeChatEncodingAdapter.from_context(ctx)
+
+
 _BUILDERS: dict[
     str,
     dict[EncodingBackend, Callable[[ChatEncodingAdapterContext], ChatEncodingAdapter]],
 ] = {
     "inkling": {"builtin": _build_inkling},
+    # DeepSeek-V4 / V4.1 keep their builtin encoders inline in serving_chat;
+    # --chat-encoding-backend recipe renders them through deepseek-recipe.
+    "dsv4": {"recipe": _build_deepseek_recipe},
+    "dsv41": {"recipe": _build_deepseek_recipe},
 }
 
 
 def has_chat_encoding_adapter(chat_encoding_spec: Optional[str]) -> bool:
     return chat_encoding_spec in _BUILDERS
+
+
+def has_chat_encoding_backend(
+    chat_encoding_spec: Optional[str], backend: EncodingBackend
+) -> bool:
+    return backend in _BUILDERS.get(chat_encoding_spec, {})
+
+
+def specs_with_backend(backend: EncodingBackend) -> list[str]:
+    return sorted(spec for spec, builders in _BUILDERS.items() if backend in builders)
 
 
 def build_chat_encoding_adapter(

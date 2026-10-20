@@ -489,6 +489,21 @@ class OpenAIServingChat(OpenAIServingBase):
     def _build_chat_encoding_adapter(
         self,
     ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
+        backend = get_serving().chat_encoding_backend
+        # Like the Rust hosts: a backend the model's spec does not offer is ignored.
+        if (
+            backend != "builtin"
+            and not chat_encoding_adapters.has_chat_encoding_backend(
+                self.chat_encoding_spec, backend
+            )
+        ):
+            logger.warning(
+                "--chat-encoding-backend %s applies to %s only; this model keeps "
+                "its builtin chat encoding",
+                backend,
+                ", ".join(chat_encoding_adapters.specs_with_backend(backend)),
+            )
+            backend = "builtin"
         if not chat_encoding_adapters.has_chat_encoding_adapter(
             self.chat_encoding_spec
         ):
@@ -507,6 +522,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 hf_config=self.tokenizer_manager.model_config.hf_config,
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
+                default_chat_template_kwargs=self.default_chat_template_kwargs,
+                backend=backend,
             )
         )
 
@@ -1281,6 +1298,17 @@ class OpenAIServingChat(OpenAIServingBase):
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
+        if self._encoding_adapter is not None:
+            self._encoding_adapter.apply_sampling(
+                request=request,
+                sampling_params=sampling_params,
+                prompt_tokens=(
+                    len(processed_messages.prompt_ids)
+                    if isinstance(processed_messages.prompt_ids, list)
+                    else 0
+                ),
+                context_length=self.tokenizer_manager.model_config.context_len,
+            )
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
@@ -1561,9 +1589,14 @@ class OpenAIServingChat(OpenAIServingBase):
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
+        strict_tool_call_arguments = (
+            self._encoding_adapter.strict_tool_call_arguments
+            if self._encoding_adapter is not None
+            else self.chat_encoding_spec != "kimi_k3"
+        )
         for message in messages:
             normalize_assistant_tool_call_arguments(
-                message, strict=self.chat_encoding_spec != "kimi_k3"
+                message, strict=strict_tool_call_arguments
             )
 
         prompt_ids = self._encode_messages(

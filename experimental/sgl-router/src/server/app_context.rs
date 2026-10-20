@@ -216,6 +216,7 @@ impl AppContext {
                     id: "stub-model".into(),
                     tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
+                    chat_encoding_backend: crate::config::ChatEncodingBackend::Builtin,
                     tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),

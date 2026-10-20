@@ -16,6 +16,9 @@ pub struct ChatFormatterOptions {
     pub model_path: String,
     pub revision: Option<String>,
     pub chat_template: Option<String>,
+    /// `--chat-encoding-backend recipe`: DeepSeek-V4 / V4.1 render through
+    /// deepseek-recipe instead of Dynamo's port of the checkpoint encoder.
+    pub recipe_backend: bool,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +56,24 @@ pub fn select_chat_formatter(
     let model_type_lower = identity.model_type.as_deref().map(str::to_ascii_lowercase);
     let display_name_lower = model_source.to_ascii_lowercase();
     if config.chat_template.is_none() {
+        #[cfg(feature = "recipe")]
+        if config.recipe_backend {
+            let model = if identity.is_deepseek_v41() {
+                Some(super::RecipeModel::V41)
+            } else if identity.is_deepseek_v4() {
+                Some(super::RecipeModel::V4)
+            } else {
+                None
+            };
+            if let Some(model) = model {
+                let formatter = super::RecipeFormatter::for_checkpoint(
+                    model,
+                    &config.model_path,
+                    config.revision.as_deref(),
+                );
+                return (Some(ChatFormatter::DeepSeekRecipe(formatter)), None);
+            }
+        }
         if identity.is_deepseek_v41() {
             return (Some(ChatFormatter::DeepSeekV41), None);
         }

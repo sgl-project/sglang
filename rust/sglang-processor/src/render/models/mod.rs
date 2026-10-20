@@ -1,5 +1,7 @@
 //! Model-specific SGLang behaviour around Dynamo's formatters.
 
+#[cfg(feature = "recipe")]
+mod deepseek_recipe;
 mod deepseek_v4;
 mod deepseek_v41;
 mod glm53;
@@ -8,6 +10,12 @@ mod kimi_k3;
 mod qwen38;
 mod schema_types;
 
+#[cfg(feature = "recipe")]
+pub use self::deepseek_recipe::{RecipeFormatter, RecipeModel, RecipeRender};
+#[cfg(feature = "recipe")]
+pub(super) use self::deepseek_recipe::{
+    render as render_deepseek_recipe, thinking as deepseek_recipe_thinking,
+};
 pub use self::deepseek_v4::DeepSeekV4Profile;
 pub(super) use self::deepseek_v4::{
     render as render_deepseek_v4, resolve_dsv4_profile, thinking as deepseek_v4_thinking,

@@ -137,7 +137,7 @@ jobs:
 
       - name: Test individual features and the render/tokenizer host configuration
         run: |
-          for features in parser render tokenizer render,tokenizer; do
+          for features in parser render tokenizer render,tokenizer recipe recipe,tokenizer; do
             cargo test --locked -p sglang-processor --no-default-features --features "$features"
           done
 

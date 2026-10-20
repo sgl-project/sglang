@@ -50,6 +50,31 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
+    if server_args.chat_encoding_backend == "recipe" {
+        // The model's config.json: `model_path` first, the tokenizer source when the
+        // model directory is not local.
+        let model_config = [&server_args.model_path, &server_args.tokenizer_path]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .find_map(|path| {
+                tokenizer::resolve_model_file(path, server_args.revision.as_deref(), "config.json")
+            });
+        match template::load_recipe_formatter(model_config.as_deref()) {
+            Ok(Some(formatter)) => {
+                tracing::info!("DeepSeek chat prompts render through deepseek-recipe");
+                return Some(formatter);
+            }
+            Ok(None) => tracing::warn!(
+                "--chat-encoding-backend recipe applies to DeepSeek-V4 / V4.1 only; \
+                 using the model's chat template"
+            ),
+            Err(error) => {
+                tracing::error!(%error, "OpenAI chat completions disabled: \
+                    --chat-encoding-backend recipe cannot read the model's config.json");
+                return None;
+            }
+        }
+    }
     let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),

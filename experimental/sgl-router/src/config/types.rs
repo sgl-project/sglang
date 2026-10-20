@@ -109,6 +109,18 @@ pub enum TokenizerBackend {
     Fast,
 }
 
+/// Chat encoder accepted by `--chat-encoding-backend`; SGLang's flag of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ChatEncodingBackend {
+    /// The engine's port of each checkpoint's encoder.
+    #[default]
+    #[value(name = "builtin")]
+    Builtin,
+    /// deepseek-recipe for DeepSeek-V4 / V4.1, the encoder matching the official API.
+    #[value(name = "recipe")]
+    Recipe,
+}
+
 /// Router tokenizer encode settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TokenizerConfig {
@@ -387,6 +399,8 @@ pub struct ModelConfig {
     /// Disable router-generated input IDs for this model; keep routing tokenization.
     /// Use when workers have rendering defaults or template stops the router cannot see.
     pub disable_input_ids_forwarding: bool,
+    /// Which encoder renders DeepSeek-V4 / V4.1 chats; must match the workers' flag.
+    pub chat_encoding_backend: ChatEncodingBackend,
     /// Encode backend and L1 cache for router tokenization.
     pub tokenizer: TokenizerConfig,
     pub policy: PolicyKind,

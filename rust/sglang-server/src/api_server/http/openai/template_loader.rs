@@ -133,6 +133,28 @@ pub(super) fn load_chat_formatter(
     }
 }
 
+/// `--chat-encoding-backend recipe`: the deepseek-recipe formatter for a
+/// DeepSeek-V4 / V4.1 checkpoint, read from its `config.json`. `Ok(None)` for
+/// any other model, which keeps the formatter [`load_chat_formatter`] selects;
+/// an unreadable config is an error, not a silent fallback.
+pub(super) fn load_recipe_formatter(
+    model_config_file: Option<&str>,
+) -> Result<Option<ChatFormatter>, TemplateError> {
+    let path = Path::new(model_config_file.ok_or(TemplateError::MissingConfig)?);
+    let config = parse_json(&read_to_string(path, "model config")?, path, "model config")?;
+    let Some(model) = sglang_processor::RecipeModel::detect(
+        config["model_type"].as_str(),
+        config["architectures"][0].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(ChatFormatter::Recipe(
+        sglang_processor::ChatFormatter::DeepSeekRecipe(sglang_processor::RecipeFormatter::new(
+            model,
+        )),
+    )))
+}
+
 /// Port of Python `get_conv_template_by_model_path` (conversation.py
 /// `matching_function_registry`, run in registration order): infer a legacy
 /// built-in template from the model path, optionally consulting the model's

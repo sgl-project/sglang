@@ -125,6 +125,9 @@ pub struct ServerArgs {
     /// When set, chat completions strip the model's reasoning markers out of
     /// `content` into `reasoning_content` — both unary and streaming.
     pub reasoning_parser: Option<String>,
+    /// `--chat-encoding-backend`: `builtin` renders DeepSeek-V4 / V4.1 chats with
+    /// the engine's port of the checkpoint encoder, `recipe` with deepseek-recipe.
+    pub chat_encoding_backend: String,
     /// Python's global default for whether an SSE stream ends with a usage chunk.
     pub stream_response_default_include_usage: bool,
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
@@ -217,6 +220,7 @@ impl ServerArgs {
         chat_template,
         tool_call_parser,
         reasoning_parser,
+        chat_encoding_backend,
         stream_response_default_include_usage,
         tokenizer_worker_num,
         detokenizer_worker_num,
@@ -264,6 +268,7 @@ impl ServerArgs {
         chat_template: Option<String>,
         tool_call_parser: Option<String>,
         reasoning_parser: Option<String>,
+        chat_encoding_backend: String,
         stream_response_default_include_usage: bool,
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
@@ -309,6 +314,7 @@ impl ServerArgs {
             chat_template,
             tool_call_parser,
             reasoning_parser,
+            chat_encoding_backend,
             stream_response_default_include_usage,
             tokenizer_worker_num,
             detokenizer_worker_num,
@@ -362,6 +368,7 @@ impl Default for ServerArgs {
             chat_template: None,
             tool_call_parser: None,
             reasoning_parser: None,
+            chat_encoding_backend: "builtin".into(),
             stream_response_default_include_usage: false,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
