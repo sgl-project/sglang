@@ -114,6 +114,7 @@ _is_cpu = is_cpu()
 # Below this image count the per-image loop beats the vectorized path (which has a
 # fixed setup cost; measured crossover ~6 on H20); both give the same result.
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
+_QWEN3_VISION_MODEL_OPT_METHODS = frozenset({"modelopt_fp4", "modelopt_mixed"})
 
 
 def _resolve_vision_parallel_group(
@@ -126,6 +127,17 @@ def _resolve_vision_parallel_group(
             raise ValueError("Explicit vision TP cannot be combined with data parallel")
         return "replicated"
     return "attn_tp" if parallel_group is None else parallel_group
+
+
+def _get_qwen3_vision_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    if (
+        quant_config is not None
+        and quant_config.get_name() in _QWEN3_VISION_MODEL_OPT_METHODS
+    ):
+        return quant_config
+    return None
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -1305,7 +1317,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         orig_to_new_prefix={
             # mapping for new names in checkpoint saved after transformers v4.52
             "model.language_model.": "language_model.model.",
-            "model.visual.": "visual.",
+            "model.visual": "visual",
             # mapping for original checkpoint
             "lm_head.": "language_model.lm_head.",
             "model.": "language_model.model.",
@@ -1331,9 +1343,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
-                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-                quant_config=None,
+                quant_config=_get_qwen3_vision_quant_config(quant_config),
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
