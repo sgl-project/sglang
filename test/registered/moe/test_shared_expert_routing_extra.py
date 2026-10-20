@@ -24,14 +24,6 @@ register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
 class TestSelectExpertsPerRankSharedSlots(CustomTestCase):
     """Shared slots must not alter routed selection or normalization."""
 
-    def setUp(self):
-        super().setUp()
-        override = get_context().override_server_args(
-            disable_shared_experts_fusion=False
-        )
-        override.install()
-        self.addCleanup(override.restore)
-
     NUM_TOKENS, TOP_K, EP_SIZE, EP_RANK = 32, 8, 8, 3
     # (num_experts, num_expert_group, topk_group, scoring_func, biased); each row
     # reaches a different router.
