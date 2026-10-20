@@ -1,7 +1,7 @@
 """Automatic speculative limits must not consume the memory reserved for KV.
 
-Regression: with radix disabled, a default request limit was treated as an
-explicit state-pool size, leaving a negative KV budget after weights fit.
+With radix disabled, a default request limit must leave the configured KV
+share even when its state pool fits within the total cache budget.
 """
 
 import unittest
@@ -74,11 +74,13 @@ class TestMambaSpeculativeBudget(CustomTestCase):
         return planner
 
     def test_automatic_speculative_limit_leaves_the_kv_memory_budget(self):
-        remaining = self._planner()._handle_max_mamba_cache(10.0)
-        # Both persistent and intermediate buffers must fit the Mamba share,
-        # including their padding slots, rather than taking the whole budget.
-        self.assertGreaterEqual(remaining, 10.0 / (1 + 0.9))
-        self.assertGreater(get_schedule().max_mamba_cache_size, 0)
+        # The fixed pool needs about 24.68 GiB. Crossing that threshold must
+        # not let it consume the KV share of the budget.
+        for budget in (10.0, 24.68, 24.70, 30.0):
+            with self.subTest(budget=budget):
+                remaining = self._planner()._handle_max_mamba_cache(budget)
+                self.assertGreaterEqual(remaining, budget / (1 + 0.9))
+                self.assertGreater(get_schedule().max_mamba_cache_size, 0)
 
     def test_fitting_automatic_limit_keeps_the_request_sized_pool(self):
         remaining = self._planner()._handle_max_mamba_cache(64.0)

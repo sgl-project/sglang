@@ -20,14 +20,7 @@ from sglang.srt.utils.common import human_readable_int
 def max_running_requests_is_explicit_of(cfg) -> bool:
     from sglang.srt.arg_groups.model_override_base import record_of
 
-    record = record_of(cfg)
-    raw = getattr(record, "_raw_input", None)
-    requested = (
-        raw.get("max_running_requests")
-        if raw is not None
-        else record.max_running_requests
-    )
-    return requested is not None
+    return record_of(cfg).max_running_requests is not None
 
 
 class Schedule(msgspec.Struct):

@@ -2972,8 +2972,8 @@ class KVCacheConfigurator:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
 
-        # Speculation may set a default request limit whose state cache does not fit.
-        # Preserve fitting pools, but auto-fit an oversized default to leave KV memory.
+        # Auto-fit default speculative pools that exceed the Mamba share,
+        # even when they fit within the total cache budget.
         auto_fit_spec_state = False
         if (
             get_memory().disable_radix_cache
@@ -2987,8 +2987,13 @@ class KVCacheConfigurator:
                 + extra_per_slot
             )
             required_state_bytes = request_slots * state_bytes_per_slot
-            available_cache_bytes = total_rest_memory * (1 << 30)
-            auto_fit_spec_state = required_state_bytes >= available_cache_bytes
+            mamba_budget_bytes = (
+                total_rest_memory
+                * get_schedule().mamba_full_memory_ratio
+                / (1 + get_schedule().mamba_full_memory_ratio)
+                * (1 << 30)
+            )
+            auto_fit_spec_state = required_state_bytes >= mamba_budget_bytes
 
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
