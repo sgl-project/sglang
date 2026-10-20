@@ -219,9 +219,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         )
 
     def _init_kv_copy_and_warmup(self):
-        # implementation relies on self.data_strides / self.data_ptrs, which the
-        # NPU paged buffer layout never builds.
+        # The tiled byte copy relies on self.data_strides / self.data_ptrs,
+        # which the NPU paged buffer layout never builds. Redirect spec-decode
+        # KV moves to the native advanced-indexing move instead: the per-layer
+        # k/v views here are [P*ps, 1, H, D], so dim-0 token indexing matches.
         self._kv_copy_config = None
+        self.use_native_move_kv_cache = True
 
     # for disagg
     def get_contiguous_buf_infos(self):

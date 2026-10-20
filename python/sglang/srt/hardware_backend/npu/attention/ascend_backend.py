@@ -14,6 +14,7 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
+    reference_swa_decode_mask,
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
@@ -356,6 +357,16 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.prefill_aware_swa = getattr(model_runner, "prefill_aware_swa", False)
+        if self.prefill_aware_swa:
+            if self.use_mla:
+                raise ValueError("Ascend reference SWA requires MHA KV storage.")
+            self.sliding_window_size = model_runner.sliding_window_size
+            # Slot zero is reserved; slot IDs are not batch-row IDs. This CPU
+            # mirror is consumed by the eager native attention path.
+            self.reference_lens = torch.zeros(
+                model_runner.req_to_token_pool.size + 1, dtype=torch.int32
+            )
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -522,6 +533,13 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if self.prefill_aware_swa and forward_batch.reference_lens_cpu is not None:
+            # Prompt lengths remain stable across chunks and retraction; a
+            # re-prefill may include generated tokens that are not references.
+            prompt_lens = forward_batch.reference_lens_cpu
+            self.reference_lens[
+                forward_batch.req_pool_indices[: len(prompt_lens)].cpu().long()
+            ] = torch.tensor(prompt_lens, dtype=torch.int32)
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
@@ -706,6 +724,20 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = False
 
+        if self.prefill_aware_swa and forward_batch.forward_mode.is_decode_or_idle():
+            positions = torch.arange(
+                self.forward_metadata.block_tables.shape[1] * self.page_size,
+                device=self.device,
+            )
+            self.forward_metadata.swa_mask = reference_swa_decode_mask(
+                self.forward_metadata.seq_lens,
+                self.reference_lens[forward_batch.req_pool_indices.cpu().long()].to(
+                    self.device
+                ),
+                positions,
+                self.sliding_window_size,
+            )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
@@ -757,18 +789,21 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
+        if self.is_hybrid_swa or self.prefill_aware_swa:
             # SWA mask: True = masked out (don't attend), False = attend.
             # Pre-allocated at max size, sliced per batch size during capture,
             # content updated via copy_() during replay.
             self.graph_metadata["swa_mask"] = torch.ones(
-                (max_bs, 1, total_context_len),
+                (max_bs, 1, (total_context_len // self.page_size) * self.page_size),
                 dtype=torch.bool,
                 device=self.device,
             )
             # Pre-allocated index buffer for mask generation during replay,
             # avoids torch.arange allocation on every replay step.
             self.graph_metadata["swa_indices"] = torch.arange(
-                total_context_len, device=self.device, dtype=torch.int32
+                (total_context_len // self.page_size) * self.page_size,
+                device=self.device,
+                dtype=torch.int32,
             )
         if self.use_sliding_window_kv_pool:
             # refilled in place at replay; the captured graph reads this storage
@@ -828,6 +863,7 @@ class AscendAttnBackend(AttentionBackend):
             ]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+        if self.is_hybrid_swa or self.prefill_aware_swa:
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
@@ -959,6 +995,17 @@ class AscendAttnBackend(AttentionBackend):
             )
             metadata.swa_mask[:bs, 0, :].copy_(mask)
             metadata.swa_mask[bs:, :, :].fill_(True)
+        if self.prefill_aware_swa:
+            references = self.reference_lens[req_pool_indices[:bs].cpu().long()].to(
+                self.device
+            )
+            mask = reference_swa_decode_mask(
+                seq_lens[:bs].int(),
+                references,
+                self.graph_metadata["swa_indices"],
+                self.sliding_window_size,
+            )
+            metadata.swa_mask[:bs].copy_(mask)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
             // self.page_size
@@ -1599,6 +1646,36 @@ class AscendAttnBackend(AttentionBackend):
 
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.prefill_aware_swa and any(
+                seq_len > prompt_len
+                for seq_len, prompt_len in zip(
+                    forward_batch.seq_lens_cpu.tolist(),
+                    forward_batch.reference_lens_cpu,
+                )
+            ):
+                query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                output = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                )
+                self.native_attn.run_sdpa_forward_extend(
+                    query,
+                    output,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.extend_prefix_lens,
+                    forward_batch.extend_seq_lens,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                    sliding_window_size=self.sliding_window_size,
+                    reference_lens=torch.tensor(forward_batch.reference_lens_cpu),
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
+                )
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
@@ -2355,6 +2432,31 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         if not self.use_mla:
+            if self.prefill_aware_swa:
+                output = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                )
+                self.native_attn.run_sdpa_forward_reference_verify(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    output,
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                        -1, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                        -1, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    self.reference_lens[forward_batch.req_pool_indices.cpu().long()],
+                    forward_batch.spec_info.custom_mask,
+                    forward_batch.positions,
+                    forward_batch.spec_info.draft_token_num,
+                    self.sliding_window_size,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                )
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
@@ -2714,7 +2816,7 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if sinks is not None or self.is_hybrid_swa:
+        if (sinks is not None or self.is_hybrid_swa) and not self.prefill_aware_swa:
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -2804,7 +2906,10 @@ class AscendAttnBackend(AttentionBackend):
         if not self.use_mla:
             seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
             seq_lens_cpu_list = self.forward_metadata.seq_lens_cpu_list
-            if self._is_swa_layer(layer):
+            if self.prefill_aware_swa:
+                block_tables = self.forward_metadata.block_tables
+                attn_mask = self.forward_metadata.swa_mask
+            elif self._is_swa_layer(layer):
                 # CUDA/NPU graph capture uses seq_len fill value 0 on Ascend.
                 # Avoid dynamic window block-table construction during capture,
                 # because it can create a zero-width block table and break tiling.
@@ -3038,6 +3143,30 @@ class AscendAttnBackend(AttentionBackend):
             num_tokens = q.shape[0]
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+            if self.prefill_aware_swa:
+                query = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                output = q.new_empty(
+                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim)
+                )
+                self.native_attn.run_sdpa_forward_decode(
+                    query,
+                    output,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens_cpu,
+                    scaling=layer.scaling,
+                    enable_gqa=layer.tp_q_head_num != layer.tp_k_head_num,
+                    sliding_window_size=self.sliding_window_size,
+                    reference_lens=self.reference_lens[
+                        forward_batch.req_pool_indices.cpu().long()
+                    ],
+                    logit_cap=layer.logit_cap,
+                    logit_capping_method=layer.logit_capping_method,
+                )
+                return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
             if sinks is not None or (self._is_swa_layer(layer) and self.use_fia):
                 # Use SWA block tables if hybrid SWA is enabled for this layer

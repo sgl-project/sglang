@@ -63,6 +63,16 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
             image_token="<image>", image_token_id=self._processor.image_token_id
         ).build(_processor)
 
+    def collect_mm_items_from_processor_output(self, data_dict, modality=None):
+        items = super().collect_mm_items_from_processor_output(data_dict, modality)
+        for item in items:
+            spatial_crop = item.model_specific_data.get("images_spatial_crop")
+            if isinstance(spatial_crop, torch.Tensor):
+                # HF emits [1, pages, 2]. Expose the page axis to the generic
+                # item splitter, alongside pixel_values and images_crop.
+                item.images_spatial_crop = spatial_crop.reshape(-1, 2)
+        return items
+
     @staticmethod
     def _mix_config_into_hash(mm_items, processor_kwargs):
         """Mix images_config into mm_item hashes so that different configs

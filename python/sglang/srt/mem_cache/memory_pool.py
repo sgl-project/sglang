@@ -3502,7 +3502,10 @@ class MHATokenToKVPool(KVCache):
     def _move_native_fp4_scales(
         self, tgt_loc: torch.Tensor, src_loc: torch.Tensor
     ) -> None:
-        if self.native_k_scale_buffer is None:
+        # NPU pool subclasses override _create_buffers and never build the
+        # native scale buffers; guard with getattr like the k_scale_buffer
+        # check in _move_kv_cache_impl.
+        if getattr(self, "native_k_scale_buffer", None) is None:
             return
         from sglang.srt.layers.quantization.nvfp4_kv_cache import (
             move_nvfp4_native_scales,

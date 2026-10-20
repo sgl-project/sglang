@@ -1204,10 +1204,26 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu", "xpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu", "npu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, XPU, or NPU devices."
         )
+    if cfg.device == "npu":
+        model_arch = model_config_of(server_args).hf_config.architectures[0]
+        if model_arch != "UnlimitedOCRForCausalLM":
+            raise ValueError(
+                "NPU NGRAM verification is currently implemented for Unlimited-OCR."
+            )
+        if (
+            cfg.speculative_ngram_min_bfs_breadth != 1
+            or cfg.speculative_ngram_max_bfs_breadth != 1
+        ):
+            raise ValueError(
+                "Unlimited-OCR NPU NGRAM requires linear-chain drafts: set "
+                "--speculative-ngram-min-bfs-breadth 1 and "
+                "--speculative-ngram-max-bfs-breadth 1. Branched page128 "
+                "verification is not implemented."
+            )
 
     _disable_overlap_schedule_for_cpu(server_args)
 

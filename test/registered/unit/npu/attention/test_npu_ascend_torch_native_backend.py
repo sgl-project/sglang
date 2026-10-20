@@ -10,10 +10,82 @@ from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
+    reference_swa_decode_mask,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
+
+
+class TestReferenceSWADecodeMask(CustomTestCase):
+    def test_verify_ancestry_uses_logical_positions_and_avoids_evicted_kv(self):
+        """A branch's storage index is not its position; freed KV may be NaN."""
+        torch.manual_seed(73)
+        prefix, reference, window, nodes = 20, 7, 4, 6
+        parents = [-1, 0, 1, 2, 0, 4]
+        depth, ancestry = [], torch.ones(nodes, prefix + nodes, dtype=torch.bool)
+        ancestry[:, prefix:] = False
+        for node, parent in enumerate(parents):
+            depth.append(0 if parent < 0 else depth[parent] + 1)
+            current = node
+            while current >= 0:
+                ancestry[node, prefix + current] = True
+                current = parents[current]
+        q = torch.randn(nodes, 2, 4)
+        raw_k, raw_v = (
+            torch.randn(prefix + nodes, 2, 4),
+            torch.randn(prefix + nodes, 2, 4),
+        )
+        # A permutation makes slot identity independent of the token position.
+        slots = torch.randperm(prefix + nodes)
+        cache_k, cache_v = torch.empty_like(raw_k), torch.empty_like(raw_v)
+        cache_k[slots], cache_v[slots] = raw_k, raw_v
+        cache_k[slots[reference : prefix - window + 1]] = float("nan")
+        cache_v[slots[reference : prefix - window + 1]] = float("nan")
+        positions = torch.tensor([prefix + d for d in depth])
+        mask = torch.zeros_like(ancestry)
+        for node, query_position in enumerate(positions.tolist()):
+            for key in range(prefix + nodes):
+                key_position = key if key < prefix else prefix + depth[key - prefix]
+                mask[node, key] = bool(ancestry[node, key]) and (
+                    key < reference or key_position > query_position - window
+                )
+        expected = scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            raw_k.transpose(0, 1)[None],
+            raw_v.transpose(0, 1)[None],
+            attn_mask=mask,
+        )[0].transpose(0, 1)
+        output = torch.empty_like(q)
+        AscendTorchNativeAttnBackend().run_sdpa_forward_reference_verify(
+            q,
+            output,
+            cache_k,
+            cache_v,
+            slots[None],
+            torch.tensor([0]),
+            torch.tensor([prefix]),
+            torch.tensor([reference]),
+            ancestry.flatten(),
+            positions,
+            nodes,
+            window,
+        )
+        torch.testing.assert_close(output, expected)
+
+    def test_non_aligned_references_suffix_and_padding(self):
+        """References survive past W; holes and graph padding remain invisible."""
+        lengths = torch.tensor([0, 1, 11, 139, 140, 257, 386, 900])
+        references = torch.tensor([0, 1, 11, 11, 11, 257, 257, 257])
+        mask = reference_swa_decode_mask(lengths, references, torch.arange(1024), 128)
+        for row, (length, reference) in enumerate(
+            zip(lengths.tolist(), references.tolist())
+        ):
+            visible = set(range(min(reference, length)))
+            visible.update(range(max(reference, length - 128), length))
+            expected = torch.tensor([pos not in visible for pos in range(1024)])
+            self.assertTrue(torch.equal(mask[row, 0], expected))
 
 
 class TestScaledDotProductAttentionWithSoftcapping(unittest.TestCase):
@@ -813,6 +885,90 @@ class TestRunSdpaForwardDecode(unittest.TestCase):
             causal=False,
         )
         self.assertEqual(result.dtype, torch.float32)
+
+
+class TestReferenceSlidingWindowDecode(CustomTestCase):
+    def test_reprefill_generated_tokens_keep_the_original_reference_boundary(self):
+        generator = torch.Generator().manual_seed(17)
+        backend = AscendTorchNativeAttnBackend()
+        prompt_len, total_len = 11, 276
+        key = torch.randn(total_len, 2, 8, generator=generator)
+        value = torch.randn(total_len, 2, 8, generator=generator)
+        for prefix_len in (0, 149):
+            with self.subTest(prefix_len=prefix_len):
+                query = torch.randn(total_len - prefix_len, 2, 8, generator=generator)
+                actual = torch.empty_like(query)
+                backend.run_sdpa_forward_extend(
+                    query,
+                    actual,
+                    key,
+                    value,
+                    torch.arange(total_len).unsqueeze(0),
+                    torch.tensor([0]),
+                    torch.tensor([total_len]),
+                    torch.tensor([prefix_len]),
+                    torch.tensor([total_len - prefix_len]),
+                    causal=True,
+                    sliding_window_size=128,
+                    reference_lens=torch.tensor([prompt_len]),
+                )
+                positions = torch.arange(total_len)
+                for offset, q in enumerate(query):
+                    position = prefix_len + offset
+                    visible = (positions <= position) & (
+                        (positions < prompt_len) | (position - positions < 128)
+                    )
+                    scores = q.unsqueeze(1) @ key.transpose(0, 1).transpose(-2, -1)
+                    scores = scores / math.sqrt(8)
+                    expected = (
+                        scores.masked_fill(~visible, float("-inf")).softmax(-1)
+                        @ value.transpose(0, 1)
+                    ).squeeze(1)
+                    torch.testing.assert_close(actual[offset], expected)
+
+    def test_reference_prefix_and_generated_window_against_full_mask(self):
+        generator = torch.Generator().manual_seed(13)
+        backend = AscendTorchNativeAttnBackend()
+        # Request pool slots deliberately differ from batch rows; scattered
+        # cache locations must be gathered in each request's logical order.
+        req_indices = torch.tensor([3, 1])
+        req_to_token = torch.stack(
+            [torch.randperm(1024, generator=generator) for _ in range(4)]
+        )
+        key = torch.randn(1024, 2, 8, generator=generator)
+        value = torch.randn(1024, 2, 8, generator=generator)
+        query = torch.randn(2, 2, 8, generator=generator)
+        reference_lens = torch.tensor([257, 11])
+        for generated in (1, 127, 128, 129, 265):
+            with self.subTest(generated=generated):
+                seq_lens = reference_lens + torch.tensor([generated, generated + 7])
+                actual = torch.empty_like(query)
+                backend.run_sdpa_forward_decode(
+                    query,
+                    actual,
+                    key,
+                    value,
+                    req_to_token,
+                    req_indices,
+                    seq_lens,
+                    sliding_window_size=128,
+                    reference_lens=reference_lens,
+                )
+                for batch_idx, slot in enumerate(req_indices):
+                    length = int(seq_lens[batch_idx])
+                    positions = torch.arange(length)
+                    visible = (positions < reference_lens[batch_idx]) | (
+                        positions >= length - 128
+                    )
+                    cache_locs = req_to_token[slot, :length]
+                    # Independent full-cache attention oracle: no compaction.
+                    q = query[batch_idx].unsqueeze(1)
+                    k = key[cache_locs].transpose(0, 1)
+                    v = value[cache_locs].transpose(0, 1)
+                    scores = (q @ k.transpose(-2, -1)) / math.sqrt(8)
+                    scores = scores.masked_fill(~visible, float("-inf"))
+                    expected = (scores.softmax(-1) @ v).squeeze(1)
+                    torch.testing.assert_close(actual[batch_idx], expected)
 
 
 if __name__ == "__main__":

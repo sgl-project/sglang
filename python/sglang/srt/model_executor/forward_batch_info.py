@@ -518,6 +518,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    # Original prompt lengths for reference SWA. Unlike orig_seq_lens these
+    # exclude generated tokens when a retracted request is prefetched again.
+    reference_lens_cpu: Optional[List[int]] = None
 
     # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -1034,6 +1037,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 else None
             ),
             orig_seq_lens=batch.orig_seq_lens,
+            reference_lens_cpu=(
+                [len(req.origin_input_ids) for req in batch.reqs]
+                if getattr(model_runner, "prefill_aware_swa", False)
+                and batch.forward_mode.is_extend_without_speculative()
+                else None
+            ),
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
             engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
