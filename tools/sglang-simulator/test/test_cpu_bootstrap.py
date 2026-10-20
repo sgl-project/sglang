@@ -128,6 +128,69 @@ class LinearPool:
         return SimpleNamespace(max_total_num_tokens=tokens // alignment * alignment)
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_mock_forward_attaches_only_its_own_opted_in_snapshot(
+    model_runner, monkeypatch, prepared
+):
+    from sglang_simulator.simulation.sglang.prepared_batch import (
+        SNAPSHOT_ATTRIBUTE,
+        predictor_batch_from_result,
+    )
+    from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
+
+    monkeypatch.setattr(
+        C_SchedulerHook,
+        "INFERENCE_PREDICTOR",
+        SimpleNamespace(requires_prepared_batch=prepared),
+    )
+    logits_module = ModuleType("sglang.srt.layers.logits_processor")
+    logits_module.LogitsProcessorOutput = SimpleNamespace
+    native_runner = ModuleType("sglang.srt.model_executor.model_runner")
+    native_runner.ModelRunnerOutput = SimpleNamespace
+    monkeypatch.setitem(sys.modules, logits_module.__name__, logits_module)
+    monkeypatch.setitem(sys.modules, native_runner.__name__, native_runner)
+    target_type = type("Target", (), {})
+    model_runner.C_ModelRunnerHook.hook(target_type)
+    target = target_type()
+    target.model_config = SimpleNamespace(vocab_size=16)
+    target.device = "cpu"
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(name="MIXED"),
+        batch_size=2,
+        seq_lens_cpu=[101, 8],
+        extend_seq_lens_cpu=[1, 8],
+        extend_prefix_lens_cpu=[100, 0],
+    )
+
+    def allocate(**kwargs):
+        batch.seq_lens_cpu[:] = [2, 2]
+        batch.extend_seq_lens_cpu[:] = [2, 2]
+        batch.extend_prefix_lens_cpu[:] = [0, 0]
+        return SimpleNamespace(shape=kwargs["size"])
+
+    monkeypatch.setattr(model_runner.torch, "empty", allocate, raising=False)
+    first = target.forward(forward_batch=batch)
+    second = target.forward(batch)
+    if prepared:
+        assert predictor_batch_from_result(
+            first, expected_batch_size=2
+        ).request_info() == [
+            [1, 100],
+            [8, 0],
+        ]
+        assert predictor_batch_from_result(
+            second, expected_batch_size=2
+        ).request_info() == [
+            [2, 0],
+            [2, 0],
+        ]
+    else:
+        assert not hasattr(first.logits_output, SNAPSHOT_ATTRIBUTE)
+        assert not hasattr(second.logits_output, SNAPSHOT_ATTRIBUTE)
+        legacy = target.forward(SimpleNamespace(batch_size=2))
+        assert not hasattr(legacy.logits_output, SNAPSHOT_ATTRIBUTE)
+
+
 def test_native_pool_budget_inverts_exact_aligned_capacity(model_runner):
     pool = LinearPool()
     budget = model_runner._native_pool_budget(pool, 16, 4, require_exact=True)

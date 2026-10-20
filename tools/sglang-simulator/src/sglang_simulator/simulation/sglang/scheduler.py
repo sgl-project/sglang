@@ -15,6 +15,9 @@ from sglang_simulator.hook import (
 )
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.sglang.prepared_batch import (
+    predictor_batch_from_result,
+)
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -60,64 +63,6 @@ def _request_prefix_len(req):
     if value is None:
         value = len(req.prefix_indices)
     return _host_int(value)
-
-
-def build_predictor_batch(batch) -> SimulationScheduleBatch:
-    """Copy prepared SGLang forward metadata into the predictor contract."""
-    mode = getattr(getattr(batch, "forward_mode", None), "name", None)
-    batch_size = len(batch.reqs)
-
-    if mode in {"EXTEND", "MIXED"}:
-        extend_lens = getattr(batch, "extend_lens", None)
-        prefix_lens = getattr(batch, "prefix_lens", None)
-        if (
-            extend_lens is None
-            or prefix_lens is None
-            or len(extend_lens) != batch_size
-            or len(prefix_lens) != batch_size
-        ):
-            raise PredictorError(
-                "invalid_batch",
-                "prepared extend and prefix lengths must match batch size",
-                forward_mode=mode,
-                batch_size=batch_size,
-            )
-        reqs = [
-            ScheduleRequest(
-                extend_length=_host_int(extend),
-                past_kv_length=_host_int(prefix),
-            )
-            for extend, prefix in zip(extend_lens, prefix_lens)
-        ]
-    elif mode == "DECODE":
-        seq_lens = getattr(batch, "seq_lens_cpu", None)
-        if seq_lens is None or len(seq_lens) != batch_size:
-            raise PredictorError(
-                "invalid_batch",
-                "prepared decode lengths must match batch size",
-                forward_mode=mode,
-                batch_size=batch_size,
-            )
-        reqs = [
-            ScheduleRequest(
-                extend_length=1,
-                # prepare_for_decode increments seq_lens_cpu for the token
-                # entering this forward. InferCast history is the KV length
-                # before that token.
-                past_kv_length=_host_int(seq_len) - 1,
-            )
-            for seq_len in seq_lens
-        ]
-    elif mode == "IDLE":
-        reqs = []
-    else:
-        raise PredictorError(
-            "unsupported_forward_mode",
-            f"unsupported SGLang forward mode {mode!r}",
-            forward_mode=mode,
-        )
-
-    return SimulationScheduleBatch(reqs=reqs, forward_mode=mode)
 
 
 def effective_l2_load_delay(
@@ -511,7 +456,9 @@ class C_SchedulerHook(BaseHook):
                     False,
                 )
                 if prepared_batch:
-                    simulation_batch = build_predictor_batch(batch)
+                    simulation_batch = predictor_batch_from_result(
+                        ret, expected_batch_size=len(batch.reqs)
+                    )
                 else:
                     simulation_batch = SimulationScheduleBatch(reqs=[])
                     if batch.forward_mode.is_extend():

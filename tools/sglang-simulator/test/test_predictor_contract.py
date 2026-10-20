@@ -7,10 +7,8 @@ from types import SimpleNamespace
 import pytest
 from sglang_simulator.simulation.manager.config import ConfigManager
 from sglang_simulator.simulation.manager.env import Envs
-from sglang_simulator.simulation.sglang.scheduler import (
-    _request_prefix_len,
-    build_predictor_batch,
-)
+from sglang_simulator.simulation.sglang.prepared_batch import capture_prepared_batch
+from sglang_simulator.simulation.sglang.scheduler import _request_prefix_len
 from sglang_simulator.simulation.types import SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
 from sglang_simulator.spec.model import ModelInfo
@@ -162,7 +160,7 @@ def test_config_manager_rejects_unknown_infercast_configuration(field, monkeypat
 def _batch(mode, **fields):
     return SimpleNamespace(
         forward_mode=SimpleNamespace(name=mode),
-        reqs=[SimpleNamespace(), SimpleNamespace()],
+        batch_size=2,
         **fields,
     )
 
@@ -170,15 +168,22 @@ def _batch(mode, **fields):
 def test_prepared_extend_metadata_is_authoritative():
     batch = _batch(
         "MIXED",
-        extend_lens=[1, 8],
-        prefix_lens=[100, 0],
+        seq_lens_cpu=[101, 8],
+        extend_seq_lens_cpu=[1, 8],
+        extend_prefix_lens_cpu=[100, 0],
     )
-    assert build_predictor_batch(batch).request_info() == [[1, 100], [8, 0]]
+    assert capture_prepared_batch(batch).predictor_batch().request_info() == [
+        [1, 100],
+        [8, 0],
+    ]
 
 
 def test_prepared_decode_metadata_is_authoritative():
     batch = _batch("DECODE", seq_lens_cpu=[100, 201])
-    assert build_predictor_batch(batch).request_info() == [[1, 99], [1, 200]]
+    assert capture_prepared_batch(batch).predictor_batch().request_info() == [
+        [1, 99],
+        [1, 200],
+    ]
 
 
 def test_request_prefix_length_supports_current_and_legacy_cores():
@@ -189,21 +194,19 @@ def test_request_prefix_length_supports_current_and_legacy_cores():
 @pytest.mark.parametrize("value", [True, 1.5, SimpleNamespace(item=lambda: 1.5)])
 def test_prepared_lengths_are_not_coerced_to_integers(value):
     with pytest.raises(PredictorError) as exc_info:
-        build_predictor_batch(
-            _batch("EXTEND", extend_lens=[value, 8], prefix_lens=[0, 0])
+        capture_prepared_batch(
+            _batch(
+                "EXTEND",
+                seq_lens_cpu=[8, 8],
+                extend_seq_lens_cpu=[value, 8],
+                extend_prefix_lens_cpu=[0, 0],
+            )
         )
     assert exc_info.value.code == "invalid_batch"
 
 
-def test_idle_batch_makes_no_predictor_work():
-    batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(name="IDLE"),
-        reqs=[],
-    )
-    assert build_predictor_batch(batch).is_empty()
-
-
-def test_unsupported_forward_mode_fails_explicitly():
+@pytest.mark.parametrize("mode", ["IDLE", "TARGET_VERIFY", "DRAFT_EXTEND", None])
+def test_unsupported_forward_mode_fails_explicitly(mode):
     with pytest.raises(PredictorError) as exc_info:
-        build_predictor_batch(_batch("TARGET_VERIFY"))
+        capture_prepared_batch(_batch(mode))
     assert exc_info.value.code == "unsupported_forward_mode"

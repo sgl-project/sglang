@@ -154,7 +154,18 @@ class C_ModelRunnerHook(BaseHook):
                 ConfigManager.set_model_info(resolve_model_info(self.model_config))
 
         def wrapped_forward(self, *args, **kwargs):
-            batch = args[0]
+            batch = args[0] if args else kwargs["forward_batch"]
+            from sglang_simulator.simulation.sglang.prepared_batch import (
+                SNAPSHOT_ATTRIBUTE,
+                capture_prepared_batch,
+            )
+            from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
+
+            snapshot = None
+            if getattr(
+                C_SchedulerHook.INFERENCE_PREDICTOR, "requires_prepared_batch", False
+            ):
+                snapshot = capture_prepared_batch(batch)
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
             from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 
@@ -164,6 +175,8 @@ class C_ModelRunnerHook(BaseHook):
                     device=self.device,
                 )
             )
+            if snapshot is not None:
+                setattr(output, SNAPSHOT_ATTRIBUTE, snapshot)
             return ModelRunnerOutput(
                 logits_output=output,
                 can_run_graph=False,

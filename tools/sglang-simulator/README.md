@@ -221,6 +221,12 @@ Supported predictors:
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.
 
+Predictors opting into `requires_prepared_batch` receive ordered EXTEND/MIXED
+prefix and query lengths, or DECODE past-KV lengths, captured from native
+`ForwardBatch` CPU mirrors at model-forward entry. The immutable snapshot travels
+with that forward's logits output, so later batch mutations cannot change the
+prediction input. Missing, inconsistent, or non-CPU mirrors fail explicitly.
+
 ## Workload formats
 
 The Autobench trace format uses timestamps in milliseconds:
