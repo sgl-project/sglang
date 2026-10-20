@@ -9,7 +9,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from cuda.bindings import driver as cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    cuda = None
 
 from sglang.srt.layers.moe.dwdp.layout import (
     DwdpExpertLayout,
@@ -46,9 +50,16 @@ def _copy_local_weights_to_handles(
     layer_weight_specs: LayerWeightSpecs,
     layout: DwdpExpertLayout,
     device_id: int,
+    backend=None,
 ) -> Tuple[Dict[Tuple[int, str], int], Dict[Tuple[int, str], int]]:
-    granularity = get_device_granularity(device_id)
-    prop = make_device_allocation_prop(device_id)
+    granularity = (
+        backend.granularity
+        if backend is not None
+        else get_device_granularity(device_id)
+    )
+    prop = (
+        backend.prop if backend is not None else make_device_allocation_prop(device_id)
+    )
     handles: Dict[Tuple[int, str], int] = {}
     sizes: Dict[Tuple[int, str], int] = {}
 
@@ -63,19 +74,26 @@ def _copy_local_weights_to_handles(
         phys_size = page_end - page_start
         data_offset = local_start_bytes - page_start
 
-        reservation = VmmReservation(phys_size, prop, device_id, alignment=granularity)
-        handle = int(reservation.map(0, phys_size, retain_handle=True))
+        if backend is not None:
+            handle = backend.copy_local(param, phys_size, data_offset)
+        else:
+            reservation = VmmReservation(
+                phys_size, prop, device_id, alignment=granularity
+            )
+            handle = int(reservation.map(0, phys_size, retain_handle=True))
 
-        nbytes = param.numel() * param.element_size()
-        check_drv(
-            cuda.cuMemcpyDtoD(reservation.base + data_offset, param.data_ptr(), nbytes),
-            "cuMemcpyDtoD",
-        )
-        torch.cuda.synchronize()
+            nbytes = param.numel() * param.element_size()
+            check_drv(
+                cuda.cuMemcpyDtoD(
+                    reservation.base + data_offset, param.data_ptr(), nbytes
+                ),
+                "cuMemcpyDtoD",
+            )
+            torch.cuda.synchronize()
 
-        reservation.close(release_handles=False)
+            reservation.close(release_handles=False)
 
-        param.untyped_storage().resize_(0)
+            param.untyped_storage().resize_(0)
 
         handles[(layer_idx, name)] = handle
         sizes[(layer_idx, name)] = phys_size
@@ -85,13 +103,15 @@ def _copy_local_weights_to_handles(
             f"phys_size={phys_size}, data_offset={data_offset}"
         )
 
-    torch.cuda.empty_cache()
+    if backend is None:
+        torch.cuda.empty_cache()
 
     return handles, sizes
 
 
 class DWDPTransport:
     def __init__(self):
+        self.backend = None
         self._handle_set: Optional[MnnvlHandleSet] = None
         self._peer_views: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self._imported_handles: List[int] = []
@@ -105,20 +125,41 @@ class DWDPTransport:
         group: dist.ProcessGroup,
         layout: DwdpExpertLayout,
         device_id: int,
+        backend=None,
     ) -> DWDPTransport:
         transport = cls()
+        transport.backend = backend
         sorted_keys = sorted(local_params.keys())
 
-        handles, sizes = _copy_local_weights_to_handles(
-            sorted_keys, local_params, layer_weight_specs, layout, device_id
-        )
+        if backend is None:
+            handles, sizes = _copy_local_weights_to_handles(
+                sorted_keys, local_params, layer_weight_specs, layout, device_id
+            )
+        else:
+            error = None
+            try:
+                backend.initialize(len(sorted_keys))
+                handles, sizes = _copy_local_weights_to_handles(
+                    sorted_keys,
+                    local_params,
+                    layer_weight_specs,
+                    layout,
+                    device_id,
+                    backend,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            errors = group.all_gather_object(error)
+            if any(errors):
+                raise RuntimeError(f"NPU DWDP weight migration/export failed: {errors}")
         transport._handle_set = MnnvlHandleSet(handles=handles, sizes=sizes)
 
         transport._import_peer_views(
             sorted_keys, layer_weight_specs, group, layout, device_id
         )
 
-        dist.barrier(group=group.device_group)
+        if backend is None:
+            dist.barrier(group=group.device_group)
         logger.debug(
             f"Transport complete: rank={layout.dwdp_rank}/{layout.dwdp_size}, "
             f"{len(handles)} handles, {len(transport._peer_views)} peer views"
@@ -134,21 +175,35 @@ class DWDPTransport:
         device_id: int,
     ) -> None:
         cpu_group = group.cpu_group
-        granularity = get_device_granularity(device_id)
-        prop = make_device_allocation_prop(device_id)
+        backend = self.backend
+        granularity = (
+            backend.granularity
+            if backend is not None
+            else get_device_granularity(device_id)
+        )
+        prop = (
+            backend.prop
+            if backend is not None
+            else make_device_allocation_prop(device_id)
+        )
 
         handle_list = [self._handle_set.get_handle(li, n) for li, n in sorted_keys]
-        fabric_handles, local_posix_fds, use_fabric = export_shareable_handles(
-            handle_list, cpu_group, layout.dwdp_rank
-        )
+        if backend is not None:
+            fabric_handles = [backend.exports[handle] for handle in handle_list]
+            local_posix_fds, use_fabric = [], True
+        else:
+            fabric_handles, local_posix_fds, use_fabric = export_shareable_handles(
+                handle_list, cpu_group, layout.dwdp_rank
+            )
         peer_fds: Dict[Tuple[int, int], int] = {}
 
-        key_counts = [None] * layout.dwdp_size
-        dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
-        if any(count != len(sorted_keys) for count in key_counts):
-            raise RuntimeError(
-                f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
-            )
+        if backend is None:
+            key_counts = [None] * layout.dwdp_size
+            dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
+            if any(count != len(sorted_keys) for count in key_counts):
+                raise RuntimeError(
+                    f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
+                )
 
         if use_fabric:
             all_fabric = [None] * layout.dwdp_size
@@ -177,10 +232,11 @@ class DWDPTransport:
 
                 fabric_handle = all_fabric[peer_rank][key_idx] if use_fabric else None
                 fd = None if use_fabric else peer_fds[(peer_rank, key_idx)]
-                peer_handle = import_peer_handle(
-                    fabric_handle, fd, use_fabric=use_fabric, peer_rank=peer_rank
-                )
-                self._imported_handles.append(int(peer_handle))
+                if backend is None:
+                    peer_handle = import_peer_handle(
+                        fabric_handle, fd, use_fabric=use_fabric, peer_rank=peer_rank
+                    )
+                    self._imported_handles.append(int(peer_handle))
 
                 peer_start, peer_end = layout.peer_ranges[peer_rank]
                 peer_start_bytes = peer_start * spec.expert_bytes
@@ -190,23 +246,36 @@ class DWDPTransport:
                 peer_phys_size = peer_page_end - peer_page_start
                 peer_data_offset = peer_start_bytes - peer_page_start
 
-                peer_reservation = VmmReservation(
-                    peer_phys_size,
-                    prop,
-                    device_id,
-                    alignment=granularity,
-                )
-                peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
-                self._peer_reservations.append(peer_reservation)
+                if backend is not None:
+                    peer_ptr = backend.import_shard(
+                        fabric_handle, peer_phys_size, peer_data_offset
+                    )
+                else:
+                    peer_reservation = VmmReservation(
+                        peer_phys_size,
+                        prop,
+                        device_id,
+                        alignment=granularity,
+                    )
+                    peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
+                    self._peer_reservations.append(peer_reservation)
+                    peer_ptr = peer_reservation.base + peer_data_offset
 
                 num_peer_experts = peer_end - peer_start
-                peer_tensor = tensor_from_pointer(
-                    peer_reservation.base + peer_data_offset,
-                    peer_end_bytes - peer_start_bytes,
-                    shape=(num_peer_experts,) + spec.full_shape[1:],
-                    dtype=spec.dtype,
-                    device_id=device_id,
+                kwargs = dict(
+                    shape=(num_peer_experts,) + spec.full_shape[1:], dtype=spec.dtype
                 )
+                if backend is not None:
+                    peer_tensor = backend.tensor(
+                        peer_ptr, peer_end_bytes - peer_start_bytes, **kwargs
+                    )
+                else:
+                    peer_tensor = tensor_from_pointer(
+                        peer_ptr,
+                        peer_end_bytes - peer_start_bytes,
+                        **kwargs,
+                        device_id=device_id,
+                    )
                 self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
 
         _close_fds(local_posix_fds)
@@ -222,6 +291,10 @@ class DWDPTransport:
         return self._peer_views
 
     def release(self) -> None:
+        if self.backend is not None:
+            self.backend.close()
+            self._peer_views.clear()
+            return
         for reservation in self._peer_reservations:
             reservation.close()
         self._peer_reservations.clear()

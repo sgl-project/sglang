@@ -271,15 +271,6 @@ def lookup_owner(expert_id: int, peer_ranges: PeerRanges) -> int:
     )
 
 
-def build_remote_slices(full_tensor, local_start, local_end, num_experts):
-    slices = []
-    if local_start > 0:
-        slices.append((full_tensor[:local_start], 0, local_start))
-    if local_end < num_experts:
-        slices.append((full_tensor[local_end:], local_end, num_experts))
-    return slices
-
-
 def build_layer_weight_specs(
     local_params: Dict[Tuple[int, str], torch.Tensor],
     num_routed_experts: int,
