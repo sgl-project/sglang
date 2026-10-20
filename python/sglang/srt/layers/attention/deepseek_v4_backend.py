@@ -1046,6 +1046,8 @@ class DSV4Metadata:
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
     q_pad_buffer: Optional[torch.Tensor] = None
+    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
+    q_pad_captured: bool = False
 
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
