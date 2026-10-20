@@ -431,7 +431,9 @@ def softmax_temp_triton(
     BLOCK_V = 2048
     CHUNK = 4 * BLOCK_V
     n_chunks = triton.cdiv(vocab, CHUNK)
-    stats = torch.empty((2, num_rows, n_chunks), dtype=torch.float32, device=logits.device)
+    stats = torch.empty(
+        (2, num_rows, n_chunks), dtype=torch.float32, device=logits.device
+    )
     grid = (num_rows, n_chunks)
     _softmax_temp_chunk_stats_kernel[grid](
         logits,
