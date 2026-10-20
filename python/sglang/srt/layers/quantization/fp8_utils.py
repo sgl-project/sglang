@@ -437,6 +437,7 @@ class Fp8GemmRunnerBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_B12X = "flashinfer_b12x"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -454,6 +455,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutedsl(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
+
+    def is_flashinfer_b12x(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_B12X
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -478,6 +482,9 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    # SM120/SM121 (GeForce / RTX PRO Blackwell) warp-level MMA MXFP8 kernel;
+    # these parts lack tcgen05/TMEM, so the cute-dsl backend cannot run there.
+    FLASHINFER_B12X = "flashinfer_b12x"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
     # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
@@ -494,6 +501,9 @@ class Mxfp8DenseGemmBackend(Enum):
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer_b12x(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_B12X
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
@@ -821,6 +831,26 @@ def prepare_xpu_block_scale_for_scaled_mm(
     return reordered
 
 
+def _flashinfer_b12x_requirements_met() -> bool:
+    """FlashInfer's ``is_backend_supported("b12x", cc)`` only gates on compute
+    capability; the CUDA 13+ and nvidia-cutlass-dsl >= 4.6.0 requirements are
+    enforced later, when the runner is first built, and would otherwise
+    surface as a ValueError at the first GEMM (after weights load)."""
+    try:
+        import importlib.metadata
+
+        import packaging.version
+
+        if get_cuda_version() < (13, 0):
+            return False
+        return packaging.version.Version(
+            importlib.metadata.version("nvidia-cutlass-dsl")
+        ) >= packaging.version.Version("4.6.0")
+    except Exception:
+        # missing package / metadata / packaging module: treat as unsupported
+        return False
+
+
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
     names a backend that owns an MXFP8 dense kernel."""
@@ -856,6 +886,20 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
+    if backend.is_flashinfer_b12x():
+        if not (
+            get_platform().is_blackwell
+            and is_flashinfer_available()
+            and _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
+            and _flashinfer_b12x_requirements_met()
+        ):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_b12x, "
+                "but that kernel requires an SM120/SM121 GPU (CUDA 13+, "
+                "nvidia-cutlass-dsl >= 4.6.0) and FlashInfer."
+            )
+        return Mxfp8DenseGemmBackend.FLASHINFER_B12X
+
     if backend.is_deep_gemm():
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -871,6 +915,14 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     if get_platform().is_blackwell and is_flashinfer_available():
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
             return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+        # SM120/SM121 lack tcgen05/TMEM, so the cutlass/cute-dsl MXFP8 kernels
+        # cannot run there; FlashInfer ships the warp-level b12x kernel for
+        # those parts instead.
+        if (
+            _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
+            and _flashinfer_b12x_requirements_met()
+        ):
+            return Mxfp8DenseGemmBackend.FLASHINFER_B12X
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -898,9 +950,13 @@ def resolve_block_fp8_mxfp8_backend() -> Mxfp8DenseGemmBackend:
         if backend.is_aiter():
             return Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER
         return Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE
-    # Explicit CUTLASS / CuTe-DSL only: they leave the weight untouched and store
+    # Explicit CUTLASS / CuTe-DSL / b12x only: they leave the weight untouched and store
     # the swizzled scale separately, so the block layout stays readable by Triton.
-    if not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass()):
+    if not (
+        backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_b12x()
+    ):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
     if not (_is_cuda and get_platform().is_blackwell and is_flashinfer_available()):
         return Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -929,6 +985,10 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     if backend.is_flashinfer_cutedsl():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
+        )
+    if backend.is_flashinfer_b12x():
+        return partial(
+            flashinfer_mxfp8_blockscaled_linear, backend="b12x", pin_tactic=True
         )
     if backend.is_gfx95_dot_scaled():
         from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
@@ -979,6 +1039,41 @@ def block_fp8_scale_to_mxfp8_e8m0(
     return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
 
 
+def mxfp8_sf_swizzle_128x4(sf: torch.Tensor) -> torch.Tensor:
+    """Scatter a row-major (N, K // 32) uint8 scale-factor grid into the 1D
+    128x4-swizzled layout FlashInfer's ``mm_mxfp8`` backends (b12x, cutlass)
+    expect for the B operand, mirroring FlashInfer's
+    ``compute_sf_index_swizzled_128x4_gpu``::
+
+        offset = (c % 4) + (c // 4) * 512 + (r % 32) * 16
+               + ((r % 128) // 32) * 4 + (r // 128) * (128 * padded_cols)
+
+    The output length is ``pad_up(N, 128) * pad_up(K // 32, 4)``. ``sf`` must
+    already be the MXFP8 per-row grid (one scale row per matrix row, i.e. the
+    output of ``block_fp8_scale_to_mxfp8_e8m0``); a (N/32, K/32) block grid
+    must be replicated 32x along N first.
+    """
+    rows, cols = sf.shape
+    padded_cols = (cols + 3) // 4 * 4
+    padded_rows = (rows + 127) // 128 * 128
+    out = torch.zeros(padded_rows * padded_cols, dtype=torch.uint8, device=sf.device)
+    r = torch.arange(rows, device=sf.device)
+    c = torch.arange(padded_cols, device=sf.device)
+    rr, cc = torch.meshgrid(r, c, indexing="ij")
+    offset = (
+        (cc % 4)
+        + (cc // 4) * 512
+        + (rr % 32) * 16
+        + ((rr % 128) // 32) * 4
+        + (rr // 128) * (128 * padded_cols)
+    )
+    vals = sf.reshape(rows, cols)
+    if cols < padded_cols:
+        vals = torch.nn.functional.pad(vals, (0, padded_cols - cols))
+    out[offset.reshape(-1)] = vals.reshape(-1).to(torch.uint8)
+    return out
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():
@@ -989,6 +1084,8 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+    elif backend.is_flashinfer_b12x():
+        return partial(flashinfer_mxfp8_blockscaled_linear, backend="b12x")
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
@@ -1136,6 +1233,13 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
+
+    elif backend.is_flashinfer_b12x():
+        raise ValueError(
+            "--fp8-gemm-backend=flashinfer_b12x serves the MXFP8 dense recipe "
+            "([32,32] ue8m0 blocks) only; this layer's block shape needs "
+            "cutlass, triton or deep_gemm."
+        )
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
@@ -1796,6 +1900,8 @@ def flashinfer_mxfp8_blockscaled_linear(
         raise ValueError(f"Input K={k} does not match weight K={k_w}.")
     if k % 32 != 0:
         raise ValueError(f"K={k} must be divisible by 32 for MXFP8.")
+    if backend == "b12x" and k % 128 != 0:
+        raise ValueError(f"The b12x MXFP8 backend requires K % 128 == 0, got K={k}.")
     if weight.dtype != torch.float8_e4m3fn:
         raise TypeError("MXFP8 weight must be FP8 E4M3.")
 

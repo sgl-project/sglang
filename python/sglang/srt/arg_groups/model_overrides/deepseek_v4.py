@@ -15,6 +15,24 @@ from sglang.srt.utils import is_flashinfer_available
 logger = logging.getLogger(__name__)
 
 
+def _flashinfer_b12x_usable() -> bool:
+    """Whether this FlashInfer build can actually run the b12x (SM120/SM121)
+    MXFP8 kernel: the backend is registered and its CUDA 13+ /
+    nvidia-cutlass-dsl >= 4.6.0 requirements hold."""
+    try:
+        from flashinfer import mm_mxfp8
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            _flashinfer_b12x_requirements_met,
+        )
+
+        return mm_mxfp8.is_backend_supported("b12x") and (
+            _flashinfer_b12x_requirements_met()
+        )
+    except Exception:
+        return False
+
+
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     """Attention, page and MoE defaults; the rest lives in deepseek_v4_hook."""
@@ -23,22 +41,34 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     model_arch = hf_config.architectures[0]
     overrides: Dict[str, Any] = {"attention_backend": "dsv4"}
 
-    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103;
-    # explicit backend choices, including Triton, take precedence.
+    # MXFP8 serves this checkpoint's 32-wide ue8m0 blocks on SM100/SM103
+    # (flashinfer_cutedsl) and on SM120/SM121 (flashinfer_b12x, the warp-level
+    # MMA kernel those parts need — they lack tcgen05/TMEM); explicit backend
+    # choices, including Triton, take precedence.
     quant = getattr(hf_config, "quantization_config", None) or {}
     if (
         getattr(hf_config, "model_type", None) == "deepseek_v41"
         and cfg.device == "cuda"
         and not get_platform().is_hip
-        and get_platform().is_sm100
         and cfg.fp8_gemm_runner_backend == "auto"
         and quant.get("quant_method") == "fp8"
         and quant.get("weight_block_size") == [32, 32]
         and quant.get("scale_fmt") == "ue8m0"
         and is_flashinfer_available()
     ):
-        overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
-        logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
+        if get_platform().is_sm100:
+            overrides["fp8_gemm_runner_backend"] = "flashinfer_cutedsl"
+            logger.info("Use flashinfer_cutedsl for DeepSeek-V4.1 MXFP8 dense GEMMs.")
+        elif get_platform().is_sm120:
+            if _flashinfer_b12x_usable():
+                overrides["fp8_gemm_runner_backend"] = "flashinfer_b12x"
+                logger.info("Use flashinfer_b12x for DeepSeek-V4.1 MXFP8 dense GEMMs.")
+            else:
+                logger.warning(
+                    "DeepSeek-V4.1 dense GEMMs stay on the Triton fallback: the "
+                    "FlashInfer b12x kernel is unavailable (needs FlashInfer with "
+                    "the b12x backend, CUDA 13+, nvidia-cutlass-dsl >= 4.6.0)."
+                )
 
     # Left unset, the pool configurator sizes the SWA pool from the request cap.
     if (

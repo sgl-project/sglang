@@ -68,6 +68,7 @@ def _serves_block_fp8_as_mxfp8_on_flashinfer(model_runner: ModelRunner) -> bool:
             and (
                 method.mxfp8_dense_backend.is_flashinfer_cutedsl()
                 or method.mxfp8_dense_backend.is_flashinfer_cutlass()
+                or method.mxfp8_dense_backend.is_flashinfer_b12x()
             )
         ):
             return True
