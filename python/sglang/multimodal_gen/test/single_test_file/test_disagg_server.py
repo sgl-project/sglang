@@ -53,7 +53,7 @@ _STARTUP_TIMEOUT_S = float(os.environ.get("SGLANG_DISAGG_STARTUP_TIMEOUT", "600"
 # ---------------------------------------------------------------------------
 
 
-def _wait_for_log(path: Path, message: str, timeout: float) -> bool:
+def _wait_for_log(path: Path, message: str, timeout: float, process=None) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if path.exists():
@@ -62,6 +62,8 @@ def _wait_for_log(path: Path, message: str, timeout: float) -> bool:
                     return True
             except OSError:
                 pass
+        if process is not None and process.poll() is not None:
+            return False
         time.sleep(2)
     return False
 
@@ -183,10 +185,10 @@ class DisaggCluster:
                 "info",
                 *self.extra_role_args.get(role, []),
             ]
-            self._start_proc(cmd, log)
+            proc = self._start_proc(cmd, log)
 
             ready_msg = f"Role {role.upper()} ready"
-            if not _wait_for_log(log, ready_msg, self.startup_timeout):
+            if not _wait_for_log(log, ready_msg, self.startup_timeout, proc):
                 raise RuntimeError(
                     f"{role} failed to start for {self.name}. Log tail:\n"
                     f"{_tail_log(log)}"
