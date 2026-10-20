@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::chat::ChatRequest;
+use super::template::render_chat;
 use super::{AppState, contains_media};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -157,12 +158,12 @@ fn render_chat_prompt(
     fields
         .entry("model")
         .or_insert_with(|| Value::from("default"));
+    let body = Value::Object(fields);
     let ChatRequest {
         request,
         chat_template_kwargs,
         ..
-    } = serde_json::from_value(Value::Object(fields))
-        .map_err(|error| (INVALID_BODY, error.to_string()))?;
+    } = serde_json::from_value(body.clone()).map_err(|error| (INVALID_BODY, error.to_string()))?;
     if request.messages.is_empty() {
         return Err((BAD_REQUEST, "messages cannot be empty".into()));
     }
@@ -175,8 +176,7 @@ fn render_chat_prompt(
     let Some(formatter) = &state.chat_formatter else {
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
-    formatter
-        .render(&request, chat_template_kwargs.as_ref())
+    render_chat(formatter, &body, &request, chat_template_kwargs.as_ref())
         .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
@@ -221,7 +221,6 @@ mod tests {
     use axum::http::StatusCode;
     use serde_json::json;
 
-    use super::super::template_loader::load_chat_formatter;
     use super::super::test_utils::{body_json, post_json};
     use super::*;
     use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
@@ -278,7 +277,7 @@ mod tests {
             ),
             server_args,
             chat_formatter: Some(
-                load_chat_formatter(
+                sglang_processor::load_chat_formatter(
                     None,           /* config_file */
                     None,           /* model_path */
                     None,           /* model_type */
