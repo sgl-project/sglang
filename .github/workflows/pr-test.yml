@@ -436,29 +436,6 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
-  # Separate only because `needs` cannot vary per matrix row: this stage takes
-  # the aarch64 build, and neither table should wait on the other's.
-  base-c-test-aarch64:
-    name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
-    if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
-    uses: ./.github/workflows/_pr-test-stage.yml
-    with:
-      self_name: base-c-test-${{ matrix.runner_config }}
-      runner_config: ${{ matrix.runner_config }}
-      check_changes: ${{ toJson(needs.check-changes.outputs) }}
-      caller_inputs: ${{ toJson(inputs) }}
-      partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: ${{ matrix.run_timeout }}
-      timeout_per_file: ${{ matrix.timeout_per_file }}
-      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
-    secrets: inherit
-
   # List every build and test job: `skipped` passes here, so an omission turns that
   # job's failure into a green run with no tests.
   pr-test-finish:
@@ -485,7 +462,6 @@ jobs:
         base-a-test-cpu,
         base-b-test,
         base-c-test,
-        base-c-test-aarch64,
       ]
     if: always()
     runs-on: ubuntu-latest

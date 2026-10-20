@@ -17,7 +17,12 @@ from sglang.test.server_fixtures.rust_mm_transport_fixture import (
     RustMmTransportServerBase,
 )
 
-register_cuda_ci(est_time=180, stage="nightly", runner_config="4-gpu-gb300")
+register_cuda_ci(
+    est_time=180,
+    stage="nightly",
+    runner_config="4-gpu-gb300",
+    disabled="4-gpu-gb300 suite removed; pending 2-gpu-gb300 runners",
+)
 
 
 class TestRustMmTransport2NodeCudaVmm(RustMmTransportServerBase):

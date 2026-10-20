@@ -92,7 +92,6 @@ PER_COMMIT_SUITES = {
         "base-b-test-diffusion-unit-1-gpu-h100",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
-        "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
@@ -152,7 +151,6 @@ NIGHTLY_SUITES = {
         "nightly-test-2-gpu-large",
         "nightly-test-4-gpu-h100",
         "nightly-test-4-gpu-b200",
-        "nightly-test-4-gpu-gb300",
         "nightly-test-8-gpu-h200",
         "nightly-test-8-gpu-b200",
     ],
@@ -270,7 +268,7 @@ def validate_all_suites(all_tests: List[CIRegistry]):
     valid_by_backend = _valid_suites_by_backend()
     errors = []
     for t in all_tests:
-        if t.backend not in _SUITE_CHECKED_BACKENDS:
+        if t.backend not in _SUITE_CHECKED_BACKENDS or t.disabled is not None:
             continue
         valid = valid_by_backend.get(t.backend, set())
         if t.effective_suite not in valid:
