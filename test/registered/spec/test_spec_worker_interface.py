@@ -72,9 +72,7 @@ class TestSpecWorkerForwardInterface(unittest.TestCase):
         )
 
     def test_the_walk_finds_workers(self):
-        self.assertTrue(
-            _workers_defining_the_call(), "no spec worker found to check"
-        )
+        self.assertTrue(_workers_defining_the_call(), "no spec worker found to check")
 
     def test_workers_accept_the_scheduler_keywords(self):
         for name, worker in sorted(_workers_defining_the_call().items()):
