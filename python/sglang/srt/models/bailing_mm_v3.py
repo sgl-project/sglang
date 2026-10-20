@@ -68,6 +68,10 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
             hf_config.text_config, quant_config
         )
 
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        return BailingMoeV3ForCausalLM.num_fusable_shared_experts(hf_config.text_config)
+
     def __init__(
         self,
         config: PretrainedConfig,
