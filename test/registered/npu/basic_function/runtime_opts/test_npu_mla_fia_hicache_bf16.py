@@ -73,8 +73,9 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
             "--tp-size",
             2,
             "--enable-hierarchical-cache",
+            # 8 GB per rank: enough for GSM8K and keeps pinned host memory small.
             "--hicache-size",
-            30,
+            8,
         ]
 
     def test_a_gsm8k_fia(self):
