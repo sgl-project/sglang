@@ -13,19 +13,17 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
     """Test case for verifying the functionality of the metrics-related parameter group.
 
     [Description]
-        The metrics-related parameter group includes: --enable-metrics; --collect-tokens-histogram;
-        --bucket-inter-token-latency; --bucket-e2e-request-latency; --bucket-time-to-first-token;
-        --prompt-tokens-buckets; --generation-tokens-buckets
+        The metrics-related parameter group includes: --enable-metrics; --bucket-time-to-first-token;
+        --bucket-inter-token-latency; --bucket-e2e-request-latency; --generation-tokens-buckets
+        --prompt-tokens-buckets;
 
         Verifies the cooperative effect of the parameter group and the independent function of each parameter, as follows:
         1.  --enable-metrics: Core switch parameter; when configured, the service enables monitoring function and
             supports obtaining various monitoring metrics through the metrics interface;
-        2.  --collect-tokens-histogram: When configured, it enables the statistical function of token count-related
-            metrics, including the statistics of prompt tokens and generation tokens;
-        3.  --bucket-time-to-first-token, --bucket-inter-token-latency, --bucket-e2e-request-latency:
+        2.  --bucket-time-to-first-token, --bucket-inter-token-latency, --bucket-e2e-request-latency:
             Used to customize the statistical bucket boundaries of the corresponding latency-related metrics, which
             correspond to time-to-first-token latency, inter-token latency, and end-to-end request latency respectively;
-        4.  --prompt-tokens-buckets, --generation-tokens-buckets:
+        3.  --prompt-tokens-buckets, --generation-tokens-buckets:
             Used to customize the bucket boundaries of token count statistical metrics, which correspond to the
             statistical intervals of prompt tokens and generation tokens respectively.
 
@@ -35,7 +33,7 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
 
     [Test Category] Parameter
     [Test Target] --enable-metrics; --bucket-time-to-first-token; --bucket-inter-token-latency; --bucket-e2e-request-latency;
-    --collect-tokens-histogram; --prompt-tokens-buckets; --generation-tokens-buckets;
+    --prompt-tokens-buckets; --generation-tokens-buckets;
     """
 
     @staticmethod
@@ -128,7 +126,7 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.other_args.extend(["--enable-metrics", "--collect-tokens-histogram"])
+        cls.other_args.extend(["--enable-metrics"])
         cls.set_default_bucket()
         cls.launch_server()
 
@@ -313,7 +311,6 @@ class TestNPUMetricsTSEBucketBoundary(TestNPULoggingBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.other_args.extend(["--enable-metrics"])
-        cls.other_args.extend(["--collect-tokens-histogram"])
         cls.set_tse_bucket()
         cls.other_args.extend(["--prompt-tokens-buckets", "tse", *cls.my_tse_set])
         cls.other_args.extend(["--generation-tokens-buckets", "tse", *cls.my_tse_set])
