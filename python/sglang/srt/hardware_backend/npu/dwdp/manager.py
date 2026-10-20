@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Ascend DWDP with resident local shards and double-buffered remote weights."""
 
 from __future__ import annotations

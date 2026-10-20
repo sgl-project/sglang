@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """Ascend virtual weight views with resident local pages and remote-only slots."""
 
 from __future__ import annotations
