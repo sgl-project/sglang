@@ -1648,6 +1648,10 @@ class DeepseekV4AttnBackend(
             page_table=page_table,
             compressed_seq_lens=c_seq_lens,
             use_topk_v2=False,
+            # The low-ratio indexer always scores with DeepGEMM's FP4 paged MQA
+            # logits, so it needs the schedule even where the C4 indexer takes
+            # the Torch fallback (the SM120 default), as on the decode path.
+            force_deep_gemm_metadata=get_platform().is_sm120,
             use_prefill_cuda_graph=True,
             compress_ratio=compress_ratio,
             row_chunk=row_chunk if row_chunk < c_seq_lens.shape[0] else 0,
