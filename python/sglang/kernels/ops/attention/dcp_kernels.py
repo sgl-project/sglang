@@ -125,6 +125,40 @@ def create_mla_kv_page_table_for_dcp(
     )
 
 
+def fill_mla_kv_page_table_for_dcp(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    local_seq_lens: torch.Tensor,
+    block_kv_indices: torch.Tensor,
+    *,
+    physical_page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    pages_per_block: int,
+    v2p: Optional[torch.Tensor] = None,
+) -> None:
+    """Fill a caller-owned MLA DCP page table without allocating or clearing it."""
+    create_mla_kv_page_table_for_dcp[
+        (
+            block_kv_indices.shape[0],
+            triton.cdiv(block_kv_indices.shape[1], pages_per_block),
+        )
+    ](
+        req_to_token,
+        req_pool_indices,
+        local_seq_lens,
+        block_kv_indices,
+        v2p,
+        req_to_token.stride(0),
+        block_kv_indices.stride(0),
+        PHYSICAL_PAGE_SIZE=physical_page_size,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        PAGES_PER_BLOCK=pages_per_block,
+        HAS_V2P=v2p is not None,
+    )
+
+
 @triton.jit
 def compact_dcp_verify_token_table_to_ragged(
     token_table_ptr,  # in: [bs * q_len, table_stride] from create_mla_kv_page_table_for_dcp
