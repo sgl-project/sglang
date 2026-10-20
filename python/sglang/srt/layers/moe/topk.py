@@ -2521,12 +2521,27 @@ def _post_process_topk_ids(
 
             lplb_solver = get_global_lplb_solver(layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
+                lp_routed_ids = (
+                    topk_ids[:, :-num_shared_topk_slots]
+                    if router_wrote_shared_cols
+                    else topk_ids
+                )
+                log2phy_prob = lplb_solver.solve(lp_routed_ids)
 
         if log2phy_prob is not None:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
-            )
+            if router_wrote_shared_cols:
+                shared_cols = topk_ids[:, -num_shared_topk_slots:]
+                routed_cols = topk_ids_logical_to_physical(
+                    topk_ids[:, :-num_shared_topk_slots],
+                    expert_location_dispatch_info,
+                    log2phy_prob,
+                )
+                topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+                recorder_topk_ids = topk_ids[:, :-num_shared_topk_slots]
+            else:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, expert_location_dispatch_info, log2phy_prob
+                )
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         elif router_wrote_shared_cols:
             # Shared IDs are outside EPLB's routed-expert table for both global

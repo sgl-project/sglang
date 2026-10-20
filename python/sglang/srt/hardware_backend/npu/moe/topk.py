@@ -132,7 +132,7 @@ def _finalize_topk_npu(
     expert_location_dispatch_info,
     layer_id,
 ):
-    num_shared = topk_config.num_fused_shared_experts
+    num_shared = topk_config.num_shared_topk_slots
     routed_ids = topk_ids[:, :-num_shared] if num_shared else topk_ids
     capture_routed_experts_if_allowed(topk_config, layer_id, routed_ids)
     routed_ids = topk_ids_logical_to_physical(routed_ids, expert_location_dispatch_info)

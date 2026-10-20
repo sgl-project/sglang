@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import DpPaddingMode
@@ -81,6 +82,8 @@ def _attention_backend():
 
 
 class _RoutingModel:
+    shared_experts_config = SharedExpertsConfig()
+
     def __init__(self, *, proxy_output):
         self.topk = TopK(
             2,

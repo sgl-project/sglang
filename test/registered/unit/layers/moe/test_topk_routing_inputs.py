@@ -547,6 +547,42 @@ class TestTopKRoutingInputs(CustomTestCase):
                 deepseek_v2.DeepseekV2MoE._can_dual_stream_graph(moe, self.hidden)
             )
 
+    def test_lp_keeps_global_shared_columns_outside_routed_domain(self):
+        router = self._router(num_fused_shared_experts=1)
+        ids = torch.tensor([[0, 4], [1, 4], [2, 4], [3, 4]], dtype=torch.int32)
+        weights = torch.tensor([[0.8, 0.2]]).repeat(4, 1)
+        solved = []
+
+        def solve(routed_ids):
+            self.assertEqual(routed_ids.tolist(), [[0], [1], [2], [3]])
+            solved.append(routed_ids.clone())
+            return torch.ones(4, 1)
+
+        def dispatch(routed_ids, info, probability=None):
+            self.assertTrue(bool(((routed_ids >= 0) & (routed_ids < 4)).all()))
+            return info.partial_logical_to_rank_dispatch_physical_map[routed_ids]
+
+        get_resources().lplb_solvers[0] = SimpleNamespace(solve=solve)
+        self.addCleanup(get_resources().lplb_solvers.pop, 0)
+        with (
+            get_exec().moe.override(ep_dispatch_algorithm="lp"),
+            patch.object(topk_module, "_is_cuda", True),
+            patch.object(topk_module, "topk_ids_logical_to_physical", dispatch),
+        ):
+            _, info = router.routing_inputs()
+            output_ids, output_weights, _ = topk_module._post_process_topk_ids(
+                ids,
+                weights,
+                topk_config=router.topk_config,
+                router_logits=self.logits,
+                layer_id=0,
+                num_token_non_padded=torch.tensor(2),
+                expert_location_dispatch_info=info,
+            )
+        self.assertEqual(len(solved), 1)
+        self.assertEqual(output_ids.tolist(), [[2, 4], [0, 4], [-1, -1], [-1, -1]])
+        torch.testing.assert_close(output_weights[:2], weights[:2])
+
     def test_empty_target_participates_in_lp_without_caller_layer_id(self):
         class Solver:
             def __init__(self):
