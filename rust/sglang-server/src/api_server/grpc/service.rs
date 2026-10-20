@@ -2,6 +2,7 @@
 //! `api.v1` messages and the shared core.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::Stream;
@@ -10,7 +11,7 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
-use crate::api_server::core::{CoreHandle, HealthStatus};
+use crate::api_server::core::{CoreHandle, HealthStatus, HiCacheManager};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::fill_preferred_sampling;
@@ -40,10 +41,15 @@ struct AdapterConfig {
 pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
+    hicache_manager: Arc<HiCacheManager>,
 }
 
 impl GrpcService {
-    pub(crate) fn new(core: CoreHandle, server_args: &ServerArgs) -> Self {
+    pub(crate) fn new(
+        core: CoreHandle,
+        server_args: &ServerArgs,
+        hicache_manager: Arc<HiCacheManager>,
+    ) -> Self {
         Self {
             core,
             config: AdapterConfig {
@@ -56,6 +62,7 @@ impl GrpcService {
                 has_tokenizer: !server_args.skip_tokenizer_init,
                 generation_policy: server_args.into(),
             },
+            hicache_manager,
         }
     }
 
@@ -67,6 +74,7 @@ impl GrpcService {
         response_timeout: Duration,
     ) -> Self {
         Self {
+            hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &ServerArgs::default())),
             core,
             config: AdapterConfig {
                 preferred_sampling_params,
@@ -165,7 +173,7 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStatus>, Status> {
-        Ok(Response::new(self.core.hicache_status().await))
+        Ok(Response::new(self.hicache_manager.status().await))
     }
 
     async fn attach_hi_cache_storage(
@@ -173,14 +181,11 @@ impl SglangService for GrpcService {
         request: Request<api::AttachHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
         let output = self
-            .core
-            .attach_hicache_storage(request.into_inner())
+            .hicache_manager
+            .attach(request.into_inner())
             .await
             .map_err(native_api::status)?;
-        Ok(Response::new(api::HiCacheStorageResponse {
-            success: output.success,
-            message: output.message,
-        }))
+        Ok(Response::new(output))
     }
 
     async fn detach_hi_cache_storage(
@@ -188,14 +193,11 @@ impl SglangService for GrpcService {
         _request: Request<api::DetachHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
         let output = self
-            .core
-            .detach_hicache_storage()
+            .hicache_manager
+            .detach()
             .await
             .map_err(native_api::status)?;
-        Ok(Response::new(api::HiCacheStorageResponse {
-            success: output.success,
-            message: output.message,
-        }))
+        Ok(Response::new(output))
     }
 
     async fn clear_hi_cache_storage(
@@ -203,14 +205,11 @@ impl SglangService for GrpcService {
         _request: Request<api::ClearHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
         let output = self
-            .core
-            .clear_hicache_storage()
+            .hicache_manager
+            .clear()
             .await
             .map_err(native_api::status)?;
-        Ok(Response::new(api::HiCacheStorageResponse {
-            success: output.success,
-            message: String::new(),
-        }))
+        Ok(Response::new(output))
     }
 
     async fn list_models(
@@ -323,7 +322,6 @@ mod tests {
                         },
                         ..Default::default()
                     }),
-                    hicache: Default::default(),
                 },
             );
             Self {
@@ -657,7 +655,6 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: CoreMetadata::default(),
-                hicache: Default::default(),
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));

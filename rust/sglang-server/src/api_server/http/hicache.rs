@@ -1,5 +1,4 @@
-//! HiCache storage management endpoints. The core submits attach, detach, and
-//! clear operations to the scheduler and tracks the configuration returned by GET.
+//! HiCache routes with dedicated state shared with the gRPC adapter.
 
 use std::sync::Arc;
 
@@ -10,27 +9,26 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-
 use sglang_api_types::api::v1 as api;
 
-use super::app::AppState;
+use crate::api_server::core::{CoreError, HiCacheManager};
 
-/// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<Arc<AppState>> {
+pub(super) fn routes(manager: Arc<HiCacheManager>) -> Router {
     Router::new()
         .route(
             "/hicache/storage-backend",
             get(status).put(attach).delete(detach),
         )
         .route("/hicache/storage-backend/clear", post(clear))
+        .with_state(manager)
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> Response {
-    axum::Json(state.core.hicache_status().await).into_response()
+async fn status(State(manager): State<Arc<HiCacheManager>>) -> Json<api::HiCacheStatus> {
+    Json(manager.status().await)
 }
 
 async fn attach(
-    State(state): State<Arc<AppState>>,
+    State(manager): State<Arc<HiCacheManager>>,
     body: Result<Json<api::AttachHiCacheStorageRequest>, JsonRejection>,
 ) -> Response {
     let body = match body {
@@ -44,60 +42,29 @@ async fn attach(
         )
             .into_response();
     }
-    match state.core.attach_hicache_storage(body).await {
-        Ok(output) => {
-            let (status, summary) = if output.success {
-                (StatusCode::OK, "HiCache storage backend attached.")
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Failed to attach HiCache storage backend.",
-                )
-            };
-            storage_response(status, summary, &output.message)
-        }
-        Err(error) => (error.http_status(), error.to_string()).into_response(),
-    }
+    storage_response(manager.attach(body).await)
 }
 
-async fn detach(State(state): State<Arc<AppState>>) -> Response {
-    match state.core.detach_hicache_storage().await {
-        Ok(output) => {
-            let (status, summary) = if output.success {
-                (StatusCode::OK, "HiCache storage backend detached.")
-            } else {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Failed to detach HiCache storage backend.",
-                )
-            };
-            storage_response(status, summary, &output.message)
-        }
-        Err(error) => (error.http_status(), error.to_string()).into_response(),
-    }
+async fn detach(State(manager): State<Arc<HiCacheManager>>) -> Response {
+    storage_response(manager.detach().await)
 }
 
-async fn clear(State(state): State<Arc<AppState>>) -> Response {
-    match state.core.clear_hicache_storage().await {
+async fn clear(State(manager): State<Arc<HiCacheManager>>) -> Response {
+    storage_response(manager.clear().await)
+}
+
+fn storage_response(result: Result<api::HiCacheStorageResponse, CoreError>) -> Response {
+    match result {
         Ok(output) => {
             let status = if output.success {
                 StatusCode::OK
             } else {
                 StatusCode::BAD_REQUEST
             };
-            (status, "Hierarchical cache storage backend cleared.\n").into_response()
+            (status, Json(output)).into_response()
         }
         Err(error) => (error.http_status(), error.to_string()).into_response(),
     }
-}
-
-fn storage_response(status: StatusCode, summary: &str, message: &str) -> Response {
-    let mut body = format!("{summary}\n");
-    if !message.is_empty() {
-        body.push_str(message);
-        body.push('\n');
-    }
-    (status, body).into_response()
 }
 
 #[cfg(test)]
@@ -132,16 +99,10 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: (&args).into(),
-                hicache: (&args).into(),
             },
         );
         (
-            routes().with_state(Arc::new(AppState {
-                core,
-                generation_policy: crate::message::request::GenerationPolicy::from(&args),
-                server_args: Arc::new(args),
-                chat_formatter: None,
-            })),
+            routes(Arc::new(HiCacheManager::new(core, &args))),
             intake_rx,
         )
     }
@@ -201,8 +162,15 @@ mod tests {
             .unwrap()
             .unwrap();
         let status = response.status();
+        if matches!(status, StatusCode::OK | StatusCode::BAD_REQUEST) {
+            assert_eq!(response.headers()["content-type"], "application/json");
+        }
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        (status, String::from_utf8(body.to_vec()).unwrap())
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        // Normalize JSON key order for comparisons, preserving plain-text errors.
+        let body =
+            serde_json::from_str::<Value>(&body).map_or(body.clone(), |value| value.to_string());
+        (status, body)
     }
 
     fn reply(value: Value) -> ResponseItem {
@@ -225,48 +193,45 @@ mod tests {
                 .await,
                 (
                     status,
-                    "Hierarchical cache storage backend cleared.\n".into()
+                    json!({"success": success, "message": ""}).to_string()
                 )
             );
         }
     }
 
-    /// Detach preserves backend details without adding a blank line for an empty message.
+    /// Detach returns the generated response, defaulting absent messages to empty.
     #[tokio::test]
     async fn detach_preserves_message_and_handles_empty_or_missing_message() {
-        for (payload, status, text) in [
-            (
-                json!({"success": true, "message": "Already detached."}),
-                StatusCode::OK,
-                "HiCache storage backend detached.\nAlready detached.\n",
-            ),
-            (
-                json!({"success": false, "message": "Reject detach: scheduler is not idle."}),
-                StatusCode::BAD_REQUEST,
-                "Failed to detach HiCache storage backend.\nReject detach: scheduler is not idle.\n",
-            ),
-            (
-                json!({"success": true, "message": ""}),
-                StatusCode::OK,
-                "HiCache storage backend detached.\n",
-            ),
-            (
-                json!({"success": false}),
-                StatusCode::BAD_REQUEST,
-                "Failed to detach HiCache storage backend.\n",
-            ),
+        for payload in [
+            json!({"success": true, "message": "Already detached."}),
+            json!({"success": false, "message": "scheduler is not idle"}),
+            json!({"success": true, "message": ""}),
+            json!({"success": false}),
         ] {
+            let (status, body) = exchange(
+                "DELETE",
+                "/hicache/storage-backend",
+                Value::Null,
+                "DetachHiCacheStorageReqInput",
+                json!([]),
+                reply(payload.clone()),
+            )
+            .await;
+            let success = payload["success"].as_bool().unwrap();
             assert_eq!(
-                exchange(
-                    "DELETE",
-                    "/hicache/storage-backend",
-                    Value::Null,
-                    "DetachHiCacheStorageReqInput",
-                    json!([]),
-                    reply(payload)
-                )
-                .await,
-                (status, text.into())
+                status,
+                if success {
+                    StatusCode::OK
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({
+                    "success": success,
+                    "message": payload.get("message").cloned().unwrap_or(json!("")),
+                })
             );
         }
     }
@@ -337,14 +302,7 @@ mod tests {
             "hicache_storage_prefetch_policy": "timeout",
             "hicache_write_policy": "write_through",
         });
-        for (success, status, summary) in [
-            (true, StatusCode::OK, "HiCache storage backend attached."),
-            (
-                false,
-                StatusCode::BAD_REQUEST,
-                "Failed to attach HiCache storage backend.",
-            ),
-        ] {
+        for (success, status) in [(true, StatusCode::OK), (false, StatusCode::BAD_REQUEST)] {
             assert_eq!(
                 exchange(
                     "PUT",
@@ -355,7 +313,10 @@ mod tests {
                     reply(json!({"success": success, "message": "backend detail"}))
                 )
                 .await,
-                (status, format!("{summary}\nbackend detail\n"))
+                (
+                    status,
+                    json!({"success": success, "message": "backend detail"}).to_string()
+                )
             );
         }
     }

@@ -741,7 +741,7 @@ pub struct HiCacheStatus {
     #[prost(string, optional, tag = "4")]
     pub hicache_write_policy: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// Structured gRPC result. HTTP preserves the Python endpoint's plain-text response.
+/// Result shared by the HTTP and gRPC management APIs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HiCacheStorageResponse {
     #[prost(bool, tag = "1")]

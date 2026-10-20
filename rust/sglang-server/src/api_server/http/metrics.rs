@@ -79,7 +79,6 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: Default::default(),
-                    hicache: Default::default(),
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(

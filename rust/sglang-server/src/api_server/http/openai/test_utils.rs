@@ -35,7 +35,6 @@ pub(super) fn core_handle() -> CoreHandle {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
-            hicache: server_args().as_ref().into(),
         },
     )
 }
@@ -133,7 +132,6 @@ pub(super) fn frontend_closed() -> CoreHandle {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
-            hicache: server_args().as_ref().into(),
         },
     )
 }
@@ -159,7 +157,6 @@ fn answering_app_state() -> Arc<super::AppState> {
             is_disaggregation: false,
             mm_limits: Default::default(),
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
-            hicache: server_args().as_ref().into(),
         },
     );
     let server_args = server_args();

@@ -570,7 +570,6 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: crate::api_server::core::CoreMetadata::default(),
-                    hicache: Default::default(),
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -611,7 +610,6 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: crate::api_server::core::CoreMetadata::default(),
-                    hicache: Default::default(),
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -649,7 +647,6 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: crate::api_server::core::CoreMetadata::default(),
-                hicache: Default::default(),
             },
         );
         let state = Arc::new(AppState {

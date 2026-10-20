@@ -35,7 +35,7 @@ message HiCacheStatus {
   ];
 }
 
-// Structured gRPC result. HTTP preserves the Python endpoint's plain-text response.
+// Result shared by the HTTP and gRPC management APIs.
 message HiCacheStorageResponse {
   bool success = 1;
   string message = 2;

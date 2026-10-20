@@ -1247,7 +1247,6 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     metadata: CoreMetadata::from(args.as_ref()),
-                    hicache: args.as_ref().into(),
                 },
             );
             let formatter =
