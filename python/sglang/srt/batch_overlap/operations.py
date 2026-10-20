@@ -54,8 +54,12 @@ def execute_overlapped_operations(
 
     stages_a = _convert_operations_to_stages(operations_a)
     stages_b = _convert_operations_to_stages(operations_b)
-    executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
-    executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
+    executor_a = _StageExecutor(
+        "a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a, micro_batch=True
+    )
+    executor_b = _StageExecutor(
+        "b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b, micro_batch=True
+    )
 
     for _ in range(delta_stage):
         executor_a.next()
@@ -111,6 +115,7 @@ class _StageExecutor:
         stages: List[Stage],
         inputs: dict,
         child_ctx: Optional[ForwardContext] = None,
+        micro_batch: bool = False,
     ):
         self._debug_name = debug_name
         self._stages = stages
@@ -128,6 +133,7 @@ class _StageExecutor:
         self._child_ctx = replace(
             child_ctx if child_ctx is not None else get_forward_context(),
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            is_micro_batch=micro_batch,
         )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len
