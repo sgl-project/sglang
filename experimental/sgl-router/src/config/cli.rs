@@ -955,7 +955,8 @@ impl AffinityArgs {
             || cache.cache_switch_margin_tokens.is_some()
             || cache.worker_queue_limit.is_some()
             || cache.saturation_queue_floor.is_some()
-            || cache.min_load_choices.is_some();
+            || cache.min_load_choices.is_some()
+            || self.route_by_uncached_tokens;
         // Value checks before the policy check: a value that is wrong under
         // every policy should say so, rather than pointing at --policy.
         ensure!(
@@ -2852,6 +2853,13 @@ mod tests {
 
         let err = cfg_of("--policy power_of_two --worker-queue-limit 4")
             .expect_err("the gate only governs cache-affinity selection")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
+        let err = cfg_of("--policy session_aware --route-by-uncached-tokens")
+            .expect_err("bucket matching on E only runs under cache_aware")
             .to_string();
         assert!(
             err.contains("cache candidate tuning flags require --policy cache_aware"),
