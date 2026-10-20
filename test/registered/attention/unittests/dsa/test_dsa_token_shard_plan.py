@@ -20,7 +20,12 @@ import itertools
 import types
 import unittest
 
-from sglang.srt.layers.attention.dsa.dsa_token_shard import _build_dsa_token_shard_plan
+import torch
+
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    _build_dsa_token_shard_plan,
+    dsa_token_shard_key_lens,
+)
 from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import plan_dsa_token_shard
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -99,6 +104,51 @@ class TestDsaTokenShardPlan(CustomTestCase):
             plan_dsa_token_shard([5, 9], [105], 4, 0)
         with self.assertRaises(AssertionError):
             plan_dsa_token_shard([5], [105], 4, 4)
+
+    def test_single_request_12119_tp16_key_lens(self):
+        # Paged SFA must be handed these key lengths, not the full seq_len.
+        # sparse_mode=3 right-aligns to the length it is given, so only the
+        # rank holding the tail may see 118615.
+        prefix, new, tp = 106496, 12119, 16
+        seq = prefix + new
+        plan0 = plan_dsa_token_shard([new], [seq], tp, 0)
+        plan14 = plan_dsa_token_shard([new], [seq], tp, 14)
+        plan15 = plan_dsa_token_shard([new], [seq], tp, 15)
+        self.assertEqual(plan0.rows, 758)
+        self.assertEqual(plan0.query_lens, [758])
+        self.assertEqual(plan0.key_lens, [107254])
+        self.assertEqual(plan14.query_lens, [758])
+        self.assertEqual(plan14.key_lens, [117866])
+        self.assertEqual(plan15.query_lens, [749])
+        self.assertEqual(plan15.key_lens, [seq])
+        self.assertNotEqual(plan0.key_lens, [seq])
+
+        forward_batch = types.SimpleNamespace()
+        self.assertEqual(
+            dsa_token_shard_key_lens(
+                forward_batch, plan0, torch.device("cpu")
+            ).tolist(),
+            [107254],
+        )
+        self.assertEqual(
+            dsa_token_shard_key_lens(
+                forward_batch, plan15, torch.device("cpu")
+            ).tolist(),
+            [seq],
+        )
+
+    def test_key_lens_are_absolute_not_a_prefix_sum(self):
+        # rank 0 of tp=2, requests [5, 9] against seq [105, 214].
+        # The frontier is [105, 207]. A prefix sum would be [105, 312].
+        plan = plan_dsa_token_shard([5, 9], [105, 214], 2, 0)
+        self.assertEqual(plan.key_lens, [105, 207])
+        forward_batch = types.SimpleNamespace()
+        self.assertEqual(
+            dsa_token_shard_key_lens(
+                forward_batch, plan, torch.device("cpu")
+            ).tolist(),
+            [105, 207],
+        )
 
 
 class TestTokenShardRefusesDcp(CustomTestCase):

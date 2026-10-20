@@ -147,6 +147,21 @@ def dsa_token_shard_cumulative_query_lens(
     return cached
 
 
+def dsa_token_shard_key_lens(
+    forward_batch: "ForwardBatch", plan: DsaTokenShardPlan, device: torch.device
+) -> torch.Tensor:
+    """One absolute KV length per request, the same shape as seq_lens.
+
+    Paged SFA sparse_mode=3 right-aligns each request to this length.
+    A running sum would only match when the forward has one request.
+    """
+    cached = getattr(forward_batch, "npu_dsa_token_shard_key_lens", None)
+    if cached is None:
+        cached = torch.tensor(list(plan.key_lens), dtype=torch.int32, device=device)
+        forward_batch.npu_dsa_token_shard_key_lens = cached
+    return cached
+
+
 def dsa_token_shard_slice(x: torch.Tensor, plan: DsaTokenShardPlan) -> torch.Tensor:
     """This rank's ``plan.rows`` rows, zero-padded at the tail to the row count
     the query has after the all-to-all."""
