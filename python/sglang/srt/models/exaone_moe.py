@@ -182,6 +182,10 @@ class ExaoneMoESparseMoEBlock(nn.Module):
             apply_routed_scaling_factor_on_output=True,
             scoring_func="sigmoid",
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         if config.num_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.num_shared_experts

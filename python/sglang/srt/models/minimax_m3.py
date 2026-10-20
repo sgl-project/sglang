@@ -430,6 +430,7 @@ class MiniMaxM3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts

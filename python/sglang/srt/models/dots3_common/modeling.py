@@ -322,6 +322,7 @@ class Dots3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_experts = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:

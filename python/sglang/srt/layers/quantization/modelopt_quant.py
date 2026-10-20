@@ -23,6 +23,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
+    RoutingMethodType,
     get_flashinfer_a2a_dispatch_type,
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -1255,14 +1256,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        if self._moe_runner_backend.is_flashinfer_trtllm():
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp8_moe_weights_for_flashinfer_trtllm,
             )
 
             # ModelOpt FP8 stores weights in [Up, Gate] order, so we need to swap
             align_fp8_moe_weights_for_flashinfer_trtllm(layer, swap_w13_halves=True)
-        elif get_moe_runner_backend().is_flashinfer_cutlass():
+        elif self._moe_runner_backend.is_flashinfer_cutlass():
             assert (
                 hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
             )
@@ -1352,6 +1353,18 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        # This per-tensor TRT-LLM adapter only supports logits routing. An
+        # undeclared router keeps Triton's weight layout and local expert IDs.
+        self._moe_runner_backend = (
+            moe_runner_backend
+            if moe_runner_backend.is_flashinfer_trtllm()
+            and moe_runner_config.routing_method_type
+            not in (None, RoutingMethodType.Unspecified)
+            else self.runner.runner_backend
+        )
+
+    def get_moe_runner_backend(self, layer):
+        return self._moe_runner_backend
 
     def apply(
         self,
@@ -1362,10 +1375,18 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        if self._moe_runner_backend.is_flashinfer_trtllm() and not (
+            TopKOutputChecker.format_is_bypassed(topk_output)
+        ):
+            raise NotImplementedError(
+                "TRT-LLM per-tensor FP8 cannot consume materialized routing. "
+                "Use --moe-runner-backend triton for this router."
+            )
+
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
 
         if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
+            self._moe_runner_backend.is_flashinfer_trtllm()
             and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1409,7 +1430,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 dispatch_output, quant_info, self.moe_runner_config
             )
 
-        if get_moe_runner_backend().is_flashinfer_cutlass():
+        if self._moe_runner_backend.is_flashinfer_cutlass():
             activation_str = self.moe_runner_config.activation
             assert activation_str in _SUPPORTED_ACT_STRS, (
                 f"Activation {activation_str!r} is not supported for "
@@ -3113,6 +3134,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return self._moe_runner_backend
 
     def get_marlin_quant_info(self, layer: torch.nn.Module):
         """Marlin payload for the fp4-marlin (W4A16) fallback; the weights were

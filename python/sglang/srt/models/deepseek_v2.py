@@ -827,6 +827,10 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             self.topk = TopK(**topk_kwargs)
+            self.topk.bind_runner_backend(
+                self.experts.runner_backend,
+                routing_method_type=self.experts.routing_method_type,
+            )
             self.routed_scaling_factor_fused_in_topk = (
                 is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
             )
@@ -1030,6 +1034,7 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and hasattr(self, "shared_experts")
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
             and not getattr(self, "is_hash", False)

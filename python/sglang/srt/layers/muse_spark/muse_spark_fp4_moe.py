@@ -108,11 +108,13 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.top_k = top_k
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
+        self.moe_runner_backend = _resolve_moe_runner_backend()
         # SwiGLU, and no routed_scaling here -- Muse folds its route_scale into
         # the topk weights before they reach us.
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=num_local_experts,
+            runner_backend=self.moe_runner_backend,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size,
             top_k=top_k,
@@ -127,7 +129,6 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.dispatcher = _DirectDispatcher()
 
         capability = get_device_capability() if is_cuda() else None
-        self.moe_runner_backend = _resolve_moe_runner_backend()
         self.use_marlin = self.moe_runner_backend.is_marlin()
         self._sm_major = capability[0] if capability is not None else 0
         if not self.use_marlin and capability is not None and capability < (10, 0):

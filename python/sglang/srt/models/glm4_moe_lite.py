@@ -237,6 +237,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
             **({"scoring_func": "sigmoid"} if _is_npu else {}),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False

@@ -461,6 +461,10 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             ),
             fused_shared_experts_scaling_factor=1,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
