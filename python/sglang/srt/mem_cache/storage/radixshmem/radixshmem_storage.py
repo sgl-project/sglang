@@ -162,6 +162,10 @@ def _pack_salt(salt, packs: List[List[_Pool]]):
     return packed
 
 
+class _PoolMismatch(RuntimeError):
+    pass
+
+
 def _as_comm(group, src: int):
     if group is None:
         return _Solo()
@@ -303,6 +307,7 @@ class RadixShmemStorage(HiCacheStorage):
         self._attach_lock = threading.Lock()
         self._retry_at = 0.0
         self._down_since: Optional[float] = None
+        self._mismatch: Optional[Exception] = None
         self._deferred: List[Tuple[float, np.ndarray, np.ndarray, Any]] = []
         self._own_groups: List[Any] = []
         self.set_shard_groups(None, None)
@@ -634,6 +639,8 @@ class RadixShmemStorage(HiCacheStorage):
         self._plan()
         if self.index is not None:
             return True
+        if self._mismatch is not None:
+            raise self._mismatch
         if time.monotonic() < self._retry_at:
             return False
         with self._attach_lock:
@@ -643,7 +650,13 @@ class RadixShmemStorage(HiCacheStorage):
                 return False
             try:
                 self._connect()
+            except _PoolMismatch as e:
+                self._mismatch = e
+                raise
             except Exception as e:
+                if "_ratio is 0" in str(e):
+                    self._mismatch = _PoolMismatch(self._mismatch_message(e))
+                    raise self._mismatch from e
                 self._retry_at = time.monotonic() + self.retry_s
                 if self._down_since is None:
                     self._down_since = time.monotonic()
@@ -681,6 +694,30 @@ class RadixShmemStorage(HiCacheStorage):
         finally:
             self.ready_timeout_s = timeout
 
+    def _aux_kinds(self) -> List[str]:
+        names = {
+            self.components[PoolName.SWA][0]: "swa",
+            self.components[PoolName.MAMBA][0]: "mamba",
+        }
+        return sorted(names[k] for k in self.kind_slot_bytes if k in names)
+
+    def _mismatch_message(self, detail) -> str:
+        return (
+            f"radixshmem: this model uses component pools {self._aux_kinds()} but "
+            f"server {self.server_name} {detail}; restart radix-server with "
+            "--swa-ratio / --mamba-ratio > 0 exactly for the pools the model uses"
+        )
+
+    def _check_aux_pools(self, info) -> None:
+        used = set(self._aux_kinds())
+        for kind in ("swa", "mamba"):
+            ratio = float(getattr(info, f"{kind}_ratio"))
+            if (ratio > 0) != (kind in used):
+                state = (
+                    f"sets {kind}_ratio={ratio}" if ratio > 0 else f"has no {kind} pool"
+                )
+                raise _PoolMismatch(self._mismatch_message(state))
+
     def _connect(self) -> None:
         swa_kind, _ = self.components[PoolName.SWA]
         mamba_kind, _ = self.components[PoolName.MAMBA]
@@ -702,6 +739,7 @@ class RadixShmemStorage(HiCacheStorage):
                 )
             )
             info = client.wait_ready(self.ready_timeout_s)
+            self._check_aux_pools(info)
             store = client.store
             index = client.index
         except Exception:

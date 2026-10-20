@@ -195,7 +195,7 @@ class TestRadixShmemStorage(CustomTestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def _new_server(self):
+    def _new_server(self, swa_ratio=0.0, mamba_ratio=0.0):
         tag = uuid.uuid4().hex[:8]
         self.name, self.endpoint = f"/rsu_{tag}", f"unix:///tmp/rsu_{tag}.sock"
         server = RadixServer(
@@ -203,8 +203,8 @@ class TestRadixShmemStorage(CustomTestCase):
                 name=self.name,
                 endpoint=self.endpoint,
                 data_bytes=16 << 20,
-                swa_ratio=0.2,
-                mamba_ratio=0.2,
+                swa_ratio=swa_ratio,
+                mamba_ratio=mamba_ratio,
                 slot_align=64,
                 prefault=False,
                 background_evict_ratio=0.0,
@@ -425,7 +425,7 @@ class TestRadixShmemStorage(CustomTestCase):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         for pages in (2, 0):
-            self._new_server()
+            self._new_server(swa_ratio=0.2 if pages else 0.0)
             ((storage, _),) = self._group(
                 lambda r: _FlatPool(16, 64), radixshmem_swa_window_pages=pages
             )
@@ -447,6 +447,7 @@ class TestRadixShmemStorage(CustomTestCase):
             self.assertTrue(torch.all(swa.page(1) == 4))
 
     def test_mamba_component_across_tp_with_deferred_publish(self):
+        self._new_server(mamba_ratio=0.2)
         groups = [4, 4, 8]
         temporal = torch.randn(2, 1, 4, 2, 2)
         conv = torch.randn(2, 1, 16, 3)
