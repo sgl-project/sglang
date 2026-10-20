@@ -229,8 +229,16 @@ def flash_mla_with_kvcache_sm120(**kwargs):
     extra_indices = kwargs.get("extra_indices_in_kvcache")
     extra_topk_length = kwargs.get("extra_topk_length")
 
+    # Target and DSpark draft pools can use different byte layouts in the
+    # same process. Dispatch from the pool's format, not an import-time flag.
+    cache_format = kwargs.get("kv_cache_format", _sm120_kv_cache_format)
+    if cache_format not in ("fp8", "nvfp4"):
+        raise ValueError(f"Unsupported SM120 KV cache format: {cache_format!r}")
+    if cache_format == "nvfp4" and _sm120_default_backend != "flashinfer":
+        raise ValueError("NVFP4 KV cache requires the FlashInfer SM120 backend")
+
     if _sm120_default_backend == "flashinfer":
-        if _sm120_kv_cache_format == "nvfp4":
+        if cache_format == "nvfp4":
             return _flash_mla_flashinfer_nvfp4(
                 q,
                 k_cache,

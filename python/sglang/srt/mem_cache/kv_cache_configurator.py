@@ -1311,6 +1311,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            is_draft_worker=self.is_draft_worker,
         )
         return token_to_kv_pool
 

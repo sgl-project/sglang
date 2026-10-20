@@ -1802,6 +1802,7 @@ class DeepseekV4AttnBackend(
                 o = flash_mla_with_kvcache_sm120(
                     q=q,
                     k_cache=swa_k_cache,
+                    kv_cache_format="nvfp4" if is_nvfp4_kv else "fp8",
                     head_dim_v=self.head_dim_v,
                     softmax_scale=self.softmax_scale,
                     indices=swa_page_indices,

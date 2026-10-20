@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsv4 import (
     clear_unaccepted_c128_draft_states,
     fused_k_norm_rope_flashmla,
+    fused_norm_rope_inplace,
     fused_store_cache,
 )
 from sglang.kernels.ops.attention.dsv4 import (
@@ -36,14 +37,21 @@ ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 NVFP4_BYTES_PER_TOKEN = 384
 
 
-@lru_cache(maxsize=1)
-def is_nvfp4_kv_cache() -> bool:
+@lru_cache(maxsize=2)
+def is_nvfp4_kv_cache(is_draft_worker: bool = False) -> bool:
     """Whether the DSv4 KV pools use FlashInfer's NVFP4 sparse-MLA cache ABI."""
-    if envs.SGLANG_SM120_KV_CACHE_FORMAT.get() != "nvfp4":
+    cache_format = envs.SGLANG_SM120_KV_CACHE_FORMAT.get()
+    if is_draft_worker:
+        draft_format = envs.SGLANG_SM120_DRAFT_KV_CACHE_FORMAT.get()
+        if draft_format != "auto":
+            cache_format = draft_format
+    if cache_format not in ("fp8", "nvfp4"):
+        raise ValueError(f"Unsupported SM120 KV cache format: {cache_format!r}")
+    if cache_format != "nvfp4":
         return False
     if not is_sm120_supported():
         raise ValueError(
-            "SGLANG_SM120_KV_CACHE_FORMAT=nvfp4 requires SM120/SM121; FlashInfer "
+            "SM120 KV cache format nvfp4 requires SM120/SM121; FlashInfer "
             "builds the NVFP4 sparse-MLA kernels for consumer Blackwell only."
         )
     return True
@@ -87,6 +95,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        is_draft_worker: bool = False,
     ):
         super().__init__(
             size,
@@ -105,7 +114,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
-        self.is_nvfp4 = is_nvfp4_kv_cache()
+        self.is_nvfp4 = is_nvfp4_kv_cache(is_draft_worker)
         # FlashInfer's NVFP4 sparse-MLA kernels accept a primary page size of
         # 64 and an extra-cache page size of 2 or 64. The NVFP4 ABI has no
         # per-page padding, so regrouping a flat slot space into 64-token
@@ -249,6 +258,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         enable_memory_saver: bool,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        is_draft_worker: bool = False,
     ):
         super().__init__(
             size,
@@ -261,6 +271,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
             enable_memory_saver,
             start_layer,
             end_layer,
+            is_draft_worker=is_draft_worker,
         )
 
         self.data_ptrs = torch.tensor(
@@ -549,6 +560,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        is_draft_worker: bool = False,
     ):
         super().__init__(
             swa_size,
@@ -561,6 +573,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             end_layer,
         )
         c4_logical_size = c128_size * 32
+        self.is_draft_worker = is_draft_worker
 
         logger.info(
             "Initialize DeepSeekV4TokenToKVPool with "
@@ -915,6 +928,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            is_draft_worker=self.is_draft_worker,
         )
 
     def _make_indexer_pool(
@@ -1248,10 +1262,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        assert not self.swa_kv_pool.is_nvfp4, (
-            "the fused norm+rope+store kernel writes the FP8 cache ABI; "
-            "SGLANG_SM120_KV_CACHE_FORMAT=nvfp4 needs the unfused store path"
-        )
+        if self.swa_kv_pool.is_nvfp4:
+            # DSpark uses this entry point for both target-hidden context KV
+            # and draft block KV. The fused store below only writes FP8, so
+            # reuse the existing BF16 norm/RoPE and FlashInfer NVFP4 append.
+            # Preserve the caller's projection, including strided QKV views.
+            if kv.shape[0] == 0:
+                return
+            kv_bf16 = kv.clone(memory_format=torch.contiguous_format)
+            fused_norm_rope_inplace(kv_bf16, kv_weight, eps, freqs_cis, positions)
+            return self.set_swa_key_buffer_radix_fused(layer_id, swa_loc, kv_bf16)
         fused_k_norm_rope_flashmla(
             kv=kv,
             kv_weight=kv_weight,
