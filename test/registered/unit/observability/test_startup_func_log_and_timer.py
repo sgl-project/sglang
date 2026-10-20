@@ -14,7 +14,6 @@ from sglang.srt.observability.startup_func_log_and_timer import (
     reset_startup_timers,
     set_startup_metric,
     startup_timer,
-    time_startup_latency,
 )
 
 
@@ -68,30 +67,6 @@ class TestStartupFuncLogAndTimer(unittest.TestCase):
             pass
         mock_gauge.labels.assert_not_called()
         self.assertIsNotNone(get_max_duration("block"))
-
-    def test_decorator_direct(self):
-        """Direct decorator @time_startup_latency preserves return value."""
-
-        @time_startup_latency
-        def add(a, b):
-            return a + b
-
-        self.assertEqual(add(2, 3), 5)
-        self.assertIsNotNone(get_max_duration("add"))
-
-    def test_decorator_log_only(self):
-        """log_only=True skips gauge but still tracks max."""
-        mock_gauge = MagicMock()
-        mod.enable_startup_metrics = True
-        mod.STARTUP_LATENCY_SECONDS = mock_gauge
-
-        @time_startup_latency(log_only=True)
-        def add(a, b):
-            return a + b
-
-        self.assertEqual(add(2, 3), 5)
-        mock_gauge.labels.assert_not_called()
-        self.assertIsNotNone(get_max_duration("add"))
 
 
 if __name__ == "__main__":

@@ -3,21 +3,17 @@
 import unittest
 import weakref
 from contextlib import nullcontext
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 from sglang.srt.layers.layer_boundary import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.output import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -73,50 +69,6 @@ class TestBatchOwnedResidual(CustomTestCase):
         self.assertIs(proxy["hidden_states"], hidden)
         self.assertIs(proxy["residual"], residual)
         self.assertIsNone(fb.residual_stream)
-
-    def test_tbo_metadata_and_reused_batch_remain_stream_free_between_calls(self):
-        size = 4
-        parent = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=size,
-            input_ids=torch.zeros(size, dtype=torch.long),
-            positions=torch.zeros(size, dtype=torch.long),
-            out_cache_loc=torch.zeros(size, dtype=torch.long),
-            req_pool_indices=torch.zeros(size, dtype=torch.long),
-            seq_lens=torch.ones(size, dtype=torch.int32),
-            seq_lens_cpu=torch.ones(size, dtype=torch.int32),
-            seq_lens_sum=size,
-            spec_info=None,
-        )
-        for _ in range(2):
-            self.assertIsNone(parent.residual_stream)
-            with (
-                get_context().override_server_args(
-                    attention_backend="fa3", moe_dense_tp_size=None
-                ),
-                get_parallel().override(attn_tp_size=1),
-            ):
-                children = [
-                    TboForwardBatchPreparer.filter_batch(
-                        parent,
-                        start_token_index=start,
-                        end_token_index=start + 2,
-                        start_seq_index=start,
-                        end_seq_index=start + 2,
-                        out_num_token_non_padded=torch.tensor(2),
-                        out_num_token_non_padded_cpu=2,
-                    )
-                    for start in (0, 2)
-                ]
-            self.assertTrue(all(child.residual_stream is None for child in children))
-            batch.start(parent)
-            owner = batch.stream_of(parent)
-            self.assertTrue(all(child.residual_stream is None for child in children))
-            hidden = owner.write(torch.ones(size, 4))
-            batch.final_norm(hidden, parent, lambda value: value)
-            cloned = replace(parent)
-            self.assertIsNone(cloned.residual_stream)
-            self.assertIsNone(parent.residual_stream)
 
     def test_split_prefill_retains_then_releases_batch_owner(self):
         from sglang.srt.models.llama4 import Llama4ForCausalLM

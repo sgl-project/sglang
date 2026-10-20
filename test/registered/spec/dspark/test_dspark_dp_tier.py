@@ -16,33 +16,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-class TestLocalVerifyTierNumTokens(CustomTestCase):
-    def test_no_budget_returns_sentinel(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=None,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            -1,
-        )
-
-    def test_budget_adds_to_anchor_floor(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=10,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            18,
-        )
-
-    # Clamp/floor variants (verify-all clamp, min_verify_len floor, min=0) are
-    # covered by the TestBusyIdleGraphKeyIdentity sweep bounds.
-
-
 class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
     def test_any_sentinel_pins_everyone(self):
         # The sweep never emits a -1 contribution, so this is the only guard

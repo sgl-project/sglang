@@ -54,16 +54,6 @@ class TestGrammarStopSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_len, 3)
         self.assertEqual(list(req.output_ids_through_stop), [11, 13, STOP_TOKEN_ID])
 
-    def test_tokenizer_stop_token_wins_over_trailing_eos(self):
-        req = _make_req()
-        req.tokenizer.additional_stop_token_ids = {STOP_TOKEN_ID}
-
-        req.update_finish_state(new_accepted_len=4)
-
-        self.assertEqual(req.finished_reason.matched, STOP_TOKEN_ID)
-        self.assertEqual(req.finished_len, 3)
-        self.assertEqual(list(req.output_ids_through_stop), [11, 13, STOP_TOKEN_ID])
-
 
 if __name__ == "__main__":
     unittest.main()

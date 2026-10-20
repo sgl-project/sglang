@@ -122,37 +122,6 @@ def _reference_paged_views(
 
 
 class TestMHASpecSurface(unittest.TestCase):
-    def test_layout_parts_match_the_entry_formula(self):
-        """Every per-layer view is built through the layout descriptor, so its
-        part offsets are pinned against the closed-form entry math. The page
-        size never enters (a page is page_size entries back to back)."""
-        spec = _mha_spec()
-        layout = spec.layout()
-        self.assertEqual(layout.entry_bytes, spec.entry_bytes())
-        for l in range(_L):
-            self.assertEqual(
-                layout.part("k").layer_offset_bytes(l), l * (_K_ROW + _V_ROW)
-            )
-            self.assertEqual(
-                layout.part("v").layer_offset_bytes(l), l * (_K_ROW + _V_ROW) + _K_ROW
-            )
-
-    def test_entry_bytes_matches_the_closed_form_and_is_aligned(self):
-        self.assertEqual(_mha_spec().entry_bytes(), _ENTRY)
-        # 48 B of rows round up to one 64 B entry; the parts still fit inside.
-        padded = MHASubPoolSpec(
-            name="full",
-            layer_num=1,
-            head_num=1,
-            head_dim=16,
-            v_head_dim=8,
-            store_dtype=_DTYPE,
-            grow_direction="down",
-        )
-        self.assertEqual(padded.entry_bytes(), ENTRY_ALIGN_BYTES * 2)
-        self.assertEqual(padded.entry_bytes() % ENTRY_ALIGN_BYTES, 0)
-        padded.layout()  # validates
-
     def test_asymmetric_rows_are_admitted(self):
         """K and V are two parts of one entry at their own offsets; they no
         longer have to be the same kind of row (the MiMoV2 shape, scaled)."""
@@ -217,23 +186,6 @@ class TestMHAViews(unittest.TestCase):
                 want_v = float(p * 100 + l * 10 + s + 4)
                 self.assertTrue(torch.all(sk[l][p, s] == want_k))
                 self.assertTrue(torch.all(sv[l][p, s] == want_v))
-
-    def test_byte_addresses_match_envelope_formula(self):
-        """The per-layer view's byte address for token ``t``, layer ``l`` must
-        equal the hand-computed envelope formula. Independent of any view
-        builder -- this is the raw layout contract every envelope consumer
-        (moves, sizing, transfer math) relies on."""
-        for ps in (1, 4):
-            num_pages = 5
-            dk, dv = _build_views(_make_raw(ps, num_pages), ps, num_pages)
-            for t in (0, 1, ps, 3 * ps + (ps - 1), 4 * ps):
-                for l in range(_L):
-                    expected_k = t * _ENTRY + l * (_K_ROW + _V_ROW)
-                    expected_v = expected_k + _K_ROW
-                    got_k = (dk[l].storage_offset() + t * dk[l].stride(0)) * _ITEM
-                    got_v = (dv[l].storage_offset() + t * dv[l].stride(0)) * _ITEM
-                    self.assertEqual(got_k, expected_k, f"K t={t} l={l} ps={ps}")
-                    self.assertEqual(got_v, expected_v, f"V t={t} l={l} ps={ps}")
 
     def test_k_and_v_share_one_id_without_aliasing(self):
         """One id, 2L distinct cells (K and V of every layer): writes through

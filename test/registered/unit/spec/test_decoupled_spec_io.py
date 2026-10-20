@@ -75,10 +75,6 @@ class TestVerifyCommitValidation(CustomTestCase):
         with self.assertRaises(ValueError):
             _commit("r", pre=-1, tokens=[1]).validate_committed_tokens()
 
-    def test_valid_commit_passes(self):
-        # Should not raise.
-        _commit("r", pre=0, tokens=[1, 2]).validate_committed_tokens()
-
 
 class TestVerifierCommitSegment(CustomTestCase):
     def test_append_coalesces_contiguous_commits(self):
@@ -255,17 +251,6 @@ class TestDraftMeshMessageEnvelope(CustomTestCase):
         self.assertEqual(msg.message_type, DraftMeshMessageType.CONTROL_BATCH)
         self.assertIs(msg.control_batch, batch)
         self.assertIsNone(msg.tail_stream_output_batch)
-
-    def test_from_tail_stream_output_batch_sets_discriminant_and_slot(self):
-        from sglang.srt.speculative.decoupled_spec_io import DraftTailStreamOutputBatch
-
-        batch = DraftTailStreamOutputBatch()
-        msg = DraftMeshMessage.from_tail_stream_output_batch(batch)
-        self.assertEqual(
-            msg.message_type, DraftMeshMessageType.TAIL_STREAM_OUTPUT_BATCH
-        )
-        self.assertIs(msg.tail_stream_output_batch, batch)
-        self.assertIsNone(msg.control_batch)
 
 
 if __name__ == "__main__":

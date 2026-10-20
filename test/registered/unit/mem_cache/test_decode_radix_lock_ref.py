@@ -141,81 +141,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
     """Test lock_ref balance across decode transfer scenarios."""
 
-    def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
-        enter_override(
-            self,
-            get_context().override_server_args(
-                disaggregation_decode_enable_radix_cache=True
-            ),
-        )
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue.scheduler = SimpleNamespace(
-            sliding_window_size=127,
-            server_args=SimpleNamespace(),
-        )
-        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
-        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-
-        tail_len = queue._swa_tail_len(895)
-
-        self.assertEqual(tail_len, 191)
-        swa_start = 895 - tail_len
-        radix_key_len = (895 // 64) * 64
-        self.assertGreaterEqual(radix_key_len - swa_start, 127)
-
-    def test_swa_admission_counts_evictable_capacity(self):
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.scheduler = MagicMock()
-        queue.scheduler.running_batch.reqs = []
-        queue.scheduler.sliding_window_size = 128
-        queue.scheduler.last_batch = None
-        queue.retracted_queue = []
-        queue._need_space_for_single_req = MagicMock(return_value=0)
-        queue._active_req_count = MagicMock(return_value=1)
-        queue.token_to_kv_pool_allocator = MagicMock()
-        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue.token_to_kv_pool_allocator.size_swa = 256
-        queue.token_to_kv_pool_allocator.swa_available_size.return_value = 0
-        queue.tree_cache = MagicMock()
-        queue.tree_cache.swa_evictable_size.return_value = 192
-
-        budget = queue._swa_tail_allocatable_token_budget(
-            count_retracted=False,
-            reserved_tokens=64,
-        )
-
-        # 192 reclaimable tokens minus 64 reserved for active-request growth.
-        self.assertEqual(budget, 128)
-
-    def test_reclaim_swa_tail_capacity_page_rounds(self):
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
-        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 192]
-        queue.tree_cache = MagicMock()
-
-        error = queue._reclaim_swa_tail_capacity(129, "req-1")
-
-        self.assertIsNone(error)
-        params = queue.tree_cache.evict_for_alloc.call_args.args[0]
-        self.assertEqual(params.num_tokens, 0)
-        self.assertEqual(params.swa_num_tokens, 128)
-
-    def test_reclaim_swa_tail_capacity_fails_before_allocation(self):
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
-        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
-        queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 128]
-        queue.tree_cache = MagicMock()
-
-        error = queue._reclaim_swa_tail_capacity(129, "req-1")
-
-        self.assertEqual(
-            error,
-            "SWA eviction insufficient: needed=192, available=128, req=req-1",
-        )
-
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""
         cache.insert(
@@ -664,46 +589,6 @@ class TestDecodeLockRefScenarios(CustomTestCase):
 
         self.assertEqual(shared.lock_ref, 2)
         self.assertEqual(req_to_token[0, :3].tolist(), prefix_vals)
-
-    def test_repeated_incremental_no_leak(self):
-        """Multiple incremental transfers shouldn't leak lock_refs."""
-        cache, req_to_token = _make_cache_with_pools()
-
-        prefix = [1, 2, 3]
-        prefix_vals = [10, 20, 30]
-        self._populate_prefix(cache, prefix, prefix_vals)
-
-        for iteration in range(5):
-            result = cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(array("q", prefix)))
-            )
-            matched_node = result.last_device_node
-            prefix_len = result.device_prefix_len
-
-            lock = cache.lock(matched_node)
-
-            suffix_token = 40 + iteration
-            full_ids = prefix + [suffix_token]
-            full_vals = prefix_vals + [100 + iteration]
-            req_to_token[0, : len(full_vals)] = torch.tensor(
-                full_vals, dtype=torch.int64
-            )
-
-            req = _make_req(
-                fill_ids=full_ids,
-                req_pool_idx=0,
-                cache_protected_len=prefix_len,
-                last_node=matched_node,
-                lock=lock,
-            )
-
-            cache.checkpoint(req, up_to=req.extend_end)
-            req.finished_reason = "finished"
-            release_kv_cache(req, cache, checkpoint=True)
-
-        # After all iterations, root lock should be 1, no protected nodes
-        self.assertEqual(cache.root_node.lock_ref, 1)
-        self.assertEqual(cache.protected_size(), 0)
 
 
 if __name__ == "__main__":

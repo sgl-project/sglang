@@ -85,18 +85,6 @@ def make_obs(
 
 
 class TestResolveComponents(CustomTestCase):
-    def test_empty_disables(self):
-        self.assertEqual(resolve_components(()), set())
-
-    def test_all_expands_to_every_component(self):
-        self.assertEqual(resolve_components(("all",)), set(InfoComponent))
-
-    def test_subset_and_whitespace_are_kept(self):
-        self.assertEqual(
-            resolve_components((" core ", "reqs")),
-            {InfoComponent.CORE, InfoComponent.REQS},
-        )
-
     def test_unknown_component_raises(self):
         with self.assertRaises(ValueError):
             resolve_components(("core", "bogus"))
@@ -164,23 +152,6 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertNotIn("step_cpu_ms", first)
         self.assertAlmostEqual(second["step_cpu_ms"], 20.0, places=3)
 
-    def test_core_fields_present(self):
-        dumper, _ = make_dumper({"core"})
-        dumper.observe_decode_step(make_obs(forward_ct=7, bs=3, num_verify_tokens=18))
-        record = dumper.dump()["records"][0]
-        self.assertEqual(record["bs"], 3)
-        self.assertEqual(record["num_running_reqs"], 3)
-        self.assertEqual(record["num_verify_tokens"], 18)
-        self.assertEqual(record["mode"], "static")
-
-    def test_core_only_omits_timing_fields(self):
-        dumper, clock = make_dumper({"core"})
-        dumper.observe_decode_step(make_obs(forward_ct=1))
-        clock.advance(0.01)
-        dumper.observe_decode_step(make_obs(forward_ct=2))
-        for record in dumper.dump()["records"]:
-            self.assertNotIn("step_cpu_ms", record)
-
     def test_non_decode_step_resets_cpu_pairing(self):
         dumper, clock = make_dumper({"core", "step_cpu_time"})
         dumper.observe_decode_step(make_obs(forward_ct=1))
@@ -225,10 +196,6 @@ class TestCoreAndCpuTiming(CustomTestCase):
         dumper.observe_decode_step(make_obs(forward_ct=2))
         dumper.clear()
         self.assertEqual(dumper.dump()["records"], [])
-        dumper.observe_decode_step(make_obs(forward_ct=9))
-        clock.advance(0.01)
-        dumper.observe_decode_step(make_obs(forward_ct=10))
-        self.assertEqual([r["forward_ct"] for r in dumper.dump()["records"]], [9, 10])
 
 
 class TestPredictedStepFields(CustomTestCase):

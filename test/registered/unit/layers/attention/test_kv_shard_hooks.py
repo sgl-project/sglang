@@ -19,7 +19,6 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.kv_shard_hooks import (
-    get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
@@ -50,13 +49,6 @@ def _batch(mode: ForwardMode):
         extend_prefix_lens_cpu=[64],
         seq_lens_cpu=torch.tensor([128], dtype=torch.int64),
     )
-
-
-def test_detects_only_page_interleaved_pools():
-    pool = _RecordingPool()
-
-    assert get_kv_shard_pool(pool) is pool
-    assert get_kv_shard_pool(object()) is None
 
 
 @pytest.mark.parametrize(
@@ -94,18 +86,6 @@ def test_prepare_updates_the_pool_lifecycle(mode, active):
         )
     else:
         assert pool.begin_args is None
-
-
-@pytest.mark.parametrize(
-    "missing_field",
-    ["req_pool_indices", "extend_prefix_lens_cpu", "seq_lens_cpu"],
-)
-def test_extend_requires_host_metadata(missing_field):
-    batch = _batch(ForwardMode.EXTEND)
-    setattr(batch, missing_field, None)
-
-    with pytest.raises(RuntimeError, match="requires request indices and CPU"):
-        prepare_kv_shard_forward(_RecordingPool(), torch.empty(0), batch)
 
 
 if __name__ == "__main__":

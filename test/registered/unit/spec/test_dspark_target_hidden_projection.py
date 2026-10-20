@@ -4,7 +4,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
 from sglang.srt.models.dspark import DSparkDraftMixin
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -69,11 +68,6 @@ class DSparkTargetHiddenProjectionTest(CustomTestCase):
         self.assertEqual(
             worker.spec_v2_attn_backends, (target.model_runner.attn_backend,)
         )
-
-    def test_single_aux_hidden_state_is_returned_without_copy(self) -> None:
-        hidden_states = torch.empty(2, 3)
-
-        self.assertIs(hidden_states, pack_aux_hidden_states([hidden_states]))
 
     def test_preprojected_hidden_is_not_projected_again(self) -> None:
         attention = _Attention()

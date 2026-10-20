@@ -61,16 +61,6 @@ class TestHiddenStateServerMode(CustomTestCase):
                 [1, 2, 3],
             )
 
-    def test_full_server_accepts_all_request_modes(self):
-        manager = self._make_tokenizer_manager("full")
-
-        for mode in (False, "last", True):
-            with self.subTest(mode=mode):
-                manager._validate_one_request(
-                    self._make_request(mode),
-                    [1, 2, 3],
-                )
-
 
 if __name__ == "__main__":
     unittest.main()

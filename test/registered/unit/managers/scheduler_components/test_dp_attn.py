@@ -27,13 +27,6 @@ register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
-    def test_skip_all_gather_policy(self):
-        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))
-            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
-        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
-            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
-
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,

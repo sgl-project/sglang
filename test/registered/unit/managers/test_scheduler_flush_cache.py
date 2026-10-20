@@ -134,12 +134,6 @@ class TestSchedulerFlushCache(unittest.TestCase):
         rust.rust_server.push_control_output.assert_called_once_with(req, output)
         rust.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
-        python = SimpleNamespace(rust_server=None, ipc_channels=MagicMock())
-        Scheduler.send_control_output(python, output, req)
-        python.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
-            output, req
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

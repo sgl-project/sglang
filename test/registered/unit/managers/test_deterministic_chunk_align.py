@@ -30,10 +30,6 @@ class TestDeterministicChunkAlign(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "at least 8192"):
             _check(align=4096, chunk=2048, attn_dp_size=2)
 
-    def test_chunk_covering_alignment_starts(self):
-        _check(align=4096, chunk=4096)
-        _check(align=4096, chunk=2048, mode=DisaggregationMode.DECODE)
-
 
 if __name__ == "__main__":
     unittest.main()

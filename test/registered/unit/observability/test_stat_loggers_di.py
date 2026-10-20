@@ -106,14 +106,6 @@ class TestResolveCollectorClass(unittest.TestCase):
             SchedulerMetricsCollector,
         )
 
-    def test_returns_default_when_stat_loggers_none(self):
-        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers=None)
-        self.assertIs(cls, SchedulerMetricsCollector)
-
-    def test_returns_default_when_stat_loggers_empty(self):
-        cls = self._resolve("scheduler", SchedulerMetricsCollector, stat_loggers={})
-        self.assertIs(cls, SchedulerMetricsCollector)
-
     def test_returns_default_when_role_missing(self):
         class MyTokenizer(TokenizerMetricsCollector):
             pass

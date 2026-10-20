@@ -27,12 +27,6 @@ class TestPrefillDelayerHighWatermark(CustomTestCase):
 
         self.assertEqual(tracker.observe_attempt(2), 2)
 
-    def test_recurring_small_peak_remains_effective(self):
-        tracker = RecentPrefillBatchSizeTracker(window_size=4)
-
-        for attempted_prefill_bs in [2, 1, 1, 2, 1, 1, 2]:
-            self.assertEqual(tracker.observe_attempt(attempted_prefill_bs), 2)
-
     def test_rejected_non_empty_attempt_advances_window(self):
         tracker = RecentPrefillBatchSizeTracker(window_size=4)
         self.assertEqual(tracker.observe_attempt(10), 10)

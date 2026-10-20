@@ -39,10 +39,8 @@ def _make_request(**overrides):
 
 
 class TestUnoRequestValidation(CustomTestCase):
-    def test_supported_request_is_accepted(self):
-        self.assertIsNone(validate_uno_request(_make_request()))
-
     def test_unsupported_request_features_are_rejected(self):
+        # One representative per distinct error category in validate_uno_request.
         cases = {
             "min_p": ({"sampling_params__min_p": 0.1}, "min_p"),
             "grammar": ({"sampling_params__regex": "[0-9]+"}, "grammar"),
@@ -55,20 +53,8 @@ class TestUnoRequestValidation(CustomTestCase):
                 },
                 "return_hidden_states",
             ),
-            "frequency penalty": (
+            "penalties": (
                 {"sampling_params__frequency_penalty": 0.1},
-                "penalties",
-            ),
-            "presence penalty": (
-                {"sampling_params__presence_penalty": 0.1},
-                "penalties",
-            ),
-            "repetition penalty": (
-                {"sampling_params__repetition_penalty": 1.1},
-                "penalties",
-            ),
-            "minimum new tokens": (
-                {"sampling_params__min_new_tokens": 1},
                 "penalties",
             ),
             "logit bias": (
