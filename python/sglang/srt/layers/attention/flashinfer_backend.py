@@ -2512,9 +2512,11 @@ class FlashInferMultiStepDraftBackend:
         )
 
         # Blocks from the length sum (upper bound on the longest live row),
-        # capped by the draft window, not from the table width.
+        # capped by the draft window, not from the table width. pool_len is
+        # the req_to_token row width, the same table width the other call
+        # sites size from.
         num_token_blocks = spec_kv_index_token_blocks(
-            table_width=self.max_context_len,
+            table_width=self.pool_len,
             kv_lens_sum=seq_lens_sum,
             batch_size=num_seqs,
             base_programs=self.speculative_num_steps * num_seqs * self.topk,
