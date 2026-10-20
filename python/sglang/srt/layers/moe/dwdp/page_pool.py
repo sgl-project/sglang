@@ -31,6 +31,7 @@ class PagePool:
         release_page: Optional[Callable[[int], None]] = None,
     ):
         self._device_id = device_id
+        self._granularity = granularity
         if allocate_page is None:
             from sglang.srt.utils.cuda_vmm_utils import (
                 get_device_granularity,
@@ -40,12 +41,6 @@ class PagePool:
             self._granularity = granularity or get_device_granularity(device_id)
             self._prop = make_device_allocation_prop(device_id, handle_types=None)
             allocate_page = self._allocate_cuda_page
-        else:
-            if not granularity or release_page is None:
-                raise ValueError(
-                    "Custom page allocation requires granularity and release"
-                )
-            self._granularity = granularity
         self._release_page = release_page or self._release_cuda_page
 
         if page_size is None:

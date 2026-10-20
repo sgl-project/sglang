@@ -13,19 +13,17 @@ from sglang.srt.layers.moe.dwdp.layer_utils import (
     validate_moe_layers,
 )
 from sglang.srt.layers.moe.dwdp.layout import WeightSpec, build_remote_slices
-from sglang.srt.layers.moe.dwdp.weight_manager import (
-    DwdpPrefetch,
-    copy_remote_expert_slices,
-)
+from sglang.srt.layers.moe.dwdp.weight_manager import DwdpPrefetch
 from sglang.srt.runtime_context import get_parallel
 
 from .vmm import NPUWeightVMM, _check, tensor_from_pointer
 
 logger = logging.getLogger(__name__)
-_WEIGHTS = ("w13_weight", "w2_weight")
 
 
 class NPUDwdpManager(DwdpPrefetch):
+    _weight_names = ("w13_weight", "w2_weight")
+
     def __init__(self, server_args):
         import acl
 
@@ -57,7 +55,7 @@ class NPUDwdpManager(DwdpPrefetch):
         local_start, local_end = self._peer_ranges[self.dwdp_rank]
         self._specs.clear()
         for li, layer in layers:
-            for name in _WEIGHTS:
+            for name in self._weight_names:
                 weight = getattr(layer, name)
                 self._specs[li, name] = WeightSpec(
                     num_routed,
@@ -87,7 +85,7 @@ class NPUDwdpManager(DwdpPrefetch):
         try:
             self._vmm = NPUWeightVMM(self.acl, self.device)
             for li, layer in layers:
-                for name in _WEIGHTS:
+                for name in self._weight_names:
                     local_handles[li, name] = self._migrate_weight(
                         (li, name), getattr(layer, name), peer_pids
                     )
@@ -105,7 +103,7 @@ class NPUDwdpManager(DwdpPrefetch):
         )
         for li, layer in layers:
             self._replicate_small_params(layer)
-            weights = {name: self._weights[li, name] for name in _WEIGHTS}
+            weights = {name: self._weights[li, name] for name in self._weight_names}
             for name, full in weights.items():
                 self._remote_slices[li, name] = build_remote_slices(
                     full, local_start, local_end, num_routed
@@ -173,15 +171,6 @@ class NPUDwdpManager(DwdpPrefetch):
 
     def _buffer_index_for_layer(self, layer_idx):
         return self._position[layer_idx] % 2
-
-    def _prefetch_layer_per_slice(self, layer_idx):
-        copy_remote_expert_slices(
-            layer_idx,
-            _WEIGHTS,
-            self._get_remote_slices,
-            self._peer_views,
-            self._peer_ranges,
-        )
 
     def cleanup(self):
         if self._state == "closed":
