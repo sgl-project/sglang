@@ -354,6 +354,9 @@ class Envs:
     # ===================================================================
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    # PD prefill/decode workers also log a stats line for steps without work,
+    # so that a plain average over the lines approximates a time average.
+    SGLANG_LOG_IDLE_BATCH_STATS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
