@@ -1,19 +1,24 @@
+import inspect
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any, ClassVar
 
 import torch
-
+import torch.nn.functional as F
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
-    offline_qk_rotation_flags,
+from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
+    AttentionQuantScheme,
+    mxfp4_quant_kwargs,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -193,6 +198,237 @@ def fused_infer_attention_varlen(
     return output, lse.squeeze(-1).transpose(0, 1).contiguous()
 
 
+class AscendMXFP4Attention:
+    """MXFP4 self-attention kernel for Ascend 950 (offline MXFP4 checkpoints).
+
+    Q/K/V are dynamically quantized to packed FP4 per call and evaluated by the
+    CANN experimental ``quant_flash_attn`` extension. Sequences are padded up
+    to a kernel-friendly length and the *real* lengths are passed as
+    ``seqused_q``/``seqused_kv``, so padded rows are quantized (to keep the
+    tensor shapes aligned) but excluded from the softmax.
+
+    The kernel is created by :class:`AscendFAImpl` when the checkpoint
+    descriptor selects ``MXFP4`` attention; per-step FLOAT precision falls back
+    to the backend's unquantized paths.
+    """
+
+    def __init__(
+        self, scheme: AttentionQuantScheme, head_size: int, causal: bool
+    ) -> None:
+        if causal or head_size != 128 or get_ring_parallel_world_size() > 1:
+            raise NotImplementedError(
+                "MXFP4 attention requires unmasked D=128 attention without "
+                "ring parallelism"
+            )
+        if torch.npu.get_soc_version() < 260:
+            raise RuntimeError("MXFP4 attention requires Ascend 950")
+        if not hasattr(torch, "float8_e8m0fnu"):
+            raise RuntimeError(
+                "MXFP4 attention requires PyTorch with float8_e8m0fnu support"
+            )
+        self.scheme = scheme
+        self.description = scheme.description
+        self.pad_base = self.description.get("mxfp4_attention_pad_size", 512)
+        if self.pad_base not in (256, 512):
+            raise ValueError("mxfp4_attention_pad_size must be 256 or 512")
+        import torch_npu
+
+        if not hasattr(torch_npu, "npu_dynamic_mx_quant") or not hasattr(
+            torch_npu, "float4_e2m1fn_x2"
+        ):
+            raise RuntimeError(
+                "MXFP4 attention requires torch_npu dynamic MXFP4 quantization"
+            )
+        try:
+            from cann_ops_transformer.ops import (
+                quant_flash_attn,
+                quant_flash_attn_metadata,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "MXFP4 attention requires the CANN experimental quant_flash_attn "
+                "and quant_flash_attn_metadata extension"
+            ) from exc
+        self.quant_flash_attn = quant_flash_attn
+        self.metadata_op = quant_flash_attn_metadata
+        self.metadata_parameters = inspect.signature(self.metadata_op).parameters
+        if not {"quant_mode", "layout_q_descale"}.issubset(self.metadata_parameters):
+            raise RuntimeError(
+                "Unsupported CANN quant_flash_attn_metadata ABI; install the "
+                "experimental MXFP4 extension"
+            )
+        self._quant_kwargs = mxfp4_quant_kwargs(self.description)
+
+    # -- Public entry points -------------------------------------------------
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor:
+        """Dense attention over BSND inputs; every batch row has length S."""
+        if return_softmax_lse:
+            raise NotImplementedError("MXFP4 attention does not support softmax LSE")
+        if query.ndim != 4 or query.shape != key.shape or key.shape != value.shape:
+            raise ValueError("MXFP4 attention requires matching BSND Q/K/V shapes")
+        self._validate(query, key, value)
+        batch, length = query.shape[0], query.shape[1]
+        q, k, v = (t.transpose(1, 2).contiguous() for t in (query, key, value))
+        q, k, v = self._pad(q, k, v)
+        seqused = torch.full((batch,), length, dtype=torch.int32, device=q.device)
+        output = self._run(q, k, v, scale, seqused)
+        return output[:, :, :length].transpose(1, 2).to(query.dtype)
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        boundaries: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Packed attention over [T, N, D] inputs with ``cu_seqlens`` boundaries.
+
+        Sequences are bucketed by padded length so each ``quant_flash_attn``
+        call sees a uniform shape; the real per-sequence lengths are passed via
+        ``seqused`` so one another's (and the alignment) padding never enters
+        the softmax. This is the path varlen models such as minimax-h3 use.
+        """
+        if query.ndim != 3 or query.shape != key.shape or key.shape != value.shape:
+            raise ValueError(
+                "Packed MXFP4 attention requires matching [T, N, D] Q/K/V shapes"
+            )
+        self._validate(query, key, value)
+        output = torch.empty_like(query)
+        buckets: dict[int, list[int]] = {}
+        for index, (start, stop) in enumerate(pairwise(boundaries)):
+            if stop > start:
+                buckets.setdefault(self._padded_length(stop - start), []).append(index)
+        for padded_length, indices in buckets.items():
+            segments = [boundaries[index : index + 2] for index in indices]
+            q, k, v = (
+                torch.stack(
+                    [
+                        F.pad(
+                            tensor[start:stop].transpose(0, 1),
+                            (0, 0, 0, padded_length - stop + start),
+                        )
+                        for start, stop in segments
+                    ]
+                )
+                for tensor in (query, key, value)
+            )
+            seqused = torch.tensor(
+                [stop - start for start, stop in segments],
+                dtype=torch.int32,
+                device=q.device,
+            )
+            bucket_output = self._run(q, k, v, scale, seqused)
+            for position, index in enumerate(indices):
+                start, stop = boundaries[index], boundaries[index + 1]
+                output[start:stop] = bucket_output[
+                    position, :, : stop - start
+                ].transpose(0, 1)
+        return output
+
+    # -- Internals -----------------------------------------------------------
+
+    def _validate(self, query, key, value) -> None:
+        if query.device.type != "npu" or not (
+            query.device == key.device == value.device
+        ):
+            raise ValueError("MXFP4 attention Q/K/V must be on the same NPU")
+        if query.dtype not in (torch.bfloat16, torch.float16) or not (
+            query.dtype == key.dtype == value.dtype
+        ):
+            raise ValueError("MXFP4 attention Q/K/V must have matching FP16/BF16 dtype")
+        if query.shape[-1] != 128 or query.shape[-2] == 0 or query.shape[0] == 0:
+            raise ValueError("MXFP4 attention requires nonempty Q/K/V with D=128")
+
+    def _padded_length(self, length: int) -> int:
+        return -(-length // self.pad_base) * self.pad_base
+
+    def _pad(self, q, k, v):
+        padding = (-q.shape[2]) % self.pad_base
+        if padding:
+            q, k, v = (F.pad(t, (0, 0, 0, padding)) for t in (q, k, v))
+        return q, k, v
+
+    def _run(self, q, k, v, scale, seqused) -> torch.Tensor:
+        """Quantize padded BNSD Q/K/V and invoke the quantized-attention kernel."""
+        import torch_npu
+
+        batch, heads, length, dim = q.shape
+        quantized, descales = [], []
+        for tensor, axis in ((q, -1), (k, -1), (v, 2)):
+            packed, descale = torch_npu.npu_dynamic_mx_quant(
+                tensor.contiguous(),
+                dst_type=torch_npu.float4_e2m1fn_x2,
+                axis=axis,
+                **self._quant_kwargs,
+            )
+            quantized.append(packed.view(torch.uint8).contiguous())
+            descales.append(descale)
+        q_scale, k_scale, v_scale = descales
+        q_scale = q_scale.reshape(batch, heads, length, dim // 64, 2)
+        k_scale = k_scale.reshape(batch, heads, length, dim // 64, 2)
+        if v_scale.ndim == 4:
+            v_scale = v_scale.reshape(batch, heads, length // 64, 2, dim).transpose(
+                -1, -2
+            )
+        descales = [
+            s.contiguous().view(torch.float8_e8m0fnu)
+            for s in (q_scale, k_scale, v_scale)
+        ]
+        expected = (batch, heads, length, dim // 2)
+        if any(t.shape != expected for t in quantized) or descales[2].shape != (
+            batch,
+            heads,
+            length // 64,
+            dim,
+            2,
+        ):
+            raise RuntimeError(
+                "Unsupported torch_npu MXFP4 attention packing/scale layout"
+            )
+        common = {
+            "quant_mode": 5,
+            "seqused_q": seqused,
+            "seqused_kv": seqused,
+            "max_seqlen_q": length,
+            "max_seqlen_kv": length,
+            "mask_mode": 0,
+            "win_left": -1,
+            "win_right": -1,
+            "layout_q": "BNSD",
+            "layout_q_descale": "BNSD",
+            "layout_kv": "BNSD",
+            "layout_out": "BNSD",
+        }
+        metadata_options = {
+            "num_heads_q": heads,
+            "num_heads_kv": heads,
+            "head_dim": dim,
+            "batch_size": batch,
+        }
+        if "v_descale" in self.metadata_parameters:
+            metadata_options["v_descale"] = descales[2]
+        elif "head_dim_v" in self.metadata_parameters:
+            metadata_options["head_dim_v"] = dim
+        metadata = self.metadata_op(**metadata_options, **common)
+        return self.quant_flash_attn(
+            *quantized,
+            *descales,
+            metadata=metadata,
+            softmax_scale=scale,
+            return_softmax_lse=False,
+            **common,
+        )[0]
+
+
 @dataclass
 class AscendFAMetadata:
     pass
@@ -259,38 +495,33 @@ class AscendFAImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         quant_config = extra_impl_args.get("quant_config")
-        descriptor_scheme = (
-            quant_config.get_attention_scheme(prefix)
-            if hasattr(quant_config, "get_attention_scheme")
+        self._attention_scheme = AttentionQuantScheme.from_quant_config(
+            quant_config, prefix
+        )
+        self._mxfp4_attention = None
+        self._quant_scheme = (
+            resolve_mx_fa_scheme(quant_config)
+            if not self._attention_scheme.is_quant
             else None
         )
-        self._modelslim_attention = None
-        self._quant_scheme = (
-            resolve_mx_fa_scheme(quant_config) if descriptor_scheme is None else None
-        )
-        description = getattr(quant_config, "quant_description", {})
         attention_prefix = prefix.removesuffix(".impl")
-        q_rotation, k_rotation = offline_qk_rotation_flags(
-            description, attention_prefix
-        )
-        self.use_offline_qk_rotation = (q_rotation and k_rotation) or (
-            not attention_prefix
-            and getattr(quant_config, "use_offline_qk_rotation", False)
+        self.use_offline_qk_rotation = (
+            self._attention_scheme.use_offline_qk_rotation
+            or (
+                not attention_prefix
+                and getattr(quant_config, "use_offline_qk_rotation", False)
+            )
         )
         self._is_cross_attention = bool(
             extra_impl_args.get("is_cross_attention", False)
         )
-        if descriptor_scheme in ("FP8", "MXFP4"):
-            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_modelslim import (
-                ModelSlimAttention,
-            )
-
+        if self._attention_scheme.is_quant:
             if self._is_cross_attention:
                 raise NotImplementedError(
-                    "ModelSlim quantized attention is supported only for Wan self-attention"
+                    "Quantized MXFP4 attention is supported only for self-attention"
                 )
-            self._modelslim_attention = ModelSlimAttention(
-                descriptor_scheme, description, head_size, causal
+            self._mxfp4_attention = AscendMXFP4Attention(
+                self._attention_scheme, head_size, causal
             )
         if self._quant_scheme is not None:
             self._head_size = head_size
@@ -335,8 +566,11 @@ class AscendFAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
-        if self._modelslim_attention is not None:
-            return self._modelslim_attention.forward(
+        if (
+            self._mxfp4_attention is not None
+            and self._attention_scheme.resolve_precision() == "MXFP4"
+        ):
+            return self._mxfp4_attention.forward(
                 query, key, value, self.softmax_scale, return_softmax_lse
             )
         if (
@@ -403,9 +637,15 @@ class AscendFAImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del max_seqlen
-        if self._modelslim_attention is not None:
-            raise NotImplementedError(
-                "ModelSlim Wan quantized attention does not support packed/masked sequences"
+        if (
+            self._mxfp4_attention is not None
+            and self._attention_scheme.resolve_precision() == "MXFP4"
+        ):
+            boundaries = _packed_boundaries(
+                cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
+            )
+            return self._mxfp4_attention.forward_varlen(
+                query, key, value, self.softmax_scale, boundaries
             )
         if (
             self._quant_scheme == "MXFP8"

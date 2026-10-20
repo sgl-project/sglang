@@ -53,8 +53,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
-    offline_qk_rotation_flags,
+from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
+    AttentionQuantScheme,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -503,19 +503,16 @@ class WanTransformerBlock(nn.Module):
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
         attention_prefix = add_prefix("attn1", prefix)
-        self.attention_quant_scheme = (
-            quant_config.get_attention_scheme(attention_prefix)
-            if hasattr(quant_config, "get_attention_scheme")
-            else None
+        self.attention_quant_scheme = AttentionQuantScheme.from_quant_config(
+            quant_config, attention_prefix
         )
-        self.attention_quant_description = getattr(
-            quant_config, "quant_description", {}
-        )
-        if self.attention_quant_scheme in ("FP8", "MXFP4"):
-            if not current_platform.is_npu() or attention_type != "original":
-                raise NotImplementedError(
-                    "ModelSlim quantized Wan attention requires dense NPU attention"
-                )
+        if self.attention_quant_scheme.is_quant and (
+            not current_platform.is_npu() or attention_type != "original"
+        ):
+            raise NotImplementedError(
+                f"{attention_prefix}: quantized MXFP4 attention requires "
+                "dense attention on Ascend NPU"
+            )
 
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
@@ -530,19 +527,9 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
-            quant_description = getattr(quant_config, "quant_description", {})
-            q_rotation, k_rotation = offline_qk_rotation_flags(
-                quant_description, attention_prefix
+            self.use_offline_qk_rotation = (
+                self.attention_quant_scheme.use_offline_qk_rotation
             )
-            if q_rotation != k_rotation:
-                raise ValueError(
-                    f"{attention_prefix}: both Q/K rotation descriptors are required"
-                )
-            if self.attention_quant_scheme == "FP8" and not q_rotation:
-                raise ValueError(
-                    f"{attention_prefix}: ModelSlim FP8 attention requires exported Q/K rotations"
-                )
-            self.use_offline_qk_rotation = q_rotation and k_rotation
             if self.use_offline_qk_rotation:
                 self.register_buffer(
                     "q_rot",
@@ -562,6 +549,7 @@ class WanTransformerBlock(nn.Module):
                     ),
                     persistent=True,
                 )
+                self.attention_quant_scheme.bind(self)
 
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
@@ -572,9 +560,7 @@ class WanTransformerBlock(nn.Module):
                 quant_config=quant_config,
                 is_cross_attention=False,
                 required_attention_backend=(
-                    AttentionBackendEnum.FA
-                    if self.attention_quant_scheme in ("FP8", "MXFP4")
-                    else None
+                    self.attention_quant_scheme.required_backend
                 ),
             )
 
@@ -780,30 +766,15 @@ class WanTransformerBlock(nn.Module):
             )
 
         from sglang.multimodal_gen import envs
-        from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
-            resolve_precision,
-        )
 
-        descriptor_rotation = (
-            self.attention_quant_scheme in ("FP8", "MXFP4")
-            and resolve_precision(
-                self.attention_quant_description, "fa", self.attention_quant_scheme
-            )
-            != "FLOAT"
-        )
-        legacy_rotation = (
-            self.attention_quant_scheme is None
-            and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
-            and self.attn1.backend is AttentionBackendEnum.FA
-            and query.shape[1:3] == key.shape[1:3]
-            and key.shape == value.shape
-            and (query.shape[0] * query.shape[1]) % 64 == 0
-        )
-        if self.use_offline_qk_rotation and (descriptor_rotation or legacy_rotation):
-            self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
-            self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)
-            query = torch.matmul(query, self.q_rot)
-            key = torch.matmul(key, self.k_rot)
+        if self.attention_quant_scheme.should_apply_rotation(
+            getattr(self.attn1, "backend", None),
+            query,
+            key,
+            value,
+            legacy_mxfp8_enabled=envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION,
+        ):
+            query, key = self.attention_quant_scheme.apply_qk_rotation(query, key)
 
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)

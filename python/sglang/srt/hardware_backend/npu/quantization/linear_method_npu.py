@@ -835,7 +835,9 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
     [out, in/32]). The weight remains ND and is transposed for matmul.
-    Wan selects MindIE's activation rounding on its kernel instance.
+    Activation rounding defaults to ``round`` (see the base class); offline Wan
+    checkpoints override ``activation_round_mode`` to ``rint`` on their kernel
+    instance for MindIE parity. Other models keep the default.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

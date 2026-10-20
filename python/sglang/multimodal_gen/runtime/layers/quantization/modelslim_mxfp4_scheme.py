@@ -13,7 +13,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
     default_mxfp4_policy,
     mxfp4_quant_kwargs,
     pack_fp4_weight,
@@ -65,7 +65,6 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             )
 
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
-            # MindIE uses the operator's rint default for offline Wan.
             self.single_level_kernel.activation_round_mode = "rint"
             self.w4a8_kernel = NPUMXFP4W4A8OfflineLinearMethod()
             self.w4a8_kernel.use_wan_bias = True
@@ -74,6 +73,21 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 f"Dual-level MXFP4 quantization requires missing '{self.dual_scale_key}' in quant_config."
                 "Check that the model was exported with dual-level quantization."
             )
+
+    # -- Timestep precision policy (consumed by the Cache-DiT guard) ---------
+
+    precision_policy_target = "w4a4_linear"
+    precision_policy_default = "W4A4"
+
+    def resolve_precision(self, default_policy: dict | None = None) -> str:
+        # Dual-scale layers stay W4A4: they reject W4A8 switching and honor
+        # only the checkpoint's own policy, never the caller's schedule.
+        return resolve_precision(
+            self.quant_config,
+            self.precision_policy_target,
+            self.precision_policy_default,
+            None if self.is_dual_scale else default_policy,
+        )
 
     def create_weights(
         self,
@@ -175,9 +189,14 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        # DualLevelQuantMatmulWeightNz rejects ND weights.
+        # npu_dual_level_quant_matmul requires the weight in FRACTAL_NZ layout;
+        # the ND packed layout is rejected by DualLevelQuantMatmulWeightNz.
+        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
         weight = torch_npu.npu_format_cast(
-            weight.view(torch.int8), 29, customize_dtype=torch.int8
+            weight.view(torch.int8),
+            NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+            customize_dtype=torch.int8,
         )
         layer.weight = torch.nn.Parameter(weight, requires_grad=False)
 
@@ -213,14 +232,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         context = get_forward_context_or_none()
         batch = context.forward_batch if context is not None else None
         num_steps = getattr(batch, "num_inference_steps", 0)
-        precision = resolve_precision(
-            self.quant_config,
-            "w4a4_linear",
-            "W4A4",
-            default_policy=(
-                None if self.is_dual_scale else default_mxfp4_policy(num_steps)
-            ),
-        )
+        precision = self.resolve_precision(default_mxfp4_policy(num_steps))
         if not self.is_dual_scale:
             if getattr(layer, "use_mul_scale", False):
                 x = x * layer.mul_scale.to(x.dtype)

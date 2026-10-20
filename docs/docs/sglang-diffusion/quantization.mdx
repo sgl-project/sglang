@@ -1338,6 +1338,26 @@ Checkpoint entries in `timestep_policy.w4a4_linear` override this schedule; set
 `{"default": "W4A4"}` there for W4A4 throughout. Dual-scale layers stay W4A4 and
 reject W4A8 switching.
 
+### MXFP4 attention
+
+Self-attention blocks whose description selects `MXFP4_DYNAMIC` run quantized
+attention on Ascend 950PR/DT: Q/K/V are dynamically quantized to packed FP4 and
+evaluated by the CANN experimental `quant_flash_attn` extension. The exported
+Q/K rotation matrices (`to_q_rot`/`to_k_rot`, or `q_rot`/`k_rot` in earlier
+exports) are registered by the attention blocks and applied on quantized steps.
+
+- Sequences are padded to a kernel-friendly length (256 or 512, from
+  `mxfp4_attention_pad_size`); the real lengths are passed to the kernel so
+  padded positions never enter the softmax.
+- Packed (varlen) inputs are supported: sequences are bucketed by padded
+  length and evaluated per bucket, which is the path varlen models such as
+  MiniMax-H3 use.
+- `timestep_policy.fa` can switch attention between `FLOAT` (unquantized) and
+  `MXFP4` per step.
+- FP8 attention descriptors (`FP8_DYNAMIC`) are rejected: FP8 attention
+  requires custom MindIE kernels that SGLang does not ship. Re-quantize such
+  checkpoints with MXFP4 attention or keep attention in BF16.
+
 ### Linear backward compatibility
 
 Wan's settings apply only to its kernel instances. Existing SRT LLM defaults remain:

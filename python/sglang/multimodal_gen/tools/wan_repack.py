@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 from safetensors.torch import load_file, save_file
 
-from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
     pack_fp4_weight,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

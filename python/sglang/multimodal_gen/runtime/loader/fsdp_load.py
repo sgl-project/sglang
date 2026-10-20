@@ -910,17 +910,20 @@ def load_model_from_full_model_state_dict(
         )
 
     if skipped_checkpoint_keys:
-        # ModelSlim FP8/MXFP4 attention is calibrated with the exported Q/K
-        # rotations, so silently skipping them skews every attention score.
-        # The legacy MXFP8 path may skip exported rotations (any orthogonal
-        # matrix preserves scores), so it keeps the warning below.
+        # Quantized attention is calibrated against the checkpoint's exported
+        # Q/K rotations, so silently skipping them skews every attention score.
+        # When attention runs unquantized (descriptor FLOAT, or the legacy
+        # online-MXFP8 path) the rotations may legitimately be skipped -- any
+        # orthogonal matrix preserves scores -- so those stay a warning.
         skipped_rotations = [
             key for key in skipped_checkpoint_keys if key.endswith(("q_rot", "k_rot"))
         ]
-        if skipped_rotations and any(
-            getattr(module, "attention_quant_scheme", None) in ("FP8", "MXFP4")
+        quantized_attention_required_rotations = any(
+            (scheme := getattr(module, "attention_quant_scheme", None)) is not None
+            and scheme.requires_exported_rotations
             for module in model.modules()
-        ):
+        )
+        if skipped_rotations and quantized_attention_required_rotations:
             raise ValueError(
                 f"Checkpoint exports offline Q/K rotation tensors that the "
                 f"model did not register: {skipped_rotations[:4]}"

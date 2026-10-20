@@ -60,28 +60,31 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_dit_gro
 _original_similarity = None
 
 
-def _install_modelslim_precision_guard(transformer):
+def _install_quant_precision_guard(transformer):
+    """Invalidate Cache-DiT histories when the effective quant precision changes.
+
+    Timestep-quantized schedules (e.g. W4A8 at the schedule boundaries, W4A4
+    elsewhere) change the numerics of cached residuals mid-run. Every module
+    that exposes a ``precision_policy_target`` (attention and linear schemes
+    alike) contributes to the per-run signature; when the signature changes,
+    both CFG branch histories and calibrator caches are dropped and the step
+    is recomputed.
+    """
     modules = getattr(transformer, "modules", None)
     if modules is None:
         return
     policies = []
     for module in modules():
-        attention = getattr(module, "attention_quant_scheme", None)
-        if attention in ("FP8", "MXFP4"):
-            policies.append(
-                (module.attention_quant_description, "fa", attention, False)
-            )
-        linear = getattr(module, "scheme", None)
-        if hasattr(linear, "is_dual_scale"):
-            policies.append(
-                (linear.quant_config, "w4a4_linear", "W4A4", not linear.is_dual_scale)
-            )
+        for attr in ("attention_quant_scheme", "scheme"):
+            scheme = getattr(module, attr, None)
+            target = getattr(scheme, "precision_policy_target", None)
+            if target is not None and not any(scheme is p for p in policies):
+                policies.append(scheme)
     if not policies or getattr(transformer.forward, "_sglang_precision_guard", False):
         return
 
-    from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp_utils import (
+    from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
         default_mxfp4_policy,
-        resolve_precision,
     )
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         get_forward_context_or_none,
@@ -104,10 +107,7 @@ def _install_modelslim_precision_guard(transformer):
             previous_signature = force_step = None
         default_policy = default_mxfp4_policy(num_steps)
         signature = tuple(
-            resolve_precision(
-                description, target, default, default_policy if mixed else None
-            )
-            for description, target, default, mixed in policies
+            scheme.resolve_precision(default_policy) for scheme in policies
         )
         contexts = [
             transformer._context_manager.get_context(name)
@@ -127,7 +127,7 @@ def _install_modelslim_precision_guard(transformer):
             force_step = step
             if changed:
                 logger.info(
-                    "ModelSlim step=%d precision changed; invalidating legacy residuals",
+                    "step=%d quant precision changed; invalidating cached residuals",
                     step,
                 )
         previous_signature, previous_batch, previous_step = signature, batch, step
@@ -772,7 +772,7 @@ def enable_cache_on_transformer(
 
             context_manager._sglang_tp_sp_group = tp_sp_group
 
-    _install_modelslim_precision_guard(transformer)
+    _install_quant_precision_guard(transformer)
     if joint_cfg_decision and get_classifier_free_guidance_world_size() > 1:
         context_manager = getattr(transformer, "_context_manager", None)
         if context_manager is not None:
@@ -991,8 +991,8 @@ def enable_cache_on_dual_transformer(
                         tp_sp_group = None
                 context_manager._sglang_tp_sp_group = tp_sp_group
 
-    _install_modelslim_precision_guard(transformer)
-    _install_modelslim_precision_guard(transformer_2)
+    _install_quant_precision_guard(transformer)
+    _install_quant_precision_guard(transformer_2)
     return transformer, transformer_2
 
 
