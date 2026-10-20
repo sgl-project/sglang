@@ -1068,6 +1068,9 @@ class Envs:
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
+    # Opt in to fused MHA KV writes. Disabled by default because ScatterPa
+    # can increase memory usage during NPU compiled graph capture.
+    SGLANG_NPU_USE_SCATTER_PA_KV_CACHE = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBool(False)
     # Quantize x to int8 in the dispatch operator (vendor alias consumed by the
@@ -1075,6 +1078,8 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
+    SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
 
     # ===================================================================
     # MUSA
@@ -1326,6 +1331,12 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
+    # cannot read CUDA sources, so they are converted by sailify first).
+    # One of: native, all, all-ppu,
+    # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
+    # device only, matching how the nvcc path pins -gencode to this GPU.
+    SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1633,6 +1644,9 @@ class Envs:
     # Decoder SWA bounded replay: eager prefill steps with up to this many tail rows
     # run the tail layers from CUDA graphs (buckets of 128 rows); 0 keeps them eager.
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = EnvInt(2048)
+    # Prefill-graph shapes of at least this many tokens run the tail from the tail
+    # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
+    SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
     # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
@@ -2133,9 +2147,6 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
-    ),
-    "SGLANG_ENABLE_UNIFIED_RADIX_TREE": _DeprecatedEnv(
-        note="The unified radix tree is the default tree cache now; unset this env."
     ),
 }
 
