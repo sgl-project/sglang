@@ -240,6 +240,36 @@ fn total_tokens_over_context_is_rejected() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
 }
 
+/// A launcher whose default for an omitted `max_new_tokens` is `None` (no
+/// limit) under `--context-length` lets a prompt near the window through
+/// untouched; the scheduler clamps the output to the room the window leaves.
+/// A fixed default (128) or an explicit context-length value would be a 400.
+#[test]
+fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
+    let limits = Limits {
+        context_len: 1000,
+        ..test_limits()
+    };
+    let request = |max_new_tokens| GenerateRequest {
+        input_ids: Some(vec![1; 990]),
+        sampling_params: SamplingParams {
+            max_new_tokens,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut g = request(None);
+    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert_eq!(
+        g.sampling_params.max_new_tokens, None,
+        "left to the scheduler"
+    );
+    for rejected in [Some(128), Some(1000)] {
+        let err = check_total_tokens(&mut request(rejected), &limits).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{rejected:?}");
+    }
+}
+
 /// The reserved slots (eagle draft tokens) count as input, so a request can be
 /// rejected for them even when the prompt alone would fit.
 #[test]
