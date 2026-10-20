@@ -1794,7 +1794,10 @@ class ModelRunner:
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        with device_timer_ctx(self.device_timer, "split_prefill"):
+        with (
+            get_model().override(shared_experts=self.model.shared_experts_config),
+            device_timer_ctx(self.device_timer, "split_prefill"),
+        ):
             ret = self.model.forward_split_prefill(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -1968,7 +1971,10 @@ class ModelRunner:
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+        with (
+            get_model().override(shared_experts=self.model.shared_experts_config),
+            ctx_mgr,
+        ):
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
