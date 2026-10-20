@@ -2292,9 +2292,9 @@ class DeepseekV4HipRadixBackend(
         """Switch the late layers onto the tail metadata; exit_late_layer_tail takes the
         return value. The source layer runs inside the tail and publishes its top-k and
         candidates on the tail rows, so nothing is carried over from the full rows."""
-        assert (
-            self.tail_source_kv_layer_id is not None
-        ), "write_tail_source_kv must run before enter_late_layer_tail"
+        assert self.tail_source_kv_layer_id is not None, (
+            "write_tail_source_kv must run before enter_late_layer_tail"
+        )
         tail_metadata = self.tail_forward_metadata
         assert tail_metadata is not None, "no tail metadata for this forward"
         saved = (self.forward_metadata, self.candidate_masks)
