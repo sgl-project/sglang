@@ -118,14 +118,6 @@ impl SwaComponent {
         }
     }
 
-    fn value_len<K: ChildKeyType>(node: &Node<K>, host: bool) -> usize {
-        if host {
-            node.host_value_len(SWA)
-        } else {
-            node.device_value_len(SWA)
-        }
-    }
-
     fn swa_uuid<K: ChildKeyType>(node: &Node<K>, host: bool) -> Option<i64> {
         if host {
             node.swa_host_uuid
@@ -682,7 +674,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 .entry(ct)
                 .or_default()
                 .push(node.device_value(FULL).shallow_clone());
-            freed = node.device_value_len(SWA);
+            freed = node.device_reclaimable_value_len(SWA);
             let _ = node.take_device_value(SWA);
             tree_core.dec_evictable_size(SWA, freed);
         }
@@ -1172,7 +1164,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             let parent = node.parent();
             let key_len = node.key.atom_len();
             let has_value = Self::has_value(node, lock_host);
-            let value_len = Self::value_len(node, lock_host);
+            let value_len = node.device_reclaimable_value_len(SWA);
             let newly_locked = Self::lock_ref(node, lock_host) == 0;
             Self::inc_lock_ref(node, lock_host);
             if newly_locked && has_value {
@@ -1225,7 +1217,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 if lock_host { "host_" } else { "" }
             );
             let has_value = Self::has_value(node, lock_host);
-            let value_len = Self::value_len(node, lock_host);
+            let value_len = node.device_reclaimable_value_len(SWA);
             if lock_ref == 1 && has_value {
                 if lock_host {
                     if !node.has_device_value(SWA) {
@@ -1288,7 +1280,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 "SWA window release hit lock_ref=0 on node {cur}"
             );
             let has_value = node.has_device_value(SWA);
-            let value_len = node.device_value_len(SWA);
+            let value_len = node.device_reclaimable_value_len(SWA);
             node.dec_device_lock_ref(SWA);
             let now_unlocked = node.device_lock_ref(SWA) == 0;
             if now_unlocked {

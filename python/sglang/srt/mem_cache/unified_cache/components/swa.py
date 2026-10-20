@@ -701,7 +701,7 @@ class SWAComponent(TreeComponent):
             device_frees[self.component_type].append(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
-            freed = len(cd.value)
+            freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
 
@@ -866,7 +866,7 @@ class SWAComponent(TreeComponent):
                     if lru.in_list(cur):
                         lru.remove_node(cur)
                 else:
-                    key_len = len(value)
+                    key_len = self.reclaimable_value_len(cur)
                     self.tree_core.component_evictable_size_[ct] -= key_len
                     self.tree_core.component_protected_size_[ct] += key_len
             if lock_host:
@@ -915,7 +915,7 @@ class SWAComponent(TreeComponent):
                         if not host_lru.in_list(cur):
                             host_lru.insert_mru(cur)
                 else:
-                    key_len = len(value)
+                    key_len = self.reclaimable_value_len(cur)
                     self.tree_core.component_evictable_size_[ct] += key_len
                     self.tree_core.component_protected_size_[ct] -= key_len
             if lock_host:
@@ -960,7 +960,7 @@ class SWAComponent(TreeComponent):
             if cd.lock_ref == 0:
                 self.tree_core._update_evictable_leaf_sets(cur)
             if cd.lock_ref == 0 and cd.value is not None:
-                value_len = len(cd.value)
+                value_len = self.reclaimable_value_len(cur)
                 self.tree_core.component_protected_size_[ct] -= value_len
                 self.tree_core.component_evictable_size_[ct] += value_len
                 if self.tree_core._is_device_leaf(cur):
