@@ -112,7 +112,7 @@ class DWDPWeightManager(DwdpPrefetch):
         self._weight_names = list(weight_names)
         self._dwdp_rank = dwdp_rank
         self._dwdp_size = dwdp_size
-        # Transport handles underpin the VA mappings; must outlive this manager.
+        # transport handles underpin the VA mappings; must outlive this manager
         self._transport = transport
         self._init_prefetch(torch.cuda, torch.device("cuda", weight_buffer.device_id))
         logger.debug(
