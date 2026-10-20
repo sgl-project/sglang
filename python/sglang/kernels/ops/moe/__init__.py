@@ -304,3 +304,35 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "router_pooler_topk",
+        "router_pooler_topk",
+        "FP32 router + BF16 pooler + sigmoid top-8 / RMSNorm epilogue",
+    ),
+    (
+        "router_pooler_topk",
+        "joint_router_pooler_topk",
+        "packed router/pooler split-K GEMM + top-8 / RMSNorm epilogue",
+    ),
+    (
+        "mxfp4_compact_a4_moe",
+        "compact_a4_experts",
+        "A4W4 MXFP4 experts for small verify batches (32 local experts, top-8)",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+            description=_desc,
+        )
+    )
+del _mod, _fn, _desc

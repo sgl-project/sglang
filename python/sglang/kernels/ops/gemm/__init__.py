@@ -643,3 +643,46 @@ register_kernel(
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
     )
 )
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "bf16_splitk_gemm",
+        "bf16_splitk_gemm_partials",
+        "BF16 small-M split-K GEMM partials in FP32",
+    ),
+    (
+        "bf16_tiled_small_m_gemm",
+        "tiled_gemm",
+        "BF16 17..64-row GEMM from a tile-contiguous weight copy",
+    ),
+    ("router_gemm_fp32", "router_gemv_fp32", "bf16 x fp32 router logits GEMV, M <= 64"),
+    (
+        "router_gemm_fp32",
+        "router_gemm_tuned",
+        "bf16 x fp32 router logits, tuned split-K at verify widths",
+    ),
+    (
+        "bf16_gemm_hipblaslt_tuned",
+        "bf16_gemm_hipblaslt",
+        "BF16 GEMM on a fixed hipBLASLt solution (tuned table)",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual",
+        "MoE unpooler GEMM + boundary norms + gated residual",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+            description=_desc,
+        )
+    )
+del _mod, _fn, _desc

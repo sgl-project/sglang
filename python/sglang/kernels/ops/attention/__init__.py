@@ -421,3 +421,50 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "qk_norm_rope_cache",
+        "qk_norm_rope_cache",
+        "QK RMSNorm + interleaved RoPE + FP8 paged KV store, head_dim 64",
+    ),
+    (
+        "qk_norm_rope_cache",
+        "qkv_proj_qk_norm_rope_cache",
+        "QKV+gate split-K projection with the QK-norm/RoPE/FP8-cache epilogue",
+    ),
+    (
+        "swa_verify_splitkv",
+        "swa_verify_splitkv",
+        "8-token GQA-8 verify on a 2047-token window, split-KV, FP8 KV page 16",
+    ),
+    (
+        "gqa_verify_splitkv",
+        "gqa_verify_splitkv",
+        "8-token GQA-8 verify, one 64-row tile per (request, KV head), split-KV",
+    ),
+    (
+        "gqa_verify_splitkv_2kv",
+        "gqa_verify_splitkv_2kv",
+        "8-token full-attention verify, both KV heads per program, split-KV",
+    ),
+    (
+        "dflash_block_splitkv",
+        "dflash_block_splitkv",
+        "DFlash 8-row block extend over an FP8 prefix cache, split-KV, head_dim 128",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+            description=_desc,
+        )
+    )
+del _mod, _fn, _desc
