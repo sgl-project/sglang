@@ -65,6 +65,10 @@ from sglang.srt.managers.load_snapshot import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.trace import (
+    get_global_tracing_enabled,
+    process_tracing_init,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
 )
@@ -603,6 +607,14 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        # Requests are unpickled in this process before being forwarded. Without
+        # tracing initialized, TraceReqContext.__setstate__ disables their traces.
+        if server_args.enable_trace and not get_global_tracing_enabled():
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                trace_modules=server_args.trace_modules,
+            )
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
