@@ -11,11 +11,15 @@ instead.
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
+from transformers import PreTrainedTokenizerBase
 from transformers.utils import get_json_schema
 
-from sglang.srt.parser.glm53_chat_template import render_glm53, render_glm53_flash
+from sglang.srt.parser.glm53_chat_template import (
+    render_glm53_flash_segments,
+    render_glm53_segments,
+)
 from sglang.srt.parser.template_detection import (
     ReasoningToggleConfig,
     is_glm53_template,
@@ -26,12 +30,13 @@ from sglang.srt.parser.template_detection import (
 class PythonChatTemplate:
     """A chat template implemented in Python, with the features sglang needs.
 
-    ``render(messages, tools=None, add_generation_prompt=False, **kwargs)``
-    receives the same variables a Jinja template does and returns the prompt.
+    ``render_segments(messages, tools=None, add_generation_prompt=False,
+    **kwargs)`` receives the same variables a Jinja template does and returns
+    the strings that concatenate to the prompt.
     """
 
     name: str
-    render: Callable[..., str]
+    render_segments: Callable[..., List[str]]
     content_format: str
     reasoning_config: Optional[ReasoningToggleConfig]
     may_reorder_tool_results: bool
@@ -54,9 +59,13 @@ _GLM53_FEATURES: Dict[str, Any] = dict(
     tool_call_parser="glm47",
 )
 
-GLM53 = PythonChatTemplate(name="glm-5.3", render=render_glm53, **_GLM53_FEATURES)
+GLM53 = PythonChatTemplate(
+    name="glm-5.3", render_segments=render_glm53_segments, **_GLM53_FEATURES
+)
 GLM53_FLASH = PythonChatTemplate(
-    name="glm-5.3-flash", render=render_glm53_flash, **_GLM53_FEATURES
+    name="glm-5.3-flash",
+    render_segments=render_glm53_flash_segments,
+    **_GLM53_FEATURES,
 )
 
 PYTHON_CHAT_TEMPLATES: Dict[str, PythonChatTemplate] = {
@@ -121,6 +130,42 @@ def _tool_schemas(tools):
     return schemas
 
 
+def _render_segments(
+    tokenizer, template, conversation, tools, documents, add_generation_prompt, kwargs
+):
+    if isinstance(conversation, (list, tuple)) and len(conversation) == 0:
+        raise ValueError(
+            "Cannot apply chat template to an empty conversation. Provide at "
+            "least one message."
+        )
+    is_batched = isinstance(conversation, (list, tuple)) and (
+        isinstance(conversation[0], (list, tuple))
+        or hasattr(conversation[0], "messages")
+    )
+    conversations = conversation if is_batched else [conversation]
+    tool_schemas = _tool_schemas(tools)
+    if documents is not None:
+        for document in documents:
+            if not isinstance(document, dict):
+                raise TypeError(
+                    "Documents should be a list of dicts with 'title' and 'text' keys!"
+                )
+
+    # As for Jinja, kwargs override special tokens of the same name.
+    template_kwargs = {**tokenizer.special_tokens_map, **kwargs}
+    segments = [
+        template.render_segments(
+            messages=getattr(chat, "messages", chat),
+            tools=tool_schemas,
+            documents=documents,
+            add_generation_prompt=add_generation_prompt,
+            **template_kwargs,
+        )
+        for chat in conversations
+    ]
+    return segments, is_batched
+
+
 def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -> None:
     """Make ``tokenizer.apply_chat_template`` render with ``template``.
 
@@ -174,37 +219,16 @@ def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -
                 **kwargs,
             )
 
-        if isinstance(conversation, (list, tuple)) and len(conversation) == 0:
-            raise ValueError(
-                "Cannot apply chat template to an empty conversation. Provide at "
-                "least one message."
-            )
-        is_batched = isinstance(conversation, (list, tuple)) and (
-            isinstance(conversation[0], (list, tuple))
-            or hasattr(conversation[0], "messages")
+        segments, is_batched = _render_segments(
+            tokenizer,
+            template,
+            conversation,
+            tools,
+            documents,
+            add_generation_prompt,
+            kwargs,
         )
-        conversations = conversation if is_batched else [conversation]
-        tool_schemas = _tool_schemas(tools)
-        if documents is not None:
-            for document in documents:
-                if not isinstance(document, dict):
-                    raise TypeError(
-                        "Documents should be a list of dicts with 'title' and "
-                        "'text' keys!"
-                    )
-
-        # As for Jinja, kwargs override special tokens of the same name.
-        template_kwargs = {**tokenizer.special_tokens_map, **kwargs}
-        rendered = [
-            template.render(
-                messages=getattr(chat, "messages", chat),
-                tools=tool_schemas,
-                documents=documents,
-                add_generation_prompt=add_generation_prompt,
-                **template_kwargs,
-            )
-            for chat in conversations
-        ]
+        rendered = ["".join(chat_segments) for chat_segments in segments]
         rendered_chat = rendered if is_batched else rendered[0]
         if not tokenize:
             return rendered_chat
@@ -222,3 +246,39 @@ def install_python_chat_template(tokenizer: Any, template: PythonChatTemplate) -
 
     tokenizer._sglang_jinja_apply_chat_template = jinja_apply_chat_template
     tokenizer.apply_chat_template = apply_chat_template
+
+
+_APPLY_CHAT_TEMPLATE_PARAMETERS = frozenset(
+    inspect.signature(PreTrainedTokenizerBase.apply_chat_template).parameters
+)
+
+
+def render_chat_segments(
+    tokenizer: Any,
+    template: PythonChatTemplate,
+    messages: List[Any],
+    *,
+    tools: Optional[List[Any]] = None,
+    add_generation_prompt: bool = False,
+    template_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[List[str]]:
+    """The segments of ``tokenizer.apply_chat_template(messages, tools=tools,
+    add_generation_prompt=add_generation_prompt, tokenize=False,
+    **template_kwargs)`` once ``template`` is installed on ``tokenizer``.
+
+    None unless ``template_kwargs`` holds template variables only, since an
+    argument of ``apply_chat_template`` itself can route that call elsewhere.
+    """
+    template_kwargs = template_kwargs or {}
+    if not _APPLY_CHAT_TEMPLATE_PARAMETERS.isdisjoint(template_kwargs):
+        return None
+    segments, is_batched = _render_segments(
+        tokenizer,
+        template,
+        messages,
+        tools,
+        None,
+        add_generation_prompt,
+        template_kwargs,
+    )
+    return None if is_batched else segments[0]

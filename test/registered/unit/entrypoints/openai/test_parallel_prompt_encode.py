@@ -589,5 +589,164 @@ class TestGatesAndArgumentAllowlist(_EncodeCase):
         self._assert_original(self.text, None)
 
 
+def _fuzz_segments():
+    """Prompts as a renderer hands them over: specials on their own, between
+    text that may end or start with part of a special, or hold whole ones."""
+    rng = random.Random(1)
+    partials = [s[:i] for s in _SPECIALS for i in range(1, len(s))]
+    partials += [s[i:] for s in _SPECIALS for i in range(1, len(s))]
+    atoms = list("aZ é中🙂'1 \n\r\t.,;:{}()<>/|[]_-") + _SPECIALS + partials
+
+    def text():
+        return "".join(rng.choice(atoms) for _ in range(rng.randint(0, 40)))
+
+    return [
+        [
+            rng.choice(_SPECIALS) if rng.random() < 0.4 else text()
+            for _ in range(rng.randint(0, 30))
+        ]
+        for _ in range(1500)
+    ]
+
+
+class TestPromptSegments(_EncodeCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
+        ppe._segment_encoders = weakref.WeakKeyDictionary()
+        self.tokenizer = _tokenizer()
+
+    def _assert_segments_match_encode(
+        self, tokenizer, segments, kwargs_variants=_ALL_KWARGS
+    ):
+        text = "".join(segments)
+        for encode_kwargs in kwargs_variants:
+            # The second call reads the ids the first one cached.
+            for _ in range(2):
+                self.assertEqual(
+                    ppe.encode_prompt_segments(tokenizer, segments, encode_kwargs),
+                    tokenizer.encode(text, **encode_kwargs),
+                    f"{encode_kwargs} on {segments[:8]!r}",
+                )
+
+    def test_ids_equal_one_encode_of_the_joined_prompt(self):
+        edge_cases = [
+            [],
+            [""],
+            ["<|user|>"],
+            ["<|user|>", "<|assistant|>"],
+            ["/no", "<think>", "think>"],
+            ["<|user|", "<|user|>", "|>"],
+            ["[gMASK]", "<sop>", "<|user|>", "hello <think> world", "<|assistant|>"],
+        ]
+        for segments in edge_cases + _fuzz_segments():
+            self._assert_segments_match_encode(self.tokenizer, segments)
+
+    def test_text_between_cut_points_is_encoded_once_whatever_the_length(self):
+        self._set_min_chars(1 << 20)
+        first = ["<|user|>", "hello world", "<|assistant|>"]
+        second = first + ["<think>", "fresh text"]
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            self._assert_segments_match_encode(self.tokenizer, first, ({},))
+            self._assert_segments_match_encode(self.tokenizer, second, ({},))
+        self.assertEqual(
+            [call.args[1] for call in encode.call_args_list],
+            [["hello world"], ["fresh text"]],
+        )
+
+    def test_long_text_between_cut_points_is_split(self):
+        self._set_min_chars(4096)
+        long_text = "the quick brown fox jumps over the lazy dog\n" * 300
+        segments = ["<|user|>", long_text, "<|assistant|>", "<think>"]
+        with unittest.mock.patch.object(
+            ppe, "split_prompt", wraps=ppe.split_prompt
+        ) as split:
+            self._assert_segments_match_encode(self.tokenizer, segments, ({},))
+        self.assertEqual([call.args[0] for call in split.call_args_list], [long_text])
+
+    def test_a_token_another_added_token_can_overlap_is_not_a_cut_point(self):
+        tokenizer = _tokenizer(
+            lambda b: b.add_tokens(
+                [
+                    AddedToken(token, normalized=False)
+                    for token in ("x<|user|>", "ab<th", "<sop>!")
+                ]
+            )
+        )
+        encoder = ppe._segment_encoder_for(tokenizer)
+        for token in ("<|user|>", "<think>", "<sop>"):
+            self.assertIsNone(encoder.cut_id(token), token)
+        self.assertIsNotNone(encoder.cut_id("<|assistant|>"))
+        for segments in (
+            ["x", "<|user|>", "q"],
+            ["ab", "<think>", "ink"],
+            ["<sop>", "!", "<|assistant|>"],
+        ):
+            self._assert_segments_match_encode(tokenizer, segments)
+
+    def _assert_falls_back(self, tokenizer, segments, encode_kwargs):
+        with (
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "encode",
+                side_effect=AssertionError("segment path taken"),
+            ),
+            unittest.mock.patch.object(
+                ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+            ) as fallback,
+        ):
+            ids = ppe.encode_prompt_segments(tokenizer, segments, encode_kwargs)
+        fallback.assert_called_once()
+        self.assertEqual(ids, tokenizer.encode("".join(segments), **encode_kwargs))
+
+    def test_falls_back_where_parallel_prompt_encode_decides(self):
+        segments = ["<|user|>", "hello world " * 50, "<|assistant|>", "<think>"]
+        cases = {
+            "no plan": (_tokenizer(_metaspace), {}),
+            "specials asked for": (_tokenizer(_post_processor_adds_bos), {}),
+            "encode kwargs outside the allowlist": (
+                self.tokenizer,
+                {"truncation": False},
+            ),
+        }
+        for name, mutate in {
+            "truncation": lambda b: b.enable_truncation(50),
+            "padding": lambda b: b.enable_padding(length=64),
+            "encode_special_tokens": lambda b: setattr(
+                b, "encode_special_tokens", True
+            ),
+        }.items():
+            tokenizer = _tokenizer()
+            mutate(tokenizer._tokenizer)
+            cases[name] = (tokenizer, {})
+        for name, (tokenizer, encode_kwargs) in cases.items():
+            with self.subTest(name):
+                self._assert_falls_back(tokenizer, segments, encode_kwargs)
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
+            self._assert_falls_back(self.tokenizer, segments, {})
+
+    def test_the_cache_keeps_to_its_token_budget(self):
+        with (
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_TOKENS", 40),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_TOKENS", 20),
+        ):
+            for i in range(30):
+                self._assert_segments_match_encode(
+                    self.tokenizer, ["<|user|>", f"turn {i} hello world"], ({},)
+                )
+            self._assert_segments_match_encode(
+                self.tokenizer, ["<|user|>", "hello world " * 30], ({},)
+            )
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        self.assertLessEqual(encoder.cached_tokens, 40)
+        self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
+        self.assertNotIn("hello world " * 30, encoder.cache)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
