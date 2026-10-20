@@ -224,7 +224,7 @@ class KDAKernelDispatcher:
                 # SM100 chunk prefill pipeline.
                 self.extend_kernel = cutedsl_kernel
             else:
-                # CuTe DSL prefill kernels need SM100 (Blackwell); on older GPUs
+                # CuTe DSL prefill kernels need SM10x (tcgen05); elsewhere
                 # fall back to the Triton chunk kernel.
                 self.extend_kernel = triton_kernel
                 rank0_log(
@@ -531,7 +531,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
-            from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+            from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
                 fused_kda_conv_gating_verify,
             )
 
