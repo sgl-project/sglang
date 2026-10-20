@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -740,6 +742,7 @@ class BuildOutTokens:
         bonus: torch.Tensor,
         verify_num_draft_tokens: int,
         gamma: int,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return build_out_tokens(
             draft_tokens=draft_tokens,
@@ -747,6 +750,7 @@ class BuildOutTokens:
             bonus=bonus,
             verify_num_draft_tokens=verify_num_draft_tokens,
             gamma=gamma,
+            out=out,
         )
 
     @classmethod
@@ -758,6 +762,7 @@ class BuildOutTokens:
         bonus: torch.Tensor,
         verify_num_draft_tokens: int,
         gamma: int,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return build_out_tokens_triton(
             draft_tokens=draft_tokens,
@@ -765,6 +770,7 @@ class BuildOutTokens:
             bonus=bonus,
             verify_num_draft_tokens=verify_num_draft_tokens,
             gamma=gamma,
+            out=out,
         )
 
 
@@ -775,6 +781,7 @@ def build_out_tokens(
     bonus: torch.Tensor,
     verify_num_draft_tokens: int,
     gamma: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     bs = draft_tokens.shape[0]
     out_tokens = torch.empty(
@@ -785,7 +792,9 @@ def build_out_tokens(
     out_tokens[:, :gamma].copy_(draft_tokens)
     out_tokens[:, gamma].fill_(0)
     out_tokens.scatter_(1, correct_len.to(torch.int64)[:, None], bonus[:, None])
-    return out_tokens
+    if out is None:
+        return out_tokens
+    return out.copy_(out_tokens)
 
 
 @triton.jit
@@ -819,14 +828,19 @@ def build_out_tokens_triton(
     bonus: torch.Tensor,
     verify_num_draft_tokens: int,
     gamma: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """``out``: a contiguous [bs, verify_num_draft_tokens] int64 buffer to fill."""
     bs = draft_tokens.shape[0]
     T = verify_num_draft_tokens
     device = draft_tokens.device
     draft_tokens = draft_tokens.to(torch.int64).contiguous()
-    correct_len_i = correct_len.to(torch.int64).contiguous()
+    # the kernel widens the int32 correct lengths as it loads them
+    correct_len_i = correct_len.contiguous()
     bonus_i = bonus.to(torch.int64).contiguous()
-    out = torch.empty((bs, T), dtype=torch.int64, device=device)
+    if out is None:
+        out = torch.empty((bs, T), dtype=torch.int64, device=device)
+    assert out.shape == (bs, T) and out.dtype == torch.int64 and out.is_contiguous()
     n_out = bs * T
     BLOCK = 256
     grid = (triton.cdiv(n_out, BLOCK),)
