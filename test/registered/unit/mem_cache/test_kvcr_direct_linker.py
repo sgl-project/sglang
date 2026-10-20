@@ -465,6 +465,32 @@ class TestKVCRDirectLinker(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "DMA still active"):
             self.linker.close()
         self.assertFalse(self.runtime.closed)
+
+    def test_owner_failure_unblocks_finish_without_releasing_native_memory(self):
+        """A poll failure after finish subscribes must not strand its waiter."""
+        self.linker.load("finish-race", self.transfer(["page"]))
+        index = self.linker.start_layer_wise_loading()
+        eventually(lambda: len(self.client.calls) == 3)
+        result = Future()
+
+        def finish():
+            try:
+                result.set_result(self.linker.finish_layer_wise_loading(index))
+            except BaseException as error:
+                result.set_exception(error)
+
+        waiter = threading.Thread(target=finish, daemon=True)
+        waiter.start()
+        try:
+            eventually(lambda: index not in self.linker._batch_results)
+            self.client.fail_poll = True
+            with self.assertRaisesRegex(RuntimeError, "owner poll failed"):
+                result.result(timeout=2)
+            self.assertFalse(self.runtime.closed)
+            self.assertIn("finish-race", self.linker._loads)
+        finally:
+            self.linker.close()
+            waiter.join(timeout=2)
         self.assertTrue(self.linker._thread.is_alive())
         self.runtime.close_error = False
         self.linker.close()
