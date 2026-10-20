@@ -33,6 +33,7 @@ CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
 # Workflow `name:` field, which is what the runs API reports (not the filename).
 EXTRA_WORKFLOW_NAME = "PR Test Extra"
+MLU_WORKFLOW_NAME = "PR Test (MLU)"
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -312,21 +313,23 @@ def has_sgl_kernel_changes(pr):
 
 
 def handle_tag_run_ci(
-    gh_repo, pr, comment, user_perms, react_on_success=True, tag_extra=False
+    gh_repo,
+    pr,
+    comment,
+    user_perms,
+    react_on_success=True,
+    tag_extra=False,
+    tag_mlu=False,
 ):
     """
     Handles the /tag-run-ci-label command.
 
-    When tag_extra is True (triggered by the `extra` argument), also adds the
-    `run-ci-extra` label. pr-test-extra.yml gates on BOTH `run-ci` and
-    `run-ci-extra`, so both must be present for the extra workflow to run —
-    we always add `run-ci` alongside `run-ci-extra`. Reuses the same
-    `can_tag_run_ci_label` permission.
+    The optional `extra` and `mlu` arguments add `run-ci-extra` and
+    `run-ci-mlu`, respectively, alongside `run-ci`. All labels require the
+    existing `can_tag_run_ci_label` permission.
 
-    Labels added here do not start a run: GITHUB_TOKEN label events do not
-    trigger workflows, and no PR workflow listens to `labeled`. The label
-    gate in pr-gate.yml reads the live label set, so the next push, or a
-    rerun of the gated run (/tag-and-rerun-ci), picks the labels up.
+    GITHUB_TOKEN label events do not trigger workflows. A subsequent push or
+    explicit rerun is needed to run CI with the updated labels.
 
     Returns True if action was taken, False otherwise.
     """
@@ -337,6 +340,8 @@ def handle_tag_run_ci(
     labels = ["run-ci"]
     if tag_extra:
         labels.append("run-ci-extra")
+    if tag_mlu:
+        labels.append("run-ci-mlu")
     print(f"Permission granted. Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
@@ -368,7 +373,9 @@ def _latest_run_per_workflow(runs):
     return list(latest.values())
 
 
-def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+def handle_rerun_failed_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, skip_mlu=False
+):
     """
     Handles the /rerun-failed-ci command.
     Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
@@ -452,6 +459,8 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     rerun_count = 0
     for run in runs:
+        if skip_mlu and run.name == MLU_WORKFLOW_NAME:
+            continue
         if run.status != "completed":
             # A newer attempt is still in flight - nothing to recover.
             continue
@@ -486,6 +495,55 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     else:
         print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
         return False
+
+
+def _run_mlu_ci(gh_repo, pr):
+    """Recheck live MLU opt-in labels with a full rerun. Returns (acted, message)."""
+    try:
+        workflow = gh_repo.get_workflow("pr-test-mlu.yml")
+        runs = workflow.get_runs(
+            event="pull_request_target", head_sha=pr.head.sha, branch=pr.head.ref
+        )
+        # Fork runs can have an empty pull_requests array, so match the source
+        # repository in addition to the SHA and branch. Newest run wins.
+        run = next((r for r in runs if r.head_repository.id == pr.head.repo.id), None)
+        if run is None:
+            return False, (
+                f"No `{MLU_WORKFLOW_NAME}` run exists for this commit, so there is "
+                "nothing to re-run. Push a commit to create one."
+            )
+        if run.status != "completed":
+            return True, (
+                f"⏳ [`{MLU_WORKFLOW_NAME}`]({run.html_url}) is already "
+                f"{run.status} for this commit; left it alone."
+            )
+        if run.conclusion == "action_required":
+            return False, f"[`{MLU_WORKFLOW_NAME}`]({run.html_url}) requires approval."
+        # Successful opt-in checks must run again after labels change, including
+        # when the workflow previously succeeded with all MLU suites skipped.
+        run.rerun()
+    except Exception as e:
+        return False, f"Failed to re-run `{MLU_WORKFLOW_NAME}`: {e}"
+    return True, f"🚀 Re-running [`{MLU_WORKFLOW_NAME}`]({run.html_url})."
+
+
+def handle_run_mlu_ci(gh_repo, pr, comment, user_perms):
+    """Label for MLU CI and rerun only its workflow, using existing permissions."""
+    if not user_perms.get("can_rerun_failed_ci", False):
+        print("Permission denied: can_rerun_failed_ci is false.")
+        return False
+    tagged = handle_tag_run_ci(
+        gh_repo, pr, comment, user_perms, react_on_success=False, tag_mlu=True
+    )
+    if not tagged:
+        return False
+
+    print("Waiting 5 seconds for labels to propagate...")
+    time.sleep(5)
+    acted, message = _run_mlu_ci(gh_repo, pr)
+    pr.create_issue_comment(message if acted else f"⛔ {message}")
+    comment.create_reaction("+1" if acted else "confused")
+    return acted
 
 
 def _run_extra_ci(gh_repo, pr):
@@ -1724,6 +1782,7 @@ KNOWN_COMMANDS = (
     "/run-full-ci",
     "/run-extra-ci",
     "/run-cpu-ci",
+    "/run-mlu-ci",
 )
 
 # Removed commands, kept because they were documented long enough that muscle
@@ -1820,11 +1879,10 @@ def main():
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
-    # `extra` argument opts in to also tagging `run-ci-extra`. Both
-    # `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` share this
-    # parser so the surface is symmetric.
+    # Both label commands accept the same optional backend arguments.
     tokens = first_line.split()
-    tag_extra = len(tokens) > 1 and "extra" in tokens[1:]
+    tag_extra = "extra" in tokens[1:]
+    tag_mlu = "mlu" in tokens[1:]
 
     # /run-full-ci is the short, spelled-out form of `/tag-and-rerun-ci extra`
     # and shares its branch below. /rerun-* spellings are accepted silently as
@@ -1837,23 +1895,36 @@ def main():
         tag_extra = True
 
     if first_line.startswith("/tag-run-ci-label"):
-        handle_tag_run_ci(repo, pr, comment, user_perms, tag_extra=tag_extra)
+        handle_tag_run_ci(
+            repo, pr, comment, user_perms, tag_extra=tag_extra, tag_mlu=tag_mlu
+        )
 
     elif is_extra_ci:
         handle_run_extra_ci(repo, pr, comment, user_perms)
 
     elif first_line.startswith(("/run-cpu-ci", "/rerun-cpu-ci")):
         handle_run_cpu_ci(repo, pr, comment, user_perms, token)
+    elif first_line.startswith("/run-mlu-ci"):
+        handle_run_mlu_ci(repo, pr, comment, user_perms)
 
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
 
     elif first_line.startswith("/tag-and-rerun-ci") or is_full_ci:
         # Perform both actions, but suppress individual reactions
-        print(f"Processing combined command: {first_line} (tag_extra={tag_extra})")
+        print(
+            f"Processing combined command: {first_line} "
+            f"(tag_extra={tag_extra}, tag_mlu={tag_mlu})"
+        )
 
         tagged = handle_tag_run_ci(
-            repo, pr, comment, user_perms, react_on_success=False, tag_extra=tag_extra
+            repo,
+            pr,
+            comment,
+            user_perms,
+            react_on_success=False,
+            tag_extra=tag_extra,
+            tag_mlu=tag_mlu,
         )
 
         # Wait for the label to propagate before triggering rerun
@@ -1862,8 +1933,17 @@ def main():
             time.sleep(5)
 
         rerun = handle_rerun_failed_ci(
-            repo, pr, comment, user_perms, react_on_success=False
+            repo,
+            pr,
+            comment,
+            user_perms,
+            react_on_success=False,
+            skip_mlu=tagged and tag_mlu,
         )
+        if tagged and tag_mlu and user_perms.get("can_rerun_failed_ci", False):
+            mlu_acted, message = _run_mlu_ci(repo, pr)
+            pr.create_issue_comment(message if mlu_acted else f"⛔ {message}")
+            rerun = mlu_acted or rerun
 
         # If at least one action was successful, add the reaction here
         if tagged or rerun:
