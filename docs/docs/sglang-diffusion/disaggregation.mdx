@@ -98,9 +98,10 @@ into other hosts.
 Contracts define the dependencies: independent encoding branches can run in
 parallel, and a downstream stage waits for its inputs. Role names do not imply
 ordering. Within one role, stages keep their pipeline order and communicate
-through the local request context, without a network hop. Cross-role edges
-transfer only the declared fields their consumers need. Independent requests can
-use different replicas of a role.
+through the local request context, without a network hop. Sequential deployments
+can transfer the request context automatically; explicit-field graphs transfer
+only the declared fields their consumers need. Independent requests can use
+different replicas of a role.
 
 Stage workers skip standalone warmup because their inputs come from upstream
 stages. Send representative requests through the coordinator before measuring
@@ -115,6 +116,8 @@ For a sequential deployment, declare stage names and component requirements
 without enumerating request fields:
 
 ```python
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import StageSpec
+
 StageSpec("encode", components=("text_encoder", "tokenizer"))
 StageSpec("denoise", components=("transformer", "scheduler"))
 StageSpec("decode", components=("vae",))

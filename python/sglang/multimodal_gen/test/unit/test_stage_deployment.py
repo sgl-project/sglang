@@ -33,6 +33,10 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
 from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
     DeploymentWorker,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
+    SlotHandle,
+    TransferTensorBuffer,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -154,6 +158,24 @@ def test_request_context_preserves_nested_state_rng_and_aliases():
     req.extra["module"] = torch.nn.Linear(2, 2)
     with pytest.raises(TypeError, match="Model modules"):
         capture_request(req)
+
+
+@pytest.mark.parametrize(
+    "tensor",
+    [
+        torch.tensor(3),
+        torch.tensor(0.5),
+        torch.tensor(True),
+        torch.arange(6).reshape(2, 3).T,
+    ],
+)
+def test_context_tensor_buffer_handles_scalars_and_views(tensor):
+    buffer = object.__new__(TransferTensorBuffer)
+    buffer._pool = torch.empty(64, dtype=torch.uint8)
+    slot = SlotHandle(request_id="context", offset=0, size=64)
+    assert buffer.write_tensor(slot, tensor) == tensor.numel() * tensor.element_size()
+    restored = buffer.read_tensor(slot, list(tensor.shape), tensor.dtype)
+    torch.testing.assert_close(restored, tensor, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("selectors", [(0, 1, 2, 3), ("text", 1, "denoise", 3)])

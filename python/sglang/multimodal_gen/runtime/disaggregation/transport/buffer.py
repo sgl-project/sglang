@@ -127,7 +127,7 @@ class TransferTensorBuffer:
         dst = self._pool[
             handle.offset + byte_offset : handle.offset + byte_offset + nbytes
         ]
-        src_bytes = src_tensor.view(torch.uint8).reshape(-1)
+        src_bytes = src_tensor.reshape(-1).view(torch.uint8)
 
         if stream is not None:
             with torch.get_device_module().stream(stream):
