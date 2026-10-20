@@ -7,7 +7,11 @@ import unittest
 import grpc
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    SignalHandler,
+    TokenizerManager,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.grpc_shutdown_helpers import (
     load_test_grpc_extension,
@@ -31,6 +35,7 @@ class TestRuntimeShutdownRpc(unittest.IsolatedAsyncioTestCase):
         self.manager._gracefully_exit = False
         self.manager._server_status = ServerStatus.Up
         self.manager._is_pause = False
+        self.manager.signal_handler_class = SignalHandler
         self.manager.rid_to_state = {"in-flight": object()}
         handle = RuntimeHandle.__new__(RuntimeHandle)
         handle.tokenizer_manager = self.manager
@@ -52,7 +57,7 @@ class TestRuntimeShutdownRpc(unittest.IsolatedAsyncioTestCase):
             await self.channel.close()
             await asyncio.to_thread(self.server.shutdown)
 
-    async def test_concurrent_acceptance_readiness_watch_and_admission(self):
+    async def test_concurrent_acceptance_runs_existing_sigterm_path(self):
         watch = self.client.WatchEngineState(
             self.proto.WatchEngineStateRequest(), timeout=10
         )
@@ -65,57 +70,21 @@ class TestRuntimeShutdownRpc(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertTrue(all(reply.SerializeToString() == b"" for reply in replies))
-        self.assertTrue(self.manager.gracefully_exit)
-        self.assertIn("in-flight", self.manager.rid_to_state)
-        self.assertFalse(
-            (await self.client.HealthCheck(self.proto.HealthCheckRequest())).healthy
-        )
         while True:
             snapshot = await watch.read()
             self.assertNotEqual(snapshot, grpc.aio.EOF)
             if not snapshot.healthy:
                 self.assertGreater(snapshot.revision, initial.revision)
                 break
-        with self.assertRaises(grpc.aio.AioRpcError) as caught:
-            await self.client.TextGenerate(
-                self.proto.TextGenerateRequest(text="hello")
-            ).read()
-        self.assertEqual(caught.exception.code(), grpc.StatusCode.UNAVAILABLE)
+        self.assertTrue(self.manager.gracefully_exit)
+        self.assertIn("in-flight", self.manager.rid_to_state)
+        self.assertFalse(
+            (await self.client.HealthCheck(self.proto.HealthCheckRequest())).healthy
+        )
         # Leave the watch open: explicit stream teardown must release the server.
         await asyncio.wait_for(asyncio.to_thread(self.server.shutdown), 5)
         while await watch.read() != grpc.aio.EOF:
             pass
-
-    async def test_snapshot_started_before_acceptance_cannot_restore_health(self):
-        entered = threading.Event()
-        release = threading.Event()
-        health_check = self.handle.health_check
-
-        def delayed_health_check():
-            healthy = health_check()
-            if not entered.is_set():
-                entered.set()
-                release.wait(timeout=5)
-            return healthy
-
-        watch = self.client.WatchEngineState(
-            self.proto.WatchEngineStateRequest(), timeout=10
-        )
-        self.assertTrue((await watch.read()).healthy)
-        self.handle.health_check = delayed_health_check
-        self.manager.is_pause = True  # Make the monitor begin an old snapshot.
-        try:
-            self.assertTrue(await asyncio.to_thread(entered.wait, 2))
-            await self.client.Shutdown(self.proto.ShutdownRequest(), timeout=2)
-            final = await watch.read()
-            self.assertFalse(final.healthy)
-        finally:
-            release.set()
-        # The pending monitor read captured healthy=True before acceptance.
-        update = await watch.read()
-        self.assertFalse(update.healthy)
-        self.assertGreater(update.revision, final.revision)
-        watch.cancel()
 
     async def test_listener_shutdown_allows_pending_python_snapshot_to_finish(self):
         entered = threading.Event()

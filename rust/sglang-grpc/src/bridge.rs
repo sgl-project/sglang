@@ -14,15 +14,7 @@ use crate::utils::{json_map_to_pydict, py_value_to_json_string};
 pub enum ResponseChunk {
     Data(ResponseData),
     Finished(ResponseData),
-    Error(tonic::Status),
-}
-
-fn callback_error_status(message: String, status_code: Option<i32>) -> tonic::Status {
-    if status_code == Some(503) {
-        tonic::Status::unavailable(message)
-    } else {
-        tonic::Status::internal(message)
-    }
+    Error(String),
 }
 
 impl ResponseChunk {
@@ -671,13 +663,12 @@ impl ChunkCallback {
         clear_on_ready_for_rid(&self.rid, &self.state);
     }
 
-    #[pyo3(signature = (chunk, finished=false, error=None, status_code=None))]
+    #[pyo3(signature = (chunk, finished=false, error=None))]
     fn __call__(
         &self,
         chunk: &Bound<'_, PyDict>,
         finished: bool,
         error: Option<String>,
-        status_code: Option<i32>,
     ) -> PyResult<ChunkSendStatus> {
         let py = chunk.py();
         let state = lock_or_recover(self.state.as_ref(), "state");
@@ -695,7 +686,7 @@ impl ChunkCallback {
                 &self.runtime_handle,
                 &self.tokio_handle,
                 &sender,
-                ResponseChunk::Error(callback_error_status(err_msg, status_code)),
+                ResponseChunk::Error(err_msg),
             );
         }
 
@@ -784,7 +775,7 @@ impl JsonChunkCallback {
                 &self.runtime_handle,
                 &self.tokio_handle,
                 &sender,
-                ResponseChunk::Error(callback_error_status(err_msg, status_code)),
+                ResponseChunk::Error(err_msg),
             );
         }
 

@@ -88,23 +88,6 @@ pub mod sglang_service_client {
             self.inner = self.inner.max_encoding_message_size(limit);
             self
         }
-        /// Reserved engine shutdown contract. Currently UNIMPLEMENTED: the embedded
-        /// frontend has no lifecycle hook that drains and stops the complete engine.
-        pub async fn shutdown(
-            &mut self,
-            request: impl tonic::IntoRequest<super::ShutdownRequest>,
-        ) -> std::result::Result<tonic::Response<super::ShutdownResponse>, tonic::Status> {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
-            let codec = tonic_prost::ProstCodec::default();
-            let path =
-                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/Shutdown");
-            let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Shutdown"));
-            self.inner.unary(req, path, codec).await
-        }
         /// `/generate`: always server-streaming (a unary request is a one-frame
         /// stream); per-batch-item failures ride the stream as GenerateStreamItem
         /// errors, pre-submit failures end the RPC with a gRPC status.
@@ -253,12 +236,6 @@ pub mod sglang_service_server {
     /// Generated trait containing gRPC methods that should be implemented for use with SglangServiceServer.
     #[async_trait]
     pub trait SglangService: std::marker::Send + std::marker::Sync + 'static {
-        /// Reserved engine shutdown contract. Currently UNIMPLEMENTED: the embedded
-        /// frontend has no lifecycle hook that drains and stops the complete engine.
-        async fn shutdown(
-            &self,
-            request: tonic::Request<super::ShutdownRequest>,
-        ) -> std::result::Result<tonic::Response<super::ShutdownResponse>, tonic::Status>;
         /// Server streaming response type for the Generate method.
         type GenerateStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::GenerateStreamItem, tonic::Status>,
@@ -381,45 +358,6 @@ pub mod sglang_service_server {
         }
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
             match req.uri().path() {
-                "/sglang.api.v1.SglangService/Shutdown" => {
-                    #[allow(non_camel_case_types)]
-                    struct ShutdownSvc<T: SglangService>(pub Arc<T>);
-                    impl<T: SglangService> tonic::server::UnaryService<super::ShutdownRequest> for ShutdownSvc<T> {
-                        type Response = super::ShutdownResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
-                        fn call(
-                            &mut self,
-                            request: tonic::Request<super::ShutdownRequest>,
-                        ) -> Self::Future {
-                            let inner = Arc::clone(&self.0);
-                            let fut = async move {
-                                <T as SglangService>::shutdown(&inner, request).await
-                            };
-                            Box::pin(fut)
-                        }
-                    }
-                    let accept_compression_encodings = self.accept_compression_encodings;
-                    let send_compression_encodings = self.send_compression_encodings;
-                    let max_decoding_message_size = self.max_decoding_message_size;
-                    let max_encoding_message_size = self.max_encoding_message_size;
-                    let inner = self.inner.clone();
-                    let fut = async move {
-                        let method = ShutdownSvc(inner);
-                        let codec = tonic_prost::ProstCodec::default();
-                        let mut grpc = tonic::server::Grpc::new(codec)
-                            .apply_compression_config(
-                                accept_compression_encodings,
-                                send_compression_encodings,
-                            )
-                            .apply_max_message_size_config(
-                                max_decoding_message_size,
-                                max_encoding_message_size,
-                            );
-                        let res = grpc.unary(method, req).await;
-                        Ok(res)
-                    };
-                    Box::pin(fut)
-                }
                 "/sglang.api.v1.SglangService/Generate" => {
                     #[allow(non_camel_case_types)]
                     struct GenerateSvc<T: SglangService>(pub Arc<T>);

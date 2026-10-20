@@ -144,17 +144,12 @@ class TestEngineShutdown(unittest.TestCase):
                             (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.CANCELLED),
                         )
                     try:
-                        self.assertFalse(
-                            client.HealthCheck(
-                                proto.HealthCheckRequest(), timeout=2
-                            ).healthy
-                        )
-                        next(
-                            client.TextGenerate(
-                                proto.TextGenerateRequest(text="reject me"), timeout=2
-                            )
-                        )
-                        self.fail("inference accepted after shutdown")
+                        deadline = time.monotonic() + 5
+                        while client.HealthCheck(
+                            proto.HealthCheckRequest(), timeout=2
+                        ).healthy:
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.05)
                     except grpc.RpcError as error:
                         self.assertEqual(error.code(), grpc.StatusCode.UNAVAILABLE)
                     self.assertEqual(process.wait(timeout=60), 0)

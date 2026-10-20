@@ -1,8 +1,8 @@
 // The native SGLang gRPC service served by rust/sglang-server's tonic
 // transport, over the same api_core the HTTP endpoints use. Covers exactly the
-// surface the native server implements, except Shutdown (see below). The
-// legacy sglang.runtime.v1 bridge's embed/classify/tokenize RPCs have no native
-// backend here and are not carried over.
+// surface the native server implements (the legacy sglang.runtime.v1 bridge's
+// embed/classify/tokenize RPCs have no native backend here and are not
+// carried over).
 
 syntax = "proto3";
 
@@ -12,10 +12,6 @@ import "sglang/api/v1/generate.proto";
 import "sglang/json/v1/options.proto";
 
 service SglangService {
-  // Reserved engine shutdown contract. Currently UNIMPLEMENTED: the embedded
-  // frontend has no lifecycle hook that drains and stops the complete engine.
-  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
-
   // `/generate`: always server-streaming (a unary request is a one-frame
   // stream); per-batch-item failures ride the stream as GenerateStreamItem
   // errors, pre-submit failures end the RPC with a gRPC status.
@@ -45,12 +41,6 @@ service SglangService {
   // ID is unaffected. Internal control/detokenization requests are not targeted.
   rpc Abort(AbortRequest) returns (AbortResponse);
 }
-
-message ShutdownRequest {}
-
-// Acknowledges acceptance, not completion. The server may close the
-// connection before the client observes the response.
-message ShutdownResponse {}
 
 message ListModelsRequest {}
 

@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pyo3::PyErr;
 use pyo3::Python;
 use pyo3::exceptions::{PyTypeError, PyValueError};
-use pyo3::types::PyAnyMethods;
 use tokio::sync::{Notify, mpsc::Receiver, watch};
 use tokio::time::{Duration, timeout};
 use tokio_stream::Stream;
@@ -55,7 +53,6 @@ struct EngineStatePublisher {
     bridge: Arc<PyBridge>,
     instance_id: u64,
     sender: watch::Sender<proto::EngineStateSnapshot>,
-    shutting_down: Arc<AtomicBool>,
 }
 
 impl EngineStatePublisher {
@@ -75,7 +72,6 @@ impl EngineStatePublisher {
             bridge,
             instance_id,
             sender,
-            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -83,29 +79,10 @@ impl EngineStatePublisher {
         self.sender.subscribe()
     }
 
-    fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Release);
-        self.sender.send_if_modified(|snapshot| {
-            if !snapshot.healthy {
-                return false;
-            }
-            snapshot.healthy = false;
-            snapshot.revision += 1;
-            true
-        });
-    }
-
     async fn publish_current(&self) -> Result<(), Status> {
-        let mut snapshot =
-            build_engine_state_snapshot(self.bridge.clone(), self.instance_id, 0).await?;
-        self.sender.send_modify(|current| {
-            // A snapshot read before Shutdown was accepted must not make the
-            // engine healthy again after the acceptance response.
-            snapshot.healthy &= !self.shutting_down.load(Ordering::Acquire);
-            snapshot.revision = current.revision + 1;
-            *current = snapshot;
-        });
-        let snapshot = self.sender.borrow();
+        let revision = self.sender.borrow().revision + 1;
+        let snapshot =
+            build_engine_state_snapshot(self.bridge.clone(), self.instance_id, revision).await?;
         tracing::info!(
             instance_id = snapshot.instance_id,
             revision = snapshot.revision,
@@ -113,49 +90,9 @@ impl EngineStatePublisher {
             is_pause = snapshot.is_pause,
             "publishing SGLang engine state"
         );
+        self.sender.send_replace(snapshot);
         Ok(())
     }
-}
-
-// Keep the final published state observable even when both watch channels
-// change together. The stream never waits for another update during teardown.
-fn engine_state_stream(
-    mut receiver: watch::Receiver<proto::EngineStateSnapshot>,
-    mut shutdown: watch::Receiver<bool>,
-) -> StreamResult<proto::EngineStateSnapshot> {
-    Box::pin(async_stream::stream! {
-        let closing = *shutdown.borrow_and_update();
-        let initial = receiver.borrow_and_update().clone();
-        let mut revision = initial.revision;
-        if !closing || !initial.healthy {
-            yield Ok(initial);
-        }
-        if closing {
-            return;
-        }
-        loop {
-            tokio::select! {
-                biased;
-                result = shutdown.changed() => {
-                    if result.is_err() || *shutdown.borrow_and_update() {
-                        let final_state = receiver.borrow_and_update().clone();
-                        if !final_state.healthy && final_state.revision != revision {
-                            yield Ok(final_state);
-                        }
-                        break;
-                    }
-                }
-                result = receiver.changed() => {
-                    if result.is_err() {
-                        break;
-                    }
-                    let update = receiver.borrow_and_update().clone();
-                    revision = update.revision;
-                    yield Ok(update);
-                }
-            }
-        }
-    })
 }
 
 async fn build_engine_state_snapshot(
@@ -225,23 +162,14 @@ fn resolve_max_message_size() -> usize {
 ///
 /// `PyValueError` / `PyTypeError` mean the client sent bad input — surface as
 /// `INVALID_ARGUMENT` so callers can distinguish them from server failures.
-/// HTTP 503 admission errors map to UNAVAILABLE.
 /// Everything else (typically `PyRuntimeError`, but also Python tracebacks
 /// from inside the tokenizer manager) maps to `INTERNAL`.
 fn pyerr_to_status(err: PyErr, context: &str) -> Status {
-    let unavailable = Python::attach(|py| {
-        err.value(py)
-            .getattr("status_code")
-            .and_then(|value| value.extract::<u16>())
-            .is_ok_and(|code| code == 503)
-    });
     let is_client_error = Python::attach(|py| {
         err.is_instance_of::<PyValueError>(py) || err.is_instance_of::<PyTypeError>(py)
     });
     let msg = format!("{}: {}", context, err);
-    if unavailable {
-        Status::unavailable(msg)
-    } else if is_client_error {
+    if is_client_error {
         Status::invalid_argument(msg)
     } else {
         Status::internal(msg)
@@ -431,9 +359,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         });
                         break;
                     }
-                    Ok(Some(ResponseChunk::Error(status))) => {
+                    Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
-                        yield Err(status);
+                        yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
@@ -501,9 +429,9 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                         });
                         break;
                     }
-                    Ok(Some(ResponseChunk::Error(status))) => {
+                    Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
-                        yield Err(status);
+                        yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
@@ -561,7 +489,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     meta_info: data.meta_info,
                 }))
             }
-            ResponseChunk::Error(status) => Err(status),
+            ResponseChunk::Error(msg) => Err(Status::internal(msg)),
         }
     }
 
@@ -596,7 +524,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     meta_info: data.meta_info,
                 }))
             }
-            ResponseChunk::Error(status) => Err(status),
+            ResponseChunk::Error(msg) => Err(Status::internal(msg)),
         }
     }
 
@@ -638,7 +566,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
                     meta_info: data.meta_info,
                 }))
             }
-            ResponseChunk::Error(status) => Err(status),
+            ResponseChunk::Error(msg) => Err(Status::internal(msg)),
         }
     }
 
@@ -739,10 +667,33 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         &self,
         _request: Request<proto::WatchEngineStateRequest>,
     ) -> Result<Response<StreamResult<proto::EngineStateSnapshot>>, Status> {
-        Ok(Response::new(engine_state_stream(
-            self.engine_state.subscribe(),
-            self.stream_shutdown.clone(),
-        )))
+        let mut receiver = self.engine_state.subscribe();
+        let mut shutdown = self.stream_shutdown.clone();
+        let stream = async_stream::stream! {
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+            let initial = receiver.borrow_and_update().clone();
+            yield Ok(initial);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow_and_update() {
+                            break;
+                        }
+                    }
+                    result = receiver.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        let update = receiver.borrow_and_update().clone();
+                        yield Ok(update);
+                    }
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn get_model_info(
@@ -819,7 +770,6 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
     ) -> Result<Response<proto::ShutdownResponse>, Status> {
         self.blocking_bridge_call("Failed to initiate shutdown", PyBridge::shutdown)
             .await?;
-        self.engine_state.begin_shutdown();
         Ok(Response::new(proto::ShutdownResponse {}))
     }
 
@@ -1069,9 +1019,9 @@ impl SglangServiceImpl {
                         });
                         break;
                     }
-                    Ok(Some(ResponseChunk::Error(status))) => {
+                    Ok(Some(ResponseChunk::Error(msg))) => {
                         abort_guard.disarm();
-                        yield Err(status);
+                        yield Err(Status::internal(msg));
                         break;
                     }
                     Ok(None) => {
@@ -1124,11 +1074,8 @@ impl SglangServiceImpl {
                     status_code: openai_status_code(&data.meta_info, 200),
                 }))
             }
-            ResponseChunk::Error(status) => {
-                if status.code() == tonic::Code::Unavailable {
-                    return Err(status);
-                }
-                let error_json = serde_json::json!({"error": {"message": status.message()}});
+            ResponseChunk::Error(msg) => {
+                let error_json = serde_json::json!({"error": {"message": msg}});
                 Ok(Response::new(proto::OpenAiResponse {
                     json_body: error_json.to_string().into_bytes(),
                     status_code: 500,
@@ -1154,7 +1101,7 @@ async fn recv_json_response(
             String::from_utf8(bytes)
                 .map_err(|e| Status::internal(format!("Invalid UTF-8 in response: {}", e)))
         }
-        ResponseChunk::Error(status) => Err(status),
+        ResponseChunk::Error(msg) => Err(Status::internal(msg)),
     }
 }
 

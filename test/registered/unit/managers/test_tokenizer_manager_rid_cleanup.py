@@ -124,7 +124,6 @@ def _make_tokenizer_manager(case) -> TokenizerManager:
     override.install()
     case.addCleanup(override.restore)
     tm = TokenizerManager.__new__(TokenizerManager)
-    tm._gracefully_exit = False
     tm.server_args = MagicMock()
     tm._config_updates = []
     tm.server_args.enable_trace = False
@@ -1094,48 +1093,6 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "choice failed"):
                 await tm._collect_batch_responses([failing_choice(), blocked_choice()])
             self.assertTrue(sibling_closed.is_set())
-
-        asyncio.run(drive())
-
-
-class TestShutdownAdmission(CustomTestCase):
-    def test_shutdown_tracks_tokenization_and_rejects_later_requests(self):
-        tm = _make_tm_for_generate(self)
-        obj = GenerateReqInput(text="hello", rid="before-shutdown")
-        tm._send_one_request = AsyncMock()
-
-        async def drive():
-            entered = asyncio.Event()
-            release = asyncio.Event()
-
-            async def tokenize(_):
-                entered.set()
-                await release.wait()
-                return MagicMock()
-
-            async def respond(*_):
-                yield {"text": "finished"}
-
-            tm._tokenize_one_request = tokenize
-            tm._wait_one_response = respond
-            task = asyncio.create_task(tm.generate_request(obj).__anext__())
-            try:
-                await asyncio.wait_for(entered.wait(), 1)
-                tm.gracefully_exit = True
-                self.assertIn(obj.rid, tm.rid_to_state)
-                with self.assertRaises(HTTPException) as caught:
-                    await tm.generate_request(
-                        GenerateReqInput(text="late", rid="after-shutdown")
-                    ).__anext__()
-                self.assertEqual(caught.exception.status_code, 503)
-                self.assertNotIn("after-shutdown", tm.rid_to_state)
-                release.set()
-                self.assertEqual(await task, {"text": "finished"})
-                tm._send_one_request.assert_awaited_once()
-            finally:
-                if not task.done():
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
 
         asyncio.run(drive())
 

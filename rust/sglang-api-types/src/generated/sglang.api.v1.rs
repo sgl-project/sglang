@@ -710,12 +710,6 @@ pub mod media_input {
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ShutdownRequest {}
-/// Acknowledges acceptance, not completion. The server may close the
-/// connection before the client observes the response.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct ShutdownResponse {}
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ListModelsRequest {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListModelsResponse {

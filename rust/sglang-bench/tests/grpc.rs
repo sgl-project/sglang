@@ -77,13 +77,6 @@ impl SglangService for Mock {
         Ok(Response::new(api::HealthCheckResponse { healthy: true }))
     }
 
-    async fn shutdown(
-        &self,
-        _: Request<api::ShutdownRequest>,
-    ) -> Result<Response<api::ShutdownResponse>, Status> {
-        Err(Status::unimplemented("shutdown"))
-    }
-
     async fn get_model_info(
         &self,
         _: Request<api::GetModelInfoRequest>,

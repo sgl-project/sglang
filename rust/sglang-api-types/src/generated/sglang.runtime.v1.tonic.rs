@@ -507,8 +507,8 @@ pub mod sglang_service_client {
             self.inner.unary(req, path, codec).await
         }
         /// Admin/Ops RPCs
-        /// Initiates orderly engine shutdown, respecting engine configuration.
-        /// A response acknowledges initiation, not completion; it may be lost on exit.
+        /// Schedules the engine's configured SIGTERM shutdown procedure.
+        /// A response acknowledges scheduling, not completion; it may be lost on exit.
         pub async fn shutdown(
             &mut self,
             request: impl tonic::IntoRequest<super::ShutdownRequest>,
@@ -756,8 +756,8 @@ pub mod sglang_service_server {
             Err(tonic::Status::unimplemented("Not yet implemented"))
         }
         /// Admin/Ops RPCs
-        /// Initiates orderly engine shutdown, respecting engine configuration.
-        /// A response acknowledges initiation, not completion; it may be lost on exit.
+        /// Schedules the engine's configured SIGTERM shutdown procedure.
+        /// A response acknowledges scheduling, not completion; it may be lost on exit.
         async fn shutdown(
             &self,
             request: tonic::Request<super::ShutdownRequest>,
