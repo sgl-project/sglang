@@ -211,5 +211,29 @@ class TestFusedStaticAcceptTail(CustomTestCase):
         )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+class TestSimBonusSharedLength(CustomTestCase):
+    def test_a_stride_0_view_of_the_shared_length_reads_like_a_full_tensor(self):
+        """The simulated bonus takes the one shared length as expand(bs) of its [1]
+        buffer (no copy in the graph); the partials equal those of a [bs] tensor."""
+        from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
+            simulated_bonus_partials_graph,
+        )
+
+        bs, rows = 8, 6
+        shared = torch.tensor([2], dtype=torch.int64, device="cuda")
+        args = dict(
+            target_logits=torch.randn(bs * rows, 9000, device="cuda"),
+            temperatures=torch.ones(bs, device="cuda"),
+            seed=torch.tensor([77], dtype=torch.int32, device="cuda"),
+            bs=bs,
+            rows_per_request=rows,
+        )
+        view = simulated_bonus_partials_graph(correct_len=shared.expand(bs), **args)
+        full = simulated_bonus_partials_graph(correct_len=shared.repeat(bs), **args)
+        self.assertTrue(torch.equal(view[0], full[0]))
+        self.assertTrue(torch.equal(view[1], full[1]))
+
+
 if __name__ == "__main__":
     unittest.main()

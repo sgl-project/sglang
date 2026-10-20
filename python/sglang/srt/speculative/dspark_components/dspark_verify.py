@@ -807,7 +807,8 @@ class DsparkVerifyEpilogue:
     def _sim_bonus_args(self, logits, bs: int) -> dict:
         return dict(
             target_logits=logits,
-            correct_len=self.simulated_correct_len.repeat(bs),
+            # One length for every request: a stride-0 view, no copy node in the graph.
+            correct_len=self.simulated_correct_len.expand(bs),
             temperatures=self.sim_temperatures_buf[:bs],
             seed=self.sim_seed_buf,
             bs=bs,

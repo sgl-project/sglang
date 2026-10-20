@@ -66,6 +66,7 @@ def _simulated_bonus_row_partial_kernel(
     logits_stride,
     temperatures_ptr,
     correct_len_ptr,
+    correct_len_stride,
     seed_ptr,
     part_val_ptr,
     part_idx_ptr,
@@ -76,7 +77,7 @@ def _simulated_bonus_row_partial_kernel(
 ):
     req = tl.program_id(0)
     split = tl.program_id(1)
-    row = req * ROWS + tl.load(correct_len_ptr + req)
+    row = req * ROWS + tl.load(correct_len_ptr + req * correct_len_stride)
     t = tl.load(temperatures_ptr + req).to(tl.float32)
     offs = split * BLOCK + tl.arange(0, BLOCK)
     mask = offs < vocab
@@ -150,8 +151,10 @@ def simulated_bonus_partials_graph(
     rows_per_request: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """simulated_bonus_sample_graph's per-split (value, index) maxima, [bs, NSPLIT];
-    a consumer reduces them as ``simulated_bonus_select_partials``."""
+    a consumer reduces them as ``simulated_bonus_select_partials``. ``correct_len``
+    may be a stride-0 view of one length shared by every request."""
     assert target_logits.stride(1) == 1
+    assert correct_len.dim() == 1 and correct_len.shape[0] == bs
     device = target_logits.device
     vocab = target_logits.shape[1]
     block = 4096
@@ -162,7 +165,8 @@ def simulated_bonus_partials_graph(
         target_logits,
         target_logits.stride(0),
         temperatures,
-        correct_len.contiguous(),
+        correct_len,
+        correct_len.stride(0),
         seed,
         part_val,
         part_idx,
