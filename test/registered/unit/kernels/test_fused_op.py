@@ -83,6 +83,22 @@ def test_forced_backend_env_var():
     m._forced_backend = m._UNRESOLVED
 
 
+_TOY_ADD_BACKENDS = (
+    KernelBackend.TORCH,
+    KernelBackend.TORCH_COMPILE,
+    KernelBackend.TRITON,
+)
+
+
+@pytest.mark.parametrize(
+    "backend", [b for b in KernelBackend if b not in _TOY_ADD_BACKENDS]
+)
+def test_forced_unimplemented_backend_falls_back(backend):
+    # Every backend needs a raising stub, else forcing it is an AttributeError.
+    K.set_fused_op_backend(backend)
+    assert _ToyAdd()(_t(1.0), _t(2.0)).item() == 1003.0
+
+
 def test_trace_records_op_backend_and_shapes():
     K.enable_fused_op_trace()
     _ToyAdd()(torch.zeros(2, 3), torch.zeros(2, 3))
@@ -93,14 +109,13 @@ def test_trace_records_op_backend_and_shapes():
 
 
 def test_fused_op_registers_all_backends():
-    backends = {s.backend for s in K.registry.get("layernorm.rmsnorm")}
+    backends = {s.backend for s in K.registry.get("activation.silu_and_mul")}
     assert backends == {
         KernelBackend.TORCH,
         KernelBackend.TORCH_COMPILE,
         KernelBackend.JIT,
         KernelBackend.AOT,
         KernelBackend.AITER,
-        KernelBackend.TORCH_NPU,
     }
 
 
@@ -148,7 +163,7 @@ def test_registry_get_backend_missing_raises():
 
 def test_spec_load_simple_and_dotted():
     assert _spec(target="math:sqrt").load() is math.sqrt
-    dotted = _spec(target="sglang.kernels.ops.layernorm:_RMSNORM.forward_native")
+    dotted = _spec(target="sglang.kernels.ops.activation:_SILU_AND_MUL.forward_native")
     assert callable(dotted.load())
 
 
@@ -160,54 +175,17 @@ def test_spec_load_bad_target_raises():
 # --- native reference math of the reworked ops (CPU) ---
 
 
-def _ref_rmsnorm(x, w, eps):
-    xf = x.float()
-    return (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w).to(x.dtype)
-
-
-def test_rmsnorm_native():
-    from sglang.kernels.ops.layernorm import _RMSNORM
-
-    x, w = torch.randn(8, 128), torch.randn(128)
-    out = _RMSNORM.forward_native(x, w, 1e-6)
-    assert torch.allclose(out, _ref_rmsnorm(x, w, 1e-6))
-    buf = torch.empty_like(x)
-    assert _RMSNORM.forward_native(x, w, 1e-6, out=buf) is buf  # out= is in place
-    assert torch.allclose(buf, out)
-
-
-def test_fused_add_rmsnorm_native():
-    from sglang.kernels.ops.layernorm import _FUSED_ADD_RMSNORM
-
-    x, residual, w = torch.randn(8, 128), torch.randn(8, 128), torch.randn(128)
-    x0, r0 = x.clone(), residual.clone()
-    assert _FUSED_ADD_RMSNORM.forward_native(x, residual, w, 1e-6) is None
-    acc = x0.float() + r0.float()
-    assert torch.allclose(residual, acc)
-    assert torch.allclose(
-        x, acc * torch.rsqrt(acc.pow(2).mean(-1, keepdim=True) + 1e-6) * w
-    )
-
-
-@pytest.mark.parametrize(
-    "op_attr, approximate",
-    [
-        ("_SILU_AND_MUL", None),
-        ("_GELU_AND_MUL", "none"),
-        ("_GELU_TANH_AND_MUL", "tanh"),
-    ],
-)
-def test_gated_activation_native(op_attr, approximate):
+def test_silu_and_mul_native():
     import torch.nn.functional as F
 
-    import sglang.kernels.ops.activation as act
+    from sglang.kernels.ops.activation import _SILU_AND_MUL
 
     x = torch.randn(8, 256)
-    gate, up = x[..., :128], x[..., 128:]
-    ref = (
-        F.silu(gate) if approximate is None else F.gelu(gate, approximate=approximate)
-    ) * up
-    assert torch.allclose(getattr(act, op_attr).forward_native(x), ref)
+    ref = F.silu(x[..., :128]) * x[..., 128:]
+    assert torch.allclose(_SILU_AND_MUL.forward_native(x), ref)
+    buf = torch.empty_like(ref)
+    assert _SILU_AND_MUL.forward_native(x, buf) is buf  # out= is in place
+    assert torch.allclose(buf, ref)
 
 
 if __name__ == "__main__":

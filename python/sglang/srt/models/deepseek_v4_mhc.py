@@ -45,6 +45,14 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+# The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
+_FUSED_MHC_TP_SIZES = (2, 4)
+
+
+def fused_mhc_tp_ok(tp_size: int) -> bool:
+    return tp_size in _FUSED_MHC_TP_SIZES
+
+
 # ---------------------------------------------------------------------------
 # What a layer hands this module
 # ---------------------------------------------------------------------------
@@ -400,7 +408,7 @@ def _combine(
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
-    from sglang.kernels.ops.layernorm.mhc import hc_combine
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
     cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
@@ -444,7 +452,7 @@ def _combine(
         from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
         return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
-    return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
+    return norm(mhc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
 # ---------------------------------------------------------------------------
