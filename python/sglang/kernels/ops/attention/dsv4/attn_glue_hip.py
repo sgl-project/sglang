@@ -510,26 +510,32 @@ def page_table_from_req_to_token(
 
 
 @triton.jit
-def _widen_pair_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, n, BLOCK: tl.constexpr):
+def _widen_pair_kernel(a_ptr, b_ptr, oa_ptr, ob_ptr, n, repeat, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = i < n
-    tl.store(oa_ptr + i, tl.load(a_ptr + i, mask=mask, other=0).to(tl.int64), mask=mask)
+    a = tl.load(a_ptr + i // repeat, mask=mask, other=0)
+    tl.store(oa_ptr + i, a.to(tl.int64), mask=mask)
     tl.store(ob_ptr + i, tl.load(b_ptr + i, mask=mask, other=0).to(tl.int64), mask=mask)
 
 
 def widen_pair_i64(
-    a: torch.Tensor, b: torch.Tensor
+    a: torch.Tensor, b: torch.Tensor, repeat: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(a.to(torch.int64), b.to(torch.int64)) for two same-length integer vectors in one
-    launch (the decode request slots and positions the low-ratio indexer takes widened)."""
-    assert a.dim() == b.dim() == 1 and a.shape == b.shape, (a.shape, b.shape)
+    """(a.repeat_interleave(repeat).to(torch.int64), b.to(torch.int64)) in one launch,
+    b ``repeat`` times a's length: the request slots and positions the low-ratio
+    indexer takes widened, a slot a row (decode) or a draft token (target verify)."""
+    assert a.dim() == b.dim() == 1 and b.shape[0] == a.shape[0] * repeat, (
+        a.shape,
+        b.shape,
+        repeat,
+    )
     assert a.stride(0) == 1 and b.stride(0) == 1
-    n = a.shape[0]
+    n = b.shape[0]
     oa = torch.empty(n, dtype=torch.int64, device=a.device)
     ob = torch.empty(n, dtype=torch.int64, device=a.device)
     if n:
         block = min(1024, triton.next_power_of_2(n))
         _widen_pair_kernel[(triton.cdiv(n, block),)](
-            a, b, oa, ob, n, BLOCK=block, num_warps=4
+            a, b, oa, ob, n, repeat, BLOCK=block, num_warps=4
         )
     return oa, ob

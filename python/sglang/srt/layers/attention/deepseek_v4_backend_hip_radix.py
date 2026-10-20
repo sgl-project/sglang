@@ -1803,6 +1803,24 @@ class DeepseekV4HipRadixBackend(
                         forward_batch.req_pool_indices, forward_batch.positions
                     )
                 )
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and forward_batch.positions.is_cuda
+                and forward_batch.positions.dim() == 1
+                and forward_batch.positions.stride(0) == 1
+                and forward_batch.req_pool_indices.stride(0) == 1
+                and forward_batch.positions.shape[0]
+                == forward_batch.req_pool_indices.shape[0]
+                * int(forward_batch.spec_info.draft_token_num)
+            ):
+                # each slot repeated a draft token, and both widenings, in one launch
+                metadata.low_ratio_req_indices, metadata.low_ratio_pos_i64 = (
+                    widen_pair_i64(
+                        forward_batch.req_pool_indices,
+                        forward_batch.positions,
+                        repeat=int(forward_batch.spec_info.draft_token_num),
+                    )
+                )
             else:
                 metadata.low_ratio_req_indices = token_req_indices(forward_batch)
                 metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)

@@ -371,6 +371,21 @@ def test_expand_same_length_positions_and_window_lens():
         assert torch.equal(window_lens, torch.clamp(ref32, max=128))
 
 
+@pytest.mark.parametrize("repeat", [1, 5], ids=["decode", "verify"])
+def test_widen_pair_i64_repeats_the_slots(repeat):
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import widen_pair_i64
+
+    _seed(14)
+    req = torch.randint(0, 4096, (7,), dtype=torch.int32, device=DEVICE)
+    positions = torch.randint(0, 1 << 20, (7 * repeat,), dtype=torch.int32).to(DEVICE)
+    out_req, out_pos = widen_pair_i64(req, positions, repeat=repeat)
+    # token_req_indices and positions.to(torch.int64), the target-verify rows
+    ref_req = torch.repeat_interleave(req.to(torch.int64), repeat)
+    assert out_req.dtype is out_pos.dtype is torch.int64
+    assert torch.equal(out_req, ref_req)
+    assert torch.equal(out_pos, positions.to(torch.int64))
+
+
 @pytest.mark.parametrize("ratios", [(1,), (2,), (1, 2)], ids=["c1", "c2", "c1c2"])
 def test_sparse_buffers_fill_low_ratio_raw_indices(ratios):
     from sglang.kernels.ops.attention.dsv4.attn_glue_hip import sparse_buffers
