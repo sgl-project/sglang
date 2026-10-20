@@ -293,15 +293,17 @@ class BlockStored(KVCacheEvent):
     # Public adapter name for router lookup. Published hashes are opaque IDs
     # scoped to the internal cache namespace, including the adapter load.
     lora_name: Optional[str] = None
+    ownership: Optional[str] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
     medium: Optional[str] = None
+    ownership: Optional[str] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
-    pass
+    ownership: Optional[str] = None
 
 
 # The dynamo format publishes namespaced hashes as block hashes. If you change

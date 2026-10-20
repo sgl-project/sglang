@@ -1187,6 +1187,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         self._binding.finish_external_linker_offload(list(node_ids), ack_id, success)
 
+    def record_external_cache_store(
+        self, node_ids: Sequence[NodeId], medium: StorageMedium
+    ) -> None:
+        self._binding.record_external_cache_store(list(node_ids), medium.value)
+
+    def remove_external_cache_storage(
+        self, hashes: Sequence[str], medium: StorageMedium, *, publish: bool = True
+    ) -> None:
+        self._binding.remove_external_cache_storage(
+            list(hashes), medium.value if publish else None
+        )
+
     @property
     def write_back_duplicate_reclaim_digest(self) -> int:
         return self._binding.write_back_duplicate_reclaim_digest()

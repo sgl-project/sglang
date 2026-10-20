@@ -26,7 +26,11 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.disaggregation.kv_events import (
+    BlockRemoved,
+    StorageMedium,
+    namespaced_block_hash,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -84,6 +88,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
+    hash_str_to_int64,
     split_node_hash_value,
 )
 
@@ -466,6 +471,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             dynamo_format=params.dynamo_kv_event_format,
             lora_names=params.kv_event_lora_names,
         )
+        # Local storage outlives device tree nodes and engine cache resets.
+        self._external_cache_event_hashes: dict[str, int] = {}
 
         self.reset()
 
@@ -729,9 +736,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
         or unanchored one would silently release (or steal) another holder's segment."""
-        assert params.node_id == node.id, (
-            f"lock receipt anchored on node {params.node_id} released on node {node.id}"
-        )
+        assert (
+            params.node_id == node.id
+        ), f"lock receipt anchored on node {params.node_id} released on node {node.id}"
 
     def _release_components(
         self,
@@ -1688,12 +1695,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> EvictDeviceNextNodeResult:
         """Resume an internal tombstone after the controller's backup attempt."""
         component = self.components_by_type[component_type]
-        assert component.is_evict_device_ongoing, (
-            f"{component_type.name} device eviction not started"
-        )
-        assert self._pending_internal_evictions.get(component_type) == node_id, (
-            f"no matching pending internal {component_type.name} eviction"
-        )
+        assert (
+            component.is_evict_device_ongoing
+        ), f"{component_type.name} device eviction not started"
+        assert (
+            self._pending_internal_evictions.get(component_type) == node_id
+        ), f"no matching pending internal {component_type.name} eviction"
         del self._pending_internal_evictions[component_type]
         # Consuming the pending request advances the walk even if I/O changed
         # this victim's eligibility. No frees occur before backup completion.
@@ -2753,6 +2760,48 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node.write_through_pending_id = None
             node.external_cache_stored |= success
 
+    def record_external_cache_store(
+        self, node_ids: Sequence[NodeId], medium: StorageMedium
+    ) -> None:
+        if not self.kv_events.enabled:
+            return
+        for node_id in node_ids:
+            node = self.node_by_id(node_id)
+            self.kv_events.record_store(node, medium=medium)
+            self._external_cache_event_hashes.update(
+                zip(
+                    node.hash_value,
+                    (
+                        namespaced_block_hash(
+                            hash_str_to_int64(value),
+                            namespace_seed=self.kv_events._namespace_seed(node),
+                        )
+                        for value in self.kv_events._node_event_hash_values(node)
+                    ),
+                )
+            )
+
+    def remove_external_cache_storage(
+        self, hashes: Sequence[str], medium: StorageMedium, *, publish: bool = True
+    ) -> None:
+        removed = set(hashes)
+        for node in self._node_arena.values():
+            if node.external_cache_stored and removed.intersection(
+                node.hash_value or ()
+            ):
+                node.external_cache_stored = False
+        if not publish:
+            return
+        block_hashes = [
+            self._external_cache_event_hashes.pop(key)
+            for key in dict.fromkeys(hashes)
+            if key in self._external_cache_event_hashes
+        ]
+        if block_hashes:
+            self.kv_events.enqueue(
+                BlockRemoved(block_hashes=block_hashes, medium=medium)
+            )
+
     def finish_write_through(self, node_ids: list[NodeId], ack_id: int) -> None:
         """Clear the write-through-pending mark (when it matches ack_id) and record the
         host store event for each acked node."""
@@ -2844,9 +2893,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             covered = assign_end
             if covered >= window_end:
                 break
-        assert covered == window_end, (
-            f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
-        )
+        assert (
+            covered == window_end
+        ), f"attach_swa_window covered {covered} of [{window_start}, {window_end})"
         return actions
 
     def _attach_swa_segment(

@@ -148,13 +148,14 @@ class KVCacheEventRecorder:
             tail = self._queue[-1]
 
             if isinstance(tail, BlockRemoved) and isinstance(event, BlockRemoved):
-                if tail.medium == event.medium:
+                if tail.medium == event.medium and tail.ownership == event.ownership:
                     tail.block_hashes.extend(event.block_hashes)
                     return
 
             elif isinstance(tail, BlockStored) and isinstance(event, BlockStored):
                 if (
                     tail.medium == event.medium
+                    and tail.ownership == event.ownership
                     and tail.lora_id == event.lora_id
                     and tail.block_size == event.block_size
                     and tail.cache_salt == event.cache_salt

@@ -21,6 +21,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -30,6 +31,7 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    CacheRequestOutcome,
     DecLockRefParams,
     DecLockRefResult,
     EvictParams,
@@ -1108,10 +1110,15 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
-        return self.session.try_cache_finished_req(req)
+        claimed = self.session.try_cache_finished_req(req)
+        if claimed and self.linker is not None and req.finished():
+            self.linker.release_request(req.cache_request_handle, cancel_load=False)
+        return claimed
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.linker is not None and req.finished():
+            self.linker.release_request(req.cache_request_handle, cancel_load=False)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -2703,12 +2710,17 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
         )
 
+    def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
+        if outcome == CacheRequestOutcome.SUCCESS and self.linker is not None:
+            self.linker.release_request(handle, cancel_load=False)
+        super().finish(handle, outcome)
+
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
-            self.linker.release_request(rid)
+            self.linker.release_request(request)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
@@ -3603,6 +3615,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            self.linker.drain_storage_removals()
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.
@@ -3877,8 +3890,18 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.root_node
 
     def take_events(self):
-        # Drain the KV event queue from the TreeCore.
-        return self.tree_core.take_events()
+        events = self.tree_core.take_events()
+        if self.linker is not None:
+            backend = self.linker.cache_linker
+            if backend.local_storage_ownership is not None:
+                # Linker and HiCache are exclusive, so only the Linker owns this tier.
+                for event in events:
+                    if (
+                        isinstance(event, (BlockStored, BlockRemoved))
+                        and event.medium == backend.local_storage_medium
+                    ):
+                        event.ownership = backend.local_storage_ownership
+        return events
 
     def resolve_node_handle(self, node_handle):
         """Look up the node object from its NodeId.

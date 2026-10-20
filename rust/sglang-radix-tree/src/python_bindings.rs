@@ -16,13 +16,13 @@ use crate::components::{ComponentSet, ComponentType, FULL, MAMBA, SWA};
 use crate::node::ChildKeyType;
 use crate::node::{KeyNamespaceRef, NodeAccessError, NodeId, TreeCoreRuntimeError};
 use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
-use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheInitParams, CacheTransferPhase,
     DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams, InsertResult, InsertStepResult,
     MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName, PoolTransfer, PoolTransferResult, Req,
     UnifiedTreeCore,
 };
+use crate::unified_tree_core::{KvCacheEvent, StorageMedium};
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
 /// Keep this boundary outside the whole binding call so its MutexGuard unwinds
@@ -42,6 +42,16 @@ fn catch_native_panic<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T>
                 "Rust TreeCore panicked: {message}"
             )))
         }
+    }
+}
+
+fn parse_storage_medium(medium: &str) -> PyResult<StorageMedium> {
+    match medium {
+        "GPU" => Ok(StorageMedium::Gpu),
+        "CPU_PINNED" => Ok(StorageMedium::Cpu),
+        _ => Err(PyValueError::new_err(format!(
+            "unknown storage medium: {medium}"
+        ))),
     }
 }
 
@@ -2328,6 +2338,28 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         .map_err(tree_core_assertion_error)
     }
 
+    fn record_external_cache_store(
+        &self,
+        py: Python<'_>,
+        node_ids: Vec<NodeId>,
+        medium: &str,
+    ) -> PyResult<()> {
+        let medium = parse_storage_medium(medium)?;
+        py.allow_threads(|| self.core().record_external_cache_store(&node_ids, medium))
+            .map_err(node_access_error)
+    }
+
+    fn remove_external_cache_storage(
+        &self,
+        py: Python<'_>,
+        hashes: Vec<String>,
+        medium: Option<&str>,
+    ) -> PyResult<()> {
+        let medium = medium.map(parse_storage_medium).transpose()?;
+        py.allow_threads(|| self.core().remove_external_cache_storage(&hashes, medium));
+        Ok(())
+    }
+
     /// Order-sensitive digest of reclaimed coexisting host values.
     fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
         py.detach(|| self.core().write_back_coexist_reclaim_digest)
@@ -3589,6 +3621,19 @@ macro_rules! tree_core_binding {
                     self.inner
                         .finish_external_linker_offload(py, node_ids, ack_id, success)
                 })
+            }
+
+            fn record_external_cache_store(
+                &self, py: Python<'_>, node_ids: Vec<NodeId>, medium: &str,
+            ) -> PyResult<()> {
+                catch_native_panic(|| self.inner.record_external_cache_store(py, node_ids, medium))
+            }
+
+            #[pyo3(signature = (hashes, medium=None))]
+            fn remove_external_cache_storage(
+                &self, py: Python<'_>, hashes: Vec<String>, medium: Option<&str>,
+            ) -> PyResult<()> {
+                catch_native_panic(|| self.inner.remove_external_cache_storage(py, hashes, medium))
             }
 
             /// Order-sensitive digest of reclaimed coexisting host values.

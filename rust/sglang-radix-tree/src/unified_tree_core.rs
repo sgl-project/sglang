@@ -659,6 +659,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) kv_event_queue: Vec<KvCacheEvent<K::Atom>>,
     /// Namespaced event hashes, seeded only by cache_salt; events omit extra_key.
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
+    // Local storage outlives device tree nodes and engine cache resets.
+    external_cache_event_hashes: HashMap<String, (i64, Option<Arc<str>>)>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
 
@@ -936,6 +938,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             dynamo_kv_event_format: params.dynamo_kv_event_format,
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
+            external_cache_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             device: params.device,
@@ -4454,6 +4457,86 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             node.external_cache_stored |= success;
         }
         Ok(())
+    }
+
+    pub fn record_external_cache_store(
+        &mut self,
+        node_ids: &[NodeId],
+        medium: StorageMedium,
+    ) -> Result<(), NodeAccessError> {
+        if !self.enable_kv_cache_events {
+            return Ok(());
+        }
+        let nodes = node_ids
+            .iter()
+            .map(|&id| self.arena.resolve(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for node_idx in nodes {
+            self.record_store_event_(node_idx, medium, None);
+            let node = self.arena.node(node_idx);
+            let hashes = node
+                .hash_value
+                .as_ref()
+                .expect("store event hashes its node");
+            let event_hashes: Vec<i64> = if node.namespace != KeyNamespace::default() {
+                self.namespaced_event_hashes[&node.id]
+                    .iter()
+                    .map(crate::node::hash_digest_to_int64)
+                    .collect()
+            } else {
+                hashes
+                    .iter()
+                    .map(|hash| crate::node::hash_str_to_int64(hash))
+                    .collect()
+            };
+            self.external_cache_event_hashes.extend(
+                hashes.iter().cloned().zip(
+                    event_hashes
+                        .into_iter()
+                        .map(|hash| (hash, node.namespace.extra_key().map(Arc::from))),
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn remove_external_cache_storage(
+        &mut self,
+        hashes: &[String],
+        medium: Option<StorageMedium>,
+    ) {
+        let removed: HashSet<_> = hashes.iter().collect();
+        let nodes: Vec<_> = self
+            .collect_all_nodes_()
+            .into_iter()
+            .filter(|&idx| {
+                let node = self.arena.node(idx);
+                node.external_cache_stored
+                    && node
+                        .hash_value
+                        .as_ref()
+                        .is_some_and(|values| values.iter().any(|key| removed.contains(key)))
+            })
+            .collect();
+        for idx in nodes {
+            self.arena.node_mut(idx).external_cache_stored = false;
+        }
+        let Some(medium) = medium else {
+            return;
+        };
+        let mut by_namespace: HashMap<Option<Arc<str>>, Vec<i64>> = HashMap::new();
+        for key in hashes {
+            if let Some((hash, extra_key)) = self.external_cache_event_hashes.remove(key) {
+                by_namespace.entry(extra_key).or_default().push(hash);
+            }
+        }
+        for (extra_key, block_hashes) in by_namespace {
+            self.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+                block_hashes,
+                medium,
+                extra_key,
+            });
+        }
     }
 
     /// Clear the write-through-pending mark (when it matches ack_id) and record the

@@ -52,8 +52,12 @@ class TestLocalKvEventSource(CustomTestCase):
     def test_advertised_source_delivers_events(self):
         for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
             with self.subTest(host=host):
-                with zmq.Context.instance().socket(zmq.PUB) as probe:
-                    port = probe.bind_to_random_port("tcp://127.0.0.1")
+                # Destroy the probe's own context before rebinding its port;
+                # Socket.close on the shared context only schedules close on
+                # its I/O thread and can race the immediately following bind.
+                with zmq.Context() as probe_context:
+                    with probe_context.socket(zmq.PUB) as probe:
+                        port = probe.bind_to_random_port("tcp://127.0.0.1")
                 publisher = self._publisher(
                     attn_dp_rank=4,
                     endpoint=f"tcp://{host}:{port - 4}",
@@ -332,6 +336,17 @@ class TestBlockStoredWireFormat(CustomTestCase):
         event = self._event(lora_name="adapter-a")
         decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
         self.assertEqual(decoded["lora_name"], "adapter-a")
+
+    def test_kvcr_ownership_is_an_optional_named_field(self):
+        for event in (
+            self._event(ownership="kvcr"),
+            BlockRemoved(
+                block_hashes=[123], medium=StorageMedium.CPU, ownership="kvcr"
+            ),
+            AllBlocksCleared(ownership="kvcr"),
+        ):
+            decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(event))
+            self.assertEqual(decoded["ownership"], "kvcr")
 
     def test_one_decoder_reads_a_mixed_batch(self):
         batch = KVEventBatch(

@@ -10,19 +10,26 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    StorageMedium,
+)
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+    EvictParams,
     InitLoadBackParams,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolHitPolicy,
-    PoolName,
-    PoolTransfer,
-)
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
@@ -39,12 +46,11 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
-from sglang.test.kits.unified_radix_cache.config import (
-    CacheConfig,
-)
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     node_children,
@@ -114,6 +120,18 @@ class _MappingRecorder:
         self.mapping.append((full.clone(), swa.clone()))
 
 
+class _ContextLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.contexts = {}
+
+    def set_request_context(self, handle, kv_hints):
+        self.contexts[handle] = kv_hints
+
+    def release_request_context(self, handle):
+        self.contexts.pop(handle)
+
+
 class _FakeExternalTreeCore:
     def __init__(self, nodes=None, offload_transfers=None):
         self.enable_external_cache_linker = False
@@ -137,9 +155,9 @@ class _FakeExternalTreeCore:
 
     def finish_external_linker_offload(self, node_ids, ack_id, success):
         nodes = [self.nodes[node_id] for node_id in node_ids]
-        assert all(node.write_through_pending_id == ack_id for node in nodes), (
-            "invalid external offload state"
-        )
+        assert all(
+            node.write_through_pending_id == ack_id for node in nodes
+        ), "invalid external offload state"
         for node in nodes:
             node.write_through_pending_id = None
             node.external_cache_stored |= success
@@ -154,6 +172,10 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "attn_cp_group": None,
+        "attn_tp_group": None,
+        "tp_world_size": 1,
+        "_all_reduce_attn_groups": lambda value, op: None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -977,22 +999,100 @@ class TestUnifiedCacheLinkerTreeCoreRustBackend(
     tree_core_backend = "rust"
 
 
-def test_restorable_prefix_intersects_sparse_rank_results():
-    remote_mask = torch.tensor([0, 0, 1, 0, 0], dtype=torch.int)
+@pytest.mark.parametrize("confirmed,expected", [(None, 2), ({1}, 1), (set(), 0)])
+def test_restorable_prefix_intersects_sparse_rank_results(confirmed, expected):
+    """Rejecting the longest shared boundary must retry a shorter shared one."""
+    remote_mask = torch.tensor([0, 1, 1, 1, 0], dtype=torch.int)
+    probes = []
+
+    def confirm(pages):
+        probes.append(pages)
+        return True
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
-        mask.copy_(torch.minimum(mask, remote_mask))
+        if mask.numel() > 1:
+            mask.copy_(torch.minimum(mask, remote_mask))
+        else:
+            mask[0] &= int(probes[-1] in confirmed)
 
     cache = _cache_for_wrapper(_all_reduce_attn_groups=intersect_remote_mask)
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
-    hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
+    hit_pages = wrapper._sync_restorable_prefix(
+        [1, 2, 4],
+        num_pages=4,
+        device_hit_pages=0,
+        confirm=None if confirmed is None else confirm,
+    )
+    assert hit_pages == expected
+    assert probes == (
+        [] if confirmed is None else [2, 1] + ([0] if not expected else [])
+    )
 
-    assert hit_pages == 2
+
+@pytest.mark.parametrize(
+    "path", ["match_rejected", "allocation_failure", "device_hit", "load_refused"]
+)
+def test_lookup_claims_released_when_device_load_is_unnecessary(
+    full_linker_component, monkeypatch, path
+):
+    """Rejected or superseded loads must not retain lookup claims or cache hits."""
+    backend = _FakeLinker()
+    backend.requires_lookup_confirmation = True
+    backend.restorable = [1]
+    claims = {"held"}
+
+    def discard(rid, transfers, pages):
+        if pages:
+            return False
+        claims.clear()
+        return True
+
+    backend.confirm_lookup = discard
+    if path == "allocation_failure":
+        full_linker_component.build_external_linker_transfer = lambda *args: None
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(
+            _components_tuple=(full_linker_component,),
+            page_size=2,
+            tree_core=SimpleNamespace(
+                enable_external_cache_linker=False, is_eagle=False
+            ),
+        ),
+        backend,
+    )
+    key = RadixKey(array("q", [1, 2]))
+    if path in ("allocation_failure", "device_hit"):
+        wrapper.hit_markers["discard"] = ExternalCacheHitMarker(["page"], 0)
+    if path == "load_refused":
+        wrapper.hit_markers["discard"] = ExternalCacheHitMarker(["page"], 0)
+        backend.load = lambda *args: False
+    req = SimpleNamespace(
+        rid="discard",
+        last_node=0,
+        cache_request_handle=CacheRequestHandle("discard", 0),
+        kv_hints=None,
+    )
+    if path in ("device_hit", "match_rejected"):
+        monkeypatch.setattr(
+            "sglang.srt.mem_cache.utils.get_native_hash", lambda *args: ["page"]
+        )
+        result = MatchResult(
+            device_prefix_len=2 if path == "device_hit" else 0,
+            last_device_node=0,
+            last_host_node=0,
+            best_match_node=0,
+        )
+        assert wrapper.match(key, req, result) == result
+    else:
+        assert wrapper.load_back(req) == (0, 0)
+    assert not claims
+    assert not wrapper.has_hit(req.rid)
 
 
-def test_async_offload_pins_node_until_completion():
+@pytest.mark.parametrize("success", [False, True])
+def test_async_offload_pins_node_until_completion(success):
     linker = _FakeLinker()
     lock_params = object()
     locks = []
@@ -1022,13 +1122,179 @@ def test_async_offload_pins_node_until_completion():
     assert node.write_through_pending_id == node_id
     assert not unlocks
 
-    linker.completed_offloads.append(False)
+    linker.completed_offloads.append(success)
     completed = wrapper.take_completed_offloads(finish_count=1)
     wrapper.commit_completed_offloads(completed)
 
-    assert not node.external_cache_stored
+    assert node.external_cache_stored == success
     assert node.write_through_pending_id is None
     assert unlocks == [(node_id, lock_params)]
+
+
+@pytest.mark.parametrize("success", [False, True])
+@pytest.mark.parametrize("events_enabled", [False, True])
+@pytest.mark.parametrize("remote_removal", [False, True])
+@pytest.mark.parametrize("namespace_seed", [None, b"\x01" * 32])
+def test_local_inventory_tracks_storage_removal_after_tree_eviction(
+    success, events_enabled, remote_removal, namespace_seed, monkeypatch
+):
+    hashes = ["1" * 64, "2" * 64]
+    root = SimpleNamespace(parent=None, hash_value=[])
+    node = SimpleNamespace(
+        id=7,
+        external_cache_stored=False,
+        write_through_pending_id=None,
+        key=RadixKey(array("q", [1, 2, 3, 4])),
+        hash_value=hashes,
+        parent=root,
+    )
+    core = _FakeExternalTreeCore(
+        {node.id: node}, [PoolTransfer(name=PoolName.KV, keys=hashes)]
+    )
+    core._node_arena = core.nodes
+    core._external_cache_event_hashes = {}
+    core.node_by_id = core.nodes.__getitem__
+    core.kv_events = KVCacheEventRecorder(enabled=events_enabled, page_size=2)
+    # Removal IDs must equal the published IDs, including namespace projection.
+    monkeypatch.setattr(core.kv_events, "_namespace_seed", lambda node: namespace_seed)
+    core.record_external_cache_store = lambda node_ids, medium: (
+        UnifiedTreeCore.record_external_cache_store(core, node_ids, medium)
+    )
+    core.remove_external_cache_storage = lambda keys, medium, **kwargs: (
+        UnifiedTreeCore.remove_external_cache_storage(core, keys, medium, **kwargs)
+    )
+    backend = _FakeLinker()
+    backend.local_storage_medium = StorageMedium.CPU
+    removals = []
+    backend.pop_storage_removals = lambda: list(removals)
+    cache = _cache_for_wrapper(
+        tree_core=core,
+        inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=object),
+        dec_lock_ref=lambda *args: None,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    wrapper.offload_nodes([node.id])
+    assert core.kv_events.take() == []
+    backend.completed_offloads.append(success)
+    completed = wrapper.take_completed_offloads(1)
+    assert core.kv_events.take() == []
+    wrapper.commit_completed_offloads(completed)
+    stored = core.kv_events.take()
+    assert bool(stored) == (success and events_enabled)
+    if stored:
+        assert isinstance(stored[0], BlockStored)
+        assert stored[0].medium == StorageMedium.CPU
+
+    if remote_removal:
+        cache.tp_world_size = 2
+        cache.tp_group = object()
+        cache._all_reduce_attn_groups = lambda value, op: value.fill_(1)
+        monkeypatch.setattr(torch.distributed, "get_world_size", lambda **kwargs: 2)
+        monkeypatch.setattr(
+            torch.distributed,
+            "all_gather_object",
+            lambda gathered, local, **kwargs: gathered.__setitem__(
+                slice(None), [local, hashes[:1]]
+            ),
+        )
+        wrapper.drain_storage_removals()
+        assert not node.external_cache_stored
+        assert core.kv_events.take() == []
+        assert set(core._external_cache_event_hashes) == (
+            set(hashes) if stored else set()
+        )
+
+    removals.append(hashes[0])
+    wrapper.drain_storage_removals()
+    assert not node.external_cache_stored
+    removed = core.kv_events.take()
+    if stored:
+        assert isinstance(removed[0], BlockRemoved)
+        assert removed[0].block_hashes == stored[0].block_hashes[:1]
+    else:
+        assert removed == []
+
+    core.nodes.clear()
+    removals[:] = [hashes[1]]
+    wrapper.drain_storage_removals()
+    removed = core.kv_events.take()
+    if stored:
+        assert removed[0].block_hashes == stored[0].block_hashes[1:]
+        assert removed[0].medium == StorageMedium.CPU
+    else:
+        assert removed == []
+
+
+@pytest.mark.parametrize("tree_core_backend", ["python", "rust"])
+@pytest.mark.parametrize("linker_mode", ["none", "default", "owned"])
+def test_take_events_tags_only_linker_local_storage(
+    tree_core_backend, linker_mode, monkeypatch
+):
+    monkeypatch.setattr(shared_cache_suite, "get_device", lambda: "cpu")
+    cache, allocator, _ = build_fixture(
+        CacheConfig(page_size=1, kv_size=8, max_context_len=8),
+        enable_kv_cache_events=True,
+        tree_core_backend=tree_core_backend,
+    )
+    cache.take_events()
+    inserted = cache.insert(
+        InsertParams(key=RadixKey(array("q", [1, 2])), value=allocator.alloc(2))
+    )
+    core = cache.tree_core
+    core.record_external_cache_store([inserted.last_device_node], StorageMedium.CPU)
+    hashes = core.get_hash_values(inserted.last_device_node)
+    core.remove_external_cache_storage(hashes[:1], StorageMedium.CPU)
+    cache.evict(EvictParams(num_tokens=2))
+    core.kv_events.record_all_cleared()
+    if linker_mode != "none":
+        backend = _FakeLinker()
+        assert backend.local_storage_ownership is None
+        backend.local_storage_medium = StorageMedium.CPU
+        if linker_mode == "owned":
+            backend.local_storage_ownership = "kvcr"
+        cache.init_cache_linker(backend)
+    owner = "kvcr" if linker_mode == "owned" else None
+    events = cache.take_events()
+    assert [
+        (type(event), getattr(event, "medium", None), event.ownership)
+        for event in events
+    ] == [
+        (BlockStored, StorageMedium.GPU, None),
+        (BlockStored, StorageMedium.CPU, owner),
+        (BlockRemoved, StorageMedium.CPU, owner),
+        (BlockRemoved, StorageMedium.GPU, None),
+        (AllBlocksCleared, None, None),
+    ]
+    cache.reset()
+    assert cache.take_events() == [AllBlocksCleared()]
+    core.remove_external_cache_storage(hashes[1:], StorageMedium.CPU)
+    assert cache.take_events() == [
+        BlockRemoved(
+            block_hashes=events[1].block_hashes[1:],
+            medium=StorageMedium.CPU,
+            ownership=owner,
+        )
+    ]
+
+
+@pytest.mark.parametrize("event_type", [BlockStored, BlockRemoved])
+def test_kv_event_coalescing_preserves_ownership(event_type):
+    recorder = KVCacheEventRecorder(enabled=True, page_size=1)
+    for index, owner in enumerate([None, "kvcr", "kvcr", None]):
+        fields = dict(block_hashes=[index], medium=StorageMedium.CPU, ownership=owner)
+        if event_type is BlockStored:
+            fields.update(
+                parent_block_hash=index - 1 if index else None,
+                token_ids=[index],
+                block_size=1,
+                lora_id=None,
+            )
+        recorder.enqueue(event_type(**fields))
+    assert [(event.block_hashes, event.ownership) for event in recorder.take()] == [
+        ([0], None),
+        ([1, 2], "kvcr"),
+        ([3], None),
+    ]
 
 
 def test_offload_skips_node_already_stored_by_tree_core():
@@ -1144,12 +1410,81 @@ def test_release_request_cancels_queued_load():
     linker.queued_loads["rid"] = [object()]
     wrapper.private_load_indices["rid"] = torch.arange(4)
 
-    wrapper.release_request("rid")
+    wrapper.release_request(CacheRequestHandle("rid", 0))
 
     assert wrapper.hit_markers == {}
     assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
     assert wrapper.private_load_indices == {}
+
+
+@pytest.mark.parametrize("cancel_load", [False, True])
+@pytest.mark.parametrize("finish", ["drain", "reset", "close"])
+def test_request_release_notifies_backend_without_unpinning_load(cancel_load, finish):
+    backend = _ContextLinker()
+    unlocked = []
+    cache = _cache_for_wrapper(dec_lock_ref=lambda *args: unlocked.append(args))
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    handle = CacheRequestHandle("rid", 1)
+    wrapper._request_handles[handle.rid] = handle
+    backend.set_request_context(handle, {"scope": "first"})
+    wrapper.inflight_load_rids = [handle.rid]
+    wrapper.private_load_indices[handle.rid] = torch.arange(4)
+    wrapper._load_request_handles[handle.rid] = handle
+
+    wrapper.release_request(handle, cancel_load=cancel_load)
+
+    assert backend.contexts == {}
+    assert not unlocked
+    if finish == "drain":
+        wrapper.start_layer_wise_loading()
+        assert wrapper.finish_loads() == []
+    else:
+        getattr(wrapper, finish)()
+    assert unlocked == []  # Request-private slots never acquire tree locks.
+    assert wrapper.private_load_indices == {}
+    assert wrapper._load_request_handles == {}
+    assert wrapper._request_handles == {}
+
+
+def test_successful_request_releases_linker_context():
+    released = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        release_request=lambda handle, **kwargs: released.append((handle, kwargs))
+    )
+    handle = CacheRequestHandle("rid", 2)
+
+    cache.finish(handle, CacheRequestOutcome.SUCCESS)
+
+    assert released == [(handle, {"cancel_load": False})]
+
+
+@pytest.mark.parametrize("finished", [False, True])
+@pytest.mark.parametrize("session_claims", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_normal_release_cleans_context_only_for_finished_request(
+    finished, session_claims, checkpointed
+):
+    backend = _ContextLinker()
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), backend)
+    handle = CacheRequestHandle("rid", 0)
+    wrapper._request_handles[handle.rid] = handle
+    backend.set_request_context(handle, None)
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.cache_controller = None
+    cache.linker = wrapper
+    cache._components_tuple = ()
+    cache.session = SimpleNamespace(try_cache_finished_req=lambda req: session_claims)
+    req = SimpleNamespace(
+        rid="rid", cache_request_handle=handle, finished=lambda: finished
+    )
+
+    assert cache.claim_kv_row(req) == session_claims
+    if not session_claims:
+        assert backend.contexts == {handle: None}
+        cache.on_release(req, checkpointed=checkpointed)
+    assert backend.contexts == ({} if finished else {handle: None})
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -1271,6 +1606,7 @@ def test_check_hicache_events_commits_common_rank_results():
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        drain_storage_removals=lambda: None,
     )
 
     reduce_calls = 0
@@ -1370,9 +1706,12 @@ def full_linker_component():
     return SimpleNamespace(
         component_type=ComponentType.FULL,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
-        update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
-            transfer
-        ),
+        update_external_linker_load=lambda phase,
+        req,
+        full_transfer,
+        transfer,
+        prefix_len,
+        **kwargs: (transfer),
     )
 
 
@@ -1405,7 +1744,13 @@ def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
         best_match_node=0,
     )
     matched = wrapper.match(
-        RadixKey(array("q", [1, 2, 3, 4])), SimpleNamespace(rid="match"), result
+        RadixKey(array("q", [1, 2, 3, 4])),
+        SimpleNamespace(
+            rid="match",
+            cache_request_handle=CacheRequestHandle("match", 0),
+            kv_hints=None,
+        ),
+        result,
     )
     assert matched.host_hit_length == 4
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [

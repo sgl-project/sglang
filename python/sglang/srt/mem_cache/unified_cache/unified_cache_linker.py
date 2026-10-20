@@ -30,14 +30,13 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import (
-    PoolName,
-    PoolTransfer,
-)
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
@@ -48,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -133,6 +133,21 @@ class UnifiedCacheLinker(ABC):
 
     layer_done_counter: object
     pools: dict[PoolName, object]
+    local_storage_medium: StorageMedium | None = None
+    local_storage_ownership: str | None = None
+    requires_lookup_confirmation: bool = False
+
+    def set_request_context(
+        self, handle: CacheRequestHandle, kv_hints: KvHintsEnvelope | None
+    ) -> None:
+        """Snapshot attempt-scoped hints; accepted loads retain their own scope."""
+
+    def release_request_context(self, handle: CacheRequestHandle) -> None:
+        """Release request scope without revoking accepted transfers."""
+
+    def pop_storage_removals(self) -> list[str]:
+        """Consume storage hashes whose local KVCR copies were removed."""
+        return []
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -146,7 +161,14 @@ class UnifiedCacheLinker(ABC):
         let the tree pick a length that is invalid on another rank.
 
         Local to this rank; the tree intersects the sets across ranks.
+        Backends requiring confirmation may return optimistic candidates.
         """
+
+    def confirm_lookup(
+        self, rid: str, transfers: list[PoolTransfer], hit_pages: int
+    ) -> bool:
+        """Confirm a shared boundary; zero discards unaccepted lookup claims."""
+        return True
 
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
@@ -237,6 +259,8 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        self._request_handles: dict[str, CacheRequestHandle] = {}
+        self._load_request_handles: dict[str, CacheRequestHandle] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -259,6 +283,9 @@ class UnifiedCacheLinkerWrapper:
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
+        previous = self.hit_markers.pop(req.rid, None)
+        if previous is not None and self.cache_linker.requires_lookup_confirmation:
+            self.cache_linker.confirm_lookup(req.rid, [], 0)
         cache = self.cache
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
@@ -280,11 +307,22 @@ class UnifiedCacheLinkerWrapper:
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
+        handle = req.cache_request_handle
+        previous = self._request_handles.get(req.rid)
+        if previous is not None and previous != handle:
+            self.release_request(previous, cancel_load=False)
+        self._request_handles[req.rid] = handle
+        self.cache_linker.set_request_context(handle, req.kv_hints)
+
+        def confirm(pages):
+            return self.cache_linker.confirm_lookup(req.rid, lookup_transfers, pages)
+
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
             self.cache_linker.lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
+            confirm=confirm if self.cache_linker.requires_lookup_confirmation else None,
         )
         if hit_pages == 0:
             return result
@@ -313,7 +351,12 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
+        self,
+        restorable: list[int],
+        *,
+        num_pages: int,
+        device_hit_pages: int,
+        confirm: Callable[[int], bool] | None = None,
     ) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
@@ -328,9 +371,15 @@ class UnifiedCacheLinkerWrapper:
                 mask[pages] = 1
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
-        if common.numel() == 0:
-            return 0
-        return int(common[-1].item())
+        if confirm is None:
+            return int(common[-1].item()) if common.numel() else 0
+        for pages in reversed(common.flatten().tolist()):
+            accepted = torch.tensor([int(confirm(pages))], dtype=torch.int)
+            self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+            if accepted.item():
+                return pages
+        confirm(0)
+        return 0
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
@@ -385,6 +434,8 @@ class UnifiedCacheLinkerWrapper:
                     component_transfers,
                     prefix_len,
                 )
+                if self.cache_linker.requires_lookup_confirmation:
+                    self.cache_linker.confirm_lookup(req.rid, [], 0)
                 return 0, req.last_node
             component_transfers.append((component, transfer))
 
@@ -406,6 +457,8 @@ class UnifiedCacheLinkerWrapper:
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT, req, component_transfers, prefix_len
             )
+            if self.cache_linker.requires_lookup_confirmation:
+                self.cache_linker.confirm_lookup(req.rid, [], 0)
             return 0, req.last_node
         self._update_load(
             ExternalLinkerLoadPhase.PREPARE,
@@ -436,6 +489,8 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
+        if req.rid in self._request_handles:
+            self._load_request_handles[req.rid] = self._request_handles[req.rid]
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
@@ -523,7 +578,43 @@ class UnifiedCacheLinkerWrapper:
             self.cache.tree_core.finish_external_linker_offload(
                 pending.publish_node_ids, pending.lock_node_id, success
             )
+            if success and self.cache_linker.local_storage_medium is not None:
+                self.cache.tree_core.record_external_cache_store(
+                    pending.publish_node_ids, self.cache_linker.local_storage_medium
+                )
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
+
+    def drain_storage_removals(self) -> None:
+        medium = self.cache_linker.local_storage_medium
+        if medium is None:
+            return
+        hashes = self.cache_linker.pop_storage_removals()
+        any_removed = torch.tensor([bool(hashes)], dtype=torch.int)
+        self.cache._all_reduce_attn_groups(any_removed, torch.distributed.ReduceOp.MAX)
+        if not any_removed.item():
+            return
+        all_hashes = set(hashes)
+        groups = [
+            group
+            for group in (self.cache.attn_cp_group, self.cache.attn_tp_group)
+            if group is not None and torch.distributed.get_world_size(group=group) > 1
+        ]
+        if not groups and self.cache.tp_world_size > 1:
+            groups = [self.cache.tp_group]
+        for group in groups:
+            gathered = [None] * torch.distributed.get_world_size(group=group)
+            torch.distributed.all_gather_object(
+                gathered, sorted(all_hashes), group=group
+            )
+            all_hashes.update(key for rank_hashes in gathered for key in rank_hashes)
+        # Offload decisions must agree, but each rank advertises its own inventory.
+        remote_hashes = all_hashes.difference(hashes)
+        if remote_hashes:
+            self.cache.tree_core.remove_external_cache_storage(
+                sorted(remote_hashes), medium, publish=False
+            )
+        if hashes:
+            self.cache.tree_core.remove_external_cache_storage(hashes, medium)
 
     def start_layer_wise_loading(self) -> int:
         self.inflight_load_index = self.cache_linker.start_layer_wise_loading()
@@ -550,6 +641,7 @@ class UnifiedCacheLinkerWrapper:
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
         for rid in rids:
             self.private_load_indices.pop(rid, None)
+            self._load_request_handles.pop(rid, None)
         if landed.item():
             return []
         logger.error(
@@ -566,6 +658,8 @@ class UnifiedCacheLinkerWrapper:
         self.private_load_indices.clear()
         self.inflight_load_index = -1
         self._release_pending_offloads()
+        self._load_request_handles.clear()
+        self._release_request_contexts()
 
     def _release_pending_offloads(self) -> None:
         for pending in self.pending_offloads:
@@ -575,16 +669,40 @@ class UnifiedCacheLinkerWrapper:
             self.cache.dec_lock_ref(pending.lock_node_id, pending.lock_params)
         self.pending_offloads.clear()
 
-    def release_request(self, rid: str) -> None:
+    def release_request(
+        self, handle: CacheRequestHandle, *, cancel_load: bool = True
+    ) -> None:
+        rid = handle.rid
+        current = self._request_handles.get(rid)
+        if current is not None and current != handle:
+            return
         self.hit_markers.pop(rid, None)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
-        if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):
+        owns_load = self._load_request_handles.get(rid, handle) == handle
+        if (
+            cancel_load
+            and owns_load
+            and rid in self.inflight_load_rids
+            and self.cache_linker.cancel_queued_load(rid)
+        ):
             self.inflight_load_rids.remove(rid)
             self.private_load_indices.pop(rid, None)
+            self._load_request_handles.pop(rid, None)
+        if current is not None:
+            self.cache_linker.release_request_context(handle)
+            self._request_handles.pop(rid)
+
+    def _release_request_contexts(self) -> None:
+        for handle in self._request_handles.values():
+            self.cache_linker.release_request_context(handle)
+        self._request_handles.clear()
 
     def close(self) -> None:
         self.cache_linker.close()
+        self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self._release_pending_offloads()
+        self._load_request_handles.clear()
+        self._release_request_contexts()

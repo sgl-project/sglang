@@ -709,6 +709,18 @@ class UnifiedTreeCoreInterface(ABC):
         """
         ...
 
+    @abstractmethod
+    def record_external_cache_store(self, node_ids: Sequence[NodeId], medium) -> None:
+        """Publish confirmed local storage, retaining its hashes beyond tree eviction."""
+        ...
+
+    @abstractmethod
+    def remove_external_cache_storage(
+        self, hashes: Sequence[str], medium, *, publish: bool = True
+    ) -> None:
+        """Invalidate stored marks and publish actual local storage removals."""
+        ...
+
     # Order-sensitive digest of write_back duplicate-reclaim victim ids,
     # cross-checked across TP ranks; cores that never reclaim keep 0.
     write_back_duplicate_reclaim_digest: int = 0
