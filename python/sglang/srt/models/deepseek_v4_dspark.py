@@ -990,6 +990,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         loaded_params = set()
 
         weights = _dequant_fp8_wo_a_streaming(weights)
+        n_routed_experts = _dspark_stage_config(self.config).n_routed_experts
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -998,7 +999,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=(self.config.n_routed_experts + self.num_fused_shared_experts),
+            num_experts=(n_routed_experts + self.num_fused_shared_experts),
         )
 
         for name, loaded_weight in weights:
@@ -1012,7 +1013,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
                 mapped = mapped.replace(
                     ".mlp.shared_experts.",
-                    f".mlp.experts.{self.config.n_routed_experts}.",
+                    f".mlp.experts.{n_routed_experts}.",
                 )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in mapped:
