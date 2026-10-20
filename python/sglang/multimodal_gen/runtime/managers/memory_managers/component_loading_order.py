@@ -166,3 +166,28 @@ def order_component_load_specs(
             spec.index,
         ),
     )
+
+
+def is_parallel_load_candidate(spec: ComponentLoadSpec) -> bool:
+    """Heavy DiT / text-encoder loads that dominate cold-start wall time.
+
+    These components are independent during instantiation and weight I/O, so
+    they can overlap on a small thread pool. VAE/tokenizer/scheduler stay on
+    the serial path (cheap, and keeps CUDA context setup simpler).
+    """
+    name = spec.load_module_name or spec.module_name
+    return is_dit_component_name(name) or is_text_encoder_component_name(name)
+
+
+def partition_component_load_specs(
+    component_specs: list[ComponentLoadSpec],
+) -> tuple[list[ComponentLoadSpec], list[ComponentLoadSpec]]:
+    """Split load specs into (parallel_heavy, serial_helpers), preserving order."""
+    parallel_specs: list[ComponentLoadSpec] = []
+    serial_specs: list[ComponentLoadSpec] = []
+    for spec in component_specs:
+        if is_parallel_load_candidate(spec):
+            parallel_specs.append(spec)
+        else:
+            serial_specs.append(spec)
+    return parallel_specs, serial_specs

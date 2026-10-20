@@ -4,7 +4,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_or
     ComponentLoadSpec,
     component_load_risk_rank,
     infer_component_weight_size_bytes,
+    is_parallel_load_candidate,
     order_component_load_specs,
+    partition_component_load_specs,
 )
 
 
@@ -128,3 +130,47 @@ def test_component_load_order_prefers_inferred_safetensors_size(tmp_path):
 
     assert ordered_names == ["text_encoder", "transformer", "scheduler"]
     assert infer_component_weight_size_bytes(str(large_encoder_path)) == 64
+
+
+def test_parallel_load_candidates_cover_dit_and_text_encoders_only():
+    assert is_parallel_load_candidate(_spec("transformer", 0))
+    assert is_parallel_load_candidate(_spec("transformer_2", 1))
+    assert is_parallel_load_candidate(_spec("text_encoder", 2))
+    assert is_parallel_load_candidate(_spec("text_encoder_2", 3))
+    assert is_parallel_load_candidate(_spec("video_dit", 4))
+    assert not is_parallel_load_candidate(_spec("vae", 5))
+    assert not is_parallel_load_candidate(_spec("scheduler", 6))
+    assert not is_parallel_load_candidate(_spec("tokenizer", 7))
+    # Alias module_name but text-encoder load target still counts as parallel.
+    assert is_parallel_load_candidate(
+        ComponentLoadSpec(
+            module_name="encoder_alias",
+            load_module_name="text_encoder_2",
+            component_model_path="/missing",
+            transformers_or_diffusers="transformers",
+            architecture=None,
+            index=8,
+        )
+    )
+
+
+def test_partition_component_load_specs_preserves_relative_order():
+    specs = [
+        _spec("transformer", 0),
+        _spec("vae", 1),
+        _spec("text_encoder", 2),
+        _spec("scheduler", 3),
+        _spec("tokenizer", 4),
+    ]
+
+    parallel_specs, serial_specs = partition_component_load_specs(specs)
+
+    assert [spec.module_name for spec in parallel_specs] == [
+        "transformer",
+        "text_encoder",
+    ]
+    assert [spec.module_name for spec in serial_specs] == [
+        "vae",
+        "scheduler",
+        "tokenizer",
+    ]
