@@ -118,6 +118,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
+    _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
 
@@ -169,6 +170,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True
+        self.enable_async_d2h_copy = False
+        self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=lambda: []
         )
@@ -557,7 +560,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda: 0,
+                    swa_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 scheduler.policy = SchedulePolicy(
@@ -1256,7 +1259,7 @@ class TestPrefillResultPolling(CustomTestCase):
                 class ChunkScheduler(_Scheduler):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
-                        req.extend_range = SimpleNamespace(end=end)
+                        req.extend_end = end
                         self.chunked_req = req if end < 12 else None
                         batch.chunked_req = self.chunked_req
                         if self.chunked_req is not None:
@@ -1264,7 +1267,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         return super().run_batch(batch)
 
                     def checkpoint_disagg_prefill(self, req):
-                        checkpoint_ends.append(req.extend_range.end)
+                        checkpoint_ends.append(req.extend_end)
                         super().checkpoint_disagg_prefill(req)
 
                 if pause_at == 1:
@@ -1335,7 +1338,7 @@ class TestPrefillResultPolling(CustomTestCase):
 
                     def run_batch(self, batch):
                         if req in batch.reqs:
-                            req.extend_range = SimpleNamespace(end=batch.forward_iter)
+                            req.extend_end = batch.forward_iter
                             self.chunked_req = batch.chunked_req = req
                             req.inflight_middle_chunks += 1
                         return super().run_batch(batch)

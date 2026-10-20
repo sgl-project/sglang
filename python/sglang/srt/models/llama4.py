@@ -212,7 +212,6 @@ class Llama4Attention(nn.Module):
         self.use_rope = (layer_id + 1) % 4 != 0
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -264,8 +263,7 @@ class Llama4Attention(nn.Module):
             bias=bias,
             quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -274,8 +272,7 @@ class Llama4Attention(nn.Module):
             bias=bias_o_proj,
             quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
         is_neox_style = True
