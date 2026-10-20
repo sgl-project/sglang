@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_disagg
@@ -39,6 +40,33 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
         and not dsa_use_prefill_cp(forward_batch)
         and not forward_batch.forward_mode.is_idle()
     )
+
+
+def rebuild_cp_kv_cache(
+    m: "DeepseekV2AttentionMLA",
+    forward_batch: "ForwardBatch",
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+):
+    """All-gather CP-sharded K into the full logical sequence order.
+
+    NPU counterpart of the CUDA DSA path
+    (``prepare_kv_for_attention`` → ``InterleaveCPStrategy.materialize_full_mla_kv``):
+    pack the post-``kv_a_layernorm`` ``k_nope`` and post-rope ``k_pe`` back into
+    the latent layout, all-gather across the attn-CP group, restore the global
+    token order, then split again. Under prefill CP every rank only projects
+    and rope-applies its own token shard, while the indexer's global top-k and
+    the sparse attention kernel (``do_cp_balance_attn``) both consume the
+    full-sequence K.
+    """
+    kv_lora_rank = m.kv_lora_rank
+    qk_rope_head_dim = m.qk_rope_head_dim
+    packed = torch.cat((k_nope, k_pe), dim=-1).view(-1, kv_lora_rank + qk_rope_head_dim)
+    full_latent = cp_gather_full_sequence_states(
+        packed.contiguous(), forward_batch, torch.npu.current_stream()
+    )
+    k_nope, k_pe = full_latent.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
+    return k_nope.unsqueeze(1), k_pe.unsqueeze(1)
 
 
 # region MHA
@@ -267,10 +295,8 @@ def forward_mla_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
+            # All-gather the CP shards and restore full-sequence order.
+            k_nope, k_pe = rebuild_cp_kv_cache(m, forward_batch, k_nope, k_pe)
         topk_indices = None
         if q_lora is not None:
             topk_indices = m.indexer(
@@ -486,10 +512,8 @@ def forward_dsa_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
+            # All-gather the CP shards and restore full-sequence order.
+            k_nope, k_pe = rebuild_cp_kv_cache(m, forward_batch, k_nope, k_pe)
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(

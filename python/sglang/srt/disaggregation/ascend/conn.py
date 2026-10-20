@@ -310,7 +310,13 @@ class AscendKVManager(MooncakeKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
-        if self.pp_size > 1:
+        if self.pp_size > 1 or (
+            self.is_mla_backend and len(self.kv_args.kv_data_ptrs) != len(dst_kv_ptrs)
+        ):
+            # The second condition covers layer-split prefill on PP=1: the
+            # sender reports owned-only entries while the decode peer
+            # registers every layer, so the entries must be remapped onto
+            # the decode peer's global layer range (same slicing as PP).
             if self.is_mla_backend:
                 src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage = (
                     self.get_mla_kv_ptrs_with_pp(self.kv_args.kv_data_ptrs, dst_kv_ptrs)
