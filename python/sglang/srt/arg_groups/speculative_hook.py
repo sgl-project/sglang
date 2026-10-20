@@ -1204,12 +1204,34 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu", "xpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu", "npu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, XPU, or NPU devices."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
+
+    if cfg.device == "npu":
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            Phase,
+            with_phase,
+        )
+
+        # NGRAM's irregular, CPU-generated masks have a different shape on
+        # every iteration. Keep them out of the fixed MTP graph capture path.
+        graph_config = with_phase(
+            cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+        )
+        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
+        declare_resolution(
+            server_args,
+            "_handle_ngram",
+            cuda_graph_config=graph_config,
+            disable_cuda_graph=True,
+            disable_overlap_schedule=True,
+        )
+        logger.warning("NGRAM on NPU uses eager execution and synchronous scheduling.")
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -1245,8 +1267,9 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         declare_resolution(
             server_args,
             "_handle_ngram",
-            speculative_num_steps=cfg.speculative_num_draft_tokens
-            // cfg.speculative_eagle_topk,
+            speculative_num_steps=max(
+                1, cfg.speculative_num_draft_tokens // cfg.speculative_eagle_topk
+            ),
         )
     if cfg.speculative_ngram_external_corpus_path is not None:
         if cfg.speculative_ngram_external_sam_budget <= 0:
@@ -1273,16 +1296,28 @@ def _handle_ngram(server_args: ServerArgs) -> None:
     )
 
     view = resolved_view(server_args)
+    if cfg.device == "npu":
+        if attention_backends_of(view) != ("ascend", "ascend"):
+            raise ValueError("NGRAM on NPU requires the ascend attention backend.")
+        if cfg.pp_size != 1 or cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+            raise ValueError(
+                "NGRAM on NPU does not support pipeline or context parallelism."
+            )
+        if cfg.speculative_use_rejection_sampling:
+            raise ValueError(
+                "NGRAM on NPU uses tree target-only sampling; chain rejection sampling "
+                "cannot verify irregular NGRAM trees."
+            )
     if (
         cfg.speculative_eagle_topk > 1
         and view.page_size > 1
-        and view.attention_backend != "flashinfer"
+        and view.attention_backend not in ("flashinfer", "ascend")
     ):
         raise ValueError(
             f"speculative_eagle_topk({cfg.speculative_eagle_topk}) > 1 "
             f"with page_size({view.page_size}) > 1 is unstable "
             "and produces incorrect results for paged attention backends. "
-            "This combination is only supported for the 'flashinfer' backend."
+            "This combination is only supported for the 'flashinfer' or 'ascend' backend."
         )
     if attn_dp_enabled_of(view):
         # TODO: support dp attention for ngram speculative decoding
