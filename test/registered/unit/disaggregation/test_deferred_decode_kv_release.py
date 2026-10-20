@@ -6,13 +6,20 @@ them immediately (which could let the still-in-flight write land on pages alread
 reused by another request). The pages are released once every prefill rank acks
 that its transfer drained (CommonKVManager.is_abort_release_safe). Device
 destinations may also release on timeout; host destinations require the ack.
+All decode attention-TP ranks must agree on holding and releasing each request.
 """
 
+import datetime
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, call, patch
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation import decode as decode_mod
 from sglang.srt.disaggregation.base.conn import BaseKVManager, KVPoll
@@ -27,10 +34,11 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=45, suite="base-a-test-cpu")
 
 ABORT_GENERATION = 7
 
@@ -661,14 +669,21 @@ class _FakeIdxAllocator:
 def _make_queue(timeout=30.0, enable_metrics=False):
     q = DecodeTransferQueue.__new__(DecodeTransferQueue)
     q._deferred_releases = []
+    q.queue = []
+    q.gloo_group = dist.group.WORLD
+    q.tp_rank = 0
+    q.enable_deferred_kv_release = True
     q.deferred_kv_release_timeout = timeout
     q.enable_host_receive = False
     q.enable_staging = False
     q.staging_handler = None
-    q.tree_cache = object()
+    q.tree_cache = MagicMock()
     q.metadata_buffers = SimpleNamespace(bootstrap_room={})
     q.req_to_metadata_buffer_idx_allocator = _FakeIdxAllocator()
     q.scheduler = SimpleNamespace(
+        enable_decode_hicache=False,
+        enable_hisparse=False,
+        output_streamer=MagicMock(),
         metrics_reporter=SimpleNamespace(enable_metrics=enable_metrics),
         metrics_collector=SimpleNamespace(
             observe_decode_deferred_kv_release=MagicMock()
@@ -680,6 +695,10 @@ def _make_queue(timeout=30.0, enable_metrics=False):
 def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
     receiver = SimpleNamespace(
         kv_mgr=mgr,
+        abort_notified=True,
+        ensure_abort_notified=MagicMock(),
+        failure_exception=lambda: None,
+        poll=lambda: KVPoll.Failed,
         # One entry per prefill rank the decode notified of the abort; its length
         # is the required drain-ack count (see DecodeTransferQueue._defer_release).
         bootstrap_infos=[{"rank": r} for r in range(n_prefill_ranks)],
@@ -687,13 +706,23 @@ def _make_decode_req(room, idx, mgr, n_prefill_ranks=1):
         clear=lambda: None,
     )
     return SimpleNamespace(
-        req=SimpleNamespace(bootstrap_room=room),
+        req=SimpleNamespace(bootstrap_room=room, rid=str(room), return_logprob=False),
+        host_staged=False,
+        hicache_restore_status=HiCacheRestoreResult.READY,
+        prefix_match=None,
+        hicache_restore_lock=None,
         kv_receiver=receiver,
         metadata_buffer_index=idx,
     )
 
 
 class TestResolveDeferredReleases(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        world_size = patch.object(dist, "get_world_size", return_value=1)
+        world_size.start()
+        self.addCleanup(world_size.stop)
+
     def test_host_release_requires_drain_on_every_rank_even_after_timeout(self):
         mgr = _make_manager()
         q = _make_queue(timeout=-1)
@@ -866,6 +895,123 @@ class TestResolveDeferredReleases(CustomTestCase):
         self.assertEqual(held_idx, 9)
         self.assertEqual(required, 1)
 
+    def test_two_rank_release_consensus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mp.spawn(
+                _run_release_consensus,
+                args=(str(Path(tmp) / "rendezvous"),),
+                nprocs=2,
+                join=True,
+            )
+
+
+def _run_release_consensus(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    try:
+        observations = []
+        expected = []
+        for scenario, host, drained, now, first_freed in (
+            ("ack", False, rank == 0, 10.0, [1]),
+            ("deadline", False, False, 31.0 if rank == 0 else 29.0, [1]),
+            ("mixed", False, rank == 0, 31.0, [0, 1]),
+            ("host_ack", True, rank == 0, 10.0, [1]),
+            ("host_timeout", True, False, 31.0, [1]),
+        ):
+            mgr = _make_manager()
+            q = _make_queue()
+            q.enable_host_receive = host
+            dreq = _make_decode_req(42, 0, mgr)
+            dreq.host_staged = host
+            dreq.kv_receiver.is_abort_release_safe = lambda: drained
+            generation = mgr.register_deferred_abort_room(42)
+            if drained:
+                mgr.note_abort_ack(42, 0, generation)
+            # An independently ready entry must be released even while the
+            # first entry waits for a peer; agreement is per request.
+            ready_req = _make_decode_req(44, 1, mgr)
+            ready_req.host_staged = host
+            ready_req.kv_receiver.is_abort_release_safe = lambda: True
+            ready_generation = mgr.register_deferred_abort_room(44)
+            mgr.note_abort_ack(44, 0, ready_generation)
+            with patch.object(decode_mod.time, "monotonic", return_value=0.0):
+                q._defer_release(dreq)
+                q._defer_release(ready_req)
+            with (
+                patch.object(decode_mod.time, "monotonic", return_value=now) as clock,
+                patch.object(decode_mod, "release_kv_cache"),
+                patch.object(decode_mod, "discard_kv_cache_backup"),
+            ):
+                q.resolve_deferred_releases()
+                observations.append(
+                    (scenario, list(q.req_to_metadata_buffer_idx_allocator.freed))
+                )
+                expected.append((scenario, first_freed))
+
+                drained = True
+                if scenario != "deadline":
+                    mgr.note_abort_ack(42, 0, generation)
+                clock.return_value = 31.0
+                q.resolve_deferred_releases()
+                q.resolve_deferred_releases()
+                observations.append(
+                    (
+                        scenario + "_drained",
+                        list(q.req_to_metadata_buffer_idx_allocator.freed),
+                    )
+                )
+                expected.append(
+                    (scenario + "_drained", [0, 1] if scenario == "mixed" else [1, 0])
+                )
+
+        for notification in ("some", "all", "none", "disabled"):
+            mgr = _make_manager()
+            q = _make_queue()
+            q.enable_deferred_kv_release = notification != "disabled"
+            dreq = _make_decode_req(43, 1, mgr)
+            receiver = dreq.kv_receiver
+            receiver.abort_notified = notification == "all" or (
+                notification == "some" and rank == 0
+            )
+            if not receiver.abort_notified:
+                receiver.bootstrap_infos = None
+            generation = mgr.register_deferred_abort_room(43)
+            q.queue = [dreq]
+            with (
+                patch.object(decode_mod, "prepare_abort"),
+                patch.object(decode_mod, "release_kv_cache"),
+            ):
+                q.pop_transferred()
+                held = len(q._deferred_releases)
+                observations.append((notification, held))
+                expected.append((notification, int(notification in ("some", "all"))))
+                held_by_rank = [None, None]
+                dist.all_gather_object(held_by_rank, held)
+                # Keep a broken implementation from deadlocking the test when
+                # just one rank enters the release collective.
+                if held_by_rank == [1, 1]:
+                    mgr.note_abort_ack(43, 0, generation)
+                    q.resolve_deferred_releases()
+                observations.append(
+                    (
+                        notification + "_freed",
+                        list(q.req_to_metadata_buffer_idx_allocator.freed),
+                    )
+                )
+                expected.append((notification + "_freed", [1]))
+
+        # Both ranks reach the same assertion even if the old code diverges.
+        results = [None, None]
+        dist.all_gather_object(results, observations)
+        assert results == [expected, expected], results
+    finally:
+        dist.destroy_process_group()
+
 
 def _make_pop_queue(mgr):
     """DecodeTransferQueue shell wired for pop_transferred's Failed branch."""
@@ -917,6 +1063,12 @@ class TestFailedTransfersDeferOnEveryFailure(CustomTestCase):
     request's pages; releasing at t=0 re-opens the reuse race the hold exists
     to prevent. pop_transferred must notify the prefill ranks and defer on
     every failure kind, not only when abort_notified is already set."""
+
+    def setUp(self):
+        super().setUp()
+        world_size = patch.object(dist, "get_world_size", return_value=1)
+        world_size.start()
+        self.addCleanup(world_size.stop)
 
     def _pop(self, q):
         released = []
