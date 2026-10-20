@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import zmq
 import zmq.asyncio
@@ -56,7 +57,9 @@ class DeploymentServer:
             request.image_path = [
                 "data:application/octet-stream;base64,"
                 + base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                if isinstance(path, str) and Path(path).is_file()
+                if isinstance(path, str)
+                and urlsplit(path).scheme not in ("http", "https", "data")
+                and Path(path).is_file()
                 else path
                 for path in paths
             ]

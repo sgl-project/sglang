@@ -183,7 +183,9 @@ def test_coordinator_parallel_join_and_cleanup():
         for name, socket in zip(roles, sockets):
             tasks.append(asyncio.create_task(peer(name, socket)))
         try:
-            result = await server.execute(None)
+            result = await server.execute(
+                Req(image_path=["data:image/png;base64," + "A" * 1024])
+            )
             assert completed == set(roles)
             assert result["sources"][0]["fields"] == ["result.output"]
             await server.release(result["lease"])
