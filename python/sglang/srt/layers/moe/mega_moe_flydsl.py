@@ -373,8 +373,6 @@ def _run_mega_routed(
 
     output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
 
-    from sglang.srt.models.deepseek_common.utils import _use_aiter
-
-    if not (moe.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter):
+    if not moe.routed_scaling_factor_fused_in_topk:
         output.mul_(moe.routed_scaling_factor)
     return output
