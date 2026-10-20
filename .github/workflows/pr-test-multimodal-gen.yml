@@ -65,7 +65,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Compute partitions
         id: compute
@@ -101,7 +101,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -168,12 +168,18 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run SM120-only diffusion unit tests
+        timeout-minutes: 10
+        working-directory: python
+        run: |
+          python3 -m pytest -v sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py
 
       - name: Run 5090 diffusion canary tests
         timeout-minutes: 120
@@ -233,7 +239,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -298,7 +304,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -368,7 +374,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -413,7 +419,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -426,6 +432,22 @@ jobs:
         timeout-minutes: 10
         run: |
           python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
+
+      - name: Run Blackwell-only diffusion unit tests
+        timeout-minutes: 10
+        working-directory: python
+        run: |
+          python3 -m pytest -v \
+            sglang/multimodal_gen/test/unit/test_mxfp8_online_gemm.py \
+            sglang/multimodal_gen/test/unit/test_wan_gelu_mlp.py
+
+      - name: Run 4-GPU diffusion unit tests
+        timeout-minutes: 15
+        working-directory: python
+        run: |
+          python3 -m pytest -v \
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sequence_parallel.py::test_joint_video_audio_tensor_sequence_parallel \
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py::test_sr_four_gpus
 
       - name: Run diffusion server tests
         timeout-minutes: 240
@@ -483,12 +505,19 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Install Quant-VideoGen
+        timeout-minutes: 5
+        run: |
+          # quant-videogen pins an incompatible torch, so install it without deps
+          # plus the import-time deps of the diffusion-qvg extra.
+          uv pip install --no-deps quant-videogen==0.1.0 "loguru>=0.7" "termcolor>=2.3"
 
       - name: Run diffusion unit tests
         timeout-minutes: 60
@@ -519,7 +548,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Download all execution reports
         uses: actions/download-artifact@v4

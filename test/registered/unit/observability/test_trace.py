@@ -156,6 +156,13 @@ class TestGetOtlpSpanExporter(unittest.TestCase):
 
 
 class TestProcessTracingInit(unittest.TestCase):
+    def setUp(self):
+        self.orig_initialized = mod.opentelemetry_initialized
+        mod.opentelemetry_initialized = False
+
+    def tearDown(self):
+        mod.opentelemetry_initialized = self.orig_initialized
+
     def test_raises_without_otel(self):
 
         orig = mod.opentelemetry_imported

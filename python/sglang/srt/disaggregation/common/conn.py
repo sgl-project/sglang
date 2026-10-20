@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_serving,
+    linear_attn_tp_size,
     max_prefill_buffer_tokens,
 )
 from sglang.srt.server_args import ServerArgs
@@ -113,6 +114,7 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
@@ -277,6 +279,7 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
 
+    kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
 
     # Used by decode when the prefill reported Failed without a reason frame.
@@ -293,6 +296,7 @@ class CommonKVManager(BaseKVManager):
     ):
         self.kv_args = args
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
+        self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -320,6 +324,11 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
+        # The TP width the transferred state is laid out over, which decode
+        # pairs with: attention TP, or the TP group under CP-TP group sharing,
+        # where the GDN heads are partitioned over it and QSA/PLE state is whole
+        # on every rank. KV heads keep following attention TP.
+        self.state_tp_size = linear_attn_tp_size()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
         self.attn_dp_size = parallel.attn_dp_size
@@ -339,7 +348,11 @@ class CommonKVManager(BaseKVManager):
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
         )
-        self.enable_all_cp_ranks_for_transfer = (
+        # CP-TP group sharing: CP rank r holds every KV head, the CP-replicated
+        # state and linear-attention head shard r. It transfers as TP rank r of
+        # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
+        cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
@@ -389,6 +402,7 @@ class CommonKVManager(BaseKVManager):
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
+                and not cp_tp_group_sharing
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
@@ -471,6 +485,7 @@ class CommonKVManager(BaseKVManager):
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
             and not get_parallel().enable_dsa_cache_layer_split
+            and not get_parallel().enable_cp_tp_group_sharing
         )
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
@@ -1198,6 +1213,17 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        if (
+            info.kv_layout is not None
+            and self.kv_layout is not None
+            and info.kv_layout != self.kv_layout
+        ):
+            raise RuntimeError(
+                f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
+                f"but decode server has kv_layout={self.kv_layout}. Both servers "
+                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+            )
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1396,11 +1422,16 @@ class CommonKVManager(BaseKVManager):
 
         bootstrap_na = NetworkAddress(host, self.bootstrap_port)
         url = f"{bootstrap_na.to_url()}/route"
+        attn_tp = (self.attn_tp_size, self.attn_tp_rank)
+        attn_cp = (self.attn_cp_size, self.attn_cp_rank)
+        if get_parallel().enable_cp_tp_group_sharing:
+            # Decode pairs its TP rank r with this CP rank r (see __init__).
+            attn_tp, attn_cp = attn_cp, (1, 0)
         payload = {
-            "attn_tp_size": self.attn_tp_size,
-            "attn_tp_rank": self.attn_tp_rank,
-            "attn_cp_size": self.attn_cp_size,
-            "attn_cp_rank": self.attn_cp_rank,
+            "attn_tp_size": attn_tp[0],
+            "attn_tp_rank": attn_tp[1],
+            "attn_cp_size": attn_cp[0],
+            "attn_cp_rank": attn_cp[1],
             "attn_dp_size": self.attn_dp_size,
             "attn_dp_rank": self.attn_dp_rank,
             "pp_size": self.pp_size,
@@ -1411,6 +1442,7 @@ class CommonKVManager(BaseKVManager):
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
+            "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
@@ -2628,6 +2660,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dp_size = None
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
+        self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
@@ -2699,6 +2732,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
+        kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
@@ -2732,6 +2766,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.kv_cache_dtype is None and kv_cache_dtype is not None:
             self.kv_cache_dtype = kv_cache_dtype
+
+        if self.kv_layout is None and kv_layout is not None:
+            self.kv_layout = kv_layout
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
@@ -2805,6 +2842,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 pp_size=self.pp_size,
                 page_size=self.page_size,
                 kv_cache_dtype=self.kv_cache_dtype,
+                kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
@@ -2818,6 +2856,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.kv_layout is None:
+                payload.pop("kv_layout")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():

@@ -17,7 +17,7 @@ namespace deepseek_v4::fp4 {
 
 /// Largest finite e2m1 value.
 constexpr float kMax = 6.0f;
-/// `6 * 2^-126`, the amax floor `torch_quant.fake_quant_fp4` clamps to.
+/// `6 * 2^-126`, the amax floor `fp4_fake_quant.fake_quant_fp4` clamps to.
 constexpr float kAmaxFloor = 6.0f * 1.1754943508222875e-38f;
 /// Elements sharing one ue8m0 scale.
 constexpr uint32_t kBlockSize = 32;
@@ -95,7 +95,7 @@ SGL_DEVICE fp32x2_t block_scale(float amax) {
 /// \brief Round a pair onto the e2m1 grid and back, through `scale`.
 ///
 /// Every e2m1 value is exact in fp16, so the roundtrip is lossless. Adding `0.0f` during
-/// scaling clears negative zero to match `torch.sign(0) == 0` in `torch_quant.round_fp4`.
+/// scaling clears negative zero to match `torch.sign(0) == 0` in `fp4_fake_quant.round_fp4`.
 SGL_DEVICE fp32x2_t fake_quant_x2(fp32x2_t x, float scale, float inv_scale) {
   const fp32x2_t scaled{__fmaf_rn(x.x, inv_scale, 0.0f), __fmaf_rn(x.y, inv_scale, 0.0f)};
 #ifdef USE_ROCM

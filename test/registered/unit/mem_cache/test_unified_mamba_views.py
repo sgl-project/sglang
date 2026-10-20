@@ -44,6 +44,7 @@ def _make_pool(
     temporal_dtype,
     want_slots=8,
     device="cpu",
+    grow_direction="down",
 ):
     """Minimal 2-sub-pool ``UnifiedKVPool`` sized to hold >= ``want_slots``
     Mamba slots; returns ``(pool, mamba_spec)``."""
@@ -56,7 +57,7 @@ def _make_pool(
     mamba_spec = MambaSubPoolSpec(
         name="mamba",
         layer_num=mamba_layer_num,
-        grow_direction="down",
+        grow_direction=grow_direction,
         conv_state_shapes=tuple(tuple(s) for s in conv_state_shapes),
         conv_dtype=conv_dtype,
         temporal_state_shape=tuple(temporal_state_shape),
@@ -69,7 +70,7 @@ def _make_pool(
         head_num=1,
         head_dim=8,
         store_dtype=torch.bfloat16,
-        grow_direction="up",
+        grow_direction="down" if grow_direction == "up" else "up",
     )
     entry_mamba = mamba_spec.entry_bytes()
     entry_full = full_spec.entry_bytes()
