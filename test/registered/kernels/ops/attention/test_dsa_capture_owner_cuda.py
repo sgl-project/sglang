@@ -167,7 +167,6 @@ def test_backend_stores_helper_retained_owner_with_the_shape():
     from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
         FullCudaGraphBackend,
     )
-
     from sglang.srt.runtime_context import get_parallel
 
     indexer = object.__new__(Indexer)

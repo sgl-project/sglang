@@ -175,10 +175,10 @@ def _run_flashinfer_b12x_w4a16(
             (runner_config.num_experts,), -1, dtype=torch.int32, device=x.device
         )
         local_start = runner_config.moe_ep_rank * runner_config.num_local_experts
-        expert_map[
-            local_start : local_start + runner_config.num_local_experts
-        ] = torch.arange(
-            runner_config.num_local_experts, dtype=torch.int32, device=x.device
+        expert_map[local_start : local_start + runner_config.num_local_experts] = (
+            torch.arange(
+                runner_config.num_local_experts, dtype=torch.int32, device=x.device
+            )
         )
 
     if quant_info.prepared_weights is None:
