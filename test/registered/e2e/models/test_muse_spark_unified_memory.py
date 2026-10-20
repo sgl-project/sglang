@@ -34,7 +34,21 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
             token_env = patch.dict(os.environ, {"HF_TOKEN": token})
             token_env.start()
             cls.addClassCleanup(token_env.stop)
-        cls.model = try_cached_model(MODEL_PATH)
+        # Pass a complete snapshot path so processor loading never queries the
+        # gated Hub repo on fork CI, where the model credential is unavailable.
+        cls.model = try_cached_model(
+            MODEL_PATH,
+            required_files=(
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+                "l4_200k_base",
+                "processor_config.json",
+                "chat_template.jinja",
+                "generation_config.json",
+                "hf_quant_config.json",
+            ),
+        )
         cls.other_args = [
             "--tp-size",
             "4",
@@ -57,7 +71,7 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
             "--speculative-algorithm",
             "DFLASH",
             "--speculative-draft-model-path",
-            try_cached_model(DRAFT_MODEL_PATH),
+            try_cached_model(DRAFT_MODEL_PATH, required_files=()),
             "--speculative-draft-attention-backend",
             "fa4",
             "--speculative-num-draft-tokens",
