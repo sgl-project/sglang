@@ -1270,25 +1270,47 @@ sglang generate \
   --sp-degree 4 \
   --attention-backend laser_attn \
   --quantization w8a8_int \
+  --quantization-ignored-layers blocks.0 \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
 
-The same online linear path is used by Wan 2.2 I2V-A14B and TI2V-5B. Use the
-[Wan 2.2 cookbook](/cookbook/diffusion/Wan/Wan2.2) for their model and input
-settings. Wan keeps its GELU activation. MiniMax-H3 uses the same linear
-backend and optionally fuses SwiGLU or residual RMSNorm with activation
-quantization when the installed NPU operators support them; otherwise it
+The following models integrate this online linear path. Target-NPU
+correctness and generation quality remain pending validation for each model.
+The component column describes global `--quantization w8a8_int` selection.
+
+| Model | Transformer components | Activation | Target-NPU validation |
+| --- | --- | --- | --- |
+| MiniMax-H3 | `transformer` | SwiGLU | Pending |
+| Wan 2.2 T2V-A14B | `transformer`, `transformer_2` | GELU | Pending |
+| Wan 2.2 I2V-A14B | `transformer`, `transformer_2` | GELU | Pending |
+| Wan 2.2 TI2V-5B | `transformer` | GELU | Pending |
+
+Use the [Wan 2.2 cookbook](/cookbook/diffusion/Wan/Wan2.2) or
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3) for model and
+input settings. MiniMax-H3 optionally fuses SwiGLU or residual RMSNorm with
+activation quantization when the installed NPU operators support them; otherwise it
 uses separate activation, normalization, and quantization operations.
 
 On Wan 2.2 A14B, global `--quantization w8a8_int` applies to both
 `transformer` and `transformer_2`. To select only the primary transformer,
 replace the global flag with `--transformer-quantization w8a8_int`.
-You can also select both components explicitly:
+The example above keeps block 0 in checkpoint precision on both A14B
+transformers. To select both components explicitly while excluding block 0
+only from the primary transformer:
 
 ```bash
---component-quantizations.transformer w8a8_int \
---component-quantizations.transformer_2 w8a8_int
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --num-gpus 8 \
+  --tp-size 2 \
+  --sp-degree 4 \
+  --attention-backend laser_attn \
+  --component-quantizations.transformer w8a8_int \
+  --component-quantizations.transformer_2 w8a8_int \
+  --component-quantization-ignored-layers.transformer blocks.0 \
+  --prompt "a fox walking through neon rain" \
+  --save-output
 ```
 
 Use `--quantization-ignored-layers blocks.0` to keep block 0 of each selected
@@ -1298,9 +1320,7 @@ layers from just one explicitly selected component, use
 `--component-quantization-ignored-layers.transformer blocks.0` together with
 `--transformer-quantization w8a8_int`.
 
-Target-NPU correctness and generation quality for this online W8A8 path
-remain pending validation. Existing BF16 cookbook benchmarks do not measure
-this configuration.
+Existing BF16 cookbook benchmarks do not measure this online W8A8 configuration.
 
 ## MXFP8 Quantization
 

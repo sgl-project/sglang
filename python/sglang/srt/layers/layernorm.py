@@ -503,10 +503,9 @@ class RMSNorm(BaseFusedOp):
             self._forward_method = self.forward_native
 
     def fuse_input_quant(self, linear: nn.Module) -> None:
-        """Fuse supported input quantization for the consuming projection.
-
-        The projection stays out of this module's children.
-        """
+        """Fuse the static per-tensor FP8 input quantization of ``linear``, the
+        projection that consumes this norm's output, whenever forward_cuda can.
+        The projection stays out of this module's children."""
         self.__dict__["_quant_linear"] = linear
 
     def forward_cuda(
@@ -632,28 +631,6 @@ class RMSNorm(BaseFusedOp):
             return result.reshape(original_shape)
         return result
 
-    def _forward_npu_quant(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor,
-        quant_linear: Optional[nn.Module] = None,
-    ):
-        if quant_linear is None:
-            quant_linear = self._quant_linear
-        if (
-            not getattr(
-                getattr(quant_linear, "quant_method", None), "accepts_int8_input", False
-            )
-            or self.variance_size_override is not None
-            or self.cast_x_before_out_mul
-            or self.fp32_residual
-            or self.override_orig_dtype is not None
-        ):
-            return None
-        from sglang.srt.hardware_backend.npu.layernorm import try_add_rmsnorm_int8
-
-        return try_add_rmsnorm_int8(x, residual, self.weight, self.variance_epsilon)
-
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -664,9 +641,6 @@ class RMSNorm(BaseFusedOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            quantized = self._forward_npu_quant(x, residual, quant_linear)
-            if quantized is not None:
-                return quantized
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )

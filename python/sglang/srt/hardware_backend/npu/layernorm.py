@@ -4,6 +4,7 @@
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
 
 
 @lru_cache(maxsize=None)
@@ -28,11 +29,11 @@ def _supports_add_rmsnorm_int8(device: torch.device, dtype: torch.dtype, width: 
         return False
 
 
-def try_add_rmsnorm_int8(
+def _try_add_rmsnorm_int8(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor | None,
-    eps: float | None,
+    eps: float,
 ):
     if (
         x.device.type != "npu"
@@ -54,9 +55,45 @@ def try_add_rmsnorm_int8(
         _INT8Activation,
     )
 
-    if eps is None:
-        eps = torch.finfo(x.dtype).eps
     data, _, residual_out, scales, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
         x, residual, weight, epsilon=eps
     )
     return _INT8Activation(data, scales, x.dtype), residual_out
+
+
+def rms_norm_npu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float | None,
+    residual: torch.Tensor | None = None,
+    *,
+    quantize: bool = False,
+    preserve_residual_rounding: bool = False,
+):
+    if eps is None:
+        eps = torch.finfo(x.dtype).eps
+    if residual is not None:
+        if quantize:
+            quantized = _try_add_rmsnorm_int8(x, residual, weight, eps)
+            if quantized is not None:
+                return quantized
+        if preserve_residual_rounding:
+            # Preserve the model's low-precision residual addition.
+            x = residual = residual + x
+        else:
+            out, _, residual_out = torch.ops.npu.npu_add_rms_norm(
+                residual, x, weight, eps
+            )
+            return out, residual_out
+
+    if preserve_residual_rounding and (
+        x.dtype not in (torch.float16, torch.bfloat16)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or x.numel() == 0
+        or not hasattr(torch.ops.npu, "npu_rms_norm")
+    ):
+        out = F.rms_norm(x, (weight.shape[-1],), weight, eps)
+    else:
+        out = torch.ops.npu.npu_rms_norm(x, weight, eps)[0]
+    return out if residual is None else (out, residual)

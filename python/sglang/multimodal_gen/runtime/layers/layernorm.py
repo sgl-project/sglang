@@ -61,7 +61,7 @@ if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
-    import torch_npu
+    import torch_npu  # noqa: F401  # Registers NPU operators.
     from sgl_kernel_npu.norm.rmsnorm_without_weight import (
         fused_rmsnorm_without_weight,
     )
@@ -148,6 +148,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.preserve_residual_rounding:
+            return self.forward_native(x, residual)
         shape = x.shape
         if self.cast_x_before_out_mul:
             if residual is not None or self.variance_size_override is not None:
@@ -268,42 +270,25 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if residual is not None:
-            if (
-                getattr(
-                    getattr(self._quant_linear, "quant_method", None),
-                    "accepts_int8_input",
-                    False,
-                )
-                and self.variance_size_override is None
-                and not self.cast_x_before_out_mul
-            ):
-                from sglang.srt.hardware_backend.npu.layernorm import (
-                    try_add_rmsnorm_int8,
-                )
+        from sglang.srt.hardware_backend.npu.layernorm import rms_norm_npu
 
-                quantized = try_add_rmsnorm_int8(
-                    x, residual, self.weight, self.variance_epsilon
-                )
-                if quantized is not None:
-                    return quantized
-            if self.preserve_residual_rounding:
-                # Preserve the model's low-precision residual addition.
-                residual = residual + x
-                return self.forward_npu(residual), residual
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
+        quantize = (
+            getattr(
+                getattr(self._quant_linear, "quant_method", None),
+                "accepts_int8_input",
+                False,
             )
-            return out, residual_out
-        if self.preserve_residual_rounding and (
-            x.dtype not in (torch.float16, torch.bfloat16)
-            or self.weight.dtype != x.dtype
-            or self.weight.device != x.device
-            or x.numel() == 0
-            or not hasattr(torch.ops.npu, "npu_rms_norm")
-        ):
-            return self.forward_native(x)
-        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+            and self.variance_size_override is None
+            and not self.cast_x_before_out_mul
+        )
+        return rms_norm_npu(
+            x,
+            self.weight.data,
+            self.variance_epsilon,
+            residual,
+            quantize=quantize,
+            preserve_residual_rounding=self.preserve_residual_rounding,
+        )
 
     def forward_hip(
         self,
@@ -318,6 +303,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.preserve_residual_rounding:
+            return self.forward_native(x, residual)
         # Fall back to the native fp32 path for cases aiter cannot serve:
         #   - fp32 input  (CK kernel is templated on fp16/bf16 only;
         #                  out.dtype check rejects fp32 with "not support output type: float")
@@ -370,6 +357,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.preserve_residual_rounding:
+            return self.forward_native(x, residual)
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
@@ -398,6 +387,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.preserve_residual_rounding:
+            return self.forward_native(x, residual)
         shape = x.shape
         x = x.reshape(-1, shape[-1])
         if residual is not None:
