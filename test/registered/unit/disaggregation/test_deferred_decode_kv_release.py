@@ -749,10 +749,13 @@ def _run_release_consensus(rank: int, rendezvous: str) -> None:
             ("mixed", False, rank == 0, 31.0, [0, 1]),
             ("host_ack", True, rank == 0, 10.0, [1]),
             ("host_timeout", True, False, 31.0, [1]),
+            ("cpu_ack", False, rank == 0, 10.0, [1]),
+            ("cpu_timeout", False, False, 31.0, [1]),
         ):
             mgr = _make_manager()
             q = _make_queue()
             q.enable_host_receive = host
+            q.enable_cpu_buffer = scenario.startswith("cpu_")
             dreq = _make_decode_req(42, 0, mgr)
             dreq.host_staged = host
             dreq.kv_receiver.is_abort_release_safe = lambda: drained
