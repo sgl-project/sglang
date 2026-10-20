@@ -104,6 +104,13 @@ class AttentionBackend(ABC):
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
+    def glue_draft_metadata(self) -> str:
+        """Called once by a speculative draft runner that would capture this
+        backend's ``init_forward_metadata_out_graph`` into its metadata glue graph:
+        "" accepts (and prepares the backend for it), otherwise the reason not to.
+        Accept only a prep whose host inputs are constant per replay key."""
+        return "the attention backend declares no host-free draft prep"
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,

@@ -25,6 +25,7 @@ Backend selection comes from cuda_graph_config.decode:
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import dataclasses
 import inspect
@@ -128,6 +129,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Draft metadata glue: steps between two "draft glue" tally lines per rank
+DRAFT_GLUE_LOG_EVERY = 1000
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -223,6 +227,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     attention backend, two-batch-overlap plugin, DeepEP adapter, and the
     pluggable self.backend that handles the actual capture/replay.
     """
+
+    _draft_glue_logged = 0
 
     dllm_input_preparation = None
     dllm_attention = None
@@ -497,6 +503,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+        # The DSpark draft runner's prep has no host-fed plan, so the guard above does
+        # not apply where its backend says so.
+        self._draft_metadata_glue = (
+            self._metadata_glue is None and self._glues_draft_metadata()
+        )
+        self._draft_glue_logged = 0
+        if self._draft_metadata_glue:
+            self._metadata_glue = MetadataGlueGraph(self.device)
+            atexit.register(self._log_draft_glue, " at shutdown")
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
@@ -1556,6 +1571,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and not self.enable_pdmux
             and self.model_runner.lora_manager is None
         ):
+            self._glue_draft_inputs(fb_view)
             # actual_forward_mode belongs in the key even though the captured
             # graph always targets capture_forward_mode: DSV4's replay prep
             # substitutes seq_lens / seq_lens_cpu / seq_lens_sum /
@@ -1572,7 +1588,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
             )
         else:
+            if self._metadata_glue is not None:
+                self._metadata_glue.note_not_routed()
             attn_backend.init_forward_metadata_out_graph(fb_view)
+        if self._draft_metadata_glue:
+            self._maybe_log_draft_glue()
 
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
@@ -1589,6 +1609,43 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
         )
+
+    def _glues_draft_metadata(self) -> bool:
+        """Whether this draft runner's metadata prep runs through the glue graph: a
+        static-verify draft runner whose backend accepts it."""
+        if not self.model_runner.is_draft_worker:
+            return False
+        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+            why = "ragged verify"
+        else:
+            why = self.attn_backend.glue_draft_metadata()
+        if why:
+            logger.info("Draft metadata glue graph off: %s.", why)
+            return False
+        logger.info("Draft metadata prep through the glue graph, one per replay key.")
+        return True
+
+    def _maybe_log_draft_glue(self) -> None:
+        glue = self._metadata_glue
+        steps = glue.replays + glue.eager
+        if steps >= self._draft_glue_logged + DRAFT_GLUE_LOG_EVERY:
+            self._draft_glue_logged = steps
+            self._log_draft_glue("")
+
+    def _log_draft_glue(self, when: str) -> None:
+        logger.debug(
+            "draft glue: %d graph replays, %d eager (since warm-up)%s",
+            self._metadata_glue.replays,
+            self._metadata_glue.eager,
+            when,
+        )
+
+    def _glue_draft_inputs(self, fb_view) -> None:
+        """The draft glue graph reads its inputs by address: out_cache_loc from the
+        registry slot fill_from just wrote, not the step's own (fresh) tensor."""
+        if self._draft_metadata_glue and fb_view.out_cache_loc is not None:
+            n = fb_view.out_cache_loc.shape[0]
+            fb_view.out_cache_loc = self.buffers.out_cache_loc[:n]
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid

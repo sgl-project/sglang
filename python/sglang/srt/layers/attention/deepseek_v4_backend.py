@@ -1191,6 +1191,7 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    draft_metadata_glued = False
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
@@ -1335,10 +1336,46 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        # Once a draft runner glues this prep (glue_draft_metadata): the draft
+        # block's extend lengths come from device constants, one per batch size.
+        self.draft_metadata_glued = False
+        self._draft_extend_lens: Dict[Tuple[int, ...], torch.Tensor] = {}
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
+
+    def glue_draft_metadata(self) -> str:
+        # On FlashMLA without online c128 MTP, a request window or context
+        # parallelism, the DSpark draft block prep launches only device work whose
+        # host inputs follow from the batch size (its CPU lengths feed asserts).
+        for bad, why in (
+            (not self.is_dspark_draft, "not the DSpark draft runner"),
+            (self.trtllm_attn, "trtllm-gen attention"),
+            (self.online_c128_mtp.enabled(), "online c128 MTP"),
+            (self.token_to_kv_pool.request_window is not None, "a request window"),
+            (get_parallel().attn_cp_size != 1, "context parallelism"),
+        ):
+            if bad:
+                return why
+        self.draft_metadata_glued = True
+        return ""
+
+    def _draft_block_extend_lens(self, lens: List[int]) -> torch.Tensor:
+        """The draft block's extend lengths on the device; glued, a cached constant
+        (a captured host copy would replay from a freed pinned buffer)."""
+        if not self.draft_metadata_glued:
+            return self._move_to_device(lens)
+        key = tuple(lens)
+        cached = self._draft_extend_lens.get(key)
+        if cached is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"draft block extend lengths {key} first seen inside the metadata "
+                    "glue capture"
+                )
+            cached = self._draft_extend_lens[key] = self._move_to_device(lens)
+        return cached
 
     def _resolve_verify_layout(
         self,
@@ -2153,7 +2190,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu_list,
             extend_len=block_size,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        extend_seq_lens = self._draft_block_extend_lens(lengths.extend_seq_lens_cpu)
         return self.init_forward_metadata_prefill(
             # DSpark draft blocks are SWA-only, like draft extend. Their full
             # context page table is unused; retain only its 2-D placeholder.
