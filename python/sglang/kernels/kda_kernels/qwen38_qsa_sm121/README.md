@@ -1,11 +1,8 @@
 # Qwen3.8 QSA packed-varlen decode for SM121
 
-This implementation was optimized by Codex and Kimi K3 agents through
-[KDA-1.5](https://github.com/radixark/KDA-1.5). The task and immutable real
-tensor replay were registered in [radixark/KDA-1.5 PR #4](https://github.com/radixark/KDA-1.5/pull/4)
-at commit `414ce456e14ae8546f77d9356d2c4d955c5bb7f1`. This package integrates
-winning submission `b4181149c8884ddb`; its byte-exact submitted source has SHA256
-`4f9977f88abfea4393a2add3a2c9255699f7e13b981dbc1a976b024b3b00e909`.
+This implementation was optimized by Codex and Kimi K3 agents through the
+Kernel Design Agents workflow, against an immutable replay of real decode
+tensors.
 
 The kernel is specialized for the packed QSA decode tensors captured from
 `RadixArk/Qwen3.8-Flash-Next-NVFP4` on NVIDIA GB10 (SM121):
