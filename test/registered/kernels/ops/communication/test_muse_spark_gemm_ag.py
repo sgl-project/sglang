@@ -21,11 +21,12 @@ import torch.nn.functional as F
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once
-from sglang.kernels.ops.communication.mp import register_comm_cleanup
-from sglang.kernels.ops.muse_spark import gemm_ag
+from sglang.kernels.ops.communication import muse_spark_all_gather
+from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.communication import muse_spark_gemm_ag as gemm_ag
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -66,7 +67,9 @@ def test_gemm_ag_matches_slice_gemms(k, n):
     comm = _init_comm()
     if comm.disabled or not comm.has_multicast:
         pytest.skip("needs a multicast-capable NVLink group")
-    max_tokens = gemm_ag.projection_max_tokens(comm.world_size, n, _device())
+    max_tokens = muse_spark_all_gather.projection_max_tokens(
+        comm.world_size, n, _device()
+    )
     n_local = n // comm.world_size
     generator = torch.Generator().manual_seed(n)
     weight = (torch.randn(n, k, generator=generator) * 0.02).to(
@@ -74,7 +77,7 @@ def test_gemm_ag_matches_slice_gemms(k, n):
     )
     for m in sorted({1, max_tokens}):
         x = torch.randn(m, k, generator=generator).to(_device(), torch.bfloat16)
-        assert gemm_ag.gemm_ag_supported(comm, x, weight)
+        assert muse_spark_all_gather.gemm_ag_supported(comm, x, weight)
         output = gemm_ag.gemm_ag(comm, x, weight)
         expected = torch.cat(
             [
@@ -86,7 +89,7 @@ def test_gemm_ag_matches_slice_gemms(k, n):
         torch.cuda.synchronize()
         assert torch.equal(output, expected), f"{m=}"
     past_bound = torch.empty(max_tokens + 1, k, device=_device(), dtype=torch.bfloat16)
-    assert not gemm_ag.gemm_ag_supported(comm, past_bound, weight)
+    assert not muse_spark_all_gather.gemm_ag_supported(comm, past_bound, weight)
 
 
 if __name__ == "__main__":

@@ -643,21 +643,44 @@ class TestDeclaredStackStructure(CustomTestCase):
     packed drafts, mirror geometry, controller arguments, sidecars."""
 
     def _run(self, *, pool, drafts, full_layer_mapping, page_size=64):
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import (
+            MLAHostAllocation,
+            MLATokenToKVPoolHost,
+        )
 
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
         def dummy_kv_host(**kwargs):
+            pool = kwargs["kv_pool"]
+            drafts = kwargs["mtp_draft_device_pools"]
+            width = kwargs["kv_pool"].kv_cache_dim or (
+                pool.kv_lora_rank + pool.qk_rope_head_dim
+            )
+            target_layer_num = (
+                (pool.layer_num + pool.layer_shard_size - 1) // pool.layer_shard_size
+                if pool.layer_shard_enabled
+                else pool.layer_num
+            )
             return MLATokenToKVPoolHost(
-                kwargs["kv_pool"],
+                MLAHostAllocation(
+                    dtype=pool.store_dtype,
+                    kv_lora_rank=pool.kv_lora_rank,
+                    qk_rope_head_dim=pool.qk_rope_head_dim,
+                    kv_cache_dim=width,
+                    size_per_token=width
+                    * pool.store_dtype.itemsize
+                    * (target_layer_num + len(drafts)),
+                    draft_layer_num=len(drafts),
+                ),
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                target_layer_num=target_layer_num,
                 host_to_device_ratio=2,
                 host_size=0,
                 page_size=kwargs["page_size"],
                 layout="page_first",
                 pin_memory=False,
-                is_dummy=True,
-                override_kv_cache_dim=kwargs["kv_pool"].kv_cache_dim,
-                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
         def dummy_indexer_host(
@@ -893,10 +916,30 @@ class TestKvHostPoolRow(CustomTestCase):
 
     def _build(self, pool, drafts=()):
         seen = {}
+        for device_pool in (pool, *drafts):
+            device_pool.model_layer_ids = tuple(range(device_pool.layer_num))
+            device_pool.kv_buffer = [
+                torch.empty(
+                    (
+                        device_pool.size + device_pool.page_size,
+                        1,
+                        device_pool.kv_cache_dim,
+                    ),
+                    dtype=device_pool.store_dtype,
+                )
+                for _ in range(device_pool.layer_num)
+            ]
+            device_pool.data_ptrs = torch.tensor(
+                [buffer.data_ptr() for buffer in device_pool.kv_buffer],
+                dtype=torch.uint64,
+            )
+            device_pool.kv_scale_buffer = None
+            device_pool.dsa_kv_cache_store_fp8 = False
+            device_pool.host_capacity_tokens = None
 
-        def fake_host(kv_pool, ratio, size, page_size, layout, **kwargs):
+        def fake_host(buffer_info, ratio, size, page_size, layout, **kwargs):
             seen.update(kwargs)
-            return SimpleNamespace(layer_num=kv_pool.layer_num)
+            return SimpleNamespace(layer_num=kwargs["target_layer_num"])
 
         with (
             patch.object(hybrid_pool_assembler, "MLATokenToKVPoolHost", fake_host),
@@ -943,7 +986,10 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
     DSA layers that own index buffers."""
 
     def test_stack_declares_indexer_and_skips_empty_layers(self):
-        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import (
+            MLAHostAllocation,
+            MLATokenToKVPoolHost,
+        )
 
         kv_pool = _dsa_pool_stub(layer_num=3)
         kv_pool.skip_topk_layers = [False, True, False]  # device layer 1: no buffer
@@ -976,16 +1022,29 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
         real_indexer_host = pool_host_dsa.DSAIndexerPoolHost
 
         def dummy_kv_host(**kwargs):
+            pool = kwargs["kv_pool"]
+            drafts = kwargs["mtp_draft_device_pools"]
+            width = None or (pool.kv_lora_rank + pool.qk_rope_head_dim)
             return MLATokenToKVPoolHost(
-                kwargs["kv_pool"],
+                MLAHostAllocation(
+                    dtype=pool.store_dtype,
+                    kv_lora_rank=pool.kv_lora_rank,
+                    qk_rope_head_dim=pool.qk_rope_head_dim,
+                    kv_cache_dim=width,
+                    size_per_token=width
+                    * pool.store_dtype.itemsize
+                    * (pool.layer_num + len(drafts)),
+                    draft_layer_num=len(drafts),
+                ),
+                device_capacity_tokens=pool.size,
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                target_layer_num=pool.layer_num,
                 host_to_device_ratio=2,
                 host_size=0,
                 page_size=kwargs["page_size"],
                 layout="page_first",
                 pin_memory=False,
-                is_dummy=True,
-                override_kv_cache_dim=None,
-                mtp_draft_device_pools=kwargs["mtp_draft_device_pools"],
             )
 
         def dummy_indexer_host(
@@ -1521,6 +1580,100 @@ class TestUnifiedPageEnvelopeSelection(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class TestMtpMhaPhysicalConstruction(CustomTestCase):
+    def test_full_token_draft_swa_preserves_capacity_and_physical_rows(self):
+        """MTP sidecars keep their capacity override and both draft allocations."""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+        original_init = MHATokenToKVPoolHost.__init__
+        allocated = []
+
+        def unpinned(host, *args, **kwargs):
+            kwargs["pin_memory"] = False
+            original_init(host, *args, **kwargs)
+            allocated.append(host)
+
+        def pool(size, layers, start, heads):
+            return MHATokenToKVPool(
+                size=size,
+                page_size=4,
+                dtype=torch.float16,
+                head_num=heads,
+                head_dim=8,
+                layer_num=layers,
+                device="cpu",
+                enable_memory_saver=False,
+                start_layer=start,
+                end_layer=start + layers,
+            )
+
+        for layout in ("layer_first", "page_first"):
+            with self.subTest(layout=layout):
+                full = pool(32, 2, 20, 2)
+                swa = pool(16, 1, 20, 1)
+                first, second = pool(16, 1, 23, 1), pool(16, 1, 24, 1)
+                first.host_capacity_tokens = 32
+                try:
+                    with (
+                        patch.object(MHATokenToKVPoolHost, "__init__", unpinned),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_memory",
+                            return_value=SimpleNamespace(
+                                hicache_ratio=1.0,
+                                hicache_size=0,
+                                hicache_mem_layout=layout,
+                            ),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "get_parallel",
+                            return_value=SimpleNamespace(dcp_enabled=False),
+                        ),
+                        patch.object(
+                            hybrid_pool_assembler,
+                            "_get_allocator_type",
+                            return_value="default",
+                        ),
+                    ):
+                        group = build_hybrid_swa_group(
+                            page_size=4,
+                            full_kv_pool=full,
+                            swa_kv_pool=swa,
+                            full_layer_mapping={0: 0, 2: 1},
+                            swa_layer_mapping={1: 0},
+                            use_mla=False,
+                            mtp_swa_full_device_pools=(first, second),
+                            transfer_layer_id_max=3,
+                        )
+                    host = group.get_pool(PoolName.DRAFT_SWA)
+                    self.assertEqual(group.get_pool(PoolName.KV).size, 36)
+                    self.assertEqual(host.device_capacity_tokens, 32)
+                    self.assertEqual(host.size, 76)
+                    self.assertEqual((host.start_layer, host.end_layer), (23, 24))
+                    self.assertEqual((host.target_layer_num, host.layer_num), (1, 2))
+                    self.assertIs(host.device_k_buffers[0], first.k_buffer[0])
+                    self.assertIs(host.device_k_buffers[1], second.k_buffer[0])
+                    self.assertIs(host.device_v_buffers[0], first.v_buffer[0])
+                    self.assertIs(host.device_v_buffers[1], second.v_buffer[0])
+                    self.assertEqual(
+                        [
+                            group.get_entry(PoolName.DRAFT_SWA).layer_mapper(i)
+                            for i in (0, 3)
+                        ],
+                        [0, 1],
+                    )
+                    self.assertEqual(
+                        group.get_entry(PoolName.DRAFT_SWA).packed_draft_device_pools,
+                        (second,),
+                    )
+                finally:
+                    for host in allocated:
+                        host.destroy()
+                    allocated.clear()
 
 
 if __name__ == "__main__":

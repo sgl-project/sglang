@@ -136,6 +136,15 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_reason.matched, r"\.$")
         self.assertEqual(req.finished_len, 2)
 
+    def test_stop_regex_end_anchored_midchunk(self):
+        """An end-anchored stop_regex that matches only after a token accepted
+        mid-step ("a." in "a.b") must still finish the request."""
+        req = _make_req([60, 61, 62], stop_regex=[r"[.!?]\s*$"])
+        req.update_finish_state(new_accepted_len=3)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
+        self.assertEqual(req.finished_len, 2)
+
     # --- decoded_text-only branch ---
     def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):
         # Documents current behavior: when the stop is only in decoded_text (not
