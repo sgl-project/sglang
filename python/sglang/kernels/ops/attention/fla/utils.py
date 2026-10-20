@@ -9,12 +9,13 @@ import os
 import sys
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable, Dict, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
 import triton
 from packaging import version
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import torch_release
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,32 @@ SUPPORTS_AUTOTUNE_CACHE = (
 autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
+
+
+def deterministic_autotune_prune(**fixed: Any) -> Callable[..., List[triton.Config]]:
+    """Build an ``early_config_prune`` that keeps one config in deterministic mode.
+
+    An autotune without a disk cache is timed again in every process, so two
+    runs, or two pipeline ranks of one run, can pick different configs. When a
+    kernel's reduction order follows its config, they then compute different
+    bits. With --enable-deterministic-inference or SGLANG_KDA_FIXED_AUTOTUNE=1,
+    only the first listed config whose kwargs and launch options match ``fixed``
+    is kept (e.g. ``num_warps=4``); otherwise all configs are kept.
+    """
+
+    def early_config_prune(configs, named_args, **kwargs):
+        if not (
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            or envs.SGLANG_KDA_FIXED_AUTOTUNE.get()
+        ):
+            return configs
+        return [
+            config
+            for config in configs
+            if all(config.all_kwargs().get(k) == v for k, v in fixed.items())
+        ][:1]
+
+    return early_config_prune
 
 
 @lru_cache(maxsize=1)
