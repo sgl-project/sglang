@@ -197,12 +197,16 @@ registration and completion contract.
   loop into independently retried operations is not supported.
 - This is not a durable job queue and does not automatically replay failed
   inference or perform cross-node resource scheduling.
+- Each worker executes one request at a time; use role replicas for concurrency.
+  Per-worker dynamic batching is not enabled on this path. Client cancellation
+  stops pending graph work and discards late results, but does not preempt an
+  already-running GPU kernel or denoising loop.
 
 ## Preset role deployment
 
 ### Quick start
 
-Disaggregation is controlled by a single flag: `--disagg-role`. Each component is launched independently, just like LLM PD disaggregation.
+The preset topology uses `--disagg-role`. Each role is launched independently.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>

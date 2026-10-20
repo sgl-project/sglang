@@ -2,6 +2,8 @@
 """Async encoding client returning named tensors on the trainer's GPU."""
 
 import asyncio
+import logging
+import uuid
 
 import zmq.asyncio
 
@@ -9,6 +11,8 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import (
     TensorTransport,
     rpc,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class EncodingClient:
@@ -40,13 +44,20 @@ class EncodingClient:
             self.pending.discard(task)
 
     async def _encode(self, request, outputs):
-        result = await rpc(
-            self.context,
-            self.endpoint,
-            {"method": "encode", "request": request, "outputs": outputs},
-            self.timeout,
-        )
+        job_id = uuid.uuid4().hex
+        result = None
         try:
+            result = await rpc(
+                self.context,
+                self.endpoint,
+                {
+                    "method": "encode",
+                    "job_id": job_id,
+                    "request": request,
+                    "outputs": outputs,
+                },
+                self.timeout,
+            )
             values = {}
             for source in result["sources"]:
                 fields = source["fields"]
@@ -62,12 +73,18 @@ class EncodingClient:
                 )
             return values
         finally:
-            await rpc(
-                self.context,
-                self.endpoint,
-                {"method": "release", "lease": result["lease"]},
-                min(self.timeout, 5),
+            cleanup = (
+                {"method": "release", "lease": result["lease"]}
+                if result is not None
+                else {"method": "cancel", "job_id": job_id}
             )
+            try:
+                await rpc(self.context, self.endpoint, cleanup, min(self.timeout, 5))
+            except Exception:
+                logger.warning(
+                    "Encoder cleanup was not acknowledged; its lease will expire",
+                    exc_info=True,
+                )
 
     async def __aenter__(self):
         return self

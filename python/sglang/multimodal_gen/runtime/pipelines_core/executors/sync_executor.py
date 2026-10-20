@@ -29,6 +29,7 @@ class SyncExecutor(PipelineExecutor):
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
 
+        run_stage = self.stage_runner(stages, server_args, run_stage)
         use_nvtx = self._should_use_stage_nvtx(payload, server_args)
         with self._component_residency_request(stages, payload, server_args):
             for stage_index, stage in enumerate(stages):

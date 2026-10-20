@@ -826,6 +826,12 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 def launch_stage_deployment(server_args: ServerArgs):
+    if server_args.disagg_timeout <= 0 or server_args.disagg_max_slots_per_instance < 1:
+        raise ValueError("Deployment timeout and capacity must be positive")
+    if server_args.batching_max_size != 1:
+        raise ValueError(
+            "Stage workers currently execute one request at a time; use role replicas for concurrency"
+        )
     if server_args.disagg_role != RoleType.MONOLITHIC or server_args.dp_size != 1:
         raise ValueError(
             "Stage deployment uses named role replicas, not --disagg-role or --dp-size"
@@ -925,7 +931,10 @@ def launch_stage_deployment(server_args: ServerArgs):
         return
     configure_logger(server_args)
     server = DeploymentServer(
-        plan, server_args.disagg_timeout, server_args.disagg_max_slots_per_instance
+        plan,
+        server_args.disagg_timeout,
+        server_args.disagg_max_slots_per_instance,
+        dispatch_policy=server_args.disagg_dispatch_policy,
     )
     server.start(server_args.scheduler_endpoint_for(0))
     try:

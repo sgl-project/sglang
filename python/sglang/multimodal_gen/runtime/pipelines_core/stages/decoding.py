@@ -398,7 +398,7 @@ class DecodingStage(PipelineStage):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> OutputBatch:
+    ) -> Req | OutputBatch:
         """
         Decode latent representations into pixel space.
 

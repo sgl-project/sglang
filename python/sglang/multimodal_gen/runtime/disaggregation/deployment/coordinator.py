@@ -7,7 +7,6 @@ import pickle
 import threading
 import time
 import uuid
-from collections import defaultdict
 from pathlib import Path
 
 import zmq
@@ -15,6 +14,9 @@ import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import fork_request
 from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import rpc
+from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
+    create_dispatch_policy,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
@@ -22,7 +24,9 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 class DeploymentServer:
     """Route ready groups concurrently; tensors move directly between their workers."""
 
-    def __init__(self, plan, timeout=600, capacity=8):
+    def __init__(self, plan, timeout=600, capacity=8, dispatch_policy="round_robin"):
+        if timeout <= 0 or capacity < 1:
+            raise ValueError("Deployment timeout and capacity must be positive")
         self.plan = plan
         self.timeout = timeout
         self.capacity = capacity
@@ -30,9 +34,16 @@ class DeploymentServer:
         self.stopped = threading.Event()
         self.thread = None
         self.context = None
-        self.counters = defaultdict(int)
-        self.slots = {}
+        self.policies = {
+            name: create_dispatch_policy(dispatch_policy, len(role.endpoints))
+            for name, role in plan.roles.items()
+        }
+        self.free_slots = {
+            name: [1] * len(role.endpoints) for name, role in plan.roles.items()
+        }
+        self.available = asyncio.Condition()
         self.leases = {}
+        self.jobs = {}
 
     async def execute(self, request, outputs=None, roles=None):
         if isinstance(request, Req) and request.image_path:
@@ -78,11 +89,6 @@ class DeploymentServer:
             role = self.plan.roles[name]
             for dependency in role.dependencies:
                 await tasks[dependency]
-            index = self.counters[name] % len(role.endpoints)
-            self.counters[name] += 1
-            endpoint = role.endpoints[index]
-            ticket = f"{job}:{name}"
-            assignments[name] = (endpoint, ticket)
             sources = []
             for dependency in role.dependencies:
                 fields = [
@@ -97,7 +103,14 @@ class DeploymentServer:
                             "fields": fields,
                         }
                     )
-            async with self.slots.setdefault(endpoint, asyncio.Semaphore(1)):
+            async with self.available:
+                await self.available.wait_for(lambda: any(self.free_slots[name]))
+                index = self.policies[name].select_with_capacity(self.free_slots[name])
+                self.free_slots[name][index] -= 1
+            endpoint = role.endpoints[index]
+            ticket = f"{job}:{name}"
+            assignments[name] = (endpoint, ticket)
+            try:
                 return await rpc(
                     self.context,
                     endpoint,
@@ -109,6 +122,12 @@ class DeploymentServer:
                     },
                     self.timeout,
                 )
+            except Exception as exc:
+                raise RuntimeError(f"Stage role {name} failed: {exc}") from exc
+            finally:
+                async with self.available:
+                    self.free_slots[name][index] += 1
+                    self.available.notify_all()
 
         try:
             for name in self.plan.order:
@@ -163,23 +182,37 @@ class DeploymentServer:
                 if message["method"] == "ping":
                     response = {"status": "ok"}
                 elif message["method"] == "encode":
-                    await admission.acquire()
+                    job_id = message["job_id"]
+                    if job_id in self.jobs or job_id in self.leases:
+                        raise ValueError("Duplicate encoding job ID")
+                    self.jobs[job_id] = asyncio.current_task()
                     try:
-                        response = await self.execute(
-                            message["request"], message["outputs"]
-                        )
-                        lease_id = uuid.uuid4().hex
-                        self.leases[lease_id] = (
-                            response["lease"],
-                            time.monotonic(),
-                            admission,
-                        )
-                        response["lease"] = lease_id
-                    except BaseException:
-                        admission.release()
-                        raise
+                        await admission.acquire()
+                        try:
+                            response = await self.execute(
+                                message["request"], message["outputs"]
+                            )
+                            self.leases[job_id] = (
+                                response["lease"],
+                                time.monotonic(),
+                                admission,
+                            )
+                            response["lease"] = job_id
+                        except BaseException:
+                            admission.release()
+                            raise
+                    finally:
+                        self.jobs.pop(job_id, None)
                 elif message["method"] == "release":
                     await self.release_lease(message["lease"])
+                    response = {}
+                elif message["method"] == "cancel":
+                    job_id = message["job_id"]
+                    task = self.jobs.pop(job_id, None)
+                    if task is not None:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    await self.release_lease(job_id)
                     response = {}
                 else:
                     raise ValueError("Unknown deployment server method")

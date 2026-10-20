@@ -5,6 +5,7 @@ import asyncio
 import pickle
 import sys
 from graphlib import CycleError
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +26,13 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
     RoleSpec,
     StageSpec,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
+    ComposedPipelineBase,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+    SyncExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 
 
 def specs():
@@ -81,6 +89,33 @@ def test_contracts_compile_and_tensor_tree_round_trip():
         unpack_fields({}, scalar)
     with pytest.raises(TypeError):
         pack_fields({"required": object()})
+
+
+@pytest.mark.parametrize("deployed", [False, True])
+def test_postprocess_can_precede_another_stage(deployed):
+    stages = [object(), object()]
+    req = Req(prompt="test")
+
+    def execute(stage, current):
+        if stage is stages[0]:
+            return OutputBatch(output=torch.ones(3, 2, 2))
+        current.output = current.output + 1
+        return current
+
+    executor = object.__new__(SyncExecutor)
+    run = executor.stage_runner(
+        stages, SimpleNamespace(stage_deployment="plan" if deployed else None), execute
+    )
+    current = run(stages[0], req)
+    assert current is req
+    current = run(stages[1], current)
+    pipeline = SimpleNamespace(deployment_plan=object() if deployed else None)
+    result = ComposedPipelineBase._finalize_stage_result(pipeline, current)
+    if deployed:
+        assert result is req
+    else:
+        assert isinstance(result, OutputBatch)
+    torch.testing.assert_close(result.output, torch.full((3, 2, 2), 2.0))
 
 
 @pytest.mark.parametrize(
@@ -178,15 +213,23 @@ def test_client_failure_cancels_outstanding_rpc(monkeypatch):
 
     async def run():
         context = zmq.asyncio.Context()
-        socket = context.socket(zmq.REP)
+        socket = context.socket(zmq.ROUTER)
         socket.setsockopt(zmq.LINGER, 0)
         port = socket.bind_to_random_port("tcp://127.0.0.1")
 
         async def peer():
-            await socket.recv()
-            await socket.send_pyobj({"error": "invalid encoder input"})
-            await socket.recv()
-            await asyncio.sleep(60)
+            first = True
+            while True:
+                frames = await socket.recv_multipart()
+                message = pickle.loads(frames[-1])
+                if message["method"] == "encode":
+                    if not first:
+                        continue
+                    first = False
+                    reply = {"error": "invalid encoder input"}
+                else:
+                    reply = {}
+                await socket.send_multipart([*frames[:-1], pickle.dumps(reply)])
 
         task = asyncio.create_task(peer())
         try:

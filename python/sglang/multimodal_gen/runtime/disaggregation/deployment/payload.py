@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
 
 
 def read_field(req, path):
+    if path == "result.output":
+        return req.output
+    if path == "result.audio":
+        return req.audio
     parts = path.split(".")
     if parts[0] == "result":
         value = vars(req.extra["_deployment_result"])
@@ -36,6 +40,13 @@ def read_field(req, path):
 def write_field(req, path, value):
     parts = path.split(".")
     if parts[0] == "result":
+        if path in (
+            "result.output",
+            "result.audio",
+            "result.audio_sample_rate",
+            "result.fps",
+        ):
+            setattr(req, parts[1], value)
         target = req.extra.setdefault("_deployment_output_fields", {})
         parts = parts[1:]
     elif parts[0] == "extra":
