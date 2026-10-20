@@ -61,8 +61,12 @@ class HiSparseV2Coordinator:
                 or draft_cache.top_k != self.cache.top_k
             ):
                 raise ValueError("HiSparse V2 MTP requires compatible DSA cache pools")
-            if host_pool.mtp_draft_device_pools:
-                if host_pool.mtp_draft_device_pools != (draft_cache.pool,):
+            draft_buffers = host_pool.device_kv_buffers[host_pool.target_layer_num :]
+            if draft_buffers:
+                if len(draft_buffers) != len(draft_cache.pool.kv_buffer) or any(
+                    packed.data_ptr() != device.data_ptr()
+                    for packed, device in zip(draft_buffers, draft_cache.pool.kv_buffer)
+                ):
                     raise ValueError(
                         "HiSparse V2 draft does not match HiCache's packed pool"
                     )

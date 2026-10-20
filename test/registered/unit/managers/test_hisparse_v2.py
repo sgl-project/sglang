@@ -450,6 +450,16 @@ class TestHiSparseV2(CustomTestCase):
     def test_mtp_fp8_target_and_draft_survive_packed_host_eviction(self):
         self._check_mtp_packed_host_eviction(torch.float8_e4m3fn)
 
+    def test_packed_host_binding_checks_draft_buffer_storage(self):
+        """Packed draft binding accepts aliasing views and rejects different KV storage."""
+        self._build(num_query_steps=4, with_draft=True)
+        pool = self.draft_cache.pool
+        pool.kv_buffer = [buffer.view_as(buffer) for buffer in pool.kv_buffer]
+        self.coordinator.attach_tree(self.tree, draft_caches=(self.draft_cache,))
+        pool.kv_buffer = [torch.empty_like(buffer) for buffer in pool.kv_buffer]
+        with self.assertRaisesRegex(ValueError, "does not match HiCache's packed pool"):
+            self.coordinator.attach_tree(self.tree, draft_caches=(self.draft_cache,))
+
     def test_graph_does_not_capture_the_real_request_count(self):
         self._build()
         graph = torch.cuda.CUDAGraph()
