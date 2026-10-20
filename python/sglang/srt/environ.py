@@ -1811,6 +1811,9 @@ class Envs:
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
     SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(False)
+    # DSpark static verify: record the post-verify engram history commit in the
+    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

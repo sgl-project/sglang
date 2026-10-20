@@ -388,6 +388,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
                     kv_injector=self._kv_injector,
+                    resolve_engram_hasher=(
+                        (
+                            lambda: self.model_runner.ngram_embedding_manager.engram_hasher
+                        )
+                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                        else None
+                    ),
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -1080,11 +1087,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             simulate_bonus_sampling_info=simulate_bonus_sampling_info,
         )
-        self.model_runner.ngram_embedding_manager.update_after_verify(
-            verify_ids_2d=verify_ids_2d,
-            req_pool_indices=batch.req_pool_indices,
-            commit_lens=accept.commit_lens,
-        )
+        # The static verify graph committed the engram history when it folded the accept.
+        if not (
+            folded_accept and not run_compact and epilogue.folds_engram_commit
+        ):
+            self.model_runner.ngram_embedding_manager.update_after_verify(
+                verify_ids_2d=verify_ids_2d,
+                req_pool_indices=batch.req_pool_indices,
+                commit_lens=accept.commit_lens,
+            )
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
@@ -1167,7 +1178,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
             accept_lens=accept.commit_lens,
-            block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
+            block_accept_lens=self._block_accept_lens(
+                accept=accept, folded_accept=folded_accept, bs=bs
+            ),
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
             ),
@@ -1176,6 +1189,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
+        in_graph = (
+            self._verify_epilogue.read_block_accept_lens(bs)
+            if folded_accept and self._verify_epilogue is not None
+            else None
+        )
+        if in_graph is not None:
+            return in_graph
+        return accept.commit_lens + accept.cap_trim_lens
 
     def _commit_target_mamba_states_after_verify(
         self,

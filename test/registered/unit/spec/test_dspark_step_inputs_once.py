@@ -133,5 +133,44 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         self.assertTrue(bool((s.verify_ids[bs:] == -1).all()))
 
 
+class TestInGraphBlockAcceptLens(unittest.TestCase):
+    """The in-graph accept's block_accept_lens equals the worker's eager
+    commit_lens + cap_trim_lens."""
+
+    def test_matches_eager_sum(self):
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            AcceptOuts,
+            build_accept_outs,
+        )
+        from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
+
+        bs, gamma = 4, 5
+        tp_sync = type("S", (), {"sync": lambda self, site, t: None})()
+        kw = dict(
+            correct_len=torch.tensor([0, 2, 5, 3]),
+            bonus=torch.tensor([7, 8, 9, 10]),
+            cap_trim_lens=torch.tensor([0, 1, 0, 2], dtype=torch.int32),
+            prefix_lens=torch.tensor([10, 20, 30, 40]),
+            draft_tokens=torch.arange(bs * gamma).view(bs, gamma),
+            gamma=gamma,
+            verify_num_draft_tokens=gamma + 1,
+            tp_sync=tp_sync,
+            sync_site=list(SpecTpSyncSite)[0],
+        )
+        eager = build_accept_outs(**kw)
+        out = AcceptOuts(
+            correct_len=torch.zeros(bs, dtype=torch.int64),
+            bonus=torch.zeros(bs, dtype=torch.int64),
+            cap_trim_lens=torch.zeros(bs, dtype=torch.int32),
+            commit_lens=torch.zeros(bs, dtype=torch.int32),
+            new_seq_lens=torch.zeros(bs, dtype=torch.int64),
+            out_tokens=torch.zeros(bs, gamma + 1, dtype=torch.int64),
+        )
+        block = torch.full((bs,), -1, dtype=torch.int32)
+        build_accept_outs(**kw, out=out, block_accept_lens_out=block)
+        expected = eager.commit_lens + eager.cap_trim_lens
+        self.assertTrue(torch.equal(block, expected.to(torch.int32)))
+
+
 if __name__ == "__main__":
     unittest.main()
