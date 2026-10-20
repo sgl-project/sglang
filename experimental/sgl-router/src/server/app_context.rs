@@ -6,16 +6,17 @@ use crate::config::Config;
 use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
-use crate::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
+use crate::state::kv_events::{
+    BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
-use crate::workers::WorkerRegistry;
+use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -61,6 +62,7 @@ pub struct AppContext {
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
+    pub decode_gate: DecodeGate,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the edge middleware (requests_total /
     /// responses_total), the chat handler (worker_requests_total), the
@@ -128,6 +130,7 @@ impl AppContext {
         // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
+        let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
         Self {
             config,
             tokenizers,
@@ -137,6 +140,7 @@ impl AppContext {
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             router_inflight_load,
+            decode_gate,
             metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
@@ -216,7 +220,10 @@ impl AppContext {
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
                     dp_aware: false,
+                    dp_rank_policy: Default::default(),
                     bucket_config: None,
+                    reorg_buckets: None,
+                    reorg_admission: Default::default(),
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,
@@ -241,6 +248,7 @@ impl AppContext {
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
+            decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,

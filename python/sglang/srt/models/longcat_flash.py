@@ -44,6 +44,7 @@ from sglang.kernels.ops.gemm.bf16_fp32 import (
 from sglang.kernels.ops.moe.ep_moe_kernels import zero_experts_compute_triton
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs import LongcatFlashConfig
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
@@ -52,9 +53,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -412,7 +414,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        self.attn_boundary, self.moe_boundary = make_stages(
+        self.attn_boundary, self.moe_boundary = append_stages(
             (
                 declare_attn(),
                 self.input_layernorm[0],
@@ -422,13 +424,9 @@ class LongcatFlashDecoderLayer(nn.Module):
                 declare_ffn(sparse=True, next_layer_sparse=True),
                 self.post_attention_layernorm[0],
             ),
-            previous=declare_ffn(sparse=True, next_layer_sparse=True)
-            if self.layer_id != 0
-            else None,
-            terminal=self.layer_id == config.num_hidden_layers - 1,
         )
         self.first_ffn_boundary, self.second_attn_boundary, self.second_ffn_boundary = (
-            make_stages(
+            append_stages(
                 (
                     declare_ffn(),
                     self.post_attention_layernorm[0],
@@ -562,18 +560,19 @@ class LongcatFlashModel(nn.Module):
             )
 
         self.alt_stream = get_stream("alt")
-        self.layers = nn.ModuleList(
-            [
-                LongcatFlashDecoderLayer(
-                    config,
-                    layer_id,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"layers.{layer_id}", prefix),
-                    alt_stream=self.alt_stream,
-                )
-                for layer_id in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    LongcatFlashDecoderLayer(
+                        config,
+                        layer_id,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"layers.{layer_id}", prefix),
+                        alt_stream=self.alt_stream,
+                    )
+                    for layer_id in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
 
@@ -609,7 +608,7 @@ class LongcatFlashModel(nn.Module):
         for i in range(total_num_layers):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
-                    self.layers[i].attn_boundary.snapshot(hidden_states, forward_batch)
+                    residual_batch.snapshot(hidden_states, forward_batch)
                 )
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
@@ -755,7 +754,7 @@ class LongcatFlashForCausalLM(nn.Module):
                             if (
                                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                                 and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                                and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                                and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                             ):
                                 block_scale = weight_scale
                                 use_deep_gemm_bmm = True

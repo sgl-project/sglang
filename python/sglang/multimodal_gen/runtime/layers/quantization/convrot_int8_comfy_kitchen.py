@@ -21,13 +21,16 @@ import os
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.multimodal_gen.runtime.layers.linear import LinearMethodBase
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
-__all__ = ["ConvRotInt8ComfyKitchenLinearMethod"]
+__all__ = ["ConvRotInt8ComfyKitchenLinearMethod", "comfy_kitchen_swiglu_mlp"]
 
 # comfy_kitchen's dtype codes for the fused op's output.
 _OUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
@@ -118,20 +121,17 @@ class ConvRotInt8ComfyKitchenLinearMethod(LinearMethodBase):
                 "--quantization-ignored-layers"
             )
 
-        # The online path initially matches UnquantizedLinearMethod so the
-        # source weights load in BF16 before quantization. Serialized weights
-        # allocate their final INT8 storage immediately.
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=(torch.int8 if self.is_checkpoint_serialized else params_dtype),
-            ),
-            requires_grad=False,
+        # Online checkpoints load their original dtype; serialized ones use INT8.
+        UnquantizedLinearMethod.create_weights(
+            self,
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            torch.int8 if self.is_checkpoint_serialized else params_dtype,
+            **extra_weight_attrs,
         )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
         if self.is_checkpoint_serialized:
             weight_scale = Parameter(
                 torch.empty(
@@ -221,3 +221,37 @@ class ConvRotInt8ComfyKitchenLinearMethod(LinearMethodBase):
         if len(orig_shape) != 2:
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
         return out
+
+
+def comfy_kitchen_swiglu_mlp(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_group_size: int,
+    down: torch.nn.Module,
+) -> torch.Tensor:
+    """``down(silu(gate) * up)`` for ``[gate | up] = x @ gate_up_weight.T``, run as
+    ComfyUI runs SwiGLU MLPs: one GEMM over the stacked [gate; up] weight, and a
+    down-projection that applies the SwiGLU inside its quantizer
+    (``input_act="swiglu"``), so the activated rows never reach HBM.
+
+    The fused quantizer keeps ``silu(gate) * up`` in FP32 instead of rounding it
+    to BF16 first, so the result is not bitwise the eager form; it sits slightly
+    closer to an FP32 reference.
+    """
+    out_code = _OUT_DTYPE_CODE[x.dtype]
+    rows = x.reshape(-1, x.shape[-1]).contiguous()
+    gate_up = torch.ops.comfy_kitchen.int8_linear(
+        rows, gate_up_weight, gate_up_scale, None, out_code, True, gate_up_group_size
+    )
+    out = torch.ops.comfy_kitchen.int8_linear(
+        gate_up,
+        down.weight,
+        down.weight_scale,
+        None,
+        out_code,
+        True,  # convrot
+        down.quant_method.group_size,
+        "swiglu",
+    )
+    return out.reshape(*x.shape[:-1], out.shape[-1])

@@ -168,8 +168,12 @@ class MambaMixer1(nn.Module):
             torch.empty(self.intermediate_size_per_tp, state_size, dtype=torch.float32)
         )
         self.D = nn.Parameter(torch.ones(self.intermediate_size_per_tp))
-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.A_log, {"weight_loader": sharded_weight_loader(0, parallel_group="tp")}
+        )
+        set_weight_attrs(
+            self.D, {"weight_loader": sharded_weight_loader(0, parallel_group="tp")}
+        )
 
         # The time-step bias is folded into dt_proj.bias (applied before the
         # scan), so the selective_state_update kernel gets a zero dt_bias. Keep

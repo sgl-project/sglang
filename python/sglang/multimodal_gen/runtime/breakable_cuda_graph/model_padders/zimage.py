@@ -55,16 +55,8 @@ def _pad_caption(obj: Any, *, target: int) -> Any:
     return obj
 
 
-def _unwrap_model(current_model: Any) -> Any:
-    for attr in ("module", "_orig_mod"):
-        wrapped = getattr(current_model, attr, None)
-        if wrapped is not None:
-            current_model = wrapped
-    return current_model
-
-
 def _build_caption_freqs(current_model: Any, *, target: int, device: torch.device):
-    rotary_emb = getattr(_unwrap_model(current_model), "rotary_emb", None)
+    rotary_emb = getattr(bcg_utils.unwrap_model(current_model), "rotary_emb", None)
     if rotary_emb is None:
         return None
 
