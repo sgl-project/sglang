@@ -1830,13 +1830,20 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     ROUND_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
+    TAIL_REQ_POOL_SIZE: tl.constexpr,
 ):
     b = tl.program_id(0)
     cache_loc_0 = tl.load(out_cache_loc_ptr + b * N)
     if cache_loc_0 == 0:
         return
 
-    req = tl.load(req_pool_indices_ptr + b)
+    # A reset (flush_cache) leaves stale non-zero plan rows in the captured
+    # buffers while out_cache_loc still gates them in; an unclamped req would
+    # then index the tail buffers out of bounds. Mirror the decode-leg gating.
+    req_raw = tl.load(req_pool_indices_ptr + b)
+    if not ((req_raw >= 0) & (req_raw < TAIL_REQ_POOL_SIZE)):
+        return
+    req = req_raw
     write_start = tl.load(write_start_ptr + b)
     offs = tl.arange(0, BLOCK_D)
     dim_mask = offs < HEAD_DIM
@@ -1992,4 +1999,5 @@ def kpool_write_tail_and_maybe_compress(
         ROUND_SCALE=round_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
+        TAIL_REQ_POOL_SIZE=tail_k.shape[0],
     )

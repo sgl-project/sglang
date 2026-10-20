@@ -899,16 +899,36 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
     @property
     def linear_fp8_config(self):
-        """Block-FP8 config for loaders that requantize mixed checkpoints.
+        """The FP8 config the checkpoint's Linear layers actually use.
 
         deepseek_weight_loader.post_load_weights dequantizes kv_b_proj for
         MLA absorption and selects its branch from
-        quant_config.linear_fp8_config (falling back to quant_config); a
-        MIXED_PRECISION checkpoint with FP8_PB_WO attention otherwise
-        resolves weight_block_size None and crashes reading weight_scale on
-        a block-quantized layer.
+        quant_config.linear_fp8_config (falling back to quant_config),
+        keying off the returned config's weight_block_size. Returning
+        fp8_block_config unconditionally mis-branched per-tensor-FP8 and
+        MXFP8 attention layers in a mixed checkpoint (and a MIXED_PRECISION
+        checkpoint with FP8_PB_WO attention used to resolve weight_block_size
+        None and crash reading weight_scale on a block-quantized layer), so
+        scan the declared linear FP8 algos instead.
         """
-        return self.fp8_block_config
+        algos = {
+            layer_info.get("quant_algo", "").upper()
+            for layer_info in self.quantized_layers.values()
+        }
+        selected = []
+        if "FP8" in algos:
+            selected.append(self.fp8_config)
+        if "MXFP8" in algos:
+            selected.append(self.mxfp8_config)
+        if algos.intersection(_BLOCK_FP8_ALGOS):
+            selected.append(self.fp8_block_config)
+        if len(selected) > 1:
+            raise ValueError(
+                "MIXED_PRECISION checkpoint uses several FP8 linear flavors "
+                f"({sorted(algos)}); linear_fp8_config cannot disambiguate "
+                "the weight loader's branch."
+            )
+        return selected[0] if selected else None
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -975,16 +995,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 "MIXED_PRECISION quantization requires a non-empty quantized_layers map."
             )
 
-        group_size = None
-        for layer_info in quantized_layers.values():
-            if layer_info.get("quant_algo", "").upper() in (
-                "NVFP4",
-                "W4A16_NVFP4",
-            ):
-                group_size = layer_info.get("group_size", 16)
-                break
-        if group_size is None:
-            group_size = 16
+        # One ModelOptFp4Config serves every NVFP4 layer (NVFP4 and
+        # W4A16_NVFP4), so their group sizes must agree — fail loudly instead
+        # of silently quantizing with the first layer's size.
+        nvfp4_group_sizes = {
+            int(layer_info.get("group_size", 16))
+            for layer_info in quantized_layers.values()
+            if layer_info.get("quant_algo", "").upper() in ("NVFP4", "W4A16_NVFP4")
+        }
+        if len(nvfp4_group_sizes) > 1:
+            raise ValueError(
+                "MIXED_PRECISION currently requires all NVFP4 layers to use "
+                f"one group_size, got {sorted(nvfp4_group_sizes)}."
+            )
+        group_size = next(iter(nvfp4_group_sizes), 16)
 
         # Block-FP8 layers carry their block size as ``group_size``
         # (default 128). One Fp8Config serves every such layer, so they must
@@ -1044,7 +1068,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         # layers take the A4 kernel route with the wrong block-scale shape.
         nvfp4a16_config.is_w4a16 = True
 
-        return cls(
+        # Publish the W4A16 route on the OUTER config: the MoE precompile hook
+        # (models/glm5_next.py) consults the outer quant_config's
+        # is_w4a16/group_size, which from_config used to set only on the inner
+        # nvfp4a16_config — the hook never fired on MIXED_PRECISION
+        # checkpoints. NVFP4 (A4) layers deliberately do not set the flag.
+        mixed = cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
             exclude_modules=exclude_modules,
             packed_modules_mapping=packed_modules_mapping,
@@ -1055,6 +1084,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
+        mixed.is_w4a16 = any(
+            layer_info.get("quant_algo", "").upper() == "W4A16_NVFP4"
+            for layer_info in quantized_layers.values()
+        )
+        if mixed.is_w4a16:
+            mixed.group_size = group_size
+        return mixed
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         super().apply_weight_name_mapper(hf_to_sglang_mapper)
@@ -2931,6 +2967,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
         copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
+        if self._use_flashinfer_b12x_w4a16 and not torch.equal(
+            g1_alphas, g1_alphas_up
+        ):
+            # The b12x kernel takes a single GEMM1 alpha (quant_scales carries
+            # only g1_alphas); a checkpoint with distinct gate/up weight
+            # scales would silently apply the gate scale to the up half.
+            raise ValueError(
+                "FlashInfer b12x W4A16 requires shared gate/up GEMM1 scales; "
+                "got distinct g1_alphas/g1_alphas_up for this checkpoint."
+            )
         copy_or_rebind_param(
             layer,
             "g2_alphas",
