@@ -843,6 +843,50 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 self.assertEqual(request._response_parser_grammar_start, grammar_start)
 
+    def _chat_outcome(self, adapted, request, output):
+        """(calls, reasoning, content, finish reasons) as a client reconstructs them."""
+        if not request.stream:
+            choice = self.chat._build_chat_response(request, [output], 0).choices[0]
+            calls = [
+                (call.function.name, call.function.arguments)
+                for call in choice.message.tool_calls or []
+            ]
+            return (
+                calls,
+                choice.message.reasoning_content or "",
+                choice.message.content or "",
+                [choice.finish_reason],
+            )
+
+        async def generate():
+            yield output
+
+        self.tm.generate_request = Mock(return_value=generate())
+        choices = [
+            choice
+            for chunk in self._parse_chunks(self._run_chat_stream(adapted, request))
+            for choice in chunk.get("choices", [])
+        ]
+        deltas = [choice.get("delta") or {} for choice in choices]
+        calls: dict[int, list[str]] = {}
+        for delta in deltas:
+            for call in delta.get("tool_calls") or []:
+                name, arguments = calls.setdefault(call["index"], ["", ""])
+                calls[call["index"]] = [
+                    name + (call["function"].get("name") or ""),
+                    arguments + (call["function"].get("arguments") or ""),
+                ]
+        return (
+            [tuple(calls[index]) for index in sorted(calls)],
+            "".join(delta.get("reasoning_content") or "" for delta in deltas),
+            "".join(delta.get("content") or "" for delta in deltas),
+            [
+                choice["finish_reason"]
+                for choice in choices
+                if choice.get("finish_reason")
+            ],
+        )
+
     def test_required_tool_json_is_parsed_under_delimited_template(self):
         """Required-tool JSON after the reasoning becomes the call, also when it
         ends on the tool closer that detokenization keeps."""
@@ -864,56 +908,43 @@ class ServingChatTestCase(CustomTestCase):
                             stream=stream,
                         ),
                     )
-                    if stream:
-                        item = self._stopped_on_token(text, 7)
+                    calls, got_reasoning, content, finish_reasons = self._chat_outcome(
+                        adapted, request, self._stopped_on_token(text, 7)
+                    )
 
-                        async def generate(item=item):
-                            yield item
-
-                        self.tm.generate_request = Mock(return_value=generate())
-                        choices = [
-                            choice
-                            for chunk in self._parse_chunks(
-                                self._run_chat_stream(adapted, request)
-                            )
-                            for choice in chunk.get("choices", [])
-                        ]
-                        deltas = [choice.get("delta") or {} for choice in choices]
-                        calls = [
-                            call["function"]
-                            for delta in deltas
-                            for call in delta.get("tool_calls") or []
-                        ]
-                        name = "".join(call.get("name") or "" for call in calls)
-                        arguments = "".join(
-                            call.get("arguments") or "" for call in calls
-                        )
-                        got_reasoning = "".join(
-                            delta.get("reasoning_content") or "" for delta in deltas
-                        )
-                        content = "".join(
-                            delta.get("content") or "" for delta in deltas
-                        )
-                        finish_reasons = [
-                            choice["finish_reason"]
-                            for choice in choices
-                            if choice.get("finish_reason")
-                        ]
-                    else:
-                        choice = self.chat._build_chat_response(
-                            request, [self._stopped_on_token(text, 7)], 0
-                        ).choices[0]
-                        (call,) = choice.message.tool_calls
-                        name, arguments = call.function.name, call.function.arguments
-                        got_reasoning = choice.message.reasoning_content or ""
-                        content = choice.message.content or ""
-                        finish_reasons = [choice.finish_reason]
-
+                    ((name, arguments),) = calls
                     self.assertEqual(name, "get_weather")
                     self.assertEqual(json.loads(arguments), {"city": "Paris"})
                     self.assertEqual(got_reasoning, reasoning)
                     self.assertEqual(content, "")
                     self.assertEqual(finish_reasons, ["tool_calls"])
+
+    def test_json_response_format_with_auto_tools_stays_content(self):
+        """A JSON response format with automatic tools must return the JSON
+        intact; template tool syntax inside its strings is never a call."""
+        payload = '{"example": "<call:get_weather>{}</call>"}'
+        for reasoning_parser in (None, "response_template"):
+            self._use_delimited_response_template(reasoning_parser)
+            reasoning = "Plan" if reasoning_parser else ""
+            text = (f"<think>{reasoning}</think>" if reasoning else "") + payload
+            for stream in (False, True):
+                with self.subTest(reasoning_parser=reasoning_parser, stream=stream):
+                    adapted, request = self._convert_rendered_as(
+                        "<assistant>",
+                        ChatCompletionRequest(
+                            model="x",
+                            messages=[{"role": "user", "content": "Weather?"}],
+                            tools=[_WEATHER_TOOL],
+                            tool_choice="auto",
+                            response_format={"type": "json_object"},
+                            stream=stream,
+                        ),
+                    )
+                    outcome = self._chat_outcome(
+                        adapted, request, self._stopped_on_token(text, 2)
+                    )
+
+                    self.assertEqual(outcome, ([], reasoning, payload, ["stop"]))
 
     def test_native_output_under_other_constraints_is_parsed_by_the_template(self):
         """A structural tag, regex or EBNF can spell the template's own framing,

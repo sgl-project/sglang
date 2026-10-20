@@ -73,6 +73,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     SglExt,
     Tool,
     ToolCall,
+    ToolCallConstraint,
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
@@ -1063,6 +1064,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request.tool_choice != "none"
             and self._effective_tools(request)
             and self.tool_call_parser
+            and not request._response_parser_json_response_format
         )
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
@@ -1382,13 +1384,19 @@ class OpenAIServingChat(OpenAIServingBase):
             apply_header_overrides(adapted_request, raw_request.headers)
 
         if processed_messages.uses_response_template:
-            self._set_response_parser_context(request, adapted_request)
+            self._set_response_parser_context(
+                request,
+                adapted_request,
+                tool_call_constraint=processed_messages.tool_call_constraint,
+            )
         return adapted_request, request
 
     def _set_response_parser_context(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
         adapted_request: GenerateReqInput,
+        *,
+        tool_call_constraint: ToolCallConstraint | None,
     ) -> None:
         """Give response-template parsers the rendered assistant prefill."""
         prefix = adapted_request.text
@@ -1415,6 +1423,11 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             request._response_parser_grammar_start = (
                 GRAMMAR_AFTER_REASONING if reasoning_gated else GRAMMAR_FROM_START
+            )
+            # Unless the schema is the required/named tool call itself, the JSON
+            # is response data, and template syntax inside its strings is literal.
+            request._response_parser_json_response_format = (
+                tool_call_constraint is None or tool_call_constraint[0] != "json_schema"
             )
 
     def _drop_kept_tool_close(

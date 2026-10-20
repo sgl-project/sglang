@@ -585,7 +585,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 processed_messages is not None
                 and processed_messages.uses_response_template
             ):
-                self._set_response_parser_context(request, adapted_request)
+                self._set_response_parser_context(
+                    request,
+                    adapted_request,
+                    tool_call_constraint=processed_messages.tool_call_constraint,
+                )
 
             # Store the input messages
             persist = self.enable_response_store and bool(request.store)
@@ -1136,9 +1140,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 request=request,
                 tokenizer=self.tokenizer_manager.tokenizer,
                 tool_call_parser_active=bool(
-                    chat_tools
-                    and self.tool_call_parser
-                    and request.tool_choice != "none"
+                    self.tool_call_parser
+                    and self._tool_parsing_active(request, chat_tools)
                 ),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
@@ -1155,9 +1158,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         detector_owns_format = False
         if (
             content
-            and chat_tools
             and self.tool_call_parser
-            and request.tool_choice != "none"
+            and self._tool_parsing_active(request, chat_tools)
         ):
             parser = FunctionCallParser(
                 chat_tools,
@@ -1240,6 +1242,14 @@ class OpenAIServingResponses(OpenAIServingChat):
     ) -> bool:
         return bool(
             chat_tools and self.tool_call_parser and request.tool_choice != "none"
+        )
+
+    @staticmethod
+    def _tool_parsing_active(request: ResponsesRequest, chat_tools: list) -> bool:
+        return bool(
+            chat_tools
+            and request.tool_choice != "none"
+            and not request._response_parser_json_response_format
         )
 
     @staticmethod
@@ -2117,8 +2127,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
         if required_json:
             tool_parser = JsonArrayParser()
-        elif token_stream is None and self._tool_call_parsing_enabled(
-            request, chat_tools
+        elif (
+            token_stream is None
+            and self._tool_call_parsing_enabled(request, chat_tools)
+            and not request._response_parser_json_response_format
         ):
             tool_parser = FunctionCallParser(
                 chat_tools,

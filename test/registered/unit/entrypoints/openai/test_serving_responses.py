@@ -691,21 +691,18 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
     }
 
     @staticmethod
-    def _output():
+    def _output(text, matched):
         return {
-            "text": (
-                "<think>Check the forecast.</think>"
-                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>'
-            ),
+            "text": text,
             "meta_info": {
                 "prompt_tokens": 3,
                 "completion_tokens": 9,
                 "cached_tokens": 0,
-                "finish_reason": {"type": "stop", "matched": 7},
+                "finish_reason": {"type": "stop", "matched": matched},
             },
         }
 
-    def _respond(self, stream):
+    def _respond(self, stream, *, output, **request_fields):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
         serving.reasoning_parser = "response_template"
@@ -727,14 +724,13 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         async def fake_generate(
             request_id, request_prompt, adapted_request, sampling_params, context, **_
         ):
-            context.append_output(self._output())
+            context.append_output(output)
             yield context
 
         serving._generate_with_builtin_tools = fake_generate
         request = ResponsesRequest(
             model="x",
             input="Weather?",
-            tool_choice="required",
             tools=[
                 {
                     "type": "function",
@@ -747,6 +743,7 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
             ],
             stream=stream,
             store=False,
+            **request_fields,
         )
         rendered = MessageProcessingResult(
             prompt="<assistant>",
@@ -773,9 +770,14 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
     def test_required_tool_json_is_parsed_under_delimited_template(self):
         """Required-tool JSON after the reasoning becomes a completed function
         call, also when it ends on the tool closer that detokenization keeps."""
+        output = self._output(
+            "<think>Check the forecast.</think>"
+            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]</call>',
+            matched=7,
+        )
         for stream in (False, True):
             with self.subTest(stream=stream):
-                response = self._respond(stream)
+                response = self._respond(stream, output=output, tool_choice="required")
 
                 self.assertEqual(response["status"], "completed")
                 self.assertEqual(
@@ -785,6 +787,27 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                 call = response["output"][1]
                 self.assertEqual(call["name"], "get_weather")
                 self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
+
+    def test_json_text_format_with_auto_tools_stays_message(self):
+        """A JSON text format with automatic tools must return the JSON intact;
+        template tool syntax inside its strings is never a function call."""
+        payload = '{"example": "<call:get_weather>{}</call>"}'
+        output = self._output(f"<think>Plan</think>{payload}", matched=2)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(
+                    stream,
+                    output=output,
+                    tool_choice="auto",
+                    text={"format": {"type": "json_object"}},
+                )
+
+                self.assertEqual(response["status"], "completed")
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "message"],
+                )
+                self.assertEqual(response["output"][1]["content"][0]["text"], payload)
 
 
 class InputItemNormalizationTestCase(CustomTestCase):
