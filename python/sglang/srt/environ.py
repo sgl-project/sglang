@@ -366,6 +366,8 @@ class Envs:
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.
     SGLANG_LOG_PICKLE_IPC_OBJECTS = EnvBool(False)
+    # Comma-separated peer IPs admitted by TCP-bound IPC sockets; empty admits all.
+    SGLANG_ZMQ_ALLOWED_PEERS = EnvTuple(tuple())
     SGLANG_USE_MESSAGE_QUEUE_BROADCASTER = EnvBool(True)
     SGLANG_TCP_STORE_PORT = EnvInt(29600)
     # Base port hint for ephemeral sockets (ZMQ, SHM broadcaster, etc.).
@@ -522,12 +524,12 @@ class Envs:
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
-    # DSpark on HIP: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
+    # DSpark opt-in: with SGLANG_SIMULATE_ACC_LEN set, temperature-only sampling requests
     # run the greedy draft/accept path and only the bonus token is temperature-sampled.
-    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(True)
-    # DSpark on HIP: apply the simulated correct_len / bonus inside the folded verify epilogue
-    # (hip graph) instead of falling back to the eager accept + commit path.
-    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(True)
+    SGLANG_SIMULATE_ACC_GREEDY = EnvBool(False)
+    # DSpark opt-in: apply the simulated correct_len / bonus inside the folded verify epilogue
+    # (CUDA/HIP graph) instead of falling back to the eager accept + commit path.
+    SGLANG_DSPARK_SIMULATE_FOLD = EnvBool(False)
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 
@@ -1573,6 +1575,8 @@ class Envs:
     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
+    # Group replies by tokenizer worker; disable for per-request delivery.
+    SGLANG_BATCH_TOKENIZER_OUTPUTS = EnvBool(True)
     # Encode long rendered chat prompts as chunks on the tokenizers thread pool.
     SGLANG_PARALLEL_PROMPT_ENCODE = EnvBool(True)
     # Shorter prompts use the single-call encode; below this the gain is eaten
