@@ -591,8 +591,15 @@ class TestNixlUnified(CustomTestCase):
                 torch.empty((4, 64 * 132), dtype=torch.uint8) for _ in range(2)
             ],
         )
+        # The indexer host mirrors the anchor's widened slot space, so the
+        # stub needs the DCP accounting a real MLATokenToKVPoolHost carries.
         anchor = SimpleNamespace(
-            page_size=64, layout="page_first", size=256, page_num=4
+            page_size=64,
+            layout="page_first",
+            size=256,
+            page_num=4,
+            logical_size=256,
+            dcp_size=1,
         )
         host = DSAIndexerPoolHost(
             make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
