@@ -134,12 +134,14 @@ class TestStructuralTagPatternDropping(CustomTestCase):
         self.assertEqual(len(changes), 2)
 
     def test_nested_patterns_are_checked_in_place(self):
-        """XML styles compile nested values as JSON, so a nested lookahead is kept."""
+        """Patterns are dropped only where they fail: XML styles compile nested values
+        as JSON, and XGrammar ignores `not`, so only `a` loses its pattern."""
         tool = _tool(
             "ls",
             {
                 "a": _string(BACKREFERENCE),
                 "b": {"type": "array", "items": _string(LOOKAHEAD)},
+                "c": {"type": "string", "not": _string(BACKREFERENCE)},
             },
         )
         tag = json.loads(_model_tag([tool]))
@@ -149,6 +151,7 @@ class TestStructuralTagPatternDropping(CustomTestCase):
         properties = tag["format"]["tags"][0]["content"]["json_schema"]["properties"]
         self.assertNotIn("pattern", properties["a"])
         self.assertEqual(properties["b"]["items"]["pattern"], LOOKAHEAD)
+        self.assertEqual(properties["c"]["not"]["pattern"], BACKREFERENCE)
         self.assertEqual(len(changes), 1)
 
     def test_pattern_inside_defs_is_dropped(self):
