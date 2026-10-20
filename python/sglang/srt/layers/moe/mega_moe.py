@@ -23,7 +23,6 @@ import torch
 
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_moe_sm90 import (
@@ -268,11 +267,7 @@ def _run_mega_routed(
             if forward_batch is not None
             else None
         )
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-            if moe.experts.uses_expert_location
-            else None
-        )
+        dispatch_info = moe.experts.expert_location_dispatch_info()
         if (
             not moe.is_hash
             and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None

@@ -162,6 +162,20 @@ class TestMegaMoEPrefillRecorder(unittest.TestCase):
             torch.equal(load.cpu(), torch.tensor([1, 0, 1, 0], dtype=torch.int32))
         )
 
+    def test_disabled_region_hides_the_fused_record_buffer(self):
+        """Inside disable_this_region no target count buffer is handed out, or the
+        fused map+record path adds draft routing to a target layer."""
+        recorder = self._make_recorder()
+        recorder._record_current_pass = True
+        gatherer = Mock(spec=_SelectExpertsSinglePassGatherer)
+        gatherer._data = torch.zeros((3, 4), dtype=torch.int32)
+        recorder._single_pass_gatherers = {"primary": gatherer}
+
+        self.assertIsNotNone(recorder.get_current_pass_count_buffer(0))
+        with recorder.disable_this_region():
+            self.assertIsNone(recorder.get_current_pass_count_buffer(0))
+        self.assertIsNotNone(recorder.get_current_pass_count_buffer(0))
+
     def _make_recorder(self):
         recorder = _ExpertDistributionRecorderReal.__new__(
             _ExpertDistributionRecorderReal

@@ -714,6 +714,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.stage_config = _dspark_stage_config(config)
         self.quant_config = quant_config
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 
@@ -990,7 +991,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         loaded_params = set()
 
         weights = _dequant_fp8_wo_a_streaming(weights)
-        n_routed_experts = _dspark_stage_config(self.config).n_routed_experts
+        n_routed_experts = self.stage_config.n_routed_experts
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

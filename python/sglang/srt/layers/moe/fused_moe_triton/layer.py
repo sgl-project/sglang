@@ -21,6 +21,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
@@ -1025,6 +1026,11 @@ class FusedMoE(torch.nn.Module):
             assert shard_id in ("w1", "w3")
             expert_data.copy_(loaded_weight)
 
+    def expert_location_dispatch_info(self) -> Optional[ExpertLocationDispatchInfo]:
+        if not self.uses_expert_location:
+            return None
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         start_idx = self._expert_storage_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
@@ -1063,24 +1069,14 @@ class FusedMoE(torch.nn.Module):
         global_expert_location_metadata = (
             get_global_expert_location_metadata() if self.uses_expert_location else None
         )
-        if global_expert_location_metadata is None:
-            if not getattr(param, "_sglang_require_global_experts", False):
-                expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-                if expert_id == -1:
-                    return
-
-            self._weight_loader_impl(
-                param=param,
-                loaded_weight=loaded_weight,
-                weight_name=weight_name,
-                shard_id=shard_id,
-                expert_id=expert_id,
-            )
-            return
-
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
+        num_logical_experts = (
+            self._num_global_routed
+            if global_expert_location_metadata is None
+            else global_expert_location_metadata.num_logical_experts
+        )
         shared_expert_id = (
-            expert_id - global_expert_location_metadata.num_logical_experts
+            expert_id - num_logical_experts
             if self._has_fused_shared and expert_id is not None
             else -1
         )
@@ -1096,6 +1092,8 @@ class FusedMoE(torch.nn.Module):
                 ]
             else:
                 physical_expert_ids = [self._num_global_routed + shared_expert_id]
+        elif global_expert_location_metadata is None:
+            physical_expert_ids = [expert_id]
         else:
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(

@@ -14,7 +14,6 @@ import torch
 
 from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
@@ -312,11 +311,7 @@ def _run_mega_routed(
                 if forward_batch is not None
                 else None
             ),
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
-                if moe.experts.uses_expert_location
-                else None
-            ),
+            expert_location_dispatch_info=moe.experts.expert_location_dispatch_info(),
             **topk_kwargs,
         )
         x_in = hidden_states

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import prime_rope_cos_sin
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -200,29 +201,33 @@ class DeepseekV4ModelNextN(nn.Module):
             # decoder layer reads the memoized gather instead of re-gathering.
             prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
+        # The draft layer has no recorder layer index.
+        recorder_scope = get_global_expert_distribution_recorder().disable_this_region()
         if _is_cuda:
             residual_batch.start(forward_batch)
             try:
-                hidden_states = self.decoder(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    input_ids=input_ids,
-                    input_ids_global=input_ids_global,
-                )
+                with recorder_scope:
+                    hidden_states = self.decoder(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                    )
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None
                 )
             finally:
                 residual_batch.clear(forward_batch)
         else:
-            hidden_states, residual, post, comb = self.decoder(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-            )
+            with recorder_scope:
+                hidden_states, residual, post, comb = self.decoder(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
             if residual is not None:
                 # NextN has a single decoder layer, so no later layer can consume a
                 # deferred fused hc_post state.
