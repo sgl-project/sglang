@@ -566,6 +566,15 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
+    if hip and dcp_size > 1:
+        no_dcp_path = chosen - {"triton", None}
+        if no_dcp_path:
+            raise ValueError(
+                f"The {'/'.join(sorted(no_dcp_path))} DSA backend has no DCP path "
+                "on ROCm; use --dsa-prefill-backend triton --dsa-decode-backend "
+                "triton with --dcp-size > 1."
+            )
+
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
     if prefill_backend != "tilelang" or decode_backend != "tilelang":
