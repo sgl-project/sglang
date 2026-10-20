@@ -23,7 +23,6 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
-    get_dsa_indexer_layer_ids,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -2060,21 +2059,20 @@ class KVCacheConfigurator:
             index_size = max_total_num_tokens
         else:
             index_size = max_total_num_tokens * dcp_size
+        is_arch35 = is_npu_arch35()
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
             is_draft_worker=self.is_draft_worker
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:
-            owner_layer_ids = get_dsa_indexer_layer_ids(
-                self.model_config.hf_config,
-                self.layer_info.start_layer,
-                self.layer_info.end_layer,
+            indexer_layer_ids = tuple(
+                layer_id
+                for layer_id in range(
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+                if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-            # Keep a usable per-token capacity when this PP range has no
-            # indexer owner; the dense fallback also avoids a zero-byte pool.
-            if owner_layer_ids:
-                indexer_layer_ids = owner_layer_ids
-        is_arch35 = is_npu_arch35()
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )

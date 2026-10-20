@@ -606,8 +606,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
-                if _is_npu and num_indexer_layers == 0:
-                    num_indexer_layers = num_layers
 
         return int(
             indexer_size_per_token * num_indexer_layers * element_size * indexer_ratio

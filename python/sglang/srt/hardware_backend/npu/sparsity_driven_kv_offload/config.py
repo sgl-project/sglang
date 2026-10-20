@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_topk,
-    get_dsa_indexer_layer_ids,
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
@@ -101,13 +101,10 @@ def get_sparsity_driven_kv_offload_cell_size(
     )
 
     if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
-        owner_layer_ids = get_dsa_indexer_layer_ids(
-            model_config.hf_config,
-            start_layer,
-            start_layer + num_layers,
+        num_indexer_layers = sum(
+            not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+            for layer_id in range(start_layer, start_layer + num_layers)
         )
-        # Match the allocator's dense fallback for a PP range without owners.
-        num_indexer_layers = len(owner_layer_ids) or num_layers
     else:
         num_indexer_layers = num_layers
     return index_head_dim * num_indexer_layers * element_size

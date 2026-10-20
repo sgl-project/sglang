@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.configs.model_config import get_dsa_indexer_layer_ids
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_cell_size,
     get_sparsity_driven_kv_offload_sparse_context_len,
@@ -27,10 +26,8 @@ def _make_glm51_model_config():
     )
 
 
-def _glm_indexer_types(num_layers=78, full_layers=None):
-    if full_layers is None:
-        full_layers = (0, 1, *range(2, num_layers, 4))
-    full_layers = set(full_layers)
+def _glm_indexer_types(num_layers=78):
+    full_layers = {0, 1, *range(2, num_layers, 4)}
     return [
         "full" if layer_id in full_layers else "shared"
         for layer_id in range(num_layers)
@@ -38,24 +35,6 @@ def _glm_indexer_types(num_layers=78, full_layers=None):
 
 
 class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
-    def test_glm52_indexer_owner_ids_use_model_layer_ids(self):
-        hf_config = SimpleNamespace(
-            architectures=["GlmMoeDsaForCausalLM"],
-            index_topk=2048,
-            indexer_types=_glm_indexer_types(),
-        )
-
-        self.assertEqual(
-            get_dsa_indexer_layer_ids(hf_config, 0, 78),
-            (0, 1, *range(2, 78, 4)),
-        )
-        self.assertEqual(
-            get_dsa_indexer_layer_ids(hf_config, 20, 40),
-            (22, 26, 30, 34, 38),
-        )
-        hf_config.indexer_types = ["full"] * 78
-        self.assertEqual(get_dsa_indexer_layer_ids(hf_config, 0, 78), tuple(range(78)))
-
     def test_sparse_offload_cell_size_uses_compact_owner_count(self):
         model_config = _make_glm51_model_config()
         model_config.hf_config.indexer_types = _glm_indexer_types()
@@ -105,9 +84,9 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
 
     def test_sparse_offload_cell_size_falls_back_to_dense_for_excluded_pool(self):
         model_config = _make_glm51_model_config()
-        model_config.hf_config.indexer_types = _glm_indexer_types(
-            full_layers=range(0, 78, 4)
-        )
+        model_config.hf_config.indexer_types = [
+            "full" if i % 4 == 0 else "shared" for i in range(78)
+        ]
         with (
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
@@ -200,7 +179,7 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
                 128 * 78 * 2,
             )
 
-    def test_sparse_offload_cell_size_falls_back_for_owner_empty_pp_range(self):
+    def test_sparse_offload_cell_size_is_zero_for_owner_empty_pp_range(self):
         model_config = _make_glm51_model_config()
         model_config.hf_config.indexer_types = _glm_indexer_types()
         with (
@@ -221,7 +200,7 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
                     element_size=2,
                     start_layer=3,
                 ),
-                128 * 3 * 2,
+                0,
             )
 
     def test_glm_dsa_model_enables_sparse_kv_offload(self):

@@ -1890,7 +1890,7 @@ class TestNPUCompactDSAIndexerSizing(CustomTestCase):
         expected_layer_ids = (0, 1, *range(2, 78, 4))
         self.assertEqual(pool.kwargs["indexer_layer_ids"], expected_layer_ids)
 
-    def test_ascend_pool_builder_falls_back_when_pp_range_has_no_owner(self):
+    def test_ascend_pool_builder_preserves_empty_owner_range(self):
         import sys
 
         import torch
@@ -1959,7 +1959,7 @@ class TestNPUCompactDSAIndexerSizing(CustomTestCase):
                 max_total_num_tokens=1024, is_dsa_model=True
             )
 
-        self.assertIsNone(pool.kwargs["indexer_layer_ids"])
+        self.assertEqual(pool.kwargs["indexer_layer_ids"], ())
 
     def test_bf16_indexer_cell_size_counts_local_owner_layers(self):
         import torch
@@ -2010,7 +2010,7 @@ class TestNPUCompactDSAIndexerSizing(CustomTestCase):
             kvc.layer_info = SimpleNamespace(start_layer=3, end_layer=6)
             self.assertEqual(
                 cfg._compute_dsa_indexer_cell_size(kvc=kvc, num_layers=3),
-                128 * 3 * torch.tensor([], dtype=torch.bfloat16).element_size(),
+                0,
             )
 
 
