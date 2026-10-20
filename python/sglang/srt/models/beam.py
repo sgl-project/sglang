@@ -225,6 +225,7 @@ def _beam_owns_tp_boundaries() -> bool:
         or execution.graph.enable_torch_compile
         or execution.deterministic.enable_deterministic_inference
         or execution.comm.disable_custom_all_reduce
+        or get_lora().enable_lora
         or get_fused_op_backend() is not None
         or torch.version.hip is not None
     )
@@ -359,11 +360,12 @@ class BeamMoE(nn.Module):
         router_backend = envs.SGLANG_BEAM_ROUTER_BACKEND.get()  # Defaults to cutile.
         if router_backend not in ("cublas", "cutile", "torch"):
             raise ValueError(f"Unsupported Beam router backend: {router_backend}")
-        # Preserve the normal linear path for offloading and strict
+        # Preserve the normal linear path for offloading, adapters and strict
         # deterministic inference.
         self.use_fast_router = (
             _is_cuda
             and not self.refresh_correction_bias
+            and not get_lora().enable_lora
             and not get_exec().deterministic.enable_deterministic_inference
             and get_fused_op_backend() != KernelBackend.TORCH
             and router_backend != "torch"
@@ -530,9 +532,12 @@ class BeamAttention(nn.Module):
         # MergedColumnParallelLinear shards each projection independently, but
         # does not replicate KV heads. Keep the existing quantized/replicated
         # paths until their loading and backend contracts are validated.
+        # LoRA wraps qkv_proj and gate_proj separately; keep those modules
+        # whenever adapters can be loaded, including dynamic LoRA loading.
         self.use_packed_projection = (
             quant_config is None
             and config.num_key_value_heads >= self.tp_size
+            and not (get_lora().enable_lora or get_lora().lora_paths)
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -1306,6 +1311,18 @@ class BeamForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # The attention output gate keeps its qualified name: its leaf, gate_proj,
+    # also names the MLP gate, which is fused into gate_up_proj.
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "self_attn.gate_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
     def __init__(
         self,
         config: BeamConfig,
@@ -1333,8 +1350,6 @@ class BeamForCausalLM(nn.Module):
                 "Beam has not been validated with expert relocation or "
                 "redundant experts; use trivial expert placement"
             )
-        if get_lora().enable_lora or get_lora().lora_paths:
-            raise NotImplementedError("LoRA adapters are not supported for Beam")
         self.config = config
         self.model = BeamModel(config, quant_config, prefix=add_prefix("model", prefix))
         self.start_layer = self.model.start_layer

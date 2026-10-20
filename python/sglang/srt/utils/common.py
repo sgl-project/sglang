@@ -4794,6 +4794,8 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "in_proj_qkvz",
     "in_proj_ba",
     "out_proj",
+    # Attention output gate on its own; a bare gate_proj also names the MLP gate.
+    "self_attn.gate_proj",
 ]
 
 LORA_TARGET_ALL_MODULES = "all"

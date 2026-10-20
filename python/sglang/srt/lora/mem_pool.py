@@ -30,6 +30,7 @@ from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
     LORA_FUSED_MEMBER_SLOTS,
     LORA_FUSED_MEMBERS,
+    PRESERVED_LORA_TARGET_NAMES,
     REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
@@ -95,6 +96,9 @@ def append_cache_key_suffix(
 def _fused_member_slot(weight_name: str) -> Optional[Tuple[str, int]]:
     """(fused module, slot) of a dense per-member adapter weight, e.g. ``...self_attn.k_proj.lora_A.weight``."""
     if re.search(r"\.(?:experts|shared_experts?)\.", weight_name):
+        return None
+    if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
+        # An attention output gate has no up_proj to stack with.
         return None
     projection = weight_name.split(".lora_", 1)[0].rsplit(".", 1)[-1]
     return LORA_FUSED_MEMBER_SLOTS.get(projection)
@@ -356,6 +360,25 @@ class LoRAMemoryPool:
         """Whether shared experts require their own MoE LoRA pool namespace."""
         return any(
             getattr(m, "is_shared_fused_moe", False) for m in base_model.modules()
+        )
+
+    @staticmethod
+    def _has_dense_module(base_model: torch.nn.Module, module_name: str) -> bool:
+        """Whether a decoder layer has a linear layer of this name outside the
+        routed experts, e.g. the MLP of a leading dense layer in a MoE model."""
+        # Imported here, like FusedMoE below: unit tests import this module with
+        # sglang.srt.lora.layers stubbed out and drop what the import loaded.
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.utils import get_layer_id
+
+        return any(
+            name.endswith(f".{module_name}")
+            and get_layer_id(name) is not None
+            and isinstance(
+                module.base_layer if isinstance(module, BaseLayerWithLoRA) else module,
+                LinearBase,
+            )
+            for name, module in base_model.named_modules()
         )
 
     @staticmethod
@@ -681,8 +704,11 @@ class LoRAMemoryPool:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
-                    # Allocate shared expert version (3D) only when model has shared experts
-                    if has_shared_experts:
+                    # Allocate the dense version (3D) for shared experts or for
+                    # dense MLP layers mixed with MoE layers.
+                    if has_shared_experts or self._has_dense_module(
+                        base_model, module_name
+                    ):
                         buffer[module_name] = [
                             torch.zeros(
                                 get_lora_shape_fn(

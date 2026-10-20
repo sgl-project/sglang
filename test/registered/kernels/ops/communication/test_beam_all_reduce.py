@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -218,6 +219,7 @@ class TestBeamAllReduce(CustomTestCase):
             for guard in (
                 get_exec().comm.override(disable_custom_all_reduce=True),
                 get_exec().deterministic.override(enable_deterministic_inference=True),
+                get_lora().override(enable_lora=True),
                 get_forward().scoped(sp_active=True),
             ):
                 with guard:
