@@ -23,6 +23,11 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -487,6 +492,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.addCleanup(override.restore)
         req = SimpleNamespace(
             rid="retry",
+            cache_request_handle=CacheRequestHandle(rid="retry", attempt_id=0),
             prefill_attempt_count=1,
             output_ids=[42],
             skip_radix_cache_insert=False,
@@ -502,7 +508,6 @@ class TestAllocationIntegration(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             tree_cache=Mock(supports_mamba=Mock(return_value=False)),
-            _release_aborted_request=Mock(),
             clear_pending_chunk_send=Mock(),
             waiting_queue=[],
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
@@ -539,6 +544,63 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(
                 0
             )
+
+    def test_requeued_optimistic_request_keeps_multimodal_inputs(self):
+        """A yielded optimistic prefill is retried, so it must keep its media.
+
+        The requeue used to go through the scheduler's abort release, which
+        also drops the request's multimodal inputs. The retry then prefilled
+        image placeholder ids with no image features to embed and crashed in
+        the embedding lookup. The requeue must still finish the cache attempt.
+        """
+        override = get_context().override_server_args(optimistic_prefill_attempts=3)
+        override.install()
+        self.addCleanup(override.restore)
+
+        class _Req:
+            release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+
+        req = _Req()
+        req.rid = "retry-mm"
+        req.cache_request_handle = CacheRequestHandle(rid="retry-mm", attempt_id=0)
+        req.session = None
+        req.multimodal_inputs = Mock()
+        req.prefill_attempt_count = 0
+        req.output_ids = [42]
+        req.skip_radix_cache_insert = False
+        req.kv = SimpleNamespace(cache_protected_len=16)
+        req.full_untruncated_fill_ids = list(range(32))
+        req._compute_max_prefix_len = Mock(return_value=31)
+        req.storage_prefetch_retry_attempts = 0
+        req.storage_prefetch_last_match_len = None
+        req.reset_for_retract = Mock()
+        req.advance_cache_request_handle = Mock()
+        req.time_stats = MagicMock()
+        scheduler = SimpleNamespace(
+            tree_cache=Mock(supports_mamba=Mock(return_value=False)),
+            clear_pending_chunk_send=Mock(),
+            waiting_queue=[],
+            disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            processed_tokens_counter=0,
+        )
+        scheduler._release_aborted_request = MethodType(
+            Scheduler._release_aborted_request, scheduler
+        )
+        with (
+            patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
+            patch("sglang.srt.disaggregation.prefill.release_kv_cache"),
+        ):
+            SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
+                scheduler, req
+            )
+
+        self.assertEqual(scheduler.waiting_queue, [req])
+        self.assertIsNotNone(req.multimodal_inputs)
+        req.multimodal_inputs.release_features.assert_not_called()
+        scheduler.tree_cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
 
     def test_chunked_prefill_does_not_yield_for_decode_admission(self):
         for policy in ("early", "prefill_complete"):
