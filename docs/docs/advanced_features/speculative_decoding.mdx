@@ -669,7 +669,8 @@ Both keys default to `0`, so a checkpoint whose config lost them builds no convo
 
 DLite predicts a linear block from the target model's current multi-layer hidden
 states. It does not retain a draft KV cache between decoding steps. SGLang
-supports the released `dlite_v1` Qwen3-4B and Qwen3-8B student checkpoints.
+supports the released Qwen3-4B `dlite_v1` and Qwen3-8B `dlite_v2` student
+checkpoints. The legacy `pivot_q_student` role name is also accepted.
 
 ```bash Command
 python3 -m sglang.launch_server \

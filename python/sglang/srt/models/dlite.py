@@ -344,7 +344,8 @@ class DLiteDraftModel(nn.Module):
         )
         self.register_buffer(
             "_query_position_offsets",
-            torch.arange(self.dlite_config.block_size, dtype=torch.long),
+            torch.arange(self.dlite_config.block_size, dtype=torch.long)
+            + self.dlite_config.query_position_offset,
             persistent=False,
         )
         self.sequential_head = DLiteSequentialHead(

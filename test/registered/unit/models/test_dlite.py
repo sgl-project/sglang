@@ -14,7 +14,7 @@ from transformers import Qwen3Config
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
-def _config() -> Qwen3Config:
+def _config(architecture_version: str = "dlite_v1") -> Qwen3Config:
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=16,
@@ -32,10 +32,10 @@ def _config() -> Qwen3Config:
     config.block_size = 4
     config.num_target_layers = 4
     config.dlite_config = {
-        "architecture_version": "dlite_v1",
+        "architecture_version": architecture_version,
         "chs_num_layers": 2,
         "mask_token_id": 31,
-        "model_role": "pivot_q_student",
+        "model_role": "student",
         "sequential_head": "rnn",
         "sequential_rank": 8,
         "target_layer_ids": [0, 3],
@@ -151,7 +151,13 @@ def _reference_forward(
     q = _rms_norm(q, weights["layers.0.self_attn.q_norm.weight"], eps)
     k = _rms_norm(k, weights["layers.0.self_attn.k_norm.weight"], eps)
 
-    query_positions = torch.arange(query_length).unsqueeze(0).expand(batch_size, -1)
+    query_position_offset = (
+        0 if config.dlite_config["architecture_version"] == "dlite_v1" else 1
+    )
+    query_positions = (
+        torch.arange(query_length).unsqueeze(0).expand(batch_size, -1)
+        + query_position_offset
+    )
     context_positions = torch.zeros((batch_size, context.shape[1]), dtype=torch.long)
     key_positions = torch.cat([context_positions, query_positions], dim=1)
     rope_cache = model.layers[0].self_attn.rotary_emb.cos_sin_cache
@@ -230,52 +236,58 @@ class TestDLiteDraftModel(unittest.TestCase):
         )
 
     def test_checkpoint_loading_and_forward_match_reference(self):
-        config = _config()
-        model = DLiteDraftModel(config)
-        weights = _checkpoint_weights(config)
-        loaded = model.load_weights(weights.items())
+        for architecture_version in ("dlite_v1", "dlite_v2"):
+            with self.subTest(architecture_version=architecture_version):
+                config = _config(architecture_version)
+                model = DLiteDraftModel(config)
+                weights = _checkpoint_weights(config)
+                loaded = model.load_weights(weights.items())
 
-        self.assertEqual(loaded, set(dict(model.named_parameters())))
+                self.assertEqual(loaded, set(dict(model.named_parameters())))
 
-        generator = torch.Generator().manual_seed(29)
-        query_embeddings = torch.randn(
-            2, config.block_size, config.hidden_size, generator=generator
-        )
-        target_hidden = torch.randn(
-            2,
-            config.dlite_config["chs_num_layers"],
-            config.hidden_size,
-            generator=generator,
-        )
-        actual_hidden = model.forward_draft(
-            query_embeddings=query_embeddings,
-            target_hidden=target_hidden,
-        )
-        flat_hidden = model.forward_draft(
-            query_embeddings=query_embeddings,
-            target_hidden=target_hidden.flatten(1),
-        )
-        torch.testing.assert_close(flat_hidden, actual_hidden, rtol=0, atol=0)
-        expected_hidden = _reference_forward(
-            config=config,
-            model=model,
-            weights=weights,
-            query_embeddings=query_embeddings,
-            target_hidden=target_hidden,
-        )
-        torch.testing.assert_close(actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+                generator = torch.Generator().manual_seed(29)
+                query_embeddings = torch.randn(
+                    2, config.block_size, config.hidden_size, generator=generator
+                )
+                target_hidden = torch.randn(
+                    2,
+                    config.dlite_config["chs_num_layers"],
+                    config.hidden_size,
+                    generator=generator,
+                )
+                actual_hidden = model.forward_draft(
+                    query_embeddings=query_embeddings,
+                    target_hidden=target_hidden,
+                )
+                flat_hidden = model.forward_draft(
+                    query_embeddings=query_embeddings,
+                    target_hidden=target_hidden.flatten(1),
+                )
+                torch.testing.assert_close(flat_hidden, actual_hidden, rtol=0, atol=0)
+                expected_hidden = _reference_forward(
+                    config=config,
+                    model=model,
+                    weights=weights,
+                    query_embeddings=query_embeddings,
+                    target_hidden=target_hidden,
+                )
+                torch.testing.assert_close(
+                    actual_hidden, expected_hidden, rtol=1e-5, atol=1e-6
+                )
 
-        anchor_token_ids = torch.tensor([3, 11])
-        actual_tokens = model.sample_greedy(
-            draft_hidden=actual_hidden,
-            anchor_token_ids=anchor_token_ids,
-        )
-        expected_tokens = _reference_sequential_tokens(
-            weights=weights,
-            hidden_states=expected_hidden,
-            anchor_token_ids=anchor_token_ids,
-        )
-        torch.testing.assert_close(actual_tokens, expected_tokens, rtol=0, atol=0)
+                anchor_token_ids = torch.tensor([3, 11])
+                actual_tokens = model.sample_greedy(
+                    draft_hidden=actual_hidden,
+                    anchor_token_ids=anchor_token_ids,
+                )
+                expected_tokens = _reference_sequential_tokens(
+                    weights=weights,
+                    hidden_states=expected_hidden,
+                    anchor_token_ids=anchor_token_ids,
+                )
+                torch.testing.assert_close(
+                    actual_tokens, expected_tokens, rtol=0, atol=0
+                )
 
     def test_qwen3_capture_uses_hf_layer_output_ids(self):
         target = SimpleNamespace(

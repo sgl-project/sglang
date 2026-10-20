@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-DLITE_ARCHITECTURE_VERSION = "dlite_v1"
-DLITE_MODEL_ROLE = "pivot_q_student"
+DLITE_ARCHITECTURE_VERSIONS = ("dlite_v1", "dlite_v2")
+DLITE_ARCHITECTURE_VERSION = DLITE_ARCHITECTURE_VERSIONS[-1]
+DLITE_MODEL_ROLES = ("student", "pivot_q_student")
+DLITE_MODEL_ROLE = DLITE_MODEL_ROLES[0]
 DLITE_SEQUENTIAL_HEAD = "rnn"
 
 
@@ -64,6 +66,10 @@ class DLiteDraftConfig:
     def proposal_length(self) -> int:
         return self.block_size - 1
 
+    @property
+    def query_position_offset(self) -> int:
+        return 0 if self.architecture_version == "dlite_v1" else 1
+
 
 def parse_dlite_draft_config(draft_hf_config: Any) -> DLiteDraftConfig:
     architectures = _config_value(draft_hf_config, "architectures", None) or []
@@ -88,17 +94,17 @@ def parse_dlite_draft_config(draft_hf_config: Any) -> DLiteDraftConfig:
         raise ValueError(f"DLite dlite_config is missing required fields: {missing}.")
 
     architecture_version = str(raw["architecture_version"])
-    if architecture_version != DLITE_ARCHITECTURE_VERSION:
+    if architecture_version not in DLITE_ARCHITECTURE_VERSIONS:
         raise ValueError(
             "SGLang currently supports released DLite student checkpoints with "
-            f"architecture_version={DLITE_ARCHITECTURE_VERSION!r}; got "
+            f"architecture_version in {DLITE_ARCHITECTURE_VERSIONS!r}; got "
             f"{architecture_version!r}."
         )
 
     model_role = str(raw["model_role"]).lower()
-    if model_role != DLITE_MODEL_ROLE:
+    if model_role not in DLITE_MODEL_ROLES:
         raise ValueError(
-            f"DLite inference requires model_role={DLITE_MODEL_ROLE!r}; "
+            f"DLite inference requires model_role in {DLITE_MODEL_ROLES!r}; "
             f"got {model_role!r}."
         )
 
@@ -201,7 +207,9 @@ def validate_dlite_target_compatibility(
 
 __all__ = [
     "DLITE_ARCHITECTURE_VERSION",
+    "DLITE_ARCHITECTURE_VERSIONS",
     "DLITE_MODEL_ROLE",
+    "DLITE_MODEL_ROLES",
     "DLITE_SEQUENTIAL_HEAD",
     "DLiteDraftConfig",
     "build_dlite_target_layer_ids",

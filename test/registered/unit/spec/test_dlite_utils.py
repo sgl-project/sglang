@@ -19,7 +19,7 @@ def _draft_config(**overrides):
             "architecture_version": "dlite_v1",
             "chs_num_layers": 4,
             "mask_token_id": 99,
-            "model_role": "pivot_q_student",
+            "model_role": "student",
             "sequential_head": "rnn",
             "sequential_rank": 32,
             "target_layer_ids": [0, 1, 6, 7],
@@ -51,6 +51,7 @@ def test_parse_released_dlite_v1_contract():
     assert parsed.proposal_length == 7
     assert parsed.target_layer_ids == (0, 1, 6, 7)
     assert parsed.sequential_rank == 32
+    assert parsed.query_position_offset == 0
 
 
 def test_public_qwen3_checkpoints_use_fixed_chs_layers():
@@ -70,6 +71,35 @@ def test_public_qwen3_checkpoints_use_fixed_chs_layers():
         34,
         35,
     )
+    assert build_dlite_target_layer_ids(36, 12) == (
+        0,
+        1,
+        5,
+        8,
+        12,
+        16,
+        19,
+        23,
+        27,
+        30,
+        34,
+        35,
+    )
+
+
+def test_parse_released_dlite_v2_contract():
+    draft = _draft_config()
+    draft.dlite_config = {
+        **draft.dlite_config,
+        "architecture_version": "dlite_v2",
+        "model_role": "pivot_q_student",
+    }
+
+    parsed = parse_dlite_draft_config(draft)
+
+    assert parsed.architecture_version == "dlite_v2"
+    assert parsed.model_role == "pivot_q_student"
+    assert parsed.query_position_offset == 1
 
 
 def test_validate_target_contract():
@@ -102,7 +132,7 @@ def test_rejects_incompatible_target(target_overrides, message):
 
 def test_rejects_unsupported_architecture_version():
     draft = _draft_config()
-    draft.dlite_config = {**draft.dlite_config, "architecture_version": "dlite_v2"}
+    draft.dlite_config = {**draft.dlite_config, "architecture_version": "dlite_v3"}
     with pytest.raises(ValueError, match="architecture_version"):
         parse_dlite_draft_config(draft)
 
