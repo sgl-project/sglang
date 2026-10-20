@@ -890,7 +890,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             wkv_linears=[stage.self_attn.wkv for stage in self.stages],
             # The FlashMLA writer reads an explicit KV row stride, so views are fine.
             allow_strided_output=(
-                get_platform().is_blackwell
+                (get_platform().is_blackwell or get_platform().is_hip)
                 and not is_unified_kv_triton()
                 and not pool.uniform_fp8
             ),
