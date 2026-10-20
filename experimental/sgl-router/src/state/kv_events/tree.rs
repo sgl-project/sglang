@@ -99,8 +99,9 @@
 //! then prefills it cold. Ownership here is "any tier", which is what makes
 //! the prefix routable again. [`MatchResult::tiers`] reports which tier each
 //! owner holds it on so a policy can price a load-back against an in-place
-//! hit; no policy consumes it yet — the routing path reads
-//! [`HashTree::prefix_depths`], which is tier-blind by design.
+//! hit. Prefill routing reads [`HashTree::prefix_depths`], which is tier-blind;
+//! opt-in decode affinity uses [`HashTree::resident_prefix_depths`] to exclude
+//! disk/external copies and distinguish device-resident from host-backed hits.
 //!
 //! Untagged events keep their pre-tiering meaning: an untagged store is a
 //! device store, an untagged remove clears every tier. A store tagged with a
@@ -1036,6 +1037,15 @@ impl TreeState {
         parent_hash: Option<i64>,
         block_hashes: &[i64],
     ) -> HashMap<KvWorkerId, usize> {
+        self.prefix_depths_in_tiers(parent_hash, block_hashes, Tiers::ALL)
+    }
+
+    fn prefix_depths_in_tiers(
+        &self,
+        parent_hash: Option<i64>,
+        block_hashes: &[i64],
+        tiers: Tiers,
+    ) -> HashMap<KvWorkerId, usize> {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
@@ -1070,14 +1080,22 @@ impl TreeState {
             reached += 1;
             if reached == 1 {
                 // Absent here means never in `alive`: a tail held without
-                // block 0 is reported as holding nothing. Presence is "on any
-                // tier" — a worker whose device copy was evicted but whose
-                // host backup remains still holds the level.
-                alive = child.workers.keys().collect();
+                // block 0 is reported as holding nothing. Each level must
+                // remain on an eligible tier for the worker to stay alive.
+                alive = child
+                    .workers
+                    .iter()
+                    .filter(|(_, held)| held.0 & tiers.0 != 0)
+                    .map(|(worker, _)| worker)
+                    .collect();
             } else {
                 let mut still = Vec::with_capacity(alive.len());
                 for w in alive {
-                    if child.workers.contains_key(w) {
+                    if child
+                        .workers
+                        .get(w)
+                        .is_some_and(|held| held.0 & tiers.0 != 0)
+                    {
                         still.push(w);
                     } else {
                         depths.insert(w, reached - 1);
@@ -1583,6 +1601,33 @@ impl HashTree {
         }
         self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
             shard.prefix_depths(parent, block_hashes)
+        })
+    }
+
+    /// Confirmed `(device-or-host, device-only)` contiguous depths per rank.
+    /// Both walks share one read lock. Disk/external and pending placements do
+    /// not establish that a decode worker can reuse a prefix from local memory.
+    pub fn resident_prefix_depths(
+        &self,
+        block_hashes: &[i64],
+    ) -> HashMap<KvWorkerId, (usize, usize)> {
+        if block_hashes.is_empty() {
+            return HashMap::new();
+        }
+        self.descend_match_shard(None, block_hashes, |shard, parent| {
+            let resident = shard.prefix_depths_in_tiers(
+                parent,
+                block_hashes,
+                Tiers::DEVICE.union(Tiers::HOST),
+            );
+            let device = shard.prefix_depths_in_tiers(parent, block_hashes, Tiers::DEVICE);
+            resident
+                .into_iter()
+                .map(|(worker, depth)| {
+                    let device_depth = device.get(&worker).copied().unwrap_or(0);
+                    (worker, (depth, device_depth))
+                })
+                .collect()
         })
     }
 
