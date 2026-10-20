@@ -488,6 +488,12 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def routes_with_fp32_correction_bias(config) -> bool:
+    """GLM-5.3-Flash's 288 fp32 biases per layer sit in a ~0.4-wide band where bf16
+    keeps 8-11 of them, which reorders top-k, so it routes with the fp32 bias."""
+    return getattr(config, "model_type", None) == "glm5_next_text"
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -517,7 +523,7 @@ class MoEGate(nn.Module):
             if (
                 quant_config is not None
                 and not is_glm_moe_dsa(config)
-                and getattr(config, "model_type", None) != "glm5_next_text"
+                and not routes_with_fp32_correction_bias(config)
             ):
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
@@ -764,6 +770,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_group=config.topk_group,
                 scoring_func=config.scoring_func,
                 correction_bias=self.gate.e_score_correction_bias,
+                fp32_correction_bias=routes_with_fp32_correction_bias(config),
                 quant_config=quant_config,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
