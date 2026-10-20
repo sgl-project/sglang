@@ -6,7 +6,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
     dequantize_nvfp4_k_cache_paged_reference,
 )
@@ -41,6 +40,7 @@ def _make_pool(rank=None, world=1):
         kwargs.update(layer_shard_rank=rank, layer_shard_size=world)
     cls = DSATokenToKVPool if rank is None else LayerSplitDSATokenToKVPool
     with (
+        get_parallel().override(attn_dcp_size=1),
         patch(
             "sglang.srt.mem_cache.memory_pool.maybe_init_custom_mem_pool",
             return_value=(False, None, None),
@@ -190,10 +190,13 @@ def test_move_and_restore_refresh_remote_kv_and_page_packed_indexer(world):
 
     def read_index(pool):
         buffer = pool.get_broadcastable_index_k_with_scale_buffer(layer_id)
-        pages = torch.arange(2)
+        # Read the page-packed layout independently of the production move.
+        # Each page stores all 128-byte keys before its four-byte scales.
+        pages = buffer[torch.arange(2)]
+        key_bytes = PAGE_SIZE * 128
         return (
-            index_buf_accessor.GetK.slow(pool, buffer, 128, pages),
-            index_buf_accessor.GetS.slow(pool, buffer, 128, pages),
+            pages[:, :key_bytes].reshape(-1, 128),
+            pages[:, key_bytes:].reshape(-1, 4),
         )
 
     # These are token locations larger than the number of indexer pages.

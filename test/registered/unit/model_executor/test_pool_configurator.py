@@ -419,8 +419,10 @@ class TestDefaultConfigurator(CustomTestCase):
                 )
                 mr.server_args = get_server_args()
                 with (
-                    mock_cpu_env(kv_size=1),
-                    get_parallel().override(attn_cp_size=shard_size, attn_cp_rank=0),
+                    mock_cpu_env(kv_size=1, tp_size=shard_size),
+                    get_parallel().override(
+                        attn_tp_size=1, attn_cp_size=shard_size, attn_cp_rank=0
+                    ),
                     patch(
                         "sglang.srt.model_executor.pool_configurator."
                         "is_float4_e2m1fn_x2",

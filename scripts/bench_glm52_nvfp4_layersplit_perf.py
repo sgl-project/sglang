@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -138,6 +139,8 @@ def run_synthetic_phase(args, phase, router_url, worker_urls, control, report):
                 "--output-file",
                 str(output),
             ]
+            if dataset_path := os.environ.get("GLM52_DATASET_PATH"):
+                command += ["--dataset-path", dataset_path]
             write_json(args.output_dir / f"{name}.command.json", command)
             with (args.output_dir / f"{name}.log").open("w") as log:
                 subprocess.run(

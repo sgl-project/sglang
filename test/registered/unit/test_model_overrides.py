@@ -2822,7 +2822,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
                 )
-                with patch.object(overrides_module, "is_hip", return_value=False):
+                with override_platform(is_hip=False):
                     self.assertEqual(
                         _dsa_kv_cache_dtype_default(
                             _view(
@@ -2902,7 +2902,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         )
             with (
                 patch("torch.cuda.get_device_capability", return_value=(9, 0)),
-                patch.object(overrides_module, "is_hip", return_value=False),
+                override_platform(is_hip=False),
                 self.assertRaisesRegex(ValueError, "requires an SM100 GPU"),
             ):
                 _dsa_kv_cache_dtype_default(

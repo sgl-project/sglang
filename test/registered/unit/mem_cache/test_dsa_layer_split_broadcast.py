@@ -211,9 +211,8 @@ def _run_fp8(rank: int, world: int):
 
 @torch.inference_mode()
 def _run_nvfp4(rank: int, world: int):
-    from sgl_kernel import flashmla_ops  # noqa: F401
+    from sgl_kernel import flashmla_nvfp4_ops  # noqa: F401
 
-    from sglang.kernels.ops.attention.dsa import index_buf_accessor
     from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitDSATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -325,10 +324,17 @@ def _run_nvfp4(rank: int, world: int):
     expected_kv = reference.get_key_buffer(layer_id)[:128].clone()
     expected_kv[target] = expected_kv[source]
     reference_index = reference.index_key_cache.get_buffer(layer_id)
-    expected_keys = index_buf_accessor.GetK.slow(reference, reference_index, 128, pages)
-    expected_scales = index_buf_accessor.GetS.slow(
-        reference, reference_index, 128, pages
-    )
+
+    def read_index(buffer):
+        # Independent byte reference for the page-packed key/scale layout.
+        selected = buffer[pages]
+        key_bytes = PAGE_SIZE * INDEX_HEAD_DIM
+        return (
+            selected[:, :key_bytes].reshape(-1, INDEX_HEAD_DIM),
+            selected[:, key_bytes:].reshape(-1, 4),
+        )
+
+    expected_keys, expected_scales = read_index(reference_index)
     expected_keys[target] = expected_keys[source]
     expected_scales[target] = expected_scales[source]
     pool.prefetch_kv_buffer(0)
@@ -339,12 +345,9 @@ def _run_nvfp4(rank: int, world: int):
     def check_moved_rows():
         assert torch.equal(pool.get_key_buffer(layer_id)[:128], expected_kv)
         buffer = pool.index_key_cache.get_buffer(layer_id)
-        assert torch.equal(
-            index_buf_accessor.GetK.slow(pool, buffer, 128, pages), expected_keys
-        )
-        assert torch.equal(
-            index_buf_accessor.GetS.slow(pool, buffer, 128, pages), expected_scales
-        )
+        keys, scales = read_index(buffer)
+        assert torch.equal(keys, expected_keys)
+        assert torch.equal(scales, expected_scales)
 
     check_moved_rows()
     saved = pool.get_cpu_copy(all_indices)

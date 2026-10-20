@@ -83,22 +83,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
-        page_size = self.pool.page_size
-        tgt_loc = tgt_loc.view(-1).long()
-        src_loc = src_loc.view(-1).long()
-        tgt_page, tgt_offset = tgt_loc // page_size, tgt_loc % page_size
-        src_page, src_offset = src_loc // page_size, src_loc % page_size
-        key_bytes = page_size * self.pool.index_head_dim
-        scale_bytes = self.pool.index_head_dim // self.pool.quant_block_size * 4
-        for buffer in self.buffer:
-            if buffer.shape[0] == 0:
-                continue
-            # Each page stores all FP8 keys before all FP32 scales. They are
-            # separate regions, rather than interleaved 132-byte token rows.
-            keys = buffer[:, :key_bytes].view(-1, page_size, self.pool.index_head_dim)
-            scales = buffer[:, key_bytes:].view(-1, page_size, scale_bytes)
-            keys[tgt_page, tgt_offset] = keys[src_page, src_offset]
-            scales[tgt_page, tgt_offset] = scales[src_page, src_offset]
+        super().move(tgt_loc, src_loc)
         self.remote_layer_id = None
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
