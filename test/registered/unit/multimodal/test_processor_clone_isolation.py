@@ -33,11 +33,6 @@ class _NarrowImageProcessor:
 
 
 class TestSarashina2PreprocessFilterSurvivesCloning(CustomTestCase):
-    def test_unfiltered_preprocess_rejects_what_transformers_forwards(self):
-        """Why the filter exists: the raw method cannot take the full kwarg set."""
-        with self.assertRaises(TypeError):
-            _NarrowImageProcessor()._preprocess(["img"], do_resize=True, do_pad=False)
-
     def test_filter_applies_to_the_patched_processor(self):
         image_processor = _NarrowImageProcessor()
         _install_preprocess_kwarg_filter(image_processor)

@@ -31,6 +31,8 @@ def speculative_sampling_classic_kernel(
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    BLOCK_VERIFICATION: tl.constexpr = False,
+    BLOCK_REDUCE: tl.constexpr = 4096,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
@@ -44,52 +46,124 @@ def speculative_sampling_classic_kernel(
     last_accepted_global_idx = root_global_idx
 
     num_accept = 0
+    residual_scale = 1.0
+    norm_sum = -1.0
 
-    # Verification Loop
-    step = 1
-    continue_verifying = 1
-
-    while (step < NUM_SLOTS) and (continue_verifying == 1):
-        draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
-
-        offset_prob = (
-            (pid * stride_tp_b)
-            + (cur_prob_row * stride_tp_s)
-            + (draft_token * stride_tp_v)
-        )
-        offset_draft = (
-            (pid * stride_dp_b)
-            + (cur_prob_row * stride_dp_s)
-            + (draft_token * stride_dp_v)
-        )
-
-        p = tl.load(TargetProbs + offset_prob)
-        q = tl.load(DraftProbs + offset_draft)
-
-        coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
-
-        if coin * q < p:
-            num_accept += 1
-            cur_prob_row = step
-            tl.store(Predicts + last_accepted_global_idx, draft_token)
-
-            curr_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
-            tl.store(
-                AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
-                curr_global_idx,
+    if BLOCK_VERIFICATION:
+        # Algorithm 2: https://arxiv.org/abs/2403.10444
+        # Keep the short recurrence in registers; only the longest accepted prefix matters.
+        prefix_prob = 1.0
+        prefix_probs = ()
+        for step in tl.static_range(1, NUM_SLOTS):
+            draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+            p = tl.load(
+                TargetProbs
+                + pid * stride_tp_b
+                + (step - 1) * stride_tp_s
+                + draft_token * stride_tp_v
             )
-            last_accepted_global_idx = curr_global_idx
+            q = tl.load(
+                DraftProbs
+                + pid * stride_dp_b
+                + (step - 1) * stride_dp_s
+                + draft_token * stride_dp_v
+            )
+            q_is_prob = (q > 0.0) & (q <= 1.0)
+            prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
+            prefix_probs += (prefix_prob,)
 
-            step += 1
-        else:
-            continue_verifying = 0
+        for step in tl.static_range(NUM_SLOTS - 1, 0, -1):
+            if num_accept == 0:
+                prefix_prob = prefix_probs[step - 1]
+                coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+                # For normalized distributions h_i <= r_i; reject before scanning.
+                if coin < prefix_prob:
+                    accept_prob = prefix_prob
+                    residual_mass = -1.0
+                    if (
+                        (step < NUM_SLOTS - 1)
+                        & (prefix_prob > 0.0)
+                        & (prefix_prob < 1.0)
+                    ):
+                        residual_mass = 0.0
+                        for v_start in range(0, VOCAB_SIZE, BLOCK_REDUCE):
+                            v_offsets = v_start + tl.arange(0, BLOCK_REDUCE)
+                            mask = v_offsets < VOCAB_SIZE
+                            p_next = tl.load(
+                                TargetProbs
+                                + pid * stride_tp_b
+                                + step * stride_tp_s
+                                + v_offsets * stride_tp_v,
+                                mask=mask,
+                                other=0.0,
+                            )
+                            q_next = tl.load(
+                                DraftProbs
+                                + pid * stride_dp_b
+                                + step * stride_dp_s
+                                + v_offsets * stride_dp_v,
+                                mask=mask,
+                                other=0.0,
+                            )
+                            residual_mass += tl.sum(
+                                tl.maximum(prefix_prob * p_next - q_next, 0.0)
+                            )
+                        accept_prob = residual_mass / (
+                            residual_mass + 1.0 - prefix_prob
+                        )
+                    if coin < accept_prob:
+                        num_accept = step
+                        residual_scale = prefix_prob
+                        norm_sum = residual_mass
+
+        cur_prob_row = num_accept
+        for step in range(1, num_accept + 1):
+            draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+            tl.store(Predicts + last_accepted_global_idx, draft_token)
+            last_accepted_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
+            tl.store(
+                AcceptIndex + pid * stride_idx_b + step * stride_idx_s,
+                last_accepted_global_idx,
+            )
+    else:
+        step = 1
+        continue_verifying = 1
+        # At each token-verification loop entry, cur_prob_row == num_accept == step - 1.
+        while (step < NUM_SLOTS) and (continue_verifying == 1):
+            draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+            p = tl.load(
+                TargetProbs
+                + pid * stride_tp_b
+                + cur_prob_row * stride_tp_s
+                + draft_token * stride_tp_v
+            )
+            q = tl.load(
+                DraftProbs
+                + pid * stride_dp_b
+                + cur_prob_row * stride_dp_s
+                + draft_token * stride_dp_v
+            )
+            coin = tl.load(uni_ptr_base + (step - 1) * stride_uni_s)
+            # A proposal token must have positive probability under its draft distribution.
+            q_is_prob = (q > 0.0) & (q <= 1.0)
+            if q_is_prob & (coin * q < p):
+                num_accept += 1
+                cur_prob_row = step
+                tl.store(Predicts + last_accepted_global_idx, draft_token)
+                last_accepted_global_idx = tl.load(idx_ptr_base + step * stride_idx_s)
+                tl.store(
+                    AcceptIndex + pid * stride_idx_b + num_accept * stride_idx_s,
+                    last_accepted_global_idx,
+                )
+                step += 1
+            else:
+                continue_verifying = 0
 
     tl.store(AcceptTokenNum + pid, num_accept)
 
     # Final Sampling
-    all_drafts_accepted = continue_verifying
+    all_drafts_accepted = num_accept == NUM_SLOTS - 1
     coin_final = tl.load(UniformSamplesFinal + pid)
-    norm_sum = 0.0
 
     tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
     # DraftProbs has only num_steps rows (TargetProbs has num_steps + 1). When
@@ -98,25 +172,30 @@ def speculative_sampling_classic_kernel(
     # dereferences this pointer; on rejection cur_prob_row <= num_steps - 1.
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
 
-    # Pass 1: Sum
-    for v_start in range(0, VOCAB_SIZE, BLOCK_V):
-        v_offsets = v_start + tl.arange(0, BLOCK_V)
-        mask = v_offsets < VOCAB_SIZE
+    # Reuse the selected prefix mass as the correction normalizer.
+    if norm_sum < 0.0:
+        norm_sum = 0.0
+        # Pass 1: Sum
+        for v_start in range(0, VOCAB_SIZE, BLOCK_V):
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < VOCAB_SIZE
 
-        p_ptr = tp_base_ptr + v_offsets * stride_tp_v
-        p_val = tl.load(p_ptr, mask=mask, other=0.0)
+            p_ptr = tp_base_ptr + v_offsets * stride_tp_v
+            p_val = tl.load(p_ptr, mask=mask, other=0.0)
 
-        if all_drafts_accepted:
-            val = p_val
-        else:
-            q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
-            q_val = tl.load(q_ptr, mask=mask, other=0.0)
-            # Treat NaN q (degenerate draft rows) as 0: residual falls back to p.
-            q_val = tl.where(q_val == q_val, q_val, 0.0)
-            diff = p_val - q_val
-            val = tl.where(diff > 0.0, diff, 0.0)
+            if all_drafts_accepted:
+                val = p_val
+            else:
+                q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
+                q_val = tl.load(q_ptr, mask=mask, other=0.0)
+                # Treat any non-probability q (NaN, +-inf, negative) as 0: the
+                # residual falls back to p. A comparison against NaN is false, so
+                # the range test rejects it along with the infinities.
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                diff = residual_scale * p_val - q_val
+                val = tl.where(diff > 0.0, diff, 0.0)
 
-        norm_sum += tl.sum(val)
+            norm_sum += tl.sum(val)
 
     # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
     # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
@@ -139,9 +218,9 @@ def speculative_sampling_classic_kernel(
             else:
                 q_ptr = dp_base_ptr_safe + v_offsets * stride_dp_v
                 q_val = tl.load(q_ptr, mask=mask, other=0.0)
-                # Same NaN-q guard as pass 1.
-                q_val = tl.where(q_val == q_val, q_val, 0.0)
-                diff = p_val - q_val
+                # Same guard as pass 1.
+                q_val = tl.where((q_val >= 0.0) & (q_val <= 1.0), q_val, 0.0)
+                diff = residual_scale * p_val - q_val
                 val = tl.where(diff > 0.0, diff, 0.0)
 
             block_cumsum = tl.cumsum(val, axis=0)
@@ -175,9 +254,14 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    *,
+    block_verification: bool = False,
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    # Keep CDF tiles small, and cap multi-tile reductions to avoid register spills.
+    block_reduce = min(triton.next_power_of_2(vocab_size), 32768)
+    num_warps = 8 if block_verification and block_reduce > 4096 else 4
 
     grid = (batch_size,)
     speculative_sampling_classic_kernel[grid](
@@ -205,4 +289,7 @@ def chain_speculative_sampling_triton(
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
+        BLOCK_VERIFICATION=block_verification,
+        BLOCK_REDUCE=block_reduce,
+        num_warps=num_warps,
     )
