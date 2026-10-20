@@ -63,8 +63,6 @@ def _is_start_req(rid: str):
     return lambda obj: isinstance(obj, _StartReq) and obj.rid == rid
 
 
-
-
 class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
     def test_http_post_failure_reaches_script_wait(self):
         """A rejected POST must report its error instead of a socket-arrival timeout."""
@@ -127,20 +125,6 @@ class TestScriptedTokenizerRecvProxyWaitUntilArrived(CustomTestCase):
 
         self.assertFalse(future.done())
         self.assertIs(proxy.recv_pyobj(), msg)
-
-    def _proxy_with_stale_control(self):
-        underlying = _FakeUnderlyingSocket()
-        proxy = ScriptedTokenizerRecvProxy(underlying=underlying)
-        stale = _ControlMsg("stale")
-        underlying.feed(stale)
-        proxy.wait_until_arrived(_is_control, timeout_s=1.0)
-        return proxy, underlying, stale
-
-
-
-
-
-
 
 
 if __name__ == "__main__":

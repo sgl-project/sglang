@@ -10,6 +10,7 @@ import orjson
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, Req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -23,8 +24,8 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class TestRequestEpochs(CustomTestCase):
     def setUp(self):
         super().setUp()
+        self.enterContext(get_parallel().override(pp_size=1))
         self.scheduler = SimpleNamespace(
-            ps=SimpleNamespace(pp_size=1),
             waiting_queue=[],
             running_batch=None,
             last_batch=None,

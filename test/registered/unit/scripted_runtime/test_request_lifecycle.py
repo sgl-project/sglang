@@ -18,6 +18,7 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime import scheduler_hook
@@ -101,6 +102,7 @@ def _tokenized_request(*, rid):
 class TestRequestLifecycle(CustomTestCase):
     def setUp(self):
         super().setUp()
+        self.enterContext(get_parallel().override(pp_size=1))
         self.socket = _SocketBoundary()
         self.http = _HttpBoundary(socket=self.socket)
         self.poster = BackgroundHttpPoster()
@@ -109,7 +111,6 @@ class TestRequestLifecycle(CustomTestCase):
         self.proxy = ScriptedTokenizerRecvProxy(underlying=self.socket)
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(host="localhost", port=30000),
-            ps=SimpleNamespace(pp_size=1),
             waiting_queue=[],
             running_batch=None,
             last_batch=None,

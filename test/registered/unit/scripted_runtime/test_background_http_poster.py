@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import unittest
-from concurrent.futures import Future
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import orjson
 from aiohttp import ClientResponseError, web
 from aiohttp.test_utils import TestServer
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scripted_runtime import background_http_poster as bg_poster
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,16 +55,9 @@ class _FakeSession:
         self.closed = True
 
 
-
-
-
-
-
-
 class TestBackgroundHttpPosterPost(CustomTestCase):
     def _run_on_loop(self, poster: BackgroundHttpPoster, coro) -> None:
         asyncio.run_coroutine_threadsafe(coro, poster._loop).result(timeout=5.0)
-
 
     def test_stream_error_split_across_chunks(self):
         """A rejection split across transport chunks must still reach the caller."""
