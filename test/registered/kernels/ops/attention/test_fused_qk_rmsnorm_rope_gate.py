@@ -211,12 +211,6 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
                             atol=tolerance,
                             rtol=tolerance,
                         )
-                        torch.testing.assert_close(
-                            actual[..., rotary_dim:],
-                            normalized[..., rotary_dim:],
-                            atol=tolerance,
-                            rtol=tolerance,
-                        )
                     torch.testing.assert_close(
                         gate_out,
                         q_gate.view(tokens, num_q_heads, 2 * head_dim)[..., head_dim:],

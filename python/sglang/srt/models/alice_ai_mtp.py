@@ -144,9 +144,6 @@ class AliceAIForCausalLMMTP(AliceAIForCausalLM):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
     def set_embed_and_head(self, embed, head):
         if embed is not None:
             del self.model.embed_tokens.weight

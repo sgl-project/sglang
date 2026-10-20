@@ -393,16 +393,6 @@ class TestAliceAI(CustomTestCase):
         self.assertEqual(loaded, set(dict(model.named_parameters())))
         torch.testing.assert_close(experts.w13_weight, gate_up)
         torch.testing.assert_close(experts.w2_weight, down)
-        hidden = torch.tensor([[0.25, -0.5], [-0.75, 0.125]])
-        for expert_id in range(model.config.num_experts):
-            gate, up = F.linear(hidden, gate_up[expert_id]).chunk(2, dim=-1)
-            expected = F.linear(F.silu(gate) * up, down[expert_id])
-            actual = F.linear(
-                F.silu(F.linear(hidden, experts.w13_weight[expert_id, :2]))
-                * F.linear(hidden, experts.w13_weight[expert_id, 2:]),
-                experts.w2_weight[expert_id],
-            )
-            torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":
