@@ -95,9 +95,10 @@ def triton_sparse_mla_decode_splitk(
     kv:      [num_pages, 1, DIM] fp8/bf16
     indices: [bs, 1, topk] int32
     workspace: backend-owned grow-only split-K buffers for graph-safe reuse
-    lengths: optional [bs] int32; only the first lengths[i] indices of row i are
-             read, so the rest of the row is never scanned. Under DCP this is
-             the per-row count of slots this rank owns.
+    lengths: optional [bs] int32 in [0, topk]; only the first lengths[i]
+             indices of row i are scanned, and the rest of the row must be -1.
+             Under DCP these are the owned counts and the -1 tail written by
+             transform_index_page_table_dcp (transform_index.py).
     returns: [1, bs, H, d_v] bf16, plus a [bs, H] fp32 base-2 LSE if return_lse
     """
     is_fp8 = _validate_input_dtypes(q_nope, q_rope, kv)
@@ -107,6 +108,12 @@ def triton_sparse_mla_decode_splitk(
     d_tail = q_rope.shape[-1]
     kv_dim = kv.shape[-1]
     topk = indices.shape[-1]
+    if lengths is not None:
+        assert lengths.shape == (bs,) and lengths.dtype == torch.int32, (
+            f"lengths must be [bs={bs}] int32, got {tuple(lengths.shape)} "
+            f"{lengths.dtype}"
+        )
+        assert indices.dtype == torch.int32
     idx_flat = indices.squeeze(1).contiguous()
     # The kernels address q by explicit row strides, so a packed [N, H, D] layout
     # is not required -- only a unit-stride last dim. Callers that pass an
@@ -201,6 +208,7 @@ def triton_sparse_mla_decode_splitk(
                 STRIDE_QR_H=stride_qr_h,
                 USE_FP8_DOT=use_fp8_dot,
                 USE_TOPK_LENGTH=lengths is not None,
+                TOPK_TAIL_INVALID=lengths is not None,
                 BLOCK_H=BLOCK_H,
                 BLOCK_K=BLOCK_K,
                 USE_I64_PAGE=not (

@@ -610,6 +610,11 @@ def _sparse_mla_fused_kernel(
     PIPE_STAGES: tl.constexpr = 3,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
+    # Set only when 0 <= topk_length <= topk and every index past it is -1,
+    # as transform_index_page_table_dcp writes the DCP-localized table: the
+    # tile count skips the clamp and the index load masks on the constexpr
+    # topk, leaving the -1 tail to slot >= 0.
+    TOPK_TAIL_INVALID: tl.constexpr = False,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
     t = tl.program_id(0)
@@ -663,12 +668,16 @@ def _sparse_mla_fused_kernel(
     if NUM_GROUPS >= 4:
         acc3 = tl.zeros((BLOCK_H, _G), dtype=tl.float32)
 
-    valid_topk = topk
-    if USE_TOPK_LENGTH:
-        valid_topk = tl.minimum(tl.maximum(tl.load(topk_length_ptr + t), 0), topk)
-
     k_offs = tl.arange(0, BLOCK_K)
-    num_tiles = tl.cdiv(valid_topk, BLOCK_K)
+    valid_topk = topk
+    if TOPK_TAIL_INVALID:
+        num_tiles = tl.cdiv(tl.load(topk_length_ptr + t), BLOCK_K)
+    else:
+        if USE_TOPK_LENGTH:
+            valid_topk = tl.minimum(
+                tl.maximum(tl.load(topk_length_ptr + t), 0), topk
+            )
+        num_tiles = tl.cdiv(valid_topk, BLOCK_K)
 
     for j in tl.range(0, num_tiles, num_stages=PIPE_STAGES):
         k_start = j * BLOCK_K
