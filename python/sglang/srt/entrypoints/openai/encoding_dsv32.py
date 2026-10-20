@@ -156,8 +156,15 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
 
 
 def render_message(
-    index: int, messages: List[Dict[str, Any]], thinking_mode: str
+    index: int,
+    messages: List[Dict[str, Any]],
+    thinking_mode: str,
+    last_user_idx: Optional[int] = None,
 ) -> str:
+    """``last_user_idx`` is ``find_last_user_index(messages)`` when the caller
+    already has it; recomputing it per message makes a whole-conversation
+    render quadratic in the number of trailing tool-result turns.
+    """
     if not (0 <= index < len(messages)):
         raise DS32EncodingError(
             f"Index {index} out of range for messages list of length {len(messages)}"
@@ -167,7 +174,8 @@ def render_message(
 
     prompt = ""
     msg = messages[index]
-    last_user_idx = find_last_user_index(messages)
+    if last_user_idx is None:
+        last_user_idx = find_last_user_index(messages)
 
     role = msg.get("role")
     content = msg.get("content")
@@ -327,9 +335,13 @@ def encode_messages(
     if thinking_mode == "thinking" and drop_thinking:
         full_messages = drop_thinking_messages(full_messages)
 
+    last_user_idx = find_last_user_index(full_messages)
     for idx in range(len(messages)):
         prompt += render_message(
-            idx + len(context), full_messages, thinking_mode=thinking_mode
+            idx + len(context),
+            full_messages,
+            thinking_mode=thinking_mode,
+            last_user_idx=last_user_idx,
         )
 
     return prompt
