@@ -130,29 +130,6 @@ def _decode_offload_enabled() -> bool:
         return False
 
 
-_DSV4_FULL_PACK = (
-    PoolName.DEEPSEEK_V4_C1,
-    PoolName.DEEPSEEK_V4_C1_INDEXER,
-    PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
-    PoolName.DEEPSEEK_V4_C2,
-    PoolName.DEEPSEEK_V4_C2_INDEXER,
-    PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
-    PoolName.DEEPSEEK_V4_C4,
-    PoolName.DEEPSEEK_V4_C4_ROPE,
-    PoolName.DEEPSEEK_V4_C4_INDEXER,
-    PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
-    PoolName.DEEPSEEK_V4_C128,
-    PoolName.DEEPSEEK_V4_C128_ROPE,
-)
-_DSV4_SWA_PACK = (
-    PoolName.SWA,
-    PoolName.DEEPSEEK_V4_C4_STATE,
-    PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-    PoolName.DEEPSEEK_V4_C128_STATE,
-    PoolName.DRAFT_SWA,
-)
-
-
 class _Pack:
     def __init__(self, name, members: List[_Pool], kind, mask: int, salt):
         self.name = name
@@ -318,6 +295,7 @@ class RadixShmemStorage(HiCacheStorage):
         self.pools: Dict[Any, _Pool] = {}
         self.packs: Dict[Any, _Pack] = {}
         self.pack_of: Dict[Any, _Pack] = {}
+        self.sidecars: Dict[Any, Any] = {}
         self.client = None
         self.index = None
         self.slot_bytes = 0
@@ -390,6 +368,9 @@ class RadixShmemStorage(HiCacheStorage):
 
     def register_mem_host_pool_v2(self, host_pool: Any, host_pool_name) -> None:
         self._register(host_pool_name, host_pool)
+
+    def describe_sidecar(self, spec) -> None:
+        self.sidecars[spec.pool_name] = spec
 
     def _register(self, name, host_pool: Any) -> None:
         self.host_pools[name] = host_pool
@@ -623,14 +604,20 @@ class RadixShmemStorage(HiCacheStorage):
         if anchor.page_bytes or self.tp_parts > 1 and not self.config.is_mla_model:
             return {}
         packs: Dict[Any, _Pack] = {}
-        full = [pools[n] for n in _DSV4_FULL_PACK if n in pools]
-        full += [
-            p for n, p in pools.items() if n in (PoolName.DRAFT, PoolName.DRAFT_INDEXER)
-        ]
-        swa = [pools[n] for n in _DSV4_SWA_PACK if n in pools]
-        use_swa = bool(
-            full and swa and swa[0].name == PoolName.SWA and self.swa_window_pages > 0
-        )
+        full, swa_side = [], []
+        for name, spec in self.sidecars.items():
+            if name not in pools:
+                continue
+            source = spec.indices_from_pool
+            if source == PoolName.KV and spec.hit_policy == PoolHitPolicy.ALL_PAGES:
+                full.append(pools[name])
+            elif (
+                source == PoolName.SWA
+                and spec.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            ):
+                swa_side.append(pools[name])
+        swa = [pools[PoolName.SWA], *swa_side] if PoolName.SWA in pools else []
+        use_swa = bool(full and swa and self.swa_window_pages > 0)
         salt = _pack_salt(anchor.salt, [full, swa if use_swa else []])
         if full:
             packs["full"] = _Pack("full", full, self.full, self.full_mask, salt)
