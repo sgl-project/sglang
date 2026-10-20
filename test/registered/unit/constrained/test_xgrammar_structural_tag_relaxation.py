@@ -220,6 +220,19 @@ class TestStructuralTagPatternDropping(CustomTestCase):
         self.assertIsInstance(result, InvalidGrammarObject)
         self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 1)
 
+    def test_schema_with_too_many_patterns_keeps_its_error(self):
+        """Checking is quadratic, so a schema with too many patterns keeps its 400."""
+        backend = _make_backend(relax=True)
+        backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)
+        cap = xgrammar_backend._MAX_PATTERNS_PER_SCHEMA
+        properties = {f"p{i}": _string("^[a-z]+$") for i in range(cap)}
+        properties["bad"] = _string(BACKREFERENCE)
+
+        result = backend.dispatch_structural_tag(_model_tag([_tool("ls", properties)]))
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 1)
+
     def test_nothing_to_drop_returns_original_error_without_recompiling(self):
         backend = _make_backend(relax=True)
         backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)

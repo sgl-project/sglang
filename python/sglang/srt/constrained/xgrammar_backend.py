@@ -207,6 +207,8 @@ class XGrammarGrammar(BaseGrammarObject):
 
 
 _SCHEMA_FORMAT_TYPES = frozenset({"json_schema", "qwen_xml_parameter"})
+# Arbitrary; checking is quadratic in a schema's patterns, which a user tag controls.
+_MAX_PATTERNS_PER_SCHEMA = 64
 
 
 def _iter_schema_formats(node: Any, label: str = "") -> Iterator[Tuple[str, Dict]]:
@@ -256,6 +258,8 @@ def _drop_uncompilable_patterns(structural_tag: Dict) -> List[str]:
             for subschema, pointer in list(iter_subschemas(schema))
             if isinstance(subschema.get("pattern"), str)
         ]
+        if len(patterned) > _MAX_PATTERNS_PER_SCHEMA:
+            return []  # Too many to check one by one; keep the original error.
         if not _schema_compiles(fmt=fmt, schema=schema):
             return []  # Not a pattern problem; keep the original error.
         for subschema, pointer, pattern in patterned:
