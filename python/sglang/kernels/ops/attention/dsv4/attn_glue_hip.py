@@ -237,8 +237,11 @@ def _sparse_buffers_kernel(
     rows,
     topk,
     width,
+    HAS_C4: tl.constexpr,
     HAS_C1: tl.constexpr,
     HAS_C2: tl.constexpr,
+    C1_AT: tl.constexpr,
+    C2_AT: tl.constexpr,
     BLOCK: tl.constexpr,
     FILL_BLOCK: tl.constexpr,
 ):
@@ -248,10 +251,11 @@ def _sparse_buffers_kernel(
         for r0 in range(0, rows, BLOCK):
             r = r0 + tl.arange(0, BLOCK)
             m = r < rows
-            c4_clamp1 = tl.load(c4_clamp1_ptr + r, mask=m, other=0)
-            c4_raw = tl.load(c4_raw_ptr + r, mask=m, other=0)
-            tl.store(c4_sparse_ptr + r, tl.minimum(c4_clamp1, topk), mask=m)
-            tl.store(c4_sparse_raw_ptr + r, tl.minimum(c4_raw, topk), mask=m)
+            if HAS_C4:
+                c4_clamp1 = tl.load(c4_clamp1_ptr + r, mask=m, other=0)
+                c4_raw = tl.load(c4_raw_ptr + r, mask=m, other=0)
+                tl.store(c4_sparse_ptr + r, tl.minimum(c4_clamp1, topk), mask=m)
+                tl.store(c4_sparse_raw_ptr + r, tl.minimum(c4_raw, topk), mask=m)
             if HAS_C1:
                 c1_clamp1 = tl.load(c1_clamp1_ptr + r, mask=m, other=0)
                 tl.store(c1_sparse_ptr + r, tl.minimum(c1_clamp1, topk), mask=m)
@@ -259,29 +263,29 @@ def _sparse_buffers_kernel(
                 c2_clamp1 = tl.load(c2_clamp1_ptr + r, mask=m, other=0)
                 tl.store(c2_sparse_ptr + r, tl.minimum(c2_clamp1, topk), mask=m)
     else:
-        # the rest fill the -1 page-index buffers, one buffer per range of programs
+        # the rest fill the -1 page-index buffers, one buffer per range of programs:
+        # c4's first, then c1's at C1_AT and c2's at C2_AT
         fill = pid - 1
         n = rows * width
         per_buffer = tl.cdiv(n, FILL_BLOCK)
         which = fill // per_buffer
         i = (fill - which * per_buffer) * FILL_BLOCK + tl.arange(0, FILL_BLOCK)
         m = i < n
-        if which == 0:
-            tl.store(c4_page_ptr + i, -1, mask=m)
-        elif which == 1:
-            if HAS_C1:
+        if HAS_C4:
+            if which == 0:
+                tl.store(c4_page_ptr + i, -1, mask=m)
+        if HAS_C1:
+            if which == C1_AT:
                 tl.store(c1_page_ptr + i, -1, mask=m)
-            elif HAS_C2:
-                tl.store(c2_page_ptr + i, -1, mask=m)
-        else:
-            if HAS_C1 and HAS_C2:
+        if HAS_C2:
+            if which == C2_AT:
                 tl.store(c2_page_ptr + i, -1, mask=m)
 
 
 def sparse_buffers(
     *,
-    c4_topk_lengths_clamp1: torch.Tensor,
-    c4_topk_lengths_raw: torch.Tensor,
+    c4_topk_lengths_clamp1: Optional[torch.Tensor],
+    c4_topk_lengths_raw: Optional[torch.Tensor],
     c1_topk_lengths_clamp1: Optional[torch.Tensor],
     c2_topk_lengths_clamp1: Optional[torch.Tensor],
     index_topk: int,
@@ -289,7 +293,8 @@ def sparse_buffers(
 ) -> Dict[str, torch.Tensor]:
     """init_flashmla_related's tensors in one launch, keyed by attribute name: the top-k
     lengths clamped to index_topk and the -1-filled int32 page-index buffers padded to
-    page_index_align, for ratio 4 and the ratios whose clamp-1 lengths are given."""
+    page_index_align, for the ratios whose clamp-1 lengths are given (ratio 4 with its raw
+    lengths too)."""
     for t in (
         c4_topk_lengths_clamp1,
         c4_topk_lengths_raw,
@@ -299,34 +304,48 @@ def sparse_buffers(
         assert t is None or (
             t.dtype is torch.int32 and t.dim() == 1 and t.is_contiguous()
         ), t
-    rows = c4_topk_lengths_clamp1.shape[0]
-    assert c4_topk_lengths_raw.shape[0] == rows
-    device = c4_topk_lengths_clamp1.device
-    width = triton.cdiv(index_topk, page_index_align) * page_index_align
-    i32 = dict(dtype=torch.int32, device=device)
-    out = {
-        "c4_sparse_topk_lengths": torch.empty(rows, **i32),
-        "c4_sparse_topk_lengths_raw": torch.empty(rows, **i32),
-        "c4_sparse_page_indices": torch.empty((rows, width), **i32),
-    }
+    has_c4 = c4_topk_lengths_clamp1 is not None
     has_c1 = c1_topk_lengths_clamp1 is not None
     has_c2 = c2_topk_lengths_clamp1 is not None
+    assert has_c4 == (c4_topk_lengths_raw is not None)
+    lengths = [
+        t
+        for t in (
+            c4_topk_lengths_clamp1,
+            c1_topk_lengths_clamp1,
+            c2_topk_lengths_clamp1,
+        )
+        if t is not None
+    ]
+    if not lengths:
+        return {}
+    rows = lengths[0].shape[0]
+    assert all(t.shape[0] == rows for t in lengths)
+    assert not has_c4 or c4_topk_lengths_raw.shape[0] == rows
+    device = lengths[0].device
+    width = triton.cdiv(index_topk, page_index_align) * page_index_align
+    i32 = dict(dtype=torch.int32, device=device)
+    out = {}
+    if has_c4:
+        out["c4_sparse_topk_lengths"] = torch.empty(rows, **i32)
+        out["c4_sparse_topk_lengths_raw"] = torch.empty(rows, **i32)
+        out["c4_sparse_page_indices"] = torch.empty((rows, width), **i32)
     for ratio, has in ((1, has_c1), (2, has_c2)):
         if has:
             out[f"c{ratio}_sparse_topk_lengths"] = torch.empty(rows, **i32)
             out[f"c{ratio}_sparse_page_indices"] = torch.empty((rows, width), **i32)
     if rows == 0:
         return out
-    placeholder = out["c4_sparse_topk_lengths"]
+    placeholder = lengths[0]
     fill_block = 1024
     per_buffer = triton.cdiv(rows * width, fill_block)
-    n_buffers = 1 + int(has_c1) + int(has_c2)
+    n_buffers = int(has_c4) + int(has_c1) + int(has_c2)
     _sparse_buffers_kernel[(1 + per_buffer * n_buffers,)](
-        c4_topk_lengths_clamp1,
-        c4_topk_lengths_raw,
-        out["c4_sparse_topk_lengths"],
-        out["c4_sparse_topk_lengths_raw"],
-        out["c4_sparse_page_indices"],
+        c4_topk_lengths_clamp1 if has_c4 else placeholder,
+        c4_topk_lengths_raw if has_c4 else placeholder,
+        out.get("c4_sparse_topk_lengths", placeholder),
+        out.get("c4_sparse_topk_lengths_raw", placeholder),
+        out.get("c4_sparse_page_indices", placeholder),
         c1_topk_lengths_clamp1 if has_c1 else placeholder,
         out.get("c1_sparse_topk_lengths", placeholder),
         out.get("c1_sparse_page_indices", placeholder),
@@ -336,8 +355,11 @@ def sparse_buffers(
         rows,
         index_topk,
         width,
+        HAS_C4=has_c4,
         HAS_C1=has_c1,
         HAS_C2=has_c2,
+        C1_AT=int(has_c4),
+        C2_AT=int(has_c4) + int(has_c1),
         BLOCK=1024,
         FILL_BLOCK=fill_block,
         num_warps=4,

@@ -400,6 +400,8 @@ class DSV4AttnMetadata:
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
+    # the pool's compress ratios; the c4 / c128 fields stay None without them (V4.1)
+    present_ratios: Tuple[int, ...] = (4, 128)
     # V4.1 ratios 1 / 2: latents live at raw_out_loc // ratio of the c1 / c2 pool; None when absent
     low_ratios: Tuple[int, ...] = ()
     c1_out_loc: Optional[torch.Tensor] = None
@@ -448,6 +450,14 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
+    @property
+    def has_c4(self) -> bool:
+        return 4 in self.present_ratios
+
+    @property
+    def has_c128(self) -> bool:
+        return 128 in self.present_ratios
+
     def sparse_page_indices(self, compress_ratio: Literal[1, 2, 4]) -> torch.Tensor:
         """Top-k slots into the ratio's extra cache, -1 padded; the indexer fills them."""
         if compress_ratio == 1:
@@ -494,6 +504,7 @@ class DSV4AttnMetadata:
                 "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
+                "present_ratios",
                 "low_ratios",
             ],
             copy_fields=[
@@ -588,33 +599,35 @@ class DSV4AttnMetadata:
             f"{self.raw_out_loc.shape=}, {num_tokens=}"
         )
 
-        (
-            self.c4_out_loc,
-            _,
-            self.c4_topk_lengths_raw,
-            self.c4_topk_lengths_clamp1,
-            self.c128_out_loc,
-            _,
-            self.c128_topk_lengths_raw,
-            self.c128_topk_lengths_clamp1,
-            self.c128_page_indices,
-        ) = _init_compression_metadata_triton(
-            self.seq_lens_casual,
-            self.positions_casual,
-            self.raw_out_loc,
-            self.page_table,
-            self.page_size,
-            compute_page_indices=True,
-        )
-
-        self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
+        has_c4_c128 = self.has_c4 or self.has_c128
+        if has_c4_c128:
+            (
+                self.c4_out_loc,
+                _,
+                self.c4_topk_lengths_raw,
+                self.c4_topk_lengths_clamp1,
+                self.c128_out_loc,
+                _,
+                self.c128_topk_lengths_raw,
+                self.c128_topk_lengths_clamp1,
+                self.c128_page_indices,
+            ) = _init_compression_metadata_triton(
+                self.seq_lens_casual,
+                self.positions_casual,
+                self.raw_out_loc,
+                self.page_table,
+                self.page_size,
+                compute_page_indices=True,
+            )
+            self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if unified_swa_pages:
             if self.unified is None:
                 self.unified = UnifiedKvMetadata()
-            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
-            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
+            if has_c4_c128:
+                self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
+                self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
 
         # ratio 1/2 counterparts of the c4/c128 metadata, one launch for both
         for name, value in low_ratio_compression_metadata(
@@ -636,12 +649,17 @@ class DSV4AttnMetadata:
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
         )
-        assert self.c4_topk_lengths_clamp1 is not None
-        assert self.c4_topk_lengths_raw is not None
+        if self.has_c4:
+            assert self.c4_topk_lengths_clamp1 is not None
+            assert self.c4_topk_lengths_raw is not None
+        else:
+            self.c4_sparse_topk_lengths = None
+            self.c4_sparse_topk_lengths_raw = None
+            self.c4_sparse_page_indices = None
         # the clamped lengths and the -1 filled top-k buffers of every ratio in one launch
         for name, value in sparse_buffers(
-            c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1,
-            c4_topk_lengths_raw=self.c4_topk_lengths_raw,
+            c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1 if self.has_c4 else None,
+            c4_topk_lengths_raw=self.c4_topk_lengths_raw if self.has_c4 else None,
             c1_topk_lengths_clamp1=(
                 self.c1_topk_lengths_clamp1 if 1 in self.low_ratios else None
             ),
@@ -652,11 +670,13 @@ class DSV4AttnMetadata:
             page_index_align=PAGE_INDEX_ALIGNED_SIZE,
         ).items():
             setattr(self, name, value)
-        if is_prefill:
+        if is_prefill and self.has_c4:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c0_flashmla_metadata = _create_flashmla_metadata()
-        self.c4_flashmla_metadata = _create_flashmla_metadata()
-        self.c128_flashmla_metadata = _create_flashmla_metadata()
+        self.c4_flashmla_metadata = _create_flashmla_metadata() if self.has_c4 else None
+        self.c128_flashmla_metadata = (
+            _create_flashmla_metadata() if self.has_c128 else None
+        )
         # -1 filled like the page indices: identity rows write only their reachable columns,
         # and the OPUS prefill reads the raw indices without the top-k lengths
         if 1 in self.low_ratios:
@@ -3611,6 +3631,7 @@ class DeepseekV4HipRadixBackend(
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
         )
