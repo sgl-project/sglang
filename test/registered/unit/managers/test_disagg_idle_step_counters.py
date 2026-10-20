@@ -510,6 +510,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
         )
         scheduler.process_input_requests = Mock()
+        scheduler.load_snapshot_writer = None
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=Mock(return_value=[])
         )
