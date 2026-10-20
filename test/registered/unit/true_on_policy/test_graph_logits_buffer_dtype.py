@@ -103,6 +103,56 @@ class TestGraphLogitsBufferDtype(unittest.TestCase):
                 self.assertEqual(eager.dtype, torch.float)
                 self.assertTrue(torch.equal(graph, eager))
 
+    def test_multi_layer_eagle_draft_extend_buffer_follows_logits_dtype(self):
+        # This runner owns its next_token_logits_buffer and holds per-step runners,
+        # not a model_runner of its own.
+        from sglang.srt.speculative import (
+            multi_layer_eagle_draft_extend_cuda_graph_runner as runner_module,
+        )
+
+        model_config = SimpleNamespace(
+            dtype=torch.bfloat16,
+            hf_text_config=SimpleNamespace(
+                vocab_size=VOCAB, final_logit_softcapping=None
+            ),
+        )
+        runner = object.__new__(
+            runner_module.MultiLayerEagleMultiStepDraftExtendCudaGraphRunner
+        )
+        runner.runners = [
+            None,
+            SimpleNamespace(model_runner=SimpleNamespace(model_config=model_config)),
+        ]
+        runner.max_bs = 2
+        runner.captured_req_width = 2
+        runner.seq_len_fill_value = 1
+        runner.device = "cpu"
+        runner.prune_draft_extend_logits = False
+        runner.rotates_in_graph = False
+        runner.require_gathered_buffer = False
+        runner._vocab_size = lambda: VOCAB
+        with (
+            patch(
+                _SERVER_ARGS_TARGET,
+                return_value=_server_args(contract=QWEN3_DENSE_TRUE_ON_POLICY_V1),
+            ),
+            patch(_GET_EXEC_TARGET, return_value=_exec()),
+            patch.object(
+                runner_module,
+                "get_draft_input_from_target_hidden_dim",
+                return_value=8,
+            ),
+            patch.object(
+                runner_module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer=False)
+                ),
+            ),
+        ):
+            buffers = runner._allocate_buffers()
+        self.assertEqual(buffers.next_token_logits_buffer.dtype, torch.bfloat16)
+
     def test_shared_buffer_is_keyed_by_dtype(self):
         shared = GraphSharedOutput(device=torch.device("cpu"), max_rows=ROWS)
         fp32 = shared.get_logits_buffer(VOCAB, rows=ROWS, dtype=torch.float)

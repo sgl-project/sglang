@@ -680,7 +680,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
                     vocab_size,
                 ),
                 dtype=get_next_token_logits_dtype(
-                    self.model_runner.model_config.hf_text_config
+                    model_runner.model_config.hf_text_config
                 ),
             )
 
