@@ -82,7 +82,7 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
         StageSpec(
             "flux3_postprocess",
             inputs=("output", "extra.flux3_crop"),
-            outputs=("result.output",),
+            outputs=("output", "result.output"),
         ),
     )
 

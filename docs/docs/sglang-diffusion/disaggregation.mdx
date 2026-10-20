@@ -168,6 +168,10 @@ scheduler, module, and CUDA-event objects local; tensors and JSON-safe metadata
 cross deployment boundaries. Required fields that cannot be serialized fail
 explicitly rather than being silently omitted.
 
+A stage returning `OutputBatch` also exposes its output through the request
+context for subsequent stages. Declare `output` as written when replacing it,
+in addition to the terminal `result.output` field.
+
 Stage factories must allow selecting stages before component loading, and
 custom loaders must honor the selected role's component set. The shared loader
 does this for componentized pipelines; FLUX.3 also honors it in its custom loader.
@@ -189,6 +193,8 @@ registration and completion contract.
 - Size `--disagg-transfer-pool-size` for simultaneous receives and sends. Result
   leases and coordinator admission are bounded by
   `--disagg-max-slots-per-instance`; receive pools are separate from model memory.
+  Cached stage tensors own their storage so reused model buffers cannot overwrite
+  earlier results. Budget for retained outputs as well as weights and transfer pools.
   Pending work is also bounded; overload returns an explicit error rather than
   accumulating an unbounded queue of raw media in host memory.
 - A result is retained through fan-out until consumers finish or its lease
