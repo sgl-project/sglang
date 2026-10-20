@@ -927,5 +927,44 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
 
 
+class TestDSV4WriteTailSourceKvBreak(CustomTestCase):
+    """The eager source-KV write at the start of the late-layer tail must write only
+    the live rows of the extend, and still mark the source layer when there are none."""
+
+    def _run(self, real_num_tokens):
+        from sglang.srt.models import deepseek_v4 as mod
+
+        backend = SimpleNamespace(
+            tail_source_kv_layer_id=None, write_tail_source_kv=mock.Mock()
+        )
+        forward_batch = SimpleNamespace(global_num_token_non_padded_cpu=real_num_tokens)
+        layer = SimpleNamespace(layer_id=21)
+        # A graph bucket of 8 rows.
+        x = torch.arange(32, dtype=torch.float32).view(8, 4)
+        positions = torch.arange(8)
+        with (
+            mock.patch.object(
+                mod,
+                "get_tc_piecewise_forward_context",
+                return_value=SimpleNamespace(forward_batch=forward_batch),
+            ),
+            mock.patch.object(mod, "get_attn_backend", return_value=backend),
+        ):
+            mod.deepseek_v4_write_tail_source_kv(layer, x, positions)
+        return backend, forward_batch, x, positions
+
+    def test_writes_live_rows_only(self):
+        backend, forward_batch, x, positions = self._run(real_num_tokens=5)
+        kwargs = backend.write_tail_source_kv.call_args.kwargs
+        self.assertTrue(torch.equal(kwargs["x"], x[:5]))
+        self.assertTrue(torch.equal(kwargs["positions"], positions[:5]))
+        self.assertIs(kwargs["forward_batch"], forward_batch)
+
+    def test_no_live_rows_marks_source_layer_without_writing(self):
+        backend, _, _, _ = self._run(real_num_tokens=0)
+        backend.write_tail_source_kv.assert_not_called()
+        self.assertEqual(backend.tail_source_kv_layer_id, 21)
+
+
 if __name__ == "__main__":
     unittest.main()

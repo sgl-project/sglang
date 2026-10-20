@@ -851,6 +851,8 @@ def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
     backend = get_attn_backend()
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens == 0:
+        # Nothing to write, but mark the source layer as write_tail_source_kv does,
+        # so its own pass inside the tail still skips the compressor.
         backend.tail_source_kv_layer_id = layer.layer_id
         return
     backend.write_tail_source_kv(
