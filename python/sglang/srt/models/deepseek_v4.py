@@ -3535,6 +3535,11 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         hidden_states = residual_batch.read_output(
             hidden_states, batch, hc_boundary.FinalRead(), None
         )
+        # DSpark aux hidden states: this ubatch's share of a captured layer's
+        # completed output; _forward_layers_tbo merges the two shares.
+        dspark_capture = getattr(batch, "dspark_capture", None)
+        if dspark_capture is not None and self.layer_id in dspark_capture[0]:
+            dspark_capture[1].append(hidden_states.mean(dim=1))
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -4127,6 +4132,7 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        dspark_aux_hidden_states: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         from sglang.srt.batch_overlap.operations import execute_overlapped_operations
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
@@ -4200,6 +4206,11 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(padded_ids, sizes=sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
+        if dspark_aux_hidden_states is not None:
+            capture_layers = set(self.dspark_layers_to_capture)
+            for child in forward_batch.tbo_children:
+                child.dspark_capture = (capture_layers, [])
+
         try:
             outputs_arr = execute_overlapped_operations(
                 inputs_arr=inputs_arr,
@@ -4207,10 +4218,29 @@ class DeepseekV4Model(nn.Module):
                 delta_stages=[0, operations_strategy.tbo_delta_stages],
             )
 
+            num_tokens = hidden_states.shape[0]
+            if dspark_aux_hidden_states is not None:
+                # Both ubatches run every layer, so their captures pair up in
+                # layer order; stitch each pair back into the parent's rows.
+                shares_a, shares_b = (
+                    child.dspark_capture[1] for child in forward_batch.tbo_children
+                )
+                for share_a, share_b in zip(shares_a, shares_b, strict=True):
+                    dspark_aux_hidden_states.append(
+                        _model_forward_tbo_merge_key(
+                            {**outputs_arr[0], "dspark_aux": share_a},
+                            {**outputs_arr[1], "dspark_aux": share_b},
+                            "dspark_aux",
+                            num_tokens,
+                        )
+                    )
             return _model_forward_tbo_merge_key(
-                outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
+                outputs_arr[0], outputs_arr[1], "hidden_states", num_tokens
             )
         finally:
+            if dspark_aux_hidden_states is not None:
+                for child in forward_batch.tbo_children:
+                    child.dspark_capture = None
             if _is_cuda:
                 for child in forward_batch.tbo_children:
                     residual_batch.clear(child)
@@ -4295,7 +4325,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        run_tbo = self._can_run_tbo(forward_batch)
 
         if _is_npu and not run_tbo:
             # Rope cos/sin for the whole forward: one bf16 gather per rope
@@ -4330,6 +4360,9 @@ class DeepseekV4Model(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                dspark_aux_hidden_states=(
+                    dspark_aux_hidden_states if capture_dspark else None
+                ),
             )
         else:
             if _is_cuda:
