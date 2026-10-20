@@ -552,7 +552,7 @@ void multimodal_rotary_embedding_cpu(
     bool is_neox);
 
 // CPU and memory binding
-std::string init_cpu_threads_env(const std::string& cpu_ids);
+std::string init_cpu_threads_env(const std::string& cpu_ids, int64_t node_mem_bind);
 
 // murmur_hash32
 at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices);
@@ -993,7 +993,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding
-  m.def("init_cpu_threads_env(str cpu_ids) -> str");
+  m.def("init_cpu_threads_env(str cpu_ids, int node_mem_bind=-1) -> str");
 
   // murmur_hash32
   m.def("murmur_hash32_cpu(Tensor seed, Tensor positions, Tensor col_indices) -> Tensor");

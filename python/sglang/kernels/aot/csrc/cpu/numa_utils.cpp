@@ -8,7 +8,7 @@
 
 #include "common.h"
 
-std::string init_cpu_threads_env(const std::string& cpu_ids) {
+std::string init_cpu_threads_env(const std::string& cpu_ids, int64_t node_mem_bind) {
   bitmask* omp_cpu_mask = numa_parse_cpustring(cpu_ids.c_str());
   TORCH_CHECK(omp_cpu_mask->size > 0);
   std::vector<int> omp_cpu_ids;
@@ -31,8 +31,8 @@ std::string init_cpu_threads_env(const std::string& cpu_ids) {
   // Memory node binding
   if (numa_available() != -1) {
     TORCH_CHECK(!omp_cpu_ids.empty(), "Cannot bind memory, no CPUs specified.");
-    int mem_node_id_st = numa_node_of_cpu(omp_cpu_ids.front());
-    int mem_node_id_ed = numa_node_of_cpu(omp_cpu_ids.back());
+    int mem_node_id_st = node_mem_bind >= 0 ? node_mem_bind : numa_node_of_cpu(omp_cpu_ids.front());
+    int mem_node_id_ed = node_mem_bind >= 0 ? node_mem_bind : numa_node_of_cpu(omp_cpu_ids.back());
     if (mem_node_id_st > mem_node_id_ed) {
       std::swap(mem_node_id_st, mem_node_id_ed);
     }
