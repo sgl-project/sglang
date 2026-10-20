@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,16 @@ class CpDecodeAttnTpContext:
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
-            cache = (raw, self._slice(raw, dim), is_param)
+            prepare = None
+            if attr_name == "weight" and is_npu():
+                scheme = getattr(obj, "scheme", None)
+                prepare = getattr(scheme, "prepare_cp_decode_weight", None)
+            local = (
+                prepare(raw, dim, self.decode_tp_rank, self.decode_tp_size)
+                if prepare is not None
+                else self._slice(raw, dim)
+            )
+            cache = (raw, local, is_param)
             self._slice_cache[cache_key] = cache
 
         if cache[2]:
@@ -135,6 +145,16 @@ class CpDecodeAttnTpContext:
             dim = 0
         else:
             return []
+
+        if is_npu():
+            scheme = getattr(linear_instance, "scheme", None)
+            slice_attrs = getattr(scheme, "get_cp_decode_slice_attrs", None)
+            if slice_attrs is not None:
+                return slice_attrs(linear_instance, row_parallel=dim == 1)
+            if scheme is not None:
+                raise ValueError(
+                    f"CP decode attention TP does not support scheme {type(scheme).__name__}"
+                )
 
         attrs = [(linear_instance, "weight", dim)]
         for scale_name in ("weight_scale_inv", "weight_scale"):
