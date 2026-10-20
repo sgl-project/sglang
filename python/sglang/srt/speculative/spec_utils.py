@@ -441,6 +441,7 @@ def sample_simulated_acc_len(
     simulate_acc_len: float,
     simulate_acc_method: str,
     max_len: int,
+    generator: Optional[torch.Generator] = None,
 ) -> int:
     """Sample a simulated acceptance length in [1, max_len]."""
     if simulate_acc_method == "multinomial":
@@ -448,6 +449,7 @@ def sample_simulated_acc_len(
             mean=simulate_acc_len,
             std=1.0,
             size=(1,),
+            generator=generator,
             device="cpu",
         )
         # clamp simulated values to be between 1 and max_len
@@ -468,7 +470,7 @@ def sample_simulated_acc_len(
             weight_upper = simulate_acc_len - lower
             weight_lower = 1.0 - weight_upper
             probs = torch.tensor([weight_lower, weight_upper], device="cpu")
-            sampled_index = torch.multinomial(probs, num_samples=1)
+            sampled_index = torch.multinomial(probs, num_samples=1, generator=generator)
             simulate_acc_len = lower if sampled_index == 0 else upper
     else:
         raise ValueError(f"Invalid simulate_acc_method: {simulate_acc_method}")
@@ -486,12 +488,13 @@ def generate_simulated_accept_index(
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+    generator: Optional[torch.Generator] = None,
 ):
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
     simulate_acc_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, spec_steps + 1
+        simulate_acc_len, simulate_acc_method, spec_steps + 1, generator=generator
     )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
@@ -516,6 +519,47 @@ def generate_simulated_accept_index(
     bonus_node_indices = sim_accept_index[:, simulate_acc_len - 1].long()
     predict[bonus_node_indices] = target_predict[:, simulate_acc_len - 1].to(
         dtype=predict.dtype
+    )
+    return sim_accept_index
+
+
+def generate_simulated_accept_index_device(
+    accept_index: torch.Tensor,
+    predict: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    bs: int,
+    spec_steps: int,
+    simulate_acc_len: torch.Tensor,
+    simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
+) -> torch.Tensor:
+    """generate_simulated_accept_index with the drawn length already on the device
+    (int64 [1]); static shapes, so a CUDA graph can replay it. Writes the same values
+    as the host-length version for the same length."""
+    width = spec_steps + 1
+    steps = torch.arange(width, device=accept_index.device, dtype=accept_index.dtype)
+    accepted = steps.view(1, width) < simulate_acc_len
+    sim_accept_index = torch.where(
+        accepted,
+        accept_index[:, :1] + steps.view(1, width),
+        torch.full_like(steps, -1).view(1, width),
+    )
+    num_correct_drafts.copy_((simulate_acc_len - 1).expand(bs))
+    if simulate_acc_token_mode != "real-draft-token":
+        predict.fill_(100)  # some legit token id
+        return sim_accept_index
+    # Chain drafts (topk=1): node b*width + j sits at row b, column j of predict.
+    rows = predict.view(bs, width)
+    drafted = torch.cat([candidates[:, 1:], candidates[:, -1:]], dim=1).to(rows.dtype)
+    rows.copy_(
+        torch.where(
+            steps < simulate_acc_len - 1,
+            drafted,
+            torch.where(
+                steps == simulate_acc_len - 1, target_predict.to(rows.dtype), rows
+            ),
+        )
     )
     return sim_accept_index
 

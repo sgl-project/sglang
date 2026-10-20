@@ -1456,6 +1456,9 @@ class Envs:
     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
+    # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
+    # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
+    SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
