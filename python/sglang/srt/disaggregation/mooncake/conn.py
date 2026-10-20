@@ -278,6 +278,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
+        # Checked in every role, so a bad value fails startup rather than a
+        # later decode -> prefill role switch.
+        self.enable_failed_session_probe = envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
+        if self.enable_failed_session_probe:
+            self.failed_session_probe_interval = (
+                envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
+            )
+            self.failed_session_probe_max_interval = (
+                envs.SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S.get()
+            )
+            self.failed_session_idle_timeout = (
+                envs.SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S.get()
+            )
+            if not (
+                0
+                < self.failed_session_probe_interval
+                <= self.failed_session_probe_max_interval
+            ):
+                raise ValueError(
+                    "Need 0 < SGLANG_FAILED_SESSION_PROBE_INTERVAL_S <= "
+                    "SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S"
+                )
+            if self.failed_session_idle_timeout <= 0:
+                raise ValueError(
+                    "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
+                )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -340,32 +366,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 t.start()
                 self._worker_threads.append(t)
-            self.enable_failed_session_probe = (
-                envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
-            )
             if self.enable_failed_session_probe:
-                self.failed_session_probe_interval = (
-                    envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
-                )
-                self.failed_session_probe_max_interval = (
-                    envs.SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S.get()
-                )
-                self.failed_session_idle_timeout = (
-                    envs.SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S.get()
-                )
-                if not (
-                    0
-                    < self.failed_session_probe_interval
-                    <= self.failed_session_probe_max_interval
-                ):
-                    raise ValueError(
-                        "Need 0 < SGLANG_FAILED_SESSION_PROBE_INTERVAL_S <= "
-                        "SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S"
-                    )
-                if self.failed_session_idle_timeout <= 0:
-                    raise ValueError(
-                        "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
-                    )
                 self._failed_session_probe_shutdown = threading.Event()
                 t = threading.Thread(
                     target=self._failed_session_probe_loop,
