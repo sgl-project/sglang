@@ -206,6 +206,68 @@ def _shared_v4_rank(rank, rendezvous, output, scenario):
                 assert all(value._closed for value in allocators)
                 assert all(not value._mappings for value in allocators)
 
+                if scenario == "metadata":
+                    # Device checks must join the shared error agreement too:
+                    # one rank must not raise before its peer enters it.
+                    for check in ("missing_state", "xpu_gate"):
+
+                        def validate_ops(**kwargs):
+                            if rank == 1:
+                                raise ValueError("injected missing XPU transfer op")
+
+                        state = SimpleNamespace(
+                            ring_size=2,
+                            kv_score_buffer=SimpleNamespace(
+                                kv_score=torch.empty((16, 3), dtype=torch.float32)
+                            ),
+                        )
+                        with (
+                            mock.patch.object(
+                                host_pools, "_is_xpu", check == "xpu_gate"
+                            ),
+                            mock.patch.object(
+                                host_pools.DeepSeekV4StateHostPool,
+                                "_kvcacheio_ops",
+                                {},
+                                create=True,
+                            ),
+                            mock.patch.object(
+                                host_pools,
+                                "require_kvcacheio_ops",
+                                side_effect=validate_ops,
+                            ) as gate,
+                        ):
+                            _expect_failure(
+                                lambda: host_pools.DeepSeekV4StateHostPool(
+                                    check,
+                                    [
+                                        None
+                                        if check == "missing_state" and rank
+                                        else state
+                                    ],
+                                    num_host_pages=8,
+                                    swa_page_size=2,
+                                    layout="page_first_direct",
+                                    pin_memory=False,
+                                    shared_memory_group=dist.group.WORLD,
+                                ),
+                                "rank 1: "
+                                + (
+                                    "missing_state state_pools must not contain None"
+                                    if check == "missing_state"
+                                    else "injected missing XPU transfer op"
+                                ),
+                            )
+                            if check == "xpu_gate":
+                                gate.assert_called_once_with(
+                                    pool="DeepSeekV4StateHostPool",
+                                    layout="page_first_direct",
+                                    ops={},
+                                )
+                    assert len(allocators) == 4
+                    assert all(value._closed for value in allocators)
+                    assert all(not value._mappings for value in allocators)
+
         Path(output, f"{rank}.json").write_text(
             json.dumps({"rank": rank, "scenario": scenario, "passed": True})
         )
