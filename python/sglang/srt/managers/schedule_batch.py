@@ -18,6 +18,7 @@ from sglang.srt.utils.common import (
     async_h2d,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
+    get_device_module,
     is_hip,
     is_pin_memory_available,
 )
@@ -776,7 +777,7 @@ class MultimodalInputs:
                     and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
                 ):
                     if reconstruct_device is None:
-                        reconstruct_device = torch.cuda.current_device()
+                        reconstruct_device = get_device_module().current_device()
                     mm_item.reconstruct(reconstruct_device)
         except BaseException:
             for mm_item in mm_items:

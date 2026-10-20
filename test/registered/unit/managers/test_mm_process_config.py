@@ -355,6 +355,29 @@ class TestMultimodalFeatureTransportRuntime(CustomTestCase):
         self.assertFalse(processor.use_ipc_pool_handle_cache)
         memory_pool.assert_called_once()
 
+    def test_npu_ipc_selects_the_shared_pool(self):
+        from sglang.srt.multimodal.processors import base_processor
+
+        with (
+            envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.override(True),
+            patch.object(
+                base_processor.BaseMultimodalProcessor, "__abstractmethods__", set()
+            ),
+            patch.object(base_processor, "MmItemMemoryPool") as memory_pool,
+        ):
+            processor = base_processor.BaseMultimodalProcessor(
+                hf_config=MagicMock(),
+                server_args=self._server_args("npu_ipc"),
+                _processor=self._processor(),
+                transport_mode=None,
+            )
+
+        self.assertEqual(processor.mm_feature_transport, "npu_ipc")
+        self.assertTrue(processor.use_cuda_ipc)
+        self.assertTrue(processor.keep_mm_features_on_device)
+        self.assertTrue(processor.use_ipc_pool_handle_cache)
+        memory_pool.assert_called_once()
+
     def test_cpu_transport_does_not_allocate_ipc_pool(self):
         from sglang.srt.multimodal.processors import base_processor
 
@@ -441,21 +464,47 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
         from sglang.srt.multimodal.transport import memory_pool
 
         consumer = memory_pool.StreamOrderedPoolConsumerMixin()
+        # NPU stamps 64-bit control words, so both the ack offset and the stride
+        # follow the platform's CONTROL_WORD_BYTES rather than a hardcoded 4.
+        ready_byte_offset = 64
+        ack_byte_offset = ready_byte_offset + memory_pool.CONTROL_WORD_BYTES
         consumer._init_stream_ordered_consumer(
-            ready_byte_offset=64,
-            ack_byte_offset=68,
+            ready_byte_offset=ready_byte_offset,
+            ack_byte_offset=ack_byte_offset,
             generation=3,
             total_consumer_count=4,
             transport_name="test",
         )
-        with patch.object(memory_pool, "stream_write_value32") as write:
+        expected_addresses = [
+            1000 + ack_byte_offset + rank * memory_pool.CONTROL_WORD_BYTES
+            for rank in range(4)
+        ]
+        with patch.object(memory_pool, "stream_write_value") as write:
             consumer._acknowledge_on_stream(1000, 0, consumer_count=4)
 
         self.assertEqual(
             [call.args[1] for call in write.call_args_list],
-            [1068, 1072, 1076, 1080],
+            expected_addresses,
         )
         self.assertEqual([call.args[2] for call in write.call_args_list], [3] * 4)
+
+    def test_npu_stream_value_ops_address_the_pool_word(self):
+        from sglang.srt.multimodal.transport import memory_pool
+
+        device_module = MagicMock()
+        device_module.current_stream.return_value.npu_stream = 7
+        with (
+            patch.object(memory_pool, "_is_npu", True),
+            patch.object(memory_pool, "_acl_module") as acl_module,
+            patch.object(memory_pool, "get_device_module", return_value=device_module),
+        ):
+            acl_module.return_value.rt.value_wait.return_value = 0
+            acl_module.return_value.rt.value_write.return_value = 0
+            memory_pool.stream_wait_value(0, 4096, 5, "NPU IPC")
+            memory_pool.stream_write_value(0, 4096, 5, "NPU IPC")
+
+        acl_module.return_value.rt.value_wait.assert_called_once_with(4096, 5, 0, 7)
+        acl_module.return_value.rt.value_write.assert_called_once_with(4096, 5, 0, 7)
 
     def test_reused_pool_slot_gets_new_generation(self):
         from sglang.srt.multimodal.transport.memory_pool import (

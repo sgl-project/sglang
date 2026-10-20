@@ -283,10 +283,11 @@ class BaseMultimodalProcessor(ABC):
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
-            if configured_mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
+            if configured_mm_feature_transport
+            in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_cuda_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
@@ -467,9 +468,10 @@ class BaseMultimodalProcessor(ABC):
             )
             total_pool_size = per_worker_pool_size * worker_num
             logger.info(
-                "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-                "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
+                "%s multimodal feature pools reserve %.0f MiB total on "
+                "device %d (%.0f MiB per tokenizer worker × %d; configured "
                 "budget %.0f MiB).",
+                "NPU IPC" if self.mm_feature_transport == "npu_ipc" else "CUDA IPC",
                 total_pool_size / (1024 * 1024),
                 self.server_args.base_gpu_id,
                 per_worker_pool_size / (1024 * 1024),
@@ -485,8 +487,8 @@ class BaseMultimodalProcessor(ABC):
 
     @property
     def keep_mm_features_on_device(self) -> bool:
-        """Whether feature transport expects processor outputs to stay on GPU."""
-        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+        """Whether feature transport expects processor outputs to stay on device."""
+        return self.mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc")
 
     def preprocess_fingerprint_payload(self) -> dict[str, Any]:
         """Return every stable setting that can change a media artifact.
@@ -1755,7 +1757,7 @@ class BaseMultimodalProcessor(ABC):
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
         """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        if tensor.device.type not in ("cuda", "npu"):
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(

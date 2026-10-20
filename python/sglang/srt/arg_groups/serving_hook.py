@@ -884,7 +884,11 @@ def handle_multimodal_feature_transport(server_args: Any):
             int(legacy_ipc_enabled),
         )
 
-    if cfg.encoder_only and requested_transport in ("cuda_ipc", "cuda_vmm"):
+    if cfg.encoder_only and requested_transport in (
+        "cuda_ipc",
+        "cuda_vmm",
+        "npu_ipc",
+    ):
         logger.warning(
             "--mm-feature-transport=%s does not control encoder-only "
             "output transfer; using cpu for this inactive transport. Select "
@@ -934,6 +938,30 @@ def handle_multimodal_feature_transport(server_args: Any):
             "CUDA IPC pool-handle caching is %s. It reuses mappings to the "
             "existing bounded pool without reserving another pool; set "
             "SGLANG_USE_IPC_POOL_HANDLE_CACHE=0 to disable it.",
+            ("enabled" if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get() else "disabled"),
+        )
+
+    if requested_transport == "npu_ipc":
+        if not get_platform().is_npu:
+            raise ValueError("--mm-feature-transport=npu_ipc requires an NPU device.")
+        if cfg.nnodes != 1:
+            raise ValueError(
+                "--mm-feature-transport=npu_ipc only supports a single node."
+            )
+
+        pool_budget_mb = envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+        logger.info(
+            "Using NPU IPC for multimodal features: reserving up to %d MiB "
+            "on base NPU %d across %d tokenizer worker(s). This reduces KV "
+            "cache headroom; a full pool falls back to CPU transport.",
+            pool_budget_mb,
+            cfg.base_gpu_id,
+            cfg.tokenizer_worker_num,
+        )
+        logger.info(
+            "NPU IPC pool-handle caching is %s. It reuses consumer mappings to "
+            "the existing bounded pool; set SGLANG_USE_IPC_POOL_HANDLE_CACHE=0 "
+            "to reopen the pool handle on every reconstruction.",
             ("enabled" if envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get() else "disabled"),
         )
 
