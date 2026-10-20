@@ -12,9 +12,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention import (
-    dsv4_attn_metadata_kernels as attn_metadata_kernels,
-)
+from sglang.kernels.ops.attention.dsv4 import attn_metadata_kernels
 from sglang.kernels.ops.speculative import ragged_verify_kernels
 from sglang.kernels.ops.speculative.dspark import (
     dspark_accept,
@@ -28,11 +26,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.kernels import dspark as dspark_kernels
+from sglang.test.test_utils import CustomTestCase, get_device
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
-DEVICE = torch.device("cuda")
+DEVICE = get_device()
 VOCAB = 129280
 
 
@@ -145,21 +144,6 @@ def _case_build_ragged_verify_window(tc):
         )
 
 
-def _case_build_step_local(tc):
-    torch.manual_seed(5)
-    for org_width, per_partition, bias_dtype in (
-        (32320, 32384, torch.bfloat16),
-        (5000, 8192, torch.float32),
-    ):
-        bias = (torch.randn(3, org_width, device=DEVICE) * 3.0).to(bias_dtype)
-        base = torch.randn(3, per_partition, device=DEVICE)
-        got, _ = tc._parity(
-            dspark_draft_model.BuildStepLocal, bias=bias, base_local=base
-        )
-        # Padding columns beyond org_width must stay pure base.
-        tc.assertTrue(torch.equal(got[:, org_width:], base[:, org_width:]))
-
-
 def _case_cap_correct_len(tc):
     torch.manual_seed(6)
     bs, nd = 64, 6
@@ -209,12 +193,15 @@ def _case_commit_inject_layout(tc):
     )
     tc._parity(dspark_verify_window.BuildCommitInjectLayout, **kw)
     # commit_len edges: 0 masks the whole row to -1, stride keeps it all.
+    # The uncommitted row holds out-of-range entries that must not be loaded.
+    rp0, p0 = int(kw["req_pool_indices"][0]), int(kw["prefix_lens"][0])
+    kw["req_to_token"][rp0, p0 : p0 + stride] = 1 << 40
     kw.update(
         req_pool_indices=kw["req_pool_indices"][:2],
         prefix_lens=kw["prefix_lens"][:2],
         commit_lens=torch.tensor([0, stride], device=DEVICE, dtype=torch.int32),
     )
-    edge = dspark_verify_window.BuildCommitInjectLayout.triton(**kw)
+    edge, _ = tc._parity(dspark_verify_window.BuildCommitInjectLayout, **kw)
     swa_2d = edge.swa_loc.view(2, stride)
     tc.assertTrue(bool((swa_2d[0] == -1).all()))
     tc.assertTrue(bool((swa_2d[1] >= 0).all()))
@@ -262,13 +249,13 @@ def _case_compact_layout(tc):
     total = int(verify_lens.sum().item())
     for padded_total in (total, bs * t):  # exact and bucket padding
         tc._parity(
-            dspark_verify_window.CompactRowIndex,
+            dspark_kernels.CompactRowIndex,
             verify_lens=verify_lens,
             padded_total=padded_total,
             device=DEVICE,
         )
         tc._parity(
-            dspark_verify_window.CompactVerifyIds,
+            dspark_kernels.CompactVerifyIds,
             draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
             draft_tokens=_ri(0, VOCAB, (bs, gamma)),
             layout=_layout(verify_lens, padded_total),
@@ -279,12 +266,22 @@ def _case_compact_layout(tc):
 def _case_swa_page_indices(tc):
     torch.manual_seed(11)
     block_size, num_q, max_reqs, n_full = 5, 320, 300, 50000
+    seq_lens_casual = _ri(1, 300, (num_q,), torch.int32)
+    req_pool_indices_repeated = _ri(0, max_reqs, (num_q,))
     _, gather = tc._parity(
         dspark_attn_metadata.ComputeDsparkWindowGather,
-        seq_lens_casual=_ri(1, 300, (num_q,), torch.int32),
-        req_pool_indices_repeated=_ri(0, max_reqs, (num_q,)),
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
         block_size=block_size,
         swa_window=128,
+    )
+    tc._parity(
+        dspark_attn_metadata.ComputeDsparkWindowGather,
+        seq_lens_casual=seq_lens_casual,
+        req_pool_indices_repeated=req_pool_indices_repeated,
+        block_size=block_size,
+        swa_window=128,
+        valid_from=_ri(0, 300, (max_reqs,)),
     )
     tc._parity(
         dspark_attn_metadata.BuildDsparkSwaPageIndices,
@@ -414,43 +411,6 @@ def _case_qo_indptr(tc):
     tc.assertEqual(got.qo_indptr[:2].tolist(), [0, 3])
 
 
-def _case_sample_step_tokens(tc):
-    torch.manual_seed(18)
-    cls = dspark_draft_model.SampleStepTokens
-    # Injected noise makes stochastic sampling exactly comparable.
-    for vocab, dtype in ((130000, torch.bfloat16), (5003, torch.float32)):
-        bs = 3
-        tc._parity(
-            cls,
-            step_logits=(torch.randn(bs, vocab, device=DEVICE) * 4.0).to(dtype),
-            temperatures=torch.rand(bs, device=DEVICE) + 0.5,
-            greedy_mask=(torch.arange(bs, device=DEVICE) % 2) == 0,
-            exp_noise=torch.empty(bs, vocab, device=DEVICE).exponential_(1),
-        )
-    # Greedy tie straddling a triton block boundary picks the smaller index.
-    logits = torch.zeros(1, 2050, device=DEVICE)
-    logits[0, 1000] = logits[0, 1100] = 5.0
-    tokens = cls.triton(
-        step_logits=logits,
-        temperatures=torch.tensor([1.0], device=DEVICE),
-        greedy_mask=torch.tensor([True], device=DEVICE),
-        exp_noise=torch.ones(1, 2050, device=DEVICE),
-    )
-    tc.assertEqual(tokens.item(), 1000)
-    # Non-contiguous strided cropped view must match its contiguous copy.
-    view = (torch.randn(2, 129536, device=DEVICE) * 4.0)[:, :VOCAB]
-    tc.assertFalse(view.is_contiguous())
-    kw = dict(
-        temperatures=torch.rand(2, device=DEVICE) + 0.5,
-        greedy_mask=torch.tensor([True, False], device=DEVICE),
-        exp_noise=torch.empty(2, VOCAB, device=DEVICE).exponential_(1),
-    )
-    tc._eq(
-        cls.triton(step_logits=view, **kw),
-        cls.triton(step_logits=view.contiguous(), **kw),
-    )
-
-
 def _case_scatter_compact_to_strided(tc):
     torch.manual_seed(19)
     t, bs, dim = 6, 8, 4096
@@ -514,7 +474,6 @@ _CASES = [
     ("build_block_seq_lens_causal", _case_build_block_seq_lens_causal),
     ("build_out_tokens", _case_build_out_tokens),
     ("build_ragged_verify_window", _case_build_ragged_verify_window),
-    ("build_step_local", _case_build_step_local),
     ("cap_correct_len", _case_cap_correct_len),
     ("causal_swa_page_indices", _case_causal_swa_page_indices),
     ("commit_inject_layout", _case_commit_inject_layout),
@@ -527,7 +486,6 @@ _CASES = [
     ("padded_to_bucket", _case_padded_to_bucket),
     ("page_table_positions", _case_page_table_positions),
     ("qo_indptr", _case_qo_indptr),
-    ("sample_step_tokens", _case_sample_step_tokens),
     ("scatter_compact_to_strided", _case_scatter_compact_to_strided),
     ("schedule_verify_lens_topk", _case_schedule_verify_lens_topk),
     ("softmax_temp", _case_softmax_temp),

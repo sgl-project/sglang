@@ -559,6 +559,11 @@ class InternS2MobiusAttentionDecoderLayer(
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        # Inherited forward_prepare_npu reads this. Mobius is never PP-split and its
+        # schedule is layer_types, not full_attention_interval.
+        self.refreshes_rope_cos_sin = layer_id == config.layer_types.index(
+            "full_attention"
+        )
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
@@ -579,8 +584,7 @@ class InternS2MobiusAttentionDecoderLayer(
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
@@ -589,8 +593,7 @@ class InternS2MobiusAttentionDecoderLayer(
             bias=False,
             quant_config=quant_config,
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
         self.attn = RadixAttention(

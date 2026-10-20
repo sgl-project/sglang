@@ -159,6 +159,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
                 model_type="qwen3_5_moe",
             ),
             decision_config=None,
+            joint_head_config=None,
         )
         pad, video = (
             tokenizer.encode(token, add_special_tokens=False)[0]
@@ -480,13 +481,17 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(route):
                 events = []
+                encoding_started = asyncio.Event()
                 encode = handler._encode_question
 
                 def recorded(**kwargs):
                     events.append("encode")
+                    encoding_started.set()
                     return encode(**kwargs)
 
                 async def other_request():
+                    # Conversion may now yield before question encoding starts.
+                    await encoding_started.wait()
                     for _ in range(3):
                         events.append("other")
                         await asyncio.sleep(0)
@@ -494,7 +499,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 handler._encode_question = recorded
                 other = asyncio.create_task(other_request())
                 response = await handler.handle_request(request, None)
-                await other
+                await asyncio.wait_for(other, timeout=5)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(events, ["encode", "other"] * 3)
 
