@@ -14,6 +14,8 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 
 if TYPE_CHECKING:
+    from flashinfer.kda import RecurrentKDAPrefillWrapper
+
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -149,12 +151,12 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
 
     def extend_in_graph(
         self,
+        *,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
         g: torch.Tensor,
         beta: torch.Tensor,
-        *,
         ssm_states: torch.Tensor,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
@@ -228,20 +230,20 @@ def _prefill_inputs(
     )
 
 
-# kda_chunked_bt16's BT: how far FlashInfer's last tile reads past the batch.
+# flashinfer.kda_prefill_cute._CHUNK_SIZE: how far its last tile reads past the batch.
 FLASHINFER_KDA_PREFILL_TILE_TOKENS = 16
 
 
+# Workaround: wrappers share FlashInfer's private planner scratch (one stream, serial);
+# drop once flashinfer-ai/flashinfer#5069 lands.
 class FlashInferKDAPrefillGraphScratch(msgspec.Struct):
     buffer: Optional[torch.Tensor] = None
 
-    # Workaround: shares FlashInfer's private planner scratch (calls run serially on
-    # one stream). Drop once flashinfer-ai/flashinfer#5069 lands.
-    def share(self, wrapper) -> None:
+    def share(self, wrapper: RecurrentKDAPrefillWrapper) -> None:
         if self.buffer is not None:
             _planner_workspace(wrapper).__dict__["_cute_dsl_workspace"] = self.buffer
 
-    def adopt(self, wrapper) -> None:
+    def adopt(self, wrapper: RecurrentKDAPrefillWrapper) -> None:
         workspace = _planner_workspace(wrapper)._cute_dsl_workspace
         if workspace is not None and (
             self.buffer is None or workspace.numel() > self.buffer.numel()
@@ -249,20 +251,28 @@ class FlashInferKDAPrefillGraphScratch(msgspec.Struct):
             self.buffer = workspace
 
 
-def _planner_workspace(wrapper):
+def _planner_workspace(wrapper: RecurrentKDAPrefillWrapper):
     return wrapper._impl.workspace
+
+
+class FlashInferKDAPrefillGraphConfig(msgspec.Struct, frozen=True):
+    checkpoint_every_n_tokens: int
+    scratch: FlashInferKDAPrefillGraphScratch
 
 
 class FlashInferKDAPrefillGraphState(msgspec.Struct, frozen=True):
     max_seqs: int
-    checkpoint_every_n_tokens: int
-    state_indices: torch.Tensor
-    checkpoint_cu_starts: Optional[torch.Tensor]
+    checkpoint_every_n_tokens: int  # 0: no prefix-cache checkpoints
+    state_indices: torch.Tensor  # [max_seqs] int32, padded rows at slot 0
+    checkpoint_cu_starts: Optional[torch.Tensor]  # [max_seqs + 1] int64
+    # [max_checkpoints] int32: the batch row snapshotting there, -1 skips.
     checkpoint_state_indices: Optional[torch.Tensor]
     host_checkpoint_cu_starts: Optional[np.ndarray]
     host_checkpoint_state_indices: Optional[np.ndarray]
     scratch: FlashInferKDAPrefillGraphScratch
-    wrappers: dict = msgspec.field(default_factory=dict)
+    wrappers: dict[int, RecurrentKDAPrefillWrapper] = msgspec.field(
+        default_factory=dict
+    )
 
     @classmethod
     def allocate(
@@ -270,10 +280,11 @@ class FlashInferKDAPrefillGraphState(msgspec.Struct, frozen=True):
         *,
         num_tokens: int,
         max_seqs: int,
-        checkpoint_every_n_tokens: int,
+        track: bool,
+        config: FlashInferKDAPrefillGraphConfig,
         device: torch.device,
-        scratch: Optional[FlashInferKDAPrefillGraphScratch] = None,
     ) -> FlashInferKDAPrefillGraphState:
+        checkpoint_every_n_tokens = config.checkpoint_every_n_tokens if track else 0
         cu_starts = indices = host_cu_starts = host_indices = None
         if checkpoint_every_n_tokens:
             max_checkpoints = num_tokens // checkpoint_every_n_tokens + 1
@@ -291,7 +302,7 @@ class FlashInferKDAPrefillGraphState(msgspec.Struct, frozen=True):
             checkpoint_state_indices=indices,
             host_checkpoint_cu_starts=host_cu_starts,
             host_checkpoint_state_indices=host_indices,
-            scratch=FlashInferKDAPrefillGraphScratch() if scratch is None else scratch,
+            scratch=config.scratch,
         )
 
     def fill(
@@ -327,6 +338,10 @@ class FlashInferKDAPrefillGraphState(msgspec.Struct, frozen=True):
         indices = self.host_checkpoint_state_indices
         indices.fill(-1)
         for row, completed_chunks in checkpoint_rows:
+            assert 0 < completed_chunks <= starts[row + 1] - starts[row], (
+                f"Invalid KDA checkpoint row: row={row}, "
+                f"completed_chunks={completed_chunks}, extend_len={extend_seq_lens[row]}"
+            )
             indices[starts[row] + completed_chunks - 1] = row
         self.checkpoint_cu_starts.copy_(
             torch.from_numpy(starts).pin_memory(), non_blocking=True
@@ -335,7 +350,9 @@ class FlashInferKDAPrefillGraphState(msgspec.Struct, frozen=True):
             torch.from_numpy(indices).pin_memory(), non_blocking=True
         )
 
-    def wrapper(self, *, layer_id: int, cu_seqlens: torch.Tensor):
+    def wrapper(
+        self, *, layer_id: int, cu_seqlens: torch.Tensor
+    ) -> RecurrentKDAPrefillWrapper:
         wrapper = self.wrappers.get(layer_id)
         if wrapper is None:
             from flashinfer.kda import RecurrentKDAPrefillWrapper
