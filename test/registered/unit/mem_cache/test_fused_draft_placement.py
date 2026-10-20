@@ -767,6 +767,27 @@ class TestFusedDraftDecision(CustomTestCase):
         decision = self._decide(algorithm="DSPARK", draft_backend="fa4")
         self.assertIsNotNone(decision.placement)
 
+    def test_fa4_draft_default_dtype_keeps_fp8_host_pool_separate(self):
+        """Muse's FP8 target must not reserve FP8 rows for a BF16 FA4 draft.
+
+        FA4 overrides the inherited KV dtype to the draft's compute dtype.
+        Missing this at target boot allocates an incompatible fused region,
+        and the draft then fails to bind even with its default settings.
+        """
+        for algorithm in ("DFLASH", "DSPARK"):
+            for draft_dtype in (None, "auto"):
+                with self.subTest(algorithm=algorithm, draft_dtype=draft_dtype):
+                    decision = self._decide(
+                        algorithm=algorithm,
+                        draft_backend="fa4",
+                        draft_kv_dtype=draft_dtype,
+                        host_kv_dtype=torch.float8_e4m3fn,
+                        kv_cache_dtype_flag="fp8_e4m3",
+                        target_backends=("trtllm_mha", "trtllm_mha"),
+                    )
+                    self.assertIsNone(decision.placement)
+                    self.assertIn("KV cache dtype", decision.declined)
+
     def test_a_trtllm_mha_draft_fuses(self):
         """trtllm_mha refills its graph page table to what each replay reads
         and widens its eager table by the draft block, so its draft fuses."""

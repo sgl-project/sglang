@@ -91,7 +91,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
 from sglang.srt.utils.common import get_device_capability, is_cuda
@@ -353,6 +353,10 @@ class MuseSpark1xAttention(nn.Module):
     def _fused_kv_store(
         self, forward_batch: ForwardBatch
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        # Unified pools interleave layers in each token row. Reuse the prefill
+        # path, whose attention-backend cache writer supports these strides.
+        if get_memory().enable_unified_memory:
+            return None
         backend = get_attn_backend()
         pool = get_token_to_kv_pool()
         if not (
