@@ -1824,11 +1824,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def load_batch(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> tuple[ForwardBatch, SharedReadEnds]:
-        """Build replay inputs and return their resolved shared-read end.
-
-        Padding, static-buffer refresh, and attention metadata preparation all
-        complete before the returned boundary can be published.
-        """
+        """Pad, fill static buffers, and prepare replay metadata and its read end."""
         num_tokens = len(forward_batch.input_ids)
         static_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
         if getattr(self, "enable_cp_bcg_capture", False) and is_cp_active(

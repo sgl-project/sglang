@@ -192,7 +192,7 @@ class AttentionBackend(ABC):
         num_qo_tokens: int,
         allow_prepare: bool = True,
     ) -> SharedReadEnds:
-        """Resolve one batch's prefill boundary, preparing snapshots if safe.
+        """Return this batch's prefill read end, running the snapshot hook if allowed.
 
         Speculative algorithms with a later draft reader are gated when the
         event is published, after their stager has run.
@@ -213,7 +213,14 @@ class AttentionBackend(ABC):
     def _prepare_prefill_shared_reads(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> SharedReadEnds:
-        """Backend hook for snapshotting scheduler-shared prefill inputs."""
+        """Snapshot late prefill reads and return where this batch's reads end.
+
+        Runs only for EXTEND, after metadata init, with the forward's query count.
+        Return PRE_REPLAY only when the forward reads no scheduler-shared buffer
+        after this point. An override keeps ``shared_read_ends(EXTEND)``
+        conservative, since captured breakable-graph metadata, full graphs, and
+        wrappers that do not forward this hook read that declaration instead.
+        """
         return self.shared_read_ends(forward_batch.forward_mode)
 
     # Chunked-prefix FullCG capture has a second model topology and stable
