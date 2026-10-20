@@ -4,6 +4,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import importlib
+import os
 import sys
 import types
 import unittest
@@ -451,6 +453,73 @@ class TestDeepseekV4QuarkMapping(CustomTestCase):
         method = config.get_quant_method(layer, "model.layers.0.self_attn.wqkv_a")
 
         self.assertIsInstance(method, Fp8LinearMethod)
+
+
+def _stub(*args, **kwargs):
+    return None
+
+
+def _fake_aiter_shuffle_modules():
+    """The aiter modules the scheme imports at load, so this stays a CPU test."""
+    shuffle = types.ModuleType("aiter.ops.shuffle")
+    for name in (
+        "moe_shuffle_scale",
+        "moe_shuffle_weight",
+        "shuffle_scale_a16w4",
+        "shuffle_weight",
+        "shuffle_weight_a16w4",
+    ):
+        setattr(shuffle, name, _stub)
+    fp4_utils = types.ModuleType("aiter.utility.fp4_utils")
+    fp4_utils.e8m0_shuffle = _stub
+    triton_quant = types.ModuleType("aiter.ops.triton.quant")
+    triton_quant.dynamic_mxfp4_quant = _stub
+    return {
+        "aiter.ops.shuffle": shuffle,
+        "aiter.utility.fp4_utils": fp4_utils,
+        "aiter.ops.triton.quant": triton_quant,
+    }
+
+
+class TestQuarkMxfp4MoEShuffleImports(CustomTestCase):
+    """process_weights_after_loading's shuffle helpers must be bound wherever it
+    calls them, whatever SGLANG_USE_AITER says: e8m0_shuffle() on gfx95 and
+    moe_shuffle_scale()/moe_shuffle_weight() on gfx1250."""
+
+    def _reload_without_env(self, *, is_gfx95, is_gfx1250):
+        previous = os.environ.pop("SGLANG_USE_AITER", None)
+        try:
+            with (
+                patch.dict(sys.modules, _fake_aiter_shuffle_modules()),
+                patch("sglang.srt.utils.is_hip", lambda: True),
+                patch("sglang.srt.utils.is_gfx95_supported", lambda: is_gfx95),
+                patch("sglang.srt.utils.is_gfx1250_supported", lambda: is_gfx1250),
+            ):
+                return importlib.reload(quark_moe)
+        finally:
+            if previous is not None:
+                os.environ["SGLANG_USE_AITER"] = previous
+
+    def tearDown(self):
+        importlib.reload(quark_moe)
+
+    def test_gfx95_binds_the_scale_and_weight_shuffles(self):
+        reloaded = self._reload_without_env(is_gfx95=True, is_gfx1250=False)
+
+        self.assertTrue(reloaded._is_shuffle_moe_mxfp4)
+        self.assertTrue(hasattr(reloaded, "e8m0_shuffle"))
+        self.assertTrue(hasattr(reloaded, "shuffle_weight"))
+
+    def test_gfx1250_binds_the_n32k4_shuffles(self):
+        reloaded = self._reload_without_env(is_gfx95=False, is_gfx1250=True)
+
+        self.assertTrue(hasattr(reloaded, "moe_shuffle_scale"))
+        self.assertTrue(hasattr(reloaded, "moe_shuffle_weight"))
+
+    def test_other_hip_arches_still_follow_the_env_var(self):
+        reloaded = self._reload_without_env(is_gfx95=False, is_gfx1250=False)
+
+        self.assertFalse(reloaded._use_aiter)
 
 
 class _Runner:
