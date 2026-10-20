@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
@@ -55,6 +56,7 @@ class SchedulerInvariantChecker:
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
     disaggregation_mode: DisaggregationMode
+    # Logical token page width; CP KV sharding uses CP size * physical page_size.
     page_size: int
     full_tokens_per_layer: Optional[int]
     swa_tokens_per_layer: Optional[int]
@@ -400,6 +402,12 @@ class SchedulerInvariantChecker:
         # the classed sharding allocator, whose free lists hold logical page
         # ids in the same unit).
         owner_pages = owner_locs // sub_allocs[0].page_size
+        if is_cp_sharded_padded():
+            cp_size = get_cp_strategy().cp_size
+            # Cache page zero reserves one page rather than one CP group.
+            owner_pages = torch.where(
+                owner_pages > 0, (owner_pages + cp_size - 1) // cp_size, owner_pages
+            )
         # Check B: every sub-pool's free set has no duplicate pages.
         for i, sub in enumerate(sub_allocs):
             free = sub.get_all_free_pages()

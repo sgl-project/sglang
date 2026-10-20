@@ -66,6 +66,10 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import (
+    get_cp_sharded_padded_cache_transfer_indices,
+    is_cp_sharded_padded,
+)
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -1567,6 +1571,12 @@ class SchedulerDisaggregationPrefillMixin:
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
+                if is_cp_sharded_padded():
+                    window_kv_indices_full = (
+                        get_cp_sharded_padded_cache_transfer_indices(
+                            window_kv_indices_full
+                        )
+                    )
                 window_kv_indices_swa = (
                     self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
                         window_kv_indices_full
@@ -1692,6 +1702,10 @@ class SchedulerDisaggregationPrefillMixin:
             ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
+            if is_cp_sharded_padded():
+                raw_kv_indices = get_cp_sharded_padded_cache_transfer_indices(
+                    raw_kv_indices
+                )
             kv_indices = (
                 self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
                     raw_kv_indices

@@ -24,6 +24,10 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import (
+    from_cp_sharded,
+    is_cp_sharded_padded,
+)
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -546,6 +550,8 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        if is_cp_sharded_padded():
+            kv_capacity = from_cp_sharded(kv_capacity)
         max_req_len = min(
             self.model_config.context_len - 1,
             kv_capacity - 1,

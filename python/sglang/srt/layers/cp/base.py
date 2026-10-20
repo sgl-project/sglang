@@ -27,9 +27,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
-from sglang.srt.runtime_context import get_parallel
+import torch
+
+from sglang.srt.arg_groups.choices import add_cp_kv_layout_choices
+from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -96,6 +99,7 @@ class ContextParallelStrategy(ABC):
 
     name: str
     kind: ContextParallelStrategyKind
+    cp_kv_sharded: bool = False
 
     def __init__(self, cp_size: int):
         self.cp_size = cp_size
@@ -244,15 +248,36 @@ def _is_dsa_active() -> bool:
     return False
 
 
-_STRATEGY: Optional[ContextParallelStrategy] = None
+_REGISTERED_CP_KV_LAYOUTS: dict[
+    str, tuple[Callable[..., ContextParallelStrategy], ContextParallelStrategyKind]
+] = {}
+
+
+def register_cp_kv_layout(
+    name: str,
+    factory: Callable[..., ContextParallelStrategy],
+    *,
+    kind: ContextParallelStrategyKind,
+) -> None:
+    """Register a KV layout factory for its compatible compute kind."""
+    _REGISTERED_CP_KV_LAYOUTS[name] = (factory, kind)
+    add_cp_kv_layout_choices([name])
+
+
+# None is uninitialized; False caches a configured-disabled strategy.
+_STRATEGY: ContextParallelStrategy | Literal[False] | None = None
 
 
 def init_cp_strategy(
-    *, enable_prefill_cp: bool, cp_size: int, cp_strategy: str
+    *,
+    enable_prefill_cp: bool,
+    cp_size: int,
+    cp_strategy: str,
+    cp_kv_layout: str | None = None,
 ) -> None:
     """Bind the CP strategy for this process.
 
-    Takes the three values: resolution calls this from inside `__post_init__`,
+    Takes the configuration values: resolution calls this from inside `__post_init__`,
     where the bags do not exist yet, and `get_cp_strategy` calls it lazily in a
     worker, which reads them off the published bags. Each caller reads from the
     source it has.
@@ -260,15 +285,25 @@ def init_cp_strategy(
     global _STRATEGY
 
     if not enable_prefill_cp:
-        _STRATEGY = None
+        _STRATEGY = False
         return
 
     if cp_size <= 1:
-        _STRATEGY = None
+        _STRATEGY = False
         return
 
     kind = ContextParallelStrategyKind.from_string(cp_strategy)
-    if kind == ContextParallelStrategyKind.ZIGZAG:
+    if cp_kv_layout is not None:
+        if cp_kv_layout not in _REGISTERED_CP_KV_LAYOUTS:
+            raise ValueError(f"Unknown cp_kv_layout={cp_kv_layout!r}")
+        factory, layout_kind = _REGISTERED_CP_KV_LAYOUTS[cp_kv_layout]
+        if kind != layout_kind:
+            raise ValueError(
+                f"KV layout {cp_kv_layout!r} requires --cp-strategy "
+                f"{layout_kind.cli_value}"
+            )
+        _STRATEGY = factory(cp_size=cp_size)
+    elif kind == ContextParallelStrategyKind.ZIGZAG:
         from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 
         _STRATEGY = ZigzagCPStrategy(cp_size=cp_size)
@@ -289,6 +324,10 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
     re-run ``ServerArgs.__post_init__`` because the pickled instance bypasses
     ``__init__``. Lazy init lets worker processes recover the singleton from
     global server args.
+
+    Configured-disabled processes cache False; setting _STRATEGY to None allows
+    lazy initialization again. A failed configuration read leaves the singleton
+    uninitialized.
     """
     global _STRATEGY
 
@@ -299,15 +338,83 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
             enable_prefill_cp = parallel.enable_prefill_cp
             cp_size = parallel.attn_cp_size
             cp_strategy = parallel.cp_strategy
+            cp_kv_layout = parallel.cp_kv_layout
         except (AssertionError, AttributeError, RuntimeError, ValueError):
             return None
-        if enable_prefill_cp:
-            init_cp_strategy(
-                enable_prefill_cp=True,
-                cp_size=cp_size,
-                cp_strategy=cp_strategy,
-            )
-    return _STRATEGY
+        init_cp_strategy(
+            enable_prefill_cp=enable_prefill_cp,
+            cp_size=cp_size,
+            cp_strategy=cp_strategy,
+            cp_kv_layout=cp_kv_layout,
+        )
+    return None if _STRATEGY is False else _STRATEGY
+
+
+def is_cp_sharded_padded() -> bool:
+    """Whether the configured strategy selects rank-local KV storage."""
+    strategy = get_cp_strategy()
+    return strategy is not None and strategy.cp_kv_sharded
+
+
+def get_cp_sharded_padded(value):
+    """Convert a global KV count to local storage for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value // strategy.cp_size
+
+
+def from_cp_sharded(value):
+    """Convert a local KV count back to global for sharded CP storage."""
+    strategy = get_cp_strategy()
+    return value * strategy.cp_size
+
+
+def get_cp_sharded_padded_cache_indices(value):
+    """Recover complete reserved local pages from actual cache-group rows."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    # The interval starts at a group boundary; its last group may be partial.
+    representatives = value[:: c * p]
+    pages = (
+        get_cp_sharded_padded_cache_transfer_indices(representatives.to(torch.int64))
+        // p
+    )
+    local = pages[:, None] * p + torch.arange(p, device=value.device)
+    return torch.where(
+        representatives[:, None] > 0,
+        local.to(value.dtype),
+        representatives[:, None],
+    ).reshape(-1)
+
+
+def from_cp_sharded_expanded_indices(value):
+    """Expand complete local pages into every CP column in cache-row order."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    pages = value[::p] // p
+    columns = torch.arange(c, device=value.device)
+    offsets = torch.arange(p, device=value.device)
+    return (
+        ((pages[:, None, None] - 1) * c + 1 + columns[None, :, None]) * p
+        + offsets[None, None, :]
+    ).reshape(-1)
+
+
+def _ceil_group_count(value, group_size):
+    """Count complete groups needed to cover a token endpoint."""
+    return (value + group_size - 1) // group_size
+
+
+def get_cp_sharded_padded_allocation_tokens(value, *, prefix_tokens):
+    """Convert raw request tokens to fresh KV capacity for sharded CP storage."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    return (
+        _ceil_group_count(prefix_tokens + value, group_size) * group_size
+        - _ceil_group_count(prefix_tokens, group_size) * group_size
+    )
 
 
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:
@@ -327,3 +434,13 @@ def is_zigzag() -> bool:
 
 def is_interleave() -> bool:
     return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
+
+
+def get_cp_sharded_padded_cache_transfer_indices(value):
+    """Project cache rows to local rows, preserving shape, dtype and sentinels."""
+    strategy = get_cp_strategy()
+    c = strategy.cp_size
+    p = get_schedule().page_size
+    shifted = value.to(torch.int64) + (c - 1) * p
+    local = (shifted // (c * p)) * p + shifted % p
+    return torch.where(value > 0, local.to(value.dtype), value)

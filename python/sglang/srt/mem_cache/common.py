@@ -12,6 +12,12 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import (
+    from_cp_sharded,
+    get_cp_sharded_padded,
+    get_cp_sharded_padded_cache_indices,
+    is_cp_sharded_padded,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -33,6 +39,17 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+
+
+def get_cp_sharded_padded_kv_segments(value):
+    """Return physical page segments for release for sharded CP storage."""
+    return [
+        (
+            get_cp_sharded_padded_cache_indices(indices),
+            get_cp_sharded_padded(start_pos),
+        )
+        for indices, start_pos in value
+    ]
 
 
 class RetractionBackup(NamedTuple):
@@ -96,8 +113,11 @@ def free_swa_out_of_window_slots(
     evicted_seqlen = req.kv.get_evicted_seqlen(component_type)
     if pre_len - sliding_window_size < evicted_seqlen + eviction_interval:
         return
+    swa_page_size = page_size
+    if component_type == ComponentType.SWA and is_cp_sharded_padded():
+        swa_page_size = from_cp_sharded(swa_page_size)
     dead_lo = (
-        req.kv.swa_dead_lo(page_size)
+        req.kv.swa_dead_lo(swa_page_size)
         if component_type == ComponentType.SWA
         else req.kv.cache_protected_len
     )
@@ -125,6 +145,10 @@ def free_swa_out_of_window_slots(
 
     if page_size > 1:
         new_evicted_seqlen = (new_evicted_seqlen // page_size) * page_size
+    if is_cp_sharded_padded():
+        # Release complete logical groups so every rank frees the same span.
+        group_size = from_cp_sharded(page_size)
+        new_evicted_seqlen = (new_evicted_seqlen // group_size) * group_size
 
     if new_evicted_seqlen > evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[
@@ -133,6 +157,9 @@ def free_swa_out_of_window_slots(
         if free_segment is None:
             assert component_type == ComponentType.SWA
             free_segment = token_to_kv_pool_allocator.free_swa_segment
+        if is_cp_sharded_padded():
+            free_slots = get_cp_sharded_padded_cache_indices(free_slots)
+            evicted_seqlen = get_cp_sharded_padded(evicted_seqlen)
         free_segment(free_slots, start_pos=evicted_seqlen)
         req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
 
@@ -184,8 +211,12 @@ def free_kv_row_segments(
             f"(page_size {allocator.page_size})"
         )
     if swa_dead:
+        if is_cp_sharded_padded():
+            swa_dead = get_cp_sharded_padded_kv_segments(swa_dead)
         allocator.free_full_segments(swa_dead)
     if swa_alive:
+        if is_cp_sharded_padded():
+            swa_alive = get_cp_sharded_padded_kv_segments(swa_alive)
         allocator.free_segments(swa_alive)
 
 
@@ -443,7 +474,10 @@ def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
     allocator = tree_cache.token_to_kv_pool_allocator
+    # Logical token alignment width: one allocator page, or a full CP group.
     page_size = allocator.page_size
+    if is_cp_sharded_padded():
+        page_size = from_cp_sharded(page_size)
     spec_algo = get_spec().speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated

@@ -110,6 +110,10 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.layers.cp.base import (
+    from_cp_sharded,
+    is_cp_sharded_padded,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -2446,6 +2450,9 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2458,18 +2465,23 @@ class Scheduler(
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             # Match the allocator and radix counters' logical units.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=global_tokens,
         )
 
     def init_invariant_checker(self) -> None:
+        global_page_size = self.page_size
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_page_size = from_cp_sharded(global_page_size)
+            global_tokens = from_cp_sharded(global_tokens)
         self.invariant_checker = SchedulerInvariantChecker(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
-            page_size=self.page_size,
+            page_size=global_page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=global_tokens,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2524,11 +2536,14 @@ class Scheduler(
         self._prev_step: Optional[Tuple[int, float, bool]] = None
         self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
             # The worker reports logical DCP capacity; add KV shard widening.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2655,6 +2670,17 @@ class Scheduler(
             self.max_total_num_tokens * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
+        if is_cp_sharded_padded():
+            token_capacity = from_cp_sharded(token_capacity)
+            # The allocator rounds to physical pages. Reserve the extra group
+            # padding and headroom here, in the scheduler's global token budget.
+            group_size = from_cp_sharded(self.page_size)
+            token_capacity -= (
+                (-input_len) % group_size
+                - (-input_len) % self.page_size
+                + group_size
+                - self.page_size
+            )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,

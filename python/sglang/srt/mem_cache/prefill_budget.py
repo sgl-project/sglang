@@ -21,7 +21,44 @@ realizes the selected reservation before a host transfer pins device rows.
 
 from typing import Optional
 
+from sglang.srt.layers.cp.base import (
+    _ceil_group_count,
+    from_cp_sharded,
+    get_cp_sharded_padded_allocation_tokens,
+    get_cp_strategy,
+    is_cp_sharded_padded,
+)
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.runtime_context import get_schedule
+
+
+def get_cp_sharded_padded_chunk_tokens(value, *, prefix_tokens):
+    """Align a chunk to complete fresh groups, retaining its reserved prefix tail."""
+    strategy = get_cp_strategy()
+    page_size = get_schedule().page_size
+    group_size = strategy.cp_size * page_size
+    tail = _ceil_group_count(prefix_tokens, group_size) * group_size - prefix_tokens
+    groups = max(0, int((value - tail) // group_size))
+    return min(max(value, 0), tail + groups * group_size)
+
+
+def get_cp_sharded_padded_available_tokens(value, *, reserved_tokens=0):
+    """Adapt free capacity before the existing chunk headroom subtraction.
+
+    The resource group is C times the strategy's physical token page size.
+    Without a prefix, allow at most one partial group's tail. A request-aware
+    geometry entry bounds that allowance by the actual reserved tail.
+    """
+    strategy = get_cp_strategy()
+    if value < 0:
+        return value
+    group_size = strategy.cp_size * get_schedule().page_size
+    return (
+        reserved_tokens
+        + max(0, (value - reserved_tokens) // group_size) * group_size
+        + group_size
+        - 1
+    )
 
 
 def estimate_swa_kv_tokens(
@@ -68,7 +105,10 @@ class PrefillBudget:
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
         self.tree_cache = tree_cache
+        # Logical token alignment width: one allocator page, or a full CP group.
         self.page_size = allocator.page_size
+        if is_cp_sharded_padded():
+            self.page_size = from_cp_sharded(self.page_size)
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0
@@ -94,7 +134,10 @@ class PrefillBudget:
             if self.tree_cache.supports_mamba()
             else self.tree_cache.evictable_size()
         )
-        return self.allocator.available_size() + evictable
+        global_available_size = self.allocator.available_size()
+        if is_cp_sharded_padded():
+            global_available_size = from_cp_sharded(global_available_size)
+        return global_available_size + evictable
 
     @property
     def remaining_total(self):
@@ -109,6 +152,9 @@ class PrefillBudget:
         return 0
 
     def has_capacity(self) -> bool:
+        if is_cp_sharded_padded():
+            # CP can reuse padding in already reserved pages when fresh capacity is zero.
+            return self.remaining_total >= 0 and self.remaining_current >= 0
         return self.remaining_total > 0 and self.remaining_current > 0
 
     def check_prefill(
@@ -140,7 +186,13 @@ class PrefillBudget:
         return paged_input <= min(self.remaining_current, self.remaining_total)
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        available = min(chunk_limit, int(self.remaining_total))
+        available_tokens = int(self.remaining_total)
+        if is_cp_sharded_padded():
+            available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
+        available = min(
+            chunk_limit,
+            available_tokens,
+        )
         # Single-pool continuation must make progress to release its KV.
         return available if available > 0 else chunk_limit
 
@@ -178,18 +230,22 @@ class SWAPrefillBudget(PrefillBudget):
 
     def _available_and_evictable(self):
         if self.all_swa:
-            return (
-                self.allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size()
-            )
-        return (
-            self.allocator.full_available_size() + self.tree_cache.full_evictable_size()
-        )
+            global_swa_available_size = self.allocator.swa_available_size()
+            if is_cp_sharded_padded():
+                global_swa_available_size = from_cp_sharded(global_swa_available_size)
+            return global_swa_available_size + self.tree_cache.swa_evictable_size()
+        global_full_available_size = self.allocator.full_available_size()
+        if is_cp_sharded_padded():
+            global_full_available_size = from_cp_sharded(global_full_available_size)
+        return global_full_available_size + self.tree_cache.full_evictable_size()
 
     @property
     def remaining_swa(self):
         evictable = 0 if self.req_ring else self.tree_cache.swa_evictable_size()
-        return self.allocator.swa_available_size() + evictable - self.swa_offset
+        global_swa_available_size = self.allocator.swa_available_size()
+        if is_cp_sharded_padded():
+            global_swa_available_size = from_cp_sharded(global_swa_available_size)
+        return global_swa_available_size + evictable - self.swa_offset
 
     def swa_tokens(
         self,
@@ -212,20 +268,32 @@ class SWAPrefillBudget(PrefillBudget):
 
     def swa_never_fits(self, extend_input_len, max_new_tokens, **kwargs):
         needed = self.swa_tokens(extend_input_len, max_new_tokens, **kwargs)
-        return (
-            needed > self.allocator.size_swa
-            if self.req_ring
-            else needed >= self.allocator.size_swa
-        )
+        size_swa = self.allocator.size_swa
+        if is_cp_sharded_padded():
+            size_swa = from_cp_sharded(size_swa)
+        return needed > size_swa if self.req_ring else needed >= size_swa
 
-    def _chunk_cap(self, max_new_tokens, swa_host_hit_length=0):
+    def _chunk_cap(
+        self,
+        max_new_tokens,
+        swa_host_hit_length=0,
+        *,
+        prefix_tokens=None,
+    ):
         # Only the sliding window stays locked between chunks, so a smaller
         # chunk can bound the transient SWA footprint of a longer prompt.
         headroom = self.swa_tokens(
             0, max_new_tokens, swa_host_hit_length=swa_host_hit_length
         )
         cap = int(self.remaining_swa) - headroom
-        return max(0, cap // self.page_size * self.page_size)
+        cap = max(0, cap // self.page_size * self.page_size)
+        if is_cp_sharded_padded() and cap > 0:
+            # Keep SWA availability at the caller; the helper only aligns tokens.
+            cap = get_cp_sharded_padded_chunk_tokens(
+                cap + self.page_size - 1,
+                prefix_tokens=prefix_tokens,
+            )
+        return cap
 
     def check_prefill(
         self,
@@ -240,6 +308,11 @@ class SWAPrefillBudget(PrefillBudget):
     ) -> tuple[bool, int | None]:
         if total_tokens >= self.remaining_total:
             return False, None
+        prefix_tokens = input_tokens - extend_input_len
+        if is_cp_sharded_padded():
+            extend_input_len = get_cp_sharded_padded_allocation_tokens(
+                extend_input_len, prefix_tokens=prefix_tokens
+            )
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
         needed = self.swa_tokens(
             extend_input_len,
@@ -263,18 +336,39 @@ class SWAPrefillBudget(PrefillBudget):
             chunk_limit=chunk_limit,
             swa_host_hit_length=swa_host_hit_length,
         ):
-            cap = self._chunk_cap(max_new_tokens, swa_host_hit_length)
+            cap = self._chunk_cap(
+                max_new_tokens,
+                swa_host_hit_length,
+                prefix_tokens=prefix_tokens,
+            )
         if chunk_limit is None or cap <= 0:
             return False, None
         return True, min(chunk_limit, cap)
 
     def has_capacity(self) -> bool:
+        if is_cp_sharded_padded():
+            # CP can reuse padding in already reserved SWA pages with zero fresh capacity.
+            return super().has_capacity() and self.remaining_swa >= 0
         return super().has_capacity() and self.remaining_swa > 0
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
-        available = min(chunk_limit, int(self.remaining_total))
+        available_tokens = int(self.remaining_total)
+        if is_cp_sharded_padded():
+            available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
+        available = min(
+            chunk_limit,
+            available_tokens,
+        )
         if not self.req_ring:
-            available = min(available, int(self.remaining_swa) - self.page_size)
+            available_tokens = int(self.remaining_swa)
+            if is_cp_sharded_padded():
+                available_tokens = get_cp_sharded_padded_available_tokens(
+                    available_tokens, reserved_tokens=self.page_size
+                )
+            available = min(
+                available,
+                available_tokens - self.page_size,
+            )
         return available if available > 0 else None
 
     def can_allocate_prefill(
