@@ -1667,7 +1667,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, real_input
+                )
             elif is_dsv41:
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
@@ -1694,12 +1696,16 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, real_input
+                )
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, real_input
+                )
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

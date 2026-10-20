@@ -1572,6 +1572,34 @@ class ServingChatTestCase(CustomTestCase):
                     prompt = self.tm.tokenizer.encode.call_args.args[0]
                     self.assertEqual("calculator" in prompt, expects_tools)
 
+    def test_native_encoders_tokenize_through_parallel_prompt_encode(self):
+        # dsv4 / dsv41 / dsv32 render the whole conversation to one string and
+        # then tokenize it on the HTTP event loop. Agent prompts reach several
+        # hundred thousand tokens, so these paths must use the same chunked
+        # encoder as the Jinja path instead of a single tokenizer.encode call.
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+
+        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Solve 100 / 7."}],
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.parallel_prompt_encode",
+                    return_value=[7, 8, 9],
+                ) as encode_mock:
+                    result = self.chat._process_messages(request, is_multimodal=False)
+
+                encode_mock.assert_called_once()
+                tokenizer, prompt = encode_mock.call_args.args
+                self.assertIs(tokenizer, self.tm.tokenizer)
+                self.assertIn("Solve 100 / 7.", prompt)
+                self.assertEqual(result.prompt_ids, [7, 8, 9])
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"
