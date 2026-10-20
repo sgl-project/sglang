@@ -1441,7 +1441,7 @@ class HiSparseCoordinator:
         if pool.index_k_with_scale_buffer is not None:
             # One pinned CPU tensor per layer: [num_pages, page_bytes].
             req.hisparse_indexer_backup = [
-                buf[page_indices].to("cpu", non_blocking=False)
+                buf[page_indices].to("cpu", non_blocking=False).pin_memory()
                 for buf in pool.index_k_with_scale_buffer
             ]
         else:
@@ -1478,6 +1478,12 @@ class HiSparseCoordinator:
                 buf[page_indices] = rows.to(buf.device, non_blocking=True)
             for buf, rows in zip(pool.index_k_scale_buffer, backup[n:]):
                 buf[page_indices] = rows.to(buf.device, non_blocking=True)
+        # The restore is a H2D copy on the current stream (async). The first
+        # forward's indexer reads must observe it: record+wait an event so the
+        # restore is complete before any subsequent kernel on this stream.
+        restore_done = device_module.Event()
+        restore_done.record(device_module.current_stream())
+        restore_done.synchronize()
         req.hisparse_indexer_backup = None
 
     def retract_req_state_preserving(self, req: Req) -> None:
