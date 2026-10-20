@@ -143,7 +143,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
         from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluQuant
 
-        result = NPUSwigluQuant.try_apply(x)
+        result = NPUSwigluQuant.apply(x)
         if result is None:
             return None
         data, scale = result

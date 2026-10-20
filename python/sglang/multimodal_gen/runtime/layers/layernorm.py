@@ -270,7 +270,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        from sglang.srt.hardware_backend.npu.layernorm import rms_norm_npu
+        from sglang.srt.hardware_backend.npu.layernorm import get_rmsnorm_variant
 
         quantize = (
             getattr(
@@ -281,12 +281,11 @@ class RMSNorm(CustomOp):
             and self.variance_size_override is None
             and not self.cast_x_before_out_mul
         )
-        return rms_norm_npu(
+        return get_rmsnorm_variant(quantize)._apply_norm(
             x,
             self.weight.data,
             self.variance_epsilon,
             residual,
-            quantize=quantize,
             preserve_residual_rounding=self.preserve_residual_rounding,
         )
 

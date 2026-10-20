@@ -48,7 +48,7 @@ def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) 
 
 class NPUSwigluQuant(BaseActivation):
     @classmethod
-    def try_apply(cls, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+    def apply(cls, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
         if (
             x.device.type != "npu"
             or x.dtype not in (torch.float16, torch.bfloat16)
