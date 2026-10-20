@@ -1,3 +1,4 @@
+import gc
 import json
 import unittest
 from io import BytesIO
@@ -106,6 +107,17 @@ class VLMInputTestBase:
         if cls.engine is not None:
             cls.engine.shutdown()
             cls.engine = None
+        # _init_visual loads vision modules into this process. Release them so
+        # the next class starts with an idle GPU; otherwise the CI GPU idle
+        # check counts them whenever it cannot match this process's PID.
+        for name, value in list(vars(cls).items()):
+            if isinstance(value, torch.nn.Module):
+                setattr(cls, name, None)
+        gc.collect()
+        if _is_cuda:
+            torch.cuda.empty_cache()
+        elif _is_xpu:
+            torch.xpu.empty_cache()
 
     def verify_response(self, output):
         # The goal is to check that the model roughly understands:
