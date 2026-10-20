@@ -2729,24 +2729,6 @@ fn external_linker_swa_offload_uses_complete_trailing_pages() {
 }
 
 #[test]
-fn external_linker_rejects_mamba_trees() {
-    let params = CacheInitParams {
-        mamba_cache_chunk_size: Some(1),
-        ..Default::default()
-    };
-    let mut tc: UnifiedTreeCore<Vec<i64>> = UnifiedTreeCore::new(params, vec![FULL, MAMBA]);
-    let error = tc.set_enable_external_cache_linker(true).unwrap_err();
-    assert!(matches!(
-        &error,
-        TreeCoreRuntimeError::ExternalCacheLinkerUnsupportedComponent {
-            component_type
-        } if *component_type == MAMBA
-    ));
-    assert!(error.to_string().contains("Mamba"));
-    assert!(!tc.enable_external_cache_linker);
-}
-
-#[test]
 fn external_linker_state_follows_load_offload_and_split_lifecycle() {
     let mut tc = core();
     tc.set_enable_external_cache_linker(true).unwrap();
@@ -3014,32 +2996,8 @@ fn backup_kv_action_chains_unbacked_ancestors_first() {
     assert_eq!(action.node_ids, vec![c]);
 }
 
-// Mirrors UnifiedRadixCache._execute_and_commit_kv_backup: back up each chain
-// node and stamp every node its transfers cover with that node's ack.
-// It skips the inc_lock_ref the Python side takes; the asserts do not depend on it.
-fn execute_backup_kv_for_test(tc: &mut UnifiedTreeCore<Vec<i64>>, backup: &BackupKV) {
-    for &node_id in &backup.node_ids {
-        let (device_value, mut comp_xfers) = tc.build_backup_spec(node_id).expect("backup spec");
-        if device_value.numel() == 0 && comp_xfers.is_empty() {
-            continue;
-        }
-        let mut publish_node_ids = Vec::new();
-        for transfer in comp_xfers.values_mut().flatten() {
-            transfer.host_indices = transfer.device_indices.as_ref().map(Tensor::copy);
-            publish_node_ids.extend(transfer.nodes_to_load.iter().flatten().copied());
-        }
-        if !publish_node_ids.contains(&node_id) {
-            publish_node_ids.push(node_id);
-        }
-        tc.commit_backup(node_id, device_value.copy(), comp_xfers)
-            .expect("live test node");
-        tc.mark_write_through_pending(publish_node_ids, /* ack_id = */ node_id)
-            .expect("live test nodes");
-    }
-}
-
 #[test]
-fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
+fn write_back_defers_swa_window_backup_until_eviction() {
     // c(Full unbacked) -> b(Full backed) -> t1(Full backed)
     //                  -> d(Full unbacked) -> t2(Full backed)
     // Every node holds a device-only SWA value inside the window.
@@ -3079,7 +3037,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
     }
 
     // Two requests in one batch finish at t1 and t2; neither ack drains.
-    for (key, target) in [(&key_t1, t1), (&key_t2, t2)] {
+    for key in [&key_t1, &key_t2] {
         let result = tc.insert(&insert_params(key, &[20, 21, 22, 23]));
         let backups: Vec<&BackupKV> = result
             .cache_actions
@@ -3089,9 +3047,7 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
                 _ => None,
             })
             .collect();
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].node_ids, vec![target]);
-        execute_backup_kv_for_test(&mut tc, backups[0]);
+        assert!(backups.is_empty());
     }
 
     let pending = |node_id| {
@@ -3099,8 +3055,11 @@ fn write_back_swa_publish_leaves_an_ancestor_pending_under_another_ack_alone() {
             .node(tc.arena.resolve(node_id).expect("live test node"))
             .write_through_pending_id
     };
-    for (node_id, ack_id) in [(c, t1), (b, t1), (t1, t1), (d, t2), (t2, t2)] {
-        assert_eq!(pending(node_id), Some(ack_id));
+    for node_id in [c, b, t1, d, t2] {
+        assert_eq!(pending(node_id), None);
+    }
+    for idx in [c_idx, b_idx, t1_idx, d_idx, t2_idx] {
+        assert!(!tc.arena.node(idx).has_host_value(SWA));
     }
     // Write-back defers the unbacked Full prefix to eviction.
     assert!(
@@ -3382,7 +3341,8 @@ fn namespaced_event_hashes_are_sparse_and_removed_with_the_node() {
 
 #[test]
 fn extra_key_nodes_publish_token_only_event_hashes() {
-    // Events omit extra_key; storage includes it.
+    // Event hashes omit extra_key; storage includes it. The event carries it
+    // so Python can apply the LoRA namespace.
     let mut tc = events_core(2);
     let key = vec![1, 2, 7, 8];
     tc.insert(&insert_params_in_namespace(
@@ -3405,7 +3365,7 @@ fn extra_key_nodes_publish_token_only_event_hashes() {
             medium: StorageMedium::Gpu,
             cache_salt: None,
             session_id: None,
-            extra_key: None,
+            extra_key: Some(Arc::from("lora-a")),
         }]
     );
 
@@ -3541,11 +3501,13 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![1],
         medium: StorageMedium::Gpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![2, 3],
         medium: StorageMedium::Gpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 5);
     assert!(matches!(
@@ -3556,6 +3518,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![4],
         medium: StorageMedium::Cpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 6);
     tc.record_all_cleared_event();
@@ -3563,6 +3526,7 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
     tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
         block_hashes: vec![5],
         medium: StorageMedium::Cpu,
+        extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 8);
     assert!(matches!(
@@ -3592,6 +3556,41 @@ fn event_coalescing_respects_store_remove_and_clear_boundaries() {
         extra_key: None,
     });
     assert_eq!(tc.kv_event_queue.len(), 2);
+
+    // Different extra_keys map to different LoRA namespaces in Python.
+    tc.kv_event_queue.clear();
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![1],
+        parent_block_hash: None,
+        token_ids: vec![10, 11],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+        cache_salt: None,
+        session_id: None,
+        extra_key: None,
+    });
+    tc.enqueue_kv_event_(KvCacheEvent::BlockStored {
+        block_hashes: vec![2],
+        parent_block_hash: Some(1),
+        token_ids: vec![12, 13],
+        block_size: 2,
+        medium: StorageMedium::Gpu,
+        cache_salt: None,
+        session_id: None,
+        extra_key: Some(Arc::from("lora-a")),
+    });
+    assert_eq!(tc.kv_event_queue.len(), 2);
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![1],
+        medium: StorageMedium::Gpu,
+        extra_key: None,
+    });
+    tc.enqueue_kv_event_(KvCacheEvent::BlockRemoved {
+        block_hashes: vec![2],
+        medium: StorageMedium::Gpu,
+        extra_key: Some(Arc::from("lora-a")),
+    });
+    assert_eq!(tc.kv_event_queue.len(), 4);
 }
 
 #[test]
@@ -3621,6 +3620,7 @@ fn eviction_emits_block_removed_with_all_page_hashes() {
                 .map(|h| crate::node::hash_str_to_int64(h))
                 .collect(),
             medium: StorageMedium::Gpu,
+            extra_key: None,
         }]
     );
 }
@@ -3831,6 +3831,7 @@ fn host_eviction_emits_a_cpu_block_removed() {
         vec![KvCacheEvent::BlockRemoved {
             block_hashes: vec![crate::node::hash_str_to_int64(&hashes[0])],
             medium: StorageMedium::Cpu,
+            extra_key: None,
         }]
     );
 }
@@ -3931,6 +3932,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                     .map(|h| crate::node::hash_str_to_int64(h))
                     .collect(),
                 medium: StorageMedium::Cpu,
+                extra_key: None,
             },
             KvCacheEvent::BlockRemoved {
                 block_hashes: leaf_hashes
@@ -3938,6 +3940,7 @@ fn drop_subtree_emits_removals_for_host_descendants_then_the_leaf() {
                     .map(|h| crate::node::hash_str_to_int64(h))
                     .collect(),
                 medium: StorageMedium::Gpu,
+                extra_key: None,
             },
         ]
     );

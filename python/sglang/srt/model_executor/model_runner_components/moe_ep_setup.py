@@ -12,7 +12,11 @@ from sglang.srt.eplb.lplb_solver import (
     set_global_lplb_solver,
 )
 from sglang.srt.layers.moe.hash_topk import HashTopK
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import (
+    TopK,
+    fused_shared_expert_weight,
+    is_routed_scaling_factor_fused_in_topk,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, log_info_on_rank0
 
@@ -52,15 +56,18 @@ def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
         )
         if isinstance(module, TopK):
             routed_scaling_factor = module.topk_config.routed_scaling_factor
+            fused_in_topk = is_routed_scaling_factor_fused_in_topk(module.topk_config)
         else:
             routed_scaling_factor = module.routed_scaling_factor
+            fused_in_topk = module.apply_routed_scaling_factor_on_output
         module.waterfill_balancer = balancer_cls(
             num_routed_experts=num_physical_routed_experts,
             world_size=parallel.moe_ep_size,
             rank=parallel.moe_ep_rank,
             layer_id=module.layer_id,
-            routed_scaling_factor=(
-                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            shared_weight=fused_shared_expert_weight(
+                routed_scaling_factor=routed_scaling_factor,
+                fused_in_topk=fused_in_topk,
             ),
         )
         num_prepared += 1

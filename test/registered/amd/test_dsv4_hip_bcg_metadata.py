@@ -79,6 +79,7 @@ def _make_backend(*, block_size, device, is_dspark_draft=True, low_ratios=()):
     backend.is_dspark = True
     backend.needs_cpu_seq_lens = False
     backend._fp4_graph_row_limit = None
+    backend._fp4_c4_rowgroup_columns = None
     backend.is_draft_worker = is_dspark_draft
     # compressed-KV metadata is built only on the target worker
     backend.need_compress = not is_dspark_draft
@@ -171,8 +172,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
-                "is_unified_kv_triton",
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
                 return_value=True,
             ),
             mock.patch(
@@ -213,7 +213,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+                "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels."
                 "ExpandPrefillCausally.execute",
                 return_value=SimpleNamespace(
                     seq_lens_casual=core.seq_lens_casual,
@@ -278,7 +278,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.kernels.ops.attention.dsv4_attn_metadata_kernels."
+                "sglang.kernels.ops.attention.dsv4.attn_metadata_kernels."
                 "ExpandPrefillCausally.execute",
                 return_value=SimpleNamespace(
                     seq_lens_casual=torch.ones(4, dtype=torch.int32),
@@ -345,6 +345,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
 
     def test_cp_unified_uses_inert_query_padding_and_logical_ring_rows(self):
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+        from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 
         backend = object.__new__(DeepseekV4HipRadixBackend)
         backend.token_to_kv_pool = SimpleNamespace(
@@ -393,7 +394,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
                 ),
             ) as build_indices,
             mock.patch.object(runtime, "prefill", return_value=output),
-            mock.patch.object(runtime, "store_swa_into_unified") as store,
+            mock.patch.object(dsv4_unified_kv_store, "store_swa_into_unified") as store,
         ):
             result = backend._forward_unified_kv(
                 q=torch.zeros(2, 1, 4),
