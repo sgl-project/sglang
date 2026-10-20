@@ -3863,10 +3863,8 @@ class DeepseekV4Model(nn.Module):
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
                     if _is_hip and source.hc_boundary_fused:
-                        # The gfx950 fused boundary leaves the previous FFN hc_post
-                        # pending for this layer's boundary launch, which also builds
-                        # the attention input: run that launch on every row.
-                        state, source_x = fused_boundary_attn_input(source, state)
+                        # The previous FFN hc_post has not run yet, so run it here too.
+                        source_x = fused_boundary_attn_input(source, state)
                     else:
                         source_x = mhc.combine(source.attn_hc, state)
                     attn_backend.write_tail_source_kv(
