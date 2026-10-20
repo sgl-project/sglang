@@ -3122,11 +3122,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.failed_session_probes.pop(session_id, None)
 
     def _send_probe(self, session_id: str) -> int:
-        send_probe = getattr(self.engine, "send_probe", None)
-        if send_probe is None:
-            return -1
         try:
-            return send_probe(session_id)
+            return self.engine.send_probe(session_id)
         except Exception as e:
             logger.warning("send_probe(%s) raised: %s", session_id, e)
             return -1
