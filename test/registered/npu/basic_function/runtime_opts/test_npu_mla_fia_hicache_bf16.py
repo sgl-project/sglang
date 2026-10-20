@@ -2,6 +2,7 @@ import os
 import unittest
 from urllib.parse import urlparse
 
+import sglang
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import run_evalscope
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     MOONLIGHT_16B_A3B_MODEL_PATH,
@@ -44,6 +45,14 @@ _is_pr_pipeline = "/.github/workflows/nightly-test-npu.yml" not in os.environ.ge
 )
 
 
+def _ensure_root_sglang_symlink():
+    # run_evalscope() installs evalscope through /root/sglang, which the PR
+    # stage never creates, so link it to the repo that provides this sglang.
+    if not os.path.lexists("/root/sglang"):
+        sglang_repo = os.path.dirname(os.path.dirname(os.path.dirname(sglang.__file__)))
+        os.symlink(sglang_repo, "/root/sglang")
+
+
 class TestAscendMlaFiaHicacheBf16(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -72,6 +81,7 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
             cls.fia_hicache_args.append("--disable-cuda-graph")
 
     def test_gsm8k_fia_hicache(self):
+        _ensure_root_sglang_symlink()
         os.environ["ASCEND_USE_FIA"] = "true"
         for model in self.models:
             with self.subTest(model=model):
