@@ -3110,6 +3110,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             kv_cache_dtype=kv_cache_dtype,
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+            prefix_indices_only=_is_npu,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

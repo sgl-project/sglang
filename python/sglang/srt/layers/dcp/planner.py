@@ -42,11 +42,17 @@ def prepare_decode_context_parallel_metadata(
     kv_cache_dtype,
     kv_cache_device,
     create_chunked_prefix_cache_kv_indices_fn,
+    *,
+    prefix_indices_only: bool = False,
 ) -> Optional[DecodeContextParallelMetadata]:
+    """Prepare MLA prefix reads, optionally without the packed gather buffer.
+
+    Consumers that gather latent and RoPE separately request only the local
+    prefix indices. The default also prepares the packed KV gather plan.
+    """
     parallel = get_parallel()
     if not parallel.dcp_enabled:
         return None
-    backend = get_attn_backend()
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank1_r1.prefix_tokens, ..., rank7_r1.prefix_tokens,
     #   ...,
@@ -80,9 +86,10 @@ def prepare_decode_context_parallel_metadata(
         dcp_prefix_kv_indices,
         req_to_token.shape[1],
     )
-    if not backend.dcp_use_packed_kv:
+    if prefix_indices_only:
+        translator = get_attn_backend().kv_index_translator
         return DecodeContextParallelMetadata(
-            dcp_local_prefix_kv_indices=backend.kv_index_translator.translate_dcp_read_ids(
+            dcp_local_prefix_kv_indices=translator.translate_dcp_read_ids(
                 dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
             ),
         )

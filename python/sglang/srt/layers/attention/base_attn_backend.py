@@ -88,10 +88,6 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
-    # FIA gathers prefix KV from separate K/rope buffers, not the packed MLA
-    # buffer. It needs only the common rank-local prefix indices.
-    dcp_use_packed_kv = True
-
     def get_fused_kv_write_buffers(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
