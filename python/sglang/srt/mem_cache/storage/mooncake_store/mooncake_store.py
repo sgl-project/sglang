@@ -899,11 +899,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             all_component_keys.extend(component_keys)
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
-        all_exists = (
-            self._batch_exist(all_component_keys, extra_info)
-            if all_component_keys
-            else []
-        )
+        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
                 break
@@ -1441,7 +1437,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys, extra_info)
+        exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1493,21 +1489,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(
-        self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> List[int]:
-        pp_rank = (
-            (extra_info.extra_info or {}).get("pp_rank")
-            if extra_info is not None
-            else None
-        )
-        if pp_rank is not None:
-            # PP is the last rank field before the pool suffix. Replace from
-            # the right so an identical TP rank or backend tag stays unchanged.
-            key_strs = [
-                f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
-                for key in key_strs
-            ]
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):

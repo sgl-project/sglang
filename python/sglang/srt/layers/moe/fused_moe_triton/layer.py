@@ -359,6 +359,7 @@ class FusedMoE(torch.nn.Module):
         gate_up_interleaved: bool = True,
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
+        uses_expert_location: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -367,6 +368,7 @@ class FusedMoE(torch.nn.Module):
         self.params_dtype = params_dtype
         self.layer_name = prefix
         self.layer_id = layer_id
+        self.uses_expert_location = uses_expert_location
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -424,16 +426,6 @@ class FusedMoE(torch.nn.Module):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
-
-        # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
-        # Pad the intermediate_size_per_partition if necessary
-        if (
-            self.use_flashinfer_trtllm_moe
-            and self.intermediate_size_per_partition % 128 != 0
-        ):
-            self.intermediate_size_per_partition = round_up(
-                self.intermediate_size_per_partition, 128
-            )
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
@@ -504,6 +496,20 @@ class FusedMoE(torch.nn.Module):
                 self.quant_method = make_for_layer(
                     layer=self, base_method=self.quant_method
                 )
+        # flashinfer_trtllm pads intermediate_size to a multiple of 128 here, except
+        # NVFP4 which aligns it in create_weights
+        if (
+            self.use_flashinfer_trtllm_moe
+            and not isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and self.intermediate_size_per_partition % 128 != 0
+        ):
+            self.intermediate_size_per_partition = round_up(
+                self.intermediate_size_per_partition, 128
+            )
+        self.moe_runner_config.intermediate_size_per_partition = (
+            self.intermediate_size_per_partition
+        )
+
         _validate_hpc_ops_quant_method(self.quant_method)
         _validate_deepep_v2_quant_method(self.quant_method)
         if (
@@ -661,7 +667,7 @@ class FusedMoE(torch.nn.Module):
         # This handles the case where the loaded weights are smaller than the padded expert_data
         # Use narrow_padded_param_and_loaded_weight for:
         # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 2. GPU with flashinfer_trtllm padding (intermediate_size padded to 128, or 64 for gated NVFP4)
         # 3. GPU with Aiter padding
         aiter_padded = (
             _use_aiter
@@ -1054,7 +1060,9 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        global_expert_location_metadata = get_global_expert_location_metadata()
+        global_expert_location_metadata = (
+            get_global_expert_location_metadata() if self.uses_expert_location else None
+        )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
