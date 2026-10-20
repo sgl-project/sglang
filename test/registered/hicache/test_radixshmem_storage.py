@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    SidecarPoolSpec,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -397,6 +398,7 @@ class TestRadixShmemStorage(CustomTestCase):
         ((storage, _),) = self._group(lambda r: _LogicalPool())
         side = _FlatPool(8, 48)
         storage.register_mem_host_pool_v2(side, PoolName.DEEPSEEK_V4_C4)
+        storage.describe_sidecar(SidecarPoolSpec(PoolName.DEEPSEEK_V4_C4, PoolName.KV))
         keys = _keys(3)
         side.page(1).fill_(5)
         transfer = PoolTransfer(
@@ -405,18 +407,21 @@ class TestRadixShmemStorage(CustomTestCase):
             keys=keys,
             indices_from_pool=PoolName.KV,
         )
+        got = storage.batch_set_v2([transfer], _info())
+        self.assertEqual(got, {PoolName.DEEPSEEK_V4_C4: [True] * 3})
         self.assertEqual(storage.batch_set_v1(keys, _idx(3), _info()), [True] * 3)
-        before = storage.batch_exists_v2(keys, [transfer], _info())
-        self.assertEqual(before.kv_hit_pages, 0)
-        storage.batch_set_v2([transfer], _info())
         result = storage.batch_exists_v2(keys, [transfer], _info())
         self.assertEqual(result.kv_hit_pages, 3)
         self.assertEqual(result.restorable_prefix_pages, [1, 2, 3])
         side.buf.zero_()
-        storage.batch_get_v2([transfer], _info())
+        self.assertEqual(storage.batch_get_v1(keys, _idx(3), _info()), [True] * 3)
         self.assertTrue(torch.all(side.page(1) == 5))
+        side.buf.zero_()
+        got = storage.batch_get_v2([transfer], _info())
+        self.assertEqual(got, {PoolName.DEEPSEEK_V4_C4: [True] * 3})
+        self.assertTrue(torch.all(side.page(1) == 0))
 
-    def test_swa_component_and_page_path_fallback(self):
+    def test_swa_component_and_unknown_window(self):
         keys = _keys(5)
         window = lambda: PoolTransfer(
             name=PoolName.SWA,
@@ -424,27 +429,30 @@ class TestRadixShmemStorage(CustomTestCase):
             keys=keys[3:5],
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
-        for pages in (2, 0):
-            self._new_server(swa_ratio=0.2 if pages else 0.0)
-            ((storage, _),) = self._group(
-                lambda r: _FlatPool(16, 64), radixshmem_swa_window_pages=pages
-            )
-            swa = _FlatPool(16, 32)
-            storage.register_mem_host_pool_v2(swa, PoolName.SWA)
-            storage.batch_set_v1(keys, _idx(5), _info())
-            kind = storage.pools[PoolName.SWA].kind
-            self.assertEqual(kind != storage.full, pages > 0)
-            swa.page(0).fill_(3)
-            swa.page(1).fill_(4)
-            got = storage.batch_set_v2([window()], _info(keys[:3]))
-            self.assertEqual(got, {PoolName.SWA: [True] * 2})
-            result = storage.batch_exists_v2(keys, [window()], _info())
-            self.assertEqual(result.restorable_prefix_pages, [5])
-            swa.buf.zero_()
-            got = storage.batch_get_v2([window()], _info(keys[:3]))
-            self.assertEqual(got, {PoolName.SWA: [True] * 2})
-            self.assertTrue(torch.all(swa.page(0) == 3))
-            self.assertTrue(torch.all(swa.page(1) == 4))
+        self._new_server(swa_ratio=0.2)
+        ((storage, _),) = self._group(
+            lambda r: _FlatPool(16, 64), radixshmem_swa_window_pages=2
+        )
+        swa = _FlatPool(16, 32)
+        storage.register_mem_host_pool_v2(swa, PoolName.SWA)
+        storage.batch_set_v1(keys, _idx(5), _info())
+        self.assertNotEqual(storage.pack_of[PoolName.SWA].kind, storage.full)
+        swa.page(0).fill_(3)
+        swa.page(1).fill_(4)
+        got = storage.batch_set_v2([window()], _info(keys[:3]))
+        self.assertEqual(got, {PoolName.SWA: [True] * 2})
+        result = storage.batch_exists_v2(keys, [window()], _info())
+        self.assertEqual(result.restorable_prefix_pages, [5])
+        swa.buf.zero_()
+        got = storage.batch_get_v2([window()], _info(keys[:3]))
+        self.assertEqual(got, {PoolName.SWA: [True] * 2})
+        self.assertTrue(torch.all(swa.page(0) == 3))
+        self.assertTrue(torch.all(swa.page(1) == 4))
+
+        ((storage, _),) = self._group(lambda r: _FlatPool(16, 64))
+        storage.register_mem_host_pool_v2(_FlatPool(16, 32), PoolName.SWA)
+        with self.assertRaises(ValueError):
+            storage.batch_exists(keys, _info())
 
     def test_mamba_component_across_tp_with_deferred_publish(self):
         self._new_server(mamba_ratio=0.2)
