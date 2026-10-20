@@ -52,9 +52,15 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
 
     @classmethod
     def setUpClass(cls):
+        token = os.environ.get("HF_MUSE_SPARK_TOKEN")
+        # GitHub does not expose this secret to pull_request runs from forks.
+        if not token and is_in_ci():
+            raise unittest.SkipTest(
+                "HF_MUSE_SPARK_TOKEN is unset; skipping the gated Muse Spark checkpoint."
+            )
         super().setUpClass()
         # Use the gated-model credential only in this test and its server children.
-        if token := os.environ.get("HF_MUSE_SPARK_TOKEN"):
+        if token:
             token_env = patch.dict(os.environ, {"HF_TOKEN": token})
             token_env.start()
             cls.addClassCleanup(token_env.stop)
