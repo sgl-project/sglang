@@ -1,6 +1,6 @@
-"""DeepSeek-V4.1-Flash + DSPARK accuracy on four GB300 GPUs: TRT-LLM bounded BCG.
+"""DeepSeek-V4.1-Flash + DSPARK accuracy on two GB300 GPUs: TRT-LLM bounded BCG.
 
-TP4 + EP4 with TRT-LLM varlen attention and decoder SWA bounded replay inside
+TP2 + EP2 with TRT-LLM varlen attention and decoder SWA bounded replay inside
 breakable prefill graphs.
 """
 
@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.dsv41_flash_common import DSV41FlashAccuracyMixin
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=600, stage="base-c", runner_config="2-gpu-gb300")
 
 
 class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):
@@ -20,7 +20,7 @@ class TestDSV41FlashTrtllmBoundedBCG(DSV41FlashAccuracyMixin, CustomTestCase):
         "--attn-dp-size",
         "1",
         "--ep-size",
-        "4",
+        "2",
         "--dsv4-attn-backend",
         "trtllm",
     ]
