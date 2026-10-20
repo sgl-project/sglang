@@ -130,6 +130,61 @@ def _decode_offload_enabled() -> bool:
         return False
 
 
+_DSV4_FULL_PACK = (
+    PoolName.DEEPSEEK_V4_C1,
+    PoolName.DEEPSEEK_V4_C1_INDEXER,
+    PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+    PoolName.DEEPSEEK_V4_C2,
+    PoolName.DEEPSEEK_V4_C2_INDEXER,
+    PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+    PoolName.DEEPSEEK_V4_C4,
+    PoolName.DEEPSEEK_V4_C4_ROPE,
+    PoolName.DEEPSEEK_V4_C4_INDEXER,
+    PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+    PoolName.DEEPSEEK_V4_C128,
+    PoolName.DEEPSEEK_V4_C128_ROPE,
+)
+_DSV4_SWA_PACK = (
+    PoolName.SWA,
+    PoolName.DEEPSEEK_V4_C4_STATE,
+    PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+    PoolName.DEEPSEEK_V4_C128_STATE,
+    PoolName.DRAFT_SWA,
+)
+
+
+class _Pack:
+    def __init__(self, name, members: List[_Pool], kind, mask: int, salt):
+        self.name = name
+        self.members = {m.name: m for m in members}
+        self.offsets: Dict[Any, int] = {}
+        offset = 0
+        for m in members:
+            self.offsets[m.name] = offset
+            offset += m.page_bytes
+        self.page_bytes = offset
+        self.slot_bytes = offset
+        self.sharded = False
+        self.writes = True
+        self.layout = None
+        self.offset = 0
+        self.kind = kind
+        self.mask = mask
+        self.salt = salt
+
+
+def _pack_salt(salt, packs: List[List[_Pool]]):
+    tag = ";".join("|".join(f"{m.name}:{m.page_bytes}" for m in p) for p in packs)
+    salts: Dict[int, int] = {}
+
+    def packed(pp_rank: int) -> int:
+        if pp_rank not in salts:
+            salts[pp_rank] = _salt(salt(pp_rank), tag)
+        return salts[pp_rank]
+
+    return packed
+
+
 def _as_comm(group, src: int):
     if group is None:
         return _Solo()
@@ -261,6 +316,8 @@ class RadixShmemStorage(HiCacheStorage):
         self.defer_s = float(cfg.get("radixshmem_defer_s", 60))
         self.host_pools: Dict[Any, Any] = {}
         self.pools: Dict[Any, _Pool] = {}
+        self.packs: Dict[Any, _Pack] = {}
+        self.pack_of: Dict[Any, _Pack] = {}
         self.client = None
         self.index = None
         self.slot_bytes = 0
@@ -544,14 +601,47 @@ class RadixShmemStorage(HiCacheStorage):
                 else self._make_pool(name, hp, anchor)
                 for name, hp in self.host_pools.items()
             }
+            packs = self._make_packs(anchor, pools)
+            packed = {name for pack in packs.values() for name in pack.members}
             sizes: Dict[Any, int] = {}
-            for p in pools.values():
+            for p in [
+                *packs.values(),
+                *(p for n, p in pools.items() if n not in packed),
+            ]:
                 sizes[p.kind] = max(sizes.get(p.kind, 0), p.slot_bytes)
             if sizes.get(self.full, 0) == 0:
                 raise RuntimeError("radixshmem: no registered host pool carries data")
+            self.packs = packs
+            self.pack_of = {
+                name: pack for pack in packs.values() for name in pack.members
+            }
             self.slot_bytes = sizes[self.full]
             self.kind_slot_bytes = sizes
             self.pools = pools
+
+    def _make_packs(self, anchor: _Pool, pools: Dict[Any, _Pool]) -> Dict[Any, _Pack]:
+        if anchor.page_bytes or self.tp_parts > 1 and not self.config.is_mla_model:
+            return {}
+        packs: Dict[Any, _Pack] = {}
+        full = [pools[n] for n in _DSV4_FULL_PACK if n in pools]
+        full += [
+            p for n, p in pools.items() if n in (PoolName.DRAFT, PoolName.DRAFT_INDEXER)
+        ]
+        swa = [pools[n] for n in _DSV4_SWA_PACK if n in pools]
+        use_swa = bool(
+            full and swa and swa[0].name == PoolName.SWA and self.swa_window_pages > 0
+        )
+        salt = _pack_salt(anchor.salt, [full, swa if use_swa else []])
+        if full:
+            packs["full"] = _Pack("full", full, self.full, self.full_mask, salt)
+        if use_swa:
+            kind, mask = self.components[PoolName.SWA]
+            packs["swa"] = _Pack("swa", swa, kind, mask, salt)
+        if any(
+            p.page_bytes == 0 for pack in packs.values() for p in pack.members.values()
+        ):
+            return {}
+        return packs
 
     def _ready(self) -> bool:
         self._plan()
@@ -649,8 +739,19 @@ class RadixShmemStorage(HiCacheStorage):
             info.geometry["pools"]["full"]["num_slots"],
             self.distributed,
             {
-                str(n): (str(p.kind), p.page_bytes, p.slot_bytes)
-                for n, p in self.pools.items()
+                **{
+                    str(n): (str(p.kind), p.page_bytes, p.slot_bytes)
+                    for n, p in self.pools.items()
+                    if n not in self.pack_of
+                },
+                **{
+                    f"pack:{k}": (
+                        str(p.kind),
+                        sorted(map(str, p.members)),
+                        p.slot_bytes,
+                    )
+                    for k, p in self.packs.items()
+                },
             },
         )
         self.index = index
@@ -683,7 +784,7 @@ class RadixShmemStorage(HiCacheStorage):
         for transfer in pool_transfers or []:
             if not restorable:
                 break
-            pool = self.pools[transfer.name]
+            pool = self.pack_of.get(transfer.name) or self.pools[transfer.name]
             if transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
                 pages = self._hit(pool, transfer.keys or keys, extra_info)
                 groups = pages // max(1, transfer.group_pages)
@@ -716,11 +817,40 @@ class RadixShmemStorage(HiCacheStorage):
     def batch_set_v2(self, transfers, extra_info=None) -> dict:
         self._require_prefix(extra_info)
         self._plan()
-        return {t.name: self._write_transfer(t, extra_info) for t in transfers}
+        out, rest = self._run_packs(transfers, extra_info, write=True)
+        out.update({t.name: self._write_transfer(t, extra_info) for t in rest})
+        return out
 
     def batch_get_v2(self, transfers, extra_info=None) -> dict:
         self._plan()
-        return {t.name: self._read_transfer(t, extra_info) for t in transfers}
+        out, rest = self._run_packs(transfers, extra_info, write=False)
+        out.update({t.name: self._read_transfer(t, extra_info) for t in rest})
+        return out
+
+    def _run_packs(self, transfers, extra_info, write: bool):
+        groups: Dict[Any, List[PoolTransfer]] = {}
+        rest = []
+        for t in transfers:
+            pack = self.pack_of.get(t.name)
+            if pack is None:
+                rest.append(t)
+            else:
+                groups.setdefault(pack.name, []).append(t)
+        out: Dict[Any, List[bool]] = {}
+        for name, group in groups.items():
+            pack = self.packs[name]
+            n = len(group[0].keys or ())
+            if any(len(t.keys or ()) != n for t in group) or (
+                write and len(group) != len(pack.members)
+            ):
+                for t in group:
+                    out[t.name] = [False] * len(t.keys or ())
+                continue
+            run = self._store_pack if write else self._load_pack
+            result = run(pack, group, extra_info)
+            for t in group:
+                out[t.name] = result
+        return out, rest
 
     def _write_transfer(self, transfer: PoolTransfer, extra_info) -> List[bool]:
         pool = self.pools[transfer.name]
@@ -1002,6 +1132,87 @@ class RadixShmemStorage(HiCacheStorage):
         )
         hit = ok.index(False) if False in ok else n
         return [True] * hit + [False] * (n - hit)
+
+    def _copy_pack(self, pack: _Pack, group, pairs, to_slot: bool) -> None:
+        for t in group:
+            member = pack.members[t.name]
+            ptrs, sizes = member.host_pool.get_page_buffer_meta(t.host_indices)
+            per = len(ptrs) // len(t.keys)
+            for i, slot in pairs:
+                at = (
+                    self._data_base
+                    + int(self.store.slot_offset(int(slot), pack.kind))
+                    + pack.offsets[t.name]
+                )
+                for j in range(i * per, (i + 1) * per):
+                    if to_slot:
+                        ctypes.memmove(at, ptrs[j], sizes[j])
+                    else:
+                        ctypes.memmove(ptrs[j], at, sizes[j])
+                    at += sizes[j]
+
+    def _store_pack(self, pack: _Pack, group, extra_info) -> List[bool]:
+        keys = group[0].keys
+        n = len(keys)
+        if n == 0:
+            return []
+        copy = lambda slots: self._copy_pack(pack, group, list(enumerate(slots)), True)
+        if pack.kind == self.full:
+            chain, start = self._chain(pack, keys, extra_info)
+
+            def publish(slots):
+                result = self.index.insert(
+                    chain, slots, start, True, component=self.full
+                )
+                ok = self._published(chain, slots, result)
+                if ok and self._deferred:
+                    self._publish_deferred()
+                return [ok] * n
+
+        else:
+            chain, _ = self._chain(pack, keys, extra_info)
+
+            def publish(slots):
+                return [self._publish_component(chain, slots, pack.kind)] * n
+
+        return self._write(pack, n, copy, publish)
+
+    def _load_pack(self, pack: _Pack, group, extra_info) -> List[bool]:
+        keys = group[0].keys
+        n = len(keys)
+        if n == 0:
+            return []
+        copy = lambda pairs: self._copy_pack(pack, group, pairs, False)
+        if pack.kind == self.full:
+            chain, start = self._chain(pack, keys, extra_info)
+
+            def fetch(finalizers):
+                slots, finalize = self._fetch(chain)
+                finalizers.append(finalize)
+                return slots[start : start + n]
+
+            ok = self._read(n, fetch, copy)
+            hit = ok.index(False) if False in ok else n
+            return [True] * hit + [False] * (n - hit)
+        chain, _ = self._chain(pack, keys, extra_info)
+        end = len(chain)
+
+        def fetch(finalizers):
+            slots = [-1] * n
+            result = self._pull(chain, self.full_mask | pack.mask)
+            if result is None:
+                return slots
+            finalizers.append(result.finalize)
+            if int(result.common_hit) != end:
+                return slots
+            window = np.asarray(result.swa_slots, dtype=np.int64)
+            for j in range(n):
+                at = end - n + j - int(result.swa_start)
+                if 0 <= at < len(window):
+                    slots[j] = int(window[at])
+            return slots
+
+        return self._read(n, fetch, copy)
 
     # ---- TRAILING_PAGES pools on the anchor path: SWA / MAMBA components ----
 
