@@ -417,8 +417,9 @@ pub struct GenerateRequest {
     pub session_id: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "34")]
     pub custom_logit_processor: ::core::option::Option<OptionalStringOrList>,
-    #[prost(message, optional, tag = "35")]
-    pub custom_labels: ::core::option::Option<CustomLabels>,
+    #[prost(map = "string, string", tag = "35")]
+    pub custom_labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, optional, tag = "36")]
     pub images_config: ::core::option::Option<ImagesConfig>,
     #[prost(bool, optional, tag = "37")]
@@ -438,13 +439,6 @@ pub struct ImagesConfig {
     pub image_mode: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "2")]
     pub prefix: ::core::option::Option<::prost::alloc::string::String>,
-}
-/// Preserve an explicitly empty label map, distinct from an absent map.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CustomLabels {
-    #[prost(map = "string, string", tag = "1")]
-    pub values:
-        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KvHintsEnvelopeOrList {

@@ -1643,8 +1643,12 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.custom_logit_processor {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "custom_logit_processor", v)?;
         }
-        if let Some(v) = &self.custom_labels {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "custom_labels", v)?;
+        if !self.custom_labels.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "custom_labels",
+                &self.custom_labels,
+            )?;
         }
         if let Some(v) = &self.images_config {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "images_config", v)?;
@@ -1954,7 +1958,15 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             if f_custom_labels.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("custom_labels"));
                             }
-                            f_custom_labels = Some(map.next_value::<Option<CustomLabels>>()?);
+                            f_custom_labels = Some(
+                                map.next_value::<Option<
+                                    ::std::collections::HashMap<
+                                        String,
+                                        ::prost::alloc::string::String,
+                                    >,
+                                >>()?
+                                .unwrap_or_default(),
+                            );
                         }
                         "images_config" => {
                             if f_images_config.is_some() {
@@ -2031,7 +2043,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     max_thinking_tokens: f_max_thinking_tokens.flatten(),
                     session_id: f_session_id.flatten(),
                     custom_logit_processor: f_custom_logit_processor.flatten(),
-                    custom_labels: f_custom_labels.flatten(),
+                    custom_labels: f_custom_labels.unwrap_or_default(),
                     images_config: f_images_config.flatten(),
                     return_prompt_token_ids: f_return_prompt_token_ids.flatten(),
                     routed_experts_start_len: f_routed_experts_start_len.flatten(),
@@ -2099,20 +2111,6 @@ impl<'de> ::serde::Deserialize<'de> for ImagesConfig {
             }
         }
         deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for CustomLabels {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.values.serialize(serializer)
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for CustomLabels {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(CustomLabels {
-            values: <::std::collections::HashMap<String, ::prost::alloc::string::String> as ::serde::Deserialize>::deserialize(deserializer)?,
-        })
     }
 }
 

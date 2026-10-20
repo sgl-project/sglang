@@ -81,7 +81,7 @@ message GenerateRequest {
   // Their presence in the wire contract does not imply native Rust support.
   optional string session_id = 33;
   OptionalStringOrList custom_logit_processor = 34;
-  CustomLabels custom_labels = 35;
+  map<string, string> custom_labels = 35;
   ImagesConfig images_config = 36;
   optional bool return_prompt_token_ids = 37;
   optional int64 routed_experts_start_len = 38;
@@ -94,12 +94,6 @@ message GenerateRequest {
 message ImagesConfig {
   optional string image_mode = 1;
   optional string prefix = 2;
-}
-
-// Preserve an explicitly empty label map, distinct from an absent map.
-message CustomLabels {
-  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_TRANSPARENT;
-  map<string, string> values = 1;
 }
 
 message KvHintsEnvelopeOrList {

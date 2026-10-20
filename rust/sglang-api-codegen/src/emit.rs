@@ -99,13 +99,10 @@ fn emit_transparent(out: &mut String, m: &MessageModel, field: &FieldModel) {
     let name = &m.rust_name;
     let ident = &field.rust_ident;
     let ty = match &field.kind {
-        FieldKind::OptScalar { ty, .. } => format!("Option<{}>", ty.rust()),
-        FieldKind::Message { rust_path, .. } => format!("Option<{rust_path}>"),
-        FieldKind::Map { value } => {
-            format!("::std::collections::HashMap<String, {}>", value.rust())
-        }
+        FieldKind::OptScalar { ty, .. } => ty.rust().to_string(),
+        FieldKind::Message { rust_path, .. } => rust_path.clone(),
         other => panic!(
-            "{name}: transparent field must be an optional scalar, message, or map, got {other:?}"
+            "{name}: transparent field must be an optional scalar or a message, got {other:?}"
         ),
     };
     out.push_str(&format!(
@@ -118,7 +115,7 @@ fn emit_transparent(out: &mut String, m: &MessageModel, field: &FieldModel) {
 impl<'de> ::serde::Deserialize<'de> for {name} {{
     fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {{
         Ok({name} {{
-            {ident}: <{ty} as ::serde::Deserialize>::deserialize(deserializer)?,
+            {ident}: <Option<{ty}> as ::serde::Deserialize>::deserialize(deserializer)?,
         }})
     }}
 }}

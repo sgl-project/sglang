@@ -269,7 +269,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     max_thinking_tokens: Optional[int] = None
     session_id: Optional[str] = None
     custom_logit_processor: Optional[OptionalStringOrList] = None
-    custom_labels: Optional[CustomLabels] = None
+    custom_labels: Dict[str, str] = {}
     images_config: Optional[ImagesConfig] = None
     return_prompt_token_ids: Optional[bool] = None
     routed_experts_start_len: Optional[int] = None
@@ -764,9 +764,6 @@ MatchedTokens = List[int]
 
 # sglang.api.v1.FinishReason: JSON object tagged by its type key; unknown tags pass through as a dict.
 FinishReason = Union[FinishStop, FinishLength, FinishAbort, Dict[str, Any]]
-
-# sglang.api.v1.CustomLabels: JSON: the wrapped value itself, null when unset.
-CustomLabels = Dict[str, str]
 
 # sglang.api.v1.OptionalKvHintsEnvelope: JSON: the wrapped value itself, null when unset.
 OptionalKvHintsEnvelope = Optional[KvHintsEnvelope]
@@ -1390,7 +1387,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "custom_logit_processor":
             kw["custom_logit_processor"] = None if x is None else decode_OptionalStringOrList(x)
         elif key == "custom_labels":
-            kw["custom_labels"] = None if x is None else decode_CustomLabels(x)
+            kw["custom_labels"] = {} if x is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(x, expected="a map").items()}
         elif key == "images_config":
             kw["images_config"] = None if x is None else decode_ImagesConfig(x)
         elif key == "return_prompt_token_ids":
@@ -1472,8 +1469,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["session_id"] = v.session_id
     if v.custom_logit_processor is not None:
         d["custom_logit_processor"] = encode_OptionalStringOrList(v.custom_logit_processor)
-    if v.custom_labels is not None:
-        d["custom_labels"] = encode_CustomLabels(v.custom_labels)
+    if v.custom_labels:
+        d["custom_labels"] = dict(v.custom_labels)
     if v.images_config is not None:
         d["images_config"] = encode_ImagesConfig(v.images_config)
     if v.return_prompt_token_ids is not None:
@@ -1505,14 +1502,6 @@ def encode_ImagesConfig(v: ImagesConfig) -> Dict[str, Any]:
     if v.prefix is not None:
         d["prefix"] = v.prefix
     return d
-
-
-def decode_CustomLabels(value: Any) -> CustomLabels:
-    return {} if value is None else {k: _expect_str(e, expected="a string") for k, e in _expect_map(value, expected="a map").items()}
-
-
-def encode_CustomLabels(v: CustomLabels) -> Any:
-    return dict(v)
 
 
 def decode_KvHintsEnvelopeOrList(value: Any) -> KvHintsEnvelopeOrList:

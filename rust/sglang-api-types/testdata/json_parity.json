@@ -3,6 +3,24 @@
   "cases": [
     {
       "type": "GenerateRequest",
+      "name": "empty custom labels are omitted",
+      "input": {
+        "custom_labels": {}
+      },
+      "canonical": "{\"stream\":false}"
+    },
+    {
+      "type": "GenerateRequest",
+      "name": "custom labels retain string values",
+      "input": {
+        "custom_labels": {
+          "tenant": "team"
+        }
+      },
+      "canonical": "{\"stream\":false,\"custom_labels\":{\"tenant\":\"team\"}}"
+    },
+    {
+      "type": "GenerateRequest",
       "name": "typed image options retain mode and prefix",
       "input": {
         "images_config": {

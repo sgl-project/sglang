@@ -39,8 +39,7 @@ enum MessageShape {
 
   // A single-field message that is invisible in JSON: it serializes as its
   // sole field's value (null when unset). Exists to give proto a presence
-  // wrapper for nullable LIST ELEMENTS (OptionalString, OptionalInt64) or
-  // an explicitly present map (including an empty map).
+  // wrapper for nullable LIST ELEMENTS (OptionalString, OptionalInt64).
   MESSAGE_SHAPE_TRANSPARENT = 3;
 }
 
