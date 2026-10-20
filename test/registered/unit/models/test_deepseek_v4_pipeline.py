@@ -43,7 +43,9 @@ class TestPipelineCompletion(unittest.TestCase):
                         ffn_hc=object(),
                         attn_hc=object(),
                         self_attn=SimpleNamespace(
-                            attn_tp_size=2, accepts_mxfp8_swizzled_input=lambda: False
+                            attn_tp_size=2,
+                            accepts_mxfp8_swizzled_input=lambda: False,
+                            dsv41_ll_chain=None,
                         ),
                         engram=None,
                         input_layernorm=fixture.Norm(),
