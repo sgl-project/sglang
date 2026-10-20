@@ -112,21 +112,22 @@ def _kernel_placement(monkeypatch, runner_config):
     monkeypatch.setattr(flashinfer_cutlass, "_activation_type", lambda config: None)
 
     hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
-    flashinfer_cutlass._run_flashinfer_cutlass(
-        dispatch_output=SimpleNamespace(
-            hidden_states=hidden_states,
-            hidden_states_scale=None,
-            topk_output=SimpleNamespace(
-                topk_weights=torch.ones(2, 1),
-                topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+    with get_context().override_server_args(model_path="dummy"):
+        flashinfer_cutlass._run_flashinfer_cutlass(
+            dispatch_output=SimpleNamespace(
+                hidden_states=hidden_states,
+                hidden_states_scale=None,
+                topk_output=SimpleNamespace(
+                    topk_weights=torch.ones(2, 1),
+                    topk_ids=torch.zeros(2, 1, dtype=torch.int64),
+                ),
             ),
-        ),
-        quant_info=FlashInferCutlassMoeQuantInfo(
-            quant_type="bf16", w13_weight=torch.zeros(1), w2_weight=torch.zeros(1)
-        ),
-        runner_config=runner_config,
-        output=torch.empty_like(hidden_states),
-    )
+            quant_info=FlashInferCutlassMoeQuantInfo(
+                quant_type="bf16", w13_weight=torch.zeros(1), w2_weight=torch.zeros(1)
+            ),
+            runner_config=runner_config,
+            output=torch.empty_like(hidden_states),
+        )
     (call,) = calls
     return (call["tp_size"], call["tp_rank"], call["ep_size"], call["ep_rank"])
 
