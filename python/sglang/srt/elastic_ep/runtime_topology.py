@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
@@ -15,6 +16,8 @@ _RUNTIME_TOPOLOGY_KEY = "elastic_ep/runtime_topology"
 _MEMBERSHIP_OBSERVATION_KEY_PREFIX = "elastic_ep/membership_observation"
 _MEMBERSHIP_EPOCH_KEY_PREFIX = "elastic_ep/membership_epoch"
 _MEMBERSHIP_LATEST_KEY_PREFIX = "elastic_ep/membership_latest"
+_MEMBERSHIP_SLOT_KEY_PREFIX = "elastic_ep/membership_slot"
+_MEMBERSHIP_PUBLICATION_LOCK = threading.RLock()
 
 
 class ElasticEPRecoveryRequiredError(RuntimeError):
@@ -108,13 +111,31 @@ def _membership_latest_key(observation: MembershipObservation) -> str:
     )
 
 
+def _membership_slot_key(observation: MembershipObservation) -> str:
+    return (
+        f"{_MEMBERSHIP_SLOT_KEY_PREFIX}/"
+        f"{quote(observation.runtime_instance_id, safe='')}/"
+        f"{observation.topology_generation}/{observation.rank}"
+    )
+
+
+def _membership_incarnation_key(observation: MembershipObservation) -> str:
+    return (
+        f"{_MEMBERSHIP_SLOT_KEY_PREFIX}/seen/"
+        f"{quote(observation.runtime_instance_id, safe='')}/"
+        f"{observation.topology_generation}/{observation.rank}/"
+        f"{quote(observation.failed_allocation_incarnation, safe='')}"
+    )
+
+
 def publish_membership_observation(
     observation: MembershipObservation,
 ) -> str:
     """Publish one CPU-only, monotonic membership observation.
 
-    The compare-set keys make duplicate observations idempotently rejectable,
-    while the epoch watermark rejects stale and ABA observations.
+    Publication is serialized so the per-slot incarnation and latest snapshot
+    cannot be observed halfway through an update. Compare-set keys reject
+    duplicates, while the epoch watermark rejects stale and ABA observations.
     """
     topology = get_runtime_topology()
     if topology is None:
@@ -124,25 +145,36 @@ def publish_membership_observation(
     if store is None:
         raise RuntimeError("Elastic EP requires the global TCPStore.")
 
-    observation_key = _membership_observation_key(observation)
-    encoded = json.dumps(asdict(observation), sort_keys=True).encode()
-    if store.check([observation_key]):
-        raise ValueError("Duplicate Elastic EP membership observation.")
-    epoch_key = _membership_epoch_key(observation)
-    if store.check([epoch_key]):
-        previous_epoch = int(store.get(epoch_key).decode())
-        if observation.membership_epoch <= previous_epoch:
-            raise ValueError("Stale or ABA Elastic EP membership observation.")
-    if hasattr(store, "compare_set"):
-        existing = store.compare_set(observation_key, b"", encoded)
-        if existing != encoded:
+    with _MEMBERSHIP_PUBLICATION_LOCK:
+        observation_key = _membership_observation_key(observation)
+        encoded = json.dumps(asdict(observation), sort_keys=True).encode()
+        if store.check([observation_key]):
             raise ValueError("Duplicate Elastic EP membership observation.")
-        store.set(epoch_key, str(observation.membership_epoch).encode())
-    else:
-        store.set(observation_key, encoded)
-        store.set(epoch_key, str(observation.membership_epoch).encode())
-    store.set(_membership_latest_key(observation), encoded)
-    return observation_key
+        epoch_key = _membership_epoch_key(observation)
+        slot_key = _membership_slot_key(observation)
+        incarnation_key = _membership_incarnation_key(observation)
+        if store.check([incarnation_key]):
+            current = json.loads(store.get(slot_key).decode())
+            if current["failed_allocation_incarnation"] != (
+                observation.failed_allocation_incarnation
+            ):
+                raise ValueError("Stale or ABA Elastic EP membership observation.")
+        if store.check([epoch_key]):
+            previous_epoch = int(store.get(epoch_key).decode())
+            if observation.membership_epoch <= previous_epoch:
+                raise ValueError("Stale or ABA Elastic EP membership observation.")
+        if hasattr(store, "compare_set"):
+            existing = store.compare_set(observation_key, b"", encoded)
+            if existing != encoded:
+                raise ValueError("Duplicate Elastic EP membership observation.")
+            store.set(epoch_key, str(observation.membership_epoch).encode())
+        else:
+            store.set(observation_key, encoded)
+            store.set(epoch_key, str(observation.membership_epoch).encode())
+        store.set(incarnation_key, b"1")
+        store.set(slot_key, encoded)
+        store.set(_membership_latest_key(observation), encoded)
+        return observation_key
 
 
 def get_membership_observation() -> Optional[MembershipObservation]:
