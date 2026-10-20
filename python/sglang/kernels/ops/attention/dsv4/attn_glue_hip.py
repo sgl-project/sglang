@@ -222,6 +222,60 @@ def low_ratio_compression_metadata(
 
 
 @triton.jit
+def _expand_same_length_kernel(
+    seq_lens_ptr,
+    req_pool_ptr,
+    seq_lens_out_ptr,
+    req_pool_out_ptr,
+    num_tokens,
+    qo_len,
+    offset,
+    BLOCK: tl.constexpr,
+):
+    t = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = t < num_tokens
+    r = t // qo_len
+    seq_len = tl.load(seq_lens_ptr + r, mask=m, other=0)
+    tl.store(
+        seq_lens_out_ptr + t,
+        seq_len + (offset - qo_len + 1) + t % qo_len,
+        mask=m,
+    )
+    tl.store(req_pool_out_ptr + t, tl.load(req_pool_ptr + r, mask=m, other=0), mask=m)
+
+
+def expand_same_length(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    qo_len: int,
+    offset: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Every request's qo_len rows, one launch: row t of request r sees
+    seq_lens[r] + offset - qo_len + 1 + t % qo_len keys (its causal length, in
+    seq_lens' dtype) and reads req_pool_indices[r]."""
+    bs = seq_lens.shape[0]
+    assert req_pool_indices.shape[0] == bs and seq_lens.is_contiguous()
+    num_tokens = bs * qo_len
+    seq_lens_out = torch.empty(num_tokens, dtype=seq_lens.dtype, device=seq_lens.device)
+    req_pool_out = torch.empty(
+        num_tokens, dtype=req_pool_indices.dtype, device=req_pool_indices.device
+    )
+    if num_tokens:
+        block = 256
+        _expand_same_length_kernel[(triton.cdiv(num_tokens, block),)](
+            seq_lens,
+            req_pool_indices.contiguous(),
+            seq_lens_out,
+            req_pool_out,
+            num_tokens,
+            qo_len,
+            offset,
+            BLOCK=block,
+        )
+    return seq_lens_out, req_pool_out
+
+
+@triton.jit
 def _sparse_buffers_kernel(
     c4_clamp1_ptr,
     c4_raw_ptr,

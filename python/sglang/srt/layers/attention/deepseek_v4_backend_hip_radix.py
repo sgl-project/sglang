@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
+    expand_same_length,
     low_ratio_compression_metadata,
     mask_indices_by_length,
     page_table_from_req_to_token,
@@ -1479,8 +1480,9 @@ class DeepseekV4HipRadixBackend(
             self.expand_extend_with_same_length(
                 bs=batch_size,
                 qo_len=block_size,
-                seq_lens=seq_lens + block_size,
+                seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
+                seq_lens_offset=block_size,
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -3526,16 +3528,14 @@ class DeepseekV4HipRadixBackend(
         qo_len: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seq_lens_offset: int = 0,
     ):
-        seq_lens_casual = seq_lens[:, None] + torch.arange(
-            -qo_len + 1, 1, **self.cuda_int32_kwargs
+        """Each request's qo_len rows, one launch: their causal lengths (of
+        seq_lens + seq_lens_offset) and request slots."""
+        assert seq_lens.shape[0] == bs
+        return expand_same_length(
+            seq_lens, req_pool_indices, qo_len, offset=seq_lens_offset
         )
-        seq_lens_casual = seq_lens_casual.flatten()
-        idx_to_req_repeated = torch.arange(
-            bs, **self.cuda_int32_kwargs
-        ).repeat_interleave(qo_len)
-        req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
-        return seq_lens_casual, req_pool_indices_repeated
 
     def make_core_attn_metadata(
         self,
