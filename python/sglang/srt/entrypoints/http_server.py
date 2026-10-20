@@ -1194,9 +1194,12 @@ async def get_hicache_l3_cache_layout():
     from sglang.srt.mem_cache.l3_layout import disabled_l3_layout, merge_l3_layouts
 
     layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
-    return merge_l3_layouts(layouts) or disabled_l3_layout(
-        "No scheduler layout replies"
-    )
+    merged = merge_l3_layouts(layouts)
+    if ((merged or {}).get("hicache_object_layout") or {}).get("pp_size", 1) > 1:
+        # Only pp rank 0 replies here; the startup info already merged every stage.
+        info = getattr(_global_state, "scheduler_info", None) or {}
+        merged = info.get("hicache_object_layout", merged)
+    return merged or disabled_l3_layout("No scheduler layout replies")
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

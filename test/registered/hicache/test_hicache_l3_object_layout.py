@@ -198,7 +198,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
                 self.assertEqual(
                     reply.layout["enabled"],
-                    hierarchical and backend is not None and pp_size == 1 and mla,
+                    hierarchical and backend is not None and mla,
                 )
                 if not reply.layout["enabled"]:
                     self.assertTrue(reply.layout["reason"])
@@ -507,10 +507,10 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             [{"pool": "kv", "suffixes": ["__k"], "hit_policy": "all_pages"}],
         )
 
-    def test_pp_layout_is_disabled_even_when_rank_zero_is_queried(self):
+    def test_pp_stage_layout_uses_its_own_stage_suffixes(self):
         store = self._store(
-            mla_suffix="0",
-            pp_rank=0,
+            mla_suffix="1",
+            pp_rank=1,
             pp_size=2,
             registered=(PoolName.DEEPSEEK_V4_C4,),
         )
@@ -524,11 +524,19 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         )
 
         object_layout = layout["hicache_object_layout"]
-        self.assertEqual(object_layout["pools"], [])
-        self.assertEqual(object_layout["pp_rank"], 0)
+        self.assertTrue(layout["enabled"])
+        self.assertEqual(object_layout["pp_rank"], 1)
         self.assertEqual(object_layout["pp_size"], 2)
-        self.assertFalse(layout["enabled"])
-        self.assertTrue(layout["reason"])
+        self.assertEqual(
+            object_layout["pools"],
+            [
+                {
+                    "pool": "deepseek_v4_c4",
+                    "suffixes": ["_1_deepseek_v4_c4"],
+                    "hit_policy": "all_pages",
+                }
+            ],
+        )
 
     @staticmethod
     def _controller(controller_type):
@@ -712,26 +720,119 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         controller._record_scheduler_init_infos([legacy_reply, legacy_reply])
         self.assertNotIn("hicache_object_layout", controller.get_init_info())
 
-    def test_pp_stage_replies_keep_rank_local_metadata(self):
-        """PP stages differ only in pp_rank, so the disabled reply must survive merging."""
+    def _stage_store(self, rank, size=2, *, mla=True):
+        store = self._store(
+            mla_suffix=str(rank),
+            pp_rank=rank,
+            pp_size=size,
+            registered=(PoolName.INDEXER,),
+        )
+        store.is_mla_backend = mla
+        return store
 
-        def merged(*stores):
-            controller = self._controller(dp_controller.DataParallelController)
-            for store in stores:
-                reply = self._scheduler(store).get_init_info()
-                controller._record_scheduler_init_infos([reply])
-            return controller.get_init_info()["hicache_object_layout"]
+    def _merged(self, *stores):
+        controller = self._controller(dp_controller.DataParallelController)
+        for store in stores:
+            reply = self._scheduler(store).get_init_info()
+            controller._record_scheduler_init_infos([reply])
+        return controller.get_init_info()["hicache_object_layout"]
 
-        layout = merged(
-            self._store(pp_rank=0, pp_size=2), self._store(pp_rank=1, pp_size=2)
+    def test_pp_stage_replies_merge_into_one_complete_layout(self):
+        """Each PP stage reports its own suffixes; the merge must cover all stages."""
+        stages = (self._stage_store(0), self._stage_store(1))
+        for replicas in (stages, stages * 2):
+            with self.subTest(replies=len(replicas)):
+                layout = self._merged(*replicas)
+                inner = layout["hicache_object_layout"]
+                self.assertTrue(layout["enabled"])
+                self.assertEqual(inner["pp_size"], 2)
+                self.assertIsNone(inner["pp_rank"])
+                self.assertEqual(
+                    [s for pool in inner["pools"] for s in pool["suffixes"]],
+                    ["_0_indexer", "_1_indexer"],
+                )
+
+    def test_missing_or_conflicting_pp_stages_are_unavailable(self):
+        """A layout that cannot cover every stage must never be advertised."""
+        layout = self._merged(self._stage_store(0))
+        self.assertFalse(layout["enabled"])
+        self.assertIn("Incomplete", layout["reason"])
+        # The rank-local details survive so consumers can fall back.
+        self.assertEqual(layout["hicache_object_layout"]["pp_size"], 2)
+        self.assertEqual(layout["hicache_object_layout"]["pools"], [])
+        layout = self._merged(self._stage_store(1))
+        self.assertIn("Incomplete", layout["reason"])
+        layout = self._merged(self._stage_store(0), self._stage_store(1, size=3))
+        self.assertIn("Inconsistent", layout["reason"])
+        disagreeing = self._stage_store(0)
+        disagreeing.registered_pools[PoolName.DEEPSEEK_V4_C4] = self._host_pool()
+        layout = self._merged(self._stage_store(0), disagreeing)
+        self.assertIn("Inconsistent", layout["reason"])
+
+    def test_mha_pp_stages_keep_rank_local_metadata(self):
+        layout = self._merged(
+            self._stage_store(0, mla=False), self._stage_store(1, mla=False)
         )
         self.assertFalse(layout["enabled"])
         self.assertEqual(layout["hicache_object_layout"]["pp_size"], 2)
-        self.assertTrue(layout["hicache_object_layout"]["is_mla_backend"])
-        layout = merged(
-            self._store(pp_rank=0, pp_size=2), self._store(pp_rank=1, pp_size=3)
+        self.assertFalse(layout["hicache_object_layout"]["is_mla_backend"])
+
+    def test_scheduler_infos_share_the_merged_layout(self):
+        """Any startup info must be representative, whichever one a consumer reads."""
+        from sglang.srt.mem_cache.l3_layout import merge_scheduler_info_layouts
+
+        infos = [
+            self._scheduler(self._stage_store(rank)).get_init_info() for rank in (0, 1)
+        ]
+        merge_scheduler_info_layouts(infos)
+        self.assertTrue(infos[0]["hicache_object_layout"]["enabled"])
+        # Merging a merged layout again (DP controller, then engine) must be a no-op.
+        before = infos[0]["hicache_object_layout"]
+        merge_scheduler_info_layouts([dict(infos[0])])
+        self.assertEqual(infos[0]["hicache_object_layout"], before)
+        self.assertIs(
+            infos[0]["hicache_object_layout"], infos[1]["hicache_object_layout"]
         )
-        self.assertIn("Inconsistent", layout["reason"])
+        self.assertEqual(
+            [
+                s
+                for pool in infos[0]["hicache_object_layout"]["hicache_object_layout"][
+                    "pools"
+                ]
+                for s in pool["suffixes"]
+            ],
+            ["_0_indexer", "_1_indexer"],
+        )
+        legacy = [{"max_total_num_tokens": 1}, {"max_total_num_tokens": 1}]
+        merge_scheduler_info_layouts(legacy)
+        self.assertNotIn("hicache_object_layout", legacy[0])
+
+    def test_endpoint_uses_the_startup_merge_for_pp(self):
+        """Only pp rank 0 answers control requests, so the endpoint needs the merge."""
+        from sglang.srt.entrypoints import http_server
+
+        startup = self._merged(self._stage_store(0), self._stage_store(1))
+        stage_zero = self._scheduler(self._stage_store(0))
+
+        async def communicate(req):
+            return [stage_zero.get_hicache_l3_cache_layout(req)]
+
+        manager = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            get_hicache_l3_cache_layout_communicator=communicate,
+        )
+
+        async def collect():
+            return await TokenizerControlMixin.get_hicache_l3_cache_layout(manager)
+
+        manager.get_hicache_l3_cache_layout = collect
+        state = SimpleNamespace(
+            tokenizer_manager=manager,
+            scheduler_info={"hicache_object_layout": startup},
+        )
+        with patch.object(http_server, "_global_state", state):
+            layout = asyncio.run(http_server.get_hicache_l3_cache_layout())
+        self.assertEqual(layout, startup)
 
     def test_ray_actor_replies_reach_engine_init_info(self):
         """Ray actor replies must survive both controller and parent handshakes."""

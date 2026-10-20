@@ -107,6 +107,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.mem_cache.l3_layout import merge_scheduler_info_layouts
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -999,6 +1000,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     ),
                     key=lambda source: source["dp_rank"],
                 )
+            merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)
             if use_dp_controller and not prelaunch_dp_schedulers:
                 for info in infos:

@@ -803,12 +803,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "pp_size": self.pp_size,
             },
         }
-        # Keys embed the pp/tp rank here and one scheduler cannot list every rank's
-        # objects, so these stay unsupported until the layout enumerates ranks.
-        if self.pp_size != 1 or not self.is_mla_backend:
+        # MHA keys embed the tp rank, which one scheduler cannot enumerate. MLA keys
+        # only embed the pp stage; merge_l3_layouts joins the stages.
+        if not self.is_mla_backend:
             layout.update(
                 enabled=False,
-                reason="External L3 lookup requires single-PP rank-replicated/MLA pools",
+                reason="External L3 lookup requires rank-replicated/MLA pools",
             )
             return layout
 
