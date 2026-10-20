@@ -86,6 +86,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
+            enable_overlap=False,
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
@@ -533,7 +534,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             queue=[], retracted_queue=[object()]
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], has_pending_deferred_releases=lambda: False
+        )
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
