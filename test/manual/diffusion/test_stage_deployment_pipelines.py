@@ -75,15 +75,15 @@ def test_external_contracts_match_monolithic(model, num_frames):
             prompt="A mountain landscape in daylight",
             negative_prompt="",
             width=width,
-            height=256,
+            height=256 if num_frames > 1 else 512,
             num_frames=num_frames,
-            num_inference_steps=2,
-            seed=42,
+            num_inference_steps=2 + 2 * index,
+            seed=42 + index,
             quality="exact",
             save_output=False,
             return_file_paths_only=False,
         )
-        for width in (256, 320)
+        for index, width in enumerate((256, 320) if num_frames > 1 else (512, 640))
     ]
     prepared, expected = [], []
     with DiffGenerator.from_pretrained(
