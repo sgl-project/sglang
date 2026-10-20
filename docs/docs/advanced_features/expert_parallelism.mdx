@@ -179,7 +179,9 @@ This design supports multiple backends via `--moe-a2a-backend` and `--moe-runner
           |             quant_method.apply -> MoeRunner.run
           |                     |              |
           |                     |              v
-          |                     | fused func, or pre-permute + grouped_gemm + post-permute
+          |                     | fused func
+          |                     | or DispatchMoeRunnerCore.run_from_dispatch
+          |                     | or pre-permute + grouped_gemm + post-permute
           |                     |              |
           |                     |--------------
           |                     v

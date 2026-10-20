@@ -323,7 +323,7 @@ Paths in this table are relative to `python/sglang/srt/layers/layer_boundary/`.
 | `residual/add_norm.py`, `residual/mhc.py` | Plain add/norm and MHC read/update implementations |
 | `residual/ihc.py`, `residual/gated.py` | Gated and gated-injection hyper-connection read/update implementations |
 | `residual/post_norm.py` | Post-norm residual: each stage's output is normalized before it is added |
-| `residual/attn_bank.py` | A residual read that aggregates a bank of snapshots of itself |
+| `residual/attn_bank.py` | A residual read that aggregates a bank of residual snapshots |
 | `residual/short_conv.py` | Deferred channelwise convolution followed by residual add and normalization |
 | `adapters/` | Attention input, TBO, branches, and LoRA integration |
 | `fusions/` | Consumer all-reduce fusion and CuteDSL integration |
