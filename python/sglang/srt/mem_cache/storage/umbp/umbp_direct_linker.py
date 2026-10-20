@@ -4,7 +4,6 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any, Callable
@@ -211,7 +210,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             extra_config = _parse_storage_extra_config(
                 get_memory().hicache_storage_backend_extra_config
             )
-        extra_config = deepcopy(extra_config)
+        extra_config = dict(extra_config)
         standalone_requested = bool(
             extra_config.get("standalone_address")
             or os.getenv("UMBP_STANDALONE_ADDRESS")
