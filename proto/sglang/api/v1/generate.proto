@@ -83,17 +83,17 @@ message GenerateRequest {
   OptionalStringOrList custom_logit_processor = 34;
   map<string, string> custom_labels = 35;
   ImagesConfig images_config = 36;
-  optional bool return_prompt_token_ids = 37;
-  optional int64 routed_experts_start_len = 38;
+  bool return_prompt_token_ids = 37;
+  int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
   OptionalStringList modalities = 40;
 }
 
 // Per-request Unlimited-OCR options. The processor owns mode validation and
-// defaults: an absent image_mode uses "gundam", an absent prefix adds no tokens.
+// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.
 message ImagesConfig {
   optional string image_mode = 1;
-  optional string prefix = 2;
+  string prefix = 2;
 }
 
 message KvHintsEnvelopeOrList {

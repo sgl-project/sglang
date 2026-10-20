@@ -422,23 +422,23 @@ pub struct GenerateRequest {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, optional, tag = "36")]
     pub images_config: ::core::option::Option<ImagesConfig>,
-    #[prost(bool, optional, tag = "37")]
-    pub return_prompt_token_ids: ::core::option::Option<bool>,
-    #[prost(int64, optional, tag = "38")]
-    pub routed_experts_start_len: ::core::option::Option<i64>,
+    #[prost(bool, tag = "37")]
+    pub return_prompt_token_ids: bool,
+    #[prost(int64, tag = "38")]
+    pub routed_experts_start_len: i64,
     #[prost(message, optional, tag = "39")]
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
 }
 /// Per-request Unlimited-OCR options. The processor owns mode validation and
-/// defaults: an absent image_mode uses "gundam", an absent prefix adds no tokens.
+/// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ImagesConfig {
     #[prost(string, optional, tag = "1")]
     pub image_mode: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(string, optional, tag = "2")]
-    pub prefix: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub prefix: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct KvHintsEnvelopeOrList {

@@ -271,8 +271,8 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     custom_logit_processor: Optional[OptionalStringOrList] = None
     custom_labels: Dict[str, str] = {}
     images_config: Optional[ImagesConfig] = None
-    return_prompt_token_ids: Optional[bool] = None
-    routed_experts_start_len: Optional[int] = None
+    return_prompt_token_ids: bool = False
+    routed_experts_start_len: int = 0
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
 
@@ -290,7 +290,7 @@ class ImagesConfig(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ImagesConfig: JSON object (unknown keys ignored)."""
 
     image_mode: Optional[str] = None
-    prefix: Optional[str] = None
+    prefix: str = ""
 
     @classmethod
     def from_json_value(cls, value: Any) -> "ImagesConfig":
@@ -1391,9 +1391,9 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "images_config":
             kw["images_config"] = None if x is None else decode_ImagesConfig(x)
         elif key == "return_prompt_token_ids":
-            kw["return_prompt_token_ids"] = None if x is None else _expect_bool(x, expected="a boolean")
+            kw["return_prompt_token_ids"] = _expect_bool(x, expected="a boolean")
         elif key == "routed_experts_start_len":
-            kw["routed_experts_start_len"] = None if x is None else _expect_int(x, expected="i64")
+            kw["routed_experts_start_len"] = _expect_int(x, expected="i64")
         elif key == "return_sampling_mask":
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
@@ -1473,10 +1473,8 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["custom_labels"] = dict(v.custom_labels)
     if v.images_config is not None:
         d["images_config"] = encode_ImagesConfig(v.images_config)
-    if v.return_prompt_token_ids is not None:
-        d["return_prompt_token_ids"] = v.return_prompt_token_ids
-    if v.routed_experts_start_len is not None:
-        d["routed_experts_start_len"] = v.routed_experts_start_len
+    d["return_prompt_token_ids"] = v.return_prompt_token_ids
+    d["routed_experts_start_len"] = v.routed_experts_start_len
     if v.return_sampling_mask is not None:
         d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
     if v.modalities is not None:
@@ -1491,7 +1489,7 @@ def decode_ImagesConfig(value: Any) -> ImagesConfig:
         if key == "image_mode":
             kw["image_mode"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "prefix":
-            kw["prefix"] = None if x is None else _expect_str(x, expected="a string")
+            kw["prefix"] = _expect_str(x, expected="a string")
     return ImagesConfig(**kw)
 
 
@@ -1499,8 +1497,7 @@ def encode_ImagesConfig(v: ImagesConfig) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     if v.image_mode is not None:
         d["image_mode"] = v.image_mode
-    if v.prefix is not None:
-        d["prefix"] = v.prefix
+    d["prefix"] = v.prefix
     return d
 
 

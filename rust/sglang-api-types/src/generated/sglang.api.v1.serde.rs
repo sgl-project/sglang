@@ -1653,12 +1653,16 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.images_config {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "images_config", v)?;
         }
-        if let Some(v) = &self.return_prompt_token_ids {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "return_prompt_token_ids", v)?;
-        }
-        if let Some(v) = &self.routed_experts_start_len {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routed_experts_start_len", v)?;
-        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_prompt_token_ids",
+            &self.return_prompt_token_ids,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "routed_experts_start_len",
+            &self.routed_experts_start_len,
+        )?;
         if let Some(v) = &self.return_sampling_mask {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "return_sampling_mask", v)?;
         }
@@ -1980,7 +1984,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                                     "return_prompt_token_ids",
                                 ));
                             }
-                            f_return_prompt_token_ids = Some(map.next_value::<Option<bool>>()?);
+                            f_return_prompt_token_ids = Some(map.next_value::<bool>()?);
                         }
                         "routed_experts_start_len" => {
                             if f_routed_experts_start_len.is_some() {
@@ -1988,7 +1992,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                                     "routed_experts_start_len",
                                 ));
                             }
-                            f_routed_experts_start_len = Some(map.next_value::<Option<i64>>()?);
+                            f_routed_experts_start_len = Some(map.next_value::<i64>()?);
                         }
                         "return_sampling_mask" => {
                             if f_return_sampling_mask.is_some() {
@@ -2045,8 +2049,8 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     custom_logit_processor: f_custom_logit_processor.flatten(),
                     custom_labels: f_custom_labels.unwrap_or_default(),
                     images_config: f_images_config.flatten(),
-                    return_prompt_token_ids: f_return_prompt_token_ids.flatten(),
-                    routed_experts_start_len: f_routed_experts_start_len.flatten(),
+                    return_prompt_token_ids: f_return_prompt_token_ids.unwrap_or_default(),
+                    routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
                 })
@@ -2062,9 +2066,7 @@ impl ::serde::Serialize for ImagesConfig {
         if let Some(v) = &self.image_mode {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_mode", v)?;
         }
-        if let Some(v) = &self.prefix {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prefix", v)?;
-        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "prefix", &self.prefix)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2096,8 +2098,7 @@ impl<'de> ::serde::Deserialize<'de> for ImagesConfig {
                             if f_prefix.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("prefix"));
                             }
-                            f_prefix =
-                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                            f_prefix = Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
@@ -2106,7 +2107,7 @@ impl<'de> ::serde::Deserialize<'de> for ImagesConfig {
                 }
                 Ok(ImagesConfig {
                     image_mode: f_image_mode.flatten(),
-                    prefix: f_prefix.flatten(),
+                    prefix: f_prefix.unwrap_or_default(),
                 })
             }
         }
