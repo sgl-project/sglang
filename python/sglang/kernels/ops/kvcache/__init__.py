@@ -129,11 +129,3 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )
-register_kernel(
-    KernelSpec(
-        op="kvcache.update_kpool_write_plan_triton_npu",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.kvcache.kpool_index_npu:update_kpool_write_plan_triton_npu",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)

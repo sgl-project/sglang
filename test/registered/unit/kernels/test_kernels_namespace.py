@@ -181,10 +181,8 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.speculative.row_argmax', "
         "'sglang.kernels.ops.attention.kpool_bf16_index', "
         "'sglang.kernels.ops.attention.kpool_decode_prepare_indexer', "
-        "'sglang.kernels.ops.attention.kpool_lightning_indexer', "
         "'sglang.kernels.ops.attention.kpool_topk_npu', "
         "'sglang.kernels.ops.kvcache.kpool_index_npu', "
-        "'sglang.kernels.ops.speculative.spec_tree_npu', "
         "'sglang.kernels.ops.mamba.causal_conv1d_target_verify')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
@@ -366,12 +364,7 @@ def test_deep_select_spec_matches_wrapper_architectures():
             KernelBackend.TRITON,
         ),
         ("attention.fused_decode_prepare_indexer", KernelBackend.TRITON),
-        ("attention.fused_paged_mqa_logits", KernelBackend.TRITON),
-        ("attention.fused_topk_paged", KernelBackend.TRITON),
         ("attention.build_pooled_page_table_64", KernelBackend.TORCH),
-        ("attention.gather_index_k_bf16_batched", KernelBackend.TORCH),
-        ("attention.bf16_paged_mqa_logits", KernelBackend.TORCH),
-        ("attention.bf16_ragged_mqa_logits", KernelBackend.TORCH),
         (
             "kvcache.kpool_decode_update_and_maybe_write_cache_bf16",
             KernelBackend.TRITON,
@@ -379,8 +372,6 @@ def test_deep_select_spec_matches_wrapper_architectures():
         ("kvcache.kpool_assemble_softmax_write_cache_npu", KernelBackend.TRITON),
         ("kvcache.kpool_write_tail_and_maybe_compress_npu", KernelBackend.TRITON),
         ("kvcache.scatter_kpool_tail_updates_npu", KernelBackend.TRITON),
-        ("kvcache.update_kpool_write_plan_triton_npu", KernelBackend.TRITON),
-        ("speculative.build_full_tree_npu", KernelBackend.TRITON),
         ("mamba.causal_conv1d_target_verify_npu", KernelBackend.TRITON),
     ],
 )

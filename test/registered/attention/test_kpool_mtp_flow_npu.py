@@ -163,7 +163,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
             torch.tensor([0, 1], dtype=torch.int64),
         )
 
-    def test_mtp_paged_read_uses_per_query_lengths(self):
+    def test_mtp_vendor_read_uses_per_query_lengths(self):
         backend = self._make_backend()
         forward_batch = self._make_forward_batch(
             ForwardMode.DRAFT_EXTEND_V2, [8, 12], [1, 3]
@@ -217,8 +217,15 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
             patch.object(
                 torch_npu, "npu_lightning_indexer", side_effect=fake_lightning_indexer
             ),
+            patch.object(
+                torch,
+                "repeat_interleave",
+                side_effect=AssertionError(
+                    "MTP graph path must not synchronize repeats"
+                ),
+            ),
         ):
-            result = indexer._get_topk_paged_npu(
+            result = indexer._get_topk_ragged_npu(
                 forward_batch, 0, query, weights, metadata
             )
 
@@ -238,38 +245,6 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                     [8, 9, -1],
                     [8, 9, 10],
                     [-1, -1, -1],
-                ],
-                dtype=torch.int32,
-            ),
-        )
-
-    def test_mtp_page_table_expansion_avoids_repeat_interleave(self):
-        forward_batch = self._make_forward_batch(
-            ForwardMode.DRAFT_EXTEND_V2, [8, 12], [1, 3]
-        )
-        block_tables = torch.tensor(
-            [[11, 12], [21, 22]], dtype=torch.int32, device=self.device
-        )
-
-        with patch.object(
-            torch,
-            "repeat_interleave",
-            side_effect=AssertionError("MTP graph path must not synchronize repeats"),
-        ):
-            expanded = IndexerKPool._expand_page_table_for_queries_npu(
-                forward_batch, block_tables, 6
-            )
-
-        torch.testing.assert_close(
-            expanded.cpu(),
-            torch.tensor(
-                [
-                    [11, 12],
-                    [11, 12],
-                    [11, 12],
-                    [21, 22],
-                    [21, 22],
-                    [21, 22],
                 ],
                 dtype=torch.int32,
             ),
@@ -380,7 +355,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                 indexer._compress_write_mtp_npu = Mock()
                 indexer._compress_write_decode_npu = Mock()
                 indexer._compress_write_extend_npu = Mock()
-                indexer._get_logits_head_gate = Mock(
+                indexer._get_logits_head_gate_npu = Mock(
                     return_value=torch.ones(
                         (6, indexer.n_heads, 1),
                         dtype=torch.bfloat16,
@@ -388,7 +363,7 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                     )
                 )
                 expected = torch.zeros((6, 11), dtype=torch.int32, device=self.device)
-                indexer._get_topk_paged_npu = Mock(return_value=expected)
+                indexer._get_topk_ragged_npu = Mock(return_value=expected)
 
                 forward_batch = SimpleNamespace(
                     forward_mode=mode,
@@ -420,10 +395,10 @@ class TestKPoolMTPFlowNPU(CustomTestCase):
                 indexer._compress_write_extend_npu.assert_not_called()
                 if return_indices:
                     self.assertIs(result, expected)
-                    indexer._get_topk_paged_npu.assert_called_once()
+                    indexer._get_topk_ragged_npu.assert_called_once()
                 else:
                     self.assertIsNone(result)
-                    indexer._get_topk_paged_npu.assert_not_called()
+                    indexer._get_topk_ragged_npu.assert_not_called()
 
 
 if __name__ == "__main__":

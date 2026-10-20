@@ -429,49 +429,9 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="attention.fused_paged_mqa_logits",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.attention.kpool_lightning_indexer:fused_paged_mqa_logits",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.fused_topk_paged",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.attention.kpool_lightning_indexer:fused_topk_paged",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
         op="attention.build_pooled_page_table_64",
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.attention.kpool_bf16_index:build_pooled_page_table_64",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.gather_index_k_bf16_batched",
-        backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.attention.kpool_bf16_index:gather_index_k_bf16_batched",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.bf16_paged_mqa_logits",
-        backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.attention.kpool_bf16_index:bf16_paged_mqa_logits",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="attention.bf16_ragged_mqa_logits",
-        backend=KernelBackend.TORCH,
-        target="sglang.kernels.ops.attention.kpool_bf16_index:bf16_ragged_mqa_logits",
         capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )

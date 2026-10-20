@@ -1896,11 +1896,7 @@ class IndexerKPool(MultiPlatformOp):
         dynamic_scale: torch.Tensor = None,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        """NPU BF16 path for IndexerKPool.
-
-        Uses PyTorch-based BF16 compression (no Hadamard, no FP8 quant).
-        Computes MQA logits in BF16 via torch.matmul.
-        """
+        """NPU BF16 compression and vendor lightning-indexer top-k path."""
 
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
@@ -1916,7 +1912,6 @@ class IndexerKPool(MultiPlatformOp):
                 dtype=torch.int,
                 device=x.device,
             )
-        # rank0_log(f"====>kpool index: {x.shape=}, {q_lora.shape=}, {self.rope_head_dim=}, {forward_batch.forward_mode.is_decode_or_idle()=}")
 
         # ── Compute query, key, gate_score (no dual stream on NPU) ──
         query, _ = self.wq_b(q_lora)
@@ -1967,16 +1962,8 @@ class IndexerKPool(MultiPlatformOp):
             # to continue with read-side computation.
             return None
 
-        # ── Read phase: topk selection ──
-        use_native = envs.SGLANG_DSA_NPU_TOPK_NATIVE.get()
-        use_triton = envs.SGLANG_DSA_NPU_TOPK_TRITON.get()
-
-        # Decode default path
-        if (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and not use_triton
-            and not use_native
-        ):
+        # Decode prepares weights and pooled page metadata in fused kernels.
+        if forward_batch.forward_mode.is_decode_or_idle():
             w_bf16, pool_seqlens, pool_block_tables = (
                 self._prepare_decode_indexer_inputs_npu(x, metadata)
             )
@@ -1996,45 +1983,13 @@ class IndexerKPool(MultiPlatformOp):
         # With q_scale=1, this matches the transformers reference exactly:
         #   scores = relu(q @ k^T * softmax_scale)
         #   index_scores = matmul(weights_proj(x) * n_heads^-0.5, scores)
-        # q_scale = torch.ones(
-        #     query.shape[0], self.n_heads, 1,
-        #     dtype=torch.float32, device=query.device,
-        # )
         weights = self._get_logits_head_gate_npu(x)
 
-        # MTP uses a per-query causal length and reads through paged top-k, as
-        # decode does. Regular extend keeps the ragged path and its
-        # request-concatenated cache access pattern.
-        if forward_batch.forward_mode.is_decode_or_idle():
-            if use_triton:
-                topk_result = self._get_topk_paged_npu_triton(
-                    forward_batch, layer_id, query, weights, metadata
-                )
-            elif use_native:
-                topk_result = self._get_topk_paged_npu_native(
-                    forward_batch, layer_id, query, weights, metadata
-                )
-            else:
-                topk_result = self._get_topk_paged_npu(
-                    forward_batch, layer_id, query, weights, metadata
-                )
-        elif forward_batch.forward_mode.is_extend_without_speculative() or is_mtp:
-            if use_triton:
-                topk_result = self._get_topk_paged_npu_triton(
-                    forward_batch, layer_id, query, weights, metadata
-                )
-            elif use_native:
-                topk_result = self._get_topk_ragged_npu_native(
-                    forward_batch, layer_id, query, weights, metadata
-                )
-            else:
-                topk_result = self._get_topk_ragged_npu(
-                    forward_batch, layer_id, query, weights, metadata
-                )
-        else:
-            raise NotImplementedError(
-                f"NPU kpool does not support forward_mode={forward_batch.forward_mode}"
-            )
+        # Extend and MTP use per-query causal lengths with vendor paged-cache
+        # top-k. The write phase above rejects unsupported forward modes.
+        topk_result = self._get_topk_ragged_npu(
+            forward_batch, layer_id, query, weights, metadata
+        )
 
         return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
 
@@ -2164,63 +2119,6 @@ class IndexerKPool(MultiPlatformOp):
 
         assert plan is not None, "NPU DSA kpool extend requires kpool_extend_plan"
 
-    @staticmethod
-    def _expand_page_table_for_queries_npu(
-        forward_batch: ForwardBatch,
-        block_tables: torch.Tensor,
-        num_query_rows: int,
-    ) -> torch.Tensor:
-        """Expand a request-level page table per query for NPU paged top-k."""
-        if block_tables.shape[0] == num_query_rows:
-            return block_tables
-
-        batch_size = forward_batch.batch_size
-        if block_tables.shape[0] != batch_size:
-            raise ValueError(
-                "NPU DSA paged top-k requires one page-table row per request; "
-                f"got {block_tables.shape[0]} rows for batch_size={batch_size}."
-            )
-
-        mode = forward_batch.forward_mode
-        if mode.is_target_verify() or mode.is_draft_extend_v2():
-            if batch_size == 0 or num_query_rows % batch_size != 0:
-                raise ValueError(
-                    "MTP query rows must be divisible by batch_size; "
-                    f"got num_query_rows={num_query_rows}, batch_size={batch_size}."
-                )
-            queries_per_request = num_query_rows // batch_size
-            # NPU graph capture cannot let repeat_interleave infer a dynamic
-            # output length from a device repeats tensor. Use a static row map
-            # for fixed-N execution to avoid synchronizing the captured stream.
-            row_indices = torch.div(
-                torch.arange(
-                    num_query_rows,
-                    dtype=torch.int64,
-                    device=block_tables.device,
-                ),
-                queries_per_request,
-                rounding_mode="floor",
-            )
-            return block_tables.index_select(0, row_indices).contiguous()
-        elif mode.is_extend():
-            if forward_batch.extend_seq_lens is None:
-                raise ValueError("NPU DSA extend requires extend_seq_lens.")
-            repeats = forward_batch.extend_seq_lens.to(
-                device=block_tables.device, dtype=torch.int64
-            )
-        else:
-            return block_tables
-
-        # Keep the write plan request-level and build a per-query view only at
-        # the read operator entry point to preserve row semantics.
-        expanded = torch.repeat_interleave(block_tables, repeats, dim=0)
-        if expanded.shape[0] != num_query_rows:
-            raise ValueError(
-                "Expanded NPU DSA page table does not match query rows; "
-                f"got {expanded.shape[0]} rows, expected {num_query_rows}."
-            )
-        return expanded.contiguous()
-
     def _prepare_decode_indexer_inputs_npu(self, x, metadata):
         """Fused decode prep for npu_lightning_indexer inputs (2 Triton kernels).
 
@@ -2249,22 +2147,16 @@ class IndexerKPool(MultiPlatformOp):
         )
 
     def _get_topk_paged_npu(
-        self, forward_batch, layer_id, query_bf16, weights, metadata, prepared=None
+        self, forward_batch, layer_id, query_bf16, weights, metadata, prepared
     ) -> torch.Tensor:
         """NPU paged topk via npu_lightning_indexer fused op on pooled cache.
 
         Args:
-            prepared: optional (pool_seqlens, pool_block_tables) precomputed by
-                the fused decode prep op; skips the torch-side construction.
+            prepared: (pool_seqlens, pool_block_tables) from fused decode prep.
         """
         import torch_npu
 
-        from sglang.kernels.ops.attention.kpool_bf16_index import (
-            build_pooled_page_table_64,
-        )
-
         pool = get_token_to_kv_pool()
-        block_tables = metadata.get_page_table_64()
         seqlens_32 = metadata.get_seqlens_int32()
 
         num_q = query_bf16.shape[0]
@@ -2274,15 +2166,7 @@ class IndexerKPool(MultiPlatformOp):
             weights = weights[:n_real]
 
         pool_size = self.index_kpool
-        if prepared is not None:
-            pool_seqlens, pool_block_tables = prepared
-        else:
-            pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
-                torch.int32
-            )
-            pool_block_tables = build_pooled_page_table_64(
-                block_tables, pool_size
-            ).contiguous()
+        pool_seqlens, pool_block_tables = prepared
 
         kv_cache = pool.get_index_k_with_scale_buffer(layer_id)
 
@@ -2384,75 +2268,6 @@ class IndexerKPool(MultiPlatformOp):
             pool_indices, seqlens_expanded, n_real_tokens, num_q
         )
 
-    def _get_topk_paged_npu_triton(
-        self, forward_batch, layer_id, query_bf16, weights, metadata
-    ) -> torch.Tensor:
-        """NPU paged topk via fused Triton kernel (paged MQA logits + causal mask + topk).
-
-        Both decode and extend use the same paged read path. The only difference
-        is pool_seqlens: per-request for decode, per-token for extend/verify.
-        """
-        from sglang.kernels.ops.attention.kpool_bf16_index import (
-            build_pooled_page_table_64,
-        )
-        from sglang.kernels.ops.attention.kpool_lightning_indexer import (
-            fused_topk_paged,
-        )
-
-        pool = get_token_to_kv_pool()
-        block_tables = metadata.get_page_table_64()
-
-        if (
-            forward_batch.forward_mode.is_extend()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            seqlens_32 = metadata.get_seqlens_expanded()
-        else:
-            seqlens_32 = metadata.get_seqlens_int32()
-
-        num_q = query_bf16.shape[0]
-        n_real = seqlens_32.shape[0]
-        if n_real < num_q:
-            query_bf16 = query_bf16[:n_real]
-            weights = weights[:n_real]
-        block_tables = self._expand_page_table_for_queries_npu(
-            forward_batch, block_tables, n_real
-        )
-
-        pool_size = self.index_kpool
-        pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
-            torch.int32
-        )
-        pool_block_tables = build_pooled_page_table_64(
-            block_tables, pool_size
-        ).contiguous()
-
-        kv_cache_bf16 = pool.get_index_k_with_scale_buffer(layer_id)
-
-        q_3d = query_bf16.contiguous().view(n_real, self.n_heads, self.head_dim)
-        w_2d = weights[:n_real]
-        if w_2d.ndim == 3:
-            w_2d = w_2d.squeeze(-1)
-
-        max_pool_len = pool_block_tables.shape[1] * pool.page_size
-        n_pool_topk = self.index_topk // pool_size
-
-        pool_indices = fused_topk_paged(
-            q_3d,
-            kv_cache_bf16,
-            w_2d,
-            pool_seqlens,
-            pool_block_tables,
-            max_pool_len,
-            n_pool_topk,
-            page_size=pool.page_size,
-        )
-
-        return self._expand_pool_topk_and_append_tail_batched(
-            pool_indices, seqlens_32, n_real, num_q
-        )
-
     def _expand_pool_topk_and_append_tail_batched(
         self,
         pool_indices: torch.Tensor,
@@ -2484,218 +2299,4 @@ class IndexerKPool(MultiPlatformOp):
             num_q_padded,
             pool_size,
             index_topk,
-        )
-
-    def _get_topk_paged_npu_native(
-        self, forward_batch, layer_id, query_bf16, weights, metadata
-    ) -> torch.Tensor:
-        """NPU paged topk: BF16 MQA logits against pooled cache.
-
-        Computes pool-level logits, selects top-k pools, then expands to
-        token-level indices via _expand_pool_topk_and_append_tail_batched
-        for consistent output with default and triton paths.
-        """
-        from sglang.kernels.ops.attention.kpool_bf16_index import (
-            bf16_paged_mqa_logits,
-            build_pooled_page_table_64,
-        )
-
-        pool = get_token_to_kv_pool()
-        block_tables = metadata.get_page_table_64()
-
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
-            seqlens_32 = metadata.get_seqlens_expanded()
-        else:
-            seqlens_32 = metadata.get_seqlens_int32()
-
-        num_q = query_bf16.shape[0]
-        n_real = seqlens_32.shape[0]
-        if n_real < num_q:
-            query_bf16 = query_bf16[:n_real]
-            weights = weights[:n_real]
-        block_tables = self._expand_page_table_for_queries_npu(
-            forward_batch, block_tables, n_real
-        )
-
-        pool_size = self.index_kpool
-        n_pool_topk = self.index_topk // pool_size
-
-        # Build pooled page table and seqlens
-        pool_seqlens = torch.div(seqlens_32, pool_size, rounding_mode="floor").to(
-            torch.int32
-        )
-        pool_block_tables = build_pooled_page_table_64(
-            block_tables, pool_size
-        ).contiguous()
-        pool_max_seq_len = pool_block_tables.shape[1] * pool.page_size
-
-        kv_cache_bf16 = pool.get_index_k_with_scale_buffer(layer_id)
-
-        q_expanded = query_bf16.unsqueeze(1)
-        logits = bf16_paged_mqa_logits(
-            q_expanded,
-            kv_cache_bf16,
-            weights.squeeze(2) if weights.ndim == 3 else weights,
-            pool_seqlens,
-            pool_block_tables,
-            pool_max_seq_len,
-            slots_per_page=pool.page_size,
-        )
-
-        # Mask invalid pool positions with -inf
-        n_cols = logits.shape[1]
-        col_idx = torch.arange(n_cols, device=logits.device).unsqueeze(0)
-        masked_logits = logits.masked_fill(
-            col_idx >= pool_seqlens[:n_real].unsqueeze(1), float("-inf")
-        )
-
-        actual_topk = min(n_pool_topk, n_cols)
-        topk_logits, topk_indices = torch.topk(
-            masked_logits, actual_topk, dim=1, largest=True
-        )
-        pool_indices = torch.where(
-            topk_logits.isneginf(),
-            torch.full_like(topk_indices, -1),
-            topk_indices,
-        ).to(torch.int32)
-
-        if actual_topk < n_pool_topk:
-            pad = torch.full(
-                (n_real, n_pool_topk - actual_topk),
-                -1,
-                dtype=torch.int32,
-                device=pool_indices.device,
-            )
-            pool_indices = torch.cat([pool_indices, pad], dim=1)
-
-        return self._expand_pool_topk_and_append_tail_batched(
-            pool_indices, seqlens_32, n_real, num_q
-        )
-
-    def _get_topk_ragged_npu_native(
-        self, forward_batch, layer_id, query_bf16, weights, metadata
-    ) -> torch.Tensor:
-        """NPU ragged topk: gather BF16 pool keys then compute MQA logits.
-
-        Computes pool-level logits per request, selects top-k pools, then
-        expands to token-level indices via _expand_pool_topk_and_append_tail_batched
-        for consistent output with default and triton paths.
-        """
-        from sglang.kernels.ops.attention.kpool_bf16_index import (
-            bf16_ragged_mqa_logits,
-            build_pooled_page_table_64,
-            gather_index_k_bf16_batched,
-        )
-
-        assert (
-            forward_batch.seq_lens_cpu is not None
-            and forward_batch.extend_seq_lens_cpu is not None
-        )
-
-        pool = get_token_to_kv_pool()
-        pool_size = self.index_kpool
-        n_pool_topk = self.index_topk // pool_size
-        block_tables = metadata.get_page_table_64()
-        buf = pool.get_index_k_with_scale_buffer(layer_id)
-
-        num_q = query_bf16.shape[0]
-        seqlens_expanded = metadata.get_seqlens_expanded()
-        n_real = seqlens_expanded.shape[0]
-
-        pool_indices_out = torch.full(
-            (num_q, n_pool_topk), -1, dtype=torch.int32, device=query_bf16.device
-        )
-
-        q_offset = 0
-        for i in range(forward_batch.batch_size):
-            q_len = int(forward_batch.extend_seq_lens_cpu[i])
-            if q_len == 0:
-                continue
-
-            seq_len = int(forward_batch.seq_lens_cpu[i].item())
-            pool_seq_len = seq_len // pool_size
-
-            q_slice = slice(q_offset, q_offset + q_len)
-            local_seqlens = seqlens_expanded[q_slice]
-            local_pool_lens = torch.div(
-                local_seqlens, pool_size, rounding_mode="floor"
-            ).to(torch.int32)
-
-            if pool_seq_len > 0:
-                num_token_pages = (seq_len + pool.page_size - 1) // pool.page_size
-                token_page_table = block_tables[i, :num_token_pages].contiguous()
-                pool_pages = (pool_seq_len + pool.page_size - 1) // pool.page_size
-                pooled_page_table = build_pooled_page_table_64(
-                    token_page_table, pool_size
-                )[:pool_pages].contiguous()
-
-                k_bf16 = torch.empty(
-                    (pool_seq_len, self.head_dim),
-                    dtype=torch.bfloat16,
-                    device=query_bf16.device,
-                )
-                gather_index_k_bf16_batched(
-                    pool=pool,
-                    buf=buf,
-                    page_indices=pooled_page_table,
-                    seq_len=pool_seq_len,
-                    k_out=k_bf16,
-                )
-
-                row_starts = torch.zeros(
-                    (q_len,), dtype=torch.int32, device=query_bf16.device
-                )
-                local_logits = bf16_ragged_mqa_logits(
-                    query_bf16[q_slice],
-                    k_bf16,
-                    weights[q_slice].squeeze(-1)
-                    if weights.ndim == 3
-                    else weights[q_slice],
-                    row_starts,
-                    local_pool_lens,
-                )
-            else:
-                local_logits = torch.empty(
-                    (q_len, 0), dtype=torch.float32, device=query_bf16.device
-                )
-
-            n_cols = local_logits.shape[1]
-            actual_topk = min(n_pool_topk, n_cols)
-            if actual_topk > 0:
-                col_idx = torch.arange(n_cols, device=local_logits.device).unsqueeze(0)
-                masked = local_logits.masked_fill(
-                    col_idx >= local_pool_lens.unsqueeze(1), float("-inf")
-                )
-                topk_logits, topk_indices = torch.topk(
-                    masked, actual_topk, dim=1, largest=True
-                )
-                local_pool_indices = torch.where(
-                    topk_logits.isneginf(),
-                    torch.full_like(topk_indices, -1),
-                    topk_indices,
-                ).to(torch.int32)
-                if actual_topk < n_pool_topk:
-                    pad = torch.full(
-                        (q_len, n_pool_topk - actual_topk),
-                        -1,
-                        dtype=torch.int32,
-                        device=query_bf16.device,
-                    )
-                    local_pool_indices = torch.cat([local_pool_indices, pad], dim=1)
-            else:
-                local_pool_indices = torch.full(
-                    (q_len, n_pool_topk),
-                    -1,
-                    dtype=torch.int32,
-                    device=query_bf16.device,
-                )
-
-            pool_indices_out[q_slice] = local_pool_indices
-            q_offset += q_len
-
-        return self._expand_pool_topk_and_append_tail_batched(
-            pool_indices_out, seqlens_expanded, n_real, num_q
         )
