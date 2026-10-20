@@ -44,8 +44,12 @@ logger = logging.getLogger(__name__)
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = is_gfx95_supported()
+# This scheme runs only on the AITER runner, so on the arches AITER has an MXFP4
+# MoE layout for, that layout is bound whatever SGLANG_USE_AITER says.
+_use_aiter = _is_hip and (
+    get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
+)
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _use_aiter:
