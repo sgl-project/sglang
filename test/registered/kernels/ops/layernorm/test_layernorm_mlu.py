@@ -26,7 +26,8 @@ class TestRMSNormMLU(CustomTestCase):
 
     def test_2d_input(self):
         x = torch.randn(4, 128, dtype=torch.bfloat16, device="mlu")
-        out = self.norm.forward_mlu(x.clone())
+        out = self.norm(x.clone())
+        self.assertEqual(self.norm._forward_method, self.norm.forward_mlu)
         ref = self.norm.forward_native(x.clone())
         self.assertEqual(out.shape, x.shape)
         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
@@ -34,7 +35,7 @@ class TestRMSNormMLU(CustomTestCase):
     def test_residual(self):
         x = torch.randn(4, 128, dtype=torch.bfloat16, device="mlu")
         residual = torch.randn_like(x)
-        out, residual_out = self.norm.forward_mlu(x.clone(), residual.clone())
+        out, residual_out = self.norm(x.clone(), residual.clone())
         ref, residual_ref = self.norm.forward_native(x.clone(), residual.clone())
         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
         torch.testing.assert_close(residual_out, residual_ref, rtol=1e-2, atol=1e-2)
@@ -43,9 +44,7 @@ class TestRMSNormMLU(CustomTestCase):
         x = torch.randn(4, 128, dtype=torch.bfloat16, device="mlu")
         residual = torch.randn_like(x)
         post = torch.randn_like(x)
-        out, residual_out = self.norm.forward_mlu(
-            x.clone(), residual.clone(), post.clone()
-        )
+        out, residual_out = self.norm(x.clone(), residual.clone(), post.clone())
         ref, residual_ref = self.norm.forward_native(
             x.clone(), residual.clone(), post.clone()
         )
@@ -54,11 +53,43 @@ class TestRMSNormMLU(CustomTestCase):
 
     def test_empty_input(self):
         x = torch.empty(0, 128, dtype=torch.bfloat16, device="mlu")
-        self.assertEqual(self.norm.forward_mlu(x).shape, x.shape)
+        self.assertEqual(self.norm(x).shape, x.shape)
         for post in (None, x.clone()):
-            out, residual = self.norm.forward_mlu(x, x.clone(), post)
+            out, residual = self.norm(x, x.clone(), post)
             self.assertEqual(out.shape, x.shape)
             self.assertEqual(residual.shape, x.shape)
+
+    def test_mixed_dtypes(self):
+        """Mixed weights or residual additions must not fail dtype checks."""
+        for weight_dtype, residual_dtype, post_dtype in (
+            (torch.float32, None, None),
+            (torch.bfloat16, torch.float32, None),
+            (torch.bfloat16, torch.bfloat16, torch.float32),
+        ):
+            with self.subTest(
+                weight_dtype=weight_dtype,
+                residual_dtype=residual_dtype,
+                post_dtype=post_dtype,
+            ):
+                norm = self.norm.to(dtype=weight_dtype)
+                x = torch.randn(4, 128, dtype=torch.bfloat16, device="mlu")
+                residual = (
+                    torch.randn_like(x, dtype=residual_dtype)
+                    if residual_dtype is not None
+                    else None
+                )
+                post = (
+                    torch.randn_like(x, dtype=post_dtype)
+                    if post_dtype is not None
+                    else None
+                )
+                ref = norm.forward_native(x, residual, post)
+                out = norm(
+                    x.clone(),
+                    residual.clone() if residual is not None else None,
+                    post.clone() if post is not None else None,
+                )
+                torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
     def test_noncontiguous_input(self):
         x = torch.randn(128, 4, dtype=torch.bfloat16, device="mlu").T
@@ -71,7 +102,7 @@ class TestRMSNormMLU(CustomTestCase):
                     input_stride=inp.stride(),
                     residual_stride=res.stride() if res is not None else None,
                 ):
-                    out = self.norm.forward_mlu(inp, res)
+                    out = self.norm(inp, res)
                     ref = self.norm.forward_native(inp, res)
                     if res is None:
                         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)

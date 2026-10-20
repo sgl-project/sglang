@@ -667,12 +667,19 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Fall back for options and input layouts unsupported by the fused kernel.
+        # Fall back for options, dtypes, and layouts unsupported by the fused kernel.
         if (
             self.variance_size_override is not None
             or self.fp32_residual
             or self.cast_x_before_out_mul
             or self.override_orig_dtype is not None
+            or self.weight.dtype != x.dtype
+            or (residual is not None and residual.dtype != x.dtype)
+            or (
+                residual is not None
+                and post_residual_addition is not None
+                and post_residual_addition.dtype != x.dtype
+            )
             or x.stride(-1) != 1
             or (residual is not None and residual.stride(-1) != 1)
         ):
