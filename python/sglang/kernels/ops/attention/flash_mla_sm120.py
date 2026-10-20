@@ -29,6 +29,8 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
 
 # Page layout constants for DSv4-Flash (MODEL1):
@@ -713,6 +715,16 @@ def _validate_flashinfer_sparse_mla_backend(
     return uses_flashinfer_sparse_mla
 
 
+# FlashInfer's native glm53_nope kernels use the 2,176-wide physical
+# candidate contract (candidates tile in 64-wide blocks; the family's
+# documented/calibrated topk), while GLM-5.3 emits 2,051 candidates.
+_GLM53_NOPE_FLASHINFER_TOPK = 2176
+# KV row widths the glm53_nope kernels accept: compact 528-byte rows
+# (512 FP8 latent values + four inline FP32 scales) and the padded
+# 656-byte fp8_ds_mla ABI.
+_GLM53_NOPE_FLASHINFER_KV_DIMS = frozenset({528, 656})
+
+
 def flashinfer_sparse_mla_forward(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -732,6 +744,41 @@ def flashinfer_sparse_mla_forward(
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
     topk = indices.shape[1]
+    # GLM NoPE (absorbed) presents a candidate count below the native kernel
+    # contract: decode kernels accept any runtime topk, but the prefill
+    # kernels are instantiated at _GLM53_NOPE_FLASHINFER_TOPK only, so a
+    # >64-token prefill-form call with the raw count finds no kernel ("no
+    # matching decode instantiation ... the prefill envelope both reject
+    # it"). Pad the tail with -1 sentinels — the kernel masks an invalid
+    # column's payload as well as its logit — and bound seq_lens by the LAST
+    # valid column, since a valid tail can follow -1 holes from defensive
+    # top-k selection.
+    is_glm53_nope = (
+        q.shape[-1] == 512
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+        and kv_cache_dim in _GLM53_NOPE_FLASHINFER_KV_DIMS
+    )
+    if is_glm53_nope:
+        if topk > _GLM53_NOPE_FLASHINFER_TOPK:
+            raise ValueError(
+                "GLM NoPE sparse MLA supports at most "
+                f"{_GLM53_NOPE_FLASHINFER_TOPK} candidates, got {topk}"
+            )
+        if topk:
+            columns = torch.arange(
+                1, topk + 1, device=indices.device, dtype=seq_lens.dtype
+            )
+            seq_lens = torch.where(indices >= 0, columns, 0).amax(dim=-1)
+        else:
+            seq_lens = torch.zeros_like(seq_lens)
+        if topk < _GLM53_NOPE_FLASHINFER_TOPK:
+            indices = torch.nn.functional.pad(
+                indices,
+                (0, _GLM53_NOPE_FLASHINFER_TOPK - topk),
+                value=-1,
+            )
+            topk = _GLM53_NOPE_FLASHINFER_TOPK
     result = trtllm_batch_decode_with_kv_cache_mla(
         query=q.unsqueeze(1),
         kv_cache=kv_cache.view(torch.uint8)
