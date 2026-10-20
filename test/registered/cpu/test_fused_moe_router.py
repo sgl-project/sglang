@@ -8,7 +8,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu-intel")
 
 
-def _reference_router(hidden_states, gating_output, topk, softcap, correction_bias=None):
+def _reference_router(
+    hidden_states, gating_output, topk, softcap, correction_bias=None
+):
     logits = hidden_states.float() @ gating_output.float().t()
     if softcap != 0:
         logits = torch.tanh(logits / softcap) * softcap
@@ -71,7 +73,9 @@ def test_fused_moe_router_shim_dispatches_cpu_kernel():
         correction_bias=True,
     )
 
-    ref_weights, ref_ids = _reference_router(hidden_states, gating_output, 2, 30.0, bias)
+    ref_weights, ref_ids = _reference_router(
+        hidden_states, gating_output, 2, 30.0, bias
+    )
     out_weights, out_ids = fused_moe_router_shim(
         30.0,
         hidden_states,
