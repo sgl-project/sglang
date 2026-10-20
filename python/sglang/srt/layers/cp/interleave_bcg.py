@@ -1,8 +1,8 @@
 """Experimental, exact-shape interleave BCG adapter for GLM-5.3 Flash.
 
 Keep full-sequence KPool positions separate from the local DSA positions.
-Only single-request, prefix-free, text batches with an exact captured token
-count replay. Other batches retain the existing eager CP path, including MM.
+Prefix-free text batches replay when their total token count matches a capture,
+independently of request boundaries. Other batches retain eager CP, including MM.
 """
 
 import torch
@@ -46,7 +46,7 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
 
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
         return (
-            batch_size == 1
+            batch_size > 0
             and num_tokens in self.bucket_local_tokens
             and not contains_mm_inputs
             and prefix_lens is not None
@@ -54,10 +54,10 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         )
 
     def required_local_tokens(self, extend_seq_lens):
-        if extend_seq_lens is None or len(extend_seq_lens) != 1:
+        if extend_seq_lens is None or len(extend_seq_lens) == 0:
             return None
         size = get_parallel().attn_cp_size
-        rows = (int(extend_seq_lens[0]) + size - 1) // size
+        rows = (sum(int(length) for length in extend_seq_lens) + size - 1) // size
         return (rows + size - 1) // size * size
 
     def model_positions(self, forward_batch):

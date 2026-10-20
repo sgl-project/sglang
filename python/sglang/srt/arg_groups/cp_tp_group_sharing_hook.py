@@ -42,15 +42,17 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
 
     # This hook runs before speculative defaults and NEXTN alias resolution.
-    # Native MTP keeps the target's CP/TP placement; other draft architectures
-    # have their own topology and model-boundary contracts.
-    if cfg.speculative_algorithm is not None and (
+    # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
+    # target's gathered hidden states and runs its draft with ordinary TP.
+    if cfg.speculative_algorithm not in (None, "DFLASH") and (
         model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration"
         or cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
         or cfg.speculative_draft_model_path not in (None, cfg.model_path)
         or cfg.speculative_eagle_topk not in (None, 1)
     ):
-        raise ValueError("CP/TP group sharing only supports native MTP with top-k 1.")
+        raise ValueError(
+            "CP/TP group sharing only supports DFLASH or native MTP with top-k 1."
+        )
 
     unsupported = {
         "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,

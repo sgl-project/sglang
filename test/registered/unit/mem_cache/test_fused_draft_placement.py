@@ -135,6 +135,7 @@ class TestFusedDraftDecision(CustomTestCase):
         draft_backend=None,
         target_backends=("triton", "triton"),
         dcp_size=1,
+        cp_size=1,
         hicache=False,
         retraction_backup=None,
     ):
@@ -149,6 +150,7 @@ class TestFusedDraftDecision(CustomTestCase):
         cfg.is_draft_worker = False
         cfg.spec_algorithm = SimpleNamespace(
             is_eagle=lambda: algorithm == "EAGLE",
+            is_dflash=lambda: algorithm == "DFLASH",
             is_dflash_family=lambda: algorithm in ("DFLASH", "DSPARK"),
         )
         cfg.model_config = SimpleNamespace(is_multi_layer_eagle=False)
@@ -161,7 +163,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 is_hybrid_swa=False,
                 is_deepseek_v4_arch=False,
                 num_nextn_predict_layers=None,
-                get_num_kv_heads=lambda tp: 4,
+                get_num_kv_heads=lambda tp: 4 // tp,
                 head_dim=64,
                 v_head_dim=64,
                 dtype=torch.bfloat16,
@@ -197,13 +199,25 @@ class TestFusedDraftDecision(CustomTestCase):
                 draft_worker_common, "attention_backends", return_value=target_backends
             ),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
-            get_parallel().override(attn_tp_size=1, attn_dcp_size=dcp_size),
+            get_parallel().override(
+                tp_size=cp_size,
+                attn_tp_size=1,
+                attn_cp_size=cp_size,
+                attn_dp_size=1,
+                attn_dcp_size=dcp_size,
+            ),
             override_platform(is_xpu=False, is_hip=False),
         ):
             return cfg._fused_draft_decision()
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_cp_dflash_fused_pool_matches_draft_tp_heads(self):
+        """A CP target's replicated KV geometry must not leak into its TP draft."""
+        placement = self._decide(algorithm="DFLASH", cp_size=4).placement
+        self.assertIsNotNone(placement)
+        self.assertEqual(placement.region.head_num, 1)
 
     def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
         """A fused draft stores its rows in the host's KV dtype; an explicit

@@ -1106,7 +1106,13 @@ class KVCacheConfigurator:
         profile = draft_kv_profile(
             aux.draft_model_config,
             num_layers=int(aux.draft_kv_num_layers),
-            attn_tp_size=get_parallel().attn_tp_size,
+            attn_tp_size=(
+                get_parallel().tp_size
+                if self.spec_algorithm.is_dflash()
+                and get_parallel().attn_cp_size > 1
+                and get_parallel().attn_dp_size == 1
+                else get_parallel().attn_tp_size
+            ),
             # A DFLASH-family draft config inherits the target's NEXTN depth
             # count; its draft is one block, replicated per runner.
             num_depths=None if self.spec_algorithm.is_eagle() else 1,

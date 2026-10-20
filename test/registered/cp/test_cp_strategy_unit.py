@@ -17,6 +17,7 @@ from sglang.srt.layers.cp.base import (
 )
 from sglang.srt.layers.cp.bcg import PrefillCPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.interleave_bcg import InterleaveCPBCGInput
 from sglang.srt.layers.cp.padding import (
     get_cp_padding_align_size,
     pad_local_rows,
@@ -156,6 +157,33 @@ class TestPrefillCPBCGReplay(CustomTestCase):
             cp_size=4,
             cp_strategy="zigzag",
         )
+
+    def test_interleave_replay_uses_total_tokens_across_requests(self):
+        """A captured token shape remains reusable when request boundaries change."""
+        runner = self._make_runner()
+        runner.prefill_cp_bcg_input = InterleaveCPBCGInput(
+            input_embeds=torch.empty(0),
+            positions=torch.empty(0),
+            bucket_local_tokens={2048: 512, 2304: 576},
+        )
+        batch = self._make_forward_batch()
+        init_cp_strategy(enable_prefill_cp=True, cp_size=4, cp_strategy="interleave")
+        for rank in range(4):
+            with (
+                self.subTest(rank=rank),
+                get_parallel().override(attn_cp_rank=rank, attn_cp_size=4),
+            ):
+                # Uneven request boundaries must not round each request up
+                # independently: interleave shards their concatenation.
+                self.assertEqual(
+                    runner.prefill_cp_bcg_input.required_local_tokens(
+                        batch.extend_seq_lens_cpu
+                    ),
+                    512,
+                )
+                self.assertTrue(runner.can_run_graph(batch))
+        batch.extend_prefix_lens_cpu = [0, 1, 0]
+        self.assertFalse(runner.can_run_graph(batch))
 
     def test_local_capacity_overflow_uses_next_capture_bucket(self):
         runner = self._make_runner()
