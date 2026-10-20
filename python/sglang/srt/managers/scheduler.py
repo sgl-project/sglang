@@ -6134,10 +6134,7 @@ class Scheduler(
     def handle_observe_elastic_ep_membership(
         self, recv_req: ObserveElasticEPMembershipReqInput
     ) -> ObserveElasticEPMembershipReqOutput:
-        from sglang.srt.elastic_ep.elastic_ep import (
-            observe_recovery_membership,
-            poll_recovery_control_plane,
-        )
+        from sglang.srt.elastic_ep.elastic_ep import observe_recovery_membership
 
         try:
             key = observe_recovery_membership(
@@ -6147,7 +6144,6 @@ class Scheduler(
                 failed_allocation_incarnation=recv_req.failed_allocation_incarnation,
                 membership_epoch=recv_req.membership_epoch,
             )
-            poll_recovery_control_plane()
         except (RuntimeError, ValueError) as exc:
             return ObserveElasticEPMembershipReqOutput(
                 accepted=False,
