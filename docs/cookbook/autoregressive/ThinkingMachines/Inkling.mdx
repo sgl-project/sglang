@@ -83,6 +83,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 2. Configuration Tips
 
+**LM-head precision.** Inkling uses FP32 logits by default so BF16 rounding does not turn distinct token scores into ties during greedy decoding.
+
 **Multimodal.** The recipes pass `--enable-multimodal` so the server accepts image and audio inputs alongside text — drop it for text-only serving.
 
 **Memory pool ratios.** `--swa-full-tokens-ratio` and `--mamba-full-memory-ratio` (both default `0.1`) size the SWA and Mamba/sconv state pools; tune them to your workload's usage.
