@@ -368,11 +368,9 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.is_mla_backend = False
         mgr.is_hybrid_mla_backend = False
         mgr.attn_tp_size = 1
-        mgr.transfer_source_rank = 0
         mgr.kv_args = SimpleNamespace(
             engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
         )
-        mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
         mgr.failure_records = {}
         mgr.send_kv_status_message = MagicMock()
@@ -707,7 +705,6 @@ class TestNixlStaging(CustomTestCase):
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
-        mgr.transfer_source_rank = 1
         mgr.kv_args = SimpleNamespace(
             gpu_id=1,
             engine_rank=1,
