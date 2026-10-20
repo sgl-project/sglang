@@ -17,6 +17,13 @@ logger = logging.getLogger(__name__)
 MXFP8_BLOCK_SIZE = 32
 # W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
+# MindIE-SD f1b15b4 "C7" activation-quantization defaults for single-level
+# MXFP4. Applied to every npu_dynamic_mx_quant call with an FP4 destination
+# (linear activations and quantized-attention Q/K/V); checkpoints override
+# either value via mxfp4_scale_alg / mxfp4_dst_type_max descriptors. Kept as a
+# local constant because srt must not import multimodal_gen, whose
+# mxfp4_utils.mxfp4_quant_kwargs reads the same descriptors.
+MXFP4_C7_ACTIVATION_QUANT_DEFAULTS = {"scale_alg": 2, "dst_type_max": 7.25}
 
 
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
@@ -598,9 +605,11 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     returns a 3D ``[tokens, in//64, 2]`` block scale so the matmul needs no extra
     scale-layout normalization.
 
-    ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
-    A5 this device forces ``allow_internal_format=False`` (the NZ cast still produces
-    a ``FRACTAL_NZ_C0_16`` tensor, which is fine). Older torch_npu (e.g.
+    ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On
+    A5 (aclnn-only SoCs, soc_version >= 260) torch_npu itself forces
+    ``allow_internal_format=False`` — a request for True is reverted with a
+    warning by torch_npu's option register — and the NZ cast still produces a
+    ``FRACTAL_NZ_C0_16`` tensor, which is fine. Older torch_npu (e.g.
     ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
     *prefill* with ``x2 should be in ... nz format, but it is 2``;
     ``2.10.0.post1.dev20260624`` (and later) runs the FRACTAL_NZ path correctly.
@@ -664,7 +673,9 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation (A8).
+        # Dynamic MXFP8 activation quantisation (A8). The destination is FP8,
+        # so the MXFP4 C7 arguments (dst_type_max=7.25 et al.) do not apply;
+        # operator-default rounding is kept for the W4A8 boundary steps.
         quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
@@ -700,12 +711,16 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
     Offline ModelSlim schemes reuse apply; direct callers can also quantize
     BF16/FP16 weights at load time. Packed ND weights are [in/2, out], with
-    UE8M0 scales [in/64, out, 2]. Inference dynamically quantizes activations
-    to FP4, using round by default; Wan opts into rint on its kernel instance.
-    The online SRT --quantization mxfp4 route uses the dual-level subclass.
+    UE8M0 scales [in/64, out, 2]. Activation quantization matches MindIE-SD's
+    C7 defaults (``rint`` rounding plus ``scale_alg=2``/``dst_type_max=7.25``;
+    per-layer checkpoint descriptors override the two kwargs). Weight-side
+    quantization keeps ``round``. The online SRT --quantization mxfp4 route
+    uses the dual-level subclass.
     """
 
-    activation_round_mode = "round"
+    # MindIE-SD rounds activations to nearest-even; the npu_dynamic_mx_quant
+    # operator default ("round", half-away-from-zero) is less accurate.
+    activation_round_mode = "rint"
 
     def create_weights(
         self,
@@ -799,12 +814,17 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
+        # Dynamic single-level MXFP4 activation quantisation (A4 — FP4) with
+        # MindIE's C7 defaults; per-layer checkpoint descriptors override.
+        quant_kwargs = {
+            **MXFP4_C7_ACTIVATION_QUANT_DEFAULTS,
+            **getattr(layer, "mxfp4_quant_kwargs", {}),
+        }
         qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
             x_2d,
             dst_type=fp4_dtype,
             round_mode=self.activation_round_mode,
-            **getattr(layer, "mxfp4_quant_kwargs", {}),
+            **quant_kwargs,
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
@@ -835,9 +855,9 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
     [out, in/32]). The weight remains ND and is transposed for matmul.
-    Activation rounding defaults to ``round`` (see the base class); offline Wan
-    checkpoints override ``activation_round_mode`` to ``rint`` on their kernel
-    instance for MindIE parity. Other models keep the default.
+    Activation quantization inherits the base class's MindIE C7 defaults
+    (``rint``); the scheme additionally attaches any checkpoint ``mxfp4_*``
+    descriptors to the layer as ``mxfp4_quant_kwargs`` overrides.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

@@ -91,6 +91,10 @@ def process_model_weights_after_loading(
         if quantized_only and unquantized:
             continue
         if is_npu() and not unquantized and torch.npu.get_soc_version() < 260:
+            # A2/A3 (soc < 260) run quantized ops faster with NZ internal
+            # formats. On A5 (soc >= 260) torch_npu itself forces
+            # allow_internal_format=False — aclnn-only SoCs revert a True
+            # request with a warning — so do not touch it there.
             torch.npu.config.allow_internal_format = True
         if process_device is None:
             method.process_weights_after_loading(module)

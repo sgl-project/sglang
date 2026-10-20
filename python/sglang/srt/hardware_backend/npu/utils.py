@@ -217,7 +217,11 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
+        # A2/A3 benefit from NZ internal formats. On A5 (soc >= 260) torch_npu
+        # itself forces allow_internal_format=False — aclnn-only SoCs revert
+        # a True request with a warning — so skip the request entirely there.
+        if torch_npu.npu.get_soc_version() < 260:
+            torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 

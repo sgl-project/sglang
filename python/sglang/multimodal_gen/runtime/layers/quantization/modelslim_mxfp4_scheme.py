@@ -13,7 +13,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
     default_mxfp4_policy,
     mxfp4_quant_kwargs,
     pack_fp4_weight,
@@ -64,8 +64,10 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 NPUSingleLevelMXFP4OfflineLinearMethod,
             )
 
+            # The kernel class defaults already match MindIE (rint rounding
+            # plus the C7 scale_alg/dst_type_max kwargs), so no per-model
+            # activation-rounding override is needed here.
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
-            self.single_level_kernel.activation_round_mode = "rint"
             self.w4a8_kernel = NPUMXFP4W4A8OfflineLinearMethod()
             self.w4a8_kernel.use_wan_bias = True
         elif self.dual_scale_key not in self.quant_config:

@@ -1360,15 +1360,20 @@ exports) are registered by the attention blocks and applied on quantized steps.
 
 ### Linear backward compatibility
 
-Wan's settings apply only to its kernel instances. Existing SRT LLM defaults remain:
+Every single-level MXFP4 path uses MindIE-SD's activation-quantization defaults
+(`round_mode="rint"`, `scale_alg=2`, `dst_type_max=7.25`); checkpoint
+`mxfp4_scale_alg`/`mxfp4_dst_type_max` descriptors override the two kwargs.
+Only the W4A8 boundary steps keep operator-default rounding — their activation
+destination is FP8, to which the FP4-targeted kwargs do not apply.
 
 | Linear path | Weight layout | Activation rounding | Matmul bias |
 | --- | --- | --- | --- |
-| SRT offline `W4A4_MXFP4` | ND | `round` | FP32, original shape |
-| SRT offline `W4A8_MXFP` | FP4-aware NZ | Operator default | FP32, original shape |
-| Wan offline single-level W4A4 | ND | `rint`, `scale_alg=2`, `dst_type_max=7.25` by default | FP32, original shape |
-| Wan offline single-level W4A8 | Same ND weights | Operator default | BF16, 1D bias expanded to `[1, out]` |
+| Offline single-level W4A4 (SRT and diffusion) | ND | `rint` + C7 kwargs | FP32, original shape |
+| Offline single-level W4A8 boundary steps (SRT and diffusion) | FP4-aware NZ (SRT) / same ND weights (diffusion) | Operator default (FP8 destination) | FP32, original shape (SRT) / BF16 `[1, out]` (diffusion) |
+| MXFP4 attention (Q/K/V) | — | `rint` + C7 kwargs | — |
 
 SRT online `--quantization mxfp4` and diffusion online `--quantization mxfp4_npu`
-retain their separate dual-level paths. CPU checks can verify dispatch and operator
-arguments; numerical accuracy, video quality, and performance require target-NPU validation.
+retain their separate dual-level paths (operator-default arguments; the
+dual-level operator's support for these kwargs must be verified on device).
+CPU checks can verify dispatch and operator arguments; numerical accuracy,
+video quality, and performance require target-NPU validation.

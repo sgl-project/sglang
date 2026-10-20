@@ -1,27 +1,24 @@
-"""Shared quantization scheme for offline MXFP checkpoints on Ascend NPU.
+"""Attention quantization scheme for offline MXFP4 checkpoints on Ascend NPU.
 
-This module consolidates everything that more than one consumer needs from an
-offline checkpoint's ``quant_model_description.json``:
+:class:`AttentionQuantScheme` is the per-attention-block quantization plan
+derived from the checkpoint's ``quant_model_description.json``: which
+precision each denoising step runs at, whether the exported Q/K rotation
+matrices must be registered and applied, and which attention backends
+implement the quantized kernel. The model layer, the attention backend, and
+the Cache-DiT precision guard all read from this object instead of
+re-deriving it from raw descriptor dicts.
 
-- :class:`AttentionQuantScheme` -- the per-attention-block quantization plan:
-  which precision each denoising step runs at, whether the exported Q/K
-  rotation matrices must be registered and applied, and which attention
-  backends implement the quantized kernel. The model layer, the attention
-  backend, and the Cache-DiT precision guard all read from this object instead
-  of re-deriving it from raw descriptor dicts.
-- Timestep precision helpers (:func:`resolve_precision`,
-  :func:`default_mxfp4_policy`) shared by attention and linear schemes.
-- :func:`pack_fp4_weight` used by the weight loaders and ``wan_repack.py``.
-
-Naming note: the checkpoints are produced by the ``msmodelslim`` tool and
-detected via ``--quantization modelslim``; the scheme classes here are
-deliberately named after the quantization format (MXFP4), not the tool.
+Shared, non-attention-specific helpers (timestep precision resolution, FP4
+packing, MindIE quantization defaults) live in ``mxfp4_utils.py``.
 """
 
 import weakref
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
+    resolve_precision,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # msmodelslim names the exported rotations after the to_q/to_k projections
@@ -50,86 +47,6 @@ def offline_qk_rotation_flags(description: dict, prefix: str) -> tuple[bool, boo
         any(description.get(f"{prefix}.{name}") == "FLOAT" for name in q_names),
         any(description.get(f"{prefix}.{name}") == "FLOAT" for name in k_names),
     )
-
-
-def default_mxfp4_policy(num_steps: int) -> dict[str, str]:
-    """MindIE-SD's default per-step W4A4/W4A8 schedule for single-level MXFP4.
-
-    The first two and last two denoising steps run W4A8 (higher activation
-    precision at the schedule boundaries); everything between runs W4A4. A
-    40-step run uses W4A8 at zero-based steps 0, 1, 38, and 39.
-    """
-    return {
-        str(step): "W4A8"
-        for step in range(num_steps)
-        if step < 2 or step >= num_steps - 2
-    }
-
-
-def resolve_precision(
-    description: dict, target: str, default: str, default_policy: dict | None = None
-) -> str:
-    """Resolve the effective precision for ``target`` at the current timestep.
-
-    ``target`` is a policy family in the checkpoint's ``timestep_policy``
-    section (``fa``, ``w4a4_linear``, ``w8a8_linear``). Per-step entries win
-    over a ``default`` entry, which wins over ``default_policy`` (the caller's
-    schedule), which wins over ``default``.
-    """
-    from sglang.multimodal_gen.runtime.managers.forward_context import (
-        get_forward_context_or_none,
-    )
-
-    context = get_forward_context_or_none()
-    policy = description.get("timestep_policy", {}).get(target, {})
-    if not policy and not default_policy:
-        return default
-    if context is None:
-        raise RuntimeError(f"{target} timestep policy requires a forward context")
-    step = context.current_timestep
-    fallback = (default_policy or {}).get(str(step), default)
-    precision = policy.get(str(step), policy.get("default", fallback))
-    allowed = {
-        "fa": ("FLOAT", "MXFP4"),
-        "w4a4_linear": ("W4A4", "W4A8"),
-        "w8a8_linear": ("W8A8", "FLOAT"),
-    }
-    if precision not in allowed[target]:
-        raise ValueError(f"Unsupported {target} precision: {precision}")
-    return precision
-
-
-def mxfp4_quant_kwargs(description: dict) -> dict:
-    # Match MindIE-SD f1b15b4 C7 quantization defaults.
-    return {
-        "scale_alg": description.get("mxfp4_scale_alg", 2),
-        "dst_type_max": description.get("mxfp4_dst_type_max", 7.25),
-    }
-
-
-def pack_fp4_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Pack one linear weight into two-FP4-per-byte uint8.
-
-    Legacy msmodelslim exports store the FP4 values as a numeric
-    ``float8_e4m3fn`` container ``[out, in]``; newer exports and the repack
-    tool emit packed ``uint8`` ``[out, in/2]``. The loader expects packed.
-    """
-    if weight.dtype == torch.uint8:
-        return weight
-    if weight.dtype != torch.float8_e4m3fn or weight.shape[-1] % 2:
-        raise ValueError(
-            "MXFP4 weights must be packed uint8 or even-width FP8 containers"
-        )
-    # Convert numeric E2M1 values before the loader casts to the target dtype.
-    values = weight.float()
-    magnitudes = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=weight.device)
-    codes = torch.searchsorted(magnitudes, values.abs()).clamp(max=7)
-    if not torch.equal(magnitudes[codes], values.abs()):
-        raise ValueError(
-            "FP8 container contains values that are not representable as FP4 E2M1"
-        )
-    codes = (codes | (torch.signbit(values).long() << 3)).to(torch.uint8)
-    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
 
 
 class AttentionQuantScheme:
@@ -269,6 +186,33 @@ class AttentionQuantScheme:
         can move them to the activation device/dtype lazily.
         """
         self._module_ref = weakref.ref(module)
+
+    def register_qk_rotation_buffers(
+        self,
+        module: torch.nn.Module,
+        head_dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> bool:
+        """Register the exported ``q_rot``/``k_rot`` buffers on ``module``.
+
+        Centralizes what every model with exported rotations needs: register
+        the two ``[head_dim, head_dim]`` buffers (so they load from the
+        checkpoint and appear in its state dict) and :meth:`bind` the module
+        for :meth:`apply_qk_rotation`. No-op returning ``False`` when the
+        checkpoint does not export both rotations; ``True`` when they were
+        registered. Models whose attention cannot apply the rotation (e.g.
+        sparse variants) should reject the configuration on ``True``.
+        """
+        if not self.use_offline_qk_rotation:
+            return False
+        for name in ("q_rot", "k_rot"):
+            module.register_buffer(
+                name,
+                torch.empty(head_dim, head_dim, dtype=dtype),
+                persistent=True,
+            )
+        self.bind(module)
+        return True
 
     def should_apply_rotation(
         self,

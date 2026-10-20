@@ -17,8 +17,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
+from sglang.multimodal_gen.runtime.layers.quantization.attention_quant_scheme import (
     AttentionQuantScheme,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
     mxfp4_quant_kwargs,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -199,6 +201,28 @@ def fused_infer_attention_varlen(
     return output, lse.squeeze(-1).transpose(0, 1).contiguous()
 
 
+def _attention_quant_kwargs(description: dict, quant_op) -> dict:
+    """MXFP4 Q/K/V quantization kwargs with MindIE's C7 defaults.
+
+    ``round_mode`` is kept out of :func:`mxfp4_quant_kwargs` (linear callers
+    pass it separately) and added here, feature-detected so older torch_npu
+    builds without a ``round_mode`` parameter keep operator-default rounding.
+    """
+    kwargs = mxfp4_quant_kwargs(description)
+    try:
+        has_round_mode = "round_mode" in inspect.signature(quant_op).parameters
+    except (TypeError, ValueError):
+        has_round_mode = True
+    if has_round_mode:
+        kwargs["round_mode"] = "rint"
+    else:
+        logger.warning_once(
+            "torch_npu.npu_dynamic_mx_quant exposes no round_mode; MXFP4 "
+            "attention falls back to operator-default rounding"
+        )
+    return kwargs
+
+
 class AscendMXFP4Attention:
     """MXFP4 self-attention kernel for Ascend 950 (offline MXFP4 checkpoints).
 
@@ -258,7 +282,9 @@ class AscendMXFP4Attention:
                 "Unsupported CANN quant_flash_attn_metadata ABI; install the "
                 "experimental MXFP4 extension"
             )
-        self._quant_kwargs = mxfp4_quant_kwargs(self.description)
+        self._quant_kwargs = _attention_quant_kwargs(
+            self.description, torch_npu.npu_dynamic_mx_quant
+        )
 
     # -- Public entry points -------------------------------------------------
 

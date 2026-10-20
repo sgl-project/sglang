@@ -53,7 +53,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.quant_scheme import (
+from sglang.multimodal_gen.runtime.layers.quantization.attention_quant_scheme import (
     AttentionQuantScheme,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -528,28 +528,10 @@ class WanTransformerBlock(nn.Module):
             )
         else:
             self.use_offline_qk_rotation = (
-                self.attention_quant_scheme.use_offline_qk_rotation
+                self.attention_quant_scheme.register_qk_rotation_buffers(
+                    self, self.dim_head
+                )
             )
-            if self.use_offline_qk_rotation:
-                self.register_buffer(
-                    "q_rot",
-                    torch.empty(
-                        self.dim_head,
-                        self.dim_head,
-                        dtype=torch.bfloat16,
-                    ),
-                    persistent=True,
-                )
-                self.register_buffer(
-                    "k_rot",
-                    torch.empty(
-                        self.dim_head,
-                        self.dim_head,
-                        dtype=torch.bfloat16,
-                    ),
-                    persistent=True,
-                )
-                self.attention_quant_scheme.bind(self)
 
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
