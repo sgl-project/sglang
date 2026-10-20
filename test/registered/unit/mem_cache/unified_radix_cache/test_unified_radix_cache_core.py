@@ -962,6 +962,114 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertEqual(self._swa_match_len(cache, third), len(shared))
         cache.sanity_check()
 
+    def _swa_window_pages(self) -> int:
+        return -(-self.cfg.sliding_window_size // self.cfg.page_size)
+
+    def _check_prompt_end_window_last(self, sub_page_tokens: int) -> None:
+        window_pages = self._swa_window_pages()
+        # Chunks long enough that each checkpoint tombstones the previous end.
+        chunk_len = (window_pages + 2) * self.cfg.page_size
+        prompt = self._make_seq(1, 3 * (window_pages + 2))
+        aligned_len = len(prompt)
+        prompt += list(range(8000, 8000 + sub_page_tokens))
+        # Long enough that the output leaf caps off a window of its own.
+        output = self._make_seq(5000, 2 * window_pages)
+        next_turn = prompt + self._make_seq(9000, 1)
+        for protect in (False, True):
+            with envs.SGLANG_OPT_SWA_PROTECT_PROMPT_TAIL.override(protect):
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                req, _ = self._make_inflight_req(
+                    cache, allocator, req_to_token_pool, prompt, output
+                )
+                chunk_ends = (chunk_len, 2 * chunk_len, aligned_len, len(prompt))
+                for up_to in dict.fromkeys(chunk_ends):
+                    cache.checkpoint(req, up_to=up_to)
+                # Every window older than the locked prompt-end window.
+                older = cache.swa_evictable_size()
+                finish_req(cache, req, len(prompt) + len(output))
+
+                cache.evict(EvictParams(swa_num_tokens=older + 1))
+                self.assertEqual(self._swa_match_len(cache, prompt[: 2 * chunk_len]), 0)
+                self.assertEqual(
+                    self._swa_match_len(cache, next_turn), aligned_len if protect else 0
+                )
+                if protect:
+                    cache.evict(EvictParams(swa_num_tokens=cache.swa_evictable_size()))
+                    self.assertEqual(self._swa_match_len(cache, next_turn), 0)
+                cache.sanity_check()
+
+    @requires_swa_only
+    def test_swa_evict_reclaims_prompt_end_window_last(self):
+        """With SGLANG_OPT_SWA_PROTECT_PROMPT_TAIL, SWA pressure tombstones a
+        request's chunk-boundary and output windows before the window its
+        prompt-end checkpoint built, so a next turn that re-renders the prompt
+        still reuses it; without the flag the prompt end goes in LRU order."""
+        self._check_prompt_end_window_last(sub_page_tokens=0)
+
+    @requires_swa_only
+    @requires_paged
+    def test_swa_evict_reclaims_prompt_end_window_last_after_sub_page_chunk(self):
+        """When the prompt's last chunk is shorter than a page, the chunk before
+        it builds the window at the prompt's last full page; that window is
+        the protected one."""
+        self._check_prompt_end_window_last(sub_page_tokens=self.cfg.page_size - 1)
+
+    @requires_swa_only
+    def test_swa_retraction_reprefill_protects_only_the_prompt_end_window(self):
+        """A re-prefill of prompt plus output (after a retraction) protects the
+        window at the prompt end, not the chunk boundaries past it."""
+        window_pages = self._swa_window_pages()
+        chunk_len = (window_pages + 2) * self.cfg.page_size
+        prompt = self._make_seq(1, 2 * (window_pages + 2))
+        output = self._make_seq(5000, 2 * (window_pages + 2))
+        next_turn = prompt + self._make_seq(9000, 1)
+        past_prompt = (prompt + output)[: 3 * chunk_len] + self._make_seq(9000, 1)
+        with envs.SGLANG_OPT_SWA_PROTECT_PROMPT_TAIL.override(True):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+            req, _ = self._make_inflight_req(
+                cache, allocator, req_to_token_pool, prompt, output
+            )
+            for up_to in range(chunk_len, len(prompt) + len(output) + 1, chunk_len):
+                cache.checkpoint(req, up_to=up_to)
+            finish_req(cache, req, len(prompt) + len(output))
+
+            # Everything but the prompt-end window and the final leaf's window.
+            spared = 2 * window_pages * self.cfg.page_size
+            cache.evict(EvictParams(swa_num_tokens=cache.swa_evictable_size() - spared))
+            self.assertEqual(self._swa_match_len(cache, next_turn), len(prompt))
+            self.assertEqual(self._swa_match_len(cache, past_prompt), len(prompt))
+            cache.sanity_check()
+
+    @requires_swa_only
+    def test_swa_prompt_end_on_an_existing_window_is_protected(self):
+        """A prompt that ends where another request's live window ends protects
+        that window, though its checkpoint adds no node."""
+        window_pages = self._swa_window_pages()
+        chunk_len = (window_pages + 2) * self.cfg.page_size
+        window_len = window_pages * self.cfg.page_size
+        longer = self._make_seq(1, 2 * (window_pages + 2))
+        prompt = longer[:chunk_len]
+        next_turn = prompt + self._make_seq(9000, 1)
+        with envs.SGLANG_OPT_SWA_PROTECT_PROMPT_TAIL.override(True):
+            cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+            for tokens, output in (
+                (longer, self._make_seq(5000, 2 * window_pages)),
+                (prompt, []),
+            ):
+                req, _ = self._make_inflight_req(
+                    cache, allocator, req_to_token_pool, tokens, output
+                )
+                for up_to in range(chunk_len, len(tokens) + 1, chunk_len):
+                    cache.checkpoint(req, up_to=up_to)
+                finish_req(cache, req, len(tokens) + len(output))
+
+            # Leaves two windows: the oldest of the three spared ones goes too.
+            cache.evict(
+                EvictParams(swa_num_tokens=cache.swa_evictable_size() - 2 * window_len)
+            )
+            self.assertEqual(self._swa_match_len(cache, next_turn), len(prompt))
+            cache.sanity_check()
+
     @requires_swa_and_mamba
     def test_leaf_transition_swa_evict_spares_locked_full(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)

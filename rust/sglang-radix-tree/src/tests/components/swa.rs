@@ -875,6 +875,7 @@ fn insert_params_swa<'k>(
         prev_prefix_len,
         swa_evicted_seqlen,
         swa_branching_seqlen: None,
+        swa_prompt_tail: false,
         inserted_len: 0,
         priority: 0,
         session_id: None,
@@ -3317,6 +3318,112 @@ fn device_walk_treats_a_window_above_a_tombstone_as_stale() {
     tc.evict_device_end(SWA);
     assert!(!tc.arena.has_device_value(chunk_window, SWA));
     assert!(tc.arena.has_device_value(idle_tail, SWA));
+    tc.sanity_check(&[], &[]);
+}
+
+// Checkpoint a 12-token prompt in three chunks, the last as a prompt end when
+// `prompt_tail`, then finish with 4 output tokens; each checkpoint keeps one
+// window live. Returns the windows oldest first: two chunk ends, the prompt
+// end, and the output's capped head and leaf.
+fn prompt_tail_fixture(prompt_tail: bool) -> (UnifiedTreeCore<Vec<i64>>, [NodeIdx_; 5]) {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    let tokens: Vec<i64> = (1..=16).collect();
+    let mut windows = vec![];
+    for (end, swa_evicted_seqlen, swa_prompt_tail) in [
+        (4, 2, false),
+        (8, 6, false),
+        (12, 10, prompt_tail),
+        (16, 12, false),
+    ] {
+        let key = tokens[..end].to_vec();
+        let values: Vec<i64> = key.iter().map(|token| token + 100).collect();
+        let result = tc.insert(&InsertParams {
+            swa_prompt_tail,
+            ..insert_params_swa(&key, &values, end - 4, swa_evicted_seqlen)
+        });
+        for action in &result.cache_actions {
+            if let Some(SwaRebuild { node_id, .. }) = action.as_any().downcast_ref::<SwaRebuild>() {
+                let node = tc.arena.resolve(*node_id).unwrap();
+                store_swa_device(&mut tc, node);
+                windows.push(node);
+            }
+        }
+    }
+    (tc, windows.try_into().unwrap())
+}
+
+// The prompt plus a token the previous output did not have.
+fn prompt_tail_next_turn() -> Vec<i64> {
+    (1..=12).chain([99]).collect()
+}
+
+#[test]
+fn device_walk_reclaims_a_prompt_end_window_after_stale_windows() {
+    for prompt_tail in [false, true] {
+        let (mut tc, [chunk_1, chunk_2, prompt_end, output_head, output_leaf]) =
+            prompt_tail_fixture(prompt_tail);
+
+        // Three windows: without the bit the prompt end goes in LRU order.
+        tc.evict_device_start(SWA, 6);
+        assert_eq!(swa_tombstone_steps(&mut tc), None);
+        tc.evict_device_end(SWA);
+        assert!(!tc.arena.has_device_value(chunk_1, SWA));
+        assert!(!tc.arena.has_device_value(chunk_2, SWA));
+        assert_eq!(tc.arena.has_device_value(prompt_end, SWA), prompt_tail);
+        assert_eq!(tc.arena.has_device_value(output_head, SWA), !prompt_tail);
+        assert!(tc.arena.has_device_value(output_leaf, SWA));
+        let matched = tc.match_prefix(&match_params(&prompt_tail_next_turn()));
+        assert_eq!(matched.device_prefix_len, if prompt_tail { 12 } else { 0 });
+        tc.sanity_check(&[], &[]);
+    }
+}
+
+#[test]
+fn device_walk_reclaims_a_prompt_end_window_once_only_spared_windows_are_left() {
+    let (mut tc, [.., prompt_end, _, output_leaf]) = prompt_tail_fixture(true);
+
+    // The three unspared windows plus one more, taken from the spared ones in LRU order.
+    tc.evict_device_start(SWA, 8);
+    assert_eq!(swa_tombstone_steps(&mut tc), None);
+    tc.evict_device_end(SWA);
+    assert!(!tc.arena.has_device_value(prompt_end, SWA));
+    assert!(!tc.arena.node(prompt_end).swa_prompt_tail);
+    assert!(tc.arena.has_device_value(output_leaf, SWA));
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn device_walk_spares_both_halves_of_a_split_prompt_end_window() {
+    let (mut tc, [_, _, prompt_end, ..]) = prompt_tail_fixture(true);
+    // Split as a match ending inside the window does, without its LRU refresh.
+    let (head, _) = tc.split_node_(prompt_end, 1);
+
+    tc.evict_device_start(SWA, 6);
+    assert_eq!(swa_tombstone_steps(&mut tc), None);
+    tc.evict_device_end(SWA);
+    assert!(tc.arena.has_device_value(head, SWA));
+    let matched = tc.match_prefix(&match_params(&prompt_tail_next_turn()));
+    assert_eq!(matched.device_prefix_len, 12);
+    tc.sanity_check(&[], &[]);
+}
+
+#[test]
+fn prompt_end_insert_marks_a_live_window_it_does_not_create() {
+    let (mut tc, [.., prompt_end, _, _]) = prompt_tail_fixture(false);
+    assert!(!tc.arena.node(prompt_end).swa_prompt_tail);
+
+    // Another request whose prompt ends on that window adds no node.
+    let key: Vec<i64> = (1..=12).collect();
+    let values: Vec<i64> = key.iter().map(|token| token + 200).collect();
+    let result = tc.insert(&InsertParams {
+        swa_prompt_tail: true,
+        ..insert_params_swa(&key, &values, 0, 10)
+    });
+    assert_eq!(
+        result.last_device_node_id,
+        Some(tc.arena.node(prompt_end).id)
+    );
+    assert!(tc.arena.node(prompt_end).swa_prompt_tail);
     tc.sanity_check(&[], &[]);
 }
 

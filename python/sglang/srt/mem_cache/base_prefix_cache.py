@@ -90,6 +90,8 @@ class InsertParams:
     # SWA specific
     prev_prefix_len: int = 0
     swa_branching_seqlen: Optional[int] = None
+    # The insert ends at the last full page of a running request's prompt.
+    swa_prompt_tail: bool = False
 
     # General
     component_evicted_seqlens: dict[ComponentType, int] = dataclasses.field(

@@ -572,6 +572,13 @@ class SWAComponent(TreeComponent):
             result.swa_branch_inserted = len(params.key) >= branching_seqlen
 
         if not is_new_leaf:
+            # An earlier checkpoint may have built the prompt-end window already.
+            if (
+                params.swa_prompt_tail
+                and node is not self.tree_core.root_node
+                and node.component_data[self.component_type].value is not None
+            ):
+                node.component_data[self.component_type].metadata["prompt_tail"] = True
             return
 
         # Another window may have split this leaf; use the full aligned insert span.
@@ -589,6 +596,10 @@ class SWAComponent(TreeComponent):
             cap_leaf=True,
             cache_actions=cache_actions,
         )
+        if params.swa_prompt_tail and end > params.get_evicted_seqlen(
+            self.component_type
+        ):
+            node.component_data[self.component_type].metadata["prompt_tail"] = True
 
     def _maybe_split_leaf_for_swa_lock(
         self,
@@ -690,6 +701,10 @@ class SWAComponent(TreeComponent):
             child.component_data[self.component_type].metadata.get("host_uuid")
         )
         child.component_data[self.component_type].metadata.pop("host_uuid", None)
+        # Both halves keep the bit, so a split leaves the protected span as it was.
+        parent_metadata = new_parent.component_data[self.component_type].metadata
+        if child.component_data[self.component_type].metadata.get("prompt_tail"):
+            parent_metadata["prompt_tail"] = True
 
     def evict_component(
         self,
@@ -715,6 +730,9 @@ class SWAComponent(TreeComponent):
             freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
+            # SWA is rebuilt only on a tombstone or a new leaf, so a window
+            # stays protected only if a prompt-end insert built it.
+            cd.metadata.pop("prompt_tail", None)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[ct]
@@ -763,7 +781,8 @@ class SWAComponent(TreeComponent):
             self._evict_device_cursor = lru.get_lru_no_lock()
 
     def _skip_branch_tails(self) -> None:
-        """Move the cursor past branch tails; reclaim them once nothing else is left."""
+        """Move the cursor past branch tails and prompt-end windows; reclaim
+        them once nothing else is left."""
         lru = self.tree_core.lru_lists[self.component_type]
         enabled = self.tree_core.enable_session_radix_cache
         while self._evict_device_spares_tails:
@@ -772,7 +791,9 @@ class SWAComponent(TreeComponent):
                 self._evict_device_spares_tails = False
                 if self._evict_device_spared_tail:
                     self._restart_device_walk()
-            elif self._is_in_branch_tail(x):
+            elif x.component_data[self.component_type].metadata.get(
+                "prompt_tail"
+            ) or self._is_in_branch_tail(x):
                 self._evict_device_spared_tail = True
                 self._evict_device_cursor = (
                     lru.cursor_next() if enabled else lru.get_prev_no_lock(x)

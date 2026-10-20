@@ -68,6 +68,7 @@ fn insert_params_mamba<'k>(
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
+        swa_prompt_tail: false,
         inserted_len: 0,
         priority: 0,
         session_id: None,
