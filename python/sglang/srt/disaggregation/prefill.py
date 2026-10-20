@@ -391,6 +391,8 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                     slot_layer_ids=slot_layer_ids,
                 )
+        if get_disagg().nixl_use_cpu_buffer:
+            kv_manager.set_cpu_kv_buffers(self.token_to_kv_pool)
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:

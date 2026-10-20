@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,51 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+
+    if cfg.nixl_use_cpu_buffer:
+        if (
+            cfg.disaggregation_transfer_backend != "nixl"
+            or cfg.disaggregation_mode == "null"
+        ):
+            raise ValueError("--nixl-use-cpu-buffer requires NIXL prefill/decode mode")
+        if (
+            not math.isfinite(cfg.nixl_cpu_buffer_size_gb)
+            or cfg.nixl_cpu_buffer_size_gb <= 0
+        ):
+            raise ValueError("--nixl-cpu-buffer-size-gb must be finite and positive")
+        if cfg.device != "cuda":
+            raise ValueError("CPU-buffer PD currently requires NVIDIA CUDA")
+        if (
+            cfg.pp_size != 1
+            or cfg.attn_cp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.speculative_algorithm is not None
+            or cfg.disaggregation_decode_host_receive_threshold != 1
+            or cfg.enable_pd_role_switch
+            or cfg.enable_hisparse
+            or cfg.enable_hierarchical_cache
+            or cfg.disaggregation_decode_enable_offload_kvcache
+            or envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        ):
+            raise ValueError(
+                "CPU-buffer PD currently requires PP=CP=DCP=1 without speculative decoding, "
+                "HiCache, HiSparse, KV offload, host receive, role switching, or GPU staging"
+            )
+
+        if cfg.disaggregation_mode == "decode":
+            if cfg.disaggregation_decode_retraction_backup == "host_pool":
+                raise ValueError(
+                    "CPU-buffer PD requires cpu_tensor or none retraction backup; "
+                    "host_pool requires CUDA host registration"
+                )
+            if cfg.disaggregation_decode_retraction_backup is None:
+                # The inferred MHA host_pool default allocates a CUDA-registered
+                # HiCache pool even when incoming KV uses pageable CPU buffers.
+                declare_resolution(
+                    server_args,
+                    "handle_pd_disaggregation",
+                    disaggregation_decode_retraction_backup="cpu_tensor",
+                )
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
