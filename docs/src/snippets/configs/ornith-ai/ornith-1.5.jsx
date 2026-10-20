@@ -5,6 +5,8 @@ export const config = {
 
   supportedHardware: ["h100", "h200"],
 
+  showPlaygroundLink: false,
+
   variants: [
     { id: "397b", label: "397B", subtitle: "MoE" },
     { id: "122b", label: "122B", subtitle: "MoE" },
