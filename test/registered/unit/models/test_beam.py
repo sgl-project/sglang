@@ -1,0 +1,1604 @@
+"""Precision and checkpoint-layout regressions for native Beam."""
+
+import contextlib
+import math
+import os
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
+from compressed_tensors.quantization import preset_name_to_scheme
+
+from sglang.kernels.ops.elementwise import BeamAttentionGateOp
+from sglang.srt.configs.beam import BeamConfig
+from sglang.srt.configs.model_config import (
+    _get_and_verify_dtype,
+    get_hybrid_layer_ids,
+    is_hybrid_swa_model,
+)
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import MergedColumnParallelLinear
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.topk import TopKOutputFormat, biased_grouped_topk_impl
+from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.models.beam import (
+    BeamAttention,
+    BeamDecoderLayer,
+    BeamForCausalLM,
+    BeamModel,
+    BeamMoE,
+    apply_ssmax,
+    compute_ssmax_scale,
+    depth_scaled_residual,
+    get_beam_quantization,
+)
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.utils.hf_transformers import get_context_length
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def tiny_config(**overrides):
+    kwargs = dict(
+        vocab_size=32,
+        hidden_size=24,
+        intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=48,
+        num_key_value_heads=8,
+        head_dim=8,
+        max_position_embeddings=1024,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+        moe_intermediate_size=32,
+        num_experts=16,
+    )
+    kwargs.update(overrides)
+    return BeamConfig(**kwargs)
+
+
+def loader_model(params):
+    model = BeamForCausalLM.__new__(BeamForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = tiny_config()
+    model.start_layer, model.end_layer = 0, 4
+    model.model = SimpleNamespace(
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    )
+    model.named_parameters = lambda: iter(params.items())
+    return model
+
+
+def fp8_config(preset="FP8_DYNAMIC", ignore=()):
+    return CompressedTensorsConfig.from_config(
+        {
+            "format": "float-quantized",
+            "config_groups": {
+                "group_0": preset_name_to_scheme(
+                    preset, targets=["Linear", "lm_head"]
+                ).model_dump()
+            },
+            "ignore": list(ignore),
+            "packed_modules_mapping": BeamForCausalLM.packed_modules_mapping,
+        }
+    )
+
+
+class _LoadedExpert:
+    def __init__(self):
+        self.shards = {}
+
+    def weight_loader(self, param, weight, name, *, shard_id, expert_id):
+        self.shards[expert_id, shard_id] = weight.clone()
+
+
+class AddLayer(torch.nn.Module):
+    def __init__(self, amount):
+        super().__init__()
+        self.amount = amount
+        self.input_layernorm = torch.nn.Linear(1, 1, bias=False)
+        self.input_layernorm.weight.data.fill_(1)
+
+    def forward(self, positions, hidden, batch, ssmax_scale):
+        return hidden + self.amount
+
+    def forward_fused(
+        self,
+        positions,
+        normed,
+        residual,
+        batch,
+        next_weight,
+        ssmax_scale,
+        attention_beam_ar_comm=None,
+        attention_flashinfer_ar=None,
+        mlp_beam_ar_topk_comm=None,
+        mlp_beam_ar_comm=None,
+        mlp_flashinfer_ar=None,
+    ):
+        hidden = self.forward(positions, residual, batch, ssmax_scale)
+        return hidden * next_weight, hidden
+
+
+def stub_beam_model(layers, norm, layers_to_capture):
+    model = BeamModel.__new__(BeamModel)
+    torch.nn.Module.__init__(model)
+    model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+    model.embed_tokens = torch.nn.Identity()
+    model.layers = torch.nn.ModuleList(layers)
+    model.norm = norm
+    model.start_layer, model.end_layer = 0, len(layers)
+    model.layers_to_capture = layers_to_capture
+    model.has_full_attention = False
+    model._flashinfer_ar_tokens = None
+    model._flashinfer_ar = None
+    model._mlp_has_single_tp_sum = True
+    return model
+
+
+# MegaMOE requires TP == DP == EP: four attention-DP ranks, experts split four ways.
+_DP4_MEGAMOE_LAYOUT = dict(
+    tp_size=4, attn_tp_size=1, attn_dp_size=4, moe_tp_size=1, moe_ep_size=4
+)
+
+
+class TestBeamConfig(CustomTestCase):
+    def test_fully_data_parallel_dense_mlp_fails_before_allocation(self):
+        # Dense layers gather attention-DP tokens over the full TP group; a
+        # replicated dense MLP would change the scheduler's scatter mode.
+        with (
+            get_context().override_server_args(moe_dense_tp_size=1),
+            patch("sglang.srt.models.beam.BeamModel") as model,
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "moe_dense_tp_size=1"):
+                BeamForCausalLM(tiny_config())
+            model.assert_not_called()
+
+    def test_bf16_and_fp8_reject_unvalidated_moe_runners(self):
+        from sglang.srt.runtime_context import get_flags
+
+        for quant in (None, fp8_config()):
+            for backend in (
+                MoeRunnerBackend.FLASHINFER_TRTLLM,
+                MoeRunnerBackend.FLASHINFER_CUTLASS,
+                MoeRunnerBackend.DEEP_GEMM,
+            ):
+                with (
+                    self.subTest(quant=quant, backend=backend),
+                    get_context().override_server_args(),
+                    get_flags().moe.override(
+                        runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                    ),
+                    get_parallel().override(moe_tp_size=1, moe_ep_size=1),
+                    self.assertRaisesRegex(ValueError, "auto or triton"),
+                ):
+                    BeamMoE(tiny_config(), 1, quant_config=quant)
+
+    def test_megamoe_builds_one_expert_set_with_explicit_routing(self):
+        from sglang.srt.runtime_context import get_flags
+
+        built = []
+
+        def make_experts(**kwargs):
+            built.append(kwargs["prefix"])
+            experts = torch.nn.Module()
+            experts.should_fuse_routed_scaling_factor_in_topk = True
+            return experts
+
+        def megamoe_context(runner_backend=MoeRunnerBackend.FLASHINFER_MEGAMOE):
+            stack = contextlib.ExitStack()
+            stack.enter_context(get_context().override_server_args())
+            stack.enter_context(
+                get_flags().moe.override(
+                    runner_backend=runner_backend,
+                    a2a_backend=MoeA2ABackend.FLASHINFER_MEGAMOE,
+                )
+            )
+            stack.enter_context(get_parallel().override(**_DP4_MEGAMOE_LAYOUT))
+            return stack
+
+        nvfp4 = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        with (
+            megamoe_context(),
+            patch(
+                "sglang.srt.models.beam.get_moe_impl_class",
+                return_value=make_experts,
+            ),
+        ):
+            moe = BeamMoE(
+                tiny_config(), 1, prefix="model.layers.1.mlp", quant_config=nvfp4
+            )
+
+        self.assertEqual(built, ["model.layers.1.mlp.experts"])
+        # MegaMOE dispatches on explicit expert ids and weights.
+        self.assertEqual(moe.topk.topk_config.output_format, TopKOutputFormat.STANDARD)
+        self.assertTrue(moe.topk.topk_config.apply_routed_scaling_factor_on_output)
+
+        rejected = {
+            "bf16": (None, MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            "fp8": (fp8_config(), MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            # Compressed-tensors NVFP4 has no MegaMOE weight preparation.
+            "non_modelopt_nvfp4": (None, MoeRunnerBackend.FLASHINFER_MEGAMOE),
+            "trtllm_runner": (nvfp4, MoeRunnerBackend.FLASHINFER_TRTLLM),
+        }
+        for case, (quant, runner) in rejected.items():
+            with (
+                self.subTest(case=case),
+                megamoe_context(runner),
+                patch(
+                    "sglang.srt.models.beam.get_beam_quantization",
+                    return_value=(
+                        "nvfp4"
+                        if case == "non_modelopt_nvfp4"
+                        else get_beam_quantization(quant)
+                    ),
+                ),
+                self.assertRaisesRegex(ValueError, "only for ModelOpt NVFP4"),
+            ):
+                BeamMoE(tiny_config(), 1, quant_config=quant)
+
+    def test_unsupported_quantization_fails_before_allocation(self):
+        # Other FP8 layouts must not pass merely because they use the same exporter.
+        mixed = fp8_config().config
+        mixed["config_groups"]["other"] = preset_name_to_scheme(
+            "FP8", targets=["model.layers.1.mlp.experts"]
+        ).model_dump()
+        for quant in (
+            Fp8Config(),
+            Fp8Config(is_checkpoint_fp8_serialized=True),
+            W8A8Fp8Config(is_checkpoint_fp8_serialized=True),
+            ModelOptFp8Config(is_checkpoint_fp8_serialized=True),
+            fp8_config("FP8"),
+            fp8_config("W8A8"),
+            CompressedTensorsConfig.from_config(mixed),
+            CompressedTensorsConfig.from_config(
+                fp8_config().config
+                | {"linear_fp8_config": {"activation_scheme": "static"}}
+            ),
+            CompressedTensorsConfig.from_config(
+                {"format": "float-quantized", "config_groups": {}, "ignore": []}
+            ),
+        ):
+            with (
+                self.subTest(quant=quant),
+                patch("sglang.srt.models.beam.BeamModel") as model,
+            ):
+                with self.assertRaisesRegex(NotImplementedError, "FP8"):
+                    BeamForCausalLM(tiny_config(), quant_config=quant)
+                model.assert_not_called()
+
+    def test_expert_relocation_fails_before_allocation(self):
+        for options in (
+            {"enable_eplb": True},
+            {"init_expert_location": "random"},
+            {"ep_num_redundant_experts": 1},
+        ):
+            with (
+                self.subTest(options=options),
+                get_context().override_server_args(**options),
+                patch("sglang.srt.models.beam.BeamModel") as model,
+            ):
+                with self.assertRaisesRegex(
+                    NotImplementedError, "expert relocation or redundant experts"
+                ):
+                    BeamForCausalLM(tiny_config())
+                model.assert_not_called()
+
+    def test_release_and_explicit_layer_schedules_choose_native_pools(self):
+        release = BeamConfig()
+        full_ids = [5, 11, 17, 23, 29, 35, 41, 47, 51]
+        sliding_ids = [layer for layer in range(52) if layer not in full_ids]
+        self.assertEqual(
+            get_hybrid_layer_ids(release.architectures, release),
+            (sliding_ids, full_ids),
+        )
+        self.assertEqual(
+            release.layer_types,
+            [
+                "full_attention" if layer in full_ids else "sliding_attention"
+                for layer in range(52)
+            ],
+        )
+        self.assertEqual(release.mlp_layer_types, ["dense"] * 3 + ["sparse"] * 49)
+        self.assertEqual(release.max_position_embeddings, 1_048_576)
+        self.assertTrue(is_hybrid_swa_model(release.architectures, release))
+
+        explicit = BeamConfig(
+            num_hidden_layers=3,
+            layer_types=["full_attention", "sliding_attention", "full_attention"],
+        )
+        self.assertEqual(
+            get_hybrid_layer_ids(explicit.architectures, explicit), ([1], [0, 2])
+        )
+        self.assertEqual(
+            BeamForCausalLM.get_attention_sliding_window_size(
+                SimpleNamespace(config=explicit)
+            ),
+            511,
+        )
+
+        full_only = BeamConfig(num_hidden_layers=3, layer_types=["full_attention"] * 3)
+        self.assertFalse(is_hybrid_swa_model(full_only.architectures, full_only))
+        self.assertEqual(
+            get_hybrid_layer_ids(full_only.architectures, full_only), ([], [0, 1, 2])
+        )
+        self.assertIsNone(
+            BeamForCausalLM.get_attention_sliding_window_size(
+                SimpleNamespace(config=full_only)
+            )
+        )
+
+        sliding_only = BeamConfig(
+            num_hidden_layers=3,
+            layer_types=["sliding_attention"] * 3,
+            sliding_window=2,
+        )
+        self.assertTrue(is_hybrid_swa_model(sliding_only.architectures, sliding_only))
+        self.assertEqual(
+            get_hybrid_layer_ids(sliding_only.architectures, sliding_only),
+            ([0, 1, 2], []),
+        )
+        self.assertEqual(
+            BeamForCausalLM.get_attention_sliding_window_size(
+                SimpleNamespace(config=sliding_only)
+            ),
+            1,
+        )
+
+    def test_rope_parameters_are_nested_per_layer_type_and_survive_roundtrip(self):
+        parameters = {
+            "sliding_attention": {"rope_type": "default", "rope_theta": 20000.0},
+            "full_attention": None,
+        }
+        config = BeamConfig(rope_parameters=parameters)
+        # save_pretrained runs the Transformers validators; see BeamConfig.validate.
+        with tempfile.TemporaryDirectory() as directory:
+            config.save_pretrained(directory)
+            saved = BeamConfig.from_pretrained(directory)
+        for candidate in (config, saved):
+            self.assertEqual(candidate.rope_parameters, parameters)
+            self.assertFalse(hasattr(candidate, "rope_theta"))
+            self.assertEqual(
+                get_context_length(candidate), candidate.max_position_embeddings
+            )
+
+    def test_unsupported_rope_and_single_token_window_fail_early(self):
+        with self.assertRaisesRegex(ValueError, "per-layer-type"):
+            BeamConfig(rope_parameters={"rope_type": "default", "rope_theta": 500000.0})
+        with self.assertRaisesRegex(ValueError, "only default RoPE"):
+            BeamConfig(
+                rope_parameters={
+                    "sliding_attention": {"rope_type": "linear", "factor": 2},
+                    "full_attention": None,
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "without rotary embeddings"):
+            BeamConfig(
+                rope_parameters={
+                    "sliding_attention": {"rope_type": "default"},
+                    "full_attention": {"rope_type": "default"},
+                }
+            )
+
+        # Checked before the Transformers constructor, which raises a non-ValueError.
+        with self.assertRaisesRegex(ValueError, "mlp_layer_types length"):
+            BeamConfig(num_hidden_layers=2, mlp_layer_types=["dense"])
+
+        for window in (None, 0, 1):
+            with (
+                self.subTest(window=window),
+                self.assertRaisesRegex(ValueError, "sliding_window >= 2"),
+            ):
+                BeamConfig(sliding_window=window)
+
+    def test_missing_dtype_defaults_to_bf16_without_overriding_metadata(self):
+        for metadata in ({}, {"dtype": None}, {"torch_dtype": None}):
+            with self.subTest(metadata=metadata):
+                config = BeamConfig(**metadata)
+                self.assertEqual(_get_and_verify_dtype(config, "auto"), torch.bfloat16)
+                restored = BeamConfig.from_dict(config.to_dict())
+                self.assertEqual(
+                    _get_and_verify_dtype(restored, "auto"), torch.bfloat16
+                )
+
+        for field in ("dtype", "torch_dtype"):
+            with self.subTest(field=field):
+                config = BeamConfig(**{field: "float16"})
+                self.assertEqual(_get_and_verify_dtype(config, "auto"), torch.float16)
+
+
+class TestBeamNumerics(CustomTestCase):
+    def test_norms_round_after_weight_multiplication(self):
+        config = tiny_config()
+        pp_group = SimpleNamespace(
+            is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+        )
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                pp_group=pp_group,
+            ),
+            patch(
+                "sglang.srt.models.beam.BeamRotaryEmbedding",
+                side_effect=lambda config: torch.nn.Identity(),
+            ) as rotary,
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+        ):
+            model = BeamModel(config)
+        rotary.assert_called_once_with(config)
+        self.assertIs(
+            model.layers[0].self_attn.rotary_emb,
+            model.layers[2].self_attn.rotary_emb,
+        )
+        for layer_id in (1, 3):
+            self.assertIsNone(model.layers[layer_id].self_attn.rotary_emb)
+        generator = torch.Generator().manual_seed(46)
+        for name, norm in model.named_modules():
+            if not isinstance(norm, RMSNorm):
+                continue
+            with self.subTest(norm=name):
+                norm = norm.bfloat16()
+                value = torch.randn(5, norm.hidden_size, generator=generator).bfloat16()
+                weight = (
+                    0.5 + torch.rand(norm.hidden_size, generator=generator)
+                ).bfloat16()
+                with torch.no_grad():
+                    norm.weight.copy_(weight)
+                normalized = value.float() * torch.rsqrt(
+                    value.float().square().mean(dim=-1, keepdim=True)
+                    + config.rms_norm_eps
+                )
+                expected = (normalized * weight.float()).bfloat16()
+                rounded_before_weight = normalized.bfloat16() * weight
+
+                actual = norm.forward_native(value)
+
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                self.assertEqual(actual.dtype, torch.bfloat16)
+                self.assertFalse(torch.equal(expected, rounded_before_weight))
+
+    def test_ssmax_absolute_positions_and_fp32_product(self):
+        positions = torch.tensor([0, 511, 512, 2047, 8192, 262143, 1048575])
+        generator = torch.Generator().manual_seed(42)
+        query = torch.randn(positions.numel(), 32, generator=generator).bfloat16()
+        scale = torch.tensor(
+            [math.exp(0.1 * math.log1p((p + 1) / 2048)) for p in positions],
+            dtype=torch.float32,
+        ).unsqueeze(-1)
+        expected = (query.float() * scale).bfloat16()
+
+        actual = apply_ssmax(query, compute_ssmax_scale(positions))
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertFalse(torch.equal(expected, query * scale.bfloat16()))
+        # Chunking and cached decode must retain the supplied absolute positions.
+        for start, end in ((0, 3), (3, 6), (6, 7)):
+            torch.testing.assert_close(
+                apply_ssmax(
+                    query[start:end], compute_ssmax_scale(positions[start:end])
+                ),
+                actual[start:end],
+                atol=0,
+                rtol=0,
+            )
+
+    def test_gate_bias_broadcast_and_bf16_serving_arithmetic(self):
+        generator = torch.Generator().manual_seed(43)
+        output = torch.randn(3, 4, 8, generator=generator).bfloat16()
+        gate = torch.randn(3, 4, 8, generator=generator).bfloat16()
+        bias = torch.tensor([-1.03125, 0.00390625, 0.53125, 2.125]).bfloat16()
+        expected = output * torch.sigmoid(gate + bias[None, :, None])
+        fp32_gate = (
+            output.float() * torch.sigmoid(gate.float() + bias.float()[None, :, None])
+        ).bfloat16()
+
+        actual = BeamAttentionGateOp().forward_native(output, gate, bias, 8)
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertFalse(torch.equal(expected, fp32_gate))
+
+    def test_depth_scaled_residual_rounds_scaled_operands_and_addition(self):
+        generator = torch.Generator().manual_seed(44)
+        branch = torch.randn(5, 32, generator=generator).bfloat16()
+        residual = torch.randn(5, 32, generator=generator).bfloat16()
+        # Layer 51 is the release depth; the default schedules cover 52 layers.
+        deep_config = tiny_config(
+            num_hidden_layers=52, layer_types=None, mlp_layer_types=None
+        )
+        for layer_id in (0, 1, 51):
+            config = deep_config if layer_id == 51 else tiny_config()
+            with (
+                get_context().override_server_args(),
+                get_parallel().override(attn_dp_size=1),
+                patch(
+                    "sglang.srt.models.beam.BeamAttention",
+                    return_value=torch.nn.Identity(),
+                ),
+                patch(
+                    "sglang.srt.models.beam.BeamMLP", return_value=torch.nn.Identity()
+                ),
+                patch(
+                    "sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()
+                ),
+            ):
+                layer = BeamDecoderLayer(config, layer_id)
+            for is_ffn in (False, True):
+                depth = 2 * (layer_id + 1) + int(is_ffn)
+                with self.subTest(layer_id=layer_id, is_ffn=is_ffn):
+                    expected = branch * (1 / math.sqrt(depth)) + residual * (
+                        math.sqrt(depth - 1) / math.sqrt(depth)
+                    )
+                    fp32_temporaries = (
+                        branch.float() * (1 / math.sqrt(depth))
+                        + residual.float() * (math.sqrt(depth - 1) / math.sqrt(depth))
+                    ).bfloat16()
+                    scales = (
+                        layer.mlp_residual_scales
+                        if is_ffn
+                        else layer.attn_residual_scales
+                    )
+                    actual = depth_scaled_residual(branch, residual, scales)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    self.assertEqual(actual.dtype, torch.bfloat16)
+                    self.assertFalse(torch.equal(expected, fp32_temporaries))
+
+    def test_moe_uses_combined_runner_output_without_reweighting(self):
+        config = tiny_config()
+        for num_tokens in (0, 1, 3):
+            with self.subTest(num_tokens=num_tokens):
+                hidden = torch.zeros(num_tokens, config.hidden_size).bfloat16()
+                combined = torch.full_like(hidden, 0.75)
+                expected = combined.clone()
+                gate = torch.nn.Module()
+                gate.forward = Mock(
+                    return_value=(torch.zeros(num_tokens, config.num_experts), None)
+                )
+                topk_output = object()
+                topk = torch.nn.Module()
+                topk.forward = Mock(return_value=topk_output)
+                topk.empty_topk_output = Mock(return_value=topk_output)
+                experts = torch.nn.Module()
+                experts.should_fuse_routed_scaling_factor_in_topk = False
+                experts.forward = Mock(return_value=combined)
+                factory = Mock(return_value=experts)
+                with (
+                    get_context().override_server_args(),
+                    get_parallel().override(moe_tp_size=1, moe_ep_size=1),
+                    patch("sglang.srt.models.beam.ReplicatedLinear", return_value=gate),
+                    patch("sglang.srt.models.beam.TopK", return_value=topk),
+                    patch(
+                        "sglang.srt.models.beam.get_moe_impl_class",
+                        return_value=factory,
+                    ),
+                ):
+                    moe = BeamMoE(config, layer_id=1)
+                    self.assertFalse(factory.call_args.kwargs.get("no_combine", False))
+                    self.assertEqual(
+                        factory.call_args.kwargs["routed_scaling_factor"],
+                        config.routed_scaling_factor,
+                    )
+                    actual = moe(hidden)
+
+                experts.forward.assert_called_once_with(hidden, topk_output)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                self.assertEqual(actual.shape, hidden.shape)
+                if num_tokens:
+                    topk.forward.assert_called_once()
+                    topk.empty_topk_output.assert_not_called()
+                else:
+                    topk.forward.assert_not_called()
+                    topk.empty_topk_output.assert_called_once()
+
+    def test_megamoe_runs_sparse_layers_on_dp_local_tokens(self):
+        from sglang.srt.runtime_context import get_flags
+
+        with (
+            get_context().override_server_args(),
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_MEGAMOE,
+                a2a_backend=MoeA2ABackend.FLASHINFER_MEGAMOE,
+            ),
+            get_parallel().override(**_DP4_MEGAMOE_LAYOUT),
+            patch(
+                "sglang.srt.models.beam.BeamAttention",
+                return_value=torch.nn.Identity(),
+            ),
+            patch("sglang.srt.models.beam.BeamMLP", return_value=torch.nn.Identity()),
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+        ):
+            dense, sparse = (BeamDecoderLayer(tiny_config(), i) for i in (0, 1))
+            # Dense MLPs stay TP-sharded over the gathered tokens.
+            self.assertTrue(dense.gather_mlp_tokens)
+            self.assertFalse(sparse.gather_mlp_tokens)
+
+            # MegaMOE returns complete tokens, so the block owes no all-reduce.
+            moe = BeamMoE.__new__(BeamMoE)
+            torch.nn.Module.__init__(moe)
+            moe.layer_id, moe.tp_size, moe.ep_size = 1, 1, 4
+            moe.use_fp32_router = moe.refresh_correction_bias = False
+            moe.use_fast_router = False
+            moe.gate = Mock(return_value=(torch.zeros(2, 8), None))
+            moe.topk = Mock(return_value="routing")
+            moe.topk.empty_topk_output = Mock(return_value="empty routing")
+            moe.experts = Mock(side_effect=lambda hidden, routing: hidden + 6)
+            sparse.mlp = moe
+            with (
+                patch(
+                    "sglang.srt.models.beam.moe_expert_parallel_all_reduce"
+                ) as ep_all_reduce,
+                patch(
+                    "sglang.srt.models.beam.moe_tensor_model_parallel_all_reduce"
+                ) as tp_all_reduce,
+                patch("sglang.srt.models.beam.dp_gather_replicate") as gather,
+            ):
+                local = torch.ones(2, 3)
+                output = sparse._forward_mlp(local, SimpleNamespace())
+                # An idle rank still enters the MegaMOE collective.
+                idle = torch.empty(0, 3)
+                idle_output = sparse._forward_mlp(idle, SimpleNamespace())
+            self.assertEqual(
+                [call.args for call in moe.experts.call_args_list],
+                [(local, "routing"), (idle, "empty routing")],
+            )
+            gather.assert_not_called()
+            ep_all_reduce.assert_not_called()
+            tp_all_reduce.assert_not_called()
+            torch.testing.assert_close(output, torch.full((2, 3), 7.0))
+            self.assertEqual(idle_output.shape, (0, 3))
+
+    def _select_beam_experts(self, config, bias, logits):
+        # Exercise the TopK constructed by Beam, replacing only the hardware
+        # selector with its shared eager implementation for CPU CI.
+        hidden = torch.ones(logits.shape[0], config.hidden_size, dtype=torch.bfloat16)
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(tp_size=1, tp_rank=0, moe_tp_size=1, moe_ep_size=1),
+            patch.object(
+                torch.nn.Identity,
+                "should_fuse_routed_scaling_factor_in_topk",
+                False,
+                create=True,
+            ),
+            patch(
+                "sglang.srt.models.beam.get_moe_impl_class",
+                return_value=Mock(return_value=torch.nn.Identity()),
+            ),
+            patch(
+                "sglang.srt.layers.moe.topk.biased_grouped_topk",
+                wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,
+            ) as selector,
+        ):
+            moe = BeamMoE(config, layer_id=1)
+            with torch.no_grad():
+                moe.gate.e_score_correction_bias.copy_(bias)
+            routing = moe.topk.topk_config
+            self.assertTrue(routing.use_grouped_topk)
+            self.assertEqual(routing.num_expert_group, config.n_group)
+            self.assertEqual(routing.topk_group, config.topk_group)
+            self.assertEqual(routing.top_k, config.num_experts_per_tok)
+            self.assertTrue(routing.renormalize)
+            self.assertEqual(routing.scoring_func, "sigmoid")
+            self.assertEqual(routing.output_format, TopKOutputFormat.STANDARD)
+            self.assertIsNone(routing.custom_routing_function)
+            self.assertIsNone(routing.routed_scaling_factor)
+            self.assertFalse(routing.apply_routed_scaling_factor_on_output)
+            self.assertIs(routing.correction_bias, moe.gate.e_score_correction_bias)
+            self.assertEqual(moe.gate.weight.dtype, torch.float32)
+            self.assertEqual(routing.correction_bias.dtype, torch.float32)
+
+            output = moe.topk.forward_native(hidden, logits)
+
+            selector.assert_called_once()
+        self.assertEqual(output.format, TopKOutputFormat.STANDARD)
+        self.assertEqual(output.topk_weights.dtype, torch.float32)
+        self.assertEqual(output.topk_ids.dtype, torch.int32)
+        return output.topk_weights, output.topk_ids
+
+    def test_non_bf16_router_uses_linear_fallback(self):
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                hidden = torch.randn(17, 24, dtype=dtype)
+                weight = torch.randn(8, 24)
+                expected = hidden.float() @ weight.T
+                gate = Mock(weight=weight, return_value=(expected, None))
+                moe = SimpleNamespace(
+                    use_fast_router=True, use_fp32_router=True, gate=gate
+                )
+                actual = BeamMoE._router_logits(moe, hidden)
+                torch.testing.assert_close(actual, expected)
+                gate.assert_called_once()
+                torch.testing.assert_close(gate.call_args.args[0], hidden.float())
+
+    def test_router_bias_selects_experts_with_unscaled_fp32_combine_scores(self):
+        config = tiny_config()
+        config.num_experts = 32
+        bias = torch.linspace(0, 1, 32)
+        logits = torch.stack(
+            (
+                torch.linspace(1, -1, 32),
+                # The epsilon is significant, and the old 1e-9 clamp would
+                # reduce the coefficient sum by many orders of magnitude.
+                torch.linspace(-49, -47, 32),
+                torch.full((32,), -100.0),
+            )
+        )
+        weights, ids = self._select_beam_experts(config, bias, logits)
+        _, unbiased_ids = self._select_beam_experts(
+            config, torch.zeros_like(bias), logits[:1]
+        )
+        self.assertNotEqual(set(ids[0].tolist()), set(unbiased_ids[0].tolist()))
+
+        for row in range(3):
+            scores = logits[row].sigmoid()
+            corrected = scores + bias
+            group_scores = [
+                sum(sorted(corrected[group * 4 : (group + 1) * 4].tolist())[-2:])
+                for group in range(8)
+            ]
+            groups = sorted(range(8), key=lambda g: group_scores[g], reverse=True)[:4]
+            selected = sorted(
+                [
+                    expert
+                    for group in groups
+                    for expert in range(group * 4, group * 4 + 4)
+                ],
+                key=lambda expert: corrected[expert].item(),
+                reverse=True,
+            )[:8]
+            self.assertEqual(set(ids[row].tolist()), set(selected))
+            # Align coefficients with actual IDs; slot order is not a contract.
+            unbiased = scores[ids[row].long()]
+            expected = unbiased / (unbiased.sum() + 1e-20)
+            torch.testing.assert_close(weights[row], expected, atol=0, rtol=0)
+        self.assertFalse(torch.equal(weights[0], weights[0].bfloat16().float()))
+        self.assertAlmostEqual(weights[0].sum().item(), 1.0, places=6)
+        self.assertGreater(weights[1].sum().item(), 0.1)
+        self.assertLess(weights[1].sum().item(), 0.95)
+        self.assertEqual(weights[2].count_nonzero().item(), 0)
+        self.assertTrue(torch.isfinite(weights).all())
+
+    def test_router_logits_change_selected_groups_and_experts_with_fixed_bias(self):
+        config = tiny_config()
+        config.num_experts = 32
+        bias = torch.linspace(-0.015, 0.015, 32)
+        # Rows 0/1 choose different groups; rows 0/2 keep the same groups but
+        # change both winning experts in every group. Fixed, small correction
+        # biases cannot select these memberships without the sigmoid scores.
+        selected = torch.tensor(
+            [
+                [0, 1, 4, 5, 8, 9, 12, 13],
+                [18, 19, 22, 23, 26, 27, 30, 31],
+                [2, 3, 6, 7, 10, 11, 14, 15],
+            ]
+        )
+        scores = torch.linspace(0.03, 0.12, 32).repeat(3, 1)
+        scores.scatter_(1, selected, torch.linspace(0.85, 0.64, 8).repeat(3, 1))
+        # Each rejected group contains a single expert stronger than any
+        # winner. Its top-two sum is still weaker: a group-max or global-topk
+        # implementation must fail these explicit membership expectations.
+        scores[torch.arange(3), torch.tensor([28, 0, 24])] = 0.95
+        weights, ids = self._select_beam_experts(config, bias, scores.logit())
+
+        for row in range(3):
+            self.assertEqual(set(ids[row].tolist()), set(selected[row].tolist()))
+        self.assertTrue(torch.isfinite(weights).all())
+
+
+class TestBeamLoading(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def test_fp8_model_uses_shared_methods_and_loads_scales(self):
+        config = tiny_config(
+            vocab_size=64,
+            num_hidden_layers=2,
+            layer_types=["full_attention"] * 2,
+            mlp_layer_types=["dense", "sparse"],
+        )
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+        # Exporters may use arbitrary group names for the FP8 recipe.
+        quant = fp8_config()
+        with (
+            get_parallel().override(
+                tp_rank=0,
+                tp_size=1,
+                attn_tp_rank=0,
+                attn_tp_size=1,
+                moe_tp_rank=0,
+                moe_tp_size=1,
+                moe_ep_rank=0,
+                moe_ep_size=1,
+                pp_group=SimpleNamespace(
+                    is_first_rank=True,
+                    is_last_rank=True,
+                    rank_in_group=0,
+                    world_size=1,
+                ),
+            ),
+            # Exercise real allocation and loaders without executing CUDA kernels.
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            model = BeamForCausalLM(config, quant_config=quant)
+            dense, sparse = model.model.layers
+            experts = sparse.mlp.experts
+            dtype = torch.float8_e4m3fn
+            for layer in (dense, sparse):
+                for proj in ("qkv_proj", "gate_proj", "o_proj"):
+                    self.assertEqual(getattr(layer.self_attn, proj).weight.dtype, dtype)
+            for param in (
+                dense.mlp.gate_up_proj.weight,
+                dense.mlp.down_proj.weight,
+            ):
+                self.assertEqual(param.dtype, dtype)
+            self.assertEqual(experts.w13_weight.dtype, dtype)
+            self.assertEqual(experts.w2_weight.dtype, dtype)
+            self.assertEqual(model.model.embed_tokens.weight.dtype, torch.bfloat16)
+            self.assertEqual(sparse.mlp.gate.weight.dtype, torch.float32)
+            self.assertEqual(
+                sparse.mlp.gate.e_score_correction_bias.dtype, torch.float32
+            )
+            self.assertEqual(
+                experts.moe_runner_config.routed_scaling_factor,
+                config.routed_scaling_factor,
+            )
+            self.assertFalse(
+                sparse.mlp.topk.topk_config.apply_routed_scaling_factor_on_output
+            )
+            with (
+                torch.no_grad(),
+                patch(
+                    "sglang.srt.layers.moe.topk.biased_grouped_topk",
+                    wraps=biased_grouped_topk_impl._torchdynamo_orig_callable,
+                ),
+            ):
+                sparse.mlp.gate.e_score_correction_bias.zero_()
+                routing = sparse.mlp.topk.forward_native(
+                    torch.ones(1, config.hidden_size),
+                    torch.linspace(1, -1, config.num_experts)[None],
+                )
+            # FP8 scales after expert combination, not in routing.
+            torch.testing.assert_close(
+                routing.topk_weights.sum(-1), torch.ones(1, dtype=torch.float32)
+            )
+            weights = []
+            for name, width, value in (
+                ("0.self_attn.q_proj", 384, 1),
+                ("0.self_attn.k_proj", 64, 2),
+                ("0.self_attn.v_proj", 64, 3),
+                ("0.mlp.gate_proj", 32, 4),
+                ("0.mlp.up_proj", 32, 5),
+                ("1.mlp.experts.0.gate_proj", 32, 6),
+                ("1.mlp.experts.0.up_proj", 32, 7),
+            ):
+                prefix = f"model.layers.{name}"
+                weights.append(
+                    (
+                        f"{prefix}.weight",
+                        torch.full((width, 24), value, dtype=dtype),
+                    )
+                )
+                weights.append(
+                    (
+                        f"{prefix}.weight_scale",
+                        torch.full(
+                            (width, 1),
+                            value / 16,
+                            dtype=torch.float32,
+                        ),
+                    )
+                )
+            model.load_weights(weights)
+            for layer, expected in (
+                (dense.self_attn.qkv_proj, [1] * 384 + [2] * 64 + [3] * 64),
+                (dense.mlp.gate_up_proj, [4] * 32 + [5] * 32),
+            ):
+                torch.testing.assert_close(
+                    layer.weight.float()[:, 0], torch.tensor(expected).float()
+                )
+                torch.testing.assert_close(
+                    layer.weight_scale.flatten(),
+                    torch.tensor(expected).float() / 16,
+                )
+            torch.testing.assert_close(
+                experts.w13_weight[0].float()[:, 0],
+                torch.tensor([6] * 32 + [7] * 32).float(),
+            )
+            torch.testing.assert_close(
+                experts.w13_weight_scale[0].flatten(),
+                torch.tensor([6] * 32 + [7] * 32).float() / 16,
+            )
+            self.assertEqual(model.lm_head.weight.dtype, dtype)
+            scales = torch.full_like(model.lm_head.weight_scale, 0.25)
+            model.load_weights(
+                [
+                    ("lm_head.weight", torch.full((64, 24), 9, dtype=dtype)),
+                    ("lm_head.weight_scale", scales),
+                ]
+            )
+            torch.testing.assert_close(
+                model.lm_head.weight.float(),
+                torch.full((64, 24), 9.0, dtype=torch.float32),
+            )
+            torch.testing.assert_close(model.lm_head.weight_scale, scales)
+
+    def test_fp8_exclusions_use_unpacked_projection_names(self):
+        ignored = [
+            f"model.layers.0.{name}"
+            for name in (
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+            )
+        ]
+        with (
+            get_parallel().override(
+                tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1
+            ),
+            patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+        ):
+            layer = BeamDecoderLayer(
+                tiny_config(layer_types=["full_attention"] * 4),
+                0,
+                quant_config=fp8_config(ignore=ignored),
+                prefix="model.layers.0",
+            )
+        self.assertEqual(
+            layer.self_attn.qkv_proj.weight.dtype, torch.get_default_dtype()
+        )
+        self.assertEqual(layer.mlp.gate_up_proj.weight.dtype, torch.get_default_dtype())
+        self.assertEqual(layer.self_attn.gate_proj.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(layer.mlp.down_proj.weight.dtype, torch.float8_e4m3fn)
+
+    def test_non_last_pipeline_stage_skips_lm_head_scales(self):
+        model = loader_model({})
+        model.model.pp_group.is_last_rank = False
+        self.assertEqual(
+            model.load_weights(
+                [
+                    (f"lm_head.{suffix}", torch.ones(1))
+                    for suffix in ("weight", "weight_scale", "input_scale")
+                ]
+            ),
+            set(),
+        )
+
+    def test_attention_tp_shards_and_packed_projections(self):
+        """Packed and split attention projections load the same TP shards."""
+        config = tiny_config()
+        for tp_size in (1, 2, 4, 8, 16):
+            rank = tp_size - 1
+            with (
+                self.subTest(tp_size=tp_size),
+                get_parallel().override(
+                    tp_size=tp_size,
+                    tp_rank=rank,
+                    attn_tp_rank=rank,
+                    attn_tp_size=tp_size,
+                    moe_tp_size=tp_size,
+                ),
+                patch(
+                    # This is a loading test; constructing the unused CPU rotary
+                    # kernel would require vLLM. Native rotation is covered in E2E.
+                    "sglang.srt.models.beam.BeamRotaryEmbedding",
+                    return_value=torch.nn.Identity(),
+                ),
+            ):
+                attention = BeamAttention(config, layer_id=0)
+                dense = MergedColumnParallelLinear(24, [32, 32], bias=False)
+                params = {
+                    "model.layers.0.self_attn.gate_bias": attention.gate_bias,
+                    "model.layers.0.mlp.gate_up_proj.weight": dense.weight,
+                }
+                for name, param in attention.named_parameters():
+                    params[f"model.layers.0.self_attn.{name}"] = param
+                weights = {
+                    f"model.layers.0.self_attn.{name}.weight": torch.arange(width * 24)
+                    .reshape(width, 24)
+                    .float()
+                    for name, width in (
+                        ("q_proj", 384),
+                        ("k_proj", 64),
+                        ("v_proj", 64),
+                        ("gate_proj", 384),
+                    )
+                }
+                weights["model.layers.0.self_attn.v_proj.weight"] += 20000
+                weights["model.layers.0.self_attn.gate_proj.weight"] += 40000
+                weights["model.layers.0.self_attn.gate_bias"] = torch.arange(48).float()
+                weights["model.layers.0.mlp.gate_proj.weight"] = (
+                    torch.arange(32 * 24).reshape(32, 24).float()
+                )
+                weights["model.layers.0.mlp.up_proj.weight"] = (
+                    weights["model.layers.0.mlp.gate_proj.weight"] + 1000
+                )
+                loader_model(params).load_weights(weights.items())
+                q_start = rank * attention.q_size
+                kv_rank = rank if tp_size <= 8 else rank // (tp_size // 8)
+                kv_start = kv_rank * attention.kv_size
+                expected_qkv = torch.cat(
+                    [
+                        weights["model.layers.0.self_attn.q_proj.weight"][
+                            q_start : q_start + attention.q_size
+                        ],
+                        weights["model.layers.0.self_attn.k_proj.weight"][
+                            kv_start : kv_start + attention.kv_size
+                        ],
+                        weights["model.layers.0.self_attn.v_proj.weight"][
+                            kv_start : kv_start + attention.kv_size
+                        ],
+                    ]
+                )
+                expected_gate = weights["model.layers.0.self_attn.gate_proj.weight"][
+                    q_start : q_start + attention.q_size
+                ]
+                if tp_size <= config.num_key_value_heads:
+                    torch.testing.assert_close(
+                        attention.qkv_gate_proj.weight,
+                        torch.cat([expected_qkv, expected_gate]),
+                    )
+                    # Packed outputs have a wider row stride. Splitting and
+                    # reshaping the gate must preserve token/head ordering.
+                    value = torch.arange(3 * 24).reshape(3, 24).float() / 100
+                    actual, _ = attention.qkv_gate_proj(value)
+                    expected = torch.cat(
+                        [
+                            torch.nn.functional.linear(value, expected_qkv),
+                            torch.nn.functional.linear(value, expected_gate),
+                        ],
+                        dim=-1,
+                    )
+                    torch.testing.assert_close(actual, expected)
+                    gate = actual[:, -attention.q_size :].view(
+                        -1, attention.num_heads, attention.head_dim
+                    )
+                    torch.testing.assert_close(
+                        gate.flatten(1), expected[:, -attention.q_size :]
+                    )
+                else:
+                    torch.testing.assert_close(attention.qkv_proj.weight, expected_qkv)
+                    torch.testing.assert_close(
+                        attention.gate_proj.weight, expected_gate
+                    )
+                torch.testing.assert_close(
+                    attention.gate_bias, torch.arange(48).float().chunk(tp_size)[rank]
+                )
+                torch.testing.assert_close(
+                    dense.weight,
+                    torch.cat(
+                        [
+                            weights["model.layers.0.mlp.gate_proj.weight"].chunk(
+                                tp_size
+                            )[rank],
+                            weights["model.layers.0.mlp.up_proj.weight"].chunk(tp_size)[
+                                rank
+                            ],
+                        ]
+                    ),
+                )
+                self.assertEqual(attention.attn.layer_id, 0)
+                self.assertEqual(attention.attn.sliding_window_size, 511)
+                self.assertEqual(attention.attn.tp_q_head_num, 48 // tp_size)
+                self.assertEqual(attention.attn.tp_k_head_num, max(1, 8 // tp_size))
+                full = BeamAttention(config, layer_id=3)
+                self.assertEqual(full.attn.layer_id, 3)
+                self.assertEqual(full.attn.sliding_window_size, -1)
+                self.assertIsNone(full.rotary_emb)
+
+    def test_split_and_packed_experts_keep_gate_up_order(self):
+        tensors = {
+            (expert, shard): torch.full(
+                (4, 6) if shard != "w2" else (6, 4), expert * 10 + offset
+            )
+            for expert in (0, 1, 15)
+            for offset, shard in enumerate(("w1", "w3", "w2"))
+        }
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                w13, w2 = _LoadedExpert(), _LoadedExpert()
+                model = loader_model(
+                    {
+                        "model.layers.1.mlp.experts.w13_weight": w13,
+                        "model.layers.1.mlp.experts.w2_weight": w2,
+                    }
+                )
+                if packed:
+                    packed_gate_up = torch.zeros(16, 8, 6)
+                    packed_down = torch.zeros(16, 6, 4)
+                    for expert in (0, 1, 15):
+                        packed_gate_up[expert] = torch.cat(
+                            [tensors[expert, "w1"], tensors[expert, "w3"]]
+                        )
+                        packed_down[expert] = tensors[expert, "w2"]
+                    weights = [
+                        ("model.layers.1.mlp.experts.gate_up_proj", packed_gate_up),
+                        ("model.layers.1.mlp.experts.down_proj", packed_down),
+                    ]
+                else:
+                    weights = [
+                        (
+                            f"model.layers.1.mlp.experts.{expert}.{name}.weight",
+                            tensors[expert, shard],
+                        )
+                        for expert in (0, 1, 15)
+                        for name, shard in (
+                            ("gate_proj", "w1"),
+                            ("up_proj", "w3"),
+                            ("down_proj", "w2"),
+                        )
+                    ]
+                model.load_weights(weights)
+                for (expert, shard), tensor in tensors.items():
+                    actual = (w2 if shard == "w2" else w13).shards[expert, shard]
+                    torch.testing.assert_close(actual, tensor.to(actual.dtype))
+
+    def test_nvfp4_expert_weights_and_scales_use_same_shard_mapping(self):
+        suffixes = ("weight", "weight_scale", "weight_scale_2", "input_scale")
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix):
+                w13, w2 = _LoadedExpert(), _LoadedExpert()
+                params = {
+                    f"model.layers.3.mlp.experts.w13_{suffix}": w13,
+                    f"model.layers.3.mlp.experts.w2_{suffix}": w2,
+                }
+                weights = [
+                    (
+                        f"model.layers.3.mlp.experts.7.{projection}.{suffix}",
+                        torch.tensor([value]),
+                    )
+                    for value, projection in enumerate(
+                        ("gate_proj", "up_proj", "down_proj"), start=1
+                    )
+                ]
+                loaded = loader_model(params).load_weights(weights)
+                self.assertEqual(loaded, set(params))
+                for param, shard, expected in (
+                    (w13, "w1", 1),
+                    (w13, "w3", 2),
+                    (w2, "w2", 3),
+                ):
+                    torch.testing.assert_close(
+                        param.shards[7, shard], torch.tensor([expected])
+                    )
+
+    def test_router_parameters_preserve_fp32_checkpoint_values(self):
+        config = tiny_config()
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.bfloat16)
+            with (
+                get_context().override_server_args(),
+                get_parallel().override(
+                    moe_tp_size=1,
+                    moe_ep_size=1,
+                ),
+                patch("sglang.srt.models.beam.TopK", return_value=torch.nn.Identity()),
+                patch.object(
+                    torch.nn.Identity,
+                    "should_fuse_routed_scaling_factor_in_topk",
+                    False,
+                    create=True,
+                ),
+                patch(
+                    "sglang.srt.models.beam.get_moe_impl_class",
+                    return_value=lambda **kwargs: torch.nn.Identity(),
+                ),
+            ):
+                moe = BeamMoE(config, layer_id=1)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        params = {
+            "model.layers.1.mlp.gate.weight": moe.gate.weight,
+            "model.layers.1.mlp.gate.e_score_correction_bias": moe.gate.e_score_correction_bias,
+        }
+        weights = {
+            name: torch.linspace(0.000123, 0.998765, param.numel()).view(param.shape)
+            for name, param in params.items()
+        }
+        loader_model(params).load_weights(weights.items())
+        for name, param in params.items():
+            self.assertEqual(param.dtype, torch.float32)
+            torch.testing.assert_close(param, weights[name], atol=0, rtol=0)
+            self.assertFalse(torch.equal(param, weights[name].bfloat16().float()))
+
+    def test_load_weights_returns_loaded_parameter_names(self):
+        params = {
+            "model.norm.weight": torch.nn.Parameter(torch.zeros(24)),
+            "model.layers.0.self_attn.gate_bias": torch.nn.Parameter(torch.zeros(48)),
+        }
+        complete = {name: torch.ones_like(param) for name, param in params.items()}
+        loaded = loader_model(params).load_weights(complete.items())
+        self.assertEqual(loaded, set(params))
+        torch.testing.assert_close(params["model.norm.weight"], torch.ones(24))
+
+        # A missing tensor is reported through the returned set, not an error.
+        del complete["model.layers.0.self_attn.gate_bias"]
+        loaded = loader_model(params).load_weights(complete.items())
+        self.assertEqual(loaded, {"model.norm.weight"})
+
+    def test_head_load_keeps_bf16_storage_and_respects_projection_precision(self):
+        config = tiny_config()
+        stub_model = torch.nn.Module()
+        stub_model.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+        stub_model.start_layer, stub_model.end_layer = 0, 4
+        generator = torch.Generator().manual_seed(45)
+        stored = torch.randn(32, 24, generator=generator)
+        loaded = stored.bfloat16()
+        hidden = torch.randn(3, 24, generator=generator).bfloat16()
+        bf16_projection = hidden @ loaded.T
+        fp32_projection = hidden.float() @ loaded.float().T
+        self.assertFalse(torch.equal(bf16_projection.float(), fp32_projection))
+        for use_fp32_lm_head in (False, True):
+            with self.subTest(use_fp32_lm_head=use_fp32_lm_head):
+                previous_dtype = torch.get_default_dtype()
+                try:
+                    torch.set_default_dtype(torch.bfloat16)
+                    with (
+                        get_context().override_server_args(
+                            enable_fp32_lm_head=use_fp32_lm_head,
+                            enable_dp_lm_head=False,
+                        ),
+                        get_parallel().override(
+                            tp_size=1,
+                            tp_rank=0,
+                            attn_tp_size=1,
+                            attn_tp_rank=0,
+                            attn_dp_size=1,
+                        ),
+                        patch(
+                            "sglang.srt.models.beam.BeamModel",
+                            return_value=stub_model,
+                        ),
+                    ):
+                        model = BeamForCausalLM(config)
+                finally:
+                    torch.set_default_dtype(previous_dtype)
+                model.load_weights([("lm_head.weight", stored)])
+                self.assertEqual(model.lm_head.weight.dtype, torch.bfloat16)
+                self.assertEqual(
+                    model.logits_processor.use_fp32_lm_head, use_fp32_lm_head
+                )
+                torch.testing.assert_close(
+                    model.lm_head.weight[:32], loaded, atol=0, rtol=0
+                )
+                actual = LogitsProcessor._compute_lm_head(
+                    model.logits_processor, hidden, model.lm_head
+                )[:, :32]
+                expected = fp32_projection if use_fp32_lm_head else bf16_projection
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                self.assertEqual(actual.dtype, expected.dtype)
+
+
+class TestBeamDFlashCapture(CustomTestCase):
+    def test_dflash_captures_post_layer_before_final_norm(self):
+        norm = torch.nn.Linear(1, 1, bias=False)
+        norm.weight.data.fill_(10)
+        model = stub_beam_model([AddLayer(1), AddLayer(2), AddLayer(3)], norm, (0, 2))
+        for fuse_layers in (True, False):
+            with self.subTest(fuse_layers=fuse_layers):
+                model.fuse_layers = fuse_layers
+                hidden, aux = model(torch.zeros(2, 1), torch.arange(2), None)
+                torch.testing.assert_close(hidden, torch.full((2, 1), 60.0))
+                torch.testing.assert_close(aux[0], torch.ones(2, 1))
+                torch.testing.assert_close(aux[1], torch.full((2, 1), 6.0))
+
+    def test_no_capture_returns_only_the_normed_stream(self):
+        norm = torch.nn.Linear(1, 1, bias=False)
+        norm.weight.data.fill_(1)
+        model = stub_beam_model([AddLayer(1)], norm, ())
+        model.fuse_layers = True
+        hidden = model(torch.zeros(2, 1), torch.arange(2), None)
+        torch.testing.assert_close(hidden, torch.ones(2, 1))
+
+    def test_dflash_rejects_ambiguous_capture_order(self):
+        model = BeamForCausalLM.__new__(BeamForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = BeamConfig(num_hidden_layers=4)
+        model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=1))
+        for ids in ([], [1, 1], [2, 0], [-1], [4]):
+            with self.subTest(ids=ids), self.assertRaises(ValueError):
+                model.set_dflash_layers_to_capture(ids)
+        model.set_dflash_layers_to_capture([0, 3])
+        self.assertTrue(model.capture_aux_hidden_states)
+        self.assertEqual(model.model.layers_to_capture, (0, 3))
+
+    def test_dflash_capture_requires_a_single_pipeline_stage(self):
+        model = BeamForCausalLM.__new__(BeamForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = BeamConfig(num_hidden_layers=4)
+        model.model = SimpleNamespace(pp_group=SimpleNamespace(world_size=2))
+        with self.assertRaisesRegex(ValueError, "PP=1"):
+            model.set_dflash_layers_to_capture([0])
+
+
+class TestBeamPipelineStage(CustomTestCase):
+    def test_empty_stage_hands_on_its_stream(self):
+        """A custom PP partition can leave a stage with no layer to run or fuse from."""
+        config = tiny_config(layer_types=["full_attention"] * 4)
+        stream = torch.arange(2.0).unsqueeze(-1)
+        for partition, rank in (("0,4", 0), ("4,0", 1)):
+            with self.subTest(partition=partition):
+                pp_group = SimpleNamespace(
+                    is_first_rank=rank == 0,
+                    is_last_rank=rank == 1,
+                    rank_in_group=rank,
+                    world_size=2,
+                )
+                with (
+                    patch.dict(os.environ, {"SGLANG_PP_LAYER_PARTITION": partition}),
+                    get_context().override_server_args(),
+                    get_parallel().override(
+                        tp_size=1,
+                        tp_rank=0,
+                        attn_tp_size=1,
+                        attn_tp_rank=0,
+                        attn_dp_size=1,
+                        pp_size=2,
+                        pp_rank=rank,
+                        pp_group=pp_group,
+                    ),
+                ):
+                    model = BeamModel(config)
+                self.assertEqual(model.start_layer, model.end_layer)
+                if rank == 0:
+                    proxy = model(None, torch.arange(2), None, input_embeds=stream)
+                    torch.testing.assert_close(proxy["hidden_states"], stream)
+                else:
+                    model.norm = torch.nn.Linear(1, 1, bias=False)
+                    model.norm.weight.data.fill_(10)
+                    hidden = model(
+                        None,
+                        torch.arange(2),
+                        None,
+                        pp_proxy_tensors=PPProxyTensors({"hidden_states": stream}),
+                    )
+                    torch.testing.assert_close(hidden, stream * 10)
+
+
+class TestBeamBoundaryOwnership(CustomTestCase):
+    """Who reduces each TP boundary, and how FlashInfer's workspace is set up."""
+
+    @staticmethod
+    def stub_layer(moe: bool, log: list):
+        """A decoder layer whose attention, MLP and collectives only record calls."""
+
+        def attention(positions, normed, batch, ssmax_scale, skip_all_reduce=False):
+            log.append("attention" if skip_all_reduce else "attention+own reduce")
+            return normed + 1
+
+        def mlp(hidden, defer_sum=False, skip_all_reduce=False):
+            if defer_sum:
+                log.append("experts deferred")
+                return hidden.unsqueeze(1).expand(-1, 8, -1)
+            log.append("mlp" if skip_all_reduce else "mlp+own reduce")
+            return hidden + 2
+
+        layer = BeamDecoderLayer.__new__(BeamDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attn = attention
+        if moe:
+            layer.mlp = BeamMoE.__new__(BeamMoE)
+            torch.nn.Module.__init__(layer.mlp)
+            layer.mlp.forward = mlp
+            layer.mlp.config = SimpleNamespace(routed_scaling_factor=2.5)
+            backend = SimpleNamespace(is_triton=lambda: True)
+            layer.mlp.experts = SimpleNamespace(
+                quant_method=SimpleNamespace(
+                    runner=SimpleNamespace(runner_backend=backend)
+                ),
+                _dwdp_bound=False,
+            )
+        else:
+            layer.mlp = mlp
+        layer.gather_mlp_tokens = False
+        weight = SimpleNamespace(weight=torch.ones(4))
+        layer.post_attention_layernorm = layer.pre_feedforward_layernorm = weight
+        layer.post_feedforward_layernorm = weight
+        layer.rms_norm_eps = 1e-6
+        layer.attn_residual_scales = layer.mlp_residual_scales = (0.5, 0.5)
+
+        def norm(branch, residual, *args):
+            log.append("norm")
+            return branch, residual
+
+        layer.sandwich_residual_norm = norm
+        return layer
+
+    def test_each_boundary_is_reduced_exactly_once(self):
+        def fused(comm, branch, residual, *args, routed_scale=1.0):
+            log.append(f"{comm} {tuple(branch.shape[1:-1])} x{routed_scale}")
+            return branch[:, 0] if branch.ndim == 3 else branch, residual
+
+        def flashinfer(branch):
+            log.append("flashinfer")
+            return branch
+
+        # (MoE layer, replacements) -> calls in order; "x2.5" marks routed scaling.
+        cases = [
+            (False, {}, ["attention+own reduce", "norm", "mlp+own reduce", "norm"]),
+            (
+                False,
+                {"attention_beam_ar_comm": "fused", "mlp_beam_ar_comm": "fused"},
+                ["attention", "fused () x1.0", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {
+                    "attention_beam_ar_comm": "fused",
+                    "mlp_beam_ar_topk_comm": "topk",
+                    "mlp_beam_ar_comm": "fused",
+                },
+                ["attention", "fused () x1.0", "experts deferred", "topk (8,) x2.5"],
+            ),
+            # The top-k variant needs per-expert outputs; a dense MLP falls back.
+            (
+                False,
+                {"mlp_beam_ar_topk_comm": "topk"},
+                ["attention+own reduce", "norm", "mlp+own reduce", "norm"],
+            ),
+            (
+                False,
+                {"mlp_beam_ar_topk_comm": "topk", "mlp_beam_ar_comm": "fused"},
+                ["attention+own reduce", "norm", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {"mlp_beam_ar_comm": "fused"},
+                ["attention+own reduce", "norm", "mlp", "fused () x1.0"],
+            ),
+            (
+                True,
+                {
+                    "attention_flashinfer_ar": flashinfer,
+                    "mlp_flashinfer_ar": flashinfer,
+                },
+                ["attention", "flashinfer", "norm", "mlp", "flashinfer", "norm"],
+            ),
+            # A reduce-scatter or two-group MLP keeps its own reduction.
+            (
+                True,
+                {"attention_flashinfer_ar": flashinfer},
+                ["attention", "flashinfer", "norm", "mlp+own reduce", "norm"],
+            ),
+        ]
+        hidden = torch.zeros(3, 4)
+        for moe, replacements, expected in cases:
+            with self.subTest(moe=moe, replacements=sorted(replacements)):
+                log = []
+                layer = self.stub_layer(moe, log)
+                with patch(
+                    "sglang.kernels.ops.communication.beam_all_reduce."
+                    "beam_all_reduce_norm",
+                    side_effect=fused,
+                ):
+                    layer.forward_fused(
+                        None, hidden, hidden, None, None, None, **replacements
+                    )
+                self.assertEqual(log, expected)
+
+    def test_meta_construction_defers_flashinfer_setup(self):
+        pp_group = SimpleNamespace(
+            is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
+        )
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                pp_group=pp_group,
+            ),
+            patch(
+                "sglang.srt.models.beam.BeamRotaryEmbedding",
+                side_effect=lambda config: torch.nn.Identity(),
+            ),
+            patch("sglang.srt.models.beam.BeamMoE", return_value=torch.nn.Identity()),
+            patch.object(BeamModel, "_flashinfer_ar_band", return_value=(96, 640)),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.FlashInferWorkspaceManager",
+                side_effect=AssertionError("workspace setup during construction"),
+            ),
+            torch.device("meta"),
+        ):
+            model = BeamModel(tiny_config())
+        self.assertEqual(model._flashinfer_ar_tokens, (96, 640))
+        self.assertIsNone(model._flashinfer_ar)
+
+    def run_setup(self, *, local_ok=True, peer_ok=True, calls=()):
+        """Drive `_flashinfer_ar_for` through `calls` of (tokens, capturing)."""
+        manager = Mock(workspace=object() if local_ok else None)
+        model = BeamModel.__new__(BeamModel)
+        torch.nn.Module.__init__(model)
+        model._flashinfer_ar_tokens, model._flashinfer_ar = (96, 640), None
+        group = SimpleNamespace(
+            world_size=4, rank_in_group=0, device_group=None, cpu_group=None
+        )
+
+        def vote(ready, op, group):
+            ready.mul_(int(peer_ok))
+
+        results = []
+        with (
+            get_parallel().override(tp_group=group),
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion.FlashInferWorkspaceManager",
+                return_value=manager,
+            ) as manager_class,
+            patch(
+                "sglang.srt.layers.flashinfer_comm_fusion."
+                "is_flashinfer_allreduce_unavailable",
+                return_value=False,
+            ),
+            patch("torch.distributed.all_reduce", side_effect=vote),
+            patch("sglang.srt.models.beam.atexit.register"),
+        ):
+            for tokens, capturing in calls:
+                hidden = torch.zeros(tokens, 8, dtype=torch.bfloat16)
+                with patch(
+                    "torch.cuda.is_current_stream_capturing", return_value=capturing
+                ):
+                    results.append(model._flashinfer_ar_for(hidden))
+        return model, manager, manager_class, results
+
+    def test_flashinfer_setup_runs_once_eagerly_and_is_reused(self):
+        model, manager, manager_class, results = self.run_setup(
+            calls=[(128, True), (8, False), (128, False), (128, True), (641, True)]
+        )
+        # Never during capture; once on the first eager forward, whatever its size.
+        self.assertIsNone(results[0])
+        manager_class.assert_called_once()
+        self.assertEqual(manager.initialize.call_args.kwargs["max_token_num"], 640)
+        self.assertIsNone(results[1])
+        self.assertIs(results[2], model._flashinfer_ar)
+        self.assertIs(results[3], model._flashinfer_ar)
+        self.assertIsNone(results[4])
+        manager.cleanup.assert_not_called()
+
+    def test_flashinfer_setup_failure_falls_back_for_good(self):
+        for local_ok, peer_ok in ((False, True), (True, False)):
+            with self.subTest(local_ok=local_ok, peer_ok=peer_ok):
+                model, manager, manager_class, results = self.run_setup(
+                    local_ok=local_ok,
+                    peer_ok=peer_ok,
+                    calls=[(128, False), (128, False), (256, True)],
+                )
+                self.assertEqual(results, [None, None, None])
+                manager_class.assert_called_once()
+                manager.cleanup.assert_called_once()
+                self.assertIsNone(model._flashinfer_ar_tokens)
+
+
+if __name__ == "__main__":
+    unittest.main()
