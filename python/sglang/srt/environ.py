@@ -1534,6 +1534,10 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Extra-buffer Mamba radix cache: end a prefill chunk at the Mamba branching
+    # point so both it and the prompt end get a checkpoint (one per extend).
+    # Off = an extend holding both checkpoints only the branching point.
+    SGLANG_OPT_MAMBA_SPLIT_EXTEND_AT_BRANCHING = EnvBool(True)
 
     # ===================================================================
     # CUDA graphs and execution buffers

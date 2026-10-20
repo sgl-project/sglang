@@ -9,6 +9,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
     get_schedule,
+    mamba_checkpoint_grid,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
 
@@ -98,6 +99,17 @@ def _use_exact_chunk_fill() -> bool:
     partial tile.
     """
     return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
+
+
+def _mamba_branching_split_grid(tree_cache: BasePrefixCache) -> Optional[int]:
+    # Only the extra-buffer strategy keeps one state snapshot per extend.
+    if not (
+        envs.SGLANG_OPT_MAMBA_SPLIT_EXTEND_AT_BRANCHING.get()
+        and tree_cache.supports_mamba()
+        and get_exec().mamba.enable_mamba_extra_buffer
+    ):
+        return None
+    return mamba_checkpoint_grid(tree_cache.page_size)
 
 
 # Threshold for in-batch prefix cache.
@@ -712,6 +724,8 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        # None disables ending a prefill chunk at the Mamba branching point.
+        self.mamba_branching_split_grid = _mamba_branching_split_grid(tree_cache)
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1140,6 +1154,18 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if (
+            not truncated
+            and self.dllm_config is None
+            and (
+                split_len := self._mamba_branching_split_len(
+                    req, prefix_len=req.prefix_len, extend_len=new_len
+                )
+            )
+        ):
+            # The last chunk would spend its snapshot on the branching point.
+            truncated = True
+            new_len = split_len
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1579,11 +1605,12 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
+            if self.new_chunked_req is not None or (
                 has_chunked_req
                 and get_schedule().schedule_policy == "shortest-prefill-first"
             ):
-                # Only one unfinished chunked request can be tracked.
+                # Only one unfinished chunked request can be tracked (a
+                # branching split may have taken it with budget left over).
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly
@@ -1610,12 +1637,49 @@ class PrefillAdder:
             max_new_tokens = 0
             tile_tokens = extend_len
 
+        # Only an extend that reaches the prompt end loses its checkpoint there;
+        # the scheduler tracks one unfinished chunked request.
+        if (
+            self.dllm_config is None
+            and not is_chunked
+            and not has_chunked_req
+            and self.new_chunked_req is None
+            and (
+                split_len := self._mamba_branching_split_len(
+                    req, prefix_len=prefix_len, extend_len=extend_len
+                )
+            )
+            and not (truncation_align_size and split_len % truncation_align_size)
+        ):
+            extend_len = split_len
+            is_chunked = True
+            max_new_tokens = 0
+            tile_tokens = extend_len
+
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
 
         return _PrefillAdmission(
             prefix_len, extend_len, max_new_tokens, is_chunked, replay_len
         )
+
+    def _mamba_branching_split_len(
+        self, req: Req, *, prefix_len: int, extend_len: int
+    ) -> Optional[int]:
+        grid = self.mamba_branching_split_grid
+        if grid is None or self.rem_chunk_tokens is None:
+            return None
+        branching = req.mamba_branching_seqlen
+        if branching is None:
+            return None
+        split_len = branching - prefix_len
+        # Same predicate as the branching-point snapshot in ScheduleBatch, and
+        # the rest of the extend must reach the next checkpoint.
+        if not 0 < split_len <= extend_len - grid or split_len % grid:
+            return None
+        if self.kv_shard_granule and branching % self.kv_shard_granule:
+            return None
+        return split_len
 
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int

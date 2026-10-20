@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt.managers.schedule_policy as schedule_policy
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -343,6 +344,156 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
+
+    def _branching_req(self, rid, *, prefix_len, prompt_len, branching):
+        req = self.create_shared_req(rid)
+        req.full_untruncated_fill_ids = list(range(prompt_len))
+        req.prefix_len = prefix_len
+        req.mamba_branching_seqlen = branching
+        return req
+
+    def _branching_adder(self, *, rem_chunk_tokens=16384):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 1 << 20
+        return self.create_adder(
+            self.create_running_batch(), rem_chunk_tokens=rem_chunk_tokens
+        )
+
+    def test_extend_ends_at_mamba_branching_point(self):
+        # The extra-buffer Mamba cache snapshots one state per extend. With the
+        # Full-KV hit (branching point 3968) past the Mamba hit (1984), ending
+        # the chunk at 3968 checkpoints it, and the next chunk then checkpoints
+        # the prompt end, which the next turn of the conversation extends.
+        base = dict(
+            grid=64,
+            prefix=1984,
+            prompt=6049,
+            branching=3968,
+            has_chunked=False,
+            chunk=16384,
+            align=None,
+            granule=0,
+        )
+        cases = (
+            ("split", 1984, {}),
+            ("disabled", 4065, dict(grid=None)),
+            ("no branching", 4065, dict(branching=None)),
+            ("rest below grid", 2047, dict(prompt=4031)),
+            ("rest one grid", 1984, dict(prompt=4032)),
+            ("other chunked req", 4065, dict(has_chunked=True)),
+            ("no chunked prefill", 4065, dict(chunk=None)),
+            ("misaligned", 4065, dict(align=256)),
+            ("off-grid prefix", 4049, dict(prefix=2000)),
+            ("off kv shard page", 4065, dict(granule=256)),
+            # A budget chunk does not end at the prompt end, so it already
+            # leaves the prompt-end snapshot to a later chunk.
+            ("budget chunk", 4096, dict(prefix=0, prompt=9000, chunk=4096)),
+        )
+        for name, extend, overrides in cases:
+            c = SimpleNamespace(**{**base, **overrides})
+            with (
+                self.subTest(name),
+                patch.object(
+                    schedule_policy, "_mamba_branching_split_grid", return_value=c.grid
+                ),
+            ):
+                adder = self._branching_adder(rem_chunk_tokens=c.chunk)
+                adder.kv_shard_granule = c.granule
+                req = self._branching_req(
+                    name,
+                    prefix_len=c.prefix,
+                    prompt_len=c.prompt,
+                    branching=c.branching,
+                )
+                adder.add_one_req(
+                    req, has_chunked_req=c.has_chunked, truncation_align_size=c.align
+                )
+                self.assertEqual(adder.can_run_list, [req])
+                self.assertEqual(req.extend_len, extend)
+                chunked = c.prefix + extend < c.prompt
+                self.assertIs(adder.new_chunked_req, req if chunked else None)
+
+    def test_last_chunk_ends_at_mamba_branching_point(self):
+        # A long prompt whose branching point (5952) falls in its last chunk
+        # would checkpoint only the branching point, so that chunk ends there.
+        with patch.object(
+            schedule_policy, "_mamba_branching_split_grid", return_value=64
+        ):
+            req = self._branching_req(
+                "long", prefix_len=0, prompt_len=6049, branching=5952
+            )
+            ends = []
+            for _ in range(3):
+                adder = self._branching_adder(rem_chunk_tokens=4096)
+                if req.prefix_len:
+                    left = adder.add_chunked_req(req)
+                else:
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                    left = adder.new_chunked_req
+                ends.append((req.extend_end, left is req))
+                req.prefix_len = req.extend_end
+            self.assertEqual(ends, [(4096, True), (5952, True), (6049, False)])
+
+    def test_mamba_branching_split_needs_extra_buffer(self):
+        # Only the extra-buffer strategy spends its one snapshot per extend on
+        # the branching point; the env var switches the split off.
+        self.mock_tree_cache.supports_mamba.return_value = True
+        for extra_buffer, enabled, expected in (
+            (True, True, 64),
+            (False, True, None),
+            (True, False, None),
+        ):
+            exec_ = SimpleNamespace(
+                mamba=SimpleNamespace(enable_mamba_extra_buffer=extra_buffer)
+            )
+            with (
+                self.subTest(extra_buffer=extra_buffer, enabled=enabled),
+                envs.SGLANG_OPT_MAMBA_SPLIT_EXTEND_AT_BRANCHING.override(enabled),
+                patch.object(schedule_policy, "get_exec", return_value=exec_),
+                patch.object(schedule_policy, "mamba_checkpoint_grid", return_value=64),
+            ):
+                self.assertEqual(
+                    schedule_policy._mamba_branching_split_grid(self.mock_tree_cache),
+                    expected,
+                )
+
+    def test_branching_split_keeps_one_chunked_request(self):
+        # A split leaves chunk budget for later candidates, but the scheduler
+        # tracks one unfinished chunked request: a later candidate that needs
+        # chunking waits, and a later branching candidate runs unsplit.
+        with patch.object(
+            schedule_policy, "_mamba_branching_split_grid", return_value=64
+        ):
+            adder = self._branching_adder(rem_chunk_tokens=8192)
+            first = self._branching_req(
+                "first", prefix_len=1984, prompt_len=6049, branching=3968
+            )
+            adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
+            self.assertEqual(first.extend_len, 1984)
+            self.assertIs(adder.new_chunked_req, first)
+
+            branching = self._branching_req(
+                "branching", prefix_len=0, prompt_len=2000, branching=1024
+            )
+            adder.add_one_req(
+                branching, has_chunked_req=False, truncation_align_size=None
+            )
+            self.assertEqual(branching.extend_len, 2000)
+
+            too_long = self._branching_req(
+                "too-long", prefix_len=0, prompt_len=9000, branching=None
+            )
+            self.assertEqual(
+                adder.add_one_req(
+                    too_long, has_chunked_req=False, truncation_align_size=None
+                ),
+                AddReqResult.OTHER,
+            )
+            self.assertEqual(adder.can_run_list, [first, branching])
+            self.assertIs(adder.new_chunked_req, first)
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
