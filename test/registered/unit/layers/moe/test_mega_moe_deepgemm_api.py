@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -211,6 +212,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             mega_l2_weights=object(),
             should_fuse_routed_scaling_factor_in_topk=True,
             moe_runner_config=SimpleNamespace(swiglu_limit=None),
+            uses_expert_location=False,
             _mega_moe_weights_built=True,
             _mega_moe_nvfp4=False,
         )
@@ -234,6 +236,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )
@@ -444,6 +447,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             experts=SimpleNamespace(
                 should_fuse_routed_scaling_factor_in_topk=scale_in_topk,
                 moe_runner_config=SimpleNamespace(swiglu_limit=None),
+                uses_expert_location=False,
             ),
             gate=MagicMock(
                 return_value=torch.zeros((3, 4)),
@@ -453,7 +457,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             topk=SimpleNamespace(
                 topk_config=TopKConfig(
                     top_k=2 + fused_shared,
-                    num_fused_shared_experts=fused_shared,
+                    shared_experts=SharedExpertsConfig(
+                        num_fused_shared_experts=fused_shared
+                    ),
                     renormalize=True,
                     routed_scaling_factor=2.0,
                     apply_routed_scaling_factor_on_output=scale_in_topk,
@@ -463,6 +469,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=fused_shared,
             layer_id=0,
             routed_scaling_factor=2.0,
+            routed_scaling_factor_fused_in_topk=scale_in_topk,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )

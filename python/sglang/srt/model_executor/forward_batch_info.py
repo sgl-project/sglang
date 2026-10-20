@@ -653,6 +653,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
+    # dLLM committed positions are immutable, including literal mask-token IDs.
+    # None when no request in the batch has a literal mask ID.
+    dllm_prompt_mask: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -1164,14 +1167,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
             block_size = batch.dllm_config.block_size
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            positions = [
+                i
+                for block_offset in (req.dllm_block_offset for req in batch.reqs)
+                for i in range(block_offset, block_offset + block_size)
+            ]
+            if any(req.dllm_has_literal_mask for req in batch.reqs):
+                # Committed outputs are immutable too when a retracted request
+                # rebuilds its KV. Transfer their lengths with the block
+                # positions to avoid an extra, blocking H2D copy.
+                committed_lens = [
+                    len(req.origin_input_ids) + len(req.output_ids)
+                    for req in batch.reqs
+                ]
+                position_info = torch.tensor(
+                    positions + committed_lens,
+                    dtype=positions_dtype,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
+                ret.positions = position_info[: len(positions)]
+                prompt_lens = position_info[len(positions) :]
+                ret.dllm_prompt_mask = (
+                    ret.positions.view(-1, block_size) < prompt_lens[:, None]
+                )
+            else:
+                # Without literal mask IDs among committed tokens, every mask
+                # ID in the block is still to be denoised.
+                ret.positions = torch.tensor(positions, dtype=positions_dtype).to(
+                    device, non_blocking=True
+                )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

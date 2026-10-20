@@ -129,7 +129,7 @@ def situ_and_mul_masked_post_quant(
     transposed: bool = False,
     swizzle: bool = False,
 ) -> None:
-    from ._jit_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
+    from .kimi_k3_situ_and_mul_quant import situ_and_mul_masked_post_quant as impl
 
     return impl(
         input,
@@ -159,8 +159,6 @@ _PHASE25_TRITON_KERNELS = [
     ("fused_moe_triton_kernels", "fused_moe_kernel"),
     ("fused_moe_triton_kernels", "fused_moe_kernel_gptq_awq"),
     ("mxfp8_moe_amd_gfx95", "fused_experts_mxfp8"),
-    ("rocm_moe_utils", "upscale"),
-    ("rocm_moe_utils", "upscale_mxfp4"),
     ("router", "fused_moe_router_shim"),
     ("deepep_waterfill_kernels", "materialize_waterfill_dispatch_fused"),
     ("fill_padded_rows", "_fill_padded_rows"),
@@ -206,7 +204,7 @@ register_kernel(
     KernelSpec(
         op="moe.situ_and_mul_masked_post_quant",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe._jit_situ_and_mul_quant:situ_and_mul_masked_post_quant",
+        target="sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant:situ_and_mul_masked_post_quant",
         capabilities=CUDA_ONLY,
     )
 )
@@ -254,25 +252,30 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="moe.silu_and_mul_clamp",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_clamp",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
-    )
-)
-register_kernel(
-    KernelSpec(
         op="moe.silu_and_mul_masked_post_quant",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.dsv4:silu_and_mul_masked_post_quant",
         capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     )
 )
+
+# Muse Spark routing, built per layer: inventoried through its class methods.
+for _bk in ("torch", "jit", "triton"):
+    register_kernel(
+        KernelSpec(
+            op="moe.muse_spark_routing",
+            backend=KernelBackend(_bk),
+            target="sglang.kernels.ops.moe.muse_spark_routing:FusedMuseSparkRouting."
+            + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+            capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+        )
+    )
+del _bk
 register_kernel(
     KernelSpec(
-        op="moe.silu_and_mul_contig_post_quant",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.dsv4:silu_and_mul_contig_post_quant",
-        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+        op="moe.muse_spark_post_expert_finalize",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
+        capabilities=CUDA_ONLY,
     )
 )

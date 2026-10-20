@@ -147,7 +147,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Download artifacts (v6)
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
@@ -155,7 +155,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - uses: ./.github/actions/download-rust-ext
         if: ${{ !inputs.skip_prebuilt_rust_ext }}
