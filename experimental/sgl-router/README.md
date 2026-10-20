@@ -100,6 +100,7 @@ every flag.
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
 | `POST /flush_cache` | Fan out a cache flush to every worker |
+| `POST /abort_request` | Fan out a request abort to every worker |
 | `GET /healthz`, `/readyz` | Liveness and readiness |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
