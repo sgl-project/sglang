@@ -353,10 +353,9 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 1250 with ROCm 10.1.0 and args (Python 3.12 + torch 2.12)
 FROM $BASE_IMAGE_1250_ROCM1010 AS gfx1250-rocm1010
 ENV BUILD_VLLM="0"
-# The SDK's Triton keeps block pointers but faults on gfx1250 in the software
-# pipeliner from num_stages=2 up, and ships no triton_kernels. Build the same
-# revision as the rocm1000 flavor instead and put the block pointers back, so
-# this image has a pipeliner, triton_kernels and the FLA kernels at once.
+# Keep the Triton that comes with the SDK. The rocm1000 flavor builds a newer
+# Triton from source, and that one no longer has block pointers or
+# triton_kernels (triton-lang/triton#10833), which sglang still uses.
 ENV BUILD_TRITON="1"
 ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
 # triton-lang/triton#10833 removed block pointers, which sglang's FLA kernels
