@@ -397,7 +397,6 @@ def _is_numa_available() -> bool:
     return True
 
 
-
 def _query_numa_node_for_npu(device_id: int) -> list:
     """Get the NUMA node affinity for a logical Ascend NPU device id.
 
