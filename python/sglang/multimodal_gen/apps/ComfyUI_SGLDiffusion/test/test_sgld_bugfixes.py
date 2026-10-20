@@ -191,21 +191,9 @@ def test_init_logs_when_node_registration_fails(caplog):
     package.__path__ = [str(PLUGIN_DIR)]
     sys.modules[pkg_name] = package
 
-    # Make the inner `from .nodes import ...` fail so __init__.py's except
+    # A None entry in sys.modules (patched in below) makes the inner
+    # `from .nodes import ...` raise ImportError, so __init__.py's except
     # branch runs.
-    broken_nodes = types.ModuleType(f"{pkg_name}.nodes")
-
-    def _raise(*a, **k):
-        raise ImportError("simulated missing runtime")
-
-    broken_nodes.__getattr__ = _raise
-    sys.modules[f"{pkg_name}.nodes"] = broken_nodes
-    # Force the `from .nodes import NODE_CLASS_MAPPINGS` to raise by not
-    # defining the attributes at all (AttributeError via __getattr__ above
-    # doesn't trigger ImportError machinery, so delete the module and let
-    # the real loader fail via a stub raising at import time instead).
-    del sys.modules[f"{pkg_name}.nodes"]
-
     init_path = PLUGIN_DIR / "__init__.py"
     spec = importlib.util.spec_from_file_location(pkg_name, init_path)
     module = importlib.util.module_from_spec(spec)
@@ -292,6 +280,18 @@ def test_gguf_support_does_not_leak_into_global_folder_registry():
                 ".gguf"
                 not in FOLDER_PATHS.folder_names_and_paths["diffusion_models"][1]
             )
+        finally:
+            FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
+
+
+def test_gguf_listing_includes_subfolders():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "flux", "q4"))
+        open(os.path.join(tmp, "flux", "q4", "model.gguf"), "wb").close()
+        FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].append(tmp)
+        try:
+            names = NODES._list_unet_names_including_gguf()
+            assert os.path.join("flux", "q4", "model.gguf") in names
         finally:
             FOLDER_PATHS.folder_names_and_paths["diffusion_models"][0].remove(tmp)
 

@@ -23,9 +23,11 @@ def _list_unet_names_including_gguf() -> list[str]:
     for folder in folder_paths.get_folder_paths("diffusion_models"):
         if not os.path.isdir(folder):
             continue
-        for entry in os.listdir(folder):
-            if entry.lower().endswith(".gguf"):
-                names.add(entry)
+        # Recursive and folder-relative, like get_filename_list.
+        for dirpath, _dirnames, filenames in os.walk(folder, followlinks=True):
+            for filename in filenames:
+                if filename.lower().endswith(".gguf"):
+                    names.add(os.path.relpath(os.path.join(dirpath, filename), folder))
     return sorted(names)
 
 
