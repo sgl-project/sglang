@@ -6,7 +6,6 @@ from urllib.parse import urlparse
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     MOONLIGHT_16B_A3B_MODEL_PATH,
 )
-from sglang.test.ascend.npu_eval_accuracy_kit import run_npu_pr_smoke
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -29,6 +28,13 @@ TEST_MODEL_MATRIX = {
     },
 }
 
+GSM8K_NUM_QUESTIONS = 1319
+# The PR pipeline evaluates the first 20% of GSM8K to keep the gate fast. The
+# subset is deterministic (temperature 0), so keep a looser threshold until the
+# PR pipeline result has been calibrated on real runs.
+PR_GSM8K_RATIO = 0.2
+PR_ACCURACY_MARGIN = 0.05
+
 # The nightly pipeline is also triggered by pull requests via path filters, so the
 # pipeline is identified by GITHUB_WORKFLOW_REF (inherited from the caller's github
 # context) instead of the triggering event.
@@ -45,7 +51,6 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.fia_hicache_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
@@ -60,6 +65,10 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
             "--hicache-size",
             2 if _is_pr_pipeline else 10,
         ]
+        # The PR pipeline runs eager to shorten startup; the nightly pipeline
+        # covers the default decode graph path with FIA + HiCache.
+        if _is_pr_pipeline:
+            cls.fia_hicache_args.append("--disable-cuda-graph")
 
     def test_gsm8k_fia_hicache(self):
         os.environ["ASCEND_USE_FIA"] = "true"
@@ -75,26 +84,28 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
                 )
 
                 try:
+                    num_questions = GSM8K_NUM_QUESTIONS
+                    accuracy_thres = TEST_MODEL_MATRIX[model]["accuracy"]
                     if _is_pr_pipeline:
-                        run_npu_pr_smoke(self.base_url)
-                    else:
-                        print(f"##=== Testing accuracy: {model} ===##")
+                        num_questions = int(GSM8K_NUM_QUESTIONS * PR_GSM8K_RATIO)
+                        accuracy_thres -= PR_ACCURACY_MARGIN
+                    print(
+                        f"##=== Testing accuracy: {model} "
+                        f"({num_questions}/{GSM8K_NUM_QUESTIONS} questions) ===##"
+                    )
 
-                        args = SimpleNamespace(
-                            num_shots=5,
-                            data_path=None,
-                            num_questions=1319,
-                            max_new_tokens=512,
-                            parallel=128,
-                            host=self.url.hostname,
-                            port=int(self.url.port),
-                        )
+                    args = SimpleNamespace(
+                        num_shots=5,
+                        data_path=None,
+                        num_questions=num_questions,
+                        max_new_tokens=512,
+                        parallel=128,
+                        host=self.url.hostname,
+                        port=int(self.url.port),
+                    )
 
-                        metrics = run_eval_few_shot_gsm8k(args)
-                        self.assertGreaterEqual(
-                            metrics["accuracy"],
-                            TEST_MODEL_MATRIX[model]["accuracy"],
-                        )
+                    metrics = run_eval_few_shot_gsm8k(args)
+                    self.assertGreaterEqual(metrics["accuracy"], accuracy_thres)
                 finally:
                     terminate_and_kill_process_tree(process)
 
