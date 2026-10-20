@@ -973,48 +973,6 @@ def post_reorder_deepgemm(
 
 
 @triton.jit
-def post_reorder_triton_kernel(
-    down_output_ptr,
-    output_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    topk_weights_ptr,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    InDtype = down_output_ptr.dtype.element_ty
-
-    src_idx_int32 = tl.program_id(0)
-    src_idx = src_idx_int32.to(tl.int64)
-    src2dst_ptr = src2dst_ptr + src_idx * topk
-    topk_ids_ptr = topk_ids_ptr + src_idx * topk
-    topk_weights_ptr = topk_weights_ptr + src_idx * topk
-
-    store_ptr = output_ptr + src_idx * hidden_size
-
-    vec = tl.arange(0, BLOCK_SIZE)
-
-    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-        offset = start_offset + vec
-        mask = offset < hidden_size
-
-        sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for idx in range(topk):
-            expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id >= 0:
-                dst_idx_int32 = tl.load(src2dst_ptr + idx)
-                dst_idx = dst_idx_int32.to(tl.int64)
-                weigh_scale = tl.load(topk_weights_ptr + idx).to(tl.float32)
-                load_ptr = down_output_ptr + dst_idx * hidden_size
-                # accumulate expert outputs in fp32 for better precision
-                # before casting to the final output dtype.
-                in_data = tl.load(load_ptr + offset, mask=mask).to(tl.float32)
-                sum_vec += in_data * weigh_scale
-        tl.store(store_ptr + offset, sum_vec.to(InDtype), mask=mask)
-
-
-@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     num_valid_tokens_per_expert,
@@ -1711,7 +1669,7 @@ def moe_ep_deepgemm_preprocess(
     from sglang.srt.layers import deep_gemm_wrapper
 
     if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
-        from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
+        from sglang.kernels.ops.moe.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
 

@@ -134,6 +134,8 @@ def test_ascend_packed_state_roundtrip_uses_buffer_descriptors(
     monkeypatch, temporal_width
 ):
     monkeypatch.setenv("SGLANG_NPU_HICACHE_MAMBA_IO", "sync")
+    # CPU buffers: keep the XPU refusal off when this runs on an XPU host.
+    monkeypatch.setattr("sglang.srt.mem_cache.pool_host.mamba._is_xpu", False)
     infos = tuple(
         MambaStateBufferInfo(
             temporal=torch.arange(layers * 8 * temporal_width).reshape(

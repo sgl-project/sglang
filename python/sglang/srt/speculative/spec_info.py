@@ -411,6 +411,11 @@ class SpecInput(ABC):
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
+    # A multi-step draft's per-step sliding-window read rail; only the
+    # multi-step draft backend of a sliding-window KV pool builds it.
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 

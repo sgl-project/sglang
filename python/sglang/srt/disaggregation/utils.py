@@ -1780,6 +1780,13 @@ def setup_state_kv_args(
                 draft_lens,
                 draft_item_lens,
             )
+        row_ptrs, row_lens, row_item_lens = (
+            draft_token_to_kv_pool.get_swa_valid_from_buf_infos()
+        )
+        if row_ptrs:
+            append_state_component(
+                kv_args, StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens
+            )
 
     if (
         StateType.MAMBA not in kv_args.state_types
@@ -1836,6 +1843,15 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+
+
+def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
+    """The KV byte layout both PD roles must share, for pools that have more than one."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        return token_to_kv_pool.pd_kv_layout()
+    return None
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
