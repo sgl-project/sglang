@@ -17,11 +17,205 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     _build_deepseek_v4_device_pool_group,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestKVCRLayout(CustomTestCase):
+    def setUp(self):
+        # KVCR owns these value types; native transport is not needed for geometry.
+        self.types_patch = patch.dict(
+            "sys.modules",
+            {
+                "kvcr.types": SimpleNamespace(
+                    RegionDescriptor=SimpleNamespace, MemoryRef=SimpleNamespace
+                )
+            },
+        )
+        self.types_patch.start()
+        self.addCleanup(self.types_patch.stop)
+
+    @staticmethod
+    def group(*, rows=8, dtype=torch.uint8, replicated=False, page_size=2):
+        entries = [
+            DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[
+                    [torch.zeros((rows, width), dtype=dtype) for width in (3, 5)],
+                    [torch.zeros((rows, width), dtype=dtype) for width in (7, 11)],
+                ],
+                layer_mapping={0: 0, 2: 1},
+                page_size=page_size,
+                rows_are_pages=False,
+                packed=False,
+            ),
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[[torch.zeros((rows, 26), dtype=dtype)[:, :13]]],
+                layer_mapping={2: 0},
+                page_size=page_size,
+                rows_are_pages=True,
+            ),
+        ]
+        return DevicePoolGroup(
+            entries, num_layers=3, page_size=page_size, rank_replicated=replicated
+        )
+
+    def layout(self, group=None, **kwargs):
+        return KVCRLayout(
+            self.group() if group is None else group,
+            model_name="model",
+            endpoint_name="worker",
+            **kwargs,
+        )
+
+    def test_named_pieces_match_page_and_sparse_layer_addresses(self):
+        group = self.group()
+        layout = self.layout(group)
+        indices = torch.tensor([0, 1, 4, 5])
+        prepared = layout.prepare(
+            [PoolTransfer(PoolName.KV, keys=["a", "b"], device_indices=indices)]
+        )
+        full = layout.mappings(prepared)
+        self.assertEqual(len(full), 1)
+        self.assertEqual(len(full[0]), 4)
+        registrations = {region.label: region for region in layout.registrations}
+        self.assertEqual(sum(layout.pool_counts.values()), 5)
+        for region in registrations.values():
+            self.assertEqual(
+                region.size, dict(layout.pool_layouts)[region.label.split(":")[0]]
+            )
+            self.assertGreaterEqual(region.stride, region.size)
+        for entry, transfer in zip(group.entries, prepared):
+            refs = [ref for key in transfer.keys for ref in full[0][key]]
+            pointers = [
+                registrations[ref.label].addr
+                + ref.element_index * registrations[ref.label].stride
+                for ref in refs
+            ]
+            sizes = [registrations[ref.label].size for ref in refs]
+            self.assertEqual((pointers, sizes), entry.get_page_buffer_meta(indices))
+        self.assertEqual(layout.mappings(prepared, layer=1), [])
+        layer = layout.mappings(prepared, layer=2)[0]
+        self.assertEqual([len(refs) for refs in layer.values()], [2, 2, 1, 1])
+        self.assertTrue(
+            all(
+                ref.end_point_name == "worker"
+                for refs in layer.values()
+                for ref in refs
+            )
+        )
+
+    def test_trailing_capacity_follows_logical_source(self):
+        group = self.group()
+        group.entries[1].indices_from_pool = PoolName.SWA
+        layout = self.layout(group)
+        self.assertEqual(sum(layout.trailing_counts.values()), 1)
+        pool = layout._labels[PoolName.INDEXER][0][0].split(":")[0]
+        self.assertEqual(layout.trailing_counts[pool], layout.pool_counts[pool])
+
+    def test_admission_snapshots_translation_and_duplicate_destinations(self):
+        group = self.group()
+        remap = torch.arange(8)
+        group.entry_map[PoolName.KV]._index_mapper = lambda indices: remap[indices]
+        layout = self.layout(group)
+        indices = torch.tensor([0, 1, 4, 5])
+        transfer = PoolTransfer(
+            PoolName.KV, keys=["same", "same"], device_indices=indices
+        )
+        prepared = layout.prepare([transfer])
+        indices.fill_(0)
+        remap.fill_(0)
+        transfer.keys.clear()
+        batches = layout.mappings(prepared)
+        self.assertEqual(len(batches), 2)
+        key = layout.encode_key("same", PoolName.KV)
+        self.assertEqual([batch[key][0].element_index for batch in batches], [0, 2])
+        self.assertEqual(prepared[0].locations, (0, 4))
+
+    def test_namespace_tracks_compatibility_and_key_roundtrip(self):
+        base = self.layout()
+        larger = self.layout(self.group(rows=16))
+        self.assertEqual(base.namespace, larger.namespace)
+        self.assertEqual(
+            base.namespace,
+            KVCRLayout(
+                self.group(), model_name="model", endpoint_name="replica"
+            ).namespace,
+        )
+        self.assertNotEqual(
+            base.namespace,
+            KVCRLayout(
+                self.group(), model_name="other", endpoint_name="worker"
+            ).namespace,
+        )
+        for kwargs in ({"tp_rank": 1, "tp_size": 2}, {"cp_size": 2}, {"pp_size": 2}):
+            self.assertNotEqual(base.namespace, self.layout(**kwargs).namespace)
+        for group in (self.group(dtype=torch.float16), self.group(page_size=4)):
+            self.assertNotEqual(base.namespace, self.layout(group).namespace)
+        byte_backed = self.group()
+        byte_backed.entries[0].device_pool = SimpleNamespace(dtype=torch.float8_e5m2)
+        logical_fp8 = self.layout(byte_backed).namespace
+        byte_backed.entries[0].device_pool.dtype = torch.float8_e4m3fn
+        self.assertNotEqual(logical_fp8, self.layout(byte_backed).namespace)
+        replicated = self.group(replicated=True)
+        self.assertEqual(
+            self.layout(replicated, tp_rank=0, tp_size=2).namespace,
+            self.layout(replicated, tp_rank=3, tp_size=4).namespace,
+        )
+        key = base.encode_key("hash:with:separators", PoolName.KV)
+        self.assertEqual(base.decode_key(key), (PoolName.KV, "hash:with:separators"))
+        self.assertIsNone(base.decode_key(b"foreign"))
+        self.assertIsNone(self.layout(tp_size=2).decode_key(key))
+
+    def test_query_geometry_and_invalid_page_counts(self):
+        layout = self.layout()
+        query = layout.prepare([PoolTransfer(PoolName.KV, keys=["a"])])
+        self.assertEqual(query[0].locations, ())
+        with self.assertRaisesRegex(ValueError, "no locations"):
+            layout.mappings(query)
+        with self.assertRaisesRegex(ValueError, "keys.*pages"):
+            layout.prepare(
+                [
+                    PoolTransfer(
+                        PoolName.KV,
+                        keys=["a", "b"],
+                        device_indices=torch.tensor([0, 1]),
+                    )
+                ]
+            )
+
+    def test_packed_draft_mapping_and_noncontiguous_page_rejection(self):
+        group = self.group()
+        group.entry_map[PoolName.KV].layer_mapping = {0: (0, 1)}
+        layout = self.layout(group)
+        prepared = layout.prepare(
+            [PoolTransfer(PoolName.KV, keys=["a"], device_indices=torch.tensor([0, 1]))]
+        )
+        key = layout.encode_key("a", PoolName.KV)
+        self.assertEqual(
+            layout.mappings(prepared, layer=0)[0][key],
+            layout.mappings(prepared)[0][key],
+        )
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[[torch.zeros((8, 6), dtype=torch.uint8)[:, :3]]],
+            layer_mapping={0: 0},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        with self.assertRaisesRegex(ValueError, "contiguous page pieces"):
+            self.layout(DevicePoolGroup([entry], num_layers=1, page_size=2))
 
 
 class TestDevicePoolEntry(CustomTestCase):
@@ -744,6 +938,78 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 params=SimpleNamespace(),
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
+
+
+class TestMhaDevicePoolAssembler(CustomTestCase):
+    @staticmethod
+    def pool(*, hnd=False, dtype=torch.bfloat16):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        with envs.SGLANG_USE_HND_KVCACHE.override(hnd):
+            return MHATokenToKVPool(
+                size=6,
+                page_size=2,
+                dtype=dtype,
+                head_num=2,
+                head_dim=3,
+                v_head_dim=5,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+            )
+
+    @staticmethod
+    def group(pool, *, page_size=2, drafts=()):
+        return resolve_hybrid_device_pool_group(
+            kvcache=pool,
+            page_size=page_size,
+            params=SimpleNamespace(mtp_draft_device_pools=drafts),
+            components={ComponentType.FULL},
+        )
+
+    def test_mha_packs_key_and_value_pages_for_each_layer(self):
+        for hnd in (False, True):
+            for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                with self.subTest(hnd=hnd, dtype=dtype):
+                    pool = self.pool(hnd=hnd, dtype=dtype)
+                    group = self.group(pool)
+                    self.assertFalse(group.rank_replicated)
+                    self.assertEqual(group.num_layers, 2)
+                    self.assertEqual(group.sources, {PoolName.KV: PoolName.KV})
+                    entry = group.entry_map[PoolName.KV]
+                    row = 1 if hnd else 2
+                    buffers = pool.k_buffer + pool.v_buffer
+                    pointers = [buffer[row].data_ptr() for buffer in buffers]
+                    element_size = pool.k_buffer[0].element_size()
+                    sizes = [12 * element_size] * 2 + [20 * element_size] * 2
+                    indices = torch.tensor([2, 3])
+                    self.assertEqual(
+                        entry.get_page_buffer_meta(indices), (pointers, sizes)
+                    )
+                    self.assertEqual(entry.prepare_locations(indices), [row])
+                    layer_pointers, layer_sizes, offsets = (
+                        entry.get_prepared_layer_range_meta([row], 1)
+                    )
+                    self.assertEqual(layer_pointers, [[pointers[1], pointers[3]]])
+                    self.assertEqual(layer_sizes, [[sizes[1], sizes[3]]])
+                    self.assertEqual(offsets, [[sizes[0], sum(sizes[:3])]])
+                    self.assertEqual(entry.device_pool.dtype, dtype)
+
+    def test_mha_rejects_incomplete_or_incompatible_pool_layouts(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
+
+        with self.assertRaisesRegex(ValueError, "MHATokenToKVPoolMXFP8"):
+            self.group(MHATokenToKVPoolMXFP8.__new__(MHATokenToKVPoolMXFP8))
+        pool = self.pool()
+        with self.assertRaisesRegex(ValueError, "page size"):
+            self.group(pool, page_size=4)
+        with self.assertRaisesRegex(ValueError, "draft"):
+            self.group(pool, drafts=(self.pool(),))
+        pool.quant_method = object()
+        with self.assertRaisesRegex(ValueError, "scale buffers"):
+            self.group(pool)
 
 
 if __name__ == "__main__":
