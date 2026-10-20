@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import maybe_create_mla_host_dedup_context
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
@@ -32,7 +33,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
     get_mha_host_pool_cls,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -165,6 +166,8 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    is_dummy: bool = False,
+    shared_memory_group=None,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -185,6 +188,12 @@ def build_kv_host_pool(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
     kwargs = {}
+    if shared_memory_group is not None:
+        if not use_mla:
+            raise ValueError("Shared host restore requires an MLA/DSA host pool.")
+        kwargs["shared_memory_group"] = shared_memory_group
+    if is_dummy and not use_mla:
+        kwargs["is_dummy"] = True
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -206,6 +215,24 @@ def build_kv_host_pool(
                 else kv_pool.layer_num
             ),
         )
+        if is_dummy:
+            # Allocator-only MLA hosts take geometry rather than device buffers.
+            # Packed drafts still count toward logical capacity, but must not
+            # retain physical draft buffers on a non-owner rank.
+            draft_layer_num = len(kwargs["draft_buffer_infos"])
+            width = override_kv_cache_dim or host_input.kv_cache_dim
+            host_input = MLAHostAllocation(
+                dtype=host_input.dtype,
+                kv_lora_rank=host_input.kv_lora_rank,
+                qk_rope_head_dim=host_input.qk_rope_head_dim,
+                kv_cache_dim=width,
+                size_per_token=width
+                * host_input.dtype.itemsize
+                * (kwargs["target_layer_num"] + draft_layer_num),
+                draft_layer_num=draft_layer_num,
+                packed_fp8=host_input.packed_fp8,
+            )
+            kwargs["draft_buffer_infos"] = ()
     else:
         kwargs.update(mha_kwargs)
     parallel = get_parallel()
@@ -283,6 +310,8 @@ def build_kv_only_group(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    is_dummy: bool = False,
+    shared_memory_group=None,
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_id_max = len(full_layer_mapping)
@@ -293,6 +322,8 @@ def build_kv_only_group(
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=is_dummy,
+        shared_memory_group=shared_memory_group,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = with_packed_draft_layer_mapping(
@@ -513,6 +544,57 @@ def _mtp_swa_sidecar_specs(group: HostPoolGroup) -> list[SidecarPoolSpec]:
     return [SidecarPoolSpec(PoolName.DRAFT_SWA, indices_from_pool=PoolName.KV)]
 
 
+def _create_mla_dedup_context(kv_pool, params, storage_backend):
+    memory = get_memory()
+    if (
+        getattr(memory, "mla_hicache_host_dedup_mode", "broadcast") == "shared"
+        and memory.enable_mla_hicache_host_dedup
+    ):
+        from sglang.srt.mem_cache.mla_host_shared import SharedCPUHostDedupContext
+
+        _validate_shared_mla_pool(kv_pool, params, storage_backend)
+        return SharedCPUHostDedupContext(params.tp_cache_group)
+    layerwise_overlap = getattr(memory, "enable_mla_hicache_layerwise_overlap", False)
+    if layerwise_overlap:
+        root_pool = params.token_to_kv_pool_allocator.get_kvcache()
+        if root_pool is not kv_pool:
+            raise ValueError(
+                "MLA layer-wise overlap does not yet support hybrid layer mappings."
+            )
+    return maybe_create_mla_host_dedup_context(
+        kv_pool,
+        params.tp_cache_group,
+        params.attn_cp_cache_group,
+        params.attn_tp_cache_group,
+        storage_backend,
+        enabled=memory.enable_mla_hicache_host_dedup,
+        layerwise_overlap=layerwise_overlap,
+        pp_group=params.pp_cache_group,
+    )
+
+
+def _validate_shared_mla_pool(kv_pool, params, storage_backend):
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, MLATokenToKVPoolFP4
+    from sglang.srt.utils import is_cuda
+
+    if (
+        not isinstance(kv_pool, MLATokenToKVPool)
+        or isinstance(kv_pool, MLATokenToKVPoolFP4)
+        or getattr(kv_pool, "layer_shard_enabled", False)
+        or params.token_to_kv_pool_allocator.get_kvcache() is not kv_pool
+        or params.mtp_draft_device_pools
+        or not is_cuda()
+    ):
+        raise ValueError(
+            "Shared MLA host restore supports flat CUDA MLA/DSA targets only; "
+            "hybrid/state pools, FP4 MLA and draft pools are unsupported."
+        )
+    if storage_backend is not None or _get_allocator_type() != "default":
+        raise ValueError(
+            "Shared MLA host restore requires L2 and the default host allocator."
+        )
+
+
 def build_kv_only_stack(
     *,
     params: CacheInitParams,
@@ -528,6 +610,7 @@ def build_kv_only_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = len(full_layer_mapping)
+    mla_dedup = _create_mla_dedup_context(kv_pool, params, storage_backend)
     host_pool_group = build_kv_only_group(
         page_size=params.page_size,
         kv_pool=kv_pool,
@@ -535,6 +618,8 @@ def build_kv_only_stack(
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=params.mtp_draft_device_pools,
+        is_dummy=mla_dedup.is_dummy_rank if mla_dedup is not None else False,
+        shared_memory_group=getattr(mla_dedup, "process_group", None),
     )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -554,6 +639,7 @@ def build_kv_only_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -795,7 +881,12 @@ def _dsv4_indexer_regions(kvcache: Any, page_size: int) -> list[_IndexerRegion]:
 
 
 def _dsv4_low_ratio_entries(
-    kvcache: Any, page_size: int, num_host_pages: int, transfer_layer_id_max: int
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+    *,
+    is_dummy: bool = False,
 ):
     """Mirror each shared source once, in FULL-page units. Prefixes end on an even
     page boundary, so ratio-2's request-scoped ring is rebuilt, not cached."""
@@ -864,6 +955,7 @@ def _dsv4_low_ratio_entries(
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
                         page_aligned_only=True,
+                        is_dummy=is_dummy,
                     ),
                     device_pool=device_pool,
                     layer_mapping=layer_mapping,
@@ -902,6 +994,7 @@ def _build_dsv4_rope_entry(
     num_host_pages: int,
     slot_page_size: int,
     transfer_layer_id_max: int,
+    is_dummy: bool = False,
 ) -> Optional[PoolEntry]:
     sibling = _dsv4_rope_sibling(kvcache, ratio)
     if sibling is None:
@@ -918,6 +1011,7 @@ def _build_dsv4_rope_entry(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             page_aligned_only=True,
+            is_dummy=is_dummy,
         ),
         device_pool=device_pool,
         layer_mapping=layer_mapping,
@@ -940,6 +1034,12 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
     layer_mappings: Optional[_DeepSeekV4LayerMappings] = None,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if get_memory().enable_mla_hicache_host_dedup and params.mtp_draft_device_pools:
+        raise ValueError(
+            "V4 host dedup requires rank-local draft sidecars, not packed drafts"
+        )
+    mla_dedup = _create_mla_dedup_context(kvcache, params, storage_backend)
+    is_dummy = mla_dedup.is_dummy_rank if mla_dedup is not None else False
     page_size = params.page_size
     layer_mappings = layer_mappings or _resolve_deepseek_v4_layer_mappings(kvcache)
     transfer_layer_id_max = layer_mappings.transfer_layer_id_max
@@ -1019,6 +1119,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=kvcache.swa_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=_dsv4_page_aligned_only(kvcache.swa_kv_pool),
         )
         swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -1051,6 +1152,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c4_kv_pool),
         )
@@ -1075,6 +1177,7 @@ def build_deepseek_v4_hicache_stack(
                         slot_page_size=region.slot_page_size,
                         layout=get_memory().hicache_mem_layout,
                         allocator_type=_get_allocator_type(),
+                        is_dummy=is_dummy,
                         page_aligned_only=region.page_aligned_only,
                     ),
                     device_pool=kvcache.c4_indexer_kv_pool,
@@ -1092,6 +1195,7 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
             transfer_layer_id_max=transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
         if c4_rope_entry is not None:
             entries.append(c4_rope_entry)
@@ -1107,6 +1211,7 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                is_dummy=is_dummy,
             )
             c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
@@ -1118,6 +1223,7 @@ def build_deepseek_v4_hicache_stack(
                 swa_page_size=kvcache.swa_page_size,
                 layout=get_memory().hicache_mem_layout,
                 allocator_type=_get_allocator_type(),
+                is_dummy=is_dummy,
             )
             entries.extend(
                 [
@@ -1158,6 +1264,7 @@ def build_deepseek_v4_hicache_stack(
             slot_page_size=c128_slot_page_size,
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
+            is_dummy=is_dummy,
             page_aligned_only=is_unified_kv
             or _dsv4_page_aligned_only(kvcache.c128_kv_pool),
         )
@@ -1197,13 +1304,18 @@ def build_deepseek_v4_hicache_stack(
             num_host_pages=c128_num_host_pages,
             slot_page_size=c128_slot_page_size,
             transfer_layer_id_max=transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
         if c128_rope_entry is not None:
             entries.append(c128_rope_entry)
 
     entries.extend(
         _dsv4_low_ratio_entries(
-            kvcache, page_size, num_host_pages, transfer_layer_id_max
+            kvcache,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            is_dummy=is_dummy,
         )
     )
 
@@ -1226,6 +1338,7 @@ def build_deepseek_v4_hicache_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -1297,6 +1410,7 @@ def build_hybrid_mamba_stack(
     )
     root = config.pools[0]
     kv_pool = root.decl.device_pool
+    mla_dedup = _create_mla_dedup_context(kv_pool, params, storage_backend)
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
         kv_host_size, mamba_host_size = _split_hicache_size(
@@ -1316,6 +1430,7 @@ def build_hybrid_mamba_stack(
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        is_dummy=mla_dedup.is_dummy_rank if mla_dedup is not None else False,
     )
     # MambaPoolHost only supports page_first_direct; the global layout may be
     # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
@@ -1390,6 +1505,7 @@ def build_hybrid_mamba_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller, config
 
@@ -1514,6 +1630,8 @@ def build_hybrid_mamba_swa_stack(
 def build_host_pool_group(
     *,
     config: HostPoolGroupConfig,
+    is_dummy: bool = False,
+    shared_memory_group=None,
 ) -> HostPoolGroup:
     """Allocate host pools and transfer entries from prepared configs."""
     root = config.pools[0]
@@ -1521,6 +1639,8 @@ def build_host_pool_group(
         kv_pool=root.decl.device_pool,
         page_size=config.transfer_page_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        is_dummy=is_dummy,
+        shared_memory_group=shared_memory_group,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
@@ -1532,26 +1652,40 @@ def _build_pool_entries(
 ) -> list[PoolEntry]:
     host_pools = {config.pools[0].decl.pool_name: root_host_pool}
     entries = []
-    for pool_config in config.pools:
-        decl = pool_config.decl
-        if not decl.is_layout_root:
-            host_pools[decl.pool_name] = decl.host_pool_builder.build(
-                decl=decl,
-                anchor_host=host_pools[decl.layout_source],
-                allocator_type=_get_allocator_type(),
-                packed_draft_device_pools=pool_config.packed_draft_device_pools,
+    try:
+        for pool_config in config.pools:
+            decl = pool_config.decl
+            if not decl.is_layout_root:
+                host_pools[decl.pool_name] = decl.host_pool_builder.build(
+                    decl=decl,
+                    anchor_host=host_pools[decl.layout_source],
+                    allocator_type=_get_allocator_type(),
+                    packed_draft_device_pools=pool_config.packed_draft_device_pools,
+                )
+            entries.append(
+                build_pool_entry(
+                    name=decl.pool_name,
+                    host_pool=host_pools[decl.pool_name],
+                    device_pool=decl.device_pool,
+                    layer_mapping=pool_config.layer_mapping,
+                    transfer_layer_id_max=pool_config.transfer_layer_id_max,
+                    is_anchor=decl.is_primary,
+                    packed_draft_device_pools=pool_config.packed_draft_device_pools,
+                )
             )
-        entries.append(
-            build_pool_entry(
-                name=decl.pool_name,
-                host_pool=host_pools[decl.pool_name],
-                device_pool=decl.device_pool,
-                layer_mapping=pool_config.layer_mapping,
-                transfer_layer_id_max=pool_config.transfer_layer_id_max,
-                is_anchor=decl.is_primary,
-                packed_draft_device_pools=pool_config.packed_draft_device_pools,
-            )
-        )
+    except Exception:
+        if getattr(getattr(root_host_pool, "allocator", None), "is_shared", False):
+            # A failed shared indexer must not strand its already registered
+            # KV anchor. Each constructor agrees on failure across ranks before
+            # returning here; destruction drains no new collectives.
+            for pool in reversed(list(host_pools.values())):
+                try:
+                    pool.destroy()
+                except Exception:
+                    logger.exception(
+                        "Could not release a partially built shared host stack"
+                    )
+        raise
     return entries
 
 
@@ -2310,7 +2444,12 @@ class _DsaStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
+        mla_dedup = _create_mla_dedup_context(kvcache, params, storage_backend)
+        host_pool_group = build_host_pool_group(
+            config=config,
+            is_dummy=mla_dedup.is_dummy_rank if mla_dedup is not None else False,
+            shared_memory_group=getattr(mla_dedup, "process_group", None),
+        )
         cache_controller = HybridCacheController(
             params.token_to_kv_pool_allocator,
             host_pool_group,
@@ -2330,6 +2469,7 @@ class _DsaStrategy(StackStrategy):
             transfer_layer_id_max=kvcache.layer_num,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=get_memory().hicache_host_memory_mode,
+            mla_dedup_context=mla_dedup,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,
@@ -2444,6 +2584,15 @@ def attach_hybrid_pool_to_unified_cache(
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
+        if (
+            getattr(get_memory(), "mla_hicache_host_dedup_mode", "broadcast")
+            == "shared"
+        ):
+            _validate_shared_mla_pool(kvcache, params, storage_backend)
+            if components != {ComponentType.FULL}:
+                raise ValueError(
+                    "Shared MLA host restore requires a KV-only cache stack."
+                )
         strategy = _select_strategy(kvcache, components)
         result = strategy.build(
             cache=cache,
