@@ -276,9 +276,11 @@ class DeploymentServer:
         self.context = zmq.asyncio.Context()
         socket = self.context.socket(zmq.ROUTER)
         socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVHWM, self.capacity * 2)
         socket.bind(endpoint)
         admission = asyncio.Semaphore(self.capacity)
         tasks = set()
+        work_tasks = set()
         self.ready.set()
         try:
             while not self.stopped.is_set():
@@ -293,13 +295,27 @@ class DeploymentServer:
                     frames = await asyncio.wait_for(socket.recv_multipart(), 0.2)
                 except TimeoutError:
                     continue
-                task = asyncio.create_task(
-                    self._handle(
-                        socket, frames[:-1], pickle.loads(frames[-1]), admission
+                message = pickle.loads(frames[-1])
+                is_work = (
+                    not isinstance(message, dict) or message.get("method") == "encode"
+                )
+                if is_work and len(work_tasks) >= self.capacity * 2:
+                    error = "Deployment queue is full; reduce client concurrency"
+                    reply = (
+                        {"error": error}
+                        if isinstance(message, dict)
+                        else OutputBatch(error=error)
                     )
+                    await socket.send_multipart([*frames[:-1], pickle.dumps(reply)])
+                    continue
+                task = asyncio.create_task(
+                    self._handle(socket, frames[:-1], message, admission)
                 )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
+                if is_work:
+                    work_tasks.add(task)
+                    task.add_done_callback(work_tasks.discard)
         finally:
             for task in tasks:
                 task.cancel()

@@ -183,6 +183,8 @@ registration and completion contract.
 - Size `--disagg-transfer-pool-size` for simultaneous receives and sends. Result
   leases and coordinator admission are bounded by
   `--disagg-max-slots-per-instance`; receive pools are separate from model memory.
+  Pending work is also bounded; overload returns an explicit error rather than
+  accumulating an unbounded queue of raw media in host memory.
 - A result is retained through fan-out until consumers finish or its lease
   expires. Unacknowledged transfers quarantine receive slots instead of reusing
   addresses that a remote sender might still write. Restart an exhausted worker
