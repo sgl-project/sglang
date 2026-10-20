@@ -938,6 +938,24 @@ jobs:
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs
 
+      - name: Upload outputs and test case map
+        # Report upload must never block the baseline publish pipeline.
+        # Must run before the publish step mv's the files to the fixed
+        # PUBLISH_DIR (fixed names there race with concurrent runs).
+        # ~300MB artifact; short retention beats the 90-day default so
+        # storage does not accumulate across runs.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: precise-test-outputs
+          # Two paths -> artifact root becomes RUN_DIR, so the archive
+          # holds outputs.tar.gz and test_case_map.json side by side.
+          path: |
+            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/outputs.tar.gz
+            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/test_case_map.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Publish outputs and map to shared disk
         shell: bash
         run: |
