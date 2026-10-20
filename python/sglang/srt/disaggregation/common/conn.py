@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.bootstrap import (
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    MetadataBuffers,
     filter_kv_indices_for_cp_rank,
     get_dsv41_spec_layout,
 )
@@ -578,15 +579,16 @@ class CommonKVManager(BaseKVManager):
     ) -> None:
         src_ptrs = self.kv_args.aux_data_ptrs
         src_item_lens = self.kv_args.aux_item_lens
-        # Hidden-state strides can differ with decode-only speculation. Only
-        # customized_info (slots 6 and 7 in MetadataBuffers) needs equal strides.
+        # Hidden-state strides can differ with decode-only speculation; only
+        # the customized_info slots need equal strides.
+        slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
         if not (
             dst_aux_item_lens is not None
             and len(src_ptrs)
             == len(src_item_lens)
             == len(dst_aux_ptrs)
             == len(dst_aux_item_lens)
-            and src_item_lens[6:8] == dst_aux_item_lens[6:8]
+            and src_item_lens[slots] == dst_aux_item_lens[slots]
         ):
             raise ValueError(
                 "Disaggregation metadata buffer layout mismatch: "
