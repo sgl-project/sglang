@@ -49,7 +49,6 @@ if _is_cuda:
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -61,7 +60,6 @@ elif _is_musa:
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
@@ -183,6 +181,16 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
+def ggml_moe_get_block_size(qweight_type: int) -> int:
+    # MOE_X in the CUDA/MUSA GGUF MMQ kernels is 4. The released wheel's
+    # Tensor-free metadata operator has no catch-all dispatch registration.
+    return (
+        (8 if _is_hip else 4)
+        if qweight_type in MMQ_QUANT_TYPES and qweight_type != WeightType.Q8_1
+        else 0
+    )
+
+
 def dequantize_gguf_weight(
     qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -242,6 +250,8 @@ def fused_moe_gguf(
             return gelu_and_mul(x)
         raise ValueError(f"Unsupported activation: {activation}")
 
+    inactive = topk_ids < 0
+    x = x.masked_fill(inactive.all(dim=-1, keepdim=True), 0.0)
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
@@ -257,6 +267,11 @@ def fused_moe_gguf(
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, BLOCK_SIZE, E
         )
+        # Released MMQ kernels inspect one slack block before their bound check.
+        block_starts = (
+            torch.arange(expert_ids.numel(), device=expert_ids.device) * BLOCK_SIZE
+        )
+        expert_ids.masked_fill_(block_starts >= num_tokens_post_padded, -1)
         out = ggml_moe_a8(
             x,
             w1,
@@ -268,6 +283,7 @@ def fused_moe_gguf(
             top_k,
             num_tokens,
         )
+        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
         out = act(out)
         out = ggml_moe_a8(
             out,
@@ -280,7 +296,8 @@ def fused_moe_gguf(
             1,
             num_tokens * top_k,
         )
-        valid_weights = topk_weights.masked_fill(topk_ids < 0, 0.0)
+        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
+        valid_weights = topk_weights.masked_fill(inactive, 0.0)
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
             valid_weights.view(num_tokens, top_k, 1)
         )
@@ -291,13 +308,18 @@ def fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        out = ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
+        # Older vector kernels form weight addresses before checking -1.
+        # They have no per-expert capacity buffer; discard their dummy slots.
+        safe_ids = topk_ids.clamp_min(0)
+        out = ggml_moe_a8_vec(x, w1, safe_ids, top_k, qweight_type, N, num_tokens)
+        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
         out = act(out)
 
         out = ggml_moe_a8_vec(
-            out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
+            out, w2, safe_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
         )
-        valid_weights = topk_weights.masked_fill(topk_ids < 0, 0.0)
+        out.masked_fill_(inactive.reshape(-1, 1), 0.0)
+        valid_weights = topk_weights.masked_fill(inactive, 0.0)
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
             valid_weights.view(num_tokens, top_k, 1)
         )

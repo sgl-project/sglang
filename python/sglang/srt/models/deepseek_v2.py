@@ -1167,7 +1167,7 @@ class DeepseekV2MoE(nn.Module):
         if use_flashinfer_trtllm_bypass:
             topk_output = BypassedTopKOutput(
                 hidden_states=hidden_states,
-                router_logits=router_logits,
+                raw_router_logits=router_logits,
                 topk_config=self.topk.topk_config,
             )
         else:

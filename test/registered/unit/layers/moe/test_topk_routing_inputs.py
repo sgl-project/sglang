@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutputPacked,
@@ -28,6 +29,7 @@ from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     initialize_moe_config,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -348,19 +350,92 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(capture.ids.tolist(), [[0], [1], [2], [3]])
 
     def test_in_kernel_formats_do_not_silently_ignore_expert_placement(self):
-        for output_format in (
-            TopKOutputFormat.TRITON_KERNEL,
-            TopKOutputFormat.BYPASSED,
+        router = self._router(output_format=TopKOutputFormat.TRITON_KERNEL)
+        with self.assertRaisesRegex(
+            NotImplementedError, "placement remapping requires"
         ):
-            with self.subTest(output_format=output_format):
-                router = self._router(output_format=output_format)
-                with forward_context(
-                    ForwardContext(attn_backend=object()), forward_batch=_batch(4)
-                ):
-                    with self.assertRaisesRegex(
-                        NotImplementedError, "placement remapping requires"
-                    ):
-                        router.forward_cuda(self.hidden, self.logits)
+            router.forward_cuda(self.hidden, self.logits)
+
+        router = self._router(output_format=TopKOutputFormat.BYPASSED)
+        output = router.forward_cuda(self.hidden, self.logits)
+        with self.assertRaisesRegex(
+            NotImplementedError, "placement remapping requires"
+        ):
+            _ = output.router_logits
+
+    def test_bypassed_materialization_preserves_placement_and_padding(self):
+        """A dispatcher can remap lazy routes before sending physical expert IDs."""
+        router = self._router(output_format=TopKOutputFormat.BYPASSED)
+        with forward_context(
+            ForwardContext(attn_backend=object()), forward_batch=_batch(2)
+        ):
+            output = router.forward_cuda(self.hidden, self.logits)
+            materialized = output.to_standard(layer_id=0)
+        self.assertEqual(
+            materialized.topk_ids.tolist(), [[2, 0], [2, 0], [-1, -1], [-1, -1]]
+        )
+        self.assertIs(materialized.router_logits, self.logits)
+        layer = SimpleNamespace(
+            _use_ascend_fuseep=False,
+            forward_impl=lambda hidden, routes, **kwargs: routes.to_standard(
+                layer_id=0
+            ),
+        )
+        with patch(
+            "sglang.srt.layers.moe.fused_moe_triton.layer.is_in_tc_piecewise_cuda_graph",
+            return_value=True,
+        ):
+            piecewise = FusedMoE.forward(layer, self.hidden, output)
+        torch.testing.assert_close(piecewise.topk_ids, materialized.topk_ids)
+
+    def test_in_range_draft_loads_experts_in_its_routing_order(self):
+        """Draft expert weights stay in logical order despite a permuted target map."""
+        outputs = []
+        for is_draft in (False, True):
+            method = UnquantizedFusedMoEMethod()
+            scope = draft_model_build_scope() if is_draft else get_parallel().override()
+            with (
+                scope,
+                patch.object(method, "create_weights"),
+                get_parallel().override(
+                    tp_size=1,
+                    moe_ep_size=1,
+                    moe_ep_rank=0,
+                    moe_tp_size=1,
+                    moe_tp_rank=0,
+                ),
+            ):
+                layer = FusedMoE(
+                    num_experts=4,
+                    hidden_size=2,
+                    intermediate_size=2,
+                    layer_id=0,
+                    top_k=2,
+                    quant_method=method,
+                )
+            weights = torch.nn.Parameter(torch.zeros((4, 2, 2)), requires_grad=False)
+            for expert_id in range(4):
+                layer.weight_loader(
+                    param=weights,
+                    loaded_weight=torch.eye(2) * (expert_id + 1),
+                    weight_name="experts.w2_weight",
+                    shard_id="w2",
+                    expert_id=expert_id,
+                )
+            self.assertEqual(
+                weights[:, 0, 0].tolist(), [1, 2, 3, 4] if is_draft else [2, 4, 1, 3]
+            )
+            router = self._router(is_draft=is_draft)
+            topk = router.forward_native(self.hidden, self.logits)
+            expert_outputs = torch.einsum(
+                "tkij,tj->tki", weights[topk.topk_ids], self.hidden
+            )
+            outputs.append((expert_outputs * topk.topk_weights[..., None]).sum(dim=1))
+        torch.testing.assert_close(outputs[0], outputs[1])
+        expected_scale = torch.softmax(self.logits[:, :2], dim=-1) @ torch.tensor(
+            [1.0, 2.0]
+        )
+        torch.testing.assert_close(outputs[1], self.hidden * expected_scale[:, None])
 
     def test_identity_placement_keeps_in_kernel_routing_available(self):
         identity = torch.arange(4).view(1, 4)
@@ -384,16 +459,19 @@ class TestTopKRoutingInputs(CustomTestCase):
                     ):
                         output = router.forward_cuda(self.hidden, self.logits)
                     self.assertEqual(output.format, output_format)
+                    if output_format == TopKOutputFormat.BYPASSED:
+                        self.assertIs(output.router_logits, self.logits)
             for algorithm in ("fake", "lp"):
                 with (
                     self.subTest(algorithm=algorithm),
                     get_exec().moe.override(ep_dispatch_algorithm=algorithm),
                 ):
                     router = self._router(output_format=TopKOutputFormat.BYPASSED)
+                    output = router.forward_cuda(self.hidden, self.logits)
                     with self.assertRaisesRegex(
                         NotImplementedError, "placement remapping requires"
                     ):
-                        router.forward_cuda(self.hidden, self.logits)
+                        _ = output.router_logits
 
     def test_hash_npu_keeps_valid_ids_and_zero_padded_weights(self):
         router = HashTopK(2, 4, 0, 4, scoring_func="softmax", layer_id=0)

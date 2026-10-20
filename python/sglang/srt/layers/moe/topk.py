@@ -398,10 +398,10 @@ class TritonKernelTopKOutput(NamedTuple):
 
 
 class BypassedTopKOutput(NamedTuple):
-    """Bypassed top-k output format."""
+    """Lazy routing that can be materialized or consumed by an in-kernel router."""
 
     hidden_states: torch.Tensor
-    router_logits: torch.Tensor
+    raw_router_logits: torch.Tensor
     topk_config: TopKConfig
     num_token_non_padded: Optional[torch.Tensor] = None
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None
@@ -410,12 +410,21 @@ class BypassedTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
 
+    @property
+    def router_logits(self) -> torch.Tensor:
+        if self.expert_location_dispatch_info is not None:
+            raise NotImplementedError(
+                "Expert placement remapping requires materialized TopK routing; "
+                "this MoE kernel routes directly from logits."
+            )
+        return self.raw_router_logits
+
     def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
         """Materialize routing tensors. Used by MoE kernels that need explicit
         topk_ids / topk_weights rather than doing routing internally."""
         return select_experts(
             hidden_states=self.hidden_states,
-            router_logits=self.router_logits,
+            router_logits=self.raw_router_logits,
             topk_config=self.topk_config,
             layer_id=layer_id,
             num_token_non_padded=self.num_token_non_padded,
@@ -866,15 +875,12 @@ class TopK(BaseFusedOp):
                 "TopK requires the owning experts' runner backend or an explicit output format."
             )
 
-        if (
-            output_format != TopKOutputFormat.STANDARD
-            and expert_location_dispatch_info is not None
-            and (
-                explicit_dispatch_info
-                or is_expert_remapping_enabled()
-                or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
-            )
-        ):
+        requires_remapping = expert_location_dispatch_info is not None and (
+            explicit_dispatch_info
+            or is_expert_remapping_enabled()
+            or expert_location_dispatch_info.ep_dispatch_algorithm in ("fake", "lp")
+        )
+        if output_format == TopKOutputFormat.TRITON_KERNEL and requires_remapping:
             raise NotImplementedError(
                 "Expert placement remapping requires a MoE runner with standard TopK routing; "
                 f"got {output_format.name}."
@@ -911,10 +917,12 @@ class TopK(BaseFusedOp):
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
-                router_logits=router_logits,
+                raw_router_logits=router_logits,
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
+                expert_location_dispatch_info=(
+                    expert_location_dispatch_info if requires_remapping else None
+                ),
             )
         else:
             self.topk_config.torch_native = False

@@ -74,6 +74,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_global_dwdp_manager,
     get_parallel,
     get_server_args,
@@ -366,6 +367,7 @@ class FusedMoE(torch.nn.Module):
         self.params_dtype = params_dtype
         self.layer_name = prefix
         self.layer_id = layer_id
+        self.is_draft = get_flags().moe.in_speculative_scope
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -1078,7 +1080,9 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        global_expert_location_metadata = get_global_expert_location_metadata()
+        global_expert_location_metadata = (
+            None if self.is_draft else get_global_expert_location_metadata()
+        )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
@@ -1555,6 +1559,14 @@ class FusedMoE(torch.nn.Module):
 
             return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
+            if (
+                TopKOutputChecker.format_is_bypassed(topk_output)
+                and topk_output.expert_location_dispatch_info is not None
+            ):
+                # The opaque logits-only op cannot carry placement metadata.
+                return self.forward_impl(
+                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                )
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -1868,7 +1880,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
 ) -> torch.Tensor:
     topk_output = BypassedTopKOutput(
         hidden_states=hidden_states,
-        router_logits=router_logits,
+        raw_router_logits=router_logits,
         topk_config=TopKConfig(
             top_k=top_k,
             topk_group=topk_group,

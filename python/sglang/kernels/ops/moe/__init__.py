@@ -60,6 +60,20 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="moe.shuffle_weighted_sum",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True, description="masked routed-row reduction"
+        ),
+        description="Reduce permuted expert outputs, skipping inactive routes.",
+    )
+)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,

@@ -133,7 +133,7 @@ class TestGgufInactiveRoutes(CustomTestCase):
         return weighted.sum(dim=1).float()
 
     def test_block_size_metadata_without_tensor_arguments(self):
-        # A metadata-only operator must dispatch without any CUDA Tensor args.
+        # Runtime metadata must work without a Tensor-dispatched wheel operator.
         for quant_type in (GGMLQuantizationType.Q4_0, GGMLQuantizationType.Q8_0):
             with self.subTest(quant_type=quant_type):
                 self.assertIn(ggml_moe_get_block_size(int(quant_type)), (4, 8))
@@ -186,7 +186,20 @@ class TestGgufInactiveRoutes(CustomTestCase):
         native_outputs = []
         native_mmq = gguf_runtime.ggml_moe_a8
 
+        native_align = gguf_runtime.moe_align_block_size
+
+        def poison_alignment(*args, **kwargs):
+            sorted_ids, expert_ids, count = native_align(*args, **kwargs)
+            block_starts = (
+                torch.arange(expert_ids.numel(), device=expert_ids.device) * 4
+            )
+            expert_ids.masked_fill_(block_starts >= count, 4)
+            return sorted_ids, expert_ids, count
+
         def record_mmq_outputs(*args, **kwargs):
+            if not torch.cuda.is_current_stream_capturing():
+                # Fail before native dispatch if a slack block can index expert E.
+                self.assertTrue(bool((args[3] < args[1].shape[0]).all()))
             result = native_mmq(*args, **kwargs)
             if torch.cuda.is_current_stream_capturing():
                 native_outputs.append(result)
@@ -199,7 +212,10 @@ class TestGgufInactiveRoutes(CustomTestCase):
             if tokens > 64
             else nullcontext()
         )
-        with observe_mmq:
+        with (
+            observe_mmq,
+            patch.object(gguf_runtime, "moe_align_block_size", poison_alignment),
+        ):
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
