@@ -35,9 +35,13 @@ route. IndexShare consumers reuse the anchor plan with their own layer KV.
 
 This differs from the original full-sequence TopK policy. Equal results against
 the same-policy LI reference do not establish model-quality parity against
-full-sequence TopK. Changing C should change cache residency, not selection;
-misses are fetched rather than dropped. Incorrect cache routing would still
-be a correctness bug, hence the bitwise KV checks.
+full-sequence TopK. C controls resident capacity rather than K. Once both
+configurations are in the offload route, misses are fetched rather than
+dropped. The experimental route threshold is page-aligned prefix >= C:
+changing C can therefore change the selection policy near that threshold.
+Cross-C quality equivalence is not claimed for these transition lengths.
+Incorrect cache routing would still be a correctness bug, hence the bitwise
+KV checks.
 
 Covered on real NPU: TopK set parity on fixed fixtures with wide score margins,
 bitwise selected KV parity, SFA output tolerance rtol=0.01/atol=0.002, cold fill,
@@ -48,11 +52,16 @@ page into TopK, then exercises mixed padding and request reuse. Invalid source
 IDs are masked explicitly because the native invalid-row path can retain stale
 outputs during graph replay.
 
-Not validated: complete model generations/logprobs/KL/perplexity/task accuracy,
-tensor-parallel communication, speculative decode, C8, or SHMEM runtime.
-The approximately 168 GB GLM-5.2-w4a8 checkpoint was not loaded. Fixed dimensions
-match its relevant configuration: index H=32/D=128, K=2048, CKV=512, KPE=64,
-and local attention QH=8; this is not a model end-to-end benchmark.
+The 151 results below are fixed-input subpath measurements. Full checkpoint
+generation and serving on 217 are documented separately below; they must not
+be inferred from the 151 timings. The earlier checkpoint size estimate was not
+a measured model run. The actual 217 checkpoint metadata reports
+404,689,509,888 weight bytes. The fixed 151 dimensions were index H=32/D=128,
+K=2048, CKV=512, KPE=64, local attention QH=8.
+
+Still outside validation: full-distribution KL, perplexity, broad task-quality
+parity, speculative decoding, C8, and the SHMEM runtime. Equal fixed-fixture
+KV payloads do not establish general end-to-end numerical equivalence.
 
 151 measurements, 2026-10-20
 ----------------------------
@@ -135,3 +144,182 @@ not install dependencies or replace a production SGLang installation.
 
 Keep this feature experimental pending complete-model quality/serving tests.
 The C=2048 regressions and native-vs-LRU miss differences are material limits.
+
+
+Full GLM-5.2-W4A8 validation on 217, 2026-10-20
+---------------------------------------------
+Environment: 16 Ascend A3 chips, 64 GiB HBM each; Python 3.12.13,
+torch 2.10.0+cpu, torch_npu 2.10.0.post6, CANN 9.1. The complete local
+GlmMoeDsaForCausalLM checkpoint was loaded. Its metadata weight size is
+404,689,509,888 bytes. W4A8 applies to model weights/activations; this
+experiment explicitly uses BF16 indexer/main KV, not C8.
+
+Source provenance: original integration bc75a6195e073aa8754e534a8a1492df5d802315
+on official main 4b83f215f498bc0371587bfae4a9470f24e77737. Tuned implementation
+d9786495c0dadc86558b58e14d788bc0a61f38e1 changes only the native resident-KV
+gather launch from 24 to 48 blocks; it also adds the two portable model clients.
+The native operator library is unchanged and retains the SHA256 listed above.
+
+All model modes use TP16/EP16, DeepEP auto, shared-expert fusion disabled,
+BF16 dtype/KV, context length 36864, max running requests 16, max total tokens
+147456, page 128, graph batch 16, static memory fraction 0.82, no chunked
+prefill, no radix cache, no speculation, and seed 42. Actual request
+concurrency is 1 or 4; graph padding remains 16 in every mode.
+
+The working A3 DeepEP deployment additionally sets:
+  STREAMS_PER_DEVICE=32
+  DEEPEP_HCCL_BUFFSIZE=2500
+  DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+  DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+  DEEPEP_NORMAL_LONG_SEQ_ROUND=72
+  SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+  DEEPEP_HYBRID_DEPLOYMENT=1
+  DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+  SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1
+The initial TP-only configuration generated garbage with offload both enabled
+and disabled and is excluded from accepted timings/quality. Multiple settings
+changed to reach the working DeepEP configuration; no single-switch root cause
+is claimed. Small graph buckets 1/2/4 are insufficient for this DeepEP setup.
+
+The production create_shm_tensor allocator and real registered host DRAM were
+used, without the 151 registered-host allocator monkeypatch. Production KV
+payloads passed bitwise checks, and LI/LIM attention outputs passed
+rtol=0.01/atol=0.002 with graph replay. This validates this host-registration
+path; it is not a SHMEM runtime test.
+
+Serving measurements include weights, projections, TP/EP communication,
+per-layer new-token writes to DRAM, real miss reads, selection/cache work,
+attention, sampling, and scheduling. Inputs are prepared once as token IDs
+and reused. Each workload has one excluded warmup round and three measured
+rounds; report medians, without outlier removal. TTFT includes prefill; TPOT
+is the streamed interval between the first and last completion divided by
+the completion-count difference. Throughput includes request prefill time.
+Profiles are collected in a separate request after timing and quality finish.
+
+Original accepted results (TPOT ms):
+  input/output/concurrency    no offload     LI reference     LIM, 24 blocks
+  8192/128/1                     47.864          286.443           127.924
+  32768/512/1                    48.189      not measured           135.750
+  8192/128/4                     49.630          269.821           134.561
+LI reference shares the prefix-TopK plus visible-tail policy with LIM.
+The no-offload mode uses the original full-visible-sequence TopK policy.
+These are two different comparisons. LIM reduces latency against the
+same-policy reference but the complete offload path remains substantially
+slower than no offload.
+
+Memory observations for the matching three-workload sessions: 16-chip
+median of each chip's sampled maximum total HBM was 57068.0 MiB without
+offload and 50394.5 MiB with original LIM, approximately 11.7% lower.
+Samples are coarse npu-smi observations (10-second waits plus command time),
+not exact allocator peak watermarks. The profile interval is excluded.
+The reference session omitted 32K/512, so its HBM peak is not used for the
+full-matrix memory comparison.
+
+The manager's exact persistent allocation formula at rows=17, layers=78,
+max context=36868, BF16 KV gives:
+  C=2048: managed HBM 3265.21 MiB; host KV 53708.83 MiB per rank
+  C=4096: managed HBM 6248.71 MiB; host KV 53708.83 MiB per rank
+C=4096 was allocated by the full model. C=2048 here is the static formula,
+not a second full-checkpoint run. Manager HBM excludes model weights, the
+full index-key pool, graph pools, allocator reserve and kernel temporaries.
+With TP16, the host allocation is approximately 839 GiB across ranks in
+this configuration; the request/context bound must be sized deliberately.
+
+The 32-example quality check uses 40 disjoint test-set demonstrations
+(indices 1279..1318), evaluates indices 0..31, prompts 6507..6589 tokens,
+temperature zero, at most 512 output tokens, concurrency 4, and stop strings
+Question / Assistant: / <|separator|>. Dataset SHA256:
+1dc2dffec42993290e95fd1ba98eeb6ae603210f76a5318a5a00281608802057
+It is a custom long-prompt GSM8K diagnostic, not a standard benchmark score
+and not the repository's KL consistency test. Original results were 29/32
+no offload, 28/32 LI reference, and 30/32 original LIM, with no truncations.
+Long generated sequences differ, even between same-policy modes. Only 6/32
+reference/LIM sequences were identical; common-prefix logprobs were compared
+only before histories diverged. Their maximum difference was 0.5766, so
+these runs do not establish general numerical equivalence. Scheduling differs
+between concurrent runs. A reference error on example 31 becomes correct
+under isolated B1, demonstrating that batch sensitivity contributes.
+
+Four 8K needle prompts, each repeated twice in each mode, returned all
+expected codes. Within-mode repeats had identical tokens/logprobs. Between
+reference and original LIM, these short responses had identical tokens and
+maximum logprob difference 2.4437e-5. This bounded check must not replace
+the long-generation caveat above.
+
+The separate NPU decode profile confirms FusedLightningIndexerManage
+execution. In 483 complete per-layer copy/SFA groups, all five copies and
+SFA ran on physical stream 187. Source-order interpretation gives median
+resident-to-selected gather 283.11 us and miss-DRAM-to-resident copy
+103.00 us. These are diagnostic kernel times, not serving TPOT. The current
+bridge does not fuse the payload-copy/SFA stage, so it does not establish
+H2D hiding. AI-CPU collective durations contain waiting and cannot be
+interpreted directly as critical-path compute time.
+
+A graph-batch-16 device-only sweep found 24->48 blocks reduced the gather
+from about 203/208 us to 110/111 us with 1/4 active requests, with bitwise
+parity. At 16 active requests, no gain was observed. Generic index_select
+was slower and was not adopted. Full-model tuned results follow below.
+
+Reproduce model clients (run every mode against the same prepared files):
+  python benchmark/hisparse/bench_lim_model.py --phase prepare \
+    --model-path "$MODEL" --workdir "$RUN"
+  python benchmark/hisparse/bench_lim_model.py --phase perf \
+    --workdir "$RUN" --base-url "$URL" --tag "$MODE" \
+    --length 8192 --output 128 --concurrency 1 --rounds 3
+  python benchmark/hisparse/eval_lim_long_gsm8k.py --prepare \
+    --model-path "$MODEL" --data-path "$LOCAL_GSM8K_CONVERSATIONS" --workdir "$RUN"
+  python benchmark/hisparse/eval_lim_long_gsm8k.py \
+    --workdir "$RUN" --base-url "$URL" --tag "$MODE"
+Retain raw JSONL, prompt hashes, exact launch arguments, source/library
+hashes and device occupancy logs with the aggregate report.
+
+
+Tuned full-checkpoint results, code d9786495 (48-block device gather)
+------------------------------------------------------------------
+input/output/concurrency    TPOT ms       TTFT s       output token/s
+8192/128/1              118.269        3.375             6.958
+32768/512/1              126.854       13.508             6.536
+8192/128/4              124.141       13.147            17.726
+Relative to original LIM, measured TPOT decreased by 7.55%, 6.55%, and 7.74%
+for these three workloads. Relative to the same-policy reference at 8K/128,
+TPOT decreased by 58.71% at concurrency 1 and 53.99% at concurrency 4.
+Relative to no offload, tuned TPOT remains 2.47x, 2.63x, and 2.50x. Thus
+the small kernel tuning has a measured benefit, but low-degradation H2D
+hiding has NOT been achieved by the complete offload bridge.
+
+Tuned session HBM: median chip sampled peak 50392.5 MiB vs baseline
+57068.0 MiB (11.70% lower). The worst-device sampled peak is 51849 MiB
+vs baseline 57229 MiB (9.40% lower). These are whole-device observations
+including the fixed model/configuration overhead, not just resident KV.
+All occupancy samples showed only processes belonging to this test.
+
+Tuned custom task score: 29/32, with zero truncations; baseline 29/32,
+same-policy reference 28/32, original LIM 30/32. Only 7/32 complete tuned
+and reference token sequences were identical. Maximum logprob difference
+on their common generated prefixes was 0.4407. Two isolated B1 rechecks
+still had differing generated sequences, with maximum common-prefix
+logprob difference 0.3106. Thus batch sensitivity explains only part of the
+differences. No accuracy-lossless or numerical-equivalence claim is made.
+These sampled-token comparisons are NOT full-distribution KL measurements.
+The same short 8K needle repeatability checks passed 8/8 for tuned code.
+
+A second diagnostic-only profile of tuned code confirms 128 native LIM
+invocations and 478 complete five-copy/SFA layer groups. All those copy
+and SFA kernels are on physical stream 187; none of the copies overlaps
+its consumer SFA. Median resident-to-selected gather fell from 283.11 us
+in the original profile to 155.03 us; the tuned miss-fill copy median was
+121.06 us. Cumulative profile durations include profiler overhead and
+partially captured graph boundaries, so they are not normalized TPOT.
+
+Validation cleanup: the test model/container were stopped, no NPU processes
+remained, and host shared memory returned to approximately 1 GiB. Source
+and raw results remain in the task directory for reproduction.
+
+Remaining work for the original performance/accuracy objectives: eliminate
+selected-KV materialization with a compatible copy/SFA fused route or direct
+resident-slot consumption; prefetch stable-prefix misses across IndexShare
+consumers; remove unnecessary same-stream event dependencies after testing;
+and isolate the first numerical divergence under fixed batch/teacher-forced
+prefixes with captured TopK sets, selected payloads and SFA inputs. Full-model
+cache-hit-rate telemetry was not collected, so fixture hit rates must not be
+substituted for actual checkpoint hit rates.
