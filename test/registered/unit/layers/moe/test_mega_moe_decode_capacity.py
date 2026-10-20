@@ -29,6 +29,7 @@ HIDDEN = 8
 def _layer(value=0):
     return SimpleNamespace(
         num_experts=EXPERTS,
+        uses_expert_location=True,
         should_fuse_routed_scaling_factor_in_topk=True,
         **{
             name: torch.full((48, 4), value, dtype=torch.uint8)
