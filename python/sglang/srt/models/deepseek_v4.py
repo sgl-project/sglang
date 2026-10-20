@@ -31,7 +31,10 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_rope_inplace,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
-from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
+from sglang.kernels.ops.attention.dsv4.wo_a import (
+    can_use_fused_wo_a,
+    fused_rope_wo_a_bf16,
+)
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
@@ -1146,9 +1149,18 @@ class MqaAttentionBase(nn.Module):
         sink_num_heads = max(kernel_num_heads, padded_num_heads)
         if self._attn_sink_local is None:
             sink = self.attn_sink.new_zeros(sink_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            self._attn_sink_local_slice = slice(
+                rank * num_heads, (rank + 1) * num_heads
+            )
+            sink[:num_heads] = self.attn_sink[self._attn_sink_local_slice]
             self._attn_sink_local = sink
         return self._attn_sink_local[:kernel_num_heads]
+
+    def refresh_attn_sink_cache(self) -> None:
+        if self._attn_sink_local is None:
+            return
+        src = self.attn_sink.data[self._attn_sink_local_slice]
+        self._attn_sink_local[: src.numel()].copy_(src)
 
     def _q_lora_quant_e8m0(self, with_indexer: bool) -> bool:
         """Whether the fused q_norm quant feeds wq_b (and the indexer's wq_b, which
@@ -1365,7 +1377,7 @@ class MQALayer(MqaAttentionBase):
             and not self.use_npu_arch35_mxfp8_wo_a
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
-            and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+            and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
         )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -3324,7 +3336,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
     def _can_fuse_ffn_mhc(self) -> bool:
         """The MoE counterpart of `_can_fuse_attn_mhc`."""
         return (
-            self.mlp.tp_size == 4
+            mhc.fused_mhc_tp_ok(self.mlp.tp_size)
             and get_moe_a2a_backend().is_none()
             and not self.mlp._shared_expert_tp1
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
@@ -3446,7 +3458,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             self.post_attention_layernorm, accepts_mxfp8=False, hc=self.ffn_hc
         )
         return (
-            get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+            get_parallel().tp_size == self.self_attn.attn_tp_size
+            and mhc.fused_mhc_tp_ok(self.self_attn.attn_tp_size)
             and boundary.norm_fusable
             and mhc.can_fuse_post(self.hc_cfg)
         )
@@ -4856,6 +4869,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 and not self_attn.indexer.compressor.ape_converted
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
+            self_attn.refresh_attn_sink_cache()
             layer.refresh_mhc_norm_weight_cache()
         layers = self.model.layers
         for i, layer in enumerate(layers):
@@ -4870,7 +4884,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         # The only deployments whose fused-collective gates can fire; registration
         # must happen eagerly here, before graph capture.
-        if get_platform().is_blackwell and get_parallel().tp_size == 4:
+        if get_platform().is_blackwell and mhc.fused_mhc_tp_ok(get_parallel().tp_size):
             from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                 register_fused_all_reduce_comm,
             )
