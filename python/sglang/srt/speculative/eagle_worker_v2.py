@@ -407,8 +407,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _configure_qsa_mtp_index_share(self) -> None:
         """Reuse the draft-extend QSA selection across the MTP decode steps;
         chain speculation only: with topk > 1 decode rows are not request-major."""
-        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
-
         hf_config = self.draft_runner.model_config.hf_config
         if (
             not _qsa_index_share_requested(hf_config)
@@ -426,6 +424,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 "speculative decoding"
             )
             return
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
         layer_ids = sorted(
             {
                 module.layer_id

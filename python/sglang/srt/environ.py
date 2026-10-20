@@ -1078,6 +1078,8 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
+    # Set to 0 to allow AscendAttnBackend to set needs_cpu_seq_lens to False for dsa models.
+    SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS = EnvBool(True)
 
     # ===================================================================
     # MUSA
@@ -1329,6 +1331,12 @@ class Envs:
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
+    # The hgcc --gpu-architecture target used by JIT builds on SAIL (hgcc
+    # cannot read CUDA sources, so they are converted by sailify first).
+    # One of: native, all, all-ppu,
+    # all-vm, ppu_10, ppu_15, vm_10, vm_15. "native" builds for the local
+    # device only, matching how the nvcc path pins -gencode to this GPU.
+    SGLANG_SAIL_GPU_ARCH = EnvStr("native")
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
