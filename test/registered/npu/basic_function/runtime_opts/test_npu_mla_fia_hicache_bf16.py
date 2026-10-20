@@ -1,13 +1,12 @@
 import os
 import unittest
-from types import SimpleNamespace
 from urllib.parse import urlparse
 
+from sglang.test.ascend.e2e.test_npu_accuracy_utils import run_evalscope
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     MOONLIGHT_16B_A3B_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -29,11 +28,13 @@ TEST_MODEL_MATRIX = {
 }
 
 GSM8K_NUM_QUESTIONS = 1319
-# The PR pipeline evaluates the first 20% of GSM8K to keep the gate fast. The
-# subset is deterministic (temperature 0), so keep a looser threshold until the
-# PR pipeline result has been calibrated on real runs.
+# Match the nightly accuracy case so both numbers come from the same harness.
+GSM8K_GENERATION_CONFIG = {"max_tokens": 7168, "temperature": 1.0}
+GSM8K_EVAL_BATCH_SIZE = 64
+
+# The PR pipeline evaluates the first 20% of GSM8K (263 questions).
 PR_GSM8K_RATIO = 0.2
-PR_ACCURACY_MARGIN = 0.05
+PR_ACCURACY_THRESHOLD = 0.77
 
 # The nightly pipeline is also triggered by pull requests via path filters, so the
 # pipeline is identified by GITHUB_WORKFLOW_REF (inherited from the caller's github
@@ -88,23 +89,24 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
                     accuracy_thres = TEST_MODEL_MATRIX[model]["accuracy"]
                     if _is_pr_pipeline:
                         num_questions = int(GSM8K_NUM_QUESTIONS * PR_GSM8K_RATIO)
-                        accuracy_thres -= PR_ACCURACY_MARGIN
+                        accuracy_thres = PR_ACCURACY_THRESHOLD
                     print(
                         f"##=== Testing accuracy: {model} "
                         f"({num_questions}/{GSM8K_NUM_QUESTIONS} questions) ===##"
                     )
 
-                    args = SimpleNamespace(
-                        num_shots=5,
-                        data_path=None,
-                        num_questions=num_questions,
-                        max_new_tokens=512,
-                        parallel=128,
+                    metrics = run_evalscope(
                         host=self.url.hostname,
                         port=int(self.url.port),
+                        model=os.path.basename(model),
+                        datasets=["gsm8k"],
+                        eval_batch_size=GSM8K_EVAL_BATCH_SIZE,
+                        limit=num_questions,
+                        generation_config=GSM8K_GENERATION_CONFIG,
                     )
-
-                    metrics = run_eval_few_shot_gsm8k(args)
+                    self.assertIn(
+                        "accuracy", metrics, "Failed to parse evalscope accuracy"
+                    )
                     self.assertGreaterEqual(metrics["accuracy"], accuracy_thres)
                 finally:
                     terminate_and_kill_process_tree(process)

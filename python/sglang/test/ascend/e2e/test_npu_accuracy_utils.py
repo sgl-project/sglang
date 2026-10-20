@@ -161,9 +161,14 @@ def run_evalscope(
 
     logger.info(f"Generated evalscope script: {script_path}")
 
-    install_cmd = (
-        "/bin/bash /root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    # PR jobs run through _npu-pr-test-stage.yml, which does not create the
+    # /root/sglang symlink, so locate the installer next to this module first.
+    install_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "run_evalscope.sh"
     )
+    if not os.path.exists(install_script):
+        install_script = "/root/sglang/python/sglang/test/ascend/e2e/run_evalscope.sh"
+    install_cmd = f"/bin/bash {install_script}"
     subprocess.run(install_cmd, shell=True, check=True)
 
     python_bin = "test_env_evalscope/bin/python"
