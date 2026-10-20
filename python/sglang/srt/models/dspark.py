@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
+from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovBiasGemv
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -94,6 +95,12 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
     def greedy_w2_weight(self) -> Optional[torch.Tensor]:
         """The w2 weight when the bias is exactly the GEMV of the previous
         token's embedding, for the fused greedy kernel; otherwise None."""
+        return None
+
+    def bias_gemv(self, prev_tokens: torch.Tensor) -> Optional[MarkovBiasGemv]:
+        """This step's bias left for the step kernel to compute, when it is the
+        BF16 GEMV of the previous token's embedding; otherwise None."""
+        del prev_tokens
         return None
 
 
