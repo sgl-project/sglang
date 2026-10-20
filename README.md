@@ -22,6 +22,11 @@ SGLang is an open-source inference framework for large language, vision-language
 
 👋 Get started below, or meet the community at [SGLang Events](https://www.sglang.io/events), including meetups, developer meetings, workshops, and office hours.
 
+> **[SGLang Summit 2026: Meet the builders of open AI](https://www.sglang.io/summit)**<br>
+> **Our flagship annual gathering · November 12–13 · San Francisco**
+>
+> Go deep on inference, training, and AI hardware through technical talks, live demos, and hands-on workshops. Bring your deployment challenges and meet the engineers and researchers building the stack.
+
 ## Get Started
 
 Pull the Docker image, which includes SGLang and its dependencies:
