@@ -322,10 +322,10 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
     round. Reuse the independent UE8M0 oracle, and compare both layouts only
     on active rows; an empty expert and a partial slab exercise masked counts.
     """
-    from sglang.kernels.ops.moe.dsv4 import (
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
         silu_and_mul_contig_post_quant,
-        silu_and_mul_masked_post_quant,
     )
+    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 
     torch.manual_seed(123 + hidden)
     experts, capacity = 3, 32

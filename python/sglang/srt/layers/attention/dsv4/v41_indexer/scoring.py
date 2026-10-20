@@ -88,7 +88,7 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
 
 
 def quantize_index_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    from sglang.kernels.ops.quantization.fp4_indexer_quant import (
         quantize_fp4_indexer_tensor,
     )
 

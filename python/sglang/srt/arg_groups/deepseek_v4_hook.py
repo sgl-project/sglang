@@ -250,7 +250,7 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
 
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
     )
 
