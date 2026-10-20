@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.draft_params import fill_draft_params
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
@@ -163,6 +164,14 @@ def resolve_draft_params(
         temperatures.fill_(1.0)
         greedy_mask.fill_(True)
         step_temperatures.zero_()
+    elif sampling_info.temperatures.is_cuda and sampling_info.top_ks.is_cuda:
+        fill_draft_params(
+            sampling_info.temperatures.view(-1),
+            sampling_info.top_ks.view(-1),
+            temperatures,
+            greedy_mask,
+            step_temperatures,
+        )
     else:
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
