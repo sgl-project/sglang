@@ -390,6 +390,10 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_index_translator = model_runner.kv_index_translator
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.is_draft_worker = bool(getattr(model_runner, "is_draft_worker", False))
+        # Captured at init. The process-wide flag is flipped for the K3 MLA
+        # draft only; the target keeps the value it saw when it was built.
+        self.use_mla_ps_kernel = False
 
         self.dcp_world_size = get_parallel().attn_dcp_size
         self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
@@ -628,6 +632,29 @@ class AiterAttnBackend(AttentionBackend):
             self.mla_kernel_num_head_padded = (
                 16 if _gathered_num_head < 16 else _gathered_num_head
             )
+            # The K3 draft has 8 local heads. Repeating them to 16 selects
+            # qh16 v3. On gfx950, fp8 qlen 4 with the count left at 8 selects
+            # the qh32 tile (s_MQA=8). v1_0 folds 8 up to 16 and then faults
+            # against that launch, so this path's metadata uses v1_2.
+            self._draft_native_gqa8 = False
+            if (
+                self.is_draft_worker
+                and self.dcp_world_size <= 1
+                and self.head_pad_mode == "repeat"
+                and self.num_head == 8
+                and self.kv_cache_dtype == fp8_dtype
+                and is_gfx95_supported()
+            ):
+                self.num_head_padded = self.num_head
+                self.mla_kernel_num_head_padded = self.num_head
+                self.head_pad_mode = "none"
+                self.head_repeat_factor = 1
+                self._draft_native_gqa8 = True
+                logger.info(
+                    "aiter draft MLA keeps %d heads so gfx950 fp8 qlen 4 "
+                    "launches the qh32 tile",
+                    self.num_head,
+                )
 
             self.attn_dp_enabled = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
@@ -701,6 +728,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = -1
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+            self.use_mla_ps_kernel = bool(_use_mla_ps_kernel)
 
     def pad_heads(self, x: torch.Tensor, padded: int) -> torch.Tensor:
         num_head = x.shape[1]
@@ -758,7 +786,7 @@ class AiterAttnBackend(AttentionBackend):
         Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
         is off. DCP ASM needs the same buffers with fast_mode scheduling.
         """
-        return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
+        return (self.use_mla_ps_kernel and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
 
@@ -806,6 +834,9 @@ class AiterAttnBackend(AttentionBackend):
             if metadata_intra_batch_mode is None
             else metadata_intra_batch_mode
         )
+        if getattr(self, "_draft_native_gqa8", False):
+            metadata_fast_mode = True
+            metadata_intra_batch_mode = False
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -889,6 +920,9 @@ class AiterAttnBackend(AttentionBackend):
             if nhead_override is None
             else nhead_override
         )
+        if getattr(self, "_draft_native_gqa8", False):
+            fast_mode = True
+            intra_batch_mode = False
 
         meta = get_mla_metadata_v1(
             qo_indptr,
@@ -1433,7 +1467,7 @@ class AiterAttnBackend(AttentionBackend):
     def _asm_cprr_supports_verify_shape(self, q_len: Optional[int]) -> bool:
         """Whether this topology has an asm cp kernel for DCP target verify."""
         return (
-            _use_mla_ps_kernel
+            self.use_mla_ps_kernel
             and self.mla_verify_backend == "asm"
             and self.dcp_world_size > 1
             and self.kv_cache_dtype == fp8_dtype
@@ -1456,8 +1490,10 @@ class AiterAttnBackend(AttentionBackend):
         q / o must already be shaped (..., num_head, head_dim).
         """
         num_head = layer.tp_q_head_num
+        if getattr(self, "_draft_native_gqa8", False):
+            kwargs["intra_batch_mode"] = False
         if (
-            _use_mla_ps_kernel
+            self.use_mla_ps_kernel
             and self.dcp_world_size <= 1
             and self._asm_ps_supports_qlen(kwargs.get("max_seqlen_q") or 1)
         ):
@@ -1467,6 +1503,36 @@ class AiterAttnBackend(AttentionBackend):
             # their KV, and that KV can be NaN. Gluon, the kernel this path
             # replaces, does not read row 0.
             k_buffer_flat[0].zero_()
+        # The K3 draft is bf16 Q against an fp8 latent. Repeat-padding those
+        # heads to 16 and leaving Q in bf16 selects a16w8. Quantize with the
+        # scale the kernel will dequantize, so the launch stays a8w8 qh16.
+        # A draft block is bidirectional: causal=False is what maps qlen>1
+        # onto the msk0 tile. qlen 3 keeps three rows; that tile reads
+        # qo_indptr's width and must not be given a fourth row.
+        if (
+            self.is_draft_worker
+            and self.head_pad_mode == "repeat"
+            and self.use_mla_ps_kernel
+            and self.dcp_world_size <= 1
+            and self.kv_cache_dtype == fp8_dtype
+            and q.dtype != fp8_dtype
+            and int(kwargs.get("max_seqlen_q") or 1) <= _MLA_ASM_PS_MAX_QLEN
+        ):
+            # qseqlen4 only. A draft prefill wider than 4 tokens must stay on
+            # the long-qlen fp8 cast below; quantizing it here launches the
+            # qseqlen4 kernel at that width and page-faults (seen at 90 tokens).
+            q_scale = kwargs.get("q_scale")
+            if not isinstance(q_scale, torch.Tensor) or q_scale.numel() != 1:
+                q_scale = None
+            q_fp8, q_scale = scaled_fp8_quant(q.reshape(q.shape[0], -1), q_scale)
+            q = q_fp8.view(q.shape)
+            kwargs["q_scale"] = q_scale
+            # Only the speculative block is bidirectional. A draft prefill
+            # chunk is wider than num_draft_tokens and stays causal.
+            block_q = int(self.num_draft_tokens or 0)
+            qlen = int(kwargs.get("max_seqlen_q") or 1)
+            if "causal" not in kwargs and block_q > 1 and 1 < qlen <= block_q:
+                kwargs["causal"] = False
         if (
             self.kv_cache_dtype == fp8_dtype
             and self.mla_kernel_num_head_padded == 16
@@ -1570,7 +1636,7 @@ class AiterAttnBackend(AttentionBackend):
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
         ) and not (
-            _use_mla_ps_kernel
+            self.use_mla_ps_kernel
             and self.mla_decode_backend == "asm"
             and self._asm_ps_supports_qlen(max_q_len)
         ):
@@ -1702,7 +1768,10 @@ class AiterAttnBackend(AttentionBackend):
         """DCP target verify on the asm cp round-robin kernel: one masked pass."""
         fm = self.forward_metadata
         num_heads = layer.tp_q_head_num  # gathered heads = num_local_heads * dcp
-        kernel_heads = fm.cprr_kernel_heads or num_heads
+        # 64 gathered heads are native on the non-cprr persistent kernel. The
+        # cprr map has no 64-head row, so it would pad the draft to 96.
+        draft_local = self.is_draft_worker
+        kernel_heads = num_heads if draft_local else (fm.cprr_kernel_heads or num_heads)
         if not self._cprr_launch_logged:
             self._cprr_launch_logged = True
             logger.info(
@@ -1724,6 +1793,8 @@ class AiterAttnBackend(AttentionBackend):
             device=q.device,
         )
         kv_indices, kv_indptr = fm.cprr_kv_indices, fm.cprr_kv_indptr
+        # The draft block attends its whole local shard. Passing the global
+        # indptr would select the target's causal cprr kernel.
         q_in = (
             q.view(n_rows, -1).to(fp8_dtype).view(n_rows, num_heads, layer.qk_head_dim)
         )
@@ -1756,10 +1827,10 @@ class AiterAttnBackend(AttentionBackend):
             intra_batch_mode=self.cprr_intra_batch_mode,
             num_kv_splits=self._kernel_num_kv_splits(),
             return_lse=True,
-            g_kv_indptr=fm.global_kv_indptr,
-            cp_world_size=self.dcp_world_size,
-            cp_rank=get_parallel().attn_dcp_rank,
-            causal=True,
+            g_kv_indptr=None if draft_local else fm.global_kv_indptr,
+            cp_world_size=1 if draft_local else self.dcp_world_size,
+            cp_rank=0 if draft_local else get_parallel().attn_dcp_rank,
+            causal=not draft_local,
         )
         lse = lse.view(n_rows, kernel_heads)
         if kernel_heads != num_heads:
@@ -2225,7 +2296,7 @@ class AiterAttnBackend(AttentionBackend):
                     TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
 
-                if _use_mla_ps_kernel:
+                if self.use_mla_ps_kernel:
                     max_seqlen_qo = num_draft_tokens
                     (
                         work_metadata,
@@ -2356,13 +2427,21 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self._build_dcp_verify_ragged_indices(
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
-                if _use_mla_ps_kernel and (
+                if self.use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     max_seqlen_qo = draft_num
-                    is_cp_round_robin = self.dcp_world_size > 1
+                    # Draft indices are already this rank's shard. The round-robin
+                    # flag is for the target cprr kernel, which remaps them.
+                    is_cp_round_robin = (
+                        self.dcp_world_size > 1 and not self.is_draft_worker
+                    )
                     metadata_heads = (
-                        self.cprr_kernel_heads if use_asm_cprr_verify else None
+                        None
+                        if self.is_draft_worker
+                        else (
+                            self.cprr_kernel_heads if use_asm_cprr_verify else None
+                        )
                     )
                     (
                         work_metadata,
@@ -2846,7 +2925,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
-        if self.use_mla and (_use_mla_ps_kernel or self.use_mla_dcp_asm):
+        if self.use_mla and (self.use_mla_ps_kernel or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
                 1 if self.num_draft_tokens is None else self.num_draft_tokens
@@ -2855,8 +2934,9 @@ class AiterAttnBackend(AttentionBackend):
                 (True, False) if self.use_mla_dcp_asm else (fast_mode, intra_batch_mode)
             )
 
-            graph_use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
-                self.num_draft_tokens
+            graph_use_asm_cprr_verify = (
+                self._asm_cprr_supports_verify_shape(self.num_draft_tokens)
+                and not self.is_draft_worker
             )
             (
                 self.work_metadata,
@@ -3115,11 +3195,17 @@ class AiterAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             assert verify_tokens_per_req is not None
-            # MLA uses a fixed draft length (num_draft_tokens); the non-MLA
-            # unified path derives it per batch from input_ids.
-            tokens_per_req = (
-                self.num_draft_tokens if self.use_mla else verify_tokens_per_req
-            )
+            # MLA target verify uses the fixed speculative width. The K3
+            # draft graph is captured at query_token_num (one shorter than
+            # the verify width when sampling from the anchor). input_ids
+            # already has that width; do not substitute the verify width or
+            # the kernel reads a query row the draft never wrote.
+            if self.is_draft_worker:
+                tokens_per_req = int(verify_tokens_per_req)
+            else:
+                tokens_per_req = (
+                    self.num_draft_tokens if self.use_mla else verify_tokens_per_req
+                )
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
                 0,
@@ -3130,12 +3216,12 @@ class AiterAttnBackend(AttentionBackend):
             )
             if self.use_mla:
                 use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
-                    self.num_draft_tokens
+                    tokens_per_req
                 )
                 kv_lens = (
                     seq_lens
                     if (self.dcp_world_size > 1 and not use_asm_cprr_verify)
-                    else seq_lens + self.num_draft_tokens
+                    else seq_lens + tokens_per_req
                 )
             else:
                 kv_lens = seq_lens
@@ -3145,7 +3231,7 @@ class AiterAttnBackend(AttentionBackend):
             # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
             if seq_lens_sum is not None:
                 kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+                    tokens_per_req * bs if self.use_mla else 0
                 )
                 assert_buffer_fits(
                     kv_indices_used,
@@ -3180,7 +3266,7 @@ class AiterAttnBackend(AttentionBackend):
                         :bs
                     ],
                 )
-                n_rows = bs * self.num_draft_tokens
+                n_rows = bs * tokens_per_req
                 (
                     verify_token_table,
                     local_kv_lens,
@@ -3188,7 +3274,7 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr,
                     req_pool_indices,
                     bs,
-                    self.num_draft_tokens,
+                    tokens_per_req,
                     self._dcp_graph_max_local_kv_len(),
                     out=self.cuda_graph_verify_token_table[:n_rows],
                     out_lens=self.cuda_graph_verify_local_kv_lens[:n_rows],
@@ -3202,19 +3288,23 @@ class AiterAttnBackend(AttentionBackend):
                         verify_token_table,
                         local_kv_lens,
                         bs,
-                        self.num_draft_tokens,
+                        tokens_per_req,
                         out_indices=self.cuda_graph_cprr_kv_indices,
                         out_indptr=self.cuda_graph_cprr_kv_indptr,
                         out_empty=self.cuda_graph_cprr_empty_rows,
                     )
 
             if self.use_mla:
-                max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and (
+                max_q_len = tokens_per_req
+                if self.use_mla_ps_kernel and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     num_kv_splits = self.max_split_per_batch
-                    is_cp_round_robin = self.dcp_world_size > 1
+                    # Draft indices are already this rank's shard. The round-robin
+                    # flag is for the target cprr kernel, which remaps them.
+                    is_cp_round_robin = (
+                        self.dcp_world_size > 1 and not self.is_draft_worker
+                    )
 
                     self.make_mla_meta_data(
                         qo_indptr,
@@ -3238,7 +3328,11 @@ class AiterAttnBackend(AttentionBackend):
                         ),
                         is_cp_round_robin=is_cp_round_robin,
                         nhead_override=(
-                            self.cprr_kernel_heads if use_asm_cprr_verify else None
+                            None
+                            if self.is_draft_worker
+                            else (
+                                self.cprr_kernel_heads if use_asm_cprr_verify else None
+                            )
                         ),
                     )
 
@@ -3361,7 +3455,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_req
 
-            if self.use_mla and _use_mla_ps_kernel:
+            if self.use_mla and self.use_mla_ps_kernel:
                 num_kv_splits = self.max_split_per_batch
 
                 self.make_mla_meta_data(
@@ -3990,7 +4084,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
                     kv_cache_dtype=self.kv_cache_dtype,
                 ) and not (
-                    _use_mla_ps_kernel
+                    self.use_mla_ps_kernel
                     and self.mla_verify_backend == "asm"
                     and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
                 ):

@@ -150,6 +150,19 @@ class TestDcpLogicalCapacity(CustomTestCase):
         self.assertEqual(runner.logical_max_total_num_tokens, 64)
         self.assertEqual(runner.effective_logical_max_total_num_tokens, 32)
 
+    def test_k3_draft_kv_is_not_replicated(self):
+        enter_scope(self, published_topology(tp_size=8, dcp_size=8))
+        replicated = make_configurator(is_draft_worker=True)
+        self.assertEqual(replicated.loc_space_scale, 8)
+
+        gqa = make_configurator(is_draft_worker=True)
+        gqa.model_config = NS(hf_config=NS(architectures=["DSparkDraftModel"]))
+        self.assertEqual(gqa.loc_space_scale, 8)
+
+        k3 = make_configurator(is_draft_worker=True)
+        k3.model_config = NS(hf_config=NS(architectures=["K3DSparkModel"]))
+        self.assertEqual(k3.loc_space_scale, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -22,6 +23,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
@@ -94,6 +96,26 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _draft_config_is_k3_dspark(server_args: ServerArgs) -> bool:
+    del server_args
+    draft_path = get_spec().speculative_draft_model_path
+    if not draft_path:
+        return False
+    import json
+
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    cfg = get_config(
+        draft_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        model_override_args=json.loads(get_model().json_model_override_args),
+        model_config_parser=get_model().model_config_parser,
+    )
+    return "K3DSparkModel" in (getattr(cfg, "architectures", None) or [])
+
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -188,6 +210,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         load_group = get_pp_stage_load_group()
+        # K3DSpark shares the target DCP group, so this scope must not clear
+        # attn_dcp_size. The flag only covers the persistent kernel and the
+        # draft query width, which the GQA draft does not need.
+        self._k3_dspark_draft = _draft_config_is_k3_dspark(server_args)
         with draft_pp_context(), self._draft_context():
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -452,8 +478,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        return draft_tp_context(self._draft_dp_context_enabled)
+        with draft_tp_context(self._draft_dp_context_enabled):
+            yield
 
     def alloc_memory_pool(
         self,
@@ -472,8 +500,45 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
-        with draft_pp_context(), self._draft_context():
-            self._draft_worker.init_attention_backends()
+        # The c16 server leaves SGLANG_AITER_MLA_PERSIST=0 so the target stays
+        # on the DCP ASM kernel. The K3 draft block is qlen 4; the
+        # non-persistent qseqlen4 kernel reads a fourth query row and faults.
+        # Turn persistent on only while this draft backend is built. Forwards
+        # read the flag stored on that backend.
+        persist_restore = None
+        if getattr(self, "_k3_dspark_draft", False):
+            import sglang.srt.layers.attention.aiter_backend as _aiter_backend
+
+            persist_restore = _aiter_backend._use_mla_ps_kernel
+            _aiter_backend._use_mla_ps_kernel = True
+        try:
+            with draft_pp_context(), self._draft_context():
+                self._draft_worker.init_attention_backends()
+        finally:
+            if persist_restore is not None:
+                import sglang.srt.layers.attention.aiter_backend as _aiter_backend
+
+                _aiter_backend._use_mla_ps_kernel = persist_restore
+        # speculative_num_draft_tokens is the target verify width (gamma + 1
+        # when the draft samples from the anchor). The draft graph and its
+        # KV are query_token_num wide. Leaving the backend at the verify
+        # width makes qo_indptr / the KV lookup one row longer than Q, and
+        # mla_a8w8_qh16_qseqlen4 page-faults on that row.
+        if getattr(self, "_k3_dspark_draft", False):
+            draft_backend = self.draft_model_runner.attn_backend
+            query_width = int(self.query_token_num)
+            if (
+                draft_backend is not None
+                and query_width > 0
+                and getattr(draft_backend, "num_draft_tokens", None) != query_width
+            ):
+                draft_backend.num_draft_tokens = query_width
+                if get_parallel().tp_rank == 0:
+                    logger.info(
+                        "K3DSpark draft attention width is %s; target verify width stays %s.",
+                        query_width,
+                        self.verify_num_draft_tokens,
+                    )
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
