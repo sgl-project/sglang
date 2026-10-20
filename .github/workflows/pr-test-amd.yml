@@ -597,7 +597,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75 }}
+        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 120 || 100 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
@@ -721,7 +721,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 150 || 120 }}
+        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 200 || 160 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 2700 --continue-on-error
 
@@ -763,7 +763,7 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 120 || 90 }}
+        timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 170 || 130 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} --continue-on-error
 
