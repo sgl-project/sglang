@@ -246,7 +246,7 @@ class LIMDecodeAdapter:
                 (valid & plan.sparse_rows[:, None]).reshape(-1).contiguous(),
                 2,
                 2,
-                block_dim=24,
+                block_dim=48,
             )
             copy(
                 manager.host_kv_buffer[layer_index],
