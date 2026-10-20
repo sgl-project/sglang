@@ -1747,6 +1747,9 @@ class Envs:
     # down_proj, the wo_a GEMM for wo_b, and the FFN norm for the shared expert's gate_up.
     SGLANG_HIP_SHARED_ACT_MXFP8 = EnvBool(_default_hip)
     SGLANG_HIP_WO_A_MXFP8 = EnvBool(_default_hip)
+    # gfx950 aiter MXFP8 dense route: keep the weight (16, 16)-preshuffled and run aiter's FlyDSL MXFP8
+    # GEMM (needs aiter with ROCm/aiter#5896) instead of the Triton group32 GEMM on the plain weight.
+    SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE = EnvBool(False)
     SGLANG_HIP_FFN_NORM_MXFP8 = EnvBool(_default_hip)
     # V4.1 low-ratio decode / target-verify indexer: score with aiter's schedule-free row-group
     # FP4 MQA logits kernel, a request's verify rows sharing each key load.
