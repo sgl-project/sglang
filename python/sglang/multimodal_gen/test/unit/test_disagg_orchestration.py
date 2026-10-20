@@ -98,17 +98,21 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated):
         reference.write_bytes(b"head-local image upload")
         for iteration in range(3 if split else 2):
             request_id = str(iteration)
+            image_path = [str(reference)] if iteration else None
             client.send_pyobj(
-                [Req(request_id=request_id, prompt="test", image_path=[str(reference)])]
+                [Req(request_id=request_id, prompt="test", image_path=image_path)]
             )
             req = pickle.loads(work[roles[0]].recv_multipart()[-1])[0]
-            if split:
+            if split and image_path:
                 assert (
                     base64.b64decode(req.image_path[0].split(",", 1)[1])
                     == reference.read_bytes()
                 )
             fail_image = split and iteration == 2
-            for sender, receiver in zip(roles, roles[1:]):
+            active_roles = [
+                role for role in roles if image_path or role != RoleType.IMAGE_ENCODER
+            ]
+            for sender, receiver in zip(active_roles, active_roles[1:]):
                 if sender == RoleType.IMAGE_ENCODER and fail_image:
                     result[sender].send_multipart(
                         encode_transfer_msg(
@@ -130,7 +134,7 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated):
                             request_id=request_id,
                             data_size=64,
                             manifest={"payload": sender.value},
-                            scalar_fields={"seed": 42},
+                            scalar_fields={"seed": 42, "image_path": image_path},
                         )
                     )
                 )

@@ -31,6 +31,10 @@ Disaggregation is controlled by a single flag: `--disagg-role`. Each component i
       <td>All stages with the default <code>RoleType.ENCODER</code> affinity: <code>InputValidationStage</code>, <code>TextEncodingStage</code> (plus <code>ImageEncodingStage</code> / <code>ImageVAEEncodingStage</code> for image-conditioned pipelines), <code>LatentPreparationStage</code>, <code>TimestepPreparationStage</code>, and any model-specific "before denoising" stage (e.g. <code>QwenImageLayeredBeforeDenoisingStage</code>, <code>GlmImageBeforeDenoisingStage</code>).</td>
     </tr>
     <tr>
+      <td><code>prompt_encoder</code> / <code>image_encoder</code></td>
+      <td>Separate text and reference-image encoding stages (currently FLUX.3 Image).</td>
+    </tr>
+    <tr>
       <td><code>denoiser</code></td>
       <td><code>DenoisingStage</code> (and its subclasses: <code>CausalDMDDenoisingStage</code>, <code>DmdDenoisingStage</code>, <code>LTX2AVDenoisingStage</code>, <code>LTX2RefinementStage</code>, <code>Hunyuan3DShapeDenoisingStage</code>, ...) — the DiT forward loop plus the scheduler stepping it drives.</td>
     </tr>
@@ -45,7 +49,7 @@ Disaggregation is controlled by a single flag: `--disagg-role`. Each component i
   </tbody>
 </table>
 
-> Each stage declares its role via the `role_affinity` property on `PipelineStage` (default `ENCODER`). When `--disagg-role` is not `monolithic`, the pipeline only instantiates stages whose affinity matches, so the above table is the source of truth for what actually runs in each process.
+> Each stage declares its role via the `role_affinity` property on `PipelineStage` (default `ENCODER`). Non-monolithic pipelines only instantiate matching stages. The combined `encoder` role also includes stages with `PROMPT_ENCODER` or `IMAGE_ENCODER` affinity.
 
 ### Single-Machine Example (Verified)
 
@@ -153,7 +157,7 @@ HTTP head -> prompt_encoder -> image_encoder -> denoiser -> decoder -> HTTP head
 The prompt encoder loads only the text encoder. The image encoder loads only
 the VAE for reference-image encoding; the decoder has its own VAE instance.
 The denoiser loads only the DiT and creates noise from the request seed locally.
-T2I follows the same route, but the image encoder skips VAE computation.
+T2I bypasses the image encoder and goes directly from prompt encoder to denoiser.
 Stages within one request run sequentially; different requests can occupy
 different worker pools concurrently. This is not a latency optimization for a
 single request: separation adds transfers and allows independent placement and
@@ -164,6 +168,9 @@ Each host currently needs a complete package on disk, even though a worker
 loads only its own components into memory. Follow the
 [FLUX.3 cookbook](/cookbook/diffusion/FLUX/FLUX.3) for model access and licensing.
 Install the transfer dependencies described below on every worker.
+For long prompts, increase `--disagg-transfer-pool-size` on the encoding and
+denoising workers to cover their largest incoming/outgoing tensors, as well as
+reserved receive slots; for example, `1073741824` reserves a 1 GiB pool.
 
 For a Linux NVIDIA deployment with four GPUs, start the workers in one shell:
 

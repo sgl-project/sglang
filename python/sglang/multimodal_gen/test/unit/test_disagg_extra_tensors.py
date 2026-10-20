@@ -31,7 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 @pytest.mark.parametrize("flow_map", [False, True])
 def test_flux3_encoding_survives_each_transfer_hop(edit, flow_map):
     """Preserve nested embeddings, reference coordinates, crop, and sampling type."""
-    params = Flux3ImageSamplingParams(flux3_mode="i2i" if edit else None)
+    params = Flux3ImageSamplingParams(
+        flux3_mode="i2i" if edit else None, guidance_scale=1.0
+    )
     params._explicit_fields = {"width"} if edit else set()
     req = Req(request_id="flux3-transfer", prompt="test", sampling_params=params)
     params.apply_request_extra(req)
@@ -53,6 +55,7 @@ def test_flux3_encoding_survives_each_transfer_hop(edit, flow_map):
         req = SchedulerDisaggMixin._build_disagg_req(scheduler, scalars, received)
         assert type(req.sampling_params) is Flux3ImageSamplingParams
         assert req.flux3_mode == params.flux3_mode
+        assert req.guidance_scale == 1.0
         assert req.sampling_params._explicit_fields == params._explicit_fields
         torch.testing.assert_close(req.extra["flux3_text"], text, atol=0, rtol=0)
         torch.testing.assert_close(

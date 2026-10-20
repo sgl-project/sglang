@@ -561,22 +561,23 @@ def launch_disagg_server(server_args: ServerArgs):
 
     frontend_endpoint = f"tcp://{host}:{base_port}"
 
-    logger.info(
-        "Starting DiffusionServer: %d encoder(s), %d denoiser(s), %d decoder(s)",
-        len(encoder_work_endpoints),
-        len(denoiser_work_endpoints),
-        len(decoder_work_endpoints),
-    )
-    logger.info("  Frontend: %s", frontend_endpoint)
-    logger.info("  Encoder work endpoints: %s", encoder_work_endpoints)
-    logger.info("  Denoiser work endpoints: %s", denoiser_work_endpoints)
-    logger.info("  Decoder work endpoints: %s", decoder_work_endpoints)
-    logger.info(
-        "  Result endpoints: encoder=%s, denoiser=%s, decoder=%s",
-        encoder_result_ep,
-        denoiser_result_ep,
-        decoder_result_ep,
-    )
+    logger.info("Starting DiffusionServer: frontend=%s", frontend_endpoint)
+    for role, endpoints in (
+        (RoleType.ENCODER, encoder_work_endpoints),
+        (RoleType.PROMPT_ENCODER, parse_url_string(server_args.prompt_encoder_urls)),
+        (RoleType.IMAGE_ENCODER, parse_url_string(server_args.image_encoder_urls)),
+        (RoleType.DENOISER, denoiser_work_endpoints),
+        (RoleType.DECODER, decoder_work_endpoints),
+    ):
+        if endpoints:
+            offset = ServerArgs.DISAGG_RESULT_PORT_OFFSETS[role]
+            logger.info(
+                "  %s: work=%s result=tcp://%s:%d",
+                role.value,
+                endpoints,
+                host,
+                base_port + offset,
+            )
 
     denoiser_options = (
         {"denoiser_capacity_per_worker": 1} if glm_distributed_mode_enabled else {}

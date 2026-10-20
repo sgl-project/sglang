@@ -165,9 +165,6 @@ _SAMPLING_PARAMS_EXCLUDE_FIELDS = frozenset(
     }
 )
 
-# Receivers reconstruct base SamplingParams, so only base defaults can be omitted.
-_BASE_SAMPLING_PARAM_FIELDS = {f.name: f for f in dataclasses.fields(SamplingParams)}
-
 
 def _is_tensor_like(value) -> bool:
     if isinstance(value, torch.Tensor):
@@ -297,12 +294,8 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
 
     sp = getattr(req, "sampling_params", None)
     if sp is not None:
-        # Forward every non-default, JSON-safe SamplingParams field, not a
-        # narrow whitelist. Previously only a handful of fields were carried
-        # across roles, which silently dropped per-request config like
-        # Qwen-Image's true_cfg_scale (and any future feature added to
-        # SamplingParams). Using a field-walk keeps the disagg boundary
-        # feature-complete without needing to edit this list.
+        # Preserve request values even when they equal a base-class default:
+        # receivers use the model's sampling subclass, whose defaults can differ.
         for f in dataclasses.fields(sp):
             name = f.name
             if name in _SAMPLING_PARAMS_EXCLUDE_FIELDS:
@@ -313,9 +306,6 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
                 continue
             value = getattr(sp, name, None)
             if value is None:
-                continue
-            base_field = _BASE_SAMPLING_PARAM_FIELDS.get(name)
-            if base_field is not None and _is_default(value, base_field):
                 continue
             try:
                 scalar_fields[name] = _to_json_serializable(value)
@@ -1499,7 +1489,7 @@ class SchedulerDisaggMixin:
         Note: Scheduler timestep init is done in _handle_transfer_ready
         to overlap with tensor loading.
         """
-        # Run denoising
+        # Run this role's stages.
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
             result = self.worker.execute_forward([req], return_req=True)
@@ -1527,7 +1517,7 @@ class SchedulerDisaggMixin:
         if staged is None:
             done_msg = TransferDoneMsg(
                 request_id=request_id,
-                error="Failed to stage denoiser output for decoder",
+                error=f"Failed to stage {self._disagg_role.value} output",
             )
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
@@ -1561,7 +1551,8 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_complete(request_id)
 
         logger.debug(
-            "Transfer DENOISER: processed %s in %.2f s, staged for decoder",
+            "Transfer %s: processed %s in %.2f s, staged for the next role",
+            self._disagg_role.value,
             request_id,
             duration_s,
         )

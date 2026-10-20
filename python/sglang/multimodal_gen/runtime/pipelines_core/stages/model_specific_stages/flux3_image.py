@@ -558,6 +558,8 @@ class Flux3ImageTextEncodeStage(PipelineStage):
             batch.extra["flux3_text"] = encoded[
                 index * branches : (index + 1) * branches
             ]
+            if not batch.image_path:
+                batch.extra.update(flux3_condition=None, flux3_crop=None)
         return batches
 
 

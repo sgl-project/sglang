@@ -55,8 +55,7 @@ class DisaggServerArgsMixin:
             offset = self.DISAGG_RESULT_PORT_OFFSETS[role]
         except KeyError as exc:
             raise ValueError(
-                "pool result endpoints are only defined for encoder, denoiser, "
-                f"and decoder roles, got {role.value!r}"
+                f"pool result endpoints are only defined for worker roles, got {role.value!r}"
             ) from exc
         return format_tcp_endpoint(host, base_port + offset, "pool_result_endpoint")
 

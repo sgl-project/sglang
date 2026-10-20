@@ -209,12 +209,6 @@ class DiffusionServer:
             encoder_work_endpoints = prompt_encoder_work_endpoints
             encoder_result_endpoint = prompt_encoder_result_endpoint
         self._frontend_endpoint = frontend_endpoint
-        self._encoder_work_endpoints = encoder_work_endpoints
-        self._denoiser_work_endpoints = denoiser_work_endpoints
-        self._decoder_work_endpoints = decoder_work_endpoints
-        self._encoder_result_endpoint = encoder_result_endpoint
-        self._denoiser_result_endpoint = denoiser_result_endpoint
-        self._decoder_result_endpoint = decoder_result_endpoint
 
         self._num_encoders = len(encoder_work_endpoints)
         self._num_denoisers = len(denoiser_work_endpoints)
@@ -282,17 +276,6 @@ class DiffusionServer:
         self._encoder_peers: dict[int, dict] = {}
         self._denoiser_peers: dict[int, dict] = {}
         self._decoder_peers: dict[int, dict] = {}
-
-        # work_endpoint -> index lookup tables, built from the --*-urls args
-        self._encoder_endpoint_to_idx = {
-            ep: i for i, ep in enumerate(encoder_work_endpoints)
-        }
-        self._denoiser_endpoint_to_idx = {
-            ep: i for i, ep in enumerate(denoiser_work_endpoints)
-        }
-        self._decoder_endpoint_to_idx = {
-            ep: i for i, ep in enumerate(decoder_work_endpoints)
-        }
 
         # Split encoding adds one hop to the existing bounded transfer pipeline.
         self._input_role = (
@@ -619,7 +602,9 @@ class DiffusionServer:
         if self._input_role == RoleType.PROMPT_ENCODER and req.image_path:
             # HTTP uploads belong to the head's filesystem, not the GPU workers'.
             paths = (
-                req.image_path if isinstance(req.image_path, list) else [req.image_path]
+                req.image_path
+                if isinstance(req.image_path, (list, tuple))
+                else [req.image_path]
             )
             try:
                 req.image_path = [
@@ -985,12 +970,6 @@ class DiffusionServer:
                 continue
             self._dispatch_to_encoder(entry.request_id, entry.payload, idx)
 
-    def _drain_denoiser_tta(self) -> None:
-        self._drain_transfer_queue(RoleType.DENOISER)
-
-    def _drain_decoder_tta(self) -> None:
-        self._drain_transfer_queue(RoleType.DECODER)
-
     def _drain_transfer_queue(self, role: RoleType) -> None:
         pool = self._pools[role]
         while pool.queue:
@@ -1202,6 +1181,10 @@ class DiffusionServer:
         if old_transfer is not None:
             self._recycle_prealloc_slot(old_transfer, role)
         next_role = self._role_order[self._role_order.index(role) + 1]
+        if role == RoleType.PROMPT_ENCODER and not msg.get("scalar_fields", {}).get(
+            "image_path"
+        ):
+            next_role = RoleType.DENOISER
 
         p2p = _TransferRequestState(
             sender_role=role,
@@ -1502,6 +1485,15 @@ class DiffusionServer:
             "num_encoders": self._num_encoders,
             "num_denoisers": self._num_denoisers,
             "num_decoders": self._num_decoders,
+            "worker_pools": {
+                role.value: {
+                    "instances": len(pool.endpoints),
+                    "free_slots": list(pool.free_slots),
+                    "queue_depth": len(pool.queue),
+                    "registered_peers": len(pool.peers),
+                }
+                for role, pool in self._pools.items()
+            },
             "pending_requests": pending_count,
             "dispatch_policy": type(self._dispatcher.encoder_policy).__name__,
             "encoder_free_slots": list(self._encoder_free_slots),

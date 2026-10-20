@@ -52,6 +52,10 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
     sampling_params_cls = Flux3ImageSamplingParams
     _required_config_modules: list[str] = []
 
+    def validate_disagg_role(self, role: RoleType) -> None:
+        if role not in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+            super().validate_disagg_role(role)
+
     def _reject_lora_on_packed_weights(self) -> None:
         super()._reject_lora_on_packed_weights()
         if "transformer" not in self.modules or flux3_prims_ts_supports_lora():

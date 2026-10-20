@@ -271,7 +271,10 @@ class ComposedPipelineBase(ABC):
 
     def validate_disagg_role(self, role: RoleType) -> None:
         """Validate whether the requested disaggregation role is supported."""
-        return
+        if role in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+            raise ValueError(
+                f"{self.pipeline_name} does not support separate prompt/image encoder roles"
+            )
 
     def _get_extra_allowed_modules_for_role(
         self, role: RoleType, task_name: str
