@@ -214,7 +214,11 @@ class TestNvFp4MoeDispatch(CustomTestCase):
 
         def routed_result(kwargs):
             self.assertEqual(kwargs["routing_method_type"], RoutingMethodType.TopK)
-            seen_ids, seen_weights = kwargs["topk_ids"]
+            routing = kwargs["topk_ids"]
+            if isinstance(routing, tuple):
+                seen_ids, seen_weights = routing
+            else:
+                seen_ids, seen_weights = routing, kwargs["topk_weights"]
             torch.testing.assert_close(seen_ids, ids)
             torch.testing.assert_close(seen_weights, weights)
             return (

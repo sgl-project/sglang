@@ -1,4 +1,6 @@
 import sys
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -72,6 +74,11 @@ class TestLayerRunnerDispatch(CustomTestCase):
             get_parallel().override(
                 tp_size=2,
                 tp_rank=1,
+                tp_group=None,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
                 attn_tp_size=2,
                 attn_tp_rank=1,
                 moe_ep_size=2,
@@ -520,6 +527,112 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 )
                 self.assertEqual(
                     topk.topk_config.output_format, TopKOutputFormat.STANDARD
+                )
+
+    def test_materialized_softmax_and_custom_routes_fold_scale_once(self):
+        """Materializers scale routed weights once while keeping shared weights unchanged."""
+        logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
+        hidden = torch.ones((1, 4))
+
+        def cpu_router(hidden_states, gating_output, topk, renormalize, **kwargs):
+            return topk_module.fused_topk_torch_native(
+                hidden_states, gating_output, topk, renormalize
+            )
+
+        def custom_router(**kwargs):
+            ids = [3, 1] + ([4] if kwargs["topk"] == 3 else [])
+            weights = [0.25, 0.75] + ([1.0] if kwargs["topk"] == 3 else [])
+            return torch.tensor([weights]), torch.tensor([ids], dtype=torch.int32)
+
+        for custom, shared in ((None, 0), (custom_router, 0), (custom_router, 1)):
+            with (
+                self.subTest(custom=custom is not None, shared=shared),
+                get_model().override(
+                    shared_experts=SharedExpertsConfig(num_fused_shared_experts=shared)
+                ),
+                patch.object(topk_module, "fused_topk", side_effect=cpu_router),
+            ):
+                topk = TopK(
+                    top_k=2,
+                    layer_id=0,
+                    custom_routing_function=custom,
+                    routed_scaling_factor=2.5,
+                    apply_routed_scaling_factor_on_output=True,
+                    allow_routed_experts_capture=False,
+                )
+                topk.bind_runner_backend(MoeRunnerBackend.FLASHINFER_TRTLLM)
+                output = topk.forward_cuda(hidden, logits)
+                expected = (
+                    torch.softmax(logits[:, :2], dim=-1)
+                    if custom is None
+                    else torch.tensor([[0.25, 0.75]])
+                ) * 2.5
+                torch.testing.assert_close(output.topk_weights[:, :2], expected)
+                if shared:
+                    self.assertEqual(output.topk_weights[0, 2].item(), 1.0)
+
+    def test_model_constructors_preserve_materialized_routed_scale(self):
+        """Bailing and normal LLaDA2 routing must retain scale when AUTO selects an FP4 kernel."""
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+        from sglang.srt.models import bailing_moe, bailing_moe_linear, llada2
+
+        logits = torch.tensor([[2.0, 1.0, 0.0, -1.0]])
+
+        def cpu_router(hidden_states, gating_output, topk, renormalize, **kwargs):
+            return topk_module.fused_topk_torch_native(
+                hidden_states, gating_output, topk, renormalize
+            )
+
+        cases = (
+            (bailing_moe, bailing_moe.BailingMoESparseMoeBlock, None),
+            (bailing_moe_linear, bailing_moe_linear.BailingMoE, 0),
+            (llada2, llada2.LLaDA2MoeSparseMoeBlock, None),
+        )
+        for module, block_type, shared in cases:
+            config = SimpleNamespace(
+                num_experts_per_tok=2,
+                norm_topk_prob=True,
+                hidden_size=4,
+                moe_intermediate_size=96,
+                num_experts=4,
+                num_shared_experts=shared,
+                hidden_act="silu",
+                routed_scaling_factor=2.5,
+                score_function="softmax",
+                router_dtype="fp32",
+            )
+            method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+            with (
+                self.subTest(model=block_type.__name__),
+                get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
+                patch.object(method, "create_weights"),
+                patch.object(
+                    module,
+                    "get_moe_impl_class",
+                    return_value=partial(FusedMoE, quant_method=method),
+                ),
+                patch(
+                    "sglang.srt.layers.quantization.modelopt_quant.is_cuda",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
+                    return_value=(10, 0),
+                ),
+                patch.object(llada2, "_is_npu", False),
+                patch.object(topk_module, "fused_topk", side_effect=cpu_router),
+            ):
+                block = block_type(config=config, layer_id=0)
+                self.assertEqual(
+                    block.experts.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM
+                )
+                output = block.topk.forward_cuda(torch.ones((1, 4)), logits)
+                self.assertEqual(output.format, TopKOutputFormat.STANDARD)
+                torch.testing.assert_close(
+                    output.topk_weights,
+                    torch.softmax(logits[:, :2], dim=-1) * 2.5,
                 )
 
     def test_router_rebinding_rejects_conflicting_contract_before_mutation(self):

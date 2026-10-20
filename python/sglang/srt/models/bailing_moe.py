@@ -310,6 +310,9 @@ class BailingMoESparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
         self.topk.bind_runner_backend(self.experts.runner_backend)
         # shared expert
         if config.num_shared_experts is not None:
