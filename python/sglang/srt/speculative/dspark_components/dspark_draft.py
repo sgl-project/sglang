@@ -164,6 +164,9 @@ def resolve_draft_params(
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
+# Arbitrary; how often the proposer logs its restage-skip count, in graph steps.
+STAGED_PARAMS_LOG_EVERY = 500
+
 # XORed into the server seed so the draft noise differs from other samplers'.
 _DRAFT_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
 
@@ -317,6 +320,11 @@ def sample_draft_block(
 
 
 class DraftBlockProposer:
+    _staged_params_key = None
+    num_staged_params_skips = 0
+    num_staged_params_calls = 0
+    deferred_commit = None
+
     def __init__(
         self,
         *,
@@ -350,6 +358,11 @@ class DraftBlockProposer:
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        # (sampler, bs, temperatures, top_ks) last staged: SamplingBatchInfo rebinds
+        # these tensors when the batch changes, never edits them in place
+        self._staged_params_key: Optional[tuple] = None
+        self.num_staged_params_skips = 0
+        self.num_staged_params_calls = 0
         self._num_token_non_padded = (
             torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
             if enable_num_token_non_padded()
@@ -362,6 +375,34 @@ class DraftBlockProposer:
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
+        """The draft graph's sampling params, restaged only when the sampler, bs or
+        the batch's temperature / top-k tensors changed since the last stage."""
+        key = (
+            draft_sampler,
+            bs,
+            None if sampling_info is None else sampling_info.temperatures,
+            None if sampling_info is None else sampling_info.top_ks,
+        )
+        staged = self._staged_params_key
+        self.num_staged_params_calls += 1
+        skip = (
+            staged is not None
+            and staged[1] == bs
+            and all(staged[i] is key[i] for i in (0, 2, 3))
+        )
+        self.num_staged_params_skips += skip
+        if self.num_staged_params_calls % STAGED_PARAMS_LOG_EVERY == 0:
+            logger.debug(
+                "DSpark draft: sampling params restage skipped on %d of %d steps",
+                self.num_staged_params_skips,
+                self.num_staged_params_calls,
+            )
+        if skip:
+            return
+        draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        self._staged_params_key = key
 
     def _base_logits_context(self):
         return draft_tp_context(self._dp_moe_sync)
@@ -559,7 +600,9 @@ class DraftBlockProposer:
             and graph_runner is not None
             and graph_runner.can_run_graph(draft_forward_batch)
         ):
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+            self._stage_sampling_params(
+                draft_sampler, bs=bs, sampling_info=sampling_info
+            )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
