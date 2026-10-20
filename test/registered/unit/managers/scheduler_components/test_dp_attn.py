@@ -507,10 +507,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner.can_replay_locally.assert_called_once()
         self.assertTrue(runner.can_replay_locally.call_args.kwargs["is_mixed"])
 
-    def test_batch_over_captured_metadata_bound_votes_eager(self):
-        """An extend or mixed batch over the captured attention metadata's
-        request bound votes eager, so no dp rank replays while another falls
-        back at forward time."""
+    def _bounded_metadata_vote(self, *, fallback):
         runner_cls = dp_attn.PrefillCudaGraphRunner
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
@@ -520,7 +517,13 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner._backend_vote_prefill_cuda_graph = None
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2
-        runner._captured_attn_metadata_fallback = False
+        runner._captured_attn_metadata_bucket_max_bs = lambda num_tokens: 2
+        runner._captured_attn_metadata_fallback = fallback
+        runner._buckets_without_captured_attn_metadata = frozenset()
+        runner._capture_chunked_prefix = False
+        runner._captured_attn_metadata_fits.side_effect = lambda **kwargs: (
+            runner_cls._captured_attn_metadata_fits(runner, **kwargs)
+        )
         runner.prefer_eager_mixed_prefill = False
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = False
@@ -553,11 +556,33 @@ class TestPrefillCudaGraphVote(CustomTestCase):
                 model_config=object(),
             )
 
+        return runner, vote
+
+    def test_batch_over_captured_metadata_bound_votes_eager(self):
+        """An extend or mixed batch over the captured attention metadata's
+        request bound votes eager, so no dp rank replays while another falls
+        back at forward time."""
+        _, vote = self._bounded_metadata_vote(fallback=False)
         # Mixed batches (--enable-mixed-chunk) count their decode rows too.
         for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             with self.subTest(mode=mode):
                 self.assertTrue(vote(mode, batch_size=2))
                 self.assertFalse(vote(mode, batch_size=3))
+
+    def test_batch_over_captured_metadata_bound_replays_eager_metadata(self):
+        """A batch over the bound keeps the graph if an eager-metadata variant exists;
+        it replays that variant, never the captured-metadata tables."""
+        runner, vote = self._bounded_metadata_vote(fallback=True)
+        shape_key = dp_attn.PrefillCudaGraphRunner._shape_key
+        for batch_size, variant in ((2, None), (3, "eager_metadata")):
+            with self.subTest(batch_size=batch_size):
+                self.assertTrue(vote(ForwardMode.EXTEND, batch_size=batch_size))
+                key = shape_key(
+                    runner,
+                    num_tokens=48,
+                    forward_batch=SimpleNamespace(batch_size=batch_size),
+                )
+                self.assertEqual(key.variant_label, variant)
 
     @patch.object(dp_attn, "get_parallel")
     @patch.object(dp_attn, "exchange_sync_rows")
