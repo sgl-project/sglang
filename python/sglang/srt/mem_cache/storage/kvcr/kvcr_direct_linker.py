@@ -244,7 +244,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                             self._runtime = error.kvcr_runtime
                         self._fatal = error
                         for batch in self._batches:
-                            self._fail_batch(batch, error)
+                            self._fail_batch(batch, error, fatal=True)
                     future.set_exception(error)
             if self._fatal is None and not self._closed:
                 try:
@@ -253,7 +253,7 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self._fatal = error
                     for batch in self._batches:
-                        self._fail_batch(batch, error)
+                        self._fail_batch(batch, error, fatal=True)
                     logger.exception(
                         "KVCR owner failed; retaining transfer ownership until close"
                     )
@@ -525,11 +525,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         prepared = self.layout.prepare(list(transfers), allow_partial=True)
         return self.layout.mappings(prepared)
 
-    def _fail_batch(self, batch, error):
+    def _fail_batch(self, batch, error, *, fatal=False):
         batch.error = error
         batch.exhausted = True
         batch.work = None
         self.layer_done_counter.fail(batch.index, error)
+        if fatal and not batch.completion.done():
+            # Unblock the scheduler with a fatal error, not a reusable failed
+            # load. Native registrations and private slots remain retained.
+            batch.completion.set_exception(error)
 
     def _progress(self):
         results = list(self._runtime.client.poll_completed())
