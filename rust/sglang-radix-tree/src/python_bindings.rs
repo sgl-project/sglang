@@ -179,7 +179,7 @@ fn cache_action_tag(action: &CacheAction) -> &'static str {
         CacheAction::FreeDeviceKV(_) => "free_device_kv",
         CacheAction::FreeDeviceKVFullOnly(_) => "free_device_kv_full_only",
         CacheAction::BackupKV(_) => "backup_kv",
-        CacheAction::ReplaceWriteThroughOnNodeSplit { .. } => "replace_write_through_on_node_split",
+        CacheAction::UpdatePendingBackupOnNodeSplit { .. } => "update_pending_backup_on_node_split",
         CacheAction::MambaEvictExcessPathStates { .. } => "mamba_evict_excess_path_states",
         CacheAction::FreeComponentDeviceSlot { .. } => "free_component_device_slot",
         CacheAction::FreeComponentHostSlot { .. } => "free_component_host_slot",
@@ -202,7 +202,7 @@ fn cache_action_to_py(py: Python<'_>, action: CacheAction) -> PyResult<Py<PyAny>
             (tag, tensors).into_py_any(py)
         }
         CacheAction::BackupKV(backup) => (tag, backup.node_ids).into_py_any(py),
-        CacheAction::ReplaceWriteThroughOnNodeSplit {
+        CacheAction::UpdatePendingBackupOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,

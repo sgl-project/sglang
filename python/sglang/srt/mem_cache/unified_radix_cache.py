@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
@@ -1348,19 +1348,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
-            self.components[action.component_type].apply_component_action(action)
-        elif isinstance(action, ReplaceWriteThroughOnNodeSplit):
-            self._replace_pending_write_through_node(
-                action.ack_id,
-                action.old_node_id,
-                [action.new_node_id, action.new_child_node_id],
-            )
-            if self.linker is not None:
-                self.linker.replace_pending_offload_node(
-                    action.ack_id,
-                    action.old_node_id,
-                    [action.new_node_id, action.new_child_node_id],
+            if (
+                isinstance(action, UpdatePendingBackupOnNodeSplit)
+                and action.ack_id is not None
+            ):
+                node_ids = [action.new_node_id, action.new_child_node_id]
+                self._replace_pending_write_through_node(
+                    action.ack_id, action.old_node_id, node_ids
                 )
+                if self.linker is not None:
+                    self.linker.replace_pending_offload_node(
+                        action.ack_id, action.old_node_id, node_ids
+                    )
+            self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:

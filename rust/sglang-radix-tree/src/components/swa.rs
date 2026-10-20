@@ -57,6 +57,7 @@ impl SwaComponent {
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         leaf_id: NodeIdx_,
+        cache_actions: &mut Vec<CacheAction>,
     ) -> Option<NodeIdx_> {
         let leaf = tree_core.arena.node(leaf_id);
         if leaf.is_root() || leaf.device_lock_ref(SWA) > 0 {
@@ -79,9 +80,18 @@ impl SwaComponent {
 
         let (new_parent, action) = tree_core.split_node_(leaf_id, split_at);
         assert!(
-            action.is_none(),
+            !matches!(
+                action,
+                Some(CacheAction::UpdatePendingBackupOnNodeSplit {
+                    ack_id: Some(_),
+                    ..
+                })
+            ),
             "fresh SWA leaf cannot be write-through-pending"
         );
+        if let Some(action) = action {
+            cache_actions.push(action);
+        }
         Some(new_parent)
     }
 
@@ -587,14 +597,16 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
                 // Node straddles the boundary: split into an out-of-window parent
                 // (tombstone) and an in-window child; `node` becomes the child.
                 let (_, action) = tree_core.split_node_(node_id, split_pos);
-                assert!(action.is_none(), "new leaf cannot be write-through-pending");
+                if let Some(action) = action {
+                    cache_actions.push(action);
+                }
             }
         }
         result.record_adopted_range(SWA, node_start.max(params.swa_evicted_seqlen), node_end);
         // Cap the in-window leaf at one window for lock granularity, then rebuild SWA
         // onto the in-window node(s) at apply time; rebuild the older prefix first so
         // the in-window tail lands more-MRU.
-        let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id);
+        let capped_parent = self.maybe_split_leaf_for_swa_lock_(tree_core, node_id, cache_actions);
         if let Some(capped_parent) = capped_parent {
             cache_actions.push(CacheAction::SwaRebuild {
                 node_id: tree_core.arena.node(capped_parent).id,

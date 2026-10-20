@@ -18,7 +18,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceSlot
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    FreeComponentDeviceSlot,
+    UpdatePendingBackupOnNodeSplit,
+)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
     ComponentType,
@@ -527,7 +530,10 @@ class FullComponent(TreeComponent):
             self.cache.host_pool_group.free(host_value, pool=PoolName.KV)
 
     def apply_component_action(self, action: ComponentAction) -> None:
-        if isinstance(action, FreeComponentDeviceSlot):
+        if isinstance(action, UpdatePendingBackupOnNodeSplit):
+            # Custom FULL components track buffer-write dependencies.
+            pass
+        elif isinstance(action, FreeComponentDeviceSlot):
             alloc = self.cache.token_to_kv_pool_allocator
             for indices in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
@@ -535,7 +541,7 @@ class FullComponent(TreeComponent):
                     alloc.full_attn_allocator.free_segment(indices, start_pos=0)
                 else:
                     alloc.free_segment(indices, start_pos=0)
-            return
-        raise AssertionError(
-            f"FullComponent: unhandled ComponentAction {type(action).__name__}"
-        )
+        else:
+            raise AssertionError(
+                f"FullComponent: unhandled ComponentAction {type(action).__name__}"
+            )
