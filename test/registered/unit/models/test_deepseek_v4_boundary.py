@@ -250,5 +250,105 @@ class TestMoeSourceRows(unittest.TestCase):
         interleave.assert_called_once()
 
 
+class TestEpMoeOutputSum(unittest.TestCase):
+    """Only FlashInfer MegaMoE opts out of leaving its output sum."""
+
+    @staticmethod
+    def _ep_exit(mlp, batch, hidden_states):
+        from sglang.srt.layers.layer_boundary.row_transport import TransportExit
+
+        layout = Layout.sharded_over(axis_sizes={})
+        layer = SimpleNamespace(
+            boundary_mhc_fusions=False,
+            mlp=mlp,
+            config=SimpleNamespace(model_type="deepseek_v4"),
+        )
+        transport = boundary.MoeTransport(
+            layer,
+            hidden_states,
+            batch,
+            boundary.LayerCall(),
+            TransportRows(layout, layout, layout, None),
+        )
+        # The real finish() checks, without a residual stream to publish to.
+        exit = object.__new__(TransportExit)
+        exit.invocation, exit.used = transport, False
+        exit.path = SimpleNamespace(exit=SimpleNamespace(writes_residual=True))
+        exit.publish = lambda _exit, value: value
+        return transport, exit
+
+    def test_flashinfer_megamoe_completes_output(self):
+        self._check_decoder_output("flashinfer_megamoe")
+
+    def test_deepgemm_fallback_still_leaves_output_sum(self):
+        # Preserve upstream behavior; fixing fallback reduction is separate.
+        self._check_decoder_output("megamoe")
+
+    def _check_decoder_output(self, backend_name):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.models import deepseek_v4
+        from sglang.srt.models.deepseek_v2 import MoEOutput
+
+        leave_sum_calls = []
+
+        def mlp(hidden_states, forward_batch, *, leave_output_sum, **kwargs):
+            leave_sum_calls.append(leave_output_sum)
+            # The normal MoE path: pieces when asked to leave its sum.
+            routed = hidden_states * 2
+            if leave_output_sum:
+                return MoEOutput(routed, None, None, 1.0, False)
+            return routed
+
+        backend = MoeA2ABackend(backend_name)
+        batch = SimpleNamespace(dp_padding_mode=None)
+        hidden_states = torch.ones(2, 3)
+        with (
+            patch.object(deepseek_v4, "get_moe_a2a_backend", return_value=backend),
+            patch.object(moe_transport, "get_moe_a2a_backend", return_value=backend),
+            patch.object(boundary, "get_moe_a2a_backend", return_value=backend),
+            patch.object(
+                deepseek_v4.residual_batch,
+                "written_residual",
+                return_value=SimpleNamespace(quantized=None),
+            ),
+        ):
+            transport, exit = self._ep_exit(mlp, batch, hidden_states)
+            layer = SimpleNamespace(
+                attn_boundary=SimpleNamespace(
+                    prepare=lambda value, batch, read_context: value,
+                    finish=lambda value, batch: value,
+                ),
+                self_attn=SimpleNamespace(
+                    maybe_use_decode_attn_tp=lambda batch: nullcontext()
+                ),
+                _run_boundary_attention=lambda value, *args: value,
+                ffn_boundary=SimpleNamespace(
+                    prepare=lambda value, batch, read_context: value,
+                    transport_context=lambda batch: transport,
+                    exit=lambda batch: nullcontext(exit),
+                ),
+                mlp=mlp,
+            )
+            if backend.is_megamoe():
+                with self.assertRaisesRegex(ValueError, "undeclared sum group"):
+                    deepseek_v4.DeepseekV4CudaDecoderLayer.forward(
+                        layer, None, hidden_states, None, batch, None
+                    )
+                self.assertEqual(leave_sum_calls, [True])
+                return
+
+            output = deepseek_v4.DeepseekV4CudaDecoderLayer.forward(
+                layer, None, hidden_states, None, batch, None
+            )
+            self.assertEqual(leave_sum_calls, [False])
+            torch.testing.assert_close(output, hidden_states * 2, atol=0, rtol=0)
+
+            # Pieces would leave a sum that the EP rows never declared.
+            _, exit = self._ep_exit(mlp, batch, hidden_states)
+            pieces = MoEOutput(hidden_states, None, None, 1.0, False)
+            with self.assertRaisesRegex(ValueError, "undeclared sum group"):
+                exit.finish(pieces)
+
+
 if __name__ == "__main__":
     unittest.main()

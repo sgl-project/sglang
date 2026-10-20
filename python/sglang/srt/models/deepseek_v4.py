@@ -3459,7 +3459,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
                 input_ids_global=transport.input_ids_global,
                 skip_shared_experts=transport.do_shared_local,
                 return_moe_output=transport.return_moe_output,
-                leave_output_sum=True,
+                # FlashInfer MegaMoE completes the EP sum inside its kernel.
+                leave_output_sum=not get_moe_a2a_backend().is_flashinfer_megamoe(),
             )
             return output.finish(hidden_states)
 
