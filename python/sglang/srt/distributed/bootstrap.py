@@ -124,7 +124,7 @@ def init_parallel_runtime(
     local_omp_cpuid = _bind_threads_if_cpu(device=device)
     # Select the local device before communicator allocation and warmup.
     try:
-        torch.get_device_module(device).set_device(get_device().gpu_id)
+        current_platform.set_device(current_platform.get_device(get_device().gpu_id))
     except Exception:
         logger.warning(
             "Context: device=%s gpu_id=%s CUDA_VISIBLE_DEVICES=%s tp_rank=%s",

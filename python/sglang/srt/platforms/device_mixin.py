@@ -53,6 +53,7 @@ class PlatformEnum(enum.Enum):
     NPU = enum.auto()
     TPU = enum.auto()
     MPS = enum.auto()
+    HPU = enum.auto()
     OOT = enum.auto()  # Out-of-tree (external plugin)
     UNSPECIFIED = enum.auto()
 
@@ -171,6 +172,32 @@ class DeviceMixin:
         """[Active] Temporarily remap a physical device to logical device 0."""
         yield device_id
 
+    # ---- Device and stream state ----
+
+    def get_device(self, device_id: int = 0) -> "torch.device":
+        """[Active] Return ``torch.device`` for the given device id."""
+        return torch.device(self.device_type, device_id)
+
+    def set_device(self, device: "torch.device") -> None:
+        """[Active] Set the current device."""
+        torch.get_device_module(self.device_type).set_device(device)
+
+    def current_device(self) -> int:
+        """[Active] Index of the current device."""
+        return torch.get_device_module(self.device_type).current_device()
+
+    def current_stream(self, device=None):
+        """[Active] The current stream on ``device`` (default: the current device)."""
+        return torch.get_device_module(self.device_type).current_stream(device)
+
+    def synchronize(self) -> None:
+        """[Active] Wait for all work queued on the current device."""
+        torch.get_device_module(self.device_type).synchronize()
+
+    def empty_cache(self) -> None:
+        """[Active] Release cached device memory. No-op for CPU-like platforms."""
+        pass
+
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded
     # calls (e.g. torch.cuda.*).  OOT implementations will NOT take
@@ -178,14 +205,6 @@ class DeviceMixin:
     # ------------------------------------------------------------------
 
     # ---- Device management ----
-
-    def get_device(self, device_id: int = 0) -> str:
-        """[Planned] Return ``torch.device`` for the given device id."""
-        raise NotImplementedError
-
-    def set_device(self, device: "torch.device") -> None:
-        """[Planned] Set the current device."""
-        raise NotImplementedError
 
     def get_device_name(self, device_id: int = 0) -> str:
         """[Planned] Get human-readable device name."""
@@ -198,14 +217,6 @@ class DeviceMixin:
     def get_device_capability(self, device_id: int = 0) -> Optional["DeviceCapability"]:
         """[Planned] Get device compute capability. None if N/A."""
         raise NotImplementedError
-
-    def empty_cache(self) -> None:
-        """[Planned] Release cached device memory. No-op for CPU-like platforms."""
-        pass
-
-    def synchronize(self) -> None:
-        """[Planned] Synchronize device operations. No-op for CPU-like platforms."""
-        pass
 
     # ---- Memory ----
 

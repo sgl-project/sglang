@@ -18,6 +18,7 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -446,9 +447,7 @@ class UnoWorkerV2(BaseSpecWorker):
         draft_state = batch.spec_info
 
         if batch.seq_lens.is_cuda:
-            batch.seq_lens.record_stream(
-                torch.get_device_module(self.device).current_stream()
-            )
+            batch.seq_lens.record_stream(current_platform.current_stream())
 
         batch_size = len(batch.seq_lens)
         committed_seq_lens = batch.seq_lens.clone()
@@ -566,9 +565,7 @@ class UnoWorkerV2(BaseSpecWorker):
             # generic EAGLE path receives an older, already-visible frontier;
             # UNO must explicitly order its freshly derived tensor before the
             # plan stream assigns Q verify cache locations from it.
-            self.plan_stream.wait_stream(
-                torch.get_device_module(self.device).current_stream()
-            )
+            self.plan_stream.wait_stream(current_platform.current_stream())
         eagle_result = run_eagle_verify(
             verify_batch,
             target_worker=self.target_worker,
@@ -628,9 +625,7 @@ class UnoWorkerV2(BaseSpecWorker):
         draft_state = batch.spec_info
 
         if batch.seq_lens.is_cuda:
-            batch.seq_lens.record_stream(
-                torch.get_device_module(self.device).current_stream()
-            )
+            batch.seq_lens.record_stream(current_platform.current_stream())
 
         batch_size = len(batch.seq_lens)
         committed_seq_lens = batch.seq_lens.clone()

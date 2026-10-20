@@ -2461,9 +2461,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        batch.seq_lens.record_stream(current_platform.current_stream())
 
         bs = len(batch.seq_lens)
         device = self.device

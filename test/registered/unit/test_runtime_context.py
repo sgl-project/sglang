@@ -2714,6 +2714,7 @@ class TestTheParallelPhase(CustomTestCase):
             patch.object(bootstrap, "_init_cpu_threads_env"),
             patch.object(bootstrap, "_bind_threads_if_cpu", return_value=None),
             patch.object(bootstrap, "maybe_init_shared_mooncake_transfer_engine"),
+            patch.object(bootstrap, "current_platform"),
         ):
             reset_context()
             self.addCleanup(reset_context)

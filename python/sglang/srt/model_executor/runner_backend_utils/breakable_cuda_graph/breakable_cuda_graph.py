@@ -38,6 +38,7 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 _is_xpu = is_xpu()
@@ -83,7 +84,7 @@ _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
 def get_current_stream(device: torch.device | None = None) -> torch.Stream:
     stream = _current_stream_var.get()
     if stream is None:
-        return get_device_module().current_stream(device)
+        return current_platform.current_stream(device)
     return stream
 
 
@@ -336,7 +337,7 @@ class BreakableCUDAGraph:
         self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
-        stream = get_device_module().current_stream()
+        stream = current_platform.current_stream()
         token = _current_stream_var.set(stream)
         try:
             for i, seg in enumerate(self._segments):
@@ -396,7 +397,7 @@ class BreakableCUDAGraphCapture:
             self._stream_ctx.__enter__()
         self._capture_token = _current_capture_var.set(self)
         self._stream_token = _current_stream_var.set(
-            self._stream or get_device_module().current_stream()
+            self._stream or current_platform.current_stream()
         )
         self._forked_token = _forked_streams_var.set(set())
         self._begin_new_segment()

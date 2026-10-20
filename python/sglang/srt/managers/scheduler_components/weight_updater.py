@@ -44,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils.weight_checker import overall_checksum
 
@@ -376,7 +377,7 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
-        torch.get_device_module().synchronize()
+        current_platform.synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
 

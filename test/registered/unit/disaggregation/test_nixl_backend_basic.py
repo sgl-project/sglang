@@ -150,18 +150,17 @@ class TestNixlBackendInitialization(CustomTestCase):
                 "sglang.srt.disaggregation.nixl.conn.get_parallel",
                 return_value=SimpleNamespace(tp_size=4),
             ),
-            patch(
-                "sglang.srt.disaggregation.nixl.conn.torch.get_device_module",
-                return_value=device_module,
-            ) as get_device_module,
+            patch("sglang.srt.disaggregation.nixl.conn.current_platform") as platform,
             patch.object(NixlKVManager, "register_buffer_to_engine"),
             patch.object(NixlKVManager, "_start_bootstrap_thread"),
             patch.object(NixlKVManager, "_start_decode_listener_thread"),
             patch.object(NixlKVManager, "_start_heartbeat_checker_thread"),
         ):
+            platform.get_device.side_effect = lambda device_id: device_id
+            platform.set_device.side_effect = device_module.set_device
             self.assertIsNone(server_args.device)
             NixlKVManager.__init__(mgr, args, mode, server_args)
-            get_device_module.assert_called_once_with("cuda")
+            platform.get_device.assert_called_once_with(gpu_id)
 
     def test_backend_initialization_selects_device_in_deadline_thread(self):
         caller_thread = threading.get_ident()

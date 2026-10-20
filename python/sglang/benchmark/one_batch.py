@@ -92,6 +92,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_device,
@@ -745,7 +746,7 @@ def correctness_test(
 
 
 def synchronize(device):
-    torch.get_device_module(device).synchronize()
+    current_platform.synchronize()
 
 
 def latency_test_run_once(

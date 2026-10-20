@@ -54,6 +54,12 @@ class XpuDeviceMixin(DeviceMixin):
     def synchronize(self) -> None:
         torch.xpu.synchronize()
 
+    def current_device(self) -> int:
+        return torch.xpu.current_device()
+
+    def current_stream(self, device=None) -> torch.xpu.Stream:
+        return torch.xpu.current_stream(device)
+
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         # TODO: simple return of torch.xpu.mem_get_info
         """Return the available and total device memory in Bytes."""

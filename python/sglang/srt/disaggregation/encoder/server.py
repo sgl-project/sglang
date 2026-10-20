@@ -59,6 +59,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     resolve_encoder_media_processor_config,
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
     get_device,
@@ -583,7 +584,7 @@ class MMEncoder:
             gpu_id=self.gpu_id,
         )
 
-        torch.get_device_module(self.device).set_device(self.gpu_id)
+        current_platform.set_device(current_platform.get_device(self.gpu_id))
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),

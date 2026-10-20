@@ -26,6 +26,7 @@ from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import get_bool_env_var
 
@@ -56,7 +57,7 @@ class ExpertLocationUpdater:
         """
         if self._first_execution:
             self._first_execution = False
-            torch.get_device_module().empty_cache()
+            current_platform.empty_cache()
 
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None

@@ -54,6 +54,12 @@ class CudaDeviceMixin(DeviceMixin):
     def synchronize(self) -> None:
         torch.cuda.synchronize()
 
+    def current_device(self) -> int:
+        return torch.cuda.current_device()
+
+    def current_stream(self, device=None) -> torch.cuda.Stream:
+        return torch.cuda.current_stream(device)
+
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         return torch.cuda.mem_get_info(device_id)
 

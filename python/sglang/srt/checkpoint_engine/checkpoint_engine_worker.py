@@ -23,7 +23,7 @@ import torch
 import zmq
 
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import get_device, get_device_module, is_npu
+from sglang.srt.utils import get_device, is_npu
 
 try:
     from checkpoint_engine.worker import update_weights_from_ipc
@@ -113,7 +113,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
             from checkpoint_engine.device_utils import npu_generate_uuid
 
             return f"NPU-{npu_generate_uuid()}"
-        device_id = get_device_module().current_device()
+        device_id = current_platform.current_device()
         try:
             return f"GPU-{current_platform.get_device_uuid(device_id)}"
         except AssertionError as e:
@@ -121,7 +121,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
 
     def get_device_id(self) -> int:
         """Get the device ID."""
-        return get_device_module().current_device()
+        return current_platform.current_device()
 
     def get_model_loader(self) -> Callable:
         """Get the model weight loader function."""
@@ -141,7 +141,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing
                         target_device = torch.device(
-                            get_device(), get_device_module().current_device()
+                            get_device(), current_platform.current_device()
                         )
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)

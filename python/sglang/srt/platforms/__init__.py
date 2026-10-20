@@ -14,12 +14,14 @@ import logging
 import os
 import pkgutil
 from importlib.metadata import entry_points
+from importlib.util import find_spec
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.hpu import HpuSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.musa import MusaSRTPlatform
@@ -63,6 +65,14 @@ def _is_musa_available() -> bool:
     return True
 
 
+def _is_hpu_available() -> bool:
+    if find_spec("habana_frameworks") is None:
+        return False
+    import habana_frameworks.torch.hpu  # noqa: F401
+
+    return torch.hpu.is_available()
+
+
 def _is_mps_available() -> bool:
     return bool(getattr(torch, "mps", None) is not None and torch.mps.is_available())
 
@@ -91,6 +101,7 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform
          - 0 activated + MUSA available → fallback MusaSRTPlatform
+         - 0 activated + HPU available  → fallback HpuSRTPlatform
          - 0 activated + MPS available  → fallback MpsSRTPlatform
          - 0 activated + none of the above → fallback base SRTPlatform
          - 1 activated → use it
@@ -167,6 +178,9 @@ def _resolve_platform() -> SRTPlatform:
                 "No platform plugin detected. Using MUSA SRTPlatform defaults."
             )
             return MusaSRTPlatform()
+        if _is_hpu_available():
+            logger.debug("No platform plugin detected. Using HPU SRTPlatform defaults.")
+            return HpuSRTPlatform()
         if _is_mps_available():
             logger.debug("No platform plugin detected. Using MPS SRTPlatform defaults.")
             return MpsSRTPlatform()

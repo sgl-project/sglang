@@ -206,7 +206,7 @@ def _set_kv_buffer_impl(
     from sglang.srt.model_executor.runner import get_is_capture_mode
 
     if get_is_capture_mode() and alt_stream is not None:
-        current_stream = device_module.current_stream()
+        current_stream = current_platform.current_stream()
         alt_stream.wait_stream(current_stream)
         k_cache[indices] = k
         with device_module.stream(alt_stream):
@@ -3761,7 +3761,7 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
         if get_is_capture_mode() and self.alt_stream is not None:
             # Overlap the copy of K and V cache for small batch size
-            current_stream = self.device_module.current_stream()
+            current_stream = current_platform.current_stream()
             self.alt_stream.wait_stream(current_stream)
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
 

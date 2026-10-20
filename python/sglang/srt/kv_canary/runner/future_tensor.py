@@ -6,6 +6,7 @@ from typing import Any, Optional, Union
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_device_stream_capturing
 
 _PayloadDict = dict[str, Any]
@@ -65,7 +66,7 @@ class FutureTensors:
         }
 
         device_module = torch.get_device_module(device)
-        d2h_stream.wait_stream(device_module.current_stream(device))
+        d2h_stream.wait_stream(current_platform.current_stream(device))
         with device_module.stream(d2h_stream):
             for key in tensors_device_cloned:
                 tensors_host[key].copy_(tensors_device_cloned[key], non_blocking=True)

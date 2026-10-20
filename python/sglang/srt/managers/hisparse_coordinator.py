@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
 if is_xpu():
@@ -382,7 +383,7 @@ class HiSparseSpecSwapManager:
             return
         coordinator = self._coordinator
         coordinator.wait_for_pending_backup()
-        schedule_stream = device_module.current_stream()
+        schedule_stream = current_platform.current_stream()
         device_locs = device_locs.contiguous()
         with device_module.stream(coordinator.decode_backup_stream):
             coordinator.decode_backup_stream.wait_stream(schedule_stream)
@@ -1233,7 +1234,7 @@ class HiSparseCoordinator:
         host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
-        schedule_stream = device_module.current_stream()
+        schedule_stream = current_platform.current_stream()
         with device_module.stream(self.decode_backup_stream):
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
@@ -1258,7 +1259,7 @@ class HiSparseCoordinator:
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
-        self._backup_done_event.wait(device_module.current_stream())
+        self._backup_done_event.wait(current_platform.current_stream())
         self._has_pending_backup = False
 
     def naive_load_topk(
@@ -1395,7 +1396,7 @@ class HiSparseCoordinator:
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
+            current_platform.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
@@ -1602,7 +1603,7 @@ class HiSparseCoordinator:
             # Skip layer: wait for its prefetched copy; the anchor's slot table
             # applies (shared index + lockstep buffers).
             slot = self._prefetch_slot[layer_id]
-            self._prefetch_events[slot].wait(device_module.current_stream())
+            self._prefetch_events[slot].wait(current_platform.current_stream())
             if top_k_result.ndim == 3:
                 return self.spec_swap.output_locs(top_k_result, num_reqs)
             return self.top_k_device_locs_buffer[:num_reqs, : self.top_k]
@@ -1620,7 +1621,7 @@ class HiSparseCoordinator:
         if group:
             # Fork: the prefetch stream must observe the anchor's plan (produced
             # on the current stream) before replaying it.
-            self.prefetch_stream.wait_stream(device_module.current_stream())
+            self.prefetch_stream.wait_stream(current_platform.current_stream())
             with device_module.stream(self.prefetch_stream):
                 for skip_layer in group:
                     self._run_copy_only_kernel(num_reqs, skip_layer)

@@ -70,7 +70,7 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
             patch.object(module, "release_kv_cache", side_effect=release),
             patch.object(module, "is_dp_attention_enabled", return_value=False),
             patch.object(module, "set_is_extend_in_batch"),
-            patch.object(module, "get_device_module", return_value=Mock()),
+            patch.object(module, "current_platform"),
             patch.object(module, "tqdm", side_effect=lambda items, **_kwargs: items),
         ):
             sizer = module.DynamicChunkSizer(

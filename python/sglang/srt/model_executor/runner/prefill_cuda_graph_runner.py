@@ -130,6 +130,7 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -698,7 +699,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         maybe_pre_warm_aiter_chip_info()
 
         # --- capture --------------------------------------------------
-        self.device_module.synchronize()
+        current_platform.synchronize()
         get_parallel().tp_group.barrier()
         self.capture()
 

@@ -386,10 +386,10 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _prewarm_hccl_group(device, group, device_module):
+def _prewarm_hccl_group(device, group):
     warmup_tensor = torch.zeros(1, dtype=torch.int32, device=device)
     torch.distributed.all_reduce(warmup_tensor, group=group)
-    device_module.synchronize()
+    current_platform.synchronize()
 
 
 # Test retract decode for debugging purposes
@@ -770,7 +770,6 @@ class Scheduler(
         _prewarm_hccl_group(
             device=tp_group.device,
             group=tp_group.device_group,
-            device_module=tp_group.device_module,
         )
         logger.info("HCCL DP prewarm done: rank=%s", rank)
 

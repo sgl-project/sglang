@@ -189,6 +189,7 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -5457,8 +5458,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.lm_head.weight = head
         # Hot weight reload (RL workflows). Use the device-agnostic module
         # accessor so this works on both CUDA/HIP and NPU.
-        torch.get_device_module().empty_cache()
-        torch.get_device_module().synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

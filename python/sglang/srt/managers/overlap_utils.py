@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
@@ -98,7 +99,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
             # CPU has no cross-stream reuse hazard (and record_stream rejects CPU tensors).
             if batch.mix_running_indices.device.type != "cpu":
                 batch.mix_running_indices.record_stream(
-                    torch.get_device_module(batch.device).current_stream()
+                    current_platform.current_stream()
                 )
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
@@ -451,7 +452,7 @@ class FutureMap:
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         if indices.device.type != "cpu":
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            indices.record_stream(current_platform.current_stream())
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None

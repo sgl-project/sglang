@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 import ray
 
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import SpawnRanks, get_device, publish, spawn_world_rank
 from sglang.srt.server_args import PortArgs, ServerArgs
 
@@ -125,10 +126,10 @@ class SchedulerActor:
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop. Blocks until shutdown."""
         try:
-            import torch
-
             # Need to set the GPU id for the event loop for nccl to work
-            torch.cuda.set_device(get_device().gpu_id)
+            current_platform.set_device(
+                current_platform.get_device(get_device().gpu_id)
+            )
             self.scheduler.run_event_loop()
         except Exception as e:
             logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")

@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -67,13 +68,16 @@ class TestDSALayerShardUtils(CustomTestCase):
             pending_remote_kv_broadcast=True,
             pending_remote_kv_layer_id=7,
             remote_kv_layer_id=None,
-            device_module=SimpleNamespace(
-                current_stream=lambda: SimpleNamespace(wait_stream=lambda _stream: None)
-            ),
             kv_broadcast_stream=object(),
         )
-        LayerSplitDSATokenToKVPool._finalize_pending_kv_broadcast(
-            pool, set_remote_layer_id=True
+        with patch(
+            "sglang.srt.mem_cache.dsa_cache_layer_split.current_platform"
+        ) as platform:
+            LayerSplitDSATokenToKVPool._finalize_pending_kv_broadcast(
+                pool, set_remote_layer_id=True
+            )
+        platform.current_stream.return_value.wait_stream.assert_called_once_with(
+            pool.kv_broadcast_stream
         )
         self.assertFalse(pool.pending_remote_kv_broadcast)
         self.assertEqual(pool.remote_kv_layer_id, 7)
