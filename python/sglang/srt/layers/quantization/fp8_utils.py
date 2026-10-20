@@ -54,7 +54,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -370,38 +369,6 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    # Resolved on first call: CUDA builds without FlashInfer must still import
-    # this module.
-    _raw_bmm_fp8_batched = LazyImport("flashinfer", "bmm_fp8")
-
-    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
-    def _bmm_fp8_batched_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
-
-    def bmm_fp8(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
-        return out
-
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
@@ -417,6 +384,9 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+    if _is_xpu:
+        # XPU's torch._scaled_mm backend supports rowwise scaling.
+        return True
     return False
 
 
@@ -822,6 +792,35 @@ def torch_w8a8_block_fp8_linear(
     return output.view(*input.shape[:-1], weight.shape[0])
 
 
+def prepare_xpu_block_scale_for_scaled_mm(
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    linear_fn: Callable,
+) -> torch.Tensor:
+    """Materialize the XPU block scale layout consumed by scaled_mm once."""
+    # Keep logical [N-blocks, K-blocks] shape, but use
+    # transpose-contiguous storage. For [1, 128], scaled_mm transposes
+    # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
+    # This avoids a per-forward contiguous/copy in either path.
+    if (
+        linear_fn is not torch_w8a8_block_fp8_linear
+        or not isinstance(block_size, (list, tuple))
+        or tuple(block_size) not in ((1, 128), (128, 128))
+        or weight_scale.ndim != 2
+        or weight_scale.t().is_contiguous()
+    ):
+        return weight_scale
+
+    reordered = torch.empty_strided(
+        weight_scale.shape,
+        (1, weight_scale.shape[0]),
+        dtype=weight_scale.dtype,
+        device=weight_scale.device,
+    )
+    reordered.copy_(weight_scale)
+    return reordered
+
+
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
     names a backend that owns an MXFP8 dense kernel."""
@@ -932,19 +931,19 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
         )
     if backend.is_gfx95_dot_scaled():
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
         return dot_scaled_mxfp8_blockscaled_linear
     if backend.is_gfx95_mxfp8_native():
-        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
             mxfp8_native_blockscaled_linear,
         )
 
         return mxfp8_native_blockscaled_linear
     if backend.is_gfx95_mxfp8_aiter():
-        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import (
             aiter_mxfp8_blockscaled_linear,
         )
 
@@ -993,7 +992,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
         dot_scaled_mxfp8_blockscaled_linear,
     )
 
@@ -2056,6 +2055,8 @@ def requant_block_scale_ue8m0_for_deepgemm(
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
+    *,
+    grouped_moe: bool = False,
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
@@ -2074,6 +2075,7 @@ def requant_block_scale_ue8m0_for_deepgemm(
             weight_block_size=weight_block_size,
             output_dtype=output_dtype,
             weight_shape=weight_shape,
+            grouped_moe=grouped_moe,
         )
     ):
         return False
@@ -2364,7 +2366,9 @@ def _apply_fallback_scaled_mm(
     )
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
-    x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
+    # A single scale has no row dimension to trim, regardless of its shape.
+    if x_scale.numel() > 1:
+        x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
 
     output = output * x_scale * weight_scale.t()
     if bias is not None:
@@ -2588,12 +2592,22 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
+    rowwise_scale_layout_supported = not _is_xpu or (
+        x_scale.ndim == 2
+        and x_scale.shape[1] == 1
+        and x_scale.is_contiguous()
+        and weight_scale.ndim == 2
+        and weight_scale.shape[1] == 1
+        and weight_scale.t().is_contiguous()
+    )
     if (
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        and (
+            (USE_ROWWISE_TORCH_SCALED_MM and rowwise_scale_layout_supported)
+            or _use_aiter
+        )
     ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor

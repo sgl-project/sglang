@@ -6,12 +6,12 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention.fla import chunk_delta_h
-from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
 )
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_gdn_prefill_prepare,
     fused_qkv_split_gdn_prefill,
