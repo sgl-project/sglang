@@ -1464,6 +1464,9 @@ class Req(ReqDllmMixin):
         # (DSV4: the indexer K lives in device logical-slot space, not in the
         # HiSparse host pool). None unless a backup exists.
         self.hisparse_indexer_backup = None
+        # SWA-window CPU sidecar (same reason; only the live window is kept).
+        self.hisparse_swa_backup = None
+        self.hisparse_swa_backup_full_len = 0
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0

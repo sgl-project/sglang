@@ -1056,6 +1056,7 @@ class ModelRunner:
                 if self.spec_algorithm.is_none()
                 else get_spec().speculative_num_draft_tokens or 0
             ),
+            sliding_window_size=self.sliding_window_size,
         )
 
     def post_capture_resize_kv_pool(self, *, draft_runners=()):

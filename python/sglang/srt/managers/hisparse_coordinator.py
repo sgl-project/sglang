@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import torch
 
@@ -545,6 +545,7 @@ class HiSparseCoordinator:
         host_to_device_ratio: int = 2,
         swap_in_block_size: int = 960,
         shared_index_layers: Optional[List[bool]] = None,
+        sliding_window_size: Optional[int] = None,
         num_draft_tokens: int = 0,
     ):
         self.req_to_token_pool = req_to_token_pool
@@ -553,6 +554,7 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         self.swap_in_block_size = swap_in_block_size
+        self.sliding_window_size = sliding_window_size
         # Timing probe: skip the host->device KV bytes to measure the "IO is
         # free" floor. Produces garbage output; benchmarking only.
         self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
@@ -1406,6 +1408,83 @@ class HiSparseCoordinator:
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         return getattr(kvcache, "c4_indexer_kv_pool", None)
 
+    def _swa_pool(self):
+        """The DSV4 SWA pool (device logical-slot space), or None."""
+        if not self.is_dsv4_hisparse:
+            return None
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        return getattr(kvcache, "swa_kv_pool", None)
+
+    def _swa_window_rows(self, req_pool_idx: int, allocated_len: int):
+        """SWA rows covering the request's live window.
+
+        Returns ``(swa_locs, full_start)``: the SWA-side locations of the last
+        ``window_size`` tokens (page-aligned start), and the full-space start
+        position they correspond to. Attending decode layers read exactly this
+        window through ``full_to_swa_index_mapping``.
+        """
+        window_size = self.sliding_window_size
+        if window_size is None or window_size <= 0 or allocated_len == 0:
+            return None, 0
+        page_size = self.token_to_kv_pool_allocator.page_size
+        start = max(0, allocated_len - window_size)
+        start = (start // page_size) * page_size
+        full_locs = self.req_to_token_pool.req_to_token[req_pool_idx, start:allocated_len]
+        swa_allocator = cast(
+            "DeepSeekV4HiSparseTokenToKVPoolAllocator",
+            self.token_to_kv_pool_allocator,
+        )
+        swa_locs = swa_allocator.translate_loc_from_full_to_swa(full_locs)
+        return swa_locs, start
+
+    def _backup_swa_rows(self, req: Req, allocated_len: int, req_pool_idx: int) -> None:
+        """Copy the live SWA window rows to a CPU sidecar.
+
+        The SWA KV also lives in device logical-slot space (prefill transfers
+        it; HiSparse does not offload it), so a resume's fresh window would
+        read garbage. Only the live window matters -- older SWA positions are
+        never read again.
+        """
+        pool = self._swa_pool()
+        if pool is None:
+            return
+        swa_locs, _start = self._swa_window_rows(req_pool_idx, allocated_len)
+        if swa_locs is None or swa_locs.numel() == 0:
+            return
+        if getattr(req, "hisparse_swa_backup", None) is not None:
+            return  # already backed up
+        page_size = self.token_to_kv_pool_allocator.page_size
+        # Whole page rows (the pool's row granularity).
+        page_rows = swa_locs[::page_size] // page_size
+        req.hisparse_swa_backup = [
+            buf[page_rows].to("cpu", non_blocking=False).pin_memory()
+            for buf in pool.kv_buffer
+        ]
+        req.hisparse_swa_backup_full_len = allocated_len
+
+    def _restore_swa_rows(self, req: Req, req_pool_idx: int) -> None:
+        """Write the SWA window sidecar into the fresh window's rows."""
+        backup = getattr(req, "hisparse_swa_backup", None)
+        if backup is None:
+            return
+        pool = self._swa_pool()
+        assert pool is not None
+        allocated_len = req.kv.kv_allocated_len
+        swa_locs, _start = self._swa_window_rows(req_pool_idx, allocated_len)
+        assert swa_locs is not None and swa_locs.numel() > 0
+        page_size = self.token_to_kv_pool_allocator.page_size
+        page_rows = swa_locs[::page_size] // page_size
+        assert page_rows.numel() == len(backup[0]), (
+            f"SWA backup page mismatch: {page_rows.numel()} new vs "
+            f"{len(backup[0])} backed up"
+        )
+        for buf, rows in zip(pool.kv_buffer, backup):
+            buf[page_rows] = rows.to(buf.device, non_blocking=True)
+        restore_done = device_module.Event()
+        restore_done.record(device_module.current_stream())
+        restore_done.synchronize()
+        req.hisparse_swa_backup = None
+
     def _indexer_page_rows(self, req_pool_idx: int, allocated_len: int):
         """Device indexer-K page rows covering ``[0, allocated_len)``.
 
@@ -1520,6 +1599,8 @@ class HiSparseCoordinator:
         # corrupt the top-k selection. Back up the request's page rows here
         # in position order; resume writes them into the new slots' pages.
         self._backup_indexer_rows(req, allocated_len, req_pool_idx)
+        # Same for the SWA window rows (device logical-slot space as well).
+        self._backup_swa_rows(req, allocated_len, req_pool_idx)
 
         # release device buffer indices (same ownership union request_finished
         # computes; over-allocation slots carry stale -1/0 entries that are
@@ -1563,6 +1644,9 @@ class HiSparseCoordinator:
         assert req.kv.req_pool_idx is not None
         # Drop the indexer-K CPU sidecar (no-op when never backed up).
         req.hisparse_indexer_backup = None
+        # Drop the SWA-window sidecar likewise.
+        req.hisparse_swa_backup = None
+        req.hisparse_swa_backup_full_len = 0
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
             req.kv.req_pool_idx,
@@ -1600,6 +1684,9 @@ class HiSparseCoordinator:
         # the page table over those slots, and would otherwise score garbage.
         assert req.kv.req_pool_idx is not None
         self._restore_indexer_rows(req, req.kv.req_pool_idx)
+        # Restore the SWA window rows likewise (attention reads the window
+        # through the fresh slots' full->swa mapping).
+        self._restore_swa_rows(req, req.kv.req_pool_idx)
         # The retained host row already covers every token up to
         # kv_allocated_len (the fill length), so the first decode step after
         # resume has nothing new to back up -- same as admit_request_direct.
