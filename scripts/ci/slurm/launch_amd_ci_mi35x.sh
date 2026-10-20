@@ -14,7 +14,10 @@
 #     job that never started is resubmitted, up to SUBMIT_ATTEMPTS times;
 #   * the controller sometimes answers with an empty queue, so one missing
 #     state reading is not taken as "job finished";
-#   * a two-field time limit parses as HH:MM, so TIME_LIMIT must be HH:MM:SS.
+#   * a two-field time limit parses as HH:MM, so TIME_LIMIT must be HH:MM:SS;
+#   * the job's exit-code file can stay invisible on the login host for up to
+#     a minute after the node writes it (NFS negative lookup caching), so a
+#     finished job is polled for it rather than checked once.
 #
 # Usage:
 #   launch_amd_ci_mi35x.sh --suite NAME [--rocm-version rocm10] [-- run_suite.py args...]
@@ -88,6 +91,16 @@ stream_log() {  # print what the job appended to $LOG since the last call
     fi
 }
 
+wait_for_exit_file() {  # up to 90s; listing the directory forces a fresh NFS lookup
+    local _
+    for _ in $(seq 1 18); do
+        ls "$RUN_DIR" > /dev/null 2>&1 || true
+        [[ -s "$CI_EXIT_FILE" ]] && return 0
+        sleep 5
+    done
+    return 1
+}
+
 job_state() {  # "<STATE> <REASON>", or empty if the controller does not know the job
     scontrol show job "$1" 2>/dev/null \
         | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^(JobState|Reason)=/) {sub(/^[^=]*=/, "", $i); printf "%s ", $i}}'
@@ -126,13 +139,17 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
             *) break ;;
         esac
     done
-    sleep 5   # let the last log lines land on shared storage
-    stream_log
+    if [[ "${state:-}" == PENDING ]]; then
+        sleep 5          # held before starting: no exit code is coming
+    else
+        wait_for_exit_file || true
+    fi
+    stream_log           # also picks up the last lines of the log
 
-    if [[ -f "$CI_EXIT_FILE" ]]; then
-        rc="$(cat "$CI_EXIT_FILE")"
-        echo "Job $JOB_ID finished with exit code $rc"
-        exit "$rc"
+    if [[ -s "$CI_EXIT_FILE" ]]; then
+        rc="$(tr -dc 0-9 < "$CI_EXIT_FILE")"
+        echo "Job $JOB_ID finished with exit code ${rc:-unknown}"
+        exit "${rc:-1}"
     fi
     if (( started )) || grep -q '^\[amd-ci-job\] start' "$LOG"; then
         echo "ERROR: job $JOB_ID started but ended (${state:-gone} ${reason:-}) without writing an exit code" >&2
