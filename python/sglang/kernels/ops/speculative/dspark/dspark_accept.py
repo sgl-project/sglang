@@ -15,9 +15,9 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_gfx1250_supported, is_npu
 
-_is_hip = is_hip()
+_is_gfx1250_supported = is_gfx1250_supported()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -511,7 +511,7 @@ def softmax_temp_triton(
     )
     temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
     out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
-    if _is_hip:
+    if _is_gfx1250_supported:
         # One CTA per row leaves most CUs idle at decode batch sizes.
         _softmax_temp_split_vocab(logits, temperatures, out, rows_per_request)
         return out
