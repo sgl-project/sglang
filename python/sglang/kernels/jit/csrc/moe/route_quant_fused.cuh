@@ -74,7 +74,9 @@ struct RouteQuantFusedKernel {
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
-      bool apply_scale) {
+      bool apply_scale,
+      int64_t local_expert_offset,
+      int64_t num_local_experts) {
     using namespace host;
     using Trait = RouteQuantTrait;
 
@@ -99,6 +101,10 @@ struct RouteQuantFusedKernel {
         N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
         "route_quant_fused is specialized for N=896, K=16");
     RuntimeCheck(scores.stride(0) % 4 == 0, "route_quant_fused: scores row stride must be a multiple of 4");
+    RuntimeCheck(
+        num_local_experts == 0 || (num_local_experts > 0 && local_expert_offset >= 0 &&
+                                   local_expert_offset + num_local_experts <= kNumExperts_),
+        "route_quant_fused: local experts must be a sub-range of the routed experts");
 
     // Quant half: shape/stride/alignment checks + byte-stride munging shared
     // with the standalone flat kernel.
@@ -132,7 +138,9 @@ struct RouteQuantFusedKernel {
              static_cast<float>(routed_scaling_factor),
              renormalize ? 1 : 0,
              apply_scale ? 1 : 0,
-             /*sorted=*/0},
+             /*sorted=*/0,
+             static_cast<int>(local_expert_offset),
+             static_cast<int>(num_local_experts)},
         .quant = quant_params,
     };
 
