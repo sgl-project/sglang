@@ -551,10 +551,17 @@ class DSparkVerifyPlanner:
     ) -> Optional[torch.Tensor]:
         if self._budget_planner is None or confidence is None or budget is None:
             return None
+        cfg = self._schedule_cfg
+        if self._budget_planner.forced_budget_frac is not None:
+            # A profiling pin requests an exact number of candidates. The
+            # normal survival cutoff may otherwise leave the budget unfilled
+            # (including at full width), so the measured T(B, M) is mislabeled.
+            # Retain confidence ordering, including zero-probability prefixes.
+            cfg = msgspec.structs.replace(cfg, survival_eps=0.0)
         verify_lens = ScheduleVerifyLensTopk.execute(
             confidence=confidence,
             budget=budget,
-            cfg=self._schedule_cfg,
+            cfg=cfg,
         ).to(device=device, dtype=torch.int32)
         self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 

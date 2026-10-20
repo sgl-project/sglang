@@ -803,6 +803,43 @@ class TestForcedBudgetUnderVerifyAll(CustomTestCase):
         _, cleared = self._schedule(planner)
         self.assertIs(cleared, uniform)
 
+    def test_pinned_budget_includes_low_survival_candidates(self):
+        # Real PD profiling hit logical M=47 at B=8/full budget because a
+        # candidate fell below survival_eps. Exercise both kernel backends,
+        # including exact zeros from confidence underflow.
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for confidence_value in (0.0, 1e-8):
+                with self.subTest(device=device, confidence=confidence_value):
+                    planner = self._planner()
+                    confidence = torch.full(
+                        (self.BS, self.GAMMA), confidence_value, device=device
+                    )
+
+                    def schedule(budget):
+                        return planner._schedule_verify_lens(
+                            req_pool_indices=torch.arange(self.BS, device=device),
+                            prefix_lens=torch.zeros(
+                                self.BS, dtype=torch.int64, device=device
+                            ),
+                            device=torch.device(device),
+                            confidence=confidence,
+                            budget=budget,
+                        )
+
+                    full_budget = self.BS * self.GAMMA
+                    self.assertEqual(schedule(full_budget).tolist(), [1] * self.BS)
+                    for frac in (0.0, 0.05, 0.4, 1.0):
+                        planner.set_forced_budget_frac(frac)
+                        budget = int(frac * full_budget)
+                        lens = schedule(budget)
+                        self.assertEqual(int(lens.sum()), self.BS + budget)
+                        self.assertTrue(bool((lens >= 1).all()))
+                        self.assertTrue(bool((lens <= self.GAMMA + 1).all()))
+                    planner.set_forced_budget_frac(None)
+                    self.assertEqual(schedule(full_budget).tolist(), [1] * self.BS)
+                    self.assertEqual(planner._schedule_cfg.survival_eps, 1e-6)
+
 
 if __name__ == "__main__":
     unittest.main()
