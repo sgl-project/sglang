@@ -80,6 +80,26 @@ def test_abort_all_spares_warmup_and_grouped_requests_are_matched_by_first_req()
     assert _replies(scheduler)[b"client-x"] == {"success": True, "num_aborted": 2}
 
 
+def test_abort_drops_generate_from_the_same_batch():
+    scheduler = _scheduler([])
+    x, y = _req("x"), _req("y")
+
+    remaining = scheduler._apply_aborts(
+        [
+            (b"client-x", x),
+            (b"client-abort", AbortReq(request_ids=["x"])),
+            (b"client-y", y),
+        ]
+    )
+
+    assert remaining == [(b"client-y", y)]
+    assert not scheduler.waiting_queue
+    assert _replies(scheduler) == {
+        b"client-x": ABORTED_ERROR,
+        b"client-abort": {"success": True, "num_aborted": 1},
+    }
+
+
 def test_abort_fans_out_to_every_replica():
     # a request may be queued on any dp replica, so the abort must reach all of them
     assert AbortReq in scheduler_client._CONTROL_REQ_TYPES
