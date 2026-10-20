@@ -1,5 +1,6 @@
 """PEFT LoRA normalization and fail-closed capability tests."""
 
+import json
 import math
 
 import pytest
@@ -80,3 +81,28 @@ def test_mixed_rank_native_safetensors_does_not_apply_global_alpha(tmp_path):
     )
 
     assert "lora_alpha" not in load_peft_config(str(weight_path))
+
+
+def test_diffusers_adapter_metadata_supplies_transformer_peft_config(tmp_path):
+    """diffusers save_lora_weights stores alpha only in lora_adapter_metadata (e.g. r=64, alpha=128)."""
+    weight_path = tmp_path / "pytorch_lora_weights.safetensors"
+    packed = {
+        "transformer.r": 4,
+        "transformer.lora_alpha": 8,
+        "transformer.alpha_pattern": {"proj": 2},
+        "text_encoder.lora_alpha": 16,
+    }
+    save_file(
+        {"transformer.proj.lora_A.weight": torch.ones(4, 8)},
+        weight_path,
+        metadata={"lora_adapter_metadata": json.dumps(packed)},
+    )
+
+    config = load_peft_config(str(weight_path))
+    assert config["lora_alpha"] == 8
+    assert config["alpha_pattern"] == {"proj": 2}
+    assert "text_encoder.lora_alpha" not in config
+
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"lora_alpha": 4}))
+    with pytest.raises(ValueError, match="conflicts with safetensors metadata"):
+        load_peft_config(str(weight_path))

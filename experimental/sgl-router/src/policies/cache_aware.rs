@@ -4,7 +4,7 @@
 //! Builds bounded cache-aware candidates from ingress Indexer results.
 
 use crate::config::AffinityConfig;
-use crate::policies::admission::FreshLoadLookup;
+use crate::policies::admission::CandidateLoads;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PrefillProposal, ProposalKind,
@@ -88,7 +88,7 @@ impl CacheAwarePolicy {
         if limit == 0 {
             return None;
         }
-        let loads = FreshLoadLookup::new(
+        let loads = CandidateLoads::new(
             ctx.load_snapshot(),
             candidates.iter().map(|candidate| &candidate.worker),
         );
@@ -139,12 +139,12 @@ impl CacheAwarePolicy {
 fn compare_candidate_seed(
     left: &CacheCandidate,
     right: &CacheCandidate,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> Ordering {
     right
         .matched_prefix_tokens
         .cmp(&left.matched_prefix_tokens)
-        .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+        .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
 
@@ -203,7 +203,7 @@ fn cap_matched_prefix_blocks(query_blocks: usize, matched_prefix_blocks: u32) ->
     matched_prefix_blocks.min(u32::try_from(query_blocks).unwrap_or(u32::MAX))
 }
 
-fn estimate_matched_prefix_tokens(
+pub(crate) fn estimate_matched_prefix_tokens(
     input_tokens: u64,
     query_blocks: usize,
     matched_prefix_blocks: u32,

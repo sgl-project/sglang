@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import sglang.srt.layers.moe.topk as topk_mod
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
     _can_fuse_padded_region,
@@ -11,6 +13,7 @@ from sglang.srt.layers.moe.topk import (
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -161,7 +164,9 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
         topk_ids = torch.randint(0, 64, (n, k), device=self.DEVICE, dtype=torch.int32)
         router_logits = torch.rand((n, 64), device=self.DEVICE, dtype=torch.float32)
         pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
-        cfg = TopKConfig(top_k=k, num_fused_shared_experts=0)
+        cfg = TopKConfig(
+            top_k=k, shared_experts=SharedExpertsConfig(num_fused_shared_experts=0)
+        )
         _, out_weights, _ = _post_process_topk_ids(
             topk_ids,
             topk_weights,
@@ -188,6 +193,35 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
             self.assertTrue(torch.all(out[n_valid:] > 0.0))
         finally:
             topk_mod._skip_hip_pad_mask = orig
+
+    def test_flag_skips_weight_masking_with_shared_append(self):
+        n, k, n_valid = 16, 8, 5
+        topk_weights = torch.rand((n, k), device=self.DEVICE) + 0.5
+        topk_ids = torch.randint(0, 64, (n, k), device=self.DEVICE, dtype=torch.int32)
+        router_logits = torch.rand((n, 64), device=self.DEVICE)
+        pad = torch.tensor(n_valid, device=self.DEVICE, dtype=torch.int32)
+        cfg = TopKConfig(
+            top_k=k + 1, shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+        )
+        orig_skip = topk_mod._skip_hip_pad_mask
+        orig_aiter = topk_mod._use_aiter
+        topk_mod._skip_hip_pad_mask = True
+        topk_mod._use_aiter = True
+        try:
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+            )
+        finally:
+            topk_mod._skip_hip_pad_mask = orig_skip
+            topk_mod._use_aiter = orig_aiter
+
+        self.assertTrue(torch.all(out_ids[n_valid:, :k] == 0))
+        self.assertTrue(torch.all(out_weights[n_valid:] > 0))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
@@ -246,6 +280,58 @@ class TestSelectExpertsCustomRoutingPadMask(CustomTestCase):
         # ...and real rows untouched (in-range, no -1 leakage).
         self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
         self.assertTrue(torch.all(out.topk_ids[:n_valid] < num_experts))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
+@unittest.skipIf(_IS_HIP, "HIP marks padded rows with zero weights instead")
+class TestSelectExpertsPerRankSharedSlotPadMask(CustomTestCase):
+    """With per-rank fused shared slots, padded rows must leave select_experts
+    fully -1, the appended shared column included. Masking only before the
+    append left them routed ids of -1 - S and a live home-rank shared slot."""
+
+    DEVICE = "cuda"
+
+    def test_padded_tail_masked_after_shared_append(self):
+        num_tokens, num_experts, top_k, n_valid = 12, 256, 8, 9
+        # EP8 rank 3: 32 routed slots per rank, then the rank's shared slot.
+        home_shared_id = 3 * 33 + 32
+        # Grouped sigmoid is masked after routing, sqrtsoftplus by its router.
+        for scoring_func, num_expert_group in (("sigmoid", 8), ("sqrtsoftplus", None)):
+            with self.subTest(scoring_func=scoring_func):
+                g = torch.Generator(device="cpu").manual_seed(0)
+                logits = torch.randn(num_tokens, num_experts, generator=g)
+                bias = 0.1 * torch.randn(num_experts, generator=g)
+                topk_config = TopKConfig(
+                    top_k=top_k + 1,
+                    use_grouped_topk=num_expert_group is not None,
+                    num_expert_group=num_expert_group,
+                    topk_group=4 if num_expert_group else None,
+                    shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
+                    correction_bias=bias.to(self.DEVICE),
+                    scoring_func=scoring_func,
+                    routed_scaling_factor=2.5,
+                    allow_routed_experts_capture=False,
+                )
+                with (
+                    patch.object(
+                        topk_mod,
+                        "has_per_rank_fused_shared_slots",
+                        side_effect=lambda num_fused: num_fused > 0,
+                    ),
+                    get_parallel().override(moe_ep_size=8, moe_ep_rank=3),
+                ):
+                    out = topk_mod.select_experts(
+                        hidden_states=torch.empty(num_tokens, 16, device=self.DEVICE),
+                        router_logits=logits.to(self.DEVICE),
+                        topk_config=topk_config,
+                        layer_id=0,
+                        num_token_non_padded=torch.tensor(
+                            n_valid, device=self.DEVICE, dtype=torch.int32
+                        ),
+                    )
+                self.assertTrue(torch.all(out.topk_ids[n_valid:] == -1))
+                self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
+                self.assertTrue(torch.all(out.topk_ids[:n_valid, -1] == home_shared_id))
 
 
 if __name__ == "__main__":

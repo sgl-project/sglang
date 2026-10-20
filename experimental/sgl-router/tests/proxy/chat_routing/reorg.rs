@@ -94,6 +94,7 @@ fn rejecting_policy() -> Arc<FirstPolicy> {
 
 fn group(id: &str, policy: Arc<FirstPolicy>) -> EngineGroup {
     EngineGroup {
+        worker_services: None,
         worker_ids: Some([WorkerId(id.into())].into_iter().collect()),
         policy,
     }
@@ -148,41 +149,44 @@ fn body(content: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn configured_limits_reject_before_dispatch_and_admit_after_load_drops() {
-    use sgl_router::policies_reorg::power_of_two::PowerOfTwoPolicy;
+async fn bucket_config_limits_reject_before_dispatch_and_admit_after_load_drops() {
+    use sgl_router::policies_reorg::factory::build_resolver;
+    use sgl_router::state::kv_events::KvEventIndex;
     use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
     use std::time::Instant;
 
     let worker = MockWorker::start(vec![]).await;
     let mut ctx = Arc::try_unwrap(context(&[("w", Stage::Plain, &worker)], vec![]))
         .unwrap_or_else(|_| panic!("context is not shared yet"));
-    let mut policy = PowerOfTwoPolicy::new(ctx.engine_reported_load.clone());
-    policy.admission = Arc::new(AdmissionLimits {
-        max_running_requests: Some(1),
-        max_kv_tokens: Some(100),
-        ..Default::default()
-    });
-    ctx.chat_routing = ChatRouting::Reorg(
-        [(
-            ModelId("tiny".into()),
-            BucketResolver::new(vec![Bucket::new(
-                "default",
-                BucketGroups::Plain(EngineGroup {
-                    worker_ids: Some([WorkerId("w".into())].into()),
-                    policy: Arc::new(policy),
-                }),
-            )])
-            .unwrap(),
-        )]
-        .into(),
+    let state = KvEventIndex::new();
+    ctx.engine_reported_load = state.engine_reported_load();
+    ctx.config.model.policy = PolicyKind::PowerOfTwo;
+    // The group sets its usages; the CLI in-flight default still applies.
+    ctx.config.model.reorg_admission.max_inflight_requests = Some(1);
+    ctx.config.model.reorg_buckets = Some(
+        serde_json::from_value(serde_json::json!({"buckets": [{
+            "id": "default",
+            "plain": {
+                "worker_ids": ["w"],
+                "admission": {"max_running_usage": 0.1, "max_kv_usage": 0.1}
+            }
+        }]}))
+        .unwrap(),
     );
+    let (resolver, _) = build_resolver(&ctx.config.model, &state, None).unwrap();
+    ctx.chat_routing = ChatRouting::Reorg([(ModelId("tiny".into()), resolver)].into());
     let ctx = Arc::new(ctx);
+    let engine = ctx.registry.get(&WorkerId("w".into())).unwrap();
     let app = build_router(ctx.clone());
-    for (running, kv_tokens, expected) in [
-        (1, 0, StatusCode::SERVICE_UNAVAILABLE),
-        (0, 100, StatusCode::SERVICE_UNAVAILABLE),
-        (0, 0, StatusCode::OK),
+    for (running, kv_tokens, inflight, expected) in [
+        (1, 0, 0, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 100, 0, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 0, 1, StatusCode::SERVICE_UNAVAILABLE),
+        (0, 0, 0, StatusCode::OK),
     ] {
+        engine
+            .active_requests
+            .store(inflight, std::sync::atomic::Ordering::Relaxed);
         ctx.engine_reported_load.set(
             &worker.url,
             0,
@@ -633,10 +637,9 @@ async fn invalid_policy_signal_stops_bucket_iteration() {
 #[tokio::test]
 async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     use sgl_router::config::AffinityConfig;
-    use sgl_router::policies::prefix_provider::RadixTreePrefixProvider;
     use sgl_router::policies_reorg::cache_aware::{CacheAwarePolicy, CacheSource};
     use sgl_router::state::kv_events::{
-        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
+        compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
     };
     use sgl_router::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 
@@ -671,6 +674,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     let mut first = Bucket::new(
         "first",
         BucketGroups::Plain(EngineGroup {
+            worker_services: None,
             worker_ids: Some([WorkerId("rejected".into())].into_iter().collect()),
             policy: Arc::new(rejecting),
         }),
@@ -679,6 +683,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
     let mut second = Bucket::new(
         "second",
         BucketGroups::Plain(EngineGroup {
+            worker_services: None,
             worker_ids: Some(
                 [WorkerId("owner".into()), WorkerId("cold".into())]
                     .into_iter()
@@ -707,7 +712,7 @@ async fn cache_aware_routes_tokenized_prompt_and_rechecks_the_next_bucket() {
 
 #[tokio::test]
 async fn default_pd_groups_apply_configured_inflight_admission() {
-    use sgl_router::config::{EligibilityConfig, FilterKind, PolicyKind};
+    use sgl_router::config::PolicyKind;
     use std::sync::atomic::Ordering;
 
     let prefill = MockWorker::start(vec![]).await;
@@ -721,11 +726,7 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
     );
     let mutable = Arc::get_mut(&mut ctx).unwrap();
     mutable.config.model.policy = PolicyKind::PowerOfTwo;
-    mutable.config.model.eligibility = Some(EligibilityConfig {
-        filters: vec![FilterKind::Overloaded],
-        max_in_flight: Some(1),
-        min_prefix_share: None,
-    });
+    mutable.config.model.reorg_admission.max_inflight_requests = Some(1);
     let state = sgl_router::state::kv_events::KvEventIndex::new();
     let (resolver, _) =
         sgl_router::policies_reorg::factory::build_resolver(&mutable.config.model, &state, None)
@@ -976,6 +977,7 @@ async fn full_decode_group_falls_back_to_another_version_group() {
                 model_ids: vec![ModelId("tiny".into())],
                 bootstrap_port: Some(8998),
                 version_group: Some(group.into()),
+                services: Default::default(),
             })
             .unwrap();
     }
@@ -989,6 +991,39 @@ async fn full_decode_group_falls_back_to_another_version_group() {
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
         .collect();
     assert_eq!(dispatched, [false, true, false, true]);
+}
+
+#[tokio::test]
+async fn rerank_instructions_count_toward_bucket_context_limits() {
+    let short_worker = MockWorker::start(vec![]).await;
+    let long_worker = MockWorker::start(vec![]).await;
+    let policy = Arc::new(FirstPolicy::default());
+    let mut short = Bucket::new("short", BucketGroups::Plain(group("short", policy.clone())));
+    short.max_context_tokens = Some(1024);
+    let long = Bucket::new("long", BucketGroups::Plain(group("long", policy)));
+    let app = build_router(context(
+        &[
+            ("short", Stage::Plain, &short_worker),
+            ("long", Stage::Plain, &long_worker),
+        ],
+        vec![long, short],
+    ));
+
+    // Qwen rerankers include the instruction in every query-document prompt.
+    for (instruct, worker) in [
+        ("Rank relevant documents.".to_owned(), &short_worker),
+        ("instruction ".repeat(8192), &long_worker),
+    ] {
+        let body = serde_json::json!({"query": "hi", "documents": ["yo"], "instruct": instruct});
+        let req = Request::post("/v1/rerank")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+        assert_eq!(worker.captured_json().await, body);
+    }
 }
 
 #[tokio::test]

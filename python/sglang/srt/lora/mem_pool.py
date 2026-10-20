@@ -138,9 +138,6 @@ class LoRAMemoryPool:
         base_hf_config: AutoConfig,
         max_loras_per_batch: int,
         dtype: torch.dtype,
-        tp_size: int,
-        tp_rank: int,
-        attn_tp_size: int,
         max_lora_rank: int,
         target_modules: Set[str],
         base_model: torch.nn.Module,
@@ -154,8 +151,9 @@ class LoRAMemoryPool:
         self.num_layer: int = base_hf_config.num_hidden_layers
         self.max_loras_per_batch: int = max_loras_per_batch
         self.dtype: torch.dtype = dtype
-        self.tp_size: int = tp_size
-        self.tp_rank: int = tp_rank
+        parallel = get_parallel()
+        self.tp_size: int = parallel.tp_size
+        self.tp_rank: int = parallel.tp_rank
         self.lora_added_tokens_size: int = lora_added_tokens_size
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
@@ -193,7 +191,7 @@ class LoRAMemoryPool:
         # under attention DP is `attn_tp_size = tp_size // attn_dp_size`.
         # The corresponding LoRA wrappers slice weights by the base layer's
         # attn_tp-local rank, so the buffer shapes must match that shard.
-        self.attn_tp_size: int = attn_tp_size
+        self.attn_tp_size: int = parallel.attn_tp_size
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -227,7 +225,7 @@ class LoRAMemoryPool:
         # Cache lm_head shard_indices from the base model so that buffer
         # allocation uses the same sharding as the base ParallelLMHead layer.
         self.lm_head_shard_indices = None
-        if "lm_head" in target_modules and tp_size > 1:
+        if "lm_head" in target_modules and self.tp_size > 1:
             from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
             for _, module in base_model.named_modules():

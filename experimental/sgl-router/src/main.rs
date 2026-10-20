@@ -10,10 +10,7 @@ use sgl_router::{
         KvIndexerEndpointConfig, LogFormat, PolicyKind,
     },
     discovery::{spawn_discovery, ModelId},
-    policies::{
-        factory::build_registry as build_policy_registry, prefix_provider::RadixTreePrefixProvider,
-        PolicyRegistry,
-    },
+    policies::{factory::build_registry as build_policy_registry, PolicyRegistry},
     policies_reorg::factory::build_resolver as build_reorg_resolver,
     proxy::Proxy,
     server::{
@@ -22,7 +19,7 @@ use sgl_router::{
         shutdown::drain_for_termination,
     },
     state::{
-        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex},
+        kv_events::{BlockSizeOracle, BootstrapTracker, KvEventIndex, RadixTreePrefixProvider},
         load_monitor::router_inflight_load::{
             spawn_janitor, JanitorHandle, RouterInflightLoadRegistry, SystemTimeClock,
         },
@@ -40,6 +37,7 @@ use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 const DRAIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Heartbeat escalates INFO -> WARN here: earlier is a routine rollout draining
@@ -151,7 +149,18 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
     tracing::info!("listening on {listen_addr}");
-    let outcome = serve(listener, app_context, sigterm, sigint).await;
+    let grpc_listener = match config.server.grpc_port {
+        Some(port) => {
+            let grpc_addr = format!("{}:{port}", config.server.host);
+            let listener = TcpListener::bind(&grpc_addr)
+                .await
+                .with_context(|| format!("bind {grpc_addr}"))?;
+            tracing::info!("serving native gRPC on {grpc_addr}");
+            Some(listener)
+        }
+        None => None,
+    };
+    let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();
@@ -375,6 +384,10 @@ fn build_app_context(
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
     .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    if let Some(cache) = config.model.cache_aware.as_ref() {
+        let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
+        engine_state.tree().pending().enable(ttl);
+    }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();
     app_context.kv_metrics = engine_state.metrics_source();
@@ -391,6 +404,7 @@ struct ServeOutcome {
 
 async fn serve(
     listener: TcpListener,
+    grpc_listener: Option<TcpListener>,
     app_context: Arc<AppContext>,
     sigterm: Signal,
     sigint: Signal,
@@ -402,13 +416,37 @@ async fn serve(
         Arc::clone(&app_context),
         drain_rx.clone(),
     ));
-    let result = axum::serve(listener, app)
+    // gRPC stops accepting with HTTP, or when HTTP serving fails.
+    let grpc_stop = CancellationToken::new();
+    let grpc = grpc_listener.map(|listener| {
+        let stop = grpc_stop.clone();
+        let app_context = Arc::clone(&app_context);
+        tokio::spawn(async move {
+            let shutdown = async move { stop.cancelled().await };
+            let result = sgl_router::server::grpc::serve(listener, app_context, shutdown).await;
+            if let Err(error) = &result {
+                tracing::error!(%error, "native gRPC server stopped");
+            }
+            result
+        })
+    });
+    let stop = grpc_stop.clone();
+    let mut result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal(sigterm, sigint, app_context, drain).await;
             let _ = drain_tx.send(Some(Instant::now()));
+            stop.cancel();
         })
         .await
         .context("axum serve");
+    grpc_stop.cancel();
+    if let Some(grpc) = grpc {
+        let grpc_result = grpc
+            .await
+            .context("gRPC server task")
+            .and_then(|r| r.context("gRPC serve"));
+        result = result.and(grpc_result);
+    }
     heartbeat.abort();
     let inflight_drain_secs = drain_rx.borrow().map(|at| at.elapsed().as_secs());
     ServeOutcome {

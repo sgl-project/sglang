@@ -21,32 +21,21 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion import (
-    mount_flux2_nvfp4_swiglu_quant,
-    mount_fused_gate_rmsnorm,
-    mount_fused_linear_gelu,
-    mount_fused_ln_modulate,
-    mount_helios_gated_residual,
-    mount_hunyuan_qknorm,
-    mount_lingbot_video_gated_residual,
-    mount_lingbot_video_rmsnorm,
-    mount_ltx2_qknorm_split_rope,
-    mount_ltx2_rms_norm_modulate,
-    mount_nvfp4_bias_gelu,
-    mount_qwen_image_added_qkv,
-    mount_sana_video_linear_attention,
-    unmount_flux2_nvfp4_swiglu_quant,
-    unmount_fused_gate_rmsnorm,
-    unmount_fused_linear_gelu,
-    unmount_fused_ln_modulate,
-    unmount_helios_gated_residual,
-    unmount_hunyuan_qknorm,
-    unmount_lingbot_video_gated_residual,
-    unmount_lingbot_video_rmsnorm,
-    unmount_ltx2_qknorm_split_rope,
-    unmount_ltx2_rms_norm_modulate,
-    unmount_nvfp4_bias_gelu,
-    unmount_qwen_image_added_qkv,
-    unmount_sana_video_linear_attention,
+    FLUX2_NVFP4_SWIGLU_QUANT,
+    FUSED_GATE_RMSNORM,
+    FUSED_LINEAR_GELU,
+    FUSED_LN_MODULATE,
+    HELIOS_GATED_RESIDUAL,
+    HUNYUAN_QKNORM,
+    LINGBOT_VIDEO_GATED_RESIDUAL,
+    LINGBOT_VIDEO_RMSNORM,
+    LTX2_QKNORM_SPLIT_ROPE,
+    LTX2_RMS_NORM_MODULATE,
+    MINIMAX_H3_NORM_MODULATE,
+    NVFP4_BIAS_GELU,
+    QWEN_IMAGE_ADDED_QKV,
+    SANA_VIDEO_LINEAR_ATTENTION,
+    QualityGatedFusion,
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
@@ -56,7 +45,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    quality_allows_kernel_fusions,
+    quality_allows,
     resolve_skip_softmax_params,
 )
 from sglang.multimodal_gen.configs.task_type import get_request_task_type
@@ -134,7 +123,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
-    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_ti2v import (
     blend_wan_ti2v_latents,
@@ -172,80 +160,54 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     CompiledModuleRegistry,
+    apply_inductor_config,
     resolve_torch_compile_kwargs,
 )
 
 logger = init_logger(__name__)
 
-_QUALITY_FUSION_HANDLERS: tuple[
-    tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
-] = (
-    (
-        "FLUX.2 NVFP4 FC1+SwiGLU+quant",
-        mount_flux2_nvfp4_swiglu_quant,
-        unmount_flux2_nvfp4_swiglu_quant,
-    ),
-    (
-        "fused linear+GELU (cublasLt epilogue)",
-        mount_fused_linear_gelu,
-        unmount_fused_linear_gelu,
-    ),
-    (
-        "Wan NVFP4 fused bias+GELU",
-        mount_nvfp4_bias_gelu,
-        unmount_nvfp4_bias_gelu,
-    ),
-    (
-        "Qwen-Image fused added-QKV",
-        mount_qwen_image_added_qkv,
-        unmount_qwen_image_added_qkv,
-    ),
-    (
-        "fused LN+modulate (affine folding)",
-        mount_fused_ln_modulate,
-        unmount_fused_ln_modulate,
-    ),
-    (
-        "LTX-2 Hopper QKNorm+split-RoPE",
-        mount_ltx2_qknorm_split_rope,
-        unmount_ltx2_qknorm_split_rope,
-    ),
-    (
-        "LTX-2 fused RMSNorm+modulate",
-        mount_ltx2_rms_norm_modulate,
-        unmount_ltx2_rms_norm_modulate,
-    ),
-    (
-        "fused gate RMSNorm (BF16-native Triton)",
-        mount_fused_gate_rmsnorm,
-        unmount_fused_gate_rmsnorm,
-    ),
-    (
-        "HunyuanVideo strided QK RMSNorm",
-        mount_hunyuan_qknorm,
-        unmount_hunyuan_qknorm,
-    ),
-    (
-        "LingBot Video fused RMSNorm",
-        mount_lingbot_video_rmsnorm,
-        unmount_lingbot_video_rmsnorm,
-    ),
-    (
-        "LingBot Video per-token gated residual",
-        mount_lingbot_video_gated_residual,
-        unmount_lingbot_video_gated_residual,
-    ),
-    (
-        "Helios per-token gated residual",
-        mount_helios_gated_residual,
-        unmount_helios_gated_residual,
-    ),
-    (
-        "SANA-Video BF16-input linear attention",
-        mount_sana_video_linear_attention,
-        unmount_sana_video_linear_attention,
-    ),
+# Request-gated DiT fusions and the lowest quality level that may mount each
+# one. A fusion belongs to "lossless" when it keeps the reference math and the
+# precision of every operand and accumulator, changing only where or in which
+# order the rounding happens; one that lowers a precision or quantizes belongs
+# to "high". No entry is tier "exact": the default must keep running the same
+# kernels it runs today, so a by-construction bit-exact fast path has to come
+# with a BitExactFusionGate before it can move there.
+_QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
+    # quantizes FC2's input before the reference BF16 intermediate exists
+    ("high", FLUX2_NVFP4_SWIGLU_QUANT),
+    ("lossless", FUSED_LINEAR_GELU),
+    ("lossless", NVFP4_BIAS_GELU),
+    ("lossless", QWEN_IMAGE_ADDED_QKV),
+    ("lossless", FUSED_LN_MODULATE),
+    ("lossless", LTX2_QKNORM_SPLIT_ROPE),
+    ("lossless", LTX2_RMS_NORM_MODULATE),
+    # Ideogram's reference keeps the norm statistics in fp32; the
+    # BF16-native kernel rounds them, which lowers accumulation precision
+    ("high", FUSED_GATE_RMSNORM),
+    ("lossless", HUNYUAN_QKNORM),
+    ("lossless", LINGBOT_VIDEO_RMSNORM),
+    ("lossless", LINGBOT_VIDEO_GATED_RESIDUAL),
+    ("lossless", HELIOS_GATED_RESIDUAL),
+    ("lossless", MINIMAX_H3_NORM_MODULATE),
+    # the first attention GEMM takes BF16 inputs where the reference
+    # promotes them to FP32
+    ("high", SANA_VIDEO_LINEAR_ATTENTION),
 )
+
+
+def toggle_quality_fusions(transformers: list[nn.Module | None], quality: str) -> None:
+    """Mount the fusions ``quality`` allows on each transformer, unmount the rest."""
+    mounted_fusions: set[str] = set()
+    for transformer in filter(None, transformers):
+        for tier, fusion in _QUALITY_FUSION_HANDLERS:
+            if quality_allows(quality, tier):
+                if fusion.mount(transformer):
+                    mounted_fusions.add(fusion.name)
+            else:
+                fusion.unmount(transformer)
+    for name in sorted(mounted_fusions):
+        logger.debug("Mounted %s for quality=%s", name, quality)
 
 
 def _ensure_tensor_model_output(model_output):
@@ -340,11 +302,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def role_affinity(self):
         return RoleType.DENOISER
 
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
-
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
@@ -353,17 +310,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.transformer_2 = transformer_2
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         # Per-request Cache-DiT overrides for the batch being executed
         # (stashed by _maybe_enable_cache_dit; read by the config builders).
         self._cache_dit_request_overrides: dict[str, Any] = {}
         # Overrides key the mounted hooks were built from; None when unmounted.
         self._cache_dit_active_key: tuple | None = None
-        # Whether request-scoped extra-high-or-higher fusions are mounted.
-        self._quality_fusions_mounted = False
+        # The quality level whose request-scoped fusions are mounted.
+        self._mounted_quality = "exact"
         self._torch_compile_registry = CompiledModuleRegistry()
-        # Breakable CUDA graph runners, one per transformer module (lazy).
-        self._bcg_runners: dict[int, Any] = {}
+        # Breakable CUDA graph runners, lazily created per (module, quality
+        # level); see _maybe_get_bcg_runner for why the level is in the key.
+        self._bcg_runners: dict[tuple[int, str], Any] = {}
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -406,7 +363,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # misc
         self.profiler = None
-        self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
@@ -533,6 +489,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     moved.append(module)
         return moved
 
+    def _explicit_dit_layerwise_offload(self) -> bool:
+        """True when the user asked for layerwise DiT residency, not a compile-only window."""
+        args = self.server_args
+        if args.dit_layerwise_offload:
+            return True
+        return bool(getattr(args, "is_dit_layerwise_offload_selected", False))
+
     def _maybe_torch_compile(self, module: object) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
@@ -553,6 +516,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return
 
         dit_config = getattr(self.server_args.pipeline_config, "dit_config", None)
+        if not current_platform.is_npu():
+            apply_inductor_config(
+                getattr(dit_config, "torch_compile_inductor_config", {})
+            )
         compile_kwargs, mode = resolve_torch_compile_kwargs(
             "SGLANG_TORCH_COMPILE_MODE",
             config=dit_config,
@@ -611,8 +578,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
+        self._reset_dit_cache_states(batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
+
+    def _reset_dit_cache_states(self, batch: Req) -> None:
+        """Start every DiT's TeaCache and Spectrum state fresh for this request.
+
+        The DiTs reset themselves at denoising step 0, which a boundary expert
+        (Wan2.2 ``transformer_2``) never sees, so its state would otherwise carry
+        over from the previous request.
+        """
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            if batch.enable_teacache and hasattr(transformer, "reset_teacache_state"):
+                transformer.reset_teacache_state()
+            if batch.enable_spectrum and hasattr(transformer, "reset_spectrum_state"):
+                transformer.reset_spectrum_state(batch.spectrum_params)
 
     def _maybe_override_attention_backend(
         self, batch: Req, *, force_fa_for_self_attention: bool = False
@@ -763,45 +744,39 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
         """Mount/unmount request-gated kernel fusions for this batch.
 
-        These fusions are numerically equivalent only at half-precision
-        rounding level (not bit-exact), so they are mounted for both
-        ``quality="extra-high"`` and ``quality="high"``. The ``"lossless"``
-        default runs the reference path bit-for-bit. ``quality`` participates
-        in the dynamic-batch signature, making this transition safe at the
-        batch boundary. Mounting is all-or-nothing per transformer and fusion
+        Each fusion declares the lowest quality level that may mount it (see
+        ``_QUALITY_FUSION_HANDLERS``), so a request mounts the fusions of its
+        own tier and of every stricter one; ``"exact"`` mounts none of them
+        and runs the reference path bit-for-bit. ``quality`` participates in
+        the dynamic-batch signature, making this transition safe at the batch
+        boundary. Mounting is all-or-nothing per transformer and fusion
         family; models without marked sites are no-ops.
+
+        Under breakable CUDA graphs the mounted set is baked into whatever was
+        captured, which is why the runner is keyed by level as well as module
+        (see :meth:`_maybe_get_bcg_runner`): changing level here cannot
+        silently replay another level's kernels.
         """
         quality = getattr(batch.sampling_params, "quality", "lossless")
-        want = quality_allows_kernel_fusions(quality)
-        if want == self._quality_fusions_mounted:
+        if quality == self._mounted_quality:
             return
-        mounted_fusions: set[str] = set()
-        for transformer in filter(None, [self.transformer, self.transformer_2]):
-            for description, mount, unmount in _QUALITY_FUSION_HANDLERS:
-                if want:
-                    if mount(transformer):
-                        mounted_fusions.add(description)
-                else:
-                    unmount(transformer)
-
-        if want and mounted_fusions and self.server_args.enable_breakable_cuda_graph:
-            for transformer in filter(None, [self.transformer, self.transformer_2]):
-                for _, _, unmount in _QUALITY_FUSION_HANDLERS:
-                    unmount(transformer)
-            descriptions = ", ".join(sorted(mounted_fusions))
-            raise ValueError(
-                f"quality={quality!r} cannot be used with breakable CUDA graphs for "
-                f"this model because its request-scoped DiT fusions "
-                f"({descriptions}) do not match the lossless warmup graphs. "
-                "Disable breakable CUDA graphs or use quality='lossless'."
-            )
-
-        self._quality_fusions_mounted = want
-        for description in sorted(mounted_fusions):
-            logger.debug("Mounted %s for quality=%s", description, quality)
+        toggle_quality_fusions([self.transformer, self.transformer_2], quality)
+        self._mounted_quality = quality
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
+
+    def _cache_dit_has_separate_cfg(self, batch: Req) -> bool:
+        """Whether CFG runs as separate cond/uncond transformer calls per step."""
+        return (
+            batch.do_classifier_free_guidance
+            and not self.server_args.enable_cfg_parallel
+        )
+
+    def _cache_dit_joint_cfg_decision(self) -> bool:
+        """Whether one forward carries the whole CFG pair (see
+        ``enable_cache_on_transformer``)."""
+        return False
 
     def _cache_dit_requested(self) -> bool:
         """Request-independent server default (init-time decisions only)."""
@@ -819,7 +794,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             disable_cache_on_transformer(transformer)
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._cache_dit_active_key = None
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
@@ -1035,8 +1009,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
+        has_separate_cfg = requested and self._cache_dit_has_separate_cfg(batch)
         desired_key = (
-            cache_dit_overrides_key(self._cache_dit_request_overrides)
+            (
+                cache_dit_overrides_key(self._cache_dit_request_overrides),
+                has_separate_cfg,
+            )
             if requested
             else None
         )
@@ -1063,11 +1041,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     steps_computation_policy=scm_policy,
                 )
             else:
-                scm_preset = None if scm_preset == "none" else scm_preset
                 refresh_context_on_transformer(
                     self.transformer,
                     primary_num_steps,
-                    scm_preset=scm_preset,
+                    steps_computation_mask=steps_computation_mask,
+                    steps_computation_policy=scm_policy,
                 )
             return
 
@@ -1142,6 +1120,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name=self._cache_dit_dual_model_name(),
                 sp_group=sp_group,
                 tp_group=tp_group,
+                has_separate_cfg=has_separate_cfg,
             )
             logger.info(
                 "cache-dit enabled on dual transformers (steps=%d, %d)",
@@ -1156,7 +1135,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 model_name="transformer",
                 sp_group=sp_group,
                 tp_group=tp_group,
-                has_separate_cfg=batch.do_classifier_free_guidance,
+                has_separate_cfg=has_separate_cfg,
+                joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )
             logger.info(
                 "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
@@ -1167,7 +1147,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
 
         self._cache_dit_enabled = True
-        self._cached_num_steps = num_inference_steps
         self._cache_dit_active_key = desired_key
 
     @lru_cache(maxsize=8)
@@ -1198,11 +1177,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        # return StageParallelismType.CFG_PARALLEL if get_global_server_args().enable_cfg_parallel else StageParallelismType.REPLICATED
-        return StageParallelismType.REPLICATED
 
     def _handle_boundary_ratio(
         self,
@@ -2020,11 +1994,19 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 for module in moved:
                     module.to(device)
             return
-        # prepare for first real request: restore the user-configured residency
-        for module in self._offloaded_dit_modules_for_compile:
-            module.disable_offload()
+        # Compile-only offload is undone so the real request is GPU-resident.
+        # An explicit layerwise request must stay enabled: disable_offload()
+        # clears manager.enabled, and the next use-site then raises
+        # ComponentResidencyError (Wan transformer_2).
+        if not self._explicit_dit_layerwise_offload():
+            for module in self._offloaded_dit_modules_for_compile:
+                module.disable_offload()
         # clear the list for avoid overhead during real request
         self._offloaded_dit_modules_for_compile.clear()
+        # The warmup traced the offload hooks, whose graph breaks inside the
+        # block loop make Dynamo skip the DiT frame for good. Forget it, so
+        # this request compiles whole graphs from the cached autotune results.
+        torch._dynamo.reset()
         yield
 
     def forward(
@@ -2054,11 +2036,40 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 neg_cond_kwargs=ctx.neg_cond_kwargs,
                 guidance=ctx.guidance,
             )
+        timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
+
+        # collect rollout outputs before finalization gathers or replaces latents
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=ctx.latents,
+                num_inference_steps=len(timesteps_cpu),
+                final_timestep=timesteps_cpu.new_zeros(()),
+                server_args=server_args,
+            )
+        self._finalize_denoising_loop(ctx, batch, server_args)
+        return batch
+
+    def _run_denoising_loop(
+        self,
+        ctx: DenoisingContext,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        collect_trajectory: bool = True,
+    ) -> torch.Tensor:
+        """Run a prepared loop, including profiling and DiT residency.
+
+        Clip-based models can reuse this without finalizing the entire request.
+        """
         denoising_start_time = time.time()
         self._before_denoising_loop(ctx, batch, server_args)
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
+        progress_step_interval = ctx.extra.get(
+            "progress_step_interval", ctx.scheduler.order
+        )
         # Re-resolve the explicit-range gate so the per-step markers
         # below honor this request's is_warmup state. Layer hooks are
         # registered by the residency manager at the use-site.
@@ -2102,7 +2113,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         # BEFORE _run_denoising_step so ctx.latents is still the
                         # pre-step value. Gated on batch.rollout to keep the
                         # non-rollout path strictly untouched.
-                        if batch.rollout:
+                        if collect_trajectory and batch.rollout:
                             batch._rollout_loop_step_index = step_index
                             self._maybe_append_dit_trajectory_step(
                                 batch=batch,
@@ -2111,11 +2122,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                                 step_index=step_index,
                             )
                         self._run_denoising_step(ctx, step, batch, server_args)
-                        self._record_trajectory(ctx, step, batch, server_args)
+                        if collect_trajectory:
+                            self._record_trajectory(ctx, step, batch, server_args)
 
                         if step_index == num_timesteps - 1 or (
                             (step_index + 1) > ctx.num_warmup_steps
-                            and (step_index + 1) % ctx.scheduler.order == 0
+                            and (step_index + 1) % progress_step_interval == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
@@ -2135,20 +2147,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             del step
         self._finish_active_component_use()
 
-        # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
-        # the final scheduler.step output (ctx.latents) is still SP-sharded and
-        # can be gathered uniformly alongside the per-step dit_trajectory via
-        # gather_stacked_latents_for_sp.
-        if batch.rollout:
-            self._postprocess_rollout_outputs(
-                batch=batch,
-                latents=ctx.latents,
-                num_inference_steps=num_timesteps,
-                final_timestep=timesteps_cpu.new_zeros(()),
-                server_args=server_args,
-            )
-        self._finalize_denoising_loop(ctx, batch, server_args)
-        return batch
+        return timesteps_cpu
 
     def _get_extra_func_kwarg_names(self, func) -> tuple[bool, frozenset[str]]:
         import functools
@@ -2581,19 +2580,38 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return None
         if not isinstance(current_model, nn.Module):
             return None
-        key = id(current_model)
+        # A captured graph bakes in whichever fusions were mounted when it was
+        # recorded, and the capture signature only covers the tensors -- so a
+        # runner is per (module, quality level). Warmup runs at the default
+        # level and captures its graphs there; a request at another level
+        # finds an empty runner and the eager fallback runs the fusion set it
+        # actually asked for. Sharing one runner would replay the warmup
+        # level's kernels under a different level's name.
+        key = (id(current_model), self._mounted_quality)
         runner = self._bcg_runners.get(key)
         if runner is None:
             from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
                 DiffusionBreakableCudaGraphRunner,
             )
 
+            # Another level already has a runner, so this one arrived after
+            # warmup and will never hold a captured graph.
+            served_another_level = any(
+                model_id == id(current_model) for model_id, _ in self._bcg_runners
+            )
             # DenoisingStage can switch between transformer and transformer_2;
             # each module owns separate graph state and static input buffers.
             runner = DiffusionBreakableCudaGraphRunner(
                 current_model, get_local_torch_device()
             )
             self._bcg_runners[key] = runner
+            if served_another_level:
+                logger.info_once(
+                    "quality=%s has no captured breakable CUDA graphs (warmup "
+                    "captures the server's default level), so its requests run "
+                    "eager.",
+                    self._mounted_quality,
+                )
         return runner
 
     def prepare_sta_param(self, batch: Req, server_args: ServerArgs):
