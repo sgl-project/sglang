@@ -5,14 +5,13 @@ from __future__ import annotations
 import logging
 
 import torch
-import torch.distributed as dist
 
+from sglang.srt.layers.moe.dwdp import layout
 from sglang.srt.layers.moe.dwdp.layer_utils import (
     collect_moe_layers,
     gather_per_expert_tensors,
     validate_moe_layers,
 )
-from sglang.srt.layers.moe.dwdp.layout import WeightSpec, build_remote_slices
 from sglang.srt.layers.moe.dwdp.weight_manager import DwdpPrefetch
 from sglang.srt.runtime_context import get_parallel
 
@@ -38,32 +37,26 @@ class NPUDwdpManager(DwdpPrefetch):
         self._vmm = None
         self._state = "new"
 
-    def _gather(self, value):
-        values = [None] * self.dwdp_size
-        dist.all_gather_object(values, value, group=self.group.cpu_group)
-        return values
-
     def setup(self, model):
         if self._state == "ready":
             return
         layers = collect_moe_layers(model)
         num_routed = validate_moe_layers(layers, self.dwdp_size, model)
-        count = num_routed // self.dwdp_size
-        self._peer_ranges = [
-            (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
-        ]
+        self._peer_ranges = layout.DwdpExpertLayout(
+            num_routed, self.dwdp_size, self.dwdp_rank
+        ).peer_ranges
         local_start, local_end = self._peer_ranges[self.dwdp_rank]
         self._specs.clear()
         for li, layer in layers:
             for name in self._weight_names:
                 weight = getattr(layer, name)
-                self._specs[li, name] = WeightSpec(
+                self._specs[li, name] = layout.WeightSpec(
                     num_routed,
                     tuple(weight.shape),
                     (num_routed, *weight.shape[1:]),
                     weight.dtype,
                 )
-        key_counts = self._gather(len(self._specs))
+        key_counts = self.group.all_gather_object(len(self._specs))
         if any(count != len(self._specs) for count in key_counts):
             raise RuntimeError(
                 f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
@@ -72,7 +65,7 @@ class NPUDwdpManager(DwdpPrefetch):
         _check(ret, "device_get_bare_tgid")
         peer_pids = [
             peer_pid
-            for rank, peer_pid in enumerate(self._gather(pid))
+            for rank, peer_pid in enumerate(self.group.all_gather_object(pid))
             if rank != self.dwdp_rank
         ]
 
@@ -91,7 +84,7 @@ class NPUDwdpManager(DwdpPrefetch):
                     )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-        errors = self._gather(error)
+        errors = self.group.all_gather_object(error)
         if any(errors):
             raise RuntimeError(f"NPU DWDP weight migration/export failed: {errors}")
         logger.info("DWDP handle exchange via FABRIC")
@@ -105,12 +98,12 @@ class NPUDwdpManager(DwdpPrefetch):
             self._replicate_small_params(layer)
             weights = {name: self._weights[li, name] for name in self._weight_names}
             for name, full in weights.items():
-                self._remote_slices[li, name] = build_remote_slices(
+                self._remote_slices[li, name] = layout.build_remote_slices(
                     full, local_start, local_end, num_routed
                 )
             layer.bind_full_expert_weights(weights)
 
-        for rank, handles in enumerate(self._gather(self._exports)):
+        for rank, handles in enumerate(self.group.all_gather_object(self._exports)):
             if rank == self.dwdp_rank:
                 continue
             for key, handle in handles.items():
@@ -125,7 +118,7 @@ class NPUDwdpManager(DwdpPrefetch):
                     device=self.device,
                 )
         torch.npu.synchronize(self.device)
-        dist.barrier(group=self.group.cpu_group)
+        self.group.barrier()
         torch.npu.empty_cache()
         self._state = "ready"
         logger.info(
@@ -177,12 +170,12 @@ class NPUDwdpManager(DwdpPrefetch):
             return
         if self._state != "new":
             torch.npu.synchronize(self.device)
-            dist.barrier(group=self.group.cpu_group)
+            self.group.barrier()
             self._peer_views.clear()
             self._remote_slices.clear()
             if self._vmm is not None:
                 self._vmm.close_imports()
-            dist.barrier(group=self.group.cpu_group)
+            self.group.barrier()
             if self._vmm is not None:
                 self._vmm.close()
         for data in (
