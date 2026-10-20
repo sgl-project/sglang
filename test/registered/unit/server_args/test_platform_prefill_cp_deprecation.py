@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
-_ENV_GATE = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+_ENV_GATE = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 
 
 def _cp_args(arch="DeepseekV4ForCausalLM", model_type="deepseek_v4", **overrides):
@@ -99,7 +99,10 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
             ("dsv4.*both phases", dict(prefill_attention_backend="flashinfer")),
             ("support multiple nodes", dict(nnodes=2)),
             ("support DeepSeek-V4.1", dict(model_type="deepseek_v41")),
-            ("bounded-replay", dict(enable_decoder_swa_bounded_replay=True)),
+            (
+                "decoder SWA bounded replay",
+                dict(enable_decoder_swa_bounded_replay=True),
+            ),
             ("two-batch-overlap", dict(enable_two_batch_overlap=True)),
         )
         for regex, overrides in cases:
