@@ -2224,6 +2224,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cons, _, _ = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
+        avail_before = cons.swa_kv_pool_host.available_size()
         self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
 
         m = match_prefix(cons, seq)
@@ -2231,6 +2232,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
         )
+        cons.drain_storage_control_queues()  # Drain the release queue.
+        self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
         cons.sanity_check()
 
     def test_tp_swa_prefetch_adopted_when_peer_present(self):
@@ -2253,28 +2256,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             "SWA must be adopted when all ranks have it",
         )
         cons.sanity_check()
-
-    def test_tp_swa_prefetch_drop_frees_host_pool(self):
-        """A dropped SWA prefetch must return its whole host buffer to the pool
-        (no leak, no over-free)."""
-        setup = self._setup_swa_tp_prefetch()
-        if setup is None:
-            return
-        storage_dir, seq = setup
-
-        cons, _, _ = self._l3_consumer(storage_dir)
-        cons.tp_world_size = 2
-        self._patch_tp_prefetch_sync(cons, drop_swa=True)
-        avail_before = cons.swa_kv_pool_host.available_size()
-        self._consume_prefetch(cons, seq, CacheRequestHandle("drop", 0))
-
-        self.assertEqual(
-            match_prefix(cons, seq).host_hit_length,
-            0,
-        )
-        # Whole window dropped -> its host buffer is fully released back.
-        cons.drain_storage_control_queues()  # Drain the release queue.
-        self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
 
     @requires_full_swa_ps1
     def test_prepare_prefetch_swa(self):

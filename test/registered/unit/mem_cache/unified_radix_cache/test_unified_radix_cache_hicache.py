@@ -365,30 +365,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
-    def test_hicache_evict_to_host(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        seq = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-
-        m = match_prefix(cache, seq)
-        node = m.last_device_node
-
-        self._backup_node(cache, node)
-        self.assertTrue(cache.tree_core.is_backuped(node))
-
-        result = cache.evict(EvictParams(num_tokens=len(seq)))
-        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
-
-        self.assertTrue(cache.tree_core.is_full_device_evicted(node))
-        self.assertTrue(cache.tree_core.is_backuped(node))
-        self.assertIsNone(node_device_value(cache, node, ComponentType.FULL))
-        self.assertIsNotNone(node_host_value(cache, node, ComponentType.FULL))
-
-        self.assertFalse(cache.tree_core.is_device_evictable_leaf(node))
-        self.assertTrue(cache.tree_core.is_host_evictable_leaf(node))
-        cache.sanity_check()
-
-    @requires_hicache
     def test_hicache_partial_match_splits_evicted_backed_up_node(self):
         """Partial matches on host-only nodes must keep the host prefix usable."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -457,6 +433,10 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self._backup_node(cache, node)
         cache.evict(EvictParams(num_tokens=len(seq)))
 
+        self.assertTrue(cache.tree_core.is_backuped(node))
+        self.assertIsNone(node_device_value(cache, node, ComponentType.FULL))
+        self.assertIsNotNone(node_host_value(cache, node, ComponentType.FULL))
+        self.assertFalse(cache.tree_core.is_device_evictable_leaf(node))
         self.assertTrue(cache.tree_core.is_full_device_evicted(node))
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(node))
 

@@ -1469,25 +1469,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
         cache.sanity_check()
 
-    def test_evict_leaf_frees_all_components(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 3)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-
-        full_before = cache.full_evictable_size()
-        mamba_before = cache.mamba_evictable_size() if self.cfg.has_mamba else 0
-        swa_before = cache.swa_evictable_size() if self.cfg.has_swa else 0
-        self.assertGreater(full_before, 0)
-
-        result = cache.evict(EvictParams(num_tokens=full_before * 2))
-        self.assertGreaterEqual(result.num_tokens_evicted, full_before)
-        self.assertEqual(cache.full_evictable_size(), 0)
-        if self.cfg.has_mamba:
-            self.assertEqual(cache.mamba_evictable_size(), 0)
-        if self.cfg.has_swa:
-            self.assertEqual(cache.swa_evictable_size(), 0)
-        cache.sanity_check()
-
     def test_evict_cascade_parent_becomes_d_leaf(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         base = self._make_seq(1, 2)
@@ -1524,6 +1505,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         result = cache.evict(EvictParams(num_tokens=initial_evictable * 2))
         self.assertGreaterEqual(result.num_tokens_evicted, initial_evictable)
         self.assertEqual(cache.full_evictable_size(), 0)
+        if self.cfg.has_mamba:
+            self.assertEqual(cache.mamba_evictable_size(), 0)
+        if self.cfg.has_swa:
+            self.assertEqual(cache.swa_evictable_size(), 0)
         self.assertEqual(len(node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
@@ -1567,37 +1552,23 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertEqual(m_low.device_prefix_len, 0)
         cache.sanity_check()
 
-    def test_evict_multiple_independent_leaves(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seqs = [self._make_seq(i * 100, 2) for i in range(4)]
-        for s in seqs:
-            self._insert(cache, allocator, req_to_token_pool, s)
-
-        total = sum(len(s) for s in seqs)
-        self.assertEqual(cache.full_evictable_size(), total)
-
-        half = total // 2
-        result = cache.evict(EvictParams(num_tokens=half))
-        self.assertGreaterEqual(result.num_tokens_evicted, half)
-        self.assertLessEqual(cache.full_evictable_size(), total - half)
-        cache.sanity_check()
-
-        remaining = cache.full_evictable_size()
-        result = cache.evict(EvictParams(num_tokens=remaining * 2))
-        self.assertGreaterEqual(result.num_tokens_evicted, remaining)
-        self.assertEqual(cache.full_evictable_size(), 0)
-        cache.sanity_check()
-
     def test_evict_result_accounting_matches_actual(self):
+        """Partial and full eviction both report exactly what they freed."""
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seqs = [self._make_seq(i * 100, 2) for i in range(5)]
         for s in seqs:
             self._insert(cache, allocator, req_to_token_pool, s)
 
         before = cache.full_evictable_size()
-        result = cache.evict(EvictParams(num_tokens=before))
+        half = before // 2
+        result = cache.evict(EvictParams(num_tokens=half))
         after = cache.full_evictable_size()
+        self.assertGreaterEqual(result.num_tokens_evicted, half)
         self.assertEqual(result.num_tokens_evicted, before - after)
+
+        remaining = cache.full_evictable_size()
+        cache.evict(EvictParams(num_tokens=remaining * 2))
+        self.assertEqual(cache.full_evictable_size(), 0)
         cache.sanity_check()
 
     @requires_swa

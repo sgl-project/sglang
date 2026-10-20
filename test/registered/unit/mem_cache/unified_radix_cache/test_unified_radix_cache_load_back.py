@@ -753,36 +753,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
         self._release_ongoing_load_back_locks(cache)
 
-    @requires_full_mamba_ps1
-    def test_load_back_success_publishes_fresh_mamba_slot(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
-
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        loaded = cache.load_back(leaf, req=req)
-
-        self.assertTrue(loaded)
-        # the successful load must keep the freshly allocated slot published
-        self.assertIsNotNone(req.kv.mamba_pool_idx)
-        self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.MAMBA))
-        # one slot restores the node's mamba value, one is the request's CoW slot
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail - 2
-        )
-        self._finish_pending_loads(cache)
-        self._release_ongoing_load_back_locks(cache)
-
     @requires(
         lambda cfg: (
             cfg.has_mamba
@@ -863,10 +833,16 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         req = self._make_req(req_to_token_pool)
         req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
         req.kv.mamba_pool_idx = None
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
         loaded = cache.load_back(leaf, req=req)
         self.assertTrue(loaded)
         self.assertIsNotNone(req.kv.mamba_pool_idx)
+        self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.MAMBA))
+        # one slot restores the node's mamba value, one is the request's CoW slot
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_avail - 2
+        )
         self._finish_pending_loads(cache)
 
         # The CoW slot must actually hold the backed-up mamba state, not merely exist.
