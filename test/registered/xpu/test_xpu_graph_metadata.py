@@ -154,6 +154,7 @@ class TestXPUGraphMetadata(CustomTestCase):
             attn_backend = SimpleNamespace(
                 attention_chunk_size=512,
                 dllm_attention=None,
+                prefill_cuda_graph_default_max_seq_len=None,
             )
             req_to_token_pool = SimpleNamespace(
                 size=16,
@@ -162,7 +163,7 @@ class TestXPUGraphMetadata(CustomTestCase):
             model_config = SimpleNamespace(
                 is_multimodal=False,
                 hidden_size=64,
-                hf_config=SimpleNamespace(),
+                hf_config=SimpleNamespace(model_type=None),
             )
             model = SimpleNamespace(quant_config=None)
             lora_manager = None
@@ -228,6 +229,7 @@ class TestXPUGraphMetadata(CustomTestCase):
             attn_backend = SimpleNamespace(
                 attention_chunk_size=512,
                 dllm_attention=None,
+                prefill_cuda_graph_default_max_seq_len=None,
             )
             req_to_token_pool = SimpleNamespace(
                 size=16,
@@ -237,7 +239,7 @@ class TestXPUGraphMetadata(CustomTestCase):
                 is_multimodal=False,
                 hidden_size=64,
                 attention_chunk_size=512,
-                hf_config=SimpleNamespace(),
+                hf_config=SimpleNamespace(model_type=None),
             )
             model = _FakeModel()
             lora_manager = None
