@@ -155,6 +155,9 @@ class HiDreamO1ImagePipeline(ComposedPipelineBase):
                 num_train_timesteps=1000,
                 shift=HIDREAM_O1_FLOW_SHIFT,
                 prediction_type="flow_prediction",
+                # The denoising stage's x_pred -> velocity conversion is only
+                # inverted by the x0 branch of convert_model_output.
+                predict_x0=True,
                 use_dynamic_shifting=False,
             ),
         }

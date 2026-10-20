@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    qwen3_apply_rotary_pos_emb,
+)
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -55,12 +58,6 @@ def timestep_embedding(
     )
     args = timestep[:, None].float() * freqs[None]
     return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
 
 
 class HiDreamO1RotaryEmbedding(nn.Module):
@@ -216,17 +213,10 @@ class HiDreamO1Attention(nn.Module):
         )
         v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # Rope wants [B, H, S, D]; LocalAttention wants [B, S, H, D].
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-        q = q * cos + rotate_half(q) * sin
-        k = k * cos + rotate_half(k) * sin
+        # cos/sin are [B, S, D]; broadcast over the head axis of [B, S, H, D].
+        q, k = qwen3_apply_rotary_pos_emb(q, k, cos.unsqueeze(2), sin.unsqueeze(2))
 
-        attn_output = self.attn(
-            q.transpose(1, 2), k.transpose(1, 2), v, attn_mask=attention_mask
-        )
+        attn_output = self.attn(q, k, v, attn_mask=attention_mask)
         output, _ = self.o_proj(attn_output.reshape(batch_size, seq_len, -1))
         return output
 

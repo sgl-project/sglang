@@ -16,6 +16,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
     HIDREAM_O1_NEG_COND_KEY,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
@@ -302,7 +305,7 @@ class HiDreamO1ImageBeforeDenoisingStage(PipelineStage):
             device=device,
         )
 
-        scheduler = self.scheduler
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         scheduler.set_timesteps(batch.num_inference_steps, device=device)
 
         batch.extra[HIDREAM_O1_COND_KEY] = cond
@@ -357,7 +360,7 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
         sigma = ctx.scheduler.sigmas[step.step_index].to(
             device=ctx.latents.device, dtype=torch.float32
         )
-        # The pixel head is conditioned on the flow position (1 -> 0), which runs
+        # The pixel head is conditioned on the flow position (0 -> 1), which runs
         # opposite to the scheduler's timestep (1000 -> 0).
         flow_position = (1.0 - sigma).reshape(-1).expand(ctx.latents.shape[0])
 
@@ -377,14 +380,13 @@ class HiDreamO1ImageDenoisingStage(DenoisingStage):
                 guidance=ctx.guidance,
                 latents=ctx.latents,
             )
-        if server_args.comfyui_mode:
-            batch.noise_pred = x_pred
-
         with maybe_nvtx_range("scheduler_step", use_nvtx):
             sample = ctx.latents.float()
             # Exact inverse of the scheduler's own convert_model_output, which
             # recovers x_pred as ``sample - sigma * model_output``.
             model_output = (sample - x_pred.float()) / sigma.clamp_min(HIDREAM_O1_T_EPS)
+            if server_args.comfyui_mode:
+                batch.noise_pred = model_output
             ctx.latents = ctx.scheduler.step(
                 model_output=model_output,
                 timestep=step.t_device,

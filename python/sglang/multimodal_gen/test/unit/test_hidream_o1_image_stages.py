@@ -229,6 +229,7 @@ class TestHiDreamO1SchedulerContract(unittest.TestCase):
             num_train_timesteps=1000,
             shift=HIDREAM_O1_FLOW_SHIFT,
             prediction_type="flow_prediction",
+            predict_x0=True,
             use_dynamic_shifting=False,
         )
         scheduler.set_timesteps(50, device=CPU)
