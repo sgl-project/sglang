@@ -196,6 +196,7 @@ class _MockTemplateManager:
         self.reasoning_config = None
         self.force_reasoning = False
         self.jinja_template_may_reorder_tool_results = False
+        self.python_chat_template = None
 
 
 class TestChatTemplateCache(CustomTestCase):

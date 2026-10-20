@@ -104,16 +104,17 @@ and will keep growing; they are implementation homes, not operator groups.
   (Humanize2) workflow, in CUDA, Triton, or CuTe DSL, with their JIT sources in
   `kda_kernels/csrc/`. `KernelBackend.KDA` records that provenance.
 - `cake_kernels/` — thin adapters to Cake-generated kernels that FlashInfer
-  distributes (generated sources and caches stay in FlashInfer); they register
-  with the provenance of that library (`KernelBackend.FLASHINFER`).
+  distributes (generated sources and caches stay in FlashInfer).
+  `KernelBackend.CAKE` records that provenance.
 
 Their public ops are registered into the logical groups with
 `KernelSpec(op="<group>.<name>", backend=..., target="sglang.kernels.kda_kernels.<mod>:<fn>")`
 (or a `cake_kernels` target), and runtime code imports the `ops.<group>`
 facade, never these packages. Put a new agent-generated kernel in the matching
-directory with its provenance (see `kda_kernels/README.md`). List them from the
-registry by target (an agent kernel that is the op's only implementation may
-keep its language backend, e.g. `TRITON`):
+directory and register it with that directory's backend (`KDA` or `CAKE`),
+whatever language it is written in (see `kda_kernels/README.md`);
+`test_kernels_namespace.py` enforces the pairing. List them from the registry
+by backend:
 
 ```python
 import sglang.kernels.ops  # populate the registry
@@ -122,10 +123,7 @@ from sglang.kernels import KernelBackend, registry
 agent_kernels = [
     spec
     for spec in registry.all_specs()
-    if spec.backend is KernelBackend.KDA
-    or spec.target.startswith(
-        ("sglang.kernels.kda_kernels.", "sglang.kernels.cake_kernels.")
-    )
+    if spec.backend in (KernelBackend.KDA, KernelBackend.CAKE)
 ]
 ```
 
