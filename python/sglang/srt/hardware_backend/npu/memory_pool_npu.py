@@ -1,10 +1,9 @@
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
+import triton
 
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_buffer_dcp_sharded_triton,
-)
+from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_kernel
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
@@ -1054,7 +1053,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and self.index_head_dim is None
             and not self.is_draft_worker
         ):
-            # Both components use the common DCP writer's owner/skip rules.
+            # Separate NPU latent/RoPE buffers share the DCP-aware Triton body,
+            # not the CUDA host wrapper or its non-DCP no-RoPE specialization.
             loc = loc.contiguous()
             for dst, src in (
                 (self.k_buffer[layer_id - self.start_layer], cache_k),
@@ -1064,7 +1064,22 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 if src.stride(-1) != 1:
                     src = src.contiguous()
                 dst = dst.view(-1, src.shape[-1])
-                set_mla_kv_buffer_dcp_sharded_triton(dst, loc, src)
+                set_mla_kv_buffer_kernel[(loc.numel(), 1)](
+                    dst,
+                    src,
+                    src,
+                    loc,
+                    0,
+                    buffer_stride=dst.stride(0),
+                    nope_stride=src.stride(0),
+                    rope_stride=src.stride(0),
+                    nope_dim=src.shape[-1],
+                    rope_dim=0,
+                    BLOCK=triton.next_power_of_2(src.shape[-1]),
+                    DCP_RANK=parallel.dcp_rank,
+                    DCP_WORLD_SIZE=parallel.dcp_size,
+                    USE_GDC=False,
+                )
             return
 
         torch_npu.npu_scatter_nd_update_(

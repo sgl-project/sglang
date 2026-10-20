@@ -67,6 +67,11 @@ def forward_mla_attention_npu(
             attn_output = cp_lse_ag_out_rs_mla_npu(
                 attn_output, lse, get_parallel().dcp_group
             )
+        elif attn_output.shape[0] == 0:
+            # An idle DCP group has no partials to exchange.
+            attn_output = attn_output.new_empty(
+                (0, module.num_local_heads, module.kv_lora_rank)
+            )
         else:
             attn_output = dcp_a2a_lse_reduce(
                 attn_output,
