@@ -128,10 +128,18 @@ class DeploymentWorker:
         error = run_partition(self.scheduler, req)
         if error:
             raise RuntimeError(error)
-        values = {path: read_field(req, path) for path in self.role.outputs}
+        # staged results outlive compute and must not alias reusable output buffers
+        values = tree_map(
+            lambda value: value.clone() if isinstance(value, torch.Tensor) else value,
+            {path: read_field(req, path) for path in self.role.outputs},
+        )
         ready = torch.cuda.Event()
         ready.record()
-        return values, ready, req.metrics, req.extra["_deployment_peak_memory_mb"]
+        peak = max(
+            req.extra["_deployment_peak_memory_mb"],
+            torch.cuda.max_memory_allocated() / (1024**2),
+        )
+        return values, ready, req.metrics, peak
 
     async def _execute_message(self, message):
         ticket = message["ticket"]

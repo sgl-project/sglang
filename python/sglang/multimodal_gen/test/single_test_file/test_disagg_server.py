@@ -563,9 +563,11 @@ class TestStageDeploymentFlux3(TestDisaggFlux3Image):
                 f"tcp://{HOST}:{self.cluster.base_port}", device="cuda:0"
             ) as client:
                 first, second = await asyncio.gather(
-                    client.encode(request, fields), client.encode(request, fields)
+                    client.encode(request, fields),
+                    client.encode(
+                        {**request, "prompt": "A watercolor landscape"}, fields
+                    ),
                 )
-                torch.testing.assert_close(first, second, rtol=0, atol=0)
                 tensors = [
                     value
                     for value in tree_leaves(first)
@@ -585,6 +587,10 @@ class TestStageDeploymentFlux3(TestDisaggFlux3Image):
                     )
                 third = await client.encode(request, fields)
                 torch.testing.assert_close(first, third, rtol=0, atol=0)
+                fourth = await client.encode(
+                    {**request, "prompt": "A watercolor landscape"}, fields
+                )
+                torch.testing.assert_close(second, fourth, rtol=0, atol=0)
 
         asyncio.run(check())
 

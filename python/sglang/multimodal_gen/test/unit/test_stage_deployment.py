@@ -26,6 +26,9 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
     RoleSpec,
     StageSpec,
 )
+from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
+    DeploymentWorker,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -89,6 +92,34 @@ def test_contracts_compile_and_tensor_tree_round_trip():
         unpack_fields({}, scalar)
     with pytest.raises(TypeError):
         pack_fields({"required": object()})
+
+
+def test_worker_retains_reusable_model_outputs(monkeypatch):
+    for method in ("set_device", "reset_peak_memory_stats"):
+        monkeypatch.setattr(torch.cuda, method, lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda: SimpleNamespace(record=lambda: None)
+    )
+    buffer = torch.zeros(2)
+
+    def forward(req, args):
+        buffer.add_(1)
+        req.latents = buffer
+        return req
+
+    worker = object.__new__(DeploymentWorker)
+    worker.device = "cpu"
+    worker.role = SimpleNamespace(outputs=("latents",))
+    worker.scheduler = SimpleNamespace(
+        server_args=None,
+        worker=SimpleNamespace(pipeline=SimpleNamespace(forward=forward)),
+        _is_multi_rank=lambda: False,
+    )
+    first, *_ = worker._execute(Req(prompt="first"))
+    second, *_ = worker._execute(Req(prompt="second"))
+    torch.testing.assert_close(first["latents"], torch.ones(2))
+    torch.testing.assert_close(second["latents"], torch.full((2,), 2.0))
 
 
 @pytest.mark.parametrize("deployed", [False, True])
