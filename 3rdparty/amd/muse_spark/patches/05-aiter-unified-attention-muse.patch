@@ -1,0 +1,262 @@
+Muse Spark verify / long-prefill tiles for aiter's Triton unified attention
+
+Target repo: aiter
+    git -C $AITER_ROOT apply patches/05-aiter-unified-attention-muse.patch
+
+Apply on top of 01-04 (the launcher and kernel are the files 03 already
+patches). Python/Triton only, nothing to rebuild.
+
+Every change is an opt-in keyword argument of unified_attention(); with the
+defaults the launcher and both kernels compute exactly what they computed
+before. SGLang's aiter attention backend passes them for the Muse Spark TP8
+shapes (head_dim 64, GQA 8, page 16, FP8 KV) on extend and target-verify
+calls; decode keeps the stock call.
+
+1. prefill_2d_config: tile config (BLOCK_M, num_warps, num_stages, TILE_SIZE,
+   waves_per_eu) for the 2D kernel's long-prefill branch (max_seqlen_q >= 256).
+   SGLang passes 128,4,2,128,2: 90K cached + 5K new tokens 5.57 -> 4.08 ms.
+
+2. unmasked_interior: the 2D kernel runs the KV tiles that every query row of
+   a block sees in full without the causal / padding / tile masks; only the
+   diagonal tiles take the masked loop. Same arithmetic per element.
+
+3. verify_block_m: uniform speculative verify (every request has exactly
+   max_seqlen_q tokens and max_seqlen_q * num_queries_per_kv == verify_block_m,
+   8 x 8 = 64 for Muse): one 64-row tile per (request, KV head) reads each KV
+   tile once instead of four times with the 16-row default. The 3D kernel then
+   launches exactly num_seqs q-blocks (EXACT_Q_BLOCKS) instead of the
+   num_tokens // BLOCK_Q + num_seqs upper bound, whose idle blocks sat at
+   alternate workgroup ids and left every working workgroup on 4 of 8 XCDs.
+   Bitwise identical to the upper-bound grid.
+
+4. verify_num_segments: split-KV segment count of that exact-q-block launch
+   (SGLang passes 256; None keeps select_3d_config's choice).
+
+diff --git a/aiter/ops/triton/_triton_kernels/attention/unified_attention.py b/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
+index 3cd6300..5682f98 100644
+--- a/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
++++ b/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
+@@ -52,6 +52,22 @@ def find_seq_idx(
+     return left - 1
+ 
+ 
++@triton.jit
++def find_seq_idx_exact_q_blocks(query_start_len_ptr, q_block_idx, num_seqs, BLOCK_Q: tl.constexpr):
++    # Request owning q-block q_block_idx when every request's query length is a multiple of BLOCK_Q, so request s
++    # owns q-blocks [cu_q[s] // BLOCK_Q, cu_q[s + 1] // BLOCK_Q): largest s with cu_q[s] // BLOCK_Q <= q_block_idx.
++    left: tl.int32 = 0
++    right = num_seqs
++    while left < right:
++        mid = (left + right) // 2
++        mid_val = tl.load(query_start_len_ptr + mid) // BLOCK_Q
++        if mid_val <= q_block_idx:
++            left = mid + 1
++        else:
++            right = mid
++    return left - 1
++
++
+ @triton.jit
+ def kernel_unified_attention_2d(
+     output_ptr,  # [num_tokens, num_query_heads, head_size]
+@@ -103,6 +119,7 @@ def kernel_unified_attention_2d(
+     ALL_DECODE: tl.constexpr = False,  # bool
+     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
+     K_WIDTH: tl.constexpr = 0,  # int
++    UNMASKED_INTERIOR: tl.constexpr = False,  # bool
+ ):
+     kv_head_idx = tl.program_id(0)
+     q_block_global_idx = tl.program_id(1)
+@@ -257,6 +274,40 @@ def kernel_unified_attention_2d(
+         k_descale = None
+         v_descale = None
+     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
++    # Long-context extend: tiles that every query row of this block sees in full need no causal,
++    # padding or tile mask; only the diagonal tiles below run the masked loop. Same arithmetic per element.
++    if (UNMASKED_INTERIOR and SLIDING_WINDOW == 0 and not ALL_DECODE and not SHUFFLED_KV_CACHE
++            and not USE_ALIBI_SLOPES and not USE_QQ_BIAS and not USE_SOFTCAP and HEAD_SIZE == HEAD_SIZE_PADDED):
++        full_end = tl.minimum(tile_end, (context_len + q_block_local_idx * BLOCK_Q + 1) // TILE_SIZE)
++        for j in range(tile_start, full_end):
++            seq_offset = j * TILE_SIZE + offs_t
++            physical_block_idx = tl.load(
++                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
++            ).to(tl.int64)
++            k_offset = (
++                physical_block_idx[None, :] * stride_k_cache_0
++                + kv_head_idx * stride_k_cache_2
++                + offs_d[:, None] * stride_k_cache_3
++                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
++            )
++            v_offset = (
++                physical_block_idx[:, None] * stride_v_cache_0
++                + kv_head_idx * stride_v_cache_2
++                + offs_d[None, :] * stride_v_cache_3
++                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
++            )
++            K = tl.load(key_cache_ptr + k_offset).to(Q.dtype)
++            V = tl.load(value_cache_ptr + v_offset).to(Q.dtype)
++            S = qk_scale * tl.dot(Q, K)
++            m_j = tl.maximum(M, tl.max(S, axis=1))
++            P = tl.math.exp2(S - m_j[:, None])
++            l_j = tl.sum(P, axis=1)
++            alpha = tl.math.exp2(M - m_j)
++            acc = acc * alpha[:, None]
++            L = L * alpha + l_j
++            M = m_j
++            acc = tl.dot(P.to(V.dtype), V, acc=acc)
++        tile_start = full_end
+     # iterate through tiles (now limited to the sliding window range)
+     for j in range(tile_start, tile_end):
+         seq_offset = j * TILE_SIZE + offs_t
+@@ -514,6 +565,10 @@ def kernel_unified_attention_3d(
+     K_WIDTH: tl.constexpr = 0,  # int
+     IS_Q_FP8: tl.constexpr = False,  # bool
+     IS_KV_FP8: tl.constexpr = False,  # bool
++    # Uniform verify: every request's query length is a multiple of BLOCK_Q and the grid holds exactly
++    # sum(query_len) // BLOCK_Q q-blocks (no "+ num_seqs" upper-bound blocks, which exit at once and, sitting at
++    # alternate linear ids, leave every working workgroup on the even XCDs).
++    EXACT_Q_BLOCKS: tl.constexpr = False,  # bool
+ ):
+     q_block_global_idx = tl.program_id(0)
+     kv_head_idx = tl.program_id(1)
+@@ -529,11 +584,18 @@ def kernel_unified_attention_3d(
+         cur_batch_query_len: tl.int32 = 1
+         cur_batch_in_all_start_index: tl.int32 = q_block_global_idx
+     else:
+-        seq_idx = find_seq_idx(
+-            query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
+-        )
+-
+-        q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
++        if EXACT_Q_BLOCKS:
++            seq_idx = find_seq_idx_exact_q_blocks(
++                query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q
++            )
++            q_block_start_idx = tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q
++        else:
++            seq_idx = find_seq_idx(
++                query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
++            )
++            q_block_start_idx = (
++                tl.load(query_start_len_ptr + seq_idx) // BLOCK_Q + seq_idx
++            )
+ 
+         q_block_local_idx = q_block_global_idx - q_block_start_idx
+ 
+diff --git a/aiter/ops/triton/attention/unified_attention.py b/aiter/ops/triton/attention/unified_attention.py
+index 8218bf7..49e29c0 100644
+--- a/aiter/ops/triton/attention/unified_attention.py
++++ b/aiter/ops/triton/attention/unified_attention.py
+@@ -87,6 +87,7 @@ def select_2d_config(
+     q_dtype,
+     kv_cache_dtype,
+     shuffled_kv_cache,
++    prefill_config=None,
+ ):
+     arch = get_arch()
+ 
+@@ -112,6 +113,10 @@ def select_2d_config(
+             if max_seqlen_q >= 256:
+                 BLOCK_M = 64 if arch.is_rdna else 128
+                 num_stages_2d, num_warps = 1, 4
++                if prefill_config is not None:
++                    BLOCK_M, num_warps, num_stages_2d, TILE_SIZE, waves_per_eu = (
++                        prefill_config
++                    )
+             else:
+                 num_stages_2d, num_warps = 1, 2
+ 
+@@ -366,7 +371,26 @@ def unified_attention(
+     sinks=None,
+     shuffled_kv_cache: bool = False,
+     skip_reduce: bool = False,
++    prefill_2d_config=None,
++    unmasked_interior: bool = False,
++    verify_block_m=None,
++    verify_num_segments=None,
+ ):
++    """Paged unified attention (prefill, decode and speculative verify).
++
++    Optional tile tuning; the defaults keep the stock configs:
++
++    * ``prefill_2d_config``: ``(BLOCK_M, num_warps, num_stages, TILE_SIZE, waves_per_eu)`` for the 2D
++      kernel's long-prefill branch (``max_seqlen_q >= 256``, head size below 256).
++    * ``unmasked_interior``: the 2D kernel runs the KV tiles every query row of a block sees in full
++      without the causal / padding masks (full attention only); same arithmetic per element.
++    * ``verify_block_m``: uniform speculative verify, i.e. every request has exactly ``max_seqlen_q``
++      query tokens and ``max_seqlen_q * num_queries_per_kv == verify_block_m``: one ``verify_block_m``-row
++      tile per (request, KV head), and the 3D kernel launches exactly one q-block per request instead of
++      the ``num_tokens // BLOCK_Q + num_seqs`` upper bound.
++    * ``verify_num_segments``: split-KV segment count (a power of two) of that exact-q-block 3D launch;
++      ``None`` keeps ``select_3d_config``'s choice.
++    """
+     assert causal, "Only causal attention is supported"
+ 
+     use_alibi_slopes = alibi_slopes is not None
+@@ -423,6 +447,13 @@ def unified_attention(
+     BLOCK_M = (
+         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+     )
++    uniform_verify = (
++        verify_block_m is not None
++        and int(max_seqlen_q) * num_queries_per_kv == verify_block_m
++        and num_tokens == num_seqs * int(max_seqlen_q)
++    )
++    if uniform_verify:
++        BLOCK_M = verify_block_m
+     BLOCK_Q = BLOCK_M // num_queries_per_kv
+     assert BLOCK_Q >= 1
+     # Ideally we would launch with kernel with:
+@@ -494,6 +525,7 @@ def unified_attention(
+                 q_dtype,
+                 kv_cache_dtype,
+                 shuffled_kv_cache,
++                prefill_config=prefill_2d_config,
+             )
+             assert config["BLOCK_Q"] >= 1
+             if ALL_DECODE:
+@@ -551,6 +583,7 @@ def unified_attention(
+                 ALL_DECODE=ALL_DECODE,
+                 SHUFFLED_KV_CACHE=shuffled_kv_cache,
+                 K_WIDTH=K_WIDTH,
++                **({"UNMASKED_INTERIOR": True} if unmasked_interior else {}),
+                 **config,
+             )
+         return out
+@@ -569,6 +602,19 @@ def unified_attention(
+             NUM_BLOCKS_GATHER_PER_TILE,
+             SLIDING_WINDOW,
+         )
++        launch_q_blocks = total_num_q_blocks
++        exact_q_blocks = uniform_verify and not (
++            IS_DEVICE_ARCH_GFX12 and shuffled_kv_cache
++        )
++        if exact_q_blocks:
++            # BLOCK_Q == max_seqlen_q: request i owns exactly q-block i.
++            launch_q_blocks = num_seqs
++            if verify_num_segments is not None:
++                assert verify_num_segments > 0 and (
++                    verify_num_segments & (verify_num_segments - 1) == 0
++                ), "verify_num_segments must be a power of 2"
++                attn_config["NUM_SEGMENTS_PER_SEQ"] = verify_num_segments
++                reduce_config["NUM_SEGMENTS_PER_SEQ"] = verify_num_segments
+         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
+         if NUM_SEGMENTS > 1:
+             segm_output = torch.empty(
+@@ -666,7 +712,7 @@ def unified_attention(
+             )
+         else:
+             kernel_unified_attention_3d[
+-                (total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)
++                (launch_q_blocks, num_kv_heads, NUM_SEGMENTS)
+             ](
+                 segm_output_ptr=segm_output,
+                 segm_max_ptr=segm_max,
+@@ -720,6 +766,7 @@ def unified_attention(
+                 K_WIDTH=K_WIDTH,
+                 IS_Q_FP8=(q_dtype == e4m3_dtype),
+                 IS_KV_FP8=(kv_cache_dtype == e4m3_dtype),
++                **({"EXACT_Q_BLOCKS": True} if exact_q_blocks else {}),
+                 **attn_config,
+             )
+ 
