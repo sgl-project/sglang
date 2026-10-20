@@ -1997,6 +1997,14 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
         self.assertEqual(cache.mamba_evictable_size(), 0)
 
 
+def _component_with_cache(component_type, cache):
+    """A registry component instance bound to a (mock) cache and its tree_core."""
+    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component.cache = cache
+    component.tree_core = cache.tree_core
+    return component
+
+
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     """CacheAction routing: each type forwards to the right Controller API."""
 
