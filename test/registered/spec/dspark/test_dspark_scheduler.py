@@ -557,7 +557,13 @@ class TestForcedBudgetRejectsSimulatedAcceptLength(CustomTestCase):
     with a constant simulated accept length above 1, which can exceed it."""
 
     def _set(self, frac):
-        from sglang.srt.managers.io_struct import SetInternalStateReq
+        from pydantic import TypeAdapter
+
+        from sglang.srt.managers.io_struct import (
+            SetInternalStateReq,
+            msgpack_decode,
+            msgpack_encode,
+        )
         from sglang.srt.managers.scheduler_components.internal_state import (
             SchedulerInternalStateController,
         )
@@ -570,10 +576,36 @@ class TestForcedBudgetRejectsSimulatedAcceptLength(CustomTestCase):
             draft_worker=draft_worker,
         )
         controller = SchedulerInternalStateController(scheduler, False)
-        output = controller.set_internal_state(
-            SetInternalStateReq(server_args={"dspark_force_budget_frac": frac})
+        # Exercise HTTP validation and the tokenizer -> scheduler IPC contract:
+        # constructing the struct directly would miss a rejected JSON null.
+        request = TypeAdapter(SetInternalStateReq).validate_python(
+            {"server_args": {"dspark_force_budget_frac": frac}}
         )
+        output = controller.set_internal_state(msgpack_decode(msgpack_encode(request)))
         return output.updated, draft_worker.set_dspark_forced_budget_frac
+
+    def test_null_for_other_knob_rejects_entire_update(self):
+        from sglang.srt.managers.io_struct import SetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        worker = types.SimpleNamespace(set_dspark_forced_budget_frac=mock.Mock())
+        scheduler = types.SimpleNamespace(
+            spec_algorithm=types.SimpleNamespace(is_dspark=lambda: True),
+            draft_worker=worker,
+        )
+        controller = SchedulerInternalStateController(scheduler, False)
+        output = controller.set_internal_state(
+            SetInternalStateReq(
+                server_args={
+                    "dspark_force_budget_frac": None,
+                    "pp_max_micro_batch_size": None,
+                }
+            )
+        )
+        self.assertFalse(output.updated)
+        worker.set_dspark_forced_budget_frac.assert_not_called()
 
     def test_pin_rejected_with_simulated_accept_length(self):
         with envs.SGLANG_SIMULATE_ACC_LEN.override(3.0):

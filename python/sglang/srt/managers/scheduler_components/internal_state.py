@@ -151,6 +151,8 @@ class SchedulerInternalStateController:
                 handler = handlers.get(key)
                 if handler is None:
                     raise UpdateRejected(f"Updating {key} is not supported.")
+                if value is None and key != "dspark_force_budget_frac":
+                    raise UpdateRejected(f"Updating {key} to null is not supported.")
                 handler.validate(key, value)
         except UpdateRejected as rejection:
             logger.warning(str(rejection))
