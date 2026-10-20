@@ -900,6 +900,9 @@ class Envs:
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # MXFP4 trtllm-gen MoE: deferred-finalize calls above 32 rows pass the finalized
+    # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
+    SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 

@@ -10,6 +10,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
@@ -463,11 +464,17 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # Deferred finalize returns the permuted GEMM2 output plus the routing
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
+        # FlashInfer keys its tactic cache on the output shape and tunes finalized
+        # calls, so deferred calls pass that shape too (the deferred ABI ignores the
+        # allocation). Measured, not principled: at <= 32 rows the tactic tuned on
+        # dummy routing is slower than the default on real routing, so deferred
+        # calls there keep the (M, 0) placeholder key and the default tactic.
+        if envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.get():
+            deferred_output_shape = num_tokens > 32
+        else:
+            deferred_output_shape = 96 < num_tokens <= 384
         symm_output = None
-        # Preserve the ordinary output shape in the medium-batch autotuner
-        # cache key. The deferred ABI ignores this allocation and returns the
-        # expanded GEMM output for the separate fused finalize epilogue.
-        if not defer_finalize or 96 < num_tokens <= 384:
+        if not defer_finalize or deferred_output_shape:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
