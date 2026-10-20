@@ -8,12 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.muse_spark_utils import try_cached_muse_spark_model
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     _wait_for_gpu_idle_in_ci,
     is_in_ci,
-    try_cached_model,
     write_github_step_summary,
 )
 
@@ -29,26 +29,12 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
 
     @classmethod
     def setUpClass(cls):
-        # Use the gated-model credential only in this test and its server children.
-        if token := os.environ.get("HF_MUSE_SPARK_TOKEN"):
+        cls.model = try_cached_muse_spark_model(MODEL_PATH)
+        # A complete local checkpoint needs no gated-model credential.
+        if cls.model == MODEL_PATH and (token := os.environ.get("HF_MUSE_SPARK_TOKEN")):
             token_env = patch.dict(os.environ, {"HF_TOKEN": token})
             token_env.start()
             cls.addClassCleanup(token_env.stop)
-        # Pass a complete snapshot path so processor loading never queries the
-        # gated Hub repo on fork CI, where the model credential is unavailable.
-        cls.model = try_cached_model(
-            MODEL_PATH,
-            required_files=(
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-                "l4_200k_base",
-                "processor_config.json",
-                "chat_template.jinja",
-                "generation_config.json",
-                "hf_quant_config.json",
-            ),
-        )
         cls.other_args = [
             "--tp-size",
             "4",
@@ -71,7 +57,7 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
             "--speculative-algorithm",
             "DFLASH",
             "--speculative-draft-model-path",
-            try_cached_model(DRAFT_MODEL_PATH, required_files=()),
+            try_cached_muse_spark_model(DRAFT_MODEL_PATH, draft=True),
             "--speculative-draft-attention-backend",
             "fa4",
             "--speculative-num-draft-tokens",

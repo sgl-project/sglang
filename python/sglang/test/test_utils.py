@@ -337,51 +337,9 @@ def _get_default_models():
     return json.dumps(list(default_models))
 
 
-def try_cached_model(
-    model_repo: str, *, required_files: Optional[Tuple[str, ...]] = None
-):
-    """Prefer a local checkpoint, optionally requiring complete safetensors weights.
-
-    Passing required_files also searches the HF cache and checks config.json,
-    every indexed weight shard (or model.safetensors), and the requested assets.
-    An incomplete cache falls back to the Hub ID so downloading remains possible.
-    """
+def try_cached_model(model_repo: str):
     model_dir = _use_cached_default_models(model_repo)
-    if required_files is None:
-        return model_dir if model_dir else model_repo
-
-    from sglang.srt.utils import find_local_repo_dir
-
-    candidates = [model_dir]
-    try:
-        candidates.append(find_local_repo_dir(model_repo))
-    except OSError:
-        pass
-    for model_dir in candidates:
-        if not model_dir:
-            continue
-        snapshot = Path(model_dir)
-        try:
-            index = snapshot / "model.safetensors.index.json"
-            if index.exists() or index.is_symlink():
-                weight_map = json.loads(index.read_text())["weight_map"]
-                if not isinstance(weight_map, dict) or not weight_map:
-                    continue
-                weights = set(weight_map.values())
-            else:
-                weights = {"model.safetensors"}
-            files = {"config.json", *required_files, *weights}
-            if not all(
-                (snapshot / name).is_file() and (snapshot / name).stat().st_size > 0
-                for name in files
-            ):
-                continue
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-
-        print(f"Using complete local checkpoint for {model_repo}: {snapshot}")
-        return str(snapshot.absolute())
-    return model_repo
+    return model_dir if model_dir else model_repo
 
 
 def popen_with_error_check(command: list[str]):
