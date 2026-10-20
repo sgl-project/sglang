@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -1191,6 +1192,8 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    pre_kv_store_hook = None
+    builds_verify_metadata_early = False
     draft_metadata_glued = False
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
@@ -1220,6 +1223,9 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
+        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
+        self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
@@ -3987,6 +3993,8 @@ class DeepseekV4AttnBackend(
         """Idle never trusts its metadata, which may be stale or unset: it writes
         the request window's idle layout, or translates the zero-padded
         out_cache_loc to the dummy slot."""
+        if self.pre_kv_store_hook is not None:
+            self.pre_kv_store_hook()
         out_cache_loc = forward_batch.out_cache_loc
         window = self.token_to_kv_pool.request_window
         if forward_batch.forward_mode.is_idle():

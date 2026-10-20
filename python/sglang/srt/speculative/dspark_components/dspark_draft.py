@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import functools
 import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -358,6 +359,8 @@ class DraftBlockProposer:
         )
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
+        self.deferred_commit = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -608,16 +611,29 @@ class DraftBlockProposer:
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
-            draft_sampler is not None
-            and graph_runner is not None
-            and graph_runner.can_run_graph(draft_forward_batch)
-        ):
+        runs_graph = graph_runner is not None and graph_runner.can_run_graph(
+            draft_forward_batch
+        )
+        if draft_sampler is not None and runs_graph:
             self._stage_sampling_params(
                 draft_sampler, bs=bs, sampling_info=sampling_info
             )
+        commit = self.deferred_commit
+        if commit is not None:
+            commit.before_draft_forward(
+                graph_bs=(
+                    graph_runner.capture_bs[
+                        bisect.bisect_left(graph_runner.capture_bs, bs)
+                    ]
+                    if runs_graph
+                    else None
+                )
+            )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        if commit is not None:
+            assert draft_out.can_run_graph == runs_graph
+            commit.after_draft_forward(graph_ran=draft_out.can_run_graph)
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:

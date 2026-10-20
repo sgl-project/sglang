@@ -21,6 +21,7 @@ from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -42,6 +43,9 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
     draft_is_deepseek_v4,
     resolve_runtime_config,
+)
+from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
+    defer_context_kv_refusal,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
@@ -262,7 +266,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             length=self.verify_num_draft_tokens, device=self.device
         )
         # Verify-window positions, cache locs and the draft anchor column in one launch.
-        self._prepare_inputs_once = envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
+        self._prepare_inputs_once = (
+            envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
+        )
         self.num_folded_verify_ids_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
@@ -371,6 +377,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
                 accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
                 accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
+                defer_context_kv=self._defer_context_kv_eligible(
+                    static_epilogue_supported
+                ),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -529,9 +538,70 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
+            commit = self._deferred_commit()
+            if commit is not None:
+                self._wire_deferred_commit(commit)
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if commit is not None:
+                commit.disarm()
+
+    def _defer_context_kv_eligible(self, static_epilogue_supported: bool) -> bool:
+        """SGLANG_DSPARK_DEFER_CONTEXT_KV: only where nothing moves or reads draft KV
+        between a verify and the next draft forward but this worker's forwards."""
+        if not envs.SGLANG_DSPARK_DEFER_CONTEXT_KV.get():
+            return False
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
+
+        memory = get_memory()
+        refusal = defer_context_kv_refusal(
+            static_verify=static_epilogue_supported,
+            draft_is_moe=self._draft_is_moe,
+            unified_kv=is_unified_kv_triton(),
+            unified_memory=memory.enable_unified_memory,
+            hicache=memory.enable_hierarchical_cache
+            or memory.hicache_storage_backend is not None,
+            disaggregated=get_disagg().disaggregation_mode != "null",
+            attn_dp=get_parallel().attn_dp_enabled,
+        )
+        if refusal:
+            logger.warning(
+                "SGLANG_DSPARK_DEFER_CONTEXT_KV refused, the commit stays in the "
+                "verify graph: %s",
+                refusal,
+            )
+            return False
+        return True
+
+    def _deferred_commit(self):
+        epilogue = self._verify_epilogue
+        return None if epilogue is None else epilogue.deferred_commit
+
+    def _wire_deferred_commit(self, commit) -> None:
+        """The draft side of SGLANG_DSPARK_DEFER_CONTEXT_KV: the proposer writes or
+        hands the staging to the draft graph, whose capture forks the write at its head
+        and whose first draft KV store joins it."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DeepseekV4MultiStepBackend,
+        )
+
+        self._proposer.deferred_commit = commit
+        self.draft_model_runner.capture_head_hooks.append(commit.capture_head_hook)
+        backend = self.draft_model_runner.attn_backend
+        backends = [backend]
+        if isinstance(backend, DeepseekV4MultiStepBackend):
+            backends.extend(backend.attn_backends)
+        for b in backends:
+            if isinstance(b, DeepseekV4AttnBackend):
+                b.pre_kv_store_hook = commit.join
+        logger.info(
+            "SGLANG_DSPARK_DEFER_CONTEXT_KV: the draft context-KV commit runs at the "
+            "head of the next draft graph, joined at its first KV store."
+        )
 
     def _maybe_build_draft_sampler(self):
         return maybe_build_draft_sampler(
@@ -551,7 +621,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def clear_cache_pool(self):
-        pass
+        if not self._hosts_draft:
+            return
+        # The staged rows' slots were just freed.
+        commit = self._deferred_commit()
+        if commit is not None:
+            commit.disarm()
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         if not self._hosts_draft:
@@ -651,6 +726,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        # The prefill's draft KV may land in slots a pending commit targets.
+        commit = self._deferred_commit()
+        if commit is not None:
+            commit.flush()
         # Placing the draft KV reads scheduler-shared tables, which prefill
         # read-done releases once the target forward's own reads end.
         placement = self._kv_injector.place_prefill(batch)

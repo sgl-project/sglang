@@ -36,6 +36,9 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
+from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
+    DeferredContextCommit,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -167,6 +170,7 @@ class TargetVerifyExecutor:
         override drawn by begin_simulated_step.
         """
         if folded_accept:
+            self.verify_epilogue.note_static_verify(bs)
             return self.verify_epilogue.read_accept(bs)
 
         simulate = self._simulated_correct_len is not None
@@ -545,8 +549,13 @@ class DsparkVerifyEpilogue:
         fused_accept_tail: bool = False,
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
+        defer_context_kv: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs stage the draft-KV commit into
+        # this, built at the first warmup; the next draft forward writes it.
+        self._defer_context_kv = bool(defer_context_kv)
+        self.deferred_commit: Optional[DeferredContextCommit] = None
         # SGLANG_SIMULATE_ACC_LEN with a sampled bonus inside the graph too: the bonus
         # is drawn at the simulated correct_len from these buffers, which
         # begin_sim_bonus writes before replay (<= 0 temperature: argmax).
@@ -701,6 +710,15 @@ class DsparkVerifyEpilogue:
                 .expand(bs, self.stride)
                 .reshape(-1)
             )
+        if self._defer_context_kv:
+            self._stage_commit(
+                target_hidden=out.hidden_states,
+                cache_loc=cache_loc,
+                positions=forward_batch.positions,
+                commit_lens=gated_commit_lens,
+                state_slot=state_slot,
+            )
+            return
         self.commit_ctx.kv_injector.inject_target_hidden(
             target_hidden=out.hidden_states,
             cache_loc=cache_loc,
@@ -784,6 +802,27 @@ class DsparkVerifyEpilogue:
             "sim-fold" if self.simulate_fold else "argmax",
             "inputs" if bonus_in is not None else "off",
         )
+
+    def _stage_commit(self, *, target_hidden, **staged) -> None:
+        if self.deferred_commit is None:
+            assert not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            ), "the deferred commit's staging is built at a warmup, before capture"
+            self.deferred_commit = DeferredContextCommit(
+                max_bs=self.max_bs,
+                stride=self.stride,
+                hidden_width=target_hidden.shape[1],
+                hidden_dtype=target_hidden.dtype,
+                device=target_hidden.device,
+                kv_injector=self.commit_ctx.kv_injector,
+                with_state_slot=staged["state_slot"] is not None,
+            )
+        self.deferred_commit.stage(target_hidden=target_hidden, **staged)
+
+    def note_static_verify(self, bs: int) -> None:
+        """Host, after a static verify graph replayed ``bs`` requests."""
+        if self.deferred_commit is not None:
+            self.deferred_commit.note_static_verify(bs)
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(

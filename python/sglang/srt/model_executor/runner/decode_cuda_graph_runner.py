@@ -1284,6 +1284,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     ForwardContext(attn_backend=attn_backend),
                     forward_batch=forward_batch,
                 ):
+                    for capture_hook in self.model_runner.capture_head_hooks:
+                        capture_hook(self, forward_batch)
                     # Backends may gather live pool mappings into their static
                     # metadata here; these nodes run before any model KV reads.
                     attn_backend.init_forward_metadata_in_graph(forward_batch)
