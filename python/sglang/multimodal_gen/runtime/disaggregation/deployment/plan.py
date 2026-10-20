@@ -220,7 +220,12 @@ class ExecutionPlan:
             for other in stage.colocate_with:
                 if owner.get(other) != role:
                     raise ValueError(f"Stages {stage.name} and {other} must colocate")
-        outputs = {path: order[-1] for path in deployment.outputs or ("result.output",)}
+        output_paths = (
+            ("result.output",) if deployment.outputs is None else deployment.outputs
+        )
+        if not output_paths:
+            raise ValueError("Declare at least one terminal output for this deployment")
+        outputs = {path: order[-1] for path in output_paths}
         roles = {}
         for index, name in enumerate(order):
             previous = order[index - 1] if index else None

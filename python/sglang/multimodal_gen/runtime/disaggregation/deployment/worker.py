@@ -86,7 +86,9 @@ def broadcast_request(scheduler, req):
     restored = object.__new__(Req)
     state = tree_unflatten(leaves, spec)
     vars(restored).update(
-        metrics=state["metrics"], trace_ctx=TraceNullContext(), modules={}
+        metrics=state["metrics"],
+        trace_ctx=req.trace_ctx if req is not None else TraceNullContext(),
+        modules={},
     )
     restore_request(restored, state["context"], f"cuda:{scheduler.worker.local_rank}")
     return restored
