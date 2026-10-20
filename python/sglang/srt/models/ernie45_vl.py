@@ -652,12 +652,12 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         )
 
         pad_values = []
-        if hasattr(forward_batch, "mm_inputs") and forward_batch.mm_inputs is not None:
+        if forward_batch.mm_inputs is not None:
             for mm_input in forward_batch.mm_inputs:
                 if mm_input is None:
                     continue
                 for item in mm_input.mm_items:
-                    pad_values.append(item.pad_value)
+                    pad_values.extend(item.padding_values())
         placeholder_tensor = torch.as_tensor(
             pad_values,
             device=input_ids.device,

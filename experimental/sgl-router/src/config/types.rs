@@ -30,6 +30,10 @@ pub struct ProxyConfig {
     pub initial_backoff_ms: u64,
     /// Upper bound on any one backoff.
     pub max_backoff_ms: u64,
+    /// PD: requests per prefill DP rank sent to decode before their first token.
+    pub decode_dispatch_limit: Option<NonZeroU32>,
+    /// PD: return decode's response only once prefill completes.
+    pub stream_after_prefill: bool,
 }
 
 impl ProxyConfig {
@@ -61,6 +65,8 @@ impl Default for ProxyConfig {
             max_attempts: NonZeroU32::MIN,
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
+            decode_dispatch_limit: None,
+            stream_after_prefill: false,
         }
     }
 }
@@ -394,9 +400,10 @@ pub struct ModelConfig {
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
     pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
-    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// Reorg admission for groups that leave a limit unset: `--max-inflight-requests`
     /// and `--max-kv-usage`.
     pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
+    /// Per-worker circuit breaker; `None` under `--disable-circuit-breaker`.
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -651,6 +658,12 @@ pub struct AffinityConfig {
     /// size chooses the exact minimum with random ties; 1 draws uniformly without
     /// a backup for admission or pressure guards. Separate from cache-owner limits.
     pub min_load_choices: usize,
+    /// Match prefill buckets on uncached tokens E instead of the input length. A
+    /// request with a reusable prefix uses E's buckets, and spills to a worker
+    /// with an idle DP rank when every rank in them has pending prefill; a
+    /// request without one uses every prefill worker whose bucket admits its
+    /// context.
+    pub route_by_uncached_tokens: bool,
 }
 
 impl Default for AffinityConfig {
@@ -679,6 +692,7 @@ impl Default for AffinityConfig {
             worker_queue_limit: None,
             saturation_queue_floor: None,
             min_load_choices: DEFAULT_MIN_LOAD_CHOICES,
+            route_by_uncached_tokens: false,
         }
     }
 }
@@ -730,8 +744,12 @@ pub struct CircuitBreakerConfig {
     pub cool_down_secs: u64,
 }
 
-/// Default circuit-breaker cool-down, applied when `--cb-threshold` is
-/// set without an explicit `--cb-cool-down-secs`.
+/// Default circuit-breaker threshold, without `--cb-threshold`.
+pub fn default_cb_threshold() -> NonZeroU32 {
+    NonZeroU32::new(3).expect("3 is non-zero")
+}
+
+/// Default circuit-breaker cool-down, without `--cb-cool-down-secs`.
 pub fn default_cb_cool_down() -> u64 {
     30
 }

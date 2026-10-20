@@ -106,6 +106,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         **kwargs,
     ):
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
         )
@@ -190,6 +191,33 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         """Return contiguous all-layer KV tensors for NPU HiCache IO."""
         return self._hicache_k_buffer, self._hicache_v_buffer
 
+    def _mha_buffer_info(self):
+        from sglang.srt.mem_cache.device_pool_info import (
+            KVBufferLayout,
+            KVBuffers,
+            MHABufferInfo,
+        )
+
+        return MHABufferInfo(
+            buffers=KVBuffers(
+                k=tuple(self.k_buffer),
+                v=tuple(self.v_buffer),
+                k_data_ptrs=None,
+                v_data_ptrs=None,
+                layout=KVBufferLayout.PAGED_NHD,
+            ),
+            page_size=self.page_size,
+            head_num=self.row_dim // self.head_dim
+            if self.head_dim == self.v_head_dim
+            else self.head_num,
+            head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
+            dtype=self.store_dtype,
+            # self.device is the bare backend name; tensors carry the rank index.
+            device=self._hicache_k_buffer.device,
+            transfer_buffers=self.get_hicache_transfer_buffers,
+        )
+
     def _init_kv_copy_and_warmup(self):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
@@ -259,7 +287,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        if self.use_fia:
+        # Both FIA and paged-attention buffers share the same physical layout.
+        # Opt in at pool initialization, keeping environment reads outside graph
+        # capture. Otherwise retain the original writers and their memory usage.
+        use_scatter_pa = (
+            self.use_scatter_pa_kv_cache
+            and hasattr(torch_npu, "npu_scatter_pa_kv_cache")
+            and self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
+        )
+        if self.use_fia or use_scatter_pa:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
             num_rows = loc.numel()
@@ -270,29 +306,43 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 or cache_v.numel() != expected_v_numel
             ):
                 raise ValueError(
-                    "NPU FIA KV scatter row mismatch: "
+                    "NPU KV scatter row mismatch: "
                     f"loc_rows={num_rows}, cache_k_shape={tuple(cache_k.shape)}, "
                     f"cache_v_shape={tuple(cache_v.shape)}, "
                     f"head_num={self.head_num}, head_dim={self.head_dim}, "
                     f"v_head_dim={self.v_head_dim}."
                 )
 
-            # aclnnScatterNdUpdate on the deployed CANN rejects the otherwise
-            # valid 4-D [slot, 1, head, dim] update during tiling. Flatten only
-            # the singleton FIA layout axis and scatter through an equivalent
-            # 3-D view; the underlying KV storage and attention layout stay
-            # unchanged.
-            loc_indices = loc.contiguous().view(-1, 1)
-            torch_npu.npu_scatter_nd_update_(
-                k_buffer_layer.view(-1, self.head_num, self.head_dim),
-                loc_indices,
-                cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
-            )
-            torch_npu.npu_scatter_nd_update_(
-                v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
-                loc_indices,
-                cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
-            )
+            if use_scatter_pa:
+                torch_npu.npu_scatter_pa_kv_cache(
+                    cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
+                    cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
+                    k_buffer_layer.view(
+                        -1, self.page_size, self.head_num, self.head_dim
+                    ),
+                    v_buffer_layer.view(
+                        -1, self.page_size, self.head_num, self.v_head_dim
+                    ),
+                    loc.reshape(-1).to(torch.int32).contiguous(),
+                    cache_mode="Norm",
+                )
+            else:
+                # aclnnScatterNdUpdate on the deployed CANN rejects the otherwise
+                # valid 4-D [slot, 1, head, dim] update during tiling. Flatten only
+                # the singleton FIA layout axis and scatter through an equivalent
+                # 3-D view; the underlying KV storage and attention layout stay
+                # unchanged.
+                loc_indices = loc.contiguous().view(-1, 1)
+                torch_npu.npu_scatter_nd_update_(
+                    k_buffer_layer.view(-1, self.head_num, self.head_dim),
+                    loc_indices,
+                    cache_k.contiguous().view(num_rows, self.head_num, self.head_dim),
+                )
+                torch_npu.npu_scatter_nd_update_(
+                    v_buffer_layer.view(-1, self.head_num, self.v_head_dim),
+                    loc_indices,
+                    cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
+                )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(
@@ -610,6 +660,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             end_layer=end_layer,
         )
 
+        self.model_layer_ids = tuple(
+            range(self.start_layer, self.start_layer + self.layer_num)
+        )
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
@@ -730,6 +783,45 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
 
         self._finalize_allocation_log(size)
+
+    def _mla_buffer_info(self):
+        from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
+
+        return MLABufferInfo(
+            buffers=self._mla_native_buffers(),
+            native_buffers=self._mla_native_buffers,
+            data_ptrs=None,
+            layer_indices=tuple(range(self.layer_num)),
+            device_layer_num=self.layer_num,
+            page_size=self.page_size,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            kv_cache_dim=self.kv_cache_dim + self.kr_cache_dim,
+            dtype=self.store_dtype,
+            # self.device is the bare backend name; tensors carry the rank index.
+            device=next(
+                buffer.device
+                for buffer in (self.k_buffer, self.index_k_buffer)
+                if buffer is not None
+            ),
+            packed_fp8=self.dsa_kv_cache_store_fp8,
+        )
+
+    def _mla_native_buffers(self):
+        from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
+
+        return MLASplitBuffers(
+            k=self.k_buffer,
+            v=self.v_buffer,
+            index_k=self.index_k_buffer,
+            index_scales=self.index_k_scale_buffer,
+            index_layer_indices=tuple(
+                i - self.start_layer for i in self.indexer_layer_ids
+            ),
+            k_width=self.kv_cache_dim,
+            v_width=self.kr_cache_dim,
+            index_width=self.index_head_dim or 0,
+        )
 
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
         if uses_global_slots or self.dcp_size <= 1:
