@@ -15,10 +15,10 @@ from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
     merge_suffix_attention_in_place,
 )
-from sglang.kernels.ops.attention.utils import assert_buffer_fits
-from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
@@ -1769,7 +1769,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
-                result = flash_attn_varlen_func(
+                result = self.flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
