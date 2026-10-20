@@ -145,5 +145,42 @@ class TestFfnInputFusionsGate(CustomTestCase):
         self.assertTrue(fused[0].run.keywords["keep_bf16"])
 
 
+class TestPreCaptureGate(CustomTestCase):
+    """graph_capture must not reach the Gluon backend on other devices.
+
+    The pre-capture rendezvous build runs inside graph_capture, which every
+    backend executes. Without an explicit gate it imports the backend and
+    probes the device on CUDA and on AMD GPUs other than gfx950 -- and, before
+    the kernel PR lands, logs a warning on every capture.
+    """
+
+    def test_graph_capture_gates_on_aiter_and_gfx95(self):
+        import inspect
+
+        from sglang.srt.distributed import parallel_state
+
+        src = inspect.getsource(parallel_state)
+        marker = "gluon_eligible = "
+        self.assertIn(marker, src, "the pre-capture build must be gated")
+        line = next(l for l in src.splitlines() if marker in l)
+        self.assertIn("_use_aiter", line)
+        self.assertIn("is_gfx95_supported()", line)
+
+    def test_backend_is_not_imported_when_ineligible(self):
+        """The import sits behind the gate, not in front of it."""
+        import inspect
+
+        from sglang.srt.distributed import parallel_state
+
+        src = inspect.getsource(parallel_state)
+        gate_at = src.index("gluon_eligible = ")
+        import_at = src.index("gluon_tp_ar_norm_quant as _g")
+        self.assertLess(
+            gate_at,
+            import_at,
+            "the gate must precede the backend import so other devices never load it",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

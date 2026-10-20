@@ -64,6 +64,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -84,6 +85,8 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+# Same definition the layer boundary uses to gate the fused AR+quant path.
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 # Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
 # through the pre-registered IPC pool instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
@@ -695,8 +698,12 @@ class GroupCoordinator:
                 # peers out of a table *tensor*, and the captured launch bakes in
                 # that table's address, not its contents. So record sites during
                 # capture and fill the tables here, before any replay.
+                # Only gfx950 with aiter can serve this; everything else keeps
+                # the original path without importing the backend or probing
+                # the device.
+                gluon_eligible = _use_aiter and is_gfx95_supported()
                 gluon_ar = getattr(self, "_gluon_tp_ar_state", None)
-                if gluon_ar is None:
+                if gluon_eligible and gluon_ar is None:
                     # Build it now rather than lazily on first use: first use may
                     # itself be inside this capture, and a state created then
                     # would not have its capture bookkeeping armed, silently
@@ -721,7 +728,7 @@ class GroupCoordinator:
                         )
                         self._gluon_tp_ar_state = False
                         gluon_ar = None
-                if not gluon_ar:  # None, or False when permanently disabled
+                if not gluon_eligible or not gluon_ar:
                     gluon_ar = None
                 if gluon_ar is not None:
                     gluon_ar.begin_capture()
