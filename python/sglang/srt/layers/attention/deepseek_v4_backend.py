@@ -2245,8 +2245,6 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
-        # With a fixed block per request the verify rows are request-major, so the
-        # full-scan indexers score each request's draft rows as one request.
         rows_per_request = 1 if is_ragged else num_draft_tokens
         return DSV4Metadata(
             core_attn_metadata,

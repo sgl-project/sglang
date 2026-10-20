@@ -43,11 +43,7 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
 
     def paged_logits_args(self, metadata, rows=slice(None)):
         """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
-        ``rows``, grouped by ``metadata.rows_per_request``: with a block of ``n``
-        consecutive rows per request the kernel takes q as [requests, n, heads, 64],
-        the lengths as [requests, n] and one page-table row per request (every row
-        of a request has the same one), and reads the request's index-K cache once
-        per block of 128 / heads rows instead of once per row."""
+        ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
         n = metadata.rows_per_request
         q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
         lens = metadata.compressed_seq_lens[rows]
