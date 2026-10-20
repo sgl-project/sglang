@@ -6,14 +6,14 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    fused_norm_rope_inplace_triton,
-    precompute_freqs_cis,
-)
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_norm_rope_store,
+)
+from sglang.kernels.ops.attention.dsv4.rope import (
+    fused_norm_rope_inplace_triton,
+    precompute_freqs_cis,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 

@@ -4,8 +4,8 @@ output followed by .to(float8_e4m3fn) -- same kernel math, cast at store."""
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
-from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
+from sglang.kernels.ops.attention.dsv4.norm_rope import fused_q_norm_rope
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")

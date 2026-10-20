@@ -78,3 +78,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.softcap_row_argmax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.softcap_row_argmax:softcap_row_argmax",
+        capabilities=CUDA_ONLY,
+    )
+)
