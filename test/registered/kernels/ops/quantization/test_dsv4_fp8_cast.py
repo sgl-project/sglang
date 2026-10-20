@@ -18,10 +18,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_cvt import cvt_fp8_e4m3
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.deepseek_v4.fp8_cvt import cvt_fp8_e4m3
 from sglang.test.test_utils import CustomTestCase
 
 # the default amd runner is mi300, where pack_fp8 still takes the software path this
