@@ -240,7 +240,16 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 )
                 self.assertEqual(layer.runner_backend, backend)
                 self.assertTrue(layer.dispatcher.skip_local_expert_mapping)
-                topk = TopK(top_k=2, layer_id=0, is_fp4_experts=fp4)
+                topk = TopK(
+                    top_k=2,
+                    layer_id=0,
+                    is_fp4_experts=fp4,
+                    use_grouped_topk=True,
+                    num_expert_group=1,
+                    topk_group=1,
+                    scoring_func="sigmoid",
+                    correction_bias=torch.zeros(4),
+                )
                 topk.bind_runner_backend(
                     layer.runner_backend,
                     routing_method_type=layer.routing_method_type,
@@ -458,8 +467,9 @@ class TestLayerRunnerDispatch(CustomTestCase):
                         expected == MoeRunnerBackend.FLASHINFER_TRTLLM,
                     )
                     topk = TopK(
-                        top_k=2,
+                        top_k=1,
                         layer_id=0,
+                        renormalize=False,
                         custom_routing_function=lambda **kwargs: None,
                     )
                     topk.bind_runner_backend(
@@ -488,6 +498,29 @@ class TestLayerRunnerDispatch(CustomTestCase):
                                     ),
                                 ),
                             )
+
+    def test_declared_softmax_kernel_cannot_replace_other_router_policies(self):
+        """A native softmax enum must not override sigmoid, grouping, bias, or renormalization."""
+        for kwargs in (
+            dict(
+                scoring_func="sigmoid",
+                use_grouped_topk=True,
+                num_expert_group=2,
+                topk_group=1,
+                correction_bias=torch.zeros(4),
+            ),
+            dict(scoring_func="sigmoid", correction_bias=torch.zeros(4)),
+            dict(renormalize=False),
+        ):
+            with self.subTest(kwargs=kwargs):
+                topk = TopK(top_k=2, layer_id=0, **kwargs)
+                topk.bind_runner_backend(
+                    MoeRunnerBackend.FLASHINFER_TRTLLM,
+                    routing_method_type=RoutingMethodType.RenormalizeNaive,
+                )
+                self.assertEqual(
+                    topk.topk_config.output_format, TopKOutputFormat.STANDARD
+                )
 
     def test_router_rebinding_rejects_conflicting_contract_before_mutation(self):
         for first, second in (

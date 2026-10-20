@@ -280,6 +280,58 @@ class TestNvFp4MoeDispatch(CustomTestCase):
         torch.testing.assert_close(fp8_output.hidden_states, expected.to(hidden.dtype))
         torch.testing.assert_close(bf16_output.hidden_states, expected.to(hidden.dtype))
 
+    def test_fp8_default_routing_policy_keeps_zero_enum(self):
+        """The native softmax selector's zero value must not select grouped sigmoid routing."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as kernels
+        from sglang.srt.layers.quantization import fp8
+
+        method = object.__new__(fp8.Fp8MoEMethod)
+        method.is_fp4_expert = False
+        method.block_quant = True
+        method.quant_config = SimpleNamespace(
+            use_mxfp8=False, weight_block_size=[128, 128]
+        )
+        method.moe_runner_config = MoeRunnerConfig(activation="silu")
+        method.runner = SimpleNamespace(
+            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
+            run=lambda dispatch, quant_info: quant_info.routing_method_type,
+        )
+        layer = SimpleNamespace(
+            num_experts=4,
+            num_local_experts=4,
+            moe_ep_rank=0,
+            w13_weight=torch.zeros((4, 256, 4)),
+            w2_weight=torch.zeros((4, 4, 128)),
+            w13_weight_scale_inv=torch.ones((4, 2, 1)),
+            w2_weight_scale_inv=torch.ones((4, 1, 1)),
+            _flashinfer_trtllm_gemm1_alpha=None,
+            _flashinfer_trtllm_gemm1_beta=None,
+            _flashinfer_trtllm_gemm1_clamp_limit=None,
+        )
+        with (
+            mock.patch.object(fp8, "use_intel_amx_backend", return_value=False),
+            mock.patch.object(fp8, "is_xpu", return_value=False),
+            mock.patch.object(
+                fp8,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
+            ),
+            mock.patch.object(kernels, "get_activation_type", return_value=0),
+        ):
+            for policy, expected in (
+                (RoutingMethodType.Default, 0),
+                (RoutingMethodType.Renormalize, 1),
+                (None, 2),
+            ):
+                with self.subTest(policy=policy):
+                    layer.routing_method_type = policy
+                    self.assertEqual(
+                        method.apply(
+                            layer, SimpleNamespace(hidden_states=torch.zeros((1, 4)))
+                        ),
+                        expected,
+                    )
+
     def test_missing_trtllm_prep_names_the_missing_field(self):
         method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED)
         layer = _trtllm_prepared_layer()

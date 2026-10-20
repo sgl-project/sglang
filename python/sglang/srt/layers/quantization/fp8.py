@@ -3218,6 +3218,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_gated=self.moe_runner_config.is_gated,
             )
 
+            routing_method_type = layer.routing_method_type
+            if routing_method_type is None:
+                routing_method_type = RoutingMethodType.DeepSeekV3
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -3225,10 +3229,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=int(
-                    getattr(layer, "routing_method_type", None)
-                    or RoutingMethodType.DeepSeekV3
-                ),
+                routing_method_type=int(routing_method_type),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
                 weight_block_k=(

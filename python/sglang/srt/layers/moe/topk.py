@@ -587,6 +587,46 @@ def _simulate_balanced_routing(
     )
 
 
+def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
+    """Match the native selector to the materialized router's policy."""
+    method = config.routing_method_type
+    if (
+        method is None
+        or method == RoutingMethodType.Unspecified
+        or config.sqrtsoftplus_log1p
+        or config.num_fused_shared_experts != 0
+    ):
+        return False
+    plain = not config.use_grouped_topk and config.correction_bias is None
+    if method == RoutingMethodType.Llama4:
+        return (
+            plain
+            and config.top_k == 1
+            and not config.renormalize
+            and config.custom_routing_function is not None
+        )
+    if config.custom_routing_function is not None:
+        return False
+    if method == RoutingMethodType.DeepSeekV3:
+        # The biased grouped router uses sigmoid regardless of scoring_func.
+        return (
+            config.use_grouped_topk
+            and config.correction_bias is not None
+            and config.renormalize
+        )
+    if not plain:
+        return False
+    if method in (RoutingMethodType.Renormalize, RoutingMethodType.RenormalizeNaive):
+        return config.scoring_func == "softmax" and config.renormalize
+    if method == RoutingMethodType.Default:
+        return config.scoring_func == "softmax" and not config.renormalize
+    if method == RoutingMethodType.SigmoidRenorm:
+        return config.scoring_func == "sigmoid" and config.renormalize
+    if method == RoutingMethodType.Sigmoid:
+        return config.scoring_func == "sigmoid" and not config.renormalize
+    return False
+
+
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -692,14 +732,7 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif runner_backend is not None and (
             runner_backend.is_flashinfer_trtllm()
-            and routing_method_type is not None
-            and routing_method_type != RoutingMethodType.Unspecified
-            and self.topk_config.scoring_func in ("softmax", "sigmoid")
-            and not self.topk_config.sqrtsoftplus_log1p
-            and (
-                self.topk_config.custom_routing_function is None
-                or routing_method_type == RoutingMethodType.Llama4
-            )
+            and _can_bypass_trtllm_routing(self.topk_config)
             or runner_backend.is_flashinfer_mxfp4()
             and not self.is_fp4_experts
         ):
