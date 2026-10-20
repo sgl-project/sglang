@@ -548,10 +548,11 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
     ):
         # Reject unsupported state before common initialization starts listeners.
         if get_disagg().nixl_use_cpu_buffer and (
-            args.state_data_ptrs or args.is_hybrid_mla_backend
+            (args.state_data_ptrs and args.state_types != [StateType.MAMBA])
+            or args.is_hybrid_mla_backend
         ):
             raise ValueError(
-                "CPU-buffer PD does not yet support model state or hybrid MLA layouts"
+                "CPU-buffer PD supports only Mamba/GDN extra state, without hybrid MLA layouts"
             )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self._cpu_pool = None
@@ -1896,7 +1897,15 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
 
                     if kv_chunk.is_last_chunk:
                         dst_info = self.decode_kv_args_table[req.agent_name]
-                        if kv_chunk.state_indices:
+                        if self.cpu_buffer_enabled:
+                            self._send_cpu_state(
+                                req,
+                                dst_info,
+                                kv_chunk,
+                                "",
+                                handles,
+                            )
+                        elif kv_chunk.state_indices:
                             state_xfer_handles = self.maybe_send_extra(
                                 req.agent_name,
                                 kv_chunk.state_indices,
@@ -2073,6 +2082,9 @@ class NixlKVManager(CpuBufferMixin, StagingManagerMixin, CommonKVManager):
         logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
+
+        if self.cpu_buffer_enabled:
+            return
 
         state_addrs = []
         for comp_ptrs, comp_lens in zip(
@@ -3713,11 +3725,12 @@ class NixlKVReceiver(CommonKVReceiver):
 
         cpu_region = None
         if self.kv_mgr.cpu_buffer_enabled:
-            if state_indices:
-                raise ValueError("CPU-buffer PD does not support state transfers")
             try:
                 cpu_region = self.kv_mgr._allocate_cpu_receive(
-                    self.bootstrap_room, kv_indices, len(self.bootstrap_infos)
+                    self.bootstrap_room,
+                    kv_indices,
+                    len(self.bootstrap_infos),
+                    state_indices,
                 )
             except (BufferError, ValueError) as exc:
                 self.kv_mgr.record_failure(self.bootstrap_room, str(exc))

@@ -309,8 +309,8 @@ class TestCpuBufferPool(CustomTestCase):
             aux_data_ptrs=[0xBEEF],
             aux_data_lens=[8],
             gpu_id=0,
-            state_data_ptrs=[],
-            state_data_lens=[],
+            state_data_ptrs=[[0xFACE]],
+            state_data_lens=[[32]],
         )
         mgr.agent = MagicMock()
         mgr.register_buffer_to_engine()
@@ -451,6 +451,104 @@ class TestCpuBufferOwnership(CustomTestCase):
         peer.decode_tp_size = 2
         with self.assertRaisesRegex(ValueError, "matching TP"):
             mgr._validate_cpu_peer(peer)
+
+
+class TestCpuBufferMambaState(CustomTestCase):
+    def test_hybrid_tensor_mapping_matches_registered_pointer_order(self):
+        mgr = manager()
+        key = torch.zeros((8, 4), dtype=torch.uint8)
+        value = torch.zeros_like(key)
+        conv = torch.zeros((4, 3), dtype=torch.bfloat16)
+        recurrent = torch.zeros((4, 2, 2), dtype=torch.float32)
+        mgr.kv_args.kv_data_ptrs = [value.data_ptr(), key.data_ptr()]
+        mgr.kv_args.kv_item_lens = [4, 4]
+        mgr.kv_args.state_data_ptrs = [[recurrent.data_ptr(), conv.data_ptr()]]
+        mgr.kv_args.state_item_lens = [[16, 6]]
+        pool = SimpleNamespace(
+            full_kv_pool=SimpleNamespace(k_buffer=[key], v_buffer=[value]),
+            mamba_pool=SimpleNamespace(
+                _iter_transfer_state_entries=lambda: iter(
+                    [("conv", conv, 0, 1), ("ssm", recurrent, 0, 1)]
+                )
+            ),
+        )
+        mgr.set_cpu_kv_buffers(pool)
+        self.assertEqual(
+            [v.data_ptr() for v in mgr._cpu_views], mgr.kv_args.kv_data_ptrs
+        )
+        self.assertEqual([v.shape[1] for v in mgr._cpu_state_views], [16, 6])
+        self.assertEqual(
+            [v.data_ptr() for v in mgr._cpu_state_views], mgr.kv_args.state_data_ptrs[0]
+        )
+
+    def test_state_roundtrip_and_abort_share_receive_ownership(self):
+        mgr = manager(512)
+        mgr._cpu_state_views = [
+            torch.zeros((4, 6), dtype=torch.uint8),
+            torch.zeros((4, 8), dtype=torch.uint8),
+        ]
+        region = mgr._allocate_cpu_receive(9, np.array([2]), 2, [[3]])
+        region.buffer.copy_(torch.arange(18, dtype=torch.uint8))
+        mgr._finish_cpu_receive(9)
+        self.assertEqual(mgr._cpu_views[0][2].tolist(), list(range(4)))
+        self.assertEqual(mgr._cpu_state_views[0][3].tolist(), list(range(4, 10)))
+        self.assertEqual(mgr._cpu_state_views[1][3].tolist(), list(range(10, 18)))
+        self.assertEqual(mgr._cpu_state_views[0][:3].count_nonzero(), 0)
+        region = mgr._allocate_cpu_receive(10, np.array([], dtype=np.int32), 2, [[1]])
+        self.assertEqual(region.buffer.numel(), 14)  # Final state without KV pages.
+        region.published = True
+        generation = mgr.register_deferred_abort_room(10)
+        mgr._clear_cpu_receive(10)
+        mgr.note_abort_ack(10, 0, generation)
+        self.assertIn(10, mgr._cpu_receives)
+        mgr.note_abort_ack(10, 1, generation)
+        self.assertNotIn(10, mgr._cpu_receives)
+
+    def test_state_post_failure_retains_source_and_validates_layout(self):
+        mgr = manager(256)
+        mgr._cpu_state_views = [torch.arange(16, dtype=torch.uint8).reshape(4, 4)]
+        mgr.kv_args.state_item_lens = [[4]]
+        mgr.kv_args.state_layer_ids = [[1]]
+        mgr.kv_args.state_dim_per_tensor = [[2]]
+        peer = SimpleNamespace(
+            cpu_buffer_version=CPU_BUFFER_VERSION,
+            decode_tp_size=1,
+            dst_dcp_size=1,
+            dst_kv_item_lens=[4],
+            dst_kv_layer_ids=[0],
+            dst_state_item_lens=[[4]],
+            dst_state_layer_ids=[[1]],
+            dst_state_dim_per_tensor=[[2]],
+        )
+        req = SimpleNamespace(
+            cpu_buffer_ptr=4096,
+            cpu_buffer_pages=2,
+            dst_kv_indices=[2, 3],
+            dst_state_indices=[[1]],
+            agent_name="peer",
+        )
+        chunk = SimpleNamespace(state_indices=[[2]])
+        mgr.agent = MagicMock()
+        mgr.agent.initialize_xfer.return_value = "state"
+        mgr.agent.transfer.side_effect = RuntimeError("partial state post")
+        mgr.agent.check_xfer_state.return_value = "PROC"
+        handles = []
+        with self.assertRaisesRegex(RuntimeError, "partial state post"):
+            mgr._send_cpu_state(req, peer, chunk, "9_state_0", handles)
+        self.assertEqual(handles, ["state"])
+        self.assertEqual(
+            mgr.agent.get_xfer_descs.call_args_list[1].args, ([(4104, 4, 0)], "DRAM")
+        )
+        mgr._cpu_pool.reap(mgr.agent)
+        with self.assertRaises(BufferError):
+            mgr._cpu_pool.allocate(1)
+        peer.dst_state_layer_ids = [[3]]
+        with self.assertRaisesRegex(ValueError, "state layouts"):
+            mgr._validate_cpu_peer(peer)
+        for indices in (None, [], [[1, 2]], [[-1]], [[4]]):
+            with self.subTest(indices=indices), self.assertRaises(ValueError):
+                mgr._allocate_cpu_receive(11, np.array([0]), 1, indices)
+        self.assertNotIn(11, mgr._cpu_receives)
 
 
 if __name__ == "__main__":

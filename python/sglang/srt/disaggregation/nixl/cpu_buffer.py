@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-CPU_BUFFER_VERSION = b"cpu-buffer-v1"
+CPU_BUFFER_VERSION = b"cpu-buffer-v2"
 
 
 class CpuBufferPool:
@@ -86,6 +86,7 @@ class CpuReceiveRegion:
     buffer: torch.Tensor
     indices: np.ndarray
     required_acks: int
+    state_indices: np.ndarray | None = None
     published: bool = False
     release_requested: bool = False
 
@@ -166,6 +167,20 @@ class CpuBufferMixin:
         return getattr(self, "_cpu_pool", None) is not None
 
     def set_cpu_kv_buffers(self, pool):
+        self._cpu_state_views = []
+        if getattr(self.kv_args, "state_data_ptrs", None):
+            # Use the same tensor enumeration as get_contiguous_buf_infos,
+            # including any slot siblings, then match by address.
+            tensors = [
+                tensor
+                for _, tensor, _, _ in pool.mamba_pool._iter_transfer_state_entries()
+            ]
+            self._cpu_state_views = page_views(
+                tensors,
+                self.kv_args.state_data_ptrs[0],
+                self.kv_args.state_item_lens[0],
+            )
+        pool = getattr(pool, "full_kv_pool", pool)
         buffers = getattr(pool, "kv_buffer", None)
         if buffers is None:
             buffers = list(pool.k_buffer) + list(pool.v_buffer)
@@ -186,10 +201,15 @@ class CpuBufferMixin:
             or peer.dst_dcp_size != 1
             or peer.dst_kv_item_lens != self.kv_args.kv_item_lens
             or peer.dst_kv_layer_ids != self.kv_args.kv_layer_ids
-            or peer.dst_state_data_ptrs
+            or (getattr(peer, "dst_state_item_lens", []) or [])
+            != (getattr(self.kv_args, "state_item_lens", []) or [])
+            or (getattr(peer, "dst_state_layer_ids", []) or [])
+            != (getattr(self.kv_args, "state_layer_ids", []) or [])
+            or (getattr(peer, "dst_state_dim_per_tensor", []) or [])
+            != (getattr(self.kv_args, "state_dim_per_tensor", []) or [])
         ):
             raise ValueError(
-                "CPU-buffer PD requires matching TP and KV layouts without extra state"
+                "CPU-buffer PD requires matching TP, KV and Mamba state layouts"
             )
 
     def _send_cpu_chunk(self, req, peer, chunk, notif, handles):
@@ -230,18 +250,80 @@ class CpuBufferMixin:
             if not retained:
                 self._cpu_pool.release(offset)
 
-    def _allocate_cpu_receive(self, room, indices, required_acks):
+    def _cpu_state_index(self, indices):
+        views = getattr(self, "_cpu_state_views", [])
+        if not views:
+            if indices:
+                raise ValueError("Unexpected CPU-buffer state indices")
+            return None
+        if (
+            indices is None
+            or len(indices) != 1
+            or indices[0] is None
+            or len(indices[0]) != 1
+        ):
+            raise ValueError(
+                "CPU-buffer Mamba transfer requires one physical state slot"
+            )
+        index = np.asarray(indices[0], dtype=np.int64)
+        if index[0] < 0 or any(index[0] >= view.shape[0] for view in views):
+            raise ValueError("CPU-buffer state slot out of bounds")
+        return index
+
+    def _send_cpu_state(self, req, peer, chunk, notif, handles):
+        self._validate_cpu_peer(peer)
+        indices = self._cpu_state_index(chunk.state_indices)
+        if indices is None:
+            return
+        if len(req.dst_state_indices) != 1 or len(req.dst_state_indices[0]) != 1:
+            raise ValueError("Missing CPU-buffer destination state slot")
+        if not req.cpu_buffer_ptr or req.cpu_buffer_pages != len(req.dst_kv_indices):
+            raise ValueError("Missing CPU-buffer state receive region")
+        size = sum(view.shape[1] for view in self._cpu_state_views)
+        self._cpu_pool.reap(self.agent)
+        offset, buffer = self._cpu_pool.allocate(size)
+        retained = False
+        try:
+            pack_pages(self._cpu_state_views, indices, buffer)
+            dst = req.cpu_buffer_ptr + req.cpu_buffer_pages * sum(
+                self.kv_args.kv_item_lens
+            )
+            handle = self.agent.initialize_xfer(
+                "WRITE",
+                self.agent.get_xfer_descs([(buffer.data_ptr(), size, 0)], "DRAM"),
+                self.agent.get_xfer_descs([(dst, size, 0)], "DRAM"),
+                req.agent_name,
+                notif.encode("ascii"),
+            )
+            if not handle:
+                raise RuntimeError(
+                    "NIXL failed to initialize CPU-buffer state transfer"
+                )
+            self._cpu_pool.retain(handle, offset)
+            retained = True
+            handles.append(handle)
+            if self.agent.transfer(handle) == "ERR":
+                raise RuntimeError("NIXL failed to post CPU-buffer state transfer")
+        finally:
+            if not retained:
+                self._cpu_pool.release(offset)
+
+    def _allocate_cpu_receive(self, room, indices, required_acks, state_indices=None):
         with self._cpu_receive_lock:
             if room in self._cpu_receives:
                 raise ValueError(
                     "CPU-buffer room is still owned by an earlier transfer"
                 )
+            state_index = self._cpu_state_index(state_indices)
             size = len(indices) * sum(self.kv_args.kv_item_lens)
+            size += sum(view.shape[1] for view in getattr(self, "_cpu_state_views", []))
             if size:
                 offset, buffer = self._cpu_pool.allocate(size)
             else:
                 offset, buffer = None, self._cpu_pool.buffer[:0]
-            region = CpuReceiveRegion(offset, buffer, indices.copy(), required_acks)
+            region = CpuReceiveRegion(
+                offset, buffer, indices.copy(), required_acks, state_index
+            )
             self._cpu_receives[room] = region
             return region
 
@@ -250,7 +332,14 @@ class CpuBufferMixin:
             region = self._cpu_receives.get(room)
             if region is None:
                 raise RuntimeError("CPU-buffer receive region is missing")
-            scatter_pages(self._cpu_views, region.indices, region.buffer)
+            kv_bytes = len(region.indices) * sum(self.kv_args.kv_item_lens)
+            scatter_pages(self._cpu_views, region.indices, region.buffer[:kv_bytes])
+            if region.state_indices is not None:
+                scatter_pages(
+                    self._cpu_state_views,
+                    region.state_indices,
+                    region.buffer[kv_bytes:],
+                )
             self._release_cpu_receive(room)
 
     def _release_cpu_receive(self, room):

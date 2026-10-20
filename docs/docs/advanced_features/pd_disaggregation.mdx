@@ -58,8 +58,14 @@ transfers through UCX.
 
 Use the same SGLang revision, model, KV layout, page size, and attention TP size
 on both sides. This initial path supports contiguous MHA and MLA KV buffers with
-PP, CP, and DCP sizes of one. It does not support speculative decoding, hybrid
-MLA layouts, extra model state (including Qwen hybrid GDN state), HiCache,
+PP, CP, and DCP sizes of one. Hybrid GDN models such as Qwen3.5 are supported
+when their only extra state component is Mamba/GDN state. The final prefill chunk
+sends the conv and recurrent state through the same host pool; decode restores
+both KV and state before allowing generation. Both sides must have identical
+state layouts and attention TP sizes.
+
+It does not support speculative decoding, hybrid MLA layouts, other extra state
+components (including QSA), HiCache,
 HiSparse, decode KV offload, decode host receive, GPU staging, or runtime PD role switching.
 Unsupported local configurations and peer layouts fail explicitly.
 
@@ -69,7 +75,7 @@ preserved. The `host_pool` backend is rejected because it allocates a
 CUDA-registered HiCache pool even when incoming KV uses CPU buffers.
 
 Size the pool for concurrent requests: decode holds every received KV page for
-a request until GPU restoration completes, while prefill holds each packed
+a request, together with its Mamba/GDN state when present, until GPU restoration completes, while prefill holds each packed
 chunk until its NIXL transfer settles. Pool exhaustion fails the affected
 request instead of waiting for pool space. An aborted decode request
 keeps its host region, GPU KV slots, and auxiliary slot until all TP ranks
