@@ -1267,12 +1267,13 @@ def test_marlin_lora_direct_inactive_routes():
 
 
 @pytest.mark.parametrize("fused_norm", [False, True])
-def test_muse_marlin_inactive_routes(fused_norm):
-    """Muse maps global routes once and masks inactive weights before either norm tail."""
+@pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+def test_muse_marlin_inactive_routes(fused_norm, hidden, intermediate):
+    """Muse reuses projection storage while keeping inactive expert outputs zero."""
     from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import MuseSpark1xFp4Experts
 
     torch.manual_seed(67)
-    rows, local_experts, hidden, intermediate, topk = 4, 2, 256, 256, 2
+    rows, local_experts, topk = 4, 2, 2
     dtype = torch.bfloat16
     layer = MuseSpark1xFp4Experts.__new__(MuseSpark1xFp4Experts)
     torch.nn.Module.__init__(layer)
@@ -1320,7 +1321,24 @@ def test_muse_marlin_inactive_routes(fused_norm):
     layer._post_expert_norm_eps = norm.eps
     layer._post_expert_norm_weight_first = False
 
-    expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
+    projection_buffers = []
+
+    def record_projection_buffer(a, c, *args, **kwargs):
+        projection_buffers.append(c)
+        if len(projection_buffers) == 2:
+            assert torch.count_nonzero(c) == 0
+        return moe_wna16_marlin_gemm(a, c, *args, **kwargs)
+
+    with patch(
+        "sglang.kernels.ops.moe.moe_wna16_marlin.moe_wna16_marlin_gemm",
+        side_effect=record_projection_buffer,
+    ):
+        expert_output, mapped = layer._marlin_expert_outputs(x, weights, ids)
+    gate_up_buffer, down_buffer = projection_buffers
+    assert gate_up_buffer.data_ptr() == down_buffer.data_ptr()
+    assert down_buffer.untyped_storage().nbytes() == (
+        rows * topk * max(2 * intermediate, hidden) * x.element_size()
+    )
     torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
     assert torch.count_nonzero(expert_output[local_ids < 0]) == 0
     expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)

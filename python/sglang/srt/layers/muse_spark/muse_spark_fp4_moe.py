@@ -434,12 +434,12 @@ class MuseSpark1xFp4Experts(nn.Module):
             dtype=hidden_states.dtype,
         )
         cache13 = torch.zeros(
-            (num_tokens * topk * (gemm1_n + size_k),),
+            (num_tokens * topk * max(gemm1_n, size_k),),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         cache1 = cache13[: num_tokens * topk * gemm1_n].view(-1, gemm1_n)
-        cache3 = cache13[num_tokens * topk * gemm1_n :].view(-1, size_k)
+        cache3 = cache13[: num_tokens * topk * size_k].view(-1, size_k)
 
         cache1 = moe_wna16_marlin_gemm(
             hidden_states,
@@ -475,6 +475,8 @@ class MuseSpark1xFp4Experts(nn.Module):
             expert_ids=local_topk_ids.view(-1),
             expert_step=1,
         )
+        # Gate/up is no longer needed once activation has its own output.
+        cache3.zero_()
         return moe_wna16_marlin_gemm(
             cache2,
             cache3,

@@ -70,6 +70,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="moe.per_tensor_absmax_fp8_for_cutlass_moe",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.ep_moe_kernels:per_tensor_absmax_fp8_for_cutlass_moe",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,

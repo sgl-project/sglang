@@ -6,6 +6,9 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.moe.ep_moe_kernels import (
+    per_tensor_absmax_fp8_for_cutlass_moe,
+)
 from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -19,6 +22,114 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+
+    def test_masked_absmax_excludes_inactive_rows(self):
+        """Any local route includes its row; inactive values cannot affect the scale."""
+        experts, rows, width = 2, 11, 257
+        floor = 1e-10 / torch.finfo(torch.float8_e4m3fn).max
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            values = torch.empty((rows, width * 2), device="cuda", dtype=dtype)[:, ::2]
+            values.copy_(
+                torch.arange(rows * width, device="cuda")
+                .reshape(rows, width)
+                .remainder(53)
+                .sub(26)
+                .float()
+                / 8
+            )
+            values[9, -1] = 7.25
+            ids = torch.tensor(
+                [
+                    [2, -1, 2],
+                    [2, 0, 2],
+                    [1, 2, -1],
+                    [-1, -1, 2],
+                    [2, 2, 1],
+                    [1, 0, 2],
+                    [2, -1, 0],
+                    [2, 2, 2],
+                    [0, 2, 1],
+                    [2, 1, 2],
+                    [-1, 2, -1],
+                ],
+                device="cuda",
+                dtype=torch.int64 if dtype == torch.float32 else torch.int32,
+            ).repeat_interleave(2, dim=1)[:, ::2]
+            active = ((ids >= 0) & (ids < experts)).any(dim=-1)
+            expected = values[active].float().abs().amax() / 448.0
+            scale = torch.full((1,), floor, device="cuda", dtype=torch.float32)
+            for poison in (1e4, float("inf"), float("nan")):
+                with self.subTest(dtype=dtype, poison=poison):
+                    values[~active] = poison
+                    scale.fill_(floor)
+                    per_tensor_absmax_fp8_for_cutlass_moe(
+                        input=values,
+                        topk_ids=ids,
+                        output_s=scale,
+                        num_local_experts=experts,
+                    )
+                    torch.testing.assert_close(
+                        scale, expected.reshape(1), rtol=1e-6, atol=0
+                    )
+            for case in ("zero", "inactive", "empty"):
+                with self.subTest(dtype=dtype, case=case):
+                    values.zero_()
+                    if case == "inactive":
+                        values.fill_(float("nan"))
+                        ids.fill_(experts)
+                    scale.fill_(floor)
+                    per_tensor_absmax_fp8_for_cutlass_moe(
+                        input=values[:0] if case == "empty" else values,
+                        topk_ids=ids[:0] if case == "empty" else ids,
+                        output_s=scale,
+                        num_local_experts=experts,
+                    )
+                    torch.testing.assert_close(
+                        scale, torch.full_like(scale, floor), rtol=0, atol=0
+                    )
+
+    def test_masked_absmax_graph_replay_updates_scale(self):
+        """A replay must reset the scale before changing live rows or route validity."""
+        experts, rows, width = 2, 13, 257
+        floor = 1e-10 / torch.finfo(torch.float8_e4m3fn).max
+        values = torch.ones((rows, width), device="cuda", dtype=torch.bfloat16)
+        ids = torch.zeros((rows, 2), device="cuda", dtype=torch.int32)
+        scale = torch.full((1,), floor, device="cuda", dtype=torch.float32)
+
+        def run():
+            scale.fill_(floor)
+            per_tensor_absmax_fp8_for_cutlass_moe(
+                input=values,
+                topk_ids=ids,
+                output_s=scale,
+                num_local_experts=experts,
+            )
+
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for case, expected in (
+            ("live", 2 / 448),
+            ("zero", floor),
+            ("inactive", floor),
+            ("partial", 3 / 448),
+        ):
+            with self.subTest(case=case):
+                values.fill_(2.0 if case == "live" else 0.0)
+                ids.fill_(0)
+                if case == "inactive":
+                    values.fill_(float("nan"))
+                    ids.fill_(experts)
+                elif case == "partial":
+                    ids.fill_(experts)
+                    ids[-1, 1] = 1
+                    values[-1, -1] = 3.0
+                graph.replay()
+                torch.testing.assert_close(
+                    scale, torch.full_like(scale, expected), rtol=1e-6, atol=0
+                )
 
     def test_ep1_and_ep2_reorder_match_dense_experts(self):
         """Real CUDA permutation/count/finalize kernels must ignore padded routes.
@@ -100,6 +211,8 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         def dense_gemm(
             out, x, packed, input_scale, _weight_scale, starts, sizes, *args
         ):
+            self.assertTrue(torch.isfinite(input_scale).all().item())
+            self.assertGreater(input_scale.item(), 0)
             out.fill_(float("nan"))
             matrices = dense_w13 if packed is w13_q else dense_w2
             for expert in range(experts):
@@ -162,6 +275,13 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                                 actual, reference.to(actual.dtype), rtol=1e-2, atol=1e-3
                             )
                             self.assertEqual(torch.count_nonzero(actual[2]).item(), 0)
+                actual = run(
+                    torch.zeros_like(inputs),
+                    dynamic=True,
+                    route_weights=weights.masked_fill(ids < 0, float("nan")),
+                )
+                self.assertTrue(torch.isfinite(actual).all().item())
+                self.assertEqual(torch.count_nonzero(actual).item(), 0)
                 inactive = torch.full_like(ids, -1)
                 actual = run(
                     torch.full_like(inputs, float("nan")),

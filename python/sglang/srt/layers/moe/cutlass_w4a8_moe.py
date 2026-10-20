@@ -28,16 +28,14 @@ from sglang.kernels.ops.moe.ep_moe_kernels import (
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
     fp8_per_token_to_per_tensor_quant_triton,
+    per_tensor_absmax_fp8_for_cutlass_moe,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
     silu_mul_dynamic_tensorwise_quant_for_cutlass_moe,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
-from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_absmax_fp8,
-    per_tensor_quant_fp8,
-)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 
 def cutlass_w4a8_moe(
@@ -140,14 +138,19 @@ def cutlass_w4a8_moe(
         dtype=torch.float8_e4m3fn,
     )
 
-    # TODO: fuse per_tensor_absmax_fp8 and pre_reorder_for_cutlass_moe
     if a1_scale is None:
-        a1_scale = torch.zeros(1, dtype=torch.float32, device=device)
-        # Inactive rows must not change the quantization of live expert inputs.
-        inactive_rows = (topk_ids == num_local_experts).all(dim=-1, keepdim=True)
-        scale_input = a.masked_fill(inactive_rows, 0.0)
-        per_tensor_absmax_fp8(scale_input, a1_scale)
-        a1_scale.clamp_(min=1e-10 / torch.finfo(torch.float8_e4m3fn).max)
+        a1_scale = torch.full(
+            (1,),
+            1e-10 / torch.finfo(torch.float8_e4m3fn).max,
+            dtype=torch.float32,
+            device=device,
+        )
+        per_tensor_absmax_fp8_for_cutlass_moe(
+            input=a,
+            topk_ids=topk_ids,
+            output_s=a1_scale,
+            num_local_experts=num_local_experts,
+        )
 
     pre_reorder_for_cutlass_moe(
         a,
