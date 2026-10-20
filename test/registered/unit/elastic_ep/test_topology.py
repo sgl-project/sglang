@@ -1,5 +1,6 @@
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     poll_recovery_control_plane,
     pre_dispatch_recovery_fence,
     register_scale_cohort,
+    validate_post_forward_recovery_generation,
     validate_scale_cohort_topology,
 )
 from sglang.srt.elastic_ep.runtime_topology import (
@@ -32,7 +34,10 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_rank_to_dp_rank,
     physical_ep_size_to_dp_size,
 )
-from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
+from sglang.srt.managers.io_struct import (
+    ObserveElasticEPMembershipReqInput,
+    ScaleElasticEPReqInput,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -213,6 +218,92 @@ def test_membership_observation_rejects_duplicate_stale_and_aba_epochs():
             publish_membership_observation(observation)
         with pytest.raises(ValueError, match="stale|ABA"):
             publish_membership_observation(replace(observation, membership_epoch=8))
+        publish_membership_observation(
+            replace(
+                observation,
+                failed_allocation_incarnation="allocation/8",
+                membership_epoch=10,
+            )
+        )
+        with pytest.raises(ValueError, match="stale|ABA"):
+            publish_membership_observation(
+                replace(
+                    observation,
+                    failed_allocation_incarnation="allocation/7",
+                    membership_epoch=11,
+                )
+            )
+
+
+def test_membership_publication_serializes_duplicate_interleavings():
+    store = _MembershipStore()
+    topology = RuntimeTopology(
+        runtime_instance_id="runtime-1",
+        initial_ep_size=2,
+        allocation_width=1,
+        effective_ep_size=2,
+        max_committed_ep_size=2,
+    )
+    observation = MembershipObservation(
+        runtime_instance_id="runtime-1",
+        topology_generation=0,
+        rank=1,
+        failed_allocation_incarnation="allocation-a",
+        membership_epoch=1,
+    )
+    with (
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_global_tcp_store",
+            return_value=store,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_runtime_topology",
+            return_value=topology,
+        ),
+    ):
+
+        def publish_once():
+            try:
+                return ("accepted", publish_membership_observation(observation))
+            except ValueError as exc:
+                return ("rejected", str(exc))
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [
+                future.result()
+                for future in (
+                    executor.submit(publish_once),
+                    executor.submit(publish_once),
+                )
+            ]
+
+    assert [result[0] for result in results].count("accepted") == 1
+    assert [result[0] for result in results].count("rejected") == 1
+    assert "Duplicate" in next(
+        result[1] for result in results if result[0] == "rejected"
+    )
+
+
+def test_membership_endpoint_only_publishes_until_scheduler_safe_boundary():
+    request = ObserveElasticEPMembershipReqInput(
+        runtime_instance_id="runtime-1",
+        topology_generation=0,
+        rank=1,
+        failed_allocation_incarnation="allocation-a",
+        membership_epoch=1,
+    )
+    with (
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership",
+            return_value="observation-key",
+        ),
+        patch("sglang.srt.elastic_ep.elastic_ep.poll_recovery_control_plane") as poll,
+    ):
+        result = Scheduler.handle_observe_elastic_ep_membership(object(), request)
+
+    assert result.accepted
+    assert result.observation_key == "observation-key"
+    poll.assert_not_called()
 
 
 def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
@@ -265,7 +356,7 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
             membership_epoch=1,
         )
         assert state.recovery_phase == "idle"
-        assert state.active_ranks_cpu[1].item() == 1
+        assert state.active_ranks_cpu[1].item() == 0
         with pytest.raises(ValueError, match="Duplicate"):
             observe_recovery_membership(
                 runtime_instance_id="runtime-1",
@@ -285,8 +376,6 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         assert poll_recovery_control_plane()
         assert state.recovery_phase == "awaiting_recovery"
         assert state.active_ranks_cpu[1].item() == 0
-        with pytest.raises(RuntimeError, match="fence"):
-            pre_dispatch_recovery_fence()
         with pytest.raises(ValueError, match="awaiting"):
             observe_recovery_membership(
                 runtime_instance_id="runtime-1",
@@ -322,7 +411,8 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         state.pending_since = time.monotonic()
         with pytest.raises(RuntimeError, match="user forward"):
             pre_dispatch_recovery_fence()
-        assert pre_dispatch_recovery_fence(internal_warmup=True) == 0
+        fence = pre_dispatch_recovery_fence(internal_warmup=True)
+        assert fence.topology_generation == 0
         state.pending_since = time.monotonic() - 1000
         with patch(
             "sglang.srt.elastic_ep.elastic_ep.get_exec",
@@ -342,6 +432,56 @@ def test_membership_admission_precedes_recovery_and_legacy_stays_unfenced():
         return_value=SimpleNamespace(moe=SimpleNamespace()),
     ):
         assert not pre_dispatch_recovery_fence()
+
+
+def test_ready_recovery_allows_user_forward_and_fences_membership_change():
+    topology = RuntimeTopology(
+        runtime_instance_id="runtime-1",
+        initial_ep_size=2,
+        allocation_width=1,
+        effective_ep_size=2,
+        max_committed_ep_size=2,
+    )
+    state = ElasticEPState(
+        active_ranks=torch.tensor([1, 1]),
+        last_active_ranks=torch.tensor([1, 1]),
+        active_ranks_cpu=torch.tensor([1, 1]),
+        effective_ep_size=2,
+        recovery_phase="ready",
+    )
+    observation = MembershipObservation(
+        runtime_instance_id="runtime-1",
+        topology_generation=0,
+        rank=1,
+        failed_allocation_incarnation="inc-1",
+        membership_epoch=1,
+    )
+    with (
+        patch.object(ElasticEPStateManager, "_instance", state),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_exec",
+            return_value=SimpleNamespace(
+                moe=SimpleNamespace(elastic_ep_recovery_policy="fixed_slot")
+            ),
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_runtime_topology",
+            return_value=topology,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_membership_observation",
+            return_value=observation,
+        ),
+    ):
+        fence = pre_dispatch_recovery_fence()
+        assert fence.topology_generation == 0
+        validate_post_forward_recovery_generation(fence)
+        with patch(
+            "sglang.srt.elastic_ep.elastic_ep.get_membership_observation",
+            return_value=replace(observation, membership_epoch=2),
+        ):
+            with pytest.raises(RuntimeError, match="membership changed"):
+                validate_post_forward_recovery_generation(fence)
 
 
 if __name__ == "__main__":

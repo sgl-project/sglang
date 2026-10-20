@@ -124,6 +124,12 @@ class RecoveryLifecycle:
         self.phase = next_phase
 
 
+@dataclass(frozen=True)
+class RecoveryDispatchFence:
+    topology_generation: int
+    membership_observation: Optional[MembershipObservation]
+
+
 _PENDING_RECOVERY_PHASES = frozenset(
     {"awaiting_recovery", "restoring", "slot_restored", "warming_up"}
 )
@@ -980,12 +986,6 @@ def observe_recovery_membership(
     state = ElasticEPStateManager.instance()
     if state is not None and state.recovery_phase == "awaiting_recovery":
         raise ValueError("Recovery membership observation is awaiting recovery.")
-    if (
-        state is not None
-        and state.active_ranks_cpu is not None
-        and 0 <= rank < len(state.active_ranks_cpu)
-    ):
-        state.active_ranks_cpu[rank] = 1
     return publish_membership_observation(
         MembershipObservation(
             runtime_instance_id=runtime_instance_id,
@@ -1038,7 +1038,7 @@ def consume_recovery_membership_observation(
 
 
 def poll_recovery_control_plane() -> bool:
-    """Consume observations and fail closed when recovery exceeds its deadline."""
+    """Consume observations at the runner boundary and fail closed on timeout."""
     consumed = consume_recovery_membership_observation()
     state = ElasticEPStateManager.instance()
     if state is not None and ElasticEPStateManager.recovery_timed_out():
@@ -1063,7 +1063,7 @@ def _fixed_slot_recovery_enabled() -> bool:
 def pre_dispatch_recovery_fence(
     *,
     internal_warmup: bool = False,
-) -> Optional[int]:
+) -> Optional[RecoveryDispatchFence]:
     """Return the generation allowed for a runner dispatch, or fence it."""
     if not _fixed_slot_recovery_enabled():
         return None
@@ -1081,6 +1081,16 @@ def pre_dispatch_recovery_fence(
     }:
         raise RuntimeError(
             "Elastic EP recovery generation fence rejected user forward."
+        )
+    if state.recovery_phase == "ready":
+        topology = get_runtime_topology()
+        if topology is None:
+            raise RuntimeError(
+                "Elastic EP recovery generation fence rejected dispatch."
+            )
+        return RecoveryDispatchFence(
+            topology_generation=topology.topology_generation,
+            membership_observation=get_membership_observation(),
         )
     if state.recovery_phase != "warming_up":
         if internal_warmup:
@@ -1102,15 +1112,22 @@ def pre_dispatch_recovery_fence(
         state.recovery_topology_generation
     ):
         raise RuntimeError("Elastic EP recovery generation fence rejected dispatch.")
-    return topology.topology_generation
+    return RecoveryDispatchFence(
+        topology_generation=topology.topology_generation,
+        membership_observation=get_membership_observation(),
+    )
 
 
-def validate_post_forward_recovery_generation(generation: Optional[int]) -> None:
-    if generation is None:
+def validate_post_forward_recovery_generation(
+    fence: Optional[RecoveryDispatchFence],
+) -> None:
+    if fence is None:
         return
     topology = get_runtime_topology()
-    if topology is None or topology.topology_generation != generation:
+    if topology is None or topology.topology_generation != fence.topology_generation:
         raise RuntimeError("Elastic EP recovery generation changed during forward.")
+    if get_membership_observation() != fence.membership_observation:
+        raise RuntimeError("Elastic EP membership changed during forward.")
 
 
 def elastic_expanded_world_enabled() -> bool:
