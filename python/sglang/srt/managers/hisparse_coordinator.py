@@ -1429,7 +1429,9 @@ class HiSparseCoordinator:
         page_size = self.token_to_kv_pool_allocator.page_size
         start = max(0, allocated_len - window_size)
         start = (start // page_size) * page_size
-        full_locs = self.req_to_token_pool.req_to_token[req_pool_idx, start:allocated_len]
+        full_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, start:allocated_len
+        ]
         swa_allocator = cast(
             "DeepSeekV4HiSparseTokenToKVPoolAllocator",
             self.token_to_kv_pool_allocator,
@@ -1493,15 +1495,15 @@ class HiSparseCoordinator:
         ``allocated_len`` counts full-space tokens; the indexer pool's page
         size is the C4 (compressed) page size.
         """
-        full_locs = self.req_to_token_pool.req_to_token[
-            req_pool_idx, :allocated_len
-        ]
+        full_locs = self.req_to_token_pool.req_to_token[req_pool_idx, :allocated_len]
         page_size = self.token_to_kv_pool_allocator.page_size
         # Mirror kv_to_page_indices(): positional page IDs from full locs.
         page_indices = full_locs[::page_size] // page_size
         return page_indices, page_indices.numel()
 
-    def _backup_indexer_rows(self, req: Req, allocated_len: int, req_pool_idx: int) -> None:
+    def _backup_indexer_rows(
+        self, req: Req, allocated_len: int, req_pool_idx: int
+    ) -> None:
         """Copy the request's indexer-K page rows to a CPU sidecar.
 
         One-shot, retraction-time only (~136B/token vs 584B/token for the C4
@@ -1525,10 +1527,9 @@ class HiSparseCoordinator:
             ]
         else:
             # FP4 layout: payload + scale buffers, whole pages only.
-            req.hisparse_indexer_backup = (
-                [buf[page_indices].to("cpu") for buf in pool.index_k_payload_buffer]
-                + [buf[page_indices].to("cpu") for buf in pool.index_k_scale_buffer]
-            )
+            req.hisparse_indexer_backup = [
+                buf[page_indices].to("cpu") for buf in pool.index_k_payload_buffer
+            ] + [buf[page_indices].to("cpu") for buf in pool.index_k_scale_buffer]
 
     def _restore_indexer_rows(self, req: Req, req_pool_idx: int) -> None:
         """Write the CPU sidecar back into the fresh logical slots' pages.

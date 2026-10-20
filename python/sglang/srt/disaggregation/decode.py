@@ -2368,9 +2368,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             host_start = 0
             if skip_host_alloc:
                 host_start = int(
-                    coordinator.req_to_host_pool_allocated_len[
-                        req.kv.req_pool_idx
-                    ]
+                    coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx]
                 )
                 if host_start < coordinator.host_token_len(fill_len):
                     host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(

@@ -5786,11 +5786,8 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
-                        if (
-                            self.hisparse_coordinator is not None
-                            and getattr(
-                                decode_req, "hisparse_retraction_pending", False
-                            )
+                        if self.hisparse_coordinator is not None and getattr(
+                            decode_req, "hisparse_retraction_pending", False
                         ):
                             self.hisparse_coordinator.discard_retracted_request(
                                 decode_req
