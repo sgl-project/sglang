@@ -221,7 +221,9 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         self.assertTrue(
             torch.equal(sampler.out[: BS * GAMMA].view(BS, GAMMA), eager.draft_tokens)
         )
-        self.assertTrue(torch.equal(sampler.corrected_logits(BS), eager.corrected_logits))
+        self.assertTrue(
+            torch.equal(sampler.corrected_logits(BS), eager.corrected_logits)
+        )
         self.assertEqual(noise.offset.item(), eager_noise.offset.item())
         # Folded steps carry the confidence the eager proposal computes.
         confidence, confidence_raw = model.compute_confidence(

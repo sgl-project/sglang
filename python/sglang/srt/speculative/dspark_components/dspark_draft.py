@@ -329,7 +329,9 @@ def sample_draft_block(
         corrected_logits=(
             None
             if greedy_draft
-            else expect(_DRAFT_STEP_LOGITS, gather_step_logits(markov_head, step_logits))
+            else expect(
+                _DRAFT_STEP_LOGITS, gather_step_logits(markov_head, step_logits)
+            )
         ),
         greedy_mask=params.greedy_mask,
         temperatures=params.temperatures,

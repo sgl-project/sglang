@@ -415,6 +415,7 @@ def _launch_bias_partial(
     )
     return partial.view(rows, parts * 2)
 
+
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``; a ``MarkovBiasGemv`` is computed in
