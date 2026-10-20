@@ -19,10 +19,11 @@ use futures::StreamExt;
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::{indexed_decode_stream, openai_error, routes};
+use super::{indexed_decode_stream, model_error, openai_error, routes};
 use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
+use crate::tokenizer_manager::wiring::TmEvent;
 pub(super) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
@@ -105,9 +106,11 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 }
 
 pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
+    let server_args = server_args();
     Arc::new(super::AppState {
         core,
-        server_args: server_args(),
+        generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        server_args,
         chat_formatter: None,
     })
 }
@@ -131,6 +134,42 @@ pub(super) fn frontend_closed() -> CoreHandle {
             metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
         },
     )
+}
+
+/// App state whose core intake answers every generation with one finished
+/// `ok` chunk, with the ChatML template so chat can render.
+fn answering_app_state() -> Arc<super::AppState> {
+    let (intake_tx, intake_rx) = flume::unbounded();
+    tokio::spawn(async move {
+        while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
+            assert!(admission.try_accept());
+            let done = chunk(request.rid.as_str(), "ok", true);
+            request.sink.try_send(done).unwrap();
+        }
+    });
+    let core = CoreHandle::new(
+        intake_tx,
+        flume::unbounded().0,
+        crate::api_server::core::CoreConfig {
+            response_capacity: 8,
+            response_activity: Default::default(),
+            startup_ready: false,
+            is_disaggregation: false,
+            mm_limits: Default::default(),
+            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+        },
+    );
+    let server_args = server_args();
+    Arc::new(super::AppState {
+        core,
+        generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        server_args,
+        chat_formatter: Some(super::ChatFormatter::Legacy(Box::new(
+            super::template::LegacyFormatter {
+                spec: super::template::builtin_template("chatml").unwrap(),
+            },
+        ))),
+    })
 }
 
 /// Serve one request through the full router (extractors, auth, routing).
@@ -216,7 +255,6 @@ async fn openai_error_response_covers_unary_and_sse() {
 async fn completions_handler_validates_before_submit() {
     let app = routes().with_state(app_state(core_handle()));
     let cases = [
-        (json!({"model": "other", "prompt": "hi"}), "unknown model"),
         (json!({"model": "model", "prompt": "hi", "n": 0}), "n=0"),
         (
             json!({"model": "model", "prompt": "hi", "max_tokens": 0}),
@@ -264,10 +302,6 @@ async fn completions_handler_validates_before_submit() {
 async fn chat_handler_validates_before_submit() {
     let app = routes().with_state(app_state(core_handle()));
     let cases = [
-        (
-            json!({"model": "other", "messages": [{"role": "user", "content": "hi"}]}),
-            "unknown model",
-        ),
         (json!({"model": "model", "messages": []}), "empty messages"),
         (
             json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 0}),
@@ -302,6 +336,38 @@ async fn chat_handler_validates_before_submit() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Python's chat and completions handlers serve any `model` name and echo it
+/// back. Only a `base-model:adapter` name is refused: it asks for a LoRA
+/// adapter, which this server does not support.
+#[tokio::test]
+async fn openai_handlers_serve_any_model_name() {
+    let app = routes().with_state(answering_app_state());
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        ("/v1/completions", json!({"prompt": "hi"})),
+        ("/v1/chat/completions", json!({"messages": messages})),
+    ] {
+        for model in ["model", "other-model"] {
+            let mut body = body.clone();
+            body["model"] = json!(model);
+            let response = post_json(app.clone(), path, body).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path} {model}");
+            assert_eq!(body_json(response).await["model"], model, "{path}");
+        }
+        let mut body = body.clone();
+        body["model"] = json!("model:adapter");
+        let response = post_json(app.clone(), path, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let message = body_json(response).await["error"]["message"].clone();
+        assert!(message.as_str().unwrap().contains("`adapter`"), "{message}");
+    }
+    // As in Python, an empty adapter (`name:`) is none. The served name is
+    // always accepted, even with a colon in it.
+    assert_eq!(model_error("other-model: ", "model"), None);
+    assert!(model_error("org/model:v1", "model").is_some());
+    assert_eq!(model_error("org/model:v1", "org/model:v1"), None);
 }
 
 #[tokio::test]

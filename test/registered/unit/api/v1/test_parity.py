@@ -43,37 +43,32 @@ FIXTURES = REPO_ROOT / "rust" / "sglang-api-types" / "testdata" / "json_parity.j
 PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
-        "cache_salt",
         "conversation_id",
         "custom_labels",
         "custom_logit_processor",
         "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
-        "extra_key",
         "http_worker_ipc",
         "image_max_dynamic_patch",
         "images_config",
         "input_embeds",
-        "kv_hints",
         "log_metrics",
         "lora_id",
-        "lora_path",
         "max_dynamic_patch",
-        "max_thinking_tokens",
         "min_dynamic_patch",
         "mm_content_hashes",
+        "mm_processor_kwargs",
         "modalities",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
         "num_items_assigned",
         "positional_embed_overrides",
-        "priority",
         "received_time",
-        "require_reasoning",
         "return_bytes",
         "return_entropy",
+        "return_flat_raw_output_top_logprobs",
         "return_flat_raw_top_logprobs",
         "return_flat_raw_top_logprobs_b64",
         "return_indexer_topk",
@@ -81,14 +76,13 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_routed_experts",
         "return_sampling_mask",
         "routed_experts_start_len",
-        "routing_key",
         "sampling_logprobs_mode",
         "session_id",
-        "session_params",
         "token_indices_to_pool",
         "use_audio_in_video",
         "video_config",
         "video_max_dynamic_patch",
+        "watermark",
     }
 )
 
@@ -113,6 +107,11 @@ def compact(value) -> str:
 def load_fixtures():
     with open(FIXTURES) as f:
         return json.load(f)["cases"]
+
+
+# Schema-only sampling inputs the Rust server lowers before the scheduler
+# (choice -> regex); Python's SamplingParams never receives them.
+SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
 
 
 class TestCrossLanguageFixtures(CustomTestCase):
@@ -155,7 +154,10 @@ class TestRequestFieldParity(CustomTestCase):
             for name in PySamplingParams.__struct_fields__
             if name not in DERIVED_SAMPLING_FIELDS
         ]
-        self.assertEqual(set(python_api), set(SamplingParams.__struct_fields__))
+        self.assertEqual(
+            set(python_api),
+            set(SamplingParams.__struct_fields__) - SCHEMA_ONLY_SAMPLING_FIELDS,
+        )
         self.assertEqual(
             set(PySamplingParams.__struct_fields__) - set(python_api),
             DERIVED_SAMPLING_FIELDS,
@@ -224,6 +226,8 @@ class TestResponseParity(CustomTestCase):
                 "completion_tokens",
                 "finish_reason",
                 "e2e_latency",
+                "cached_tokens",
+                "reasoning_tokens",
             ],
         )
         self.assertEqual(
@@ -243,7 +247,10 @@ class TestResponseParity(CustomTestCase):
             list(GenerateMetaInfo.__struct_fields__)[:4],
             ["id", "prompt_tokens", "completion_tokens", "finish_reason"],
         )
-        self.assertEqual(list(GenerateMetaInfo.__struct_fields__)[-1], "e2e_latency")
+        self.assertEqual(
+            list(GenerateMetaInfo.__struct_fields__)[-3:],
+            ["e2e_latency", "cached_tokens", "reasoning_tokens"],
+        )
 
 
 if __name__ == "__main__":
