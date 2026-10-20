@@ -1393,9 +1393,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
             )
 
         # Apply chat template and its stop strings
@@ -1605,7 +1605,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request_tools = request.tools if tools else None
             render_response_format = (
                 request.response_format is not None
-                and request.response_format.type in ("json_schema", "json_object")
+                and request.response_format.type == "json_schema"
             )
 
             # An empty system message hosts the request tools and response_format;
@@ -1618,11 +1618,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 dpsk_response_format = request.response_format.model_dump(
                     exclude_unset=True, by_alias=True
                 )
-                if dpsk_response_format["type"] == "json_schema":
-                    # convert type from json_schema to json_object to align dpsk official document
-                    # https://api-docs.deepseek.com/api/create-chat-completion/
-                    dpsk_response_format["type"] = "json_object"
-                messages[0]["response_format"] = dpsk_response_format
+                messages[0]["response_format"] = dpsk_response_format.get(
+                    "json_schema", {}
+                ).get("schema")
             if request_tools:
                 messages[0]["tools"] = [
                     (
