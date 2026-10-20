@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.minimax_sparse.decode import (
+    flash_with_topk_idx as fwti,
+)
 from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxSparseAttnBackend,
 )
@@ -230,8 +233,17 @@ def _assert_same(got, want, exact, rows=None):
             torch.testing.assert_close(g, w, atol=2e-2, rtol=2e-2)
 
 
+class _Launches:
+    def __init__(self, kernel):
+        self.kernel, self.count = kernel, 0
+
+    def __getitem__(self, grid):
+        self.count += 1
+        return self.kernel[grid]
+
+
 @pytest.mark.parametrize("with_value", [False, True])
-def test_eager_verify_matches_causal_rows(with_value):
+def test_eager_verify_matches_causal_rows(monkeypatch, with_value):
     """Rows of one request share its cache yet see only their own prefix."""
     # 5118 + ndt crosses into a new 128-token block, so the bound must count the drafts.
     case = _Case([1000, 5118], with_value)
@@ -239,6 +251,8 @@ def test_eager_verify_matches_causal_rows(with_value):
     batch = case.batch()
     backend.init_forward_metadata_out_graph(batch)
     assert backend._max_seqlen_k == 5118 + NDT
+    packed = _Launches(fwti._decode_score_packed_kernel)
+    monkeypatch.setattr(fwti, "_decode_score_packed_kernel", packed)
     got = _verify(
         backend,
         batch,
@@ -249,6 +263,8 @@ def test_eager_verify_matches_causal_rows(with_value):
         case.idx_k,
         case.idx_v,
     )
+    # Score-only layers score a request's draft rows in one pass over its index K.
+    assert packed.count == (0 if with_value else 1)
     _assert_same(got, case.reference(), exact=True)
     # Verify leaves the batch's per-request metadata to the dense layers.
     assert batch.seq_lens.tolist() == [1000, 5118]
