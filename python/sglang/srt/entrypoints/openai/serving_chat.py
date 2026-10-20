@@ -1669,6 +1669,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
             elif is_dsv41:
+                tokenizer = self.tokenizer_manager.tokenizer
+                messages = chat_encoding.mark_dsv41_request_text(tokenizer, messages)
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
                         messages, request.task
@@ -1687,14 +1689,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     image_data.extend(
                         ImageData(url=image["url"]) for image in media["images"]
                     )
-                    tokenizer = self.tokenizer_manager.tokenizer
                     real_input = real_input.replace(
                         encoding_dsv41.IMAGE_PLACEHOLDER,
                         tokenizer.convert_ids_to_tokens(
                             self.tokenizer_manager.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = chat_encoding.encode_dsv41_prompt(tokenizer, real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode

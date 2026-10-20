@@ -12,7 +12,12 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv41
+from sglang.srt.entrypoints.openai import (
+    encoding_dsv4,
+    encoding_dsv41,
+    plain_text_encode,
+)
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +209,50 @@ def default_dsv41_reasoning_effort_from_env(raw: Optional[str]) -> Union[str, in
     return effort
 
 
+# Grounding tokens are model output; deepseek-recipe encodes them as control
+# tokens when they appear in assistant content or reasoning content.
+_DSV41_GROUNDING_TOKENS = (
+    "<｜ref｜>",
+    "<｜/ref｜>",
+    "<｜box｜>",
+    "<｜/box｜>",
+    "<｜point｜>",
+    "<｜/point｜>",
+    "<｜polygon｜>",
+    "<｜/polygon｜>",
+)
+_ASSISTANT_OUTPUT_FIELDS = ("content", "reasoning_content")
+
+
+def mark_dsv41_request_text(
+    tokenizer: Any, messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Mark the control-token spellings in V4.1 messages for ``encode_dsv41_prompt``."""
+    if not envs.SGLANG_ENABLE_DSV41_PLAIN_TEXT_ENCODE.get():
+        return messages
+    marked = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            marked.append(plain_text_encode.mark_request_text(tokenizer, message))
+            continue
+        rest = {k: v for k, v in message.items() if k not in _ASSISTANT_OUTPUT_FIELDS}
+        marked_message = plain_text_encode.mark_request_text(tokenizer, rest)
+        for field in _ASSISTANT_OUTPUT_FIELDS:
+            if field in message:
+                marked_message[field] = plain_text_encode.mark_request_text(
+                    tokenizer, message[field], keep=_DSV41_GROUNDING_TOKENS
+                )
+        marked.append(marked_message)
+    return marked
+
+
+def encode_dsv41_prompt(tokenizer: Any, prompt: str) -> List[int]:
+    """Token ids of a V4.1 prompt rendered from ``mark_dsv41_request_text`` output."""
+    if not envs.SGLANG_ENABLE_DSV41_PLAIN_TEXT_ENCODE.get():
+        return tokenizer.encode(prompt)
+    return plain_text_encode.encode_marked_prompt(tokenizer, prompt)
+
+
 def spec_supports_inline_system(spec: Optional[str]) -> bool:
     """Native encoders verified to render mid-conversation system messages in place."""
     # K3's tokenizer renders in Python, so there is no Jinja source to probe.
@@ -269,8 +318,10 @@ def encode_simple_chat(
             )
         elif spec == "dsv41":
             real_input = encoding_dsv41.encode_messages(
-                messages, thinking_mode=thinking_mode
+                mark_dsv41_request_text(tokenizer, messages),
+                thinking_mode=thinking_mode,
             )
+            return encode_dsv41_prompt(tokenizer, real_input)
         else:
             from sglang.srt.entrypoints.openai import encoding_dsv32
 
