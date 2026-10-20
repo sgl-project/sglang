@@ -28,6 +28,8 @@ sglang/kernels/
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
+  low_latency_kernels/  # low-latency kernel backend: small-batch decode kernels
+                        # and the megakernel / monokernel interfaces
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -84,7 +86,9 @@ Runtime integration that owns process groups, symmetric buffers, workspace
 classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
 collective-GEMM communication adapters and workspaces live in
 `srt/layers/communication/`, while their callable kernels live in
-`kernels/ops/communication/` and take that state as arguments. Reference/test oracles belong in
+`kernels/ops/communication/` and take that state as arguments. The exception
+is the whole-step interfaces in `low_latency_kernels/` (see below), which
+replace a model's forward. Reference/test oracles belong in
 `sglang.test.kernels`, not in an operator module. Tests of runtime state belong
 with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
 tests belong in `test/registered/unit/kernels/`.
@@ -127,6 +131,28 @@ agent_kernels = [
 ]
 ```
 
+## Low-latency kernel backend: `low_latency_kernels/`
+
+This directory holds kernels for small-batch decode, where launch gaps and
+collective latency dominate a step; `KernelBackend.LOW_LATENCY` records them.
+Like the agent backends it is an implementation home, not an operator group,
+and it holds two kinds of code (details in `low_latency_kernels/README.md`):
+
+- **Operator kernels**, such as one model's fused small-batch decode chain.
+  Each public op registers into its logical group with
+  `KernelSpec(op="<group>.<name>", backend=KernelBackend.LOW_LATENCY, target="sglang.kernels.low_latency_kernels.<mod>:<fn>")`,
+  and runtime code imports the `ops.<group>` facade; `test_kernels_namespace.py`
+  enforces the pairing.
+- **Whole-step interfaces**: `megakernels/` (`--enable-nvidia-megakernel`) and
+  `monokernels/` (`--enable-amd-monokernel`) check the configuration at
+  argument resolution, build a plugin's spec once the model is prepared, and
+  route the covered decode and verify steps through it. The kernels stay in
+  their own libraries,
+  [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) and
+  [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono). Because they
+  replace a model's forward, these two read `srt` runtime state and `srt`
+  imports them directly; operator kernels must not.
+
 ## How it works
 
 Each `ops.<group>` function is a thin wrapper that forwards to a chosen
@@ -168,7 +194,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
-    `forward_helion` /
+    `forward_helion` / `forward_kda` / `forward_cake` / `forward_low_latency` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared
