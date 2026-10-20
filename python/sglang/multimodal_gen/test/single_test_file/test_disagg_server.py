@@ -206,7 +206,7 @@ class DisaggCluster:
                 self.model,
                 *mode_args,
                 "--scheduler-port",
-                str(port),
+                str(find_free_port(HOST) if self.stage_groups else port),
                 "--num-gpus",
                 str(len(gpus)),
                 "--base-gpu-id",
