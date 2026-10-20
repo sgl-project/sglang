@@ -11,12 +11,19 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
+from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def _published_server_args():
+    with get_context().override_server_args():
+        yield
 
 
 class _Event:
@@ -66,6 +73,21 @@ def test_publishes_recorded_event_by_default():
 def test_disabled_when_flag_is_false():
     runner = _model_runner()
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
+        _prepare_and_publish(runner, _batch())
+    assert runner.shared_read_done_event is None
+
+
+@pytest.mark.parametrize(
+    "memory",
+    [
+        {"enable_hierarchical_cache": True},
+        {"hicache_storage_backend": "mooncake"},
+        {"enable_lmcache": True},
+    ],
+)
+def test_kv_offload_keeps_the_coarse_barrier(memory):
+    runner = _model_runner()
+    with get_memory().override(**memory):
         _prepare_and_publish(runner, _batch())
     assert runner.shared_read_done_event is None
 
