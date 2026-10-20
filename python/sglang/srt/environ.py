@@ -1826,6 +1826,9 @@ class Envs:
     # DSpark static verify: build the target verify metadata on a side stream beside the
     # draft graph, for requests up to the candidate span (needs the glue switch above).
     SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(False)
+    # Decode / verify graph replays whose metadata glue graph is captured skip the
+    # replay ForwardBatch view (the graph reads slots and buffers by address).
+    SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(False)
     # DSpark static verify: record the post-verify engram history commit in the
     # target-verify CUDA graph (epilogue) instead of launching it after the replay.
     SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)

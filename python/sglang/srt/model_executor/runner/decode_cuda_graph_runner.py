@@ -263,6 +263,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _skips_prefilled_inputs = False
     _prefilled_inputs: Optional[tuple] = None
     num_prefilled_input_skips = 0
+    # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
+    _skip_glued_replay_view = False
 
     def __init__(
         self,
@@ -562,6 +564,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._metadata_glue = MetadataGlueGraph(self.device)
             atexit.register(self._log_draft_glue, " at shutdown")
+        self._skip_glued_replay_view = envs.SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW.get()
         # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the verify's inputs and metadata glue
         # graph run on a side stream beside the draft graph (stage_verify_metadata_early).
         self._early_verify_metadata: Optional[EarlyVerifyMetadata] = (
@@ -1668,47 +1671,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
 
-        attn_backend = self._replay_attn_backend()
-        fb_view = build_replay_fb_view(
-            forward_batch=forward_batch,
-            buffers=buffers,
-            bs=bs,
+        self._init_replay_attn_metadata(
+            forward_batch,
             raw_bs=raw_bs,
+            bs=bs,
             num_tokens=padded_num_tokens,
-            global_num_tokens_cpu=self._global_num_tokens_for_graph(padded_num_tokens),
-            seq_len_fill_value=self.seq_len_fill_value,
-            capture_forward_mode=self.capture_forward_mode,
-            is_encoder_decoder=self.is_encoder_decoder,
+            glue_key=glue_key,
+            early_staged=early_staged,
+            attention_variant=attention_variant,
         )
-        if (
-            self.model_runner.lora_manager is not None
-            and self.model_runner.lora_manager.attn_dp_enabled
-        ):
-            self.model_runner.lora_manager.prepare_lora_batch(
-                cast(ForwardBatch, fb_view)
-            )
-        # Glue-graph fast path: pointer-stable prep (static buffers + pool
-        # tensors only) is captured per key; guards keep every python-visible
-        # branch inside the backends constant for that key.
-        if early_staged:
-            # The side stream already replayed the glue graph for this step's inputs.
-            self._metadata_glue.reinstall(glue_key)
-        elif (
-            self._metadata_glue is not None
-            and not self._metadata_glue.disabled
-            and raw_bs == bs
-            and not self.enable_two_batch_overlap
-            and not self.enable_pdmux
-            and self.model_runner.lora_manager is None
-        ):
-            self._glue_draft_inputs(fb_view)
-            with self._prep_attention_variant(attention_variant):
-                self._metadata_glue.run(attn_backend, fb_view, glue_key)
-        else:
-            if self._metadata_glue is not None:
-                self._metadata_glue.note_not_routed()
-            with self._prep_attention_variant(attention_variant):
-                attn_backend.init_forward_metadata_out_graph(fb_view)
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._maybe_log_draft_glue()
 
@@ -1745,6 +1716,92 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
         logger.info("Draft metadata prep through the glue graph, one per replay key.")
         return True
+
+    def _init_replay_attn_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        bs: int,
+        num_tokens: int,
+        glue_key: tuple,
+        early_staged: bool,
+        attention_variant,
+    ) -> None:
+        """The attention backend's out-of-graph metadata prep for this replay."""
+        # Glue-graph fast path: pointer-stable prep (static buffers + pool
+        # tensors only) is captured per key; guards keep every python-visible
+        # branch inside the backends constant for that key.
+        glue_route = (
+            self._metadata_glue is not None
+            and not self._metadata_glue.disabled
+            and raw_bs == bs
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and self.model_runner.lora_manager is None
+        )
+        if early_staged:
+            # The side stream already replayed the glue graph for this step's inputs.
+            self._metadata_glue.reinstall(glue_key)
+        elif (
+            glue_route
+            and self._skip_glued_replay_view
+            and isinstance(self._metadata_glue, MetadataGlueGraph)
+            and self._metadata_glue.is_captured(glue_key)
+        ):
+            # A captured glue graph reads slots and backend buffers by address: no
+            # replay view, no out_cache_loc re-point.
+            self._metadata_glue.replay(glue_key)
+        else:
+            self._init_replay_attn_metadata_from_view(
+                forward_batch,
+                raw_bs=raw_bs,
+                bs=bs,
+                num_tokens=num_tokens,
+                glue_key=glue_key if glue_route else None,
+                attention_variant=attention_variant,
+            )
+
+    def _init_replay_attn_metadata_from_view(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        bs: int,
+        num_tokens: int,
+        glue_key: Optional[tuple],
+        attention_variant,
+    ) -> None:
+        """The replay metadata prep through the replay ForwardBatch view: the glue
+        graph's warm-ups and capture (``glue_key``), or the eager prep (None)."""
+        attn_backend = self._replay_attn_backend()
+        fb_view = build_replay_fb_view(
+            forward_batch=forward_batch,
+            buffers=self.buffers,
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=num_tokens,
+            global_num_tokens_cpu=self._global_num_tokens_for_graph(num_tokens),
+            seq_len_fill_value=self.seq_len_fill_value,
+            capture_forward_mode=self.capture_forward_mode,
+            is_encoder_decoder=self.is_encoder_decoder,
+        )
+        if (
+            self.model_runner.lora_manager is not None
+            and self.model_runner.lora_manager.attn_dp_enabled
+        ):
+            self.model_runner.lora_manager.prepare_lora_batch(
+                cast(ForwardBatch, fb_view)
+            )
+        if glue_key is not None:
+            self._glue_draft_inputs(fb_view)
+            with self._prep_attention_variant(attention_variant):
+                self._metadata_glue.run(attn_backend, fb_view, glue_key)
+        else:
+            if self._metadata_glue is not None:
+                self._metadata_glue.note_not_routed()
+            with self._prep_attention_variant(attention_variant):
+                attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _wants_early_verify_metadata(self) -> bool:
         """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY for this runner, from facts fixed before

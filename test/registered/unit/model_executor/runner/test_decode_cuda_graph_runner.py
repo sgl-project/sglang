@@ -453,5 +453,90 @@ class TestSkipPrefilledInputs(CustomTestCase):
         self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
 
 
+class _RecordingGlue(mod.MetadataGlueGraph):
+    """SGLang's glue graph, with each key either captured or not yet."""
+
+    def __init__(self, captured_keys=()):
+        super().__init__("cpu")
+        self.captured_keys = set(captured_keys)
+        self.calls = []
+
+    def is_captured(self, key):
+        return key in self.captured_keys
+
+    def replay(self, key):
+        self.calls.append(("replay", key))
+
+    def reinstall(self, key):
+        self.calls.append(("reinstall", key))
+
+    def run(self, attn_backend, fb_view, key):
+        self.calls.append(("run", fb_view, key))
+
+
+class TestReplayAttnMetadataWiring(CustomTestCase):
+    """Each replay's metadata prep: a staged one only reinstalls; a captured glue key
+    replays without the replay view (SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW); before its
+    capture the glue runs on a view; unrouted replays run the eager prep on a view."""
+
+    KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
+
+    def _replay(self, glue, *, raw_bs=2, bs=2, skip=True, staged=False):
+        runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
+        runner._metadata_glue = glue
+        runner._skip_glued_replay_view = skip
+        runner.enable_two_batch_overlap = False
+        runner.enable_pdmux = False
+        runner.model_runner = SimpleNamespace(lora_manager=None)
+        runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
+        eager = []
+        runner.attn_backend = SimpleNamespace(
+            init_forward_metadata_out_graph=eager.append
+        )
+        runner.buffers = None
+        runner.seq_len_fill_value = 1
+        runner.is_encoder_decoder = False
+        runner._global_num_tokens_for_graph = lambda num_tokens: None
+        views = []
+
+        def build_view(**kwargs):
+            views.append(SimpleNamespace(out_cache_loc=None, **kwargs))
+            return views[-1]
+
+        with mock.patch.object(mod, "build_replay_fb_view", build_view):
+            runner._init_replay_attn_metadata(
+                SimpleNamespace(forward_mode=mod.ForwardMode.TARGET_VERIFY),
+                raw_bs=raw_bs,
+                bs=bs,
+                num_tokens=12,
+                glue_key=self.KEY,
+                early_staged=staged,
+                attention_variant=None,
+            )
+        return views, eager
+
+    def test_replay_routes(self):
+        key = self.KEY
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, staged=True)
+        self.assertEqual((glue.calls, views, eager), ([("reinstall", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue)
+        self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, skip=False)
+        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
+
+        glue = _RecordingGlue()
+        views, eager = self._replay(glue)
+        self.assertEqual((glue.calls, eager), ([("run", views[0], key)], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=1)
+        self.assertEqual((glue.calls, eager), ([], views))
+
+
 if __name__ == "__main__":
     unittest.main()
