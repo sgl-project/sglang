@@ -1,7 +1,7 @@
 import unittest
+from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
     BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
@@ -110,8 +110,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     70000,
     "--max-running-requests",
     256,
-    "--dp-size",
-    16,
     "--enable-dp-attention",
     "--tokenizer-worker-num",
     16,
@@ -132,7 +130,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--chunked-prefill-size",
     32768,
     "--init-expert-location",
-    "/__w/sglang/sglang/test/registered/npu/performance/deepseek_v4_flash/expert-layout-ais-replicas16.json",
+    str(Path(__file__).parent / "expert-layout-ais-replicas16.json"),
     "--ep-dispatch-algorithm",
     "dynamic",
     "--ep-num-redundant-experts",
@@ -144,8 +142,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "zigzag",
     "--optimistic-prefill-attempts",
     1,
-    "--prefill-max-requests",
-    256,
     "--json-model-override-args",
     '{"use_index_cache":true,"index_topk_freq":2}',
     "--expert-distribution-recorder-mode",
@@ -190,11 +186,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
-    "--cuda-graph-bs-decode",
-    1,
-    2,
-    4,
-    7,
     # DSPARK configuration.
     "--speculative-algorithm",
     "DSPARK",
@@ -219,16 +210,12 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     7,
     8,
     10,
-    "--mem-fraction-static",
-    0.71,
     "--json-model-override-args",
     '{"use_index_cache":true,"index_topk_freq":2}',
     "--tokenizer-worker-num",
     16,
     "--speculative-dspark-block-size",
     5,
-    "--speculative-num-draft-tokens",
-    6,
 ]
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k deployment.
@@ -262,6 +249,7 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     warmup_requests = 16
     pop_sglang_is_in_ci_for_gsp = True
     tpot = 20
+    output_token_throughput = 60.304
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
         """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
