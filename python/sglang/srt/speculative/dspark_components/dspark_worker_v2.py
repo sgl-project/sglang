@@ -64,6 +64,9 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
+from sglang.srt.speculative.dspark_components.dspark_repetition import (
+    RepetitionDraftFallback,
+)
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
@@ -332,6 +335,21 @@ class DSparkWorkerV2(BaseSpecWorker):
             random_seed=target_worker.random_seed,
             greedy_draft=self._greedy_draft,
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
+        )
+        self._repetition_fallback = (
+            RepetitionDraftFallback()
+            if envs.SGLANG_OPT_DSPARK_REPETITION_FALLBACK.get()
+            and is_cuda()
+            and self._verify_planner.mode_value == "static"
+            and not self._draft_is_moe
+            and not get_parallel().attn_dp_enabled
+            and get_parallel().pp_size == 1
+            and self._simulate_acc_len <= 0
+            and not envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+            and not envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+            and not envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
+            and not envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get()
+            else None
         )
         self._verify_epilogue = None
         target_is_dsv41 = (
@@ -907,6 +925,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        if (
+            self._repetition_fallback is not None
+            and (sampling_info is None or sampling_info.is_all_greedy)
+            and not batch.has_grammar
+            and verify_logits_adjustments_are_noop(sampling_info)
+        ):
+            self._repetition_fallback.apply(
+                reqs=batch.reqs,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+            )
         if coordination_plan is not None:
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 

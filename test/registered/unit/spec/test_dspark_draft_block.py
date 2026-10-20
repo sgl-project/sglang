@@ -126,6 +126,99 @@ class TestFusedGreedyEligibility(CustomTestCase):
                 self.assertIs(head.greedy_w2_weight() is not None, fuses)
 
 
+class TestRepetitionDraftFallback(CustomTestCase):
+    def _req(self, rid="r", *, period=(11, 22, 33), verify=40, correct=0):
+        return SimpleNamespace(
+            rid=rid,
+            origin_input_ids=[1] * 100,
+            output_ids=list(period) * max(16, 32 // len(period)),
+            spec_verify_ct=verify,
+            spec_num_correct_drafts=correct,
+        )
+
+    def test_overlap_phase_and_reordered_rows(self):
+        """Continue the live GPU prefix when host history lags or rows reorder."""
+        from sglang.srt.speculative.dspark_components.dspark_repetition import (
+            RepetitionDraftFallback,
+        )
+
+        fallback = RepetitionDraftFallback()
+        a, b = self._req(), self._req("b", period=(55,))
+        tokens = torch.zeros((2, 7), dtype=torch.int64)
+        fallback.apply(
+            reqs=[a, b], prefix_lens=torch.tensor([151, 120]), draft_tokens=tokens
+        )
+        self.assertEqual(tokens[0].tolist(), [22, 33, 11, 22, 33, 11, 22])
+        self.assertEqual(tokens[1].tolist(), [55] * 7)
+        fallback.apply(
+            reqs=[b, a], prefix_lens=torch.tensor([127, 154]), draft_tokens=tokens
+        )
+        self.assertEqual(tokens[0].tolist(), [55] * 7)
+        self.assertEqual(tokens[1].tolist(), [22, 33, 11, 22, 33, 11, 22])
+
+    def test_recovery_does_not_oscillate_and_broken_cycle_exits(self):
+        """Keep recovery through success, but clear broken and finished cycles."""
+        from sglang.srt.speculative.dspark_components.dspark_repetition import (
+            RepetitionDraftFallback,
+        )
+
+        fallback = RepetitionDraftFallback()
+        req = self._req()
+        self.assertIsNotNone(fallback.select_patterns([req]))
+        # Successful fallback raises the cumulative acceptance: keep using it
+        # until the verified output stops repeating, rather than oscillating.
+        req.spec_num_correct_drafts = 200
+        self.assertIsNotNone(fallback.select_patterns([req]))
+        req.output_ids.append(99)
+        self.assertIsNone(fallback.select_patterns([req]))
+        # A finished request's state cannot authorize a new request.
+        fallback.select_patterns([])
+        replacement = self._req(verify=0)
+        self.assertIsNone(fallback.select_patterns([replacement]))
+
+    def test_healthy_and_insufficient_history_keep_learned_candidates(self):
+        """Leave learned proposals intact until repeated rejection is established."""
+        from sglang.srt.speculative.dspark_components.dspark_repetition import (
+            RepetitionDraftFallback,
+        )
+
+        fallback = RepetitionDraftFallback()
+        healthy = self._req(correct=100)
+        young = self._req("young", verify=2)
+        short = self._req("short")
+        short.output_ids = [7] * 8
+        tokens = torch.arange(21).view(3, 7)
+        original = tokens.clone()
+        fallback.apply(
+            reqs=[healthy, young, short],
+            prefix_lens=torch.tensor([151, 151, 108]),
+            draft_tokens=tokens,
+        )
+        self.assertTrue(torch.equal(tokens, original))
+
+    def test_target_still_rejects_a_broken_repetition(self):
+        """A periodic proposal cannot commit tokens past a target mismatch."""
+        from sglang.srt.speculative.dflash_utils import (
+            compute_dflash_correct_drafts_and_bonus,
+        )
+        from sglang.srt.speculative.dspark_components.dspark_repetition import (
+            RepetitionDraftFallback,
+        )
+
+        req = self._req(period=(11, 22))
+        drafts = torch.zeros((1, 7), dtype=torch.int64)
+        RepetitionDraftFallback().apply(
+            reqs=[req], prefix_lens=torch.tensor([131]), draft_tokens=drafts
+        )
+        candidates = torch.cat([torch.tensor([[22]]), drafts], dim=1)
+        target = torch.tensor([[11, 22, 99, 11, 22, 11, 22, 11]])
+        accepted, bonus = compute_dflash_correct_drafts_and_bonus(
+            candidates=candidates, target_predict=target
+        )
+        self.assertEqual(accepted.tolist(), [2])
+        self.assertEqual(bonus.tolist(), [99])
+
+
 def _folded_draft_model():
     """A draft model for the folded proposal."""
     model = SimpleNamespace(

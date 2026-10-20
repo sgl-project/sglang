@@ -48,4 +48,13 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="speculative.override_repeating_draft_tokens",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.repetition:override_repeating_draft_tokens",
+        capabilities=CUDA_ONLY,
+    )
+)
+
 __all__ = []
