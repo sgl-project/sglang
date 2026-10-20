@@ -250,9 +250,6 @@ def sample_generated_shared_prefix_requests(
     ).reshape(num_groups, prompts_per_group)
     del system_prompt_len, question_len, output_len
 
-    # input_ids emits raw token-id lists so the server receives ids directly and
-    # skips tokenization before prefill; the text path decodes ids back to a
-    # string that the server then re-encodes.
     generate_prompt = gen_prompt_ids if input_ids else gen_prompt
     system_prompts = [
         generate_prompt(tokenizer, int(system_prompt_lens[i]))
@@ -303,9 +300,8 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
-        # ids path concatenates lists; text path concatenates strings.
         if input_ids:
-            turn_prompts = [system_prompt + turn_questions[0]] + turn_questions[1:]
+            turn_prompts = [system_prompt + turn_questions[0]]
         else:
             turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
                 1:
