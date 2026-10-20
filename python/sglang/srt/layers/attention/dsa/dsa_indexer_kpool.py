@@ -310,6 +310,15 @@ class IndexerKPool(MultiPlatformOp):
             )
         torch.cat(parts, out=self.x_proj_weight)
 
+    def _use_fused_x_proj(self) -> bool:
+        """The stack holds base weights only, built before LoRA wraps any module: an
+        adapter on wk or weights_proj must take the unfused path, which applies it.
+        wq_b runs as a module call on both paths."""
+        return self.x_proj_weight is not None and not any(
+            getattr(getattr(self, name, None), "set_lora", False)
+            for name in ("wk", "weights_proj")
+        )
+
     def _get_q_k_fused_x_proj(self, q_lora: torch.Tensor, x: torch.Tensor):
         from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
 
@@ -1660,7 +1669,7 @@ class IndexerKPool(MultiPlatformOp):
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
 
-        fused_x_proj = self.x_proj_weight is not None
+        fused_x_proj = self._use_fused_x_proj()
         if fused_x_proj:
             query, key, gate_score_maybe, head_weights = self._get_q_k_fused_x_proj(
                 q_lora, x

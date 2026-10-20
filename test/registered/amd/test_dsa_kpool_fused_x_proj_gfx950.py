@@ -28,6 +28,19 @@ class _Linear:
         return F.linear(x, self.weight), None
 
 
+class _LoRALinear(_Linear):
+    """A LoRA-wrapped linear as the indexer sees it: base weight plus a delta in forward."""
+
+    set_lora = True
+
+    def __init__(self, weight, delta):
+        super().__init__(weight)
+        self.delta = delta
+
+    def __call__(self, x):
+        return F.linear(x, self.weight + self.delta.to(self.weight.dtype)), None
+
+
 def _eager(method):
     return getattr(method, "_torchdynamo_orig_callable", method)
 
@@ -117,6 +130,40 @@ class TestKPoolFusedXProj(CustomTestCase):
         indexer.weights_proj.weight.add_(1e-6)
         indexer.fuse_x_projections()
         self.assertIsNone(indexer.x_proj_weight)
+
+    @torch.no_grad()
+    def test_lora_adapter_takes_the_unfused_path(self):
+        x = torch.randn(TOKENS, HIDDEN, device="cuda").bfloat16()
+        q_lora = torch.randn(TOKENS, Q_LORA, device="cuda").bfloat16()
+        for name in ("wk", "weights_proj"):
+            with self.subTest(adapter=name):
+                indexer = _indexer()
+                indexer.fuse_x_projections()
+                self.assertTrue(indexer._use_fused_x_proj())
+                base = getattr(indexer, name).weight
+                setattr(indexer, name, _LoRALinear(base, torch.randn_like(base) * 0.02))
+                self.assertFalse(indexer._use_fused_x_proj())
+                # the stack still holds the base weights, so it would drop the delta
+                fused = indexer._get_q_k_fused_x_proj(q_lora, x)
+                if name == "wk":
+                    got, want = (
+                        fused[1],
+                        indexer._get_q_k_bf16(
+                            q_lora,
+                            x,
+                            positions=None,
+                            enable_dual_stream=False,
+                            forward_batch=None,
+                        )[1],
+                    )
+                else:
+                    got, want = (
+                        fused[3],
+                        _eager(IndexerKPool._project_head_gates)(indexer, x),
+                    )
+                self.assertFalse(
+                    torch.allclose(got.float(), want.float(), atol=2e-2, rtol=2e-2)
+                )
 
     @torch.no_grad()
     def test_tail_write_accepts_a_column_slice_score(self):
