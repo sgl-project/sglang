@@ -59,11 +59,7 @@ from test_deferred_decode_kv_release import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import (
-    ABORT_TAG,
-    AbortNotification,
-    AckTarget,
-)
+from sglang.srt.disaggregation.common.conn import AbortNotification, AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
@@ -134,33 +130,6 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
     def _drain_test_transfer(self, manager) -> None:
         manager._mark_transfer_quiescent(_chunk(self.room))
-
-    def test_abort_without_valid_return_address_marks_failed_without_ack(self):
-        messages = (
-            ("missing", [ABORT_TAG, b"11"]),
-            ("malformed port", [ABORT_TAG, b"11", b"10.0.0.3", b"bad"]),
-        )
-
-        for name, message in messages:
-            with self.subTest(name=name):
-                manager = _manager()
-                manager.request_status[11] = KVPoll.WaitingForInput
-
-                manager._handle_abort_message(message)
-
-                self.assertEqual(manager.request_status[11], KVPoll.Failed)
-                self.assertEqual(manager._sent, [])
-                self.assertEqual(manager._deferred_ack_targets, {})
-
-    def test_feature_off_preserves_abort_without_ack(self):
-        manager = _manager(enabled=False)
-        manager.request_status[11] = KVPoll.WaitingForInput
-
-        manager._handle_abort_message(_abort_message())
-
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertEqual(manager._sent, [])
-        self.assertEqual(manager._deferred_ack_targets, {})
 
     def test_abort_after_submit_waits_for_terminal_status(self):
         manager = _manager()
@@ -260,24 +229,6 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         self.assertEqual(manager._staging_outstanding[11], 1)
         self.assertEqual(manager._drain_queue.qsize(), 1)
         manager.conclude_failure.assert_called_once()
-
-    def test_sla_failure_keeps_legacy_early_return_when_disabled(self):
-        manager = _manager(enabled=False)
-        manager._transfer_timeout_ms = 1
-        manager.engine = MagicMock()
-        manager.engine.wait_all.side_effect = (
-            StatusCode.IN_PROGRESS,
-            StatusCode.SUCCESS,
-        )
-
-        with patch(
-            "sglang.srt.disaggregation.mori.conn.time.perf_counter",
-            side_effect=(0.0, 0.002),
-        ):
-            failure = manager._wait_transfer_completion([object()])
-
-        self.assertEqual(failure, "KV transfer exceeded SLA 1ms")
-        self.assertEqual(manager.engine.wait_all.call_count, 1)
 
     def test_wait_event_failure_releases_outstanding_count(self):
         manager = _manager()

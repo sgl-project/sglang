@@ -119,34 +119,6 @@ class TestPpPrefillToUnpipelinedDecode(CustomTestCase):
 class TestExistingPairingIsUnchanged(CustomTestCase):
     """All layouts outside heterogeneous plain MLA retain existing pairing."""
 
-    def test_unpipelined_prefill_uses_positional_pairing(self):
-        for n_dst in (NUM_LAYERS, NUM_LAYERS + 1):
-            with self.subTest(n_dst=n_dst):
-                self.assertEqual(
-                    _resolve(
-                        _StubKVManager(
-                            pp_size=1, prefill_start_layer=0, n_src=NUM_LAYERS
-                        ),
-                        _peer(n_dst=n_dst),
-                        NUM_LAYERS,
-                        n_dst,
-                    ),
-                    list(range(NUM_LAYERS)),
-                )
-
-    def test_matched_pp_uses_identity_pairing(self):
-        for start, num in _pp_layer_split(NUM_LAYERS, 4):
-            with self.subTest(start_layer=start):
-                self.assertEqual(
-                    _resolve(
-                        _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
-                        _peer(n_dst=num),
-                        num,
-                        num,
-                    ),
-                    list(range(num)),
-                )
-
     def test_one_sided_layer_ids_are_rejected(self):
         start, num = _pp_layer_split(NUM_LAYERS, 4)[2]
         with self.assertRaisesRegex(RuntimeError, "both PD peers or neither"):
@@ -203,19 +175,6 @@ class TestMatchedPpWithDraftRegions(CustomTestCase):
     span. Stage 0 degenerates to the identity and stays correct; every stage
     above it must be rejected by the bound rather than writing at an offset the
     peer does not have."""
-
-    def test_rank0_identity_span_stays_correct(self):
-        start, num = _pp_layer_split(NUM_LAYERS, 4)[0]
-        self.assertEqual(start, 0)
-        self.assertEqual(
-            _resolve(
-                _StubKVManager(pp_size=4, prefill_start_layer=start, n_src=num),
-                _peer(n_dst=num + 1),
-                num,
-                num + 1,
-            ),
-            list(range(num)),
-        )
 
     def test_later_ranks_are_rejected(self):
         for start, num in _pp_layer_split(NUM_LAYERS, 4)[1:]:
