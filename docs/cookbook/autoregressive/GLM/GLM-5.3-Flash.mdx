@@ -122,7 +122,7 @@ Neither algorithm runs with DP-Attention; the card disables the affected chips a
 
 ### Serve on TPU7x
 
-The TPU7x recipe serves the language model with DeepSeek Sparse Attention on the Pallas sparse MLA kernels and MTP 5/1/6 on the experimental chain speculative worker (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`). It is sized for one request with 8K input and 1K output: `--context-length 10240`, `--max-running-requests 1`, and a 20,480-token KV pool. Raise `--context-length`, `--max-total-tokens`, `--max-running-requests` and `--max-mamba-cache-size` together for longer or concurrent requests; those settings are outside the verified command. The first start compiles every decode and prefill shape listed in `--tpu-compile-bs` and `--tpu-compile-tokens`, so it takes longer than later starts that reuse the compilation cache.
+The TPU7x recipe serves the language model with DeepSeek Sparse Attention on the Pallas sparse MLA kernels and MTP 3/1/4 on the experimental chain speculative worker (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`). On TPU7x, 3/1/4 decodes faster than 5/1/6 at the same accept length, because each extra draft row widens the target verify. It is sized for one request with 8K input and 1K output: `--context-length 10240`, `--max-running-requests 1`, and a 20,480-token KV pool. Raise `--context-length`, `--max-total-tokens`, `--max-running-requests` and `--max-mamba-cache-size` together for longer or concurrent requests; those settings are outside the verified command. The first start compiles every decode and prefill shape listed in `--tpu-compile-bs` and `--tpu-compile-tokens`, so it takes longer than later starts that reuse the compilation cache.
 
 ### Size both memory pools
 

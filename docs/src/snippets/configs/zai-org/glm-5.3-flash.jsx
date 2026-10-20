@@ -1196,9 +1196,9 @@ sgl-eval run gsm8k \\
         "--port {{PORT}}",
       ],
     },
-    // One TPU7x host (4 chips, 8 TensorCores), sglang-torchtpu built from main:
-    // DSA through the Pallas sparse MLA kernels, MTP 5/1/6 on the chain spec
-    // worker. Sized for 8k-in / 1k-out at concurrency 1.
+    // One TPU7x host (4 chips, 8 TensorCores), sglang-torchtpu main: DSA through the
+    // Pallas sparse MLA kernels, MTP 3/1/4 on the chain spec worker. Sized for
+    // 8k-in / 1k-out at concurrency 1.
     {
       match: { hw: "tpu7x", strategy: "low-latency", quant: "fp8" },
       nnodes: 1,
@@ -1250,9 +1250,9 @@ sgl-eval run gsm8k \\
         "--tpu-compile-tokens 1024 2048 4096 8192",
         "--grammar-backend none",
         "--speculative-algorithm NEXTN",
-        "--speculative-num-steps 5",
+        "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
-        "--speculative-num-draft-tokens 6",
+        "--speculative-num-draft-tokens 4",
         `--json-model-override-args '{"index_share_for_mtp_iteration": false, "text_config": {"index_share_for_mtp_iteration": false}}'`,
         "--gc-threshold 50000 100 100",
         "--watchdog-timeout 1800",
