@@ -1095,10 +1095,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info=batch.spec_info,
         )
 
-        # ScheduleBatch, req_to_token and the plan keep allocator-global slots.
-        # DSA's translator localizes page-interleaved writes at bind below;
-        # preserve the global view for consumers that still read it. Dense
-        # MLA (Kimi-K3) keeps global slots until its KV writer localizes them.
+        # This applies to DSA; dense MLA localizes global slots in its KV writer.
+        # ScheduleBatch and req_to_token keep allocator-global slot identities,
+        # and so does the plan's window. An NPU DCP target writes rank-local
+        # slots, which its translator maps the window to at `bind` below; keep
+        # the global view for the consumers that read it.
         if (
             _is_npu
             and get_parallel().dcp_enabled

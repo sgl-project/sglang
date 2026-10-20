@@ -621,11 +621,15 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.spec_algorithm is not None
                 and forward_batch.spec_algorithm.is_dflash()
             ):
-                # DFlash's CPU lengths already include the verify block.
+                # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
+                # one verify block, which already covers the draft block.
                 seq_lens_max = forward_batch.seq_lens_cpu.max().item()
             else:
-                # Overlap may publish CPU lengths ahead of device lengths.
-                # Size the page table from the same source FIA will read.
+                # Overlap scheduling can publish the CPU sequence length one
+                # step ahead of the device tensor. FIA consumes seq_lens_cpu
+                # below, so derive the block-table width from the same source.
+                # Otherwise a page-aligned request can expose KV_S=N while
+                # asking FIA for N+1.
                 spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
                 seq_lens_max = (
                     forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
@@ -663,6 +667,9 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
+        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
+        # only rebind the Host-side IntArray when captured as a Python list.
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if spec_algorithm is None or not spec_algorithm.is_dflash_family():
@@ -735,6 +742,8 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        # Draft workers retain allocator-global cache slots and use the non-DCP
+        # attention path, so only target workers need DCP-specific metadata.
         if self._use_dsa_dcp():
             self._init_dsa_dcp_metadata(forward_batch)
 
@@ -1090,8 +1099,12 @@ class AscendAttnBackend(AttentionBackend):
 
             if forward_mode.is_target_verify():
                 seq_lens = seq_lens + self.speculative_num_draft_tokens
-                # Only DFlash refreshes this list on replay. Other algorithms
-                # let the graph runner recompute lengths, avoiding a D2H sync.
+                # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
+                # length; refresh the graph-bound list from that CPU tensor.
+                # Other spec algorithms keep the capture-time list (graph_runner
+                # recomputes it): gathering seq_lens[:bs] here would force a D2H
+                # sync for models (e.g. DSA+MTP) whose replay path is otherwise
+                # sync-free.
                 if _is_dflash_verify(spec_info):
                     if seq_lens_cpu is not None:
                         kv_lens = seq_lens_cpu[:bs]
