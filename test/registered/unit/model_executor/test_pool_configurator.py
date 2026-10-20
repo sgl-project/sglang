@@ -85,6 +85,8 @@ def _make_model_runner(
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
     enable_unified_memory=False,
+    enable_hisparse=False,
+    hisparse_host_to_device_ratio=1,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
@@ -152,7 +154,10 @@ def _make_model_runner(
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
         enable_unified_memory=enable_unified_memory,
-        enable_hisparse=False,
+        enable_hisparse=enable_hisparse,
+        hisparse_config=(
+            f'{{"host_to_device_ratio": {hisparse_host_to_device_ratio}}}'
+        ),
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
         kv_cache_dtype="auto",
@@ -830,6 +835,49 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
 
+class TestPerWorkerRequestSplit(CustomTestCase):
+    """A --max-running-requests cap below the attention DP size must still leave
+    every worker one request slot, not zero."""
+
+    def test_max_num_reqs_keeps_one_slot_below_dp_size(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        _publish_config(self, max_running_requests=1)
+        kvc = SimpleNamespace(
+            attn_dp_size=4,
+            mambaish_config=None,
+            model_config=SimpleNamespace(context_len=8192),
+        )
+        self.assertEqual(KVCacheConfigurator.resolve_max_num_reqs(kvc, 1 << 20), 1)
+
+    def test_chunk_cache_cap_sizes_one_request_below_dp_size(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            disable_radix_cache=True,
+            chunked_prefill_size=1000,
+            sliding_window_size=4,
+            page_size=1,
+            max_running_requests=1,
+            disaggregation_mode="decode",
+        )
+        mr.attn_dp_size = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(1_000_000, page_size=1)
+
+        # One request per worker at 4 + 1 + 4 + 1 = 10 SWA tokens, the same
+        # per-request cost as test_chunk_cache_cap_drops_prefill_for_disagg_decode.
+        self.assertEqual(config.swa_max_total_num_tokens, 10)
+
+
 class TestAllSWAConfigurator(CustomTestCase):
     """All-SWA (full_layers=0): special case."""
 
@@ -949,6 +997,52 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hisparse_draft_expanded_id_space_is_budgeted(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The dense draft pool spans HiSparse's host-expanded logical IDs."""
+        available = 10_000_000
+        num_layers = 78
+        draft_num_layers = 1
+        indexer_bytes_per_token = 132
+        host_to_device_ratio = 4
+
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            enable_hisparse=True,
+            hisparse_host_to_device_ratio=host_to_device_ratio,
+        )
+        _configure_dsa_model(mr)
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_num_layers
+
+        with mock_cpu_env(kv_size=1):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        actual_bytes_per_token = (
+            576 * num_layers
+            + indexer_bytes_per_token * num_layers * host_to_device_ratio
+            + (576 + indexer_bytes_per_token) * draft_num_layers * host_to_device_ratio
+        )
+        self.assertEqual(cfg._cell_size, actual_bytes_per_token)
+        self.assertLessEqual(
+            config.max_total_num_tokens * actual_bytes_per_token,
+            available,
+        )
+
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000
@@ -990,6 +1084,49 @@ class TestEagleConfigurator(CustomTestCase):
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_non_arch35_npu_budget_uses_compact_indexer_capacity(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        num_layers = 6
+        mr = _make_model_runner(self, num_layers=num_layers, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.hf_config.indexer_types = [
+            "full",
+            "shared",
+            "full",
+            "shared",
+            "shared",
+            "shared",
+        ]
+        available_bytes = 1_000_000
+
+        with (
+            mock_cpu_env(kv_size=2),
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            pool_sizes = configurator.calculate_pool_sizes(
+                available_bytes,
+                page_size=1,
+            )
+
+        compact_cell_size = 576 * num_layers * 2 + 128 * 2 * 2
+        dense_cell_size = (576 + 128) * num_layers * 2
+        self.assertEqual(configurator._cell_size, compact_cell_size)
+        self.assertGreater(
+            pool_sizes.max_total_num_tokens,
+            available_bytes // dense_cell_size,
+        )
+
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
@@ -1441,7 +1578,7 @@ class TestSWAPoolFloor(CustomTestCase):
                 0.1 * cfg.bytes_per_swa_token + 585 / 4 + 864 / 128 + 132 / 4,
             )
 
-    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+    def _dspark_replay_planner(self, *, draft_ring):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
 
         _publish_config(
@@ -1473,9 +1610,31 @@ class TestSWAPoolFloor(CustomTestCase):
             sliding_window_size=128,
             page_size=256,
             spec_algorithm=spec,
-            spec_aux_config=SimpleNamespace(dflash_draft_num_layers=3),
+            spec_aux_config=SimpleNamespace(
+                dflash_draft_num_layers=40, dspark_num_stages=3
+            ),
         )
-        planner = DSV4PoolConfigurator(kvc)
+        with patch(
+            "sglang.srt.model_executor.pool_configurator.uses_draft_swa_ring",
+            return_value=draft_ring,
+        ):
+            return DSV4PoolConfigurator(kvc)
+
+    def test_dsv4_dspark_draft_ring_budget_is_fixed(self):
+        planner = self._dspark_replay_planner(draft_ring=True)
+        paged = self._dspark_replay_planner(draft_ring=False)
+        self.assertEqual(planner.bytes_per_swa_token, 0)
+        self.assertEqual(planner.swa_cap_tokens, 0)
+        # Three draft stages of one ring per request slot: 128 + 6 rows in a page.
+        self.assertEqual(
+            planner.request_window_bytes - paged.request_window_bytes,
+            (3 * 256 + 256) * 3 * 584,
+        )
+        sizes = planner.calculate_pool_sizes(256 * 1024 * 1024, 256)
+        self.assertEqual(sizes.swa_max_total_num_tokens, 0)
+
+    def test_dsv4_paged_dspark_budget_reserves_window_and_draft_layers(self):
+        planner = self._dspark_replay_planner(draft_ring=False)
         self.assertEqual(planner.bytes_per_swa_token, 3 * 584)
         budget = 256 * 1024 * 1024
         sizes = planner.calculate_pool_sizes(budget, 256)
@@ -1485,6 +1644,22 @@ class TestSWAPoolFloor(CustomTestCase):
             + planner._get_swa_fixed_bytes(),
             budget,
         )
+
+    def test_dsv4_replay_prefix_tails_scale_with_draft_layers(self):
+        from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+
+        _publish_config(self, max_running_requests=64)
+        cfg = object.__new__(DSV4PoolConfigurator)
+        cfg.requested_max_running_requests_per_worker = 64
+        cfg.num_layers_total = 43
+        cfg.encoder_replay = False
+        cfg.paged_draft_layers = 0
+        self.assertEqual(cfg._resolve_swa_prefix_tails(), 256)
+        cfg.encoder_replay = True
+        cfg.paged_draft_layers = 3
+        self.assertEqual(cfg._resolve_swa_prefix_tails(), 256 * 14)
+        _publish_config(self, swa_prefix_tails=1024)
+        self.assertEqual(cfg._resolve_swa_prefix_tails(), 1024)
 
     def test_dsv4_trtllm_kv_bytes(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -1665,6 +1840,27 @@ class TestFusedDraftPricing(unittest.TestCase):
         self.assertIsInstance(cfg, SWARequestCapPoolConfigurator)
         config = cfg.calculate_pool_sizes(available, 1)
         self._assert_unified_bytes_price_the_fused_entry(cfg, config, available)
+
+    def test_fused_swa_entry_replaces_the_swa_terms(self):
+        """A draft placed in the swa sub-pool is priced through the fused swa
+        entry: the separate per-layer swa draft term must go, or the draft is
+        charged twice (once inside the entry, once as a private pool)."""
+        mr, cfg = self._make(fused_entry=None, draft_layers=2)
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 2
+        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            fused = HybridSWAPoolConfigurator(mr)
+        self.assertEqual(fused._draft_swa_layers_num, 0)
+        self.assertEqual(fused._draft_full_layers_num, 0)
+        self.assertEqual(
+            fused._cell_size,
+            fused._full_per_token * fused._full_layers_num
+            + fused._swa_full_tokens_ratio * 4_321,
+        )
 
 
 if __name__ == "__main__":
