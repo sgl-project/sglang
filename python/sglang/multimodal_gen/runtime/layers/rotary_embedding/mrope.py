@@ -367,6 +367,26 @@ class NDRotaryEmbedding(torch.nn.Module):
         positions = torch.tensor(pos_tuple, dtype=torch.long, device=device)
         return self.forward_uncached(pos=positions)
 
+    def forward_3d_sequence_shard(
+        self,
+        local_len: int,
+        rank: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed a contiguous shard of a flattened (time, height, width) grid."""
+        token_start = rank * local_len
+        token_indices = torch.arange(
+            token_start, token_start + local_len, device=device, dtype=torch.long
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.forward_uncached(positions)
+
     def forward_uncached(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         The core implementation that computes embeddings from a position tensor.

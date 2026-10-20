@@ -29,18 +29,16 @@ from diffusers.models.normalization import (
 from torch.nn import LayerNorm as LayerNorm
 
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
+    FUSED_LN_MODULATE,
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     can_use_linear_gelu,
     can_use_ln_modulate,
-    fused_gelu_active,
     fused_layernorm_modulate,
     fused_linear_gelu_tanh,
     fused_ln_modulate,
-    fused_ln_modulate_active,
     is_plain_layer_norm,
-    mark_fused_gelu_site,
-    mark_fused_ln_modulate_site,
     modulate_scale_shift,
     residual_gate_add,
 )
@@ -155,10 +153,6 @@ def _flux_fused_ln_modulate(
         ref,
         sig=sig,
         logger=logger,
-        mismatch_msg=(
-            "FLUX fused LN+modulate fast path is not bit-exact against this "
-            "platform's LayerNorm dispatch; falling back to eager"
-        ),
     )
 
 
@@ -182,7 +176,7 @@ def _flux_norm_modulate(
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
     if out is not None:
         return out
-    if fused_ln_modulate_active(site) and can_use_ln_modulate(x, scale, shift):
+    if FUSED_LN_MODULATE.is_enabled(site) and can_use_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
     return modulate_scale_shift(norm(x), scale, shift)
 
@@ -193,7 +187,7 @@ class FluxAdaLayerNormZero(AdaLayerNormZero):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        mark_fused_ln_modulate_site(self)
+        FUSED_LN_MODULATE.mark(self)
 
     def forward(
         self,
@@ -219,7 +213,7 @@ class FluxAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        mark_fused_ln_modulate_site(self)
+        FUSED_LN_MODULATE.mark(self)
 
     def forward(
         self,
@@ -410,10 +404,12 @@ class FluxGELU(nn.Module):
         self.gelu = nn.GELU(approximate="tanh")
         # lossless/high fusion site: up-proj GEMM + tanh-GELU in the cublasLt
         # epilogue. Off by default; mounted per batch by the denoising stage.
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -434,10 +430,12 @@ class FluxFusedGELUProj(nn.Module):
     def __init__(self, proj: nn.Linear):
         super().__init__()
         self.proj = proj
-        mark_fused_gelu_site(self, "proj")
+        FUSED_LINEAR_GELU.mark(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
+            self.proj, hidden_states
+        ):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -523,7 +521,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         )
         self.local_heads = divide(self.heads, self.tp_size)
         self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
 
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
         self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
@@ -878,7 +875,7 @@ class FluxSingleTransformerBlock(nn.Module):
             self.act_mlp = nn.GELU(approximate="tanh")
             # lossless/high fusion site: proj_mlp GEMM + tanh-GELU in the
             # cublasLt epilogue (mounted per batch by the denoising stage).
-            mark_fused_gelu_site(self, "proj_mlp")
+            FUSED_LINEAR_GELU.mark(self, "proj_mlp")
             proj_out_cls = (
                 RowParallelLinear if shard_single_block else ColumnParallelLinear
             )
@@ -980,7 +977,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if fused_gelu_active(self) and can_use_linear_gelu(
+            if FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(
@@ -1045,7 +1042,7 @@ class FluxTransformerBlock(nn.Module):
         self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         # lossless/high site: norm2/norm2_context modulate folds into the
         # LN affine when mounted.
-        mark_fused_ln_modulate_site(self)
+        FUSED_LN_MODULATE.mark(self)
 
         nunchaku_enabled = (
             quant_config is not None
@@ -1197,6 +1194,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
     """
 
+    _compile_conditions = [
+        lambda name, module: isinstance(
+            module, (FluxTransformerBlock, FluxSingleTransformerBlock)
+        )
+    ]
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
 
     @classmethod

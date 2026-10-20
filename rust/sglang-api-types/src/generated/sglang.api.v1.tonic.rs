@@ -168,6 +168,59 @@ pub mod sglang_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// The same static model cards as HTTP `/v1/models`.
+        pub async fn list_models(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListModelsRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListModelsResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/ListModels");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "ListModels"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Decode token IDs locally, without running model inference.
+        pub async fn detokenize(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DetokenizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::DetokenizeResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/Detokenize");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Detokenize"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Cancel by the native rid used by HTTP `/generate` or gRPC Generate, or
+        /// cancel all active frontend generations with abort_all. HTTP chat/completion
+        /// response IDs are not supported as rid selectors.
+        /// Duplicate native IDs cancel all matching generations. A later reuse of the
+        /// ID is unaffected. Internal control/detokenization requests are not targeted.
+        pub async fn abort(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AbortRequest>,
+        ) -> std::result::Result<tonic::Response<super::AbortResponse>, tonic::Status> {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/sglang.api.v1.SglangService/Abort");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Abort"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -212,6 +265,25 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::GetServerInfoRequest>,
         ) -> std::result::Result<tonic::Response<super::GetServerInfoResponse>, tonic::Status>;
+        /// The same static model cards as HTTP `/v1/models`.
+        async fn list_models(
+            &self,
+            request: tonic::Request<super::ListModelsRequest>,
+        ) -> std::result::Result<tonic::Response<super::ListModelsResponse>, tonic::Status>;
+        /// Decode token IDs locally, without running model inference.
+        async fn detokenize(
+            &self,
+            request: tonic::Request<super::DetokenizeRequest>,
+        ) -> std::result::Result<tonic::Response<super::DetokenizeResponse>, tonic::Status>;
+        /// Cancel by the native rid used by HTTP `/generate` or gRPC Generate, or
+        /// cancel all active frontend generations with abort_all. HTTP chat/completion
+        /// response IDs are not supported as rid selectors.
+        /// Duplicate native IDs cancel all matching generations. A later reuse of the
+        /// ID is unaffected. Internal control/detokenization requests are not targeted.
+        async fn abort(
+            &self,
+            request: tonic::Request<super::AbortRequest>,
+        ) -> std::result::Result<tonic::Response<super::AbortResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -438,6 +510,122 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetServerInfoSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/ListModels" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListModelsSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::ListModelsRequest> for ListModelsSvc<T> {
+                        type Response = super::ListModelsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListModelsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::list_models(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListModelsSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/Detokenize" => {
+                    #[allow(non_camel_case_types)]
+                    struct DetokenizeSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::DetokenizeRequest> for DetokenizeSvc<T> {
+                        type Response = super::DetokenizeResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DetokenizeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::detokenize(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DetokenizeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/Abort" => {
+                    #[allow(non_camel_case_types)]
+                    struct AbortSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService> tonic::server::UnaryService<super::AbortRequest> for AbortSvc<T> {
+                        type Response = super::AbortResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AbortRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut =
+                                async move { <T as SglangService>::abort(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AbortSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

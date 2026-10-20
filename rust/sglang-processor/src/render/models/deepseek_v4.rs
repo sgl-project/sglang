@@ -1,9 +1,12 @@
 //! DeepSeek-V4 prompts as SGLang's `serving_chat.py` builds them, on Dynamo's V4 encoder.
 
+use std::collections::HashMap;
+
 use dynamo_renderer::deepseek::v4::{self, ReasoningEffort, ThinkingMode};
 use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
+use super::schema_types::normalize_json_schema_types;
 use crate::model_files::resolve_model_file;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -18,6 +21,7 @@ pub enum DeepSeekV4Profile {
 pub(crate) fn render(
     profile: DeepSeekV4Profile,
     mut request: Value,
+    defaults: &HashMap<String, Value>,
 ) -> Result<(String, String), String> {
     let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
@@ -28,20 +32,7 @@ pub(crate) fn render(
         check_tool_arguments(message)?;
     }
     let request = &request;
-    let mut prefix = String::new();
-    if let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant")
-        && let Some(content) = last["content"].as_str().map(str::to_owned)
-    {
-        if request
-            .get("continue_final_message")
-            .map_or(Ok(false), pydantic_bool)?
-        {
-            prefix = content;
-            messages.pop();
-        } else {
-            *last = json!({"role": "user", "content": content});
-        }
-    }
+    let prefix = split_continuation(&mut messages, request)?;
     // SGLang fails on `messages[0]` here.
     if messages.is_empty() {
         return Err("no messages to render".into());
@@ -54,8 +45,60 @@ pub(crate) fn render(
             .ok_or("task requires a user or developer message")?;
         message["task"] = task.clone();
     }
-    // SGLang drops a later user's task when merging it into a user or tool-result turn.
-    // Workaround for ai-dynamo/frontend-crates#366; drop once dynamo-renderer includes it.
+    drop_merged_tasks(&mut messages);
+    normalize_messages(&mut messages)?;
+    if messages.first().is_none_or(|m| m["role"] != "system") {
+        messages.insert(0, json!({"role": "system", "content": ""}));
+    }
+    // Unlike the Jinja path, SGLang passes every request tool once `tool_choice` allows any.
+    if let Some(tools) = request["tools"]
+        .as_array()
+        .filter(|tools| !tools.is_empty())
+    {
+        let normalized = normalize_tools(tools)?;
+        if renders_tools(request, tools) {
+            messages[0]["tools"] = normalized.into();
+        }
+    }
+    let mode = if thinking(request, defaults) {
+        ThinkingMode::Thinking
+    } else {
+        ThinkingMode::Chat
+    };
+    let fallback = std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok();
+    let effort = effort(profile, request, defaults, fallback);
+    let prompt = v4::encode_messages_with_options(&messages, mode, true, true, effort)
+        .map_err(|error| error.to_string())?;
+    Ok((prompt, prefix))
+}
+
+/// The `continue_final_message` prefix, taken off a final assistant turn with
+/// text content; without the flag that turn renders as a user turn.
+pub(super) fn split_continuation(
+    messages: &mut Vec<Value>,
+    request: &Value,
+) -> Result<String, String> {
+    let Some(last) = messages.last_mut().filter(|m| m["role"] == "assistant") else {
+        return Ok(String::new());
+    };
+    let Some(content) = last["content"].as_str().map(str::to_owned) else {
+        return Ok(String::new());
+    };
+    if request
+        .get("continue_final_message")
+        .map_or(Ok(false), pydantic_bool)?
+    {
+        messages.pop();
+        return Ok(content);
+    }
+    *last = json!({"role": "user", "content": content});
+    Ok(String::new())
+}
+
+/// `merge_tool_messages` folds a user turn into a preceding user or
+/// tool-result turn, dropping the later turn's task.
+/// Workaround for ai-dynamo/frontend-crates#366; drop once dynamo-renderer includes it.
+pub(super) fn drop_merged_tasks(messages: &mut [Value]) {
     for index in 1..messages.len() {
         if messages[index]["role"] == "user"
             && matches!(messages[index - 1]["role"].as_str(), Some("user" | "tool"))
@@ -64,51 +107,41 @@ pub(crate) fn render(
             message.remove("task");
         }
     }
-    normalize_messages(&mut messages)?;
-    if messages.first().is_none_or(|m| m["role"] != "system") {
-        messages.insert(0, json!({"role": "system", "content": ""}));
-    }
-    // Unlike the Jinja path, SGLang passes every request tool, whatever the tool_choice.
-    if let Some(tools) = request["tools"]
-        .as_array()
-        .filter(|tools| !tools.is_empty())
-    {
-        messages[0]["tools"] = normalize_tools(tools)?.into();
-    }
-    let mode = if thinking(request) {
-        ThinkingMode::Thinking
-    } else {
-        ThinkingMode::Chat
-    };
-    let fallback = std::env::var("SGLANG_DSV4_REASONING_EFFORT").ok();
-    let effort = effort(profile, request, fallback);
-    let prompt = v4::encode_messages_with_options(&messages, mode, true, true, effort)
-        .map_err(|error| error.to_string())?;
-    Ok((prompt, prefix))
 }
 
 /// `serving_chat.py`: kwargs `thinking` wins, then what `reasoning` and the
-/// effort imply, then `SGLANG_DEFAULT_THINKING`.
-pub(crate) fn thinking(request: &Value) -> bool {
+/// effort imply, then the server's default kwargs and `SGLANG_DEFAULT_THINKING`.
+pub(crate) fn thinking(request: &Value, defaults: &HashMap<String, Value>) -> bool {
     if let Some(thinking) = request["chat_template_kwargs"].get("thinking") {
         return minijinja::Value::from_serialize(thinking).is_true();
     }
-    requested_thinking(request).unwrap_or_else(|| {
-        std::env::var("SGLANG_DEFAULT_THINKING")
-            .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
-    })
+    if let Some(thinking) = requested_thinking(request) {
+        return thinking;
+    }
+    if let Some(thinking) = defaults.get("thinking") {
+        return minijinja::Value::from_serialize(thinking).is_true();
+    }
+    std::env::var("SGLANG_DEFAULT_THINKING")
+        .is_ok_and(|v| ["true", "1", "yes", "y"].contains(&v.to_lowercase().as_str()))
 }
 
 /// `encoding_dsv4.REASONING_EFFORT_PROFILES`: kwargs effort replaces the request
-/// effort, `fallback` (`SGLANG_DSV4_REASONING_EFFORT`) fills in, and other tiers add no prefix.
+/// effort, then the server's default kwargs and `fallback`
+/// (`SGLANG_DSV4_REASONING_EFFORT`) fill in; other tiers add no prefix.
 fn effort(
     profile: DeepSeekV4Profile,
     request: &Value,
+    defaults: &HashMap<String, Value>,
     fallback: Option<String>,
 ) -> Option<ReasoningEffort> {
     let requested = Some(&request["chat_template_kwargs"]["reasoning_effort"])
         .filter(|effort| !effort.is_null())
         .or_else(|| requested_effort(request))
+        .or_else(|| {
+            defaults
+                .get("reasoning_effort")
+                .filter(|effort| !effort.is_null())
+        })
         .map(|effort| effort.as_str().map(str::to_owned))
         .unwrap_or(fallback);
     match (profile, requested.as_deref()) {
@@ -122,7 +155,7 @@ fn effort(
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
-fn engine_message(message: Value) -> Value {
+pub(super) fn engine_message(message: Value) -> Value {
     let mut message = match message {
         Value::Object(message) => message,
         _ => Map::new(),
@@ -147,7 +180,23 @@ fn engine_message(message: Value) -> Value {
     message.retain(|key, value| kept.contains(&key.as_str()) && !value.is_null());
     message.insert("role".into(), role.into());
     message.entry("content").or_insert_with(|| "".into());
+    if let Some(Value::Array(calls)) = message.get_mut("tool_calls") {
+        calls
+            .iter_mut()
+            .for_each(|call| *call = tool_call_dump(call));
+    }
     message.into()
+}
+
+/// `ToolCall.model_dump()`: its declared fields only, unset ones null.
+fn tool_call_dump(call: &Value) -> Value {
+    let function = &call["function"];
+    json!({
+        "id": call["id"],
+        "index": call["index"],
+        "type": "function",
+        "function": {"name": function["name"], "arguments": function["arguments"]},
+    })
 }
 
 /// `process_content_for_template_format`: text parts joined with spaces.
@@ -165,7 +214,7 @@ fn flatten_content(message: &mut Value) {
 
 /// `serving_chat.normalize_assistant_tool_call_arguments`: string arguments must
 /// be a JSON object; other values wait for the final-turn handling.
-fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
+pub(super) fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
     for arguments in tool_arguments(message) {
         if let Some(text) = arguments.as_str()
             && (serde_json::from_str::<IgnoredAny>(text).is_err()
@@ -179,7 +228,7 @@ fn check_tool_arguments(message: &mut Value) -> Result<(), String> {
 
 /// The messages the encoder sees: empty tool lists dropped, message tools dumped,
 /// and tool arguments as JSON object text, which Dynamo parses itself.
-fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
+pub(super) fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
     for message in messages {
         for arguments in tool_arguments(message) {
             match arguments {
@@ -208,7 +257,7 @@ fn normalize_messages(messages: &mut [Value]) -> Result<(), String> {
 }
 
 /// Each assistant tool call's `function.arguments`, absent ones as `null`.
-fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
+pub(super) fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
     let is_assistant = message["role"] == "assistant";
     message
         .get_mut("tool_calls")
@@ -220,9 +269,21 @@ fn tool_arguments(message: &mut Value) -> impl Iterator<Item = &mut Value> {
         .map(|function| function.entry("arguments").or_insert(Value::Null))
 }
 
-/// `protocol.py::Function.model_dump()`, in declared field order; the encoder
-/// serializes it verbatim.
-fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
+/// Whether `serving_chat` hands the encoder the request tools: `tool_choice`
+/// `"none"` withholds them, and a named choice needs a request tool of that name.
+pub(super) fn renders_tools(request: &Value, tools: &[Value]) -> bool {
+    match &request["tool_choice"] {
+        Value::Null => true,
+        Value::String(choice) => choice != "none",
+        named => tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == named["function"]["name"]),
+    }
+}
+
+/// `protocol.py::Function.model_dump()`, in declared field order, after
+/// `_validate_request` normalizes the schema types; the encoder serializes it verbatim.
+pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
     tools
         .iter()
         .map(|tool| {
@@ -231,7 +292,9 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
             let mut function = Map::new();
             function.insert("description".into(), f["description"].clone());
             function.insert("name".into(), name.into());
-            function.insert("parameters".into(), f["parameters"].clone());
+            let mut parameters = f["parameters"].clone();
+            normalize_json_schema_types(&mut parameters);
+            function.insert("parameters".into(), parameters);
             let strict = f.get("strict").map_or(Ok(false), pydantic_bool)?;
             function.insert("strict".into(), strict.into());
             if let Some(defer) = [f.get("defer_loading"), tool.get("defer_loading")]
@@ -247,7 +310,7 @@ fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
-fn pydantic_bool(value: &Value) -> Result<bool, String> {
+pub(super) fn pydantic_bool(value: &Value) -> Result<bool, String> {
     let parsed = match value {
         Value::Bool(value) => Some(*value),
         Value::Number(number) => match number.as_f64() {
@@ -265,47 +328,50 @@ fn pydantic_bool(value: &Value) -> Result<bool, String> {
     parsed.ok_or_else(|| format!("expected a boolean, got {value}"))
 }
 
+impl DeepSeekV4Profile {
+    /// `chat_encoding.py`: the config override, else the checkpoint encoder's
+    /// declarations (`encoding/encoding_dsv4.py` source); preview when absent.
+    pub fn from_checkpoint(profile: Option<&str>, encoder: Option<&str>) -> Result<Self, String> {
+        if let Some(profile) = profile {
+            return match profile {
+                "preview" => Ok(Self::Preview),
+                "official" => Ok(Self::Official),
+                _ => Err(format!(
+                    "invalid dsv4_reasoning_effort_profile: {profile:?}; expected \"preview\" or \"official\""
+                )),
+            };
+        }
+        let Some(source) = encoder.filter(|source| source.len() <= 1 << 20) else {
+            return Ok(Self::Preview);
+        };
+        let default = top_level_python_assignment(source, "DEFAULT_REASONING_EFFORT")
+            .and_then(python_string_literal);
+        let prompt_keys = top_level_python_assignment(source, "REASONING_EFFORT_PROMPTS")
+            .and_then(python_dict_keys)
+            .unwrap_or_default();
+        if default.as_deref() == Some("low")
+            && ["low", "high", "max"]
+                .iter()
+                .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
+        {
+            Ok(Self::Official)
+        } else {
+            Ok(Self::Preview)
+        }
+    }
+}
+
 pub(crate) fn resolve_dsv4_profile(
     profile: Option<&str>,
     model_source: &str,
     revision: Option<&str>,
 ) -> Result<DeepSeekV4Profile, String> {
-    if let Some(profile) = profile {
-        return match profile {
-            "preview" => Ok(DeepSeekV4Profile::Preview),
-            "official" => Ok(DeepSeekV4Profile::Official),
-            _ => Err(format!(
-                "invalid dsv4_reasoning_effort_profile: {profile:?}; expected \"preview\" or \"official\""
-            )),
-        };
-    }
-    let Some(encoder) = resolve_model_file(model_source, revision, "encoding/encoding_dsv4.py")
-    else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    let Ok(metadata) = std::fs::metadata(&encoder) else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    if metadata.len() > 1 << 20 {
-        return Ok(DeepSeekV4Profile::Preview);
-    }
-    let Ok(source) = std::fs::read_to_string(encoder) else {
-        return Ok(DeepSeekV4Profile::Preview);
-    };
-    let default = top_level_python_assignment(&source, "DEFAULT_REASONING_EFFORT")
-        .and_then(python_string_literal);
-    let prompt_keys = top_level_python_assignment(&source, "REASONING_EFFORT_PROMPTS")
-        .and_then(python_dict_keys)
-        .unwrap_or_default();
-    if default.as_deref() == Some("low")
-        && ["low", "high", "max"]
-            .iter()
-            .all(|key| prompt_keys.iter().any(|candidate| candidate == key))
-    {
-        Ok(DeepSeekV4Profile::Official)
-    } else {
-        Ok(DeepSeekV4Profile::Preview)
-    }
+    let encoder = profile
+        .is_none()
+        .then(|| resolve_model_file(model_source, revision, "encoding/encoding_dsv4.py"))
+        .flatten()
+        .and_then(|encoder| std::fs::read_to_string(encoder).ok());
+    DeepSeekV4Profile::from_checkpoint(profile, encoder.as_deref())
 }
 
 fn top_level_python_assignment<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -433,7 +499,7 @@ mod tests {
             let request = json!({ "reasoning_effort": requested });
             let fallback = fallback.map(str::to_owned);
             assert_eq!(
-                effort(profile, &request, fallback),
+                effort(profile, &request, &Default::default(), fallback),
                 expected,
                 "{profile:?} {requested:?}"
             );
