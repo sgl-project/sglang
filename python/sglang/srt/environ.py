@@ -775,7 +775,7 @@ class Envs:
     SGLANG_EXA_INCLUDE_HIGHLIGHTS = EnvBool(True)
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
     # Applies to every structural tag, including user-supplied response_format tags.
-    SGLANG_ENABLE_STRUCTURAL_TAG_SCHEMA_RELAXATION = EnvBool(False)
+    SGLANG_ENABLE_STRUCTURAL_TAG_PATTERN_RELAXATION = EnvBool(False)
 
     # ===================================================================
     # HiCache storage backends and mmap allocation

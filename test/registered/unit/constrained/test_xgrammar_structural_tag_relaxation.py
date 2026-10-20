@@ -1,9 +1,10 @@
-"""Unit tests for relaxing structural tag schemas that XGrammar cannot compile."""
+"""Unit tests for dropping structural tag patterns that XGrammar cannot compile."""
 
 import copy
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import xgrammar as xgr
 
@@ -12,9 +13,11 @@ from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.xgrammar_backend import (
     XGrammarGrammar,
     XGrammarGrammarBackend,
-    _relax_schema_slots,
+    _drop_uncompilable_patterns,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
@@ -24,15 +27,15 @@ BACKREFERENCE = r"(a)\1"
 
 def _make_backend(*, relax: bool) -> XGrammarGrammarBackend:
     vocab = [chr(i) for i in range(32, 127)] + ["\n", "<eos>"]
-    tokenizer_info = xgr.TokenizerInfo(
-        vocab, xgr.VocabType.RAW, stop_token_ids=[len(vocab) - 1]
-    )
-    backend = object.__new__(XGrammarGrammarBackend)
-    backend.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
-    backend.vocab_size = len(vocab)
-    backend.override_stop_tokens = None
-    backend.relax_structural_tag_schemas = relax
-    return backend
+    info = xgr.TokenizerInfo(vocab, xgr.VocabType.RAW, stop_token_ids=[len(vocab) - 1])
+    tokenizer = SimpleNamespace(init_xgrammar=lambda: (info, None))
+    with envs.SGLANG_ENABLE_STRUCTURAL_TAG_PATTERN_RELAXATION.override(relax):
+        return XGrammarGrammarBackend(tokenizer, len(vocab))
+
+
+def _dispatch(key: str, *, relax: bool, backend=None):
+    backend = backend or _make_backend(relax=relax)
+    return backend.dispatch_structural_tag(key)
 
 
 def _tool(name: str, properties: dict) -> dict:
@@ -50,9 +53,13 @@ def _tool(name: str, properties: dict) -> dict:
     }
 
 
-def _qwen3_coder_tag(tools: list) -> str:
+def _string(pattern: str) -> dict:
+    return {"type": "string", "pattern": pattern}
+
+
+def _model_tag(tools: list, model="qwen_3_coder", tool_choice="required") -> str:
     return xgr.get_model_structural_tag(
-        model="qwen_3_coder", tools=tools, tool_choice="required", reasoning=False
+        model=model, tools=tools, tool_choice=tool_choice, reasoning=False
     ).model_dump_json()
 
 
@@ -72,55 +79,49 @@ def _legacy_tag(schema: dict) -> str:
     )
 
 
-class TestStructuralTagSchemaRelaxation(unittest.TestCase):
+class TestStructuralTagPatternDropping(CustomTestCase):
     def test_flag_off_still_fails(self):
-        key = _qwen3_coder_tag(
-            [_tool("ls", {"path": {"type": "string", "pattern": LOOKAHEAD}})]
-        )
+        key = _model_tag([_tool("ls", {"path": _string(LOOKAHEAD)})])
 
-        result = _make_backend(relax=False).dispatch_structural_tag(key)
+        result = _dispatch(key, relax=False)
 
         self.assertIsInstance(result, InvalidGrammarObject)
         self.assertIn("Lookahead", result.error_message)
 
     def test_native_tag_compiles_and_names_the_tool(self):
         """One tool with an uncompilable pattern must not fail the whole tool set (#45224)."""
-        key = _qwen3_coder_tag(
+        key = _model_tag(
             [
-                _tool("ls", {"path": {"type": "string", "pattern": LOOKAHEAD}}),
-                _tool("cat", {"file": {"type": "string", "pattern": "^[a-z]+$"}}),
+                _tool("ls", {"path": _string(LOOKAHEAD)}),
+                _tool("cat", {"file": _string("^[a-z]+$")}),
             ]
         )
 
         with self.assertLogs(xgrammar_backend.logger, level="WARNING") as logs:
-            result = _make_backend(relax=True).dispatch_structural_tag(key)
+            result = _dispatch(key, relax=True)
 
         self.assertIsInstance(result, XGrammarGrammar)
         self.assertIn("<function=ls>", logs.output[0])
         self.assertIn("dropped pattern at #/properties/path", logs.output[0])
         self.assertNotIn("<function=cat>", logs.output[0])
+        self.assertNotIn(LOOKAHEAD.replace("\\", "\\\\"), result.key_string)
 
     def test_only_failing_patterns_are_dropped(self):
         tag = json.loads(
-            _qwen3_coder_tag(
+            _model_tag(
                 [
                     _tool(
                         "ls",
-                        {
-                            "path": {"type": "string", "pattern": LOOKAHEAD},
-                            "mode": {"type": "string", "pattern": "^[rw]$"},
-                        },
+                        {"path": _string(LOOKAHEAD), "mode": _string("^[rw]$")},
                     ),
-                    _tool(
-                        "cat", {"file": {"type": "string", "pattern": BACKREFERENCE}}
-                    ),
-                    _tool("rm", {"file": {"type": "string", "pattern": "^[a-z]+$"}}),
+                    _tool("cat", {"file": _string(BACKREFERENCE)}),
+                    _tool("rm", {"file": _string("^[a-z]+$")}),
                 ]
             )
         )
         before = copy.deepcopy(tag)
 
-        changes = _relax_schema_slots(tag)
+        changes = _drop_uncompilable_patterns(tag)
 
         schemas = [t["content"]["json_schema"] for t in tag["format"]["tags"]]
         self.assertNotIn("pattern", schemas[0]["properties"]["path"])
@@ -131,63 +132,110 @@ class TestStructuralTagSchemaRelaxation(unittest.TestCase):
         )
         self.assertEqual(len(changes), 2)
 
-    def test_legacy_tag_is_relaxed(self):
+    def test_pattern_inside_defs_is_dropped(self):
+        tool = _tool("ls", {"path": {"$ref": "#/$defs/Path"}})
+        tool["function"]["parameters"]["$defs"] = {"Path": _string(LOOKAHEAD)}
+
+        changes = _drop_uncompilable_patterns(json.loads(_model_tag([tool])))
+
+        self.assertEqual(len(changes), 1)
+        self.assertIn("#/$defs/Path", changes[0])
+
+    def test_json_style_keeps_patterns_it_can_compile(self):
+        """JSON style ignores only the lookahead, so that pattern is kept."""
         key = _legacy_tag(
             {
                 "type": "object",
-                "properties": {"name": {"type": "string", "pattern": BACKREFERENCE}},
+                "properties": {
+                    "name": _string(LOOKAHEAD),
+                    "id": _string(BACKREFERENCE),
+                },
             }
         )
+        self.assertIsInstance(_dispatch(key, relax=False), InvalidGrammarObject)
 
-        self.assertIsInstance(
-            _make_backend(relax=False).dispatch_structural_tag(key),
-            InvalidGrammarObject,
-        )
-        with self.assertLogs(xgrammar_backend.logger, level="WARNING"):
-            result = _make_backend(relax=True).dispatch_structural_tag(key)
-        self.assertIsInstance(result, XGrammarGrammar)
+        tag = json.loads(key)
+        changes = _drop_uncompilable_patterns(tag)
 
-    def test_schema_left_unconstrained_when_dropping_patterns_is_not_enough(self):
-        tag = json.loads(
-            _legacy_tag(
-                {"type": "object", "patternProperties": {"(?<=a)b": {"type": "string"}}}
-            )
-        )
-
-        changes = _relax_schema_slots(tag)
-
-        self.assertEqual(tag["structures"][0]["schema"], {})
+        properties = tag["structures"][0]["schema"]["properties"]
+        self.assertEqual(properties["name"]["pattern"], LOOKAHEAD)
+        self.assertNotIn("pattern", properties["id"])
         self.assertEqual(len(changes), 1)
-        self.assertIn("left unconstrained", changes[0])
+        with self.assertLogs(xgrammar_backend.logger, level="WARNING"):
+            self.assertIsInstance(_dispatch(key, relax=True), XGrammarGrammar)
 
-    def test_no_relaxable_schema_returns_original_error_without_recompiling(self):
+    def test_patterns_are_checked_in_the_tag_style(self):
+        """Covers a style stricter than plain regex and a schema nested in `optional`."""
+        cases = [
+            # minimax_m3_xml rejects every pattern, even one plain regex accepts.
+            ("minimax_m3", "required", _string("^[a-z]+$")),
+            # kimi_k3 puts tool schemas under an `optional` format with tool_choice=auto.
+            ("kimi_k3", "auto", _string(BACKREFERENCE)),
+        ]
+        for model, tool_choice, prop in cases:
+            with self.subTest(model=model):
+                key = _model_tag([_tool("ls", {"x": prop})], model, tool_choice)
+                self.assertIsInstance(_dispatch(key, relax=False), InvalidGrammarObject)
+                with self.assertLogs(xgrammar_backend.logger, level="WARNING"):
+                    result = _dispatch(key, relax=True)
+                self.assertIsInstance(result, XGrammarGrammar)
+
+    def test_other_schema_errors_still_fail(self):
+        """Only patterns are relaxed; a broken schema keeps returning its error."""
         backend = _make_backend(relax=True)
         backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)
-        key = _qwen3_coder_tag(
-            [_tool("ls", {"path": {"type": "string", "pattern": LOOKAHEAD}})]
+        key = _model_tag(
+            [
+                _tool(
+                    "ls", {"path": {"type": "string", "minLength": 5, "maxLength": 1}}
+                ),
+                _tool("cat", {"file": _string(LOOKAHEAD)}),
+            ]
         )
 
-        with patch.object(xgrammar_backend, "_schema_slot_compiles", return_value=True):
-            result = backend.dispatch_structural_tag(key)
+        result = _dispatch(key, relax=True, backend=backend)
 
         self.assertIsInstance(result, InvalidGrammarObject)
-        self.assertIn("Lookahead", result.error_message)
-        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 1)
+        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 2)
 
-    def test_relaxation_compiles_with_the_tokenizer_at_most_twice(self):
+    def test_nothing_to_drop_returns_original_error_without_recompiling(self):
         backend = _make_backend(relax=True)
         backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)
-        tools = [
-            _tool(f"t{i}", {"x": {"type": "string", "pattern": "^[a-z]+$"}})
-            for i in range(50)
-        ]
-        tools.append(_tool("bad", {"x": {"type": "string", "pattern": LOOKAHEAD}}))
+        key = _legacy_tag(
+            {"type": "object", "patternProperties": {"(?<=a)b": {"type": "string"}}}
+        )
+
+        result = _dispatch(key, relax=True, backend=backend)
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 1)
+
+    def test_compiles_with_the_tokenizer_at_most_twice(self):
+        backend = _make_backend(relax=True)
+        backend.grammar_compiler = MagicMock(wraps=backend.grammar_compiler)
+        tools = [_tool(f"t{i}", {"x": _string("^[a-z]+$")}) for i in range(50)]
+        tools.append(_tool("bad", {"x": _string(LOOKAHEAD)}))
 
         with self.assertLogs(xgrammar_backend.logger, level="WARNING"):
-            result = backend.dispatch_structural_tag(_qwen3_coder_tag(tools))
+            result = _dispatch(_model_tag(tools), relax=True, backend=backend)
 
         self.assertIsInstance(result, XGrammarGrammar)
         self.assertEqual(backend.grammar_compiler.compile_structural_tag.call_count, 2)
+
+    def test_missing_schema_is_filled_in_any_container(self):
+        tag = {
+            "type": "optional",
+            "content": {
+                "type": "tag",
+                "begin": "<a>",
+                "content": {"type": "json_schema", "json_schema": None},
+                "end": "</a>",
+            },
+        }
+
+        XGrammarGrammarBackend._sanitize_structural_format(tag)
+
+        self.assertEqual(tag["content"]["content"]["json_schema"], {})
 
 
 if __name__ == "__main__":
