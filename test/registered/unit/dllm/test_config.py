@@ -51,20 +51,41 @@ class TestDllmConfig(CustomTestCase):
             ):
                 return DllmConfig.from_server_args(server_args)
 
-    def test_unknown_keys_name_the_selected_algorithm(self):
+    def test_unknown_keys_list_the_supported_keys(self):
         cases = (
-            ("LowConfidence", "threshhold"),  # codespell:ignore threshhold
-            ("JointThreshold", "edit_treshold"),  # codespell:ignore treshold
-            ("JointThresholdInDel", "max_post_edit_step"),
-            ("Gemma4Renoise", "max_denoise_steps"),
+            (
+                "LowConfidence",
+                "threshhold",  # codespell:ignore threshhold
+                "block_size, threshold",
+            ),
+            (
+                "JointThreshold",
+                "edit_treshold",  # codespell:ignore treshold
+                "block_size, edit_threshold, max_post_edit_steps, penalty_lambda, "
+                "threshold, vectorized_decoding",
+            ),
+            (
+                "JointThresholdInDel",
+                "max_post_edit_step",
+                "block_size, edit_threshold, max_post_edit_steps, threshold",
+            ),
+            (
+                "Gemma4Renoise",
+                "max_denoise_steps",
+                "block_size, capture_input_preparation, confidence_threshold, "
+                "max_denoising_steps, sampler_config, seed, stability_threshold, "
+                "stopping_config, t_max, t_min, temperature_schedule, "
+                "use_temperature_table",
+            ),
         )
-        for algorithm, key in cases:
+        for algorithm, key, supported_keys in cases:
             with self.subTest(algorithm=algorithm):
                 with self.assertRaises(ValueError) as error:
                     self._parse_config(algorithm, yaml.safe_dump({key: 1}))
                 self.assertEqual(
                     str(error.exception),
-                    f"Unknown configuration keys for {algorithm}: {key}",
+                    f"Unknown configuration keys for {algorithm}: {key}. "
+                    f"Supported keys: {supported_keys}",
                 )
 
     def test_keys_from_other_algorithms_are_rejected(self):
@@ -79,18 +100,32 @@ class TestDllmConfig(CustomTestCase):
             with self.subTest(algorithm=algorithm, key=key):
                 with self.assertRaises(ValueError) as error:
                     self._parse_config(algorithm, yaml.safe_dump({key: 1}))
-                self.assertEqual(
+                self.assertIn(
+                    f"Unknown configuration keys for {algorithm}: {key}. "
+                    "Supported keys: ",
                     str(error.exception),
-                    f"Unknown configuration keys for {algorithm}: {key}",
                 )
 
     def test_unknown_gemma_keys_include_the_section(self):
         cases = (
-            ("sampler_config", "entrophy_bound"),  # codespell:ignore entrophy
-            ("temperature_schedule", "min_temperature"),
-            ("stopping_config", "confidence_treshold"),  # codespell:ignore treshold
+            (
+                "sampler_config",
+                "entrophy_bound",  # codespell:ignore entrophy
+                "sampler_config.entropy_bound",
+            ),
+            (
+                "temperature_schedule",
+                "min_temperature",
+                "temperature_schedule.t_max, temperature_schedule.t_min",
+            ),
+            (
+                "stopping_config",
+                "confidence_treshold",  # codespell:ignore treshold
+                "stopping_config.confidence_threshold, "
+                "stopping_config.stability_threshold",
+            ),
         )
-        for section, key in cases:
+        for section, key, supported_keys in cases:
             with self.subTest(section=section):
                 with self.assertRaises(ValueError) as error:
                     self._parse_config(
@@ -98,7 +133,8 @@ class TestDllmConfig(CustomTestCase):
                     )
                 self.assertEqual(
                     str(error.exception),
-                    f"Unknown configuration keys for Gemma4Renoise: {section}.{key}",
+                    f"Unknown configuration keys for Gemma4Renoise: {section}.{key}. "
+                    f"Supported keys: {supported_keys}",
                 )
 
     def test_mixed_unknown_key_types_report_a_value_error(self):
@@ -114,9 +150,42 @@ class TestDllmConfig(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 with self.assertRaises(ValueError) as error:
                     self._parse_config(algorithm, yaml.safe_dump(values))
-                self.assertEqual(
+                self.assertIn(
+                    f"Unknown configuration keys for {algorithm}: {keys}. "
+                    "Supported keys: ",
                     str(error.exception),
-                    f"Unknown configuration keys for {algorithm}: {keys}",
+                )
+
+    def test_input_preparation_option_requires_algorithm_support(self):
+        for algorithm in ("LowConfidence", "JointThreshold", "JointThresholdInDel"):
+            for enabled in (False, True):
+                with self.subTest(algorithm=algorithm, enabled=enabled):
+                    with self.assertRaises(ValueError) as error:
+                        self._parse_config(
+                            algorithm,
+                            yaml.safe_dump({"capture_input_preparation": enabled}),
+                        )
+                    message = str(error.exception)
+                    self.assertIn(
+                        f"Unknown configuration keys for {algorithm}: "
+                        "capture_input_preparation. Supported keys: ",
+                        message,
+                    )
+                    self.assertNotIn(
+                        "capture_input_preparation",
+                        message.split("Supported keys: ", 1)[1],
+                    )
+
+    def test_gemma_input_preparation_option(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                config = self._parse_config(
+                    "Gemma4Renoise",
+                    yaml.safe_dump({"capture_input_preparation": enabled}),
+                )
+                self.assertEqual(config.capture_input_preparation, enabled)
+                self.assertEqual(
+                    get_algorithm(config).use_graph_input_preparation, enabled
                 )
 
     def test_valid_threshold_configs_reach_the_algorithm(self):
@@ -145,13 +214,7 @@ class TestDllmConfig(CustomTestCase):
             with self.subTest(algorithm=name):
                 config = self._parse_config(
                     name,
-                    yaml.safe_dump(
-                        {
-                            **values,
-                            "block_size": 16,
-                            "capture_input_preparation": False,
-                        }
-                    ),
+                    yaml.safe_dump({**values, "block_size": 16}),
                 )
                 algorithm = get_algorithm(config)
                 self.assertEqual(config.block_size, 16)
