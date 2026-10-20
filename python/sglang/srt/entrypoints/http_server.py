@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from functools import partial
 from http import HTTPStatus
 from typing import (
     Annotated,
@@ -168,19 +169,25 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.observability.func_timer import enable_func_timer
+from sglang.srt.observability.http_request_metrics import (
+    add_http_request_metrics_middleware,
+    init_http_request_metrics,
+)
 from sglang.srt.observability.trace import (
+    fastapi_telemetry_disabled_kwargs,
     process_tracing_init,
     set_global_trace_level,
     trace_set_thread_info,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_manager import TemplateManager
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
     build_server_info,
     delete_directory,
+    freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
@@ -293,13 +300,15 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        warmup_thread_kwargs = dict(server_args=server_args)
-        thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
+        worker_id = _global_state.tokenizer_manager.worker_id
+        warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
+        thread_label = f"MultiTokenizer-{worker_id}"
 
     # Add prometheus middleware
     if get_observability().enable_metrics:
         add_prometheus_middleware(app)
         enable_func_timer()
+        init_http_request_metrics()
 
     # Init tracing
     if get_observability().enable_trace:
@@ -479,6 +488,7 @@ class ORJSONRoute(APIRoute):
 app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
+    **fastapi_telemetry_disabled_kwargs(),
 )
 app.router.route_class = ORJSONRoute
 app.add_middleware(
@@ -495,6 +505,9 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     )
 
     app.add_middleware(RequestDecompressionMiddleware)
+
+# Registered at import so that tokenizer workers, which re-import this module, get it too.
+add_http_request_metrics_middleware(app)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -861,13 +874,15 @@ async def server_info():
     server_args = _global_state.tokenizer_manager.server_args
 
     return msgspec_to_builtins(
-        {
-            **build_server_info(server_args, _global_state.scheduler_info),
-            "startup_time": _global_state.tokenizer_manager.startup_time,
-            "internal_states": internal_states,
-            "version": __version__,
-            "frontend": "python",
-        }
+        redact_watermark_secrets(
+            {
+                **build_server_info(server_args, _global_state.scheduler_info),
+                "startup_time": _global_state.tokenizer_manager.startup_time,
+                "internal_states": internal_states,
+                "version": __version__,
+                "frontend": "python",
+            }
+        )
     )
 
 
@@ -2454,6 +2469,19 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:
+    return partial(freeze_gc, f"Tokenizer worker {worker_id}", gc_threshold)
+
+
+def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
+    return dict(
+        server_args=server_args,
+        post_warmup_callback=_tokenizer_worker_gc_callback(
+            worker_id, server_args.gc_threshold
+        ),
+    )
+
+
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
     # Freeze GC after server warmup so static objects skip future GC gen2 collection.
     # Use /freeze_gc to freeze scheduler and detokenizer as well.
@@ -2477,6 +2505,7 @@ def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
+    post_warmup_callback: Optional[Callable[[], None]] = None,
 ):
     if get_model().checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
@@ -2495,6 +2524,8 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    if post_warmup_callback is not None:
+        post_warmup_callback()
     _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
@@ -2566,7 +2597,7 @@ def _run_granian_server(
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
     target = (
-        app if tokenizer_worker_num == 1 else "sglang.srt.entrypoints.http_server:app"
+        app if tokenizer_worker_num == 1 else envs.SGLANG_HTTP_SERVER_APP_PATH.get()
     )
     granian_kwargs = dict(
         target=target,
@@ -2642,9 +2673,6 @@ def _setup_and_run_http_server(
     # Store watchdog on tokenizer_manager (single source of truth for SIGQUIT handler)
     if tokenizer_manager is not None:
         tokenizer_manager._subprocess_watchdog = subprocess_watchdog
-
-    if get_observability().enable_metrics:
-        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
@@ -2831,7 +2859,7 @@ def _setup_and_run_http_server(
                 )
             else:
                 uvicorn.run(
-                    "sglang.srt.entrypoints.http_server:app",
+                    envs.SGLANG_HTTP_SERVER_APP_PATH.get(),
                     host=get_serving().host,
                     port=get_serving().port,
                     root_path=get_serving().fastapi_root_path,
