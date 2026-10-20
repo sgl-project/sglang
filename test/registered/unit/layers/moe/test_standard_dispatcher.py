@@ -135,6 +135,153 @@ class TestLayerRunnerDispatch(CustomTestCase):
         self.assertEqual(topk.topk_config.output_format, TopKOutputFormat.STANDARD)
         self.assertFalse(dispatcher.use_aiter_moe_runner)
 
+    def test_compressed_routes_apply_scale_once_for_the_effective_runner(self):
+        """Wrapped FP8/NVFP4 experts consume final materialized route weights."""
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+            CompressedTensorsFusedMoEMethod,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4_moe import (
+            CompressedTensorsW4A4Nvfp4MoE,
+        )
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8_moe import (
+            CompressedTensorsW8A8Fp8MoE,
+        )
+
+        with (
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM),
+            get_parallel().override(
+                tp_size=1,
+                tp_rank=0,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                moe_ep_size=1,
+                moe_ep_rank=0,
+            ),
+            get_model().override(shared_experts=SharedExpertsConfig()),
+            patch.object(
+                topk_module,
+                "grouped_topk_gpu",
+                topk_module.grouped_topk_gpu._torchdynamo_orig_callable,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.compressed_tensors.schemes."
+                "compressed_tensors_w4a4_nvfp4_moe.get_platform",
+                return_value=SimpleNamespace(is_blackwell=True),
+            ),
+        ):
+            schemes = (
+                CompressedTensorsW8A8Fp8MoE(
+                    SimpleNamespace(
+                        strategy="block", block_structure=[128, 128], dynamic=False
+                    ),
+                    SimpleNamespace(strategy="token", dynamic=True),
+                ),
+                CompressedTensorsW4A4Nvfp4MoE(),
+            )
+            hidden = torch.ones((1, 128))
+            logits = torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]])
+            expert_outputs = torch.tensor(
+                [4.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+            )
+            for scheme in schemes:
+                for renormalize in (True, False):
+                    for factor in (1.0, 2.5):
+                        with self.subTest(
+                            scheme=type(scheme).__name__,
+                            renormalize=renormalize,
+                            factor=factor,
+                        ):
+                            method = CompressedTensorsFusedMoEMethod(None)
+
+                            def select_method(layer, prefix):
+                                layer.scheme = scheme
+                                return method
+
+                            layer = FusedMoE(
+                                num_experts=8,
+                                top_k=2,
+                                hidden_size=128,
+                                intermediate_size=128,
+                                layer_id=0,
+                                quant_config=SimpleNamespace(
+                                    get_quant_method=select_method,
+                                    get_name=lambda: "compressed-tensors",
+                                ),
+                                routed_scaling_factor=factor,
+                                routing_method_type=RoutingMethodType.DeepSeekV3,
+                            )
+                            topk = TopK(
+                                top_k=2,
+                                layer_id=0,
+                                use_grouped_topk=True,
+                                num_expert_group=2,
+                                topk_group=1,
+                                renormalize=renormalize,
+                                routed_scaling_factor=factor,
+                                apply_routed_scaling_factor_on_output=layer.should_fuse_routed_scaling_factor_in_topk,
+                                allow_routed_experts_capture=False,
+                            )
+                            topk.bind_runner_backend(
+                                layer.runner_backend,
+                                routing_method_type=layer.routing_method_type,
+                            )
+                            routes = topk.forward_cuda(hidden, logits)
+                            self.assertEqual(routes.format, TopKOutputFormat.STANDARD)
+                            dispatched = layer.dispatcher.dispatch(hidden, routes)
+                            actual = (
+                                expert_outputs[dispatched.topk_output.topk_ids.long()]
+                                * dispatched.topk_output.topk_weights
+                            ).sum()
+                            reference = logits.softmax(-1)[:, :2]
+                            if renormalize:
+                                reference = reference / reference.sum(-1, keepdim=True)
+                            expected = factor * (reference * expert_outputs[:2]).sum()
+                            torch.testing.assert_close(actual, expected)
+
+    def test_materialized_router_scale_is_independent_of_renormalization(self):
+        """Folding a routed factor does not require selected-weight normalization."""
+        hidden = torch.ones((1, 4))
+        logits = torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]])
+        for name in (
+            "grouped_topk_gpu",
+            "kimi_k2_biased_topk_impl",
+            "biased_topk_impl",
+        ):
+            router = getattr(topk_module, name)._torchdynamo_orig_callable
+            for renormalize in (True, False):
+                for fold in (True, False):
+                    with self.subTest(router=name, renormalize=renormalize, fold=fold):
+                        kwargs = dict(
+                            hidden_states=hidden,
+                            gating_output=logits,
+                            topk=2,
+                            renormalize=renormalize,
+                            routed_scaling_factor=2.5,
+                            apply_routed_scaling_factor_on_output=fold,
+                        )
+                        if name == "grouped_topk_gpu":
+                            kwargs.update(num_expert_group=2, topk_group=1)
+                            scores = logits.softmax(-1)
+                        else:
+                            kwargs["correction_bias"] = torch.zeros(8)
+                            scores = logits.sigmoid()
+                        weights, ids = router(**kwargs)
+                        expected = scores.gather(1, ids.long())
+                        if renormalize:
+                            expected = expected / expected.sum(-1, keepdim=True)
+                        if fold:
+                            expected *= 2.5
+                        torch.testing.assert_close(weights, expected)
+                        if name != "kimi_k2_biased_topk_impl":
+                            kwargs.update(topk=3, num_fused_shared_experts=1)
+                            shared_weights, shared_ids = router(**kwargs)
+                            torch.testing.assert_close(shared_weights[:, :2], expected)
+                            self.assertEqual(int(shared_ids[0, -1]), logits.shape[-1])
+                            torch.testing.assert_close(
+                                shared_weights[:, -1],
+                                torch.tensor([1.0 if fold else 1.0 / 2.5]),
+                            )
+
     def test_fp8_fallback_uses_local_ids_and_materialized_routes(self):
         """FP8 experts under an FP4 runner request must not receive global IDs."""
         for requested in (
@@ -603,6 +750,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 score_function="softmax",
                 router_dtype="fp32",
             )
+            if module is bailing_moe:
+                # Grouped softmax still requires materialized routes.
+                config.n_group = 2
+                config.topk_group = 1
             method = object.__new__(ModelOptNvFp4FusedMoEMethod)
             with (
                 self.subTest(model=block_type.__name__),
@@ -623,6 +774,11 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 ),
                 patch.object(llada2, "_is_npu", False),
                 patch.object(topk_module, "fused_topk", side_effect=cpu_router),
+                patch.object(
+                    topk_module,
+                    "grouped_topk_gpu",
+                    topk_module.grouped_topk_gpu._torchdynamo_orig_callable,
+                ),
             ):
                 block = block_type(config=config, layer_id=0)
                 self.assertEqual(

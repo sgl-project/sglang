@@ -1333,8 +1333,8 @@ def grouped_topk_gpu(
         )
         if routed_scaling_factor is not None:
             topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
+                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
+            ) / routed_scaling_factor
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
@@ -1346,8 +1346,8 @@ def grouped_topk_gpu(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -1471,8 +1471,8 @@ def kimi_k2_biased_topk_impl(
         # the existing kernels, so no extra cast launch is needed
         topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
@@ -1523,8 +1523,8 @@ def biased_topk_impl(
         )
         if routed_scaling_factor is not None:
             topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
+                topk_weights[:, :-1].sum(dim=-1) if renormalize else 1.0
+            ) / routed_scaling_factor
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in
@@ -1536,8 +1536,8 @@ def biased_topk_impl(
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True, dtype=torch.float32)
         )
         topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-        if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+    if apply_routed_scaling_factor_on_output:
+        topk_weights *= routed_scaling_factor
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
