@@ -178,10 +178,12 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         )
 
     def test_autocast_and_dtype_alignment(self):
-        self.assertTrue(autocast_enabled(torch.float16, disable_autocast=False))
-        self.assertTrue(autocast_enabled(torch.bfloat16, disable_autocast=False))
-        self.assertFalse(autocast_enabled(torch.float32, disable_autocast=False))
-        self.assertFalse(autocast_enabled(torch.float16, disable_autocast=True))
+        amp_platform = _FakePlatform("cpu", is_mps=False, amp_supported=True)
+        with mock.patch.object(precision, "current_platform", amp_platform):
+            self.assertTrue(autocast_enabled(torch.float16, disable_autocast=False))
+            self.assertTrue(autocast_enabled(torch.bfloat16, disable_autocast=False))
+            self.assertFalse(autocast_enabled(torch.float32, disable_autocast=False))
+            self.assertFalse(autocast_enabled(torch.float16, disable_autocast=True))
 
         module = _ParameterDtypeWinsModule()
         self.assertEqual(get_module_dtype(module), torch.float16)
