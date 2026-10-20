@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.layer_boundary import (
     Layout,
@@ -462,6 +463,15 @@ class TboDPAttentionPreparer:
                 and not ll_supports_extend
                 and (resolved_deepep_mode.is_low_latency())
             )
+            if (
+                local_can_run_tbo
+                and local_batch.forward_mode.is_extend()
+                and not local_batch.forward_mode.is_target_verify()
+                and num_tokens < envs.SGLANG_TBO_MIN_EXTEND_TOKENS.get()
+            ):
+                # Halving a short prefill doubles its kernel launches and buys no
+                # overlap; one such rank keeps the whole step unsplit.
+                local_can_run_tbo = False
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True

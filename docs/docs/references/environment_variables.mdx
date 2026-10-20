@@ -1774,6 +1774,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sanitize NaN logits before sampling kernels and emit a throttled warning.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TBO_MIN_EXTEND_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-two-batch-overlap</code>, run a prefill step without TBO when any DP rank's extend batch has fewer tokens. Halving a short prefill doubles its kernel launches without overlapping anything. <code>0</code> splits every eligible batch.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 

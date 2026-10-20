@@ -501,6 +501,8 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Prefill batches with fewer tokens on any DP rank run without TBO.
+    SGLANG_TBO_MIN_EXTEND_TOKENS = EnvInt(0)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
