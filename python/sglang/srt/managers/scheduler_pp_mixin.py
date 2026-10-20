@@ -426,6 +426,8 @@ class SchedulerPPMixin:
                 self._sched_idled = True
                 if len(self.disagg_prefill_transfer_queue) == 0:
                     self.on_idle()
+                else:
+                    self.metrics_reporter.maybe_report_idle_stats()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -639,6 +641,8 @@ class SchedulerPPMixin:
                 self._sched_idled = True
                 if queue_size == 0:
                     self.on_idle()
+                else:
+                    self.metrics_reporter.maybe_report_idle_stats()
 
     def _pp_ingest_requests(self: Scheduler) -> List:
         """Hold a pause, and the inputs after it, until no micro-batch is
