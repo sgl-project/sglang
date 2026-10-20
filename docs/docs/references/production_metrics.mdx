@@ -7,6 +7,19 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+## KV transfer timeout observations
+
+With `--enable-metrics`, `sglang:kv_transfer_timeouts_total{stage}` counts timeout observations in the shared P/D (prefill/decode) KV protocol:
+
+- `stage="bootstrap"`: a prefill sender reaches its bootstrap deadline before decode destination metadata arrives.
+- `stage="transfer"`: a decode receiver reaches the existing deadline while waiting for the KV transfer completion signal.
+
+Each sender or receiver counts its timeout once, even if it is polled again. Both stages start at zero. The counter uses only the two stage labels; it does not include room IDs, request IDs, sessions, or peer addresses.
+
+These are observations by individual sender/receiver objects, not unique failed requests or incidents. Multiple ranks can observe the same request. Prometheus multiprocess export sums those observations within one server's metrics directory. Do not use this counter as a request failure-rate numerator.
+
+The metric covers the existing shared bootstrap and waiting-timeout helpers. It does not add deadlines, detect stalled transfers that never reach those helpers, or count cancellation, heartbeat/session failures, or transport errors. The existing phase failure counters remain available.
+
 ## Language model metrics
 
 `sglang:time_to_first_token_seconds` measures the time from request creation in the API server to the first token. For streaming requests it ends when the first output arrives after detokenization, which may contain no printable text. Non-streaming clients only see the final response, so for them it ends when the scheduler produced the first token.
