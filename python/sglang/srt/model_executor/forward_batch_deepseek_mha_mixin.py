@@ -5,7 +5,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
     create_flashinfer_kv_indices_triton,
 )
