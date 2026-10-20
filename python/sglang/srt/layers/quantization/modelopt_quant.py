@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 from dataclasses import replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -2967,9 +2967,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
         copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
-        if self._use_flashinfer_b12x_w4a16 and not torch.equal(
-            g1_alphas, g1_alphas_up
-        ):
+        if self._use_flashinfer_b12x_w4a16 and not torch.equal(g1_alphas, g1_alphas_up):
             # The b12x kernel takes a single GEMM1 alpha (quant_scales carries
             # only g1_alphas); a checkpoint with distinct gate/up weight
             # scales would silently apply the gate scale to the up half.
