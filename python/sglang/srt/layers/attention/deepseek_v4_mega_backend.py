@@ -17,11 +17,18 @@ def interleave_query_rows(x: torch.Tensor, num_heads: int) -> torch.Tensor:
     return x.view(num_heads, 32, 16, -1).transpose(0, 1).reshape(x.shape)
 
 
-def pack_query(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
+def pack_query(
+    q: torch.Tensor, padded_heads: int, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    # Writes only the real heads' slots: an ``out`` passed in must already hold
+    # zeros in the padded heads' slots.
     tokens, heads, _ = q.shape
-    out = q.new_zeros(tokens, 32, padded_heads, 16)
-    out[:, :, :heads] = q.view(tokens, heads, 32, 16).transpose(1, 2)
-    return out.view(tokens, padded_heads, HEAD_DIM)
+    if out is None:
+        out = q.new_zeros(tokens, padded_heads, HEAD_DIM)
+    out.view(tokens, 32, padded_heads, 16)[:, :, :heads] = q.view(
+        tokens, heads, 32, 16
+    ).transpose(1, 2)
+    return out
 
 
 def interleave_output_columns(w: torch.Tensor) -> torch.Tensor:

@@ -1149,30 +1149,37 @@ class MqaAttentionBase(nn.Module):
         # Other FlashMLA implementations retain their existing padded shape.
         return 64 if self.n_local_heads <= 64 else self.n_heads
 
-    def _zero_padded_q(self, x, kernel_num_heads, attn_backend) -> torch.Tensor:
+    def _zero_padded_q(
+        self,
+        x,
+        kernel_num_heads,
+        attn_backend,
+        buffer_attr: str = "q_pad_buffer",
+        captured_attr: str = "q_pad_captured",
+    ) -> torch.Tensor:
         # One zeroed buffer per metadata, grown to the most rows it has served; each
         # call takes a row slice. A graph that keeps the metadata keeps the buffer,
         # so the buffer must not grow once a graph has captured it.
         meta = getattr(attn_backend, "forward_metadata", None)
-        buf = getattr(meta, "q_pad_buffer", None)
+        buf = getattr(meta, buffer_attr, None)
         if (
             buf is None
             or buf.shape[0] < x.shape[0]
             or buf.shape[1:] != (kernel_num_heads, self.head_dim)
             or buf.dtype != x.dtype
         ):
-            assert not getattr(meta, "q_pad_captured", False), (
+            assert not getattr(meta, captured_attr, False), (
                 "the padded query buffer grew after a CUDA graph captured it"
             )
             buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
             if meta is not None:
                 try:
-                    meta.q_pad_buffer = buf
+                    setattr(meta, buffer_attr, buf)
                 except (AttributeError, TypeError):
                     pass
         if meta is not None and torch.cuda.is_current_stream_capturing():
             try:
-                meta.q_pad_captured = True
+                setattr(meta, captured_attr, True)
             except (AttributeError, TypeError):
                 pass
         return buf[: x.shape[0]]
@@ -1535,7 +1542,16 @@ class MQALayer(MqaAttentionBase):
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
-            q = pack_query(q, kernel_num_heads)
+            # The packed layout puts real heads where q_pad_buffer pads, so mega
+            # keeps its own zeroed buffer; pack_query writes only the real heads.
+            out = self._zero_padded_q(
+                q,
+                kernel_num_heads,
+                attn_backend,
+                buffer_attr="q_mega_pad_buffer",
+                captured_attr="q_mega_pad_captured",
+            )
+            q = pack_query(q, kernel_num_heads, out=out)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
