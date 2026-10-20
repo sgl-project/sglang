@@ -30,6 +30,10 @@ pub struct ProxyConfig {
     pub initial_backoff_ms: u64,
     /// Upper bound on any one backoff.
     pub max_backoff_ms: u64,
+    /// PD: requests per prefill DP rank sent to decode before their first token.
+    pub decode_dispatch_limit: Option<NonZeroU32>,
+    /// PD: return decode's response only once prefill completes.
+    pub stream_after_prefill: bool,
 }
 
 impl ProxyConfig {
@@ -61,6 +65,8 @@ impl Default for ProxyConfig {
             max_attempts: NonZeroU32::MIN,
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
+            decode_dispatch_limit: None,
+            stream_after_prefill: false,
         }
     }
 }
@@ -150,6 +156,19 @@ pub enum DecodePolicyKind {
     PowerOfTwo,
     #[value(name = "legacy_host_affinity")]
     LegacyHostAffinity,
+}
+
+/// How `--dp-aware` picks a DP rank that no routing key or cached prefix decides,
+/// which in PD mode is every decode rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DpRankPolicy {
+    /// The rank with the fewest requests this router has in flight on it.
+    #[default]
+    #[value(name = "least_in_flight")]
+    LeastInFlight,
+    /// The worker's ranks in turn.
+    #[value(name = "round_robin")]
+    RoundRobin,
 }
 
 /// Role served by a static bucket.
@@ -283,6 +302,8 @@ impl std::fmt::Display for StickyFallbackKind {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Native gRPC listener on `host`; `None` disables it.
+    pub grpc_port: Option<u16>,
     /// Pause after SIGTERM with `/readyz` returning 503 before stopping accepts.
     /// Allows endpoint removal or readiness-probe failures to reach load balancers.
     /// Leave time in the pod grace period for in-flight draining; 0 disables the pause.
@@ -318,6 +339,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            grpc_port: None,
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
@@ -372,13 +394,16 @@ pub struct ModelConfig {
     pub decode_policy: DecodePolicyKind,
     /// Send a DP rank as `X-Data-Parallel-Rank`; see [`crate::policies::dp_rank`].
     pub dp_aware: bool,
+    /// Rank choice under `dp_aware` when no routing key or cached prefix decides it.
+    pub dp_rank_policy: DpRankPolicy,
     /// Optional static bucket configuration. `None` uses the global domain.
     pub bucket_config: Option<BucketConfig>,
     /// Reorg `--bucket-config`; `None` builds the default plain and P/D buckets.
     pub reorg_buckets: Option<crate::policies_reorg::factory::BucketsConfig>,
-    /// Reorg admission for groups that leave a limit unset: `--max-in-flight`
+    /// Reorg admission for groups that leave a limit unset: `--max-inflight-requests`
     /// and `--max-kv-usage`.
     pub reorg_admission: crate::policies_reorg::admission::AdmissionLimits,
+    /// Per-worker circuit breaker; `None` under `--disable-circuit-breaker`.
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     /// Cache-Aware prefix configuration.
     pub cache_aware: Option<CacheAwareConfig>,
@@ -712,8 +737,12 @@ pub struct CircuitBreakerConfig {
     pub cool_down_secs: u64,
 }
 
-/// Default circuit-breaker cool-down, applied when `--cb-threshold` is
-/// set without an explicit `--cb-cool-down-secs`.
+/// Default circuit-breaker threshold, without `--cb-threshold`.
+pub fn default_cb_threshold() -> NonZeroU32 {
+    NonZeroU32::new(3).expect("3 is non-zero")
+}
+
+/// Default circuit-breaker cool-down, without `--cb-cool-down-secs`.
 pub fn default_cb_cool_down() -> u64 {
     30
 }

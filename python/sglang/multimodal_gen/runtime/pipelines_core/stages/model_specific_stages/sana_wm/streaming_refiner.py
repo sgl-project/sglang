@@ -19,7 +19,6 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_refiner_transformer import (
     pack_latents,
     unpack_latents,
@@ -445,32 +444,6 @@ class RefinerChunkRunner:
     def refine_block(
         self, *, block_idx, clean_block, block_start, block_end, sink_seed_frames=None
     ):
-        # parity harness (env-gated, no-op in prod): per-block input/config/output
-        # checksums; both the batch stage and the realtime stage run through here.
-        _probe_dir = parity_probe.probe_dir(
-            parity_probe.ENV_RT_DUMP, parity_probe.ENV_FORK_DUMP
-        )
-        _probe = None
-        if _probe_dir:
-            _ck = parity_probe.checksum
-            _probe = {
-                "block_idx": int(block_idx),
-                "block_start": int(block_start),
-                "block_end": int(block_end),
-                "clean_block": _ck(clean_block),
-                "sink_seed_frames": _ck(sink_seed_frames),
-                "prompt_embeds": _ck(self.prompt_embeds),
-                "prompt_attention_mask": _ck(self.prompt_attention_mask),
-                "fps": self.fps,
-                "sigmas": [float(s) for s in self.sigmas],
-                "source_sink_frames": self.source_sink_frames,
-                "block_size": self.block_size,
-                "kv_max_frames": self.kv_max_frames,
-                "history_frames": self.history_frames,
-                "generator_state": float(
-                    self.generator.get_state().double().sum().item()
-                ),
-            }
         del block_idx
         refiner = self.refiner
         if block_start < self.source_sink_frames:
@@ -580,11 +553,6 @@ class RefinerChunkRunner:
                         old[1][:, -keep_tokens:],
                     )
             self.history_frames = self.max_history_frames
-        if _probe is not None:
-            _probe["refined"] = parity_probe.checksum(x_t)
-            parity_probe.dump_obj(
-                _probe_dir, f"refiner_probe_{_probe['block_idx']:03d}", _probe
-            )
         return x_t
 
 
@@ -634,8 +602,6 @@ class SanaWMStreamingRefinerStage(SanaWMLTX2RefinerStage):
             )
             return batch
         n_blocks = math.ceil(n_active / self.block_size)
-        total_iterations = n_blocks * (len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1)
-        batch.record_stage_iterations(total_iterations, total_iterations)
         self.log_info(
             "SANA-WM streaming refiner: latent=%s, sink=%d, block=%d, blocks=%d, kv_max=%d, seed=%d",
             tuple(latents.shape),

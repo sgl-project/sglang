@@ -143,5 +143,57 @@ def test_cutlass_passes_the_runner_config_placement(monkeypatch) -> None:
     assert placement == (2, 1, 4, 3)
 
 
+def test_sm120_nvfp4_dispatch_uses_live_layer_placement(monkeypatch) -> None:
+    from sglang.kernels.ops.gemm import sm120_nvfp4_moe
+
+    calls = []
+    monkeypatch.setattr(flashinfer_cutlass, "is_sm120", lambda: True)
+    monkeypatch.setattr(flashinfer_cutlass, "_sm120_mtp_mma_supported", lambda: True)
+    monkeypatch.setattr(
+        flashinfer_cutlass, "_flashinfer_autotune_active", lambda: False
+    )
+
+    def native(*args, **kwargs):
+        calls.append("native")
+        return kwargs["out"]
+
+    def fallback(**kwargs):
+        calls.append((kwargs["tp_size"], kwargs["ep_size"]))
+        return [kwargs["output"]]
+
+    monkeypatch.setattr(sm120_nvfp4_moe, "nvfp4_moe_mtp_mma", native)
+    monkeypatch.setattr(
+        flashinfer_cutlass, "_flashinfer_cutlass_fused_moe", lambda: (fallback, None)
+    )
+    monkeypatch.setattr(flashinfer_cutlass, "_activation_type", lambda config: None)
+    layer = SimpleNamespace(moe_tp_size=1, moe_tp_rank=0, moe_ep_size=1, moe_ep_rank=0)
+    config = MoeRunnerConfig(activation="relu2", is_gated=False, layer=layer)
+    quant = FlashInferCutlassMoeQuantInfo(
+        "fp4",
+        torch.empty((512, 2688, 512), device="meta", dtype=torch.uint8),
+        torch.empty((512, 1024, 1344), device="meta", dtype=torch.uint8),
+        quant_scales=[torch.ones(1)] * 6,
+        output_dtype=torch.bfloat16,
+    )
+    x = torch.zeros((1, 1024), dtype=torch.bfloat16)
+    dispatch = SimpleNamespace(
+        hidden_states=x,
+        hidden_states_scale=None,
+        topk_output=SimpleNamespace(
+            topk_ids=torch.zeros((1, 22), dtype=torch.int32),
+            topk_weights=torch.ones((1, 22)),
+        ),
+    )
+    for tp, ep in [(1, 1), (2, 1), (1, 2)]:
+        layer.moe_tp_size, layer.moe_ep_size = tp, ep
+        flashinfer_cutlass._run_flashinfer_cutlass(
+            dispatch_output=dispatch,
+            quant_info=quant,
+            runner_config=config,
+            output=torch.empty_like(x),
+        )
+    assert calls == ["native", (2, 1), (1, 2)]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

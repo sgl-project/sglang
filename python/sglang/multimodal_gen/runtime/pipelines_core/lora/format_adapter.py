@@ -189,8 +189,8 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
         for k in keys
     )
     has_single_blocks = any(
-        k.startswith("single_blocks.")
-        or k.startswith("base_model.model.single_blocks.")
+        k.startswith(("single_blocks.", "base_model.model.single_blocks."))
+        and (".linear1." in k or ".linear2." in k)
         for k in keys
     )
     has_lora_ab = _has_substring_key(keys, ".lora_A") or _has_substring_key(

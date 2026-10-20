@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from functools import total_ordering
+from functools import lru_cache, total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -39,6 +39,7 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -62,6 +63,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
+    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
@@ -628,12 +630,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
+    watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
     # CUDA-graph runners may capture only the transformer body and execute the
     # logits processor eagerly after replay.
     defer_logits_to_eager: bool = False
+    # Full prefill graph capture uses a fixed request axis whose inactive slots
+    # must not participate in data-dependent row selection.
+    full_prefill_cuda_graph_capture: bool = False
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -646,6 +653,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
+    # dLLM committed positions are immutable, including literal mask-token IDs.
+    # None when no request in the batch has a literal mask ID.
+    dllm_prompt_mask: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -728,6 +738,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
+    # LLaDA-Image conditioning text lengths, declared so batch rebuilds
+    # carry them to the llada2_cfg_flashinfer backend
+    llada_image_conditioning_text_lens_cpu: Optional[List[int]] = None
+
     # For DP attention (padding / local info)
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for extend, local start pos and num tokens is different in logits processor
@@ -739,6 +753,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # global_num_tokens_cpu as published for the DP gather: attn-TP aligned and,
     # under MAX_LEN, padded to the max. None when the raw list already is.
     global_num_tokens_padded_cpu: Optional[List[int]] = None
+    # Each DP rank's rows from a late-layer row switch on; None on steps that skip
+    # the exchange.
+    global_late_layer_num_tokens_cpu: Optional[List[int]] = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -762,6 +779,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
     encoder_swa_replay: bool = False
+    # Encoder replay folded into the extend: per-row window floor [num_tokens]
+    # int64 (the request's replay start, 0 for other requests).
+    encoder_swa_row_floor: Optional[torch.Tensor] = None
+    encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
@@ -988,6 +1009,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
+        watermark_state = (
+            model_runner.watermark_state
+            if isinstance(model_runner, ModelRunner)
+            else None
+        )
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1049,6 +1078,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            watermark_prompt_tail_ids=(
+                watermark_state.prompt_tails(batch)
+                if watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+                else None
+            ),
+            watermark_context_hash_history=(
+                watermark_state.retracted_context_hashes(batch)
+                if watermark_state is not None
+                and batch.sampling_info.has_watermark_candidates
+                else None
+            ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -1126,14 +1167,35 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.dllm_config is not None and ret.forward_mode.is_dllm_extend():
             block_size = batch.dllm_config.block_size
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
-            ret.positions = torch.tensor(
-                [
-                    i
-                    for block_offset in (req.dllm_block_offset for req in batch.reqs)
-                    for i in range(block_offset, block_offset + block_size)
-                ],
-                dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            positions = [
+                i
+                for block_offset in (req.dllm_block_offset for req in batch.reqs)
+                for i in range(block_offset, block_offset + block_size)
+            ]
+            if any(req.dllm_has_literal_mask for req in batch.reqs):
+                # Committed outputs are immutable too when a retracted request
+                # rebuilds its KV. Transfer their lengths with the block
+                # positions to avoid an extra, blocking H2D copy.
+                committed_lens = [
+                    len(req.origin_input_ids) + len(req.output_ids)
+                    for req in batch.reqs
+                ]
+                position_info = torch.tensor(
+                    positions + committed_lens,
+                    dtype=positions_dtype,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
+                ret.positions = position_info[: len(positions)]
+                prompt_lens = position_info[len(positions) :]
+                ret.dllm_prompt_mask = (
+                    ret.positions.view(-1, block_size) < prompt_lens[:, None]
+                )
+            else:
+                # Without literal mask IDs among committed tokens, every mask
+                # ID in the block is still to be denoised.
+                ret.positions = torch.tensor(positions, dtype=positions_dtype).to(
+                    device, non_blocking=True
+                )
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -1630,6 +1692,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dim=0,
             )
 
+    @property
+    def logical_forward_mode(self) -> ForwardMode:
+        """The mode these rows actually carry.
+
+        ``prepare_mlp_sync_batch`` may relabel a decode batch as a 1-token
+        extend so every DP rank presents one shape to the collectives.
+        Consumers that need the decode semantics behind the label -- mamba
+        state updates, linear-attention gates -- read through it here.
+        """
+        original = self._original_forward_mode
+        if (
+            original is not None
+            and original.is_decode()
+            and self.forward_mode.is_extend()
+        ):
+            return original
+        return self.forward_mode
+
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
@@ -1749,7 +1829,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # empty (idle) rank. Ranks reach this once MAX_LEN is forced for
                 # the prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
+                # branch handles decode rows padded to a 1-token extend: full
+                # attention runs them as real 1-token extends, while the mamba
+                # layers read back through the relabel via logical_forward_mode.
                 if self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     self.extend_num_tokens = num_tokens
@@ -1823,6 +1905,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu.copy_(
             global_num_tokens_pinned, non_blocking=self.use_pin_memory
         )
+        # Exchanged here, not in the model forward: every rank reaches this point
+        # after reshaping its batch and before it picks a prefill graph or eager.
+        if (
+            self.is_extend_in_batch
+            and sync_group_size > 1
+            and not model_runner.is_draft_worker
+        ):
+            local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
+            if local_late_rows is not None:
+                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                all_gather_single(
+                    late_rows,
+                    torch.tensor([local_late_rows], dtype=torch.int64),
+                    group=get_parallel().tp_group.cpu_group,
+                )
+                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -2111,10 +2209,27 @@ def enable_num_token_non_padded():
 
     # Elastic joiners also need graph padding masked after joining WORLD; a
     # customized A2A backend consumes the count whatever the EP size.
-    return (
+    if (
         get_parallel().moe_ep_size > 1
         or world_dp_gather_enabled()
         or get_moe_a2a_backend().is_customized()
+    ):
+        return True
+    # DP attention + TP MoE gathers each rank's whole padded chunk into the MoE,
+    # so the model needs the real count to zero the pad rows (see
+    # deepseek_common.moe_transport).
+    return _dp_tp_moe_masks_pad_rows()
+
+
+@lru_cache(maxsize=1)
+def _dp_tp_moe_masks_pad_rows() -> bool:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    return (
+        _is_hip
+        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
+        and get_parallel().attn_dp_size > 1
+        and get_moe_a2a_backend().is_none()
     )
 
 
