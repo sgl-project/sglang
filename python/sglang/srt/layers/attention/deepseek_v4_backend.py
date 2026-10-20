@@ -93,6 +93,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
 )
+from sglang.srt.layers.attention.graph_variants import DSV41_EARLY_VERIFY_VARIANTS
 from sglang.srt.layers.attention.verify_mask import (
     VerifyMask,
     maybe_create_verify_mask,
@@ -1176,6 +1177,18 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
+def _replan_topk_in_graph(metadata) -> None:
+    from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+
+    for indexer in (
+        metadata.indexer_metadata,
+        metadata.c1_indexer_metadata,
+        metadata.c2_indexer_metadata,
+    ):
+        if indexer is not None and indexer.use_topk_v2:
+            plan_topk_v2(indexer.compressed_seq_lens, out=indexer.topk_metadata)
+
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
@@ -1349,6 +1362,12 @@ class DeepseekV4AttnBackend(
         # block's extend lengths come from device constants, one per batch size.
         self.draft_metadata_glued = False
         self._draft_extend_lens: Dict[Tuple[int, ...], torch.Tensor] = {}
+        # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: set only by the target verify runner
+        # that stages this metadata (enable_early_verify_metadata); the replay prep then
+        # builds the full metadata and the verify graph records none.
+        self.builds_verify_metadata_early = False
+        # Ids of the captured verify metadata built that way; the bucket keeps them alive.
+        self._early_verify_metadata_ids: set = set()
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -2238,6 +2257,7 @@ class DeepseekV4AttnBackend(
         self,
         raw_metadata: DSV4RawVerifyMetadata,
         online_c128_state_slot_offset: int = 0,
+        graph_backed: bool = False,
     ) -> DSV4Metadata:
         req_pool_indices = raw_metadata.req_pool_indices
         seq_lens = raw_metadata.seq_lens
@@ -2283,7 +2303,9 @@ class DeepseekV4AttnBackend(
             num_groups=bs,
         )
         indexer_metadata = (
-            self.init_forward_metadata_indexer(core_attn_metadata)
+            self.init_forward_metadata_indexer(
+                core_attn_metadata, use_prefill_cuda_graph=graph_backed
+            )
             if self.has_c4
             else None
         )
@@ -2314,6 +2336,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=1,
                     rows_per_request=rows_per_request,
+                    use_prefill_cuda_graph=graph_backed,
                 )
                 if 1 in low
                 else None
@@ -2323,6 +2346,7 @@ class DeepseekV4AttnBackend(
                     core_attn_metadata,
                     compress_ratio=2,
                     rows_per_request=rows_per_request,
+                    use_prefill_cuda_graph=graph_backed,
                 )
                 if 2 in low
                 else None
@@ -2466,6 +2490,12 @@ class DeepseekV4AttnBackend(
             skip_low_ratio_indexer,
         )
 
+        # Built in full by the replay prep (_install_early_verify_metadata), except the
+        # indexers' top-k plans, which the verify graph records as the in-graph upgrade
+        # does: the prep's copy of them diverged at long context.
+        if id(self.forward_metadata) in self._early_verify_metadata_ids:
+            _replan_topk_in_graph(self.forward_metadata)
+            return
         # Upgrade Raw->Full so compress + core_attn + indexer materialization is
         # recorded inside the cuda graph.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
@@ -2567,6 +2597,71 @@ class DeepseekV4AttnBackend(
                     )
                 if self.trtllm_attn:
                     metadata.core_attn_metadata.init_trtllm_sparse_buffers()
+
+    def enable_early_verify_metadata(self) -> None:
+        """Called by the target verify runner whose own predicate stages the metadata
+        early, so capture and replay agree on which metadata object the graph reads."""
+        self.builds_verify_metadata_early = True
+        logger.info("Target verify metadata built outside the verify graph.")
+
+    def _uses_early_verify_metadata(self, *, ragged_layout) -> bool:
+        """Whether this target verify prep builds the full metadata itself: only for
+        the variant the runner prepares (capture or replay) under
+        ``DSV41_EARLY_VERIFY_VARIANTS``; every other variant keeps its in-graph upgrade."""
+        if not self.builds_verify_metadata_early or ragged_layout is not None:
+            return False
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_capture_attention_variant,
+            skip_low_ratio_indexer,
+        )
+
+        early = get_capture_attention_variant() in DSV41_EARLY_VERIFY_VARIANTS
+        # Only the in-graph upgrade fills the all-position indices of such a variant.
+        assert not (early and any(map(skip_low_ratio_indexer, self.low_ratios))), (
+            "early verify metadata does not fill candidate_all indices"
+        )
+        return early
+
+    def _install_early_verify_metadata(
+        self, *, graph_key, raw_metadata: DSV4RawVerifyMetadata, out_cache_loc
+    ) -> None:
+        """What ``init_forward_metadata_in_graph`` records for target verify, built
+        here and copied in place into the one metadata object the early variant's
+        verify graph of ``graph_key`` was captured with (its own bucket entry, beside
+        the Raw one the other variants upgrade in-graph)."""
+        graph_key = (graph_key, "early")
+        # Graph-backed, like the in-graph build it replaces: one indexer call per layer,
+        # no free-memory row chunking (a chunked schedule would be rebound, not copied).
+        metadata = self.make_forward_metadata_from_raw_verify(
+            raw_metadata=raw_metadata,
+            online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
+            graph_backed=True,
+        )
+        # The full build leaves the SWA write locations to the in-graph op it replaces.
+        pool = self.token_to_kv_pool
+        swa_out_cache_loc = (
+            pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int32)
+            if pool.request_window is None and pool.swa_req_ring_size is None
+            else None
+        )
+        self.tail_forward_metadata = None
+        bucket_metadata = self.cuda_graph_metadata_of_bucket_and_bs[
+            _GraphBucket.TARGET_VERIFY
+        ]
+        captured = bucket_metadata.get(graph_key)
+        if captured is None:
+            metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
+            bucket_metadata[graph_key] = metadata
+            self._early_verify_metadata_ids.add(id(metadata))
+            self.forward_metadata = metadata
+            return
+        # copy_ assigns swa_out_cache_loc; the verify graphs read the captured tensor.
+        captured_swa_out_cache_loc = captured.core_attn_metadata.swa_out_cache_loc
+        captured.copy_(metadata)
+        if captured_swa_out_cache_loc is not None:
+            captured_swa_out_cache_loc.copy_(swa_out_cache_loc)
+        captured.core_attn_metadata.swa_out_cache_loc = captured_swa_out_cache_loc
+        self.forward_metadata = captured
 
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
@@ -2730,6 +2825,15 @@ class DeepseekV4AttnBackend(
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
             )
+            if self._uses_early_verify_metadata(ragged_layout=ragged_layout):
+                self._install_early_verify_metadata(
+                    graph_key=graph_key,
+                    raw_metadata=temp_metadata,
+                    out_cache_loc=out_cache_loc_padded,
+                )
+                if in_capture:
+                    self._current_capture_raw = None
+                return
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             self.online_c128_mtp.prepare_forward(
                 actual_forward_mode,

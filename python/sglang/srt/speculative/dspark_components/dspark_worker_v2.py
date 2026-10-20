@@ -354,6 +354,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             == "deepseek_v41"
         )
+        # SGLANG_OPT_DSV41_TARGET_METADATA_EARLY: the static verify's inputs are final
+        # after the head; the target runner stages their metadata beside the draft.
+        self._verify_inputs_ready: Optional[torch.cuda.Event] = (
+            torch.cuda.Event()
+            if envs.SGLANG_OPT_DSV41_TARGET_METADATA_EARLY.get()
+            and self._verify_planner.mode_value == "static"
+            and not get_parallel().attn_dp_enabled
+            and torch.device(self.device).type == "cuda"
+            else None
+        )
         static_epilogue_supported = (
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
@@ -878,6 +888,27 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _stage_target_verify_metadata(
+        self, *, batch: ScheduleBatch, verify_window, seq_lens_cpu
+    ) -> None:
+        """Right after the draft graph's launch; the sources are the tensors the verify
+        batch uses, and the side stream waits only for the head (_verify_inputs_ready)."""
+        target_runner = self.target_worker.model_runner.decode_cuda_graph_runner
+        if target_runner is None:
+            return
+        target_runner.stage_verify_metadata_early(
+            seq_lens=batch.seq_lens,
+            req_pool_indices=batch.req_pool_indices,
+            out_cache_loc=verify_window.verify_cache_loc,
+            positions=verify_window.positions_2d.reshape(-1),
+            max_seq_len=(
+                int(seq_lens_cpu.max())
+                if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0
+                else None
+            ),
+            after=self._verify_inputs_ready,
+        )
+
     def _forward_decode(
         self,
         batch: ScheduleBatch,
@@ -939,6 +970,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._prepare_inputs_once
             else None
         )
+        window_seq_lens_cpu = (
+            batch.seq_lens_cpu
+            if batch.seq_lens_cpu is not None
+            else draft_input.nxt_kv_lens_cpu
+        )
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -946,14 +982,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             block_pos_offsets=self._block_pos_offsets,
             model_runner=self.model_runner,
-            seq_lens_cpu=(
-                batch.seq_lens_cpu
-                if batch.seq_lens_cpu is not None
-                else draft_input.nxt_kv_lens_cpu
-            ),
+            seq_lens_cpu=window_seq_lens_cpu,
             bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
             anchor_ids=anchor_ids,
         )
+        if self._verify_inputs_ready is not None:
+            # The verify's inputs are final here; the early metadata waits for this.
+            self._verify_inputs_ready.record()
 
         sampling_info = batch.sampling_info
         # Simulated acceptance overrides correct_len, so only the bonus token needs the
@@ -981,6 +1016,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 target_model=target_model,
                 sampling_info=sampling_info,
                 anchor_prepared=anchor_ids is not None,
+            )
+        if self._verify_inputs_ready is not None:
+            self._stage_target_verify_metadata(
+                batch=batch,
+                verify_window=verify_window,
+                seq_lens_cpu=window_seq_lens_cpu,
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block

@@ -72,6 +72,22 @@ class MetadataGlueGraph:
             backends.extend(attn_backend.attn_backend_list)
         return backends
 
+    def is_captured(self, key) -> bool:
+        st = self._states.get(key)
+        return not self.disabled and st is not None and st["graph"] is not None
+
+    def reinstall(self, key) -> None:
+        """Point each backend at the metadata ``key``'s graph writes."""
+        for backend, metadata in self._states[key]["meta"]:
+            backend.forward_metadata = metadata
+
+    def replay(self, key) -> None:
+        """Replay ``key``'s captured prep on the current stream (a staging side stream
+        included); the caller reinstalls its metadata before the forward."""
+        self.reinstall(key)
+        self._states[key]["graph"].replay()
+        self.replays += 1
+
     def run(self, attn_backend, fb_view, key) -> None:
         """Run ``init_forward_metadata_out_graph`` for this replay, through the
         captured glue graph once it is ready."""
