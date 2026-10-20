@@ -68,6 +68,7 @@ class _FakeLinker(UnifiedCacheLinker):
         self.completed_offloads = []
         self.reset_count = 0
         self.closed = False
+        self.pools = {}
 
     def lookup(self, rid, transfers):
         return list(self.restorable)
@@ -201,6 +202,7 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
 
     def __init__(self, stored_keys=None):
         self.layer_done_counter = object()
+        self.pools = dict.fromkeys(PoolName)
         self.stored_keys = defaultdict(set) if stored_keys is None else stored_keys
         self.lookup_calls = []
         self.offload_calls = []
@@ -1334,6 +1336,23 @@ def test_cache_without_swa_needs_no_reprefill():
     assert cache.swa_reprefill_tail_tokens() == 0
 
 
+@pytest.mark.parametrize("swa_stored", [True, False])
+def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
+    """A store without SWA pages must tombstone restored tails, not mark them hit."""
+    linker = _FakeLinker()
+    if swa_stored:
+        linker.pools[PoolName.SWA] = object()
+    swa = object()
+    cache = _cache_for_wrapper(
+        components={ComponentType.SWA: swa},
+        _components_tuple=(swa,),
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert wrapper._skip_swa is (not swa_stored)
+    assert (swa in wrapper._components) is swa_stored
+
+
 @pytest.fixture
 def full_linker_component():
     def build_transfer(phase, node, keys):
@@ -1357,9 +1376,7 @@ def full_linker_component():
     )
 
 
-def test_linker_filters_request_relative_swa_from_lookup(
-    full_linker_component,
-):
+def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
     swa.build_external_linker_transfer = MagicMock(
@@ -1369,7 +1386,6 @@ def test_linker_filters_request_relative_swa_from_lookup(
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=_swa_allocator(True),
         tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
         page_size=2,
         _all_reduce_attn_groups=lambda value, op: None,
@@ -1398,12 +1414,12 @@ def test_linker_filters_request_relative_swa_from_lookup(
     swa.build_external_linker_transfer.assert_not_called()
 
 
-@pytest.mark.parametrize("swa_req_ring", [False, True], ids=["paged", "request-ring"])
+@pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
 )
 def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
-    swa_req_ring, completion
+    swa_stored, completion
 ):
     node = SimpleNamespace(
         id=7, external_cache_stored=False, write_through_pending_id=None
@@ -1418,7 +1434,6 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
     cache = _cache_for_wrapper(
         components={ComponentType.SWA: swa},
         _components_tuple=(swa,),
-        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         tree_core=core,
         inc_lock_ref=MagicMock(
             return_value=SimpleNamespace(to_dec_params=lambda: lock_params)
@@ -1426,10 +1441,12 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
         dec_lock_ref=MagicMock(),
     )
     backend = _FakeLinker()
+    if swa_stored:
+        backend.pools[PoolName.SWA] = object()
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
 
     wrapper.offload_nodes([node.id, node.id])
-    expected = transfers[:1] if swa_req_ring else transfers
+    expected = transfers if swa_stored else transfers[:1]
     assert backend.queued_offloads == [expected]
     assert core.offload_transfers == transfers
     assert node.write_through_pending_id == node.id
@@ -1457,25 +1474,24 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
 
 
 @pytest.mark.parametrize(
-    "swa_req_ring,previous_boundary,expected_boundary",
+    "swa_stored,previous_boundary,expected_boundary",
     [
-        pytest.param(True, None, 4, id="unified-tombstones"),
-        pytest.param(True, 8, 8, id="preserve-existing-boundary"),
-        pytest.param(False, None, 2, id="paged-prepare-boundary"),
-        pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
+        pytest.param(False, None, 4, id="unstored-tombstones"),
+        pytest.param(False, 8, 8, id="preserve-existing-boundary"),
+        pytest.param(True, None, 2, id="stored-prepare-boundary"),
     ],
 )
 @pytest.mark.parametrize("load_refused", [False, True], ids=["queued", "refused"])
 def test_linker_load_preserves_swa_boundaries(
     full_linker_component,
-    swa_req_ring,
+    swa_stored,
     previous_boundary,
     expected_boundary,
     load_refused,
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
-    participates = not swa_req_ring
+    participates = swa_stored
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
@@ -1495,11 +1511,12 @@ def test_linker_load_preserves_swa_boundaries(
         _components_tuple=(full, swa),
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         insert=MagicMock(side_effect=AssertionError("the tail must stay private")),
     )
     backend = _FakeLinker()
     backend.load = MagicMock(return_value=not load_refused)
+    if swa_stored:
+        backend.pools[PoolName.SWA] = object()
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
         tail_hashes=["a", "b"],
