@@ -135,8 +135,19 @@ def _configure_target_hidden_projection(
     )
 
 
+def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> bool:
+    """SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD, only under simulated acceptance: with
+    real acceptance there is no draw, so the step order stays as it was."""
+    return (
+        envs.SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD.get()
+        and simulated_correct_len is not None
+    )
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
+    _sim_draw_ahead = False
+    num_sim_draws_ahead = 0
     _prepare_inputs_once = False
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
@@ -333,6 +344,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._simulate_acc_len > 0
             else None
         )
+        # The simulated acceptance draw (and sim bonus seed) before the draft launch,
+        # where the host waits on the previous verify anyway; off with real acceptance.
+        self._sim_draw_ahead = sim_draw_ahead_enabled(self._simulated_correct_len)
+        self.num_sim_draws_ahead = 0
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         self._proposer = DraftBlockProposer(
             draft_model=self.draft_model,
@@ -1006,6 +1021,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             simulate_bonus_sampling_info = sampling_info
             sampling_info = None
+        if self._sim_draw_ahead:
+            self._begin_simulated_step_ahead(
+                bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
+            )
         with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
             proposal = self._proposer.propose(
                 batch=batch,
@@ -1082,16 +1101,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             and not batch.has_grammar
         )
-        self._verify_executor.begin_simulated_step()
-        if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
-            self._verify_executor.verify_epilogue.begin_sim_bonus(
-                bs,
-                (
-                    None
-                    if simulate_bonus_sampling_info is None
-                    else simulate_bonus_sampling_info.temperatures[:bs]
-                ),
-            )
+        if not self._sim_draw_ahead:
+            self._verify_executor.begin_simulated_step()
+            if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
+                self._verify_executor.verify_epilogue.begin_sim_bonus(
+                    bs,
+                    (
+                        None
+                        if simulate_bonus_sampling_info is None
+                        else simulate_bonus_sampling_info.temperatures[:bs]
+                    ),
+                )
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -1275,6 +1295,28 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self.num_relayed_in_graph_steps == 1:
             logger.info("Seq lens and bonus relayed by the verify graph (first step).")
         return relay
+
+    def _begin_simulated_step_ahead(self, *, bs: int, simulate_bonus_sampling_info):
+        """Before the draft launch: neither write depends on the draft. The sim bonus
+        buffers are read only by a folded verify accept, so a step that turns out
+        not fold-eligible ignores them."""
+        executor = self._verify_executor
+        executor.begin_simulated_step()
+        epilogue = executor.verify_epilogue
+        if epilogue is not None and epilogue.simulate_fold:
+            epilogue.begin_sim_bonus(
+                bs,
+                (
+                    None
+                    if simulate_bonus_sampling_info is None
+                    else simulate_bonus_sampling_info.temperatures[:bs]
+                ),
+            )
+        self.num_sim_draws_ahead += 1
+        if self.num_sim_draws_ahead == 1:
+            logger.info(
+                "Simulated acceptance drawn ahead of the draft launch (first step)."
+            )
 
     def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
         in_graph = (
