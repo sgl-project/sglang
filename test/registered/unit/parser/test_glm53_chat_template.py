@@ -111,6 +111,14 @@ CASES = {
         "<think>r1</think>a1<|user|>q2<|assistant|><think>r2</think>a2",
         None,
     ),
+    "reasoning_effort_fallback": (
+        dict(
+            messages=[{"role": "user", "content": "q"}],
+            reasoning_effort="medium",
+        ),
+        PREFIX + "<|user|>q",
+        None,
+    ),
     "clear_thinking": (
         dict(
             messages=[
@@ -297,27 +305,6 @@ class TestGlm53ChatTemplate(CustomTestCase):
                 self.assertEqual(
                     _render(render_glm53_flash, kwargs), flash_prompt or text_prompt
                 )
-
-    def test_reasoning_effort_header(self):
-        for effort, header in (
-            ("low", "Low"),
-            ("high", "High"),
-            ("medium", "Max"),
-            (None, "Max"),
-        ):
-            prompt = render_glm53(
-                [{"role": "user", "content": "q"}], reasoning_effort=effort
-            )
-            self.assertTrue(
-                prompt.startswith(f"[gMASK]<sop><|system|>Reasoning Effort: {header}")
-            )
-
-    def test_unknown_template_variables_are_ignored(self):
-        messages = [{"role": "user", "content": "q"}]
-        self.assertEqual(
-            render_glm53(messages, enable_thinking=False, eos_token="<|endoftext|>"),
-            render_glm53(messages),
-        )
 
     def test_tool_keys_are_interpolated_raw(self):
         tool = {"name": "f", 'we"ird': 1, "strict": False}

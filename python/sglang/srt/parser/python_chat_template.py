@@ -1,17 +1,12 @@
 """Chat templates rendered in Python instead of the checkpoint's Jinja template.
 
-Some model families publish a reference ``chat_template.py`` alongside their
-``chat_template.jinja``. sglang carries such renderers and, when one applies to
-the served checkpoint, uses it in place of the Jinja template:
-
-* The serving tokenizer's ``apply_chat_template`` renders through Python, so
-  every caller keeps the transformers calling convention and the request
-  pipeline in front of it (content-part normalization, tool-result reordering,
-  ``continue_final_message``, the render cache) is unchanged.
-* The template features sglang would otherwise derive from the Jinja source
-  (content format, reasoning mode, tool-result reordering, inline system
-  messages and the parsers ``auto`` resolves to) are declared on the template
-  instead.
+When one applies to the served checkpoint, the serving tokenizer's
+``apply_chat_template`` renders through Python, so every caller keeps the
+transformers calling convention and the request pipeline in front of it is
+unchanged; the features sglang would otherwise derive from the Jinja source
+(content format, reasoning mode, tool-result reordering, inline system
+messages, the parsers ``auto`` resolves to) are declared on the template
+instead.
 """
 
 import inspect
@@ -49,10 +44,7 @@ class PythonChatTemplate:
         return self.reasoning_config is not None and self.reasoning_config.always_on
 
 
-# Shared by both GLM-5.3 templates, matching what template detection derives
-# from their Jinja source: list content parts, always-on reasoning (the
-# generation prompt opens <think> and there is no toggle), tool results matched
-# to tool_calls by id, and in-place mid-conversation system messages.
+# Matching what template detection derives from both models' Jinja source.
 _GLM53_FEATURES: Dict[str, Any] = dict(
     content_format="openai",
     reasoning_config=ReasoningToggleConfig(special_case="always"),

@@ -1,22 +1,14 @@
 # Adapted from the GLM-5.3 / GLM-5.3-Flash reference chat_template.py by Z.ai.
 """Python version of the GLM-5.3 and GLM-5.3-Flash chat templates.
 
-Both checkpoints ship a ``chat_template.jinja`` and the two templates are the
-same apart from one multimodal block, so a single renderer serves both:
-
-* GLM-5.3 is text-only. Image/video/audio content parts render a plain-prose
-  ``<reminder>`` sentence and never emit structural tokens, and the template's
-  ``'<tool_call>' + tc.name`` raises ``TypeError`` for a non-string name.
-* GLM-5.3-Flash adds the multimodal block: image and video parts render
-  ``<|begin_of_X|><|X|><|end_of_X|>`` (audio has no inner token), and its
-  ``'<tool_call>' ~ tc.name`` stringifies the name instead.
-
-The output is byte-identical to the Jinja templates. Where a template fails on
-malformed input, the renderer fails at the same point, raising ``ValueError``
-for Jinja's ``UndefinedError`` and the very ``TypeError`` Jinja would raise, so
-the serving layer answers both with 400 exactly as it did for the template.
-Jinja semantics that are easy to get wrong when reading the template source are
-called out inline; ``_UNDEFINED`` stands for Jinja's ``Undefined``.
+The two templates are the same apart from the multimodal block, so a single
+renderer serves both. The output is byte-identical to the Jinja templates.
+Where a template fails on malformed input, the renderer fails at the same
+point, raising ``ValueError`` for Jinja's ``UndefinedError`` and the very
+``TypeError`` Jinja would raise, so the serving layer answers both with 400
+exactly as it did for the template. Jinja semantics that are easy to get wrong
+when reading the template source are called out inline; ``_UNDEFINED`` stands
+for Jinja's ``Undefined``.
 """
 
 from __future__ import annotations
