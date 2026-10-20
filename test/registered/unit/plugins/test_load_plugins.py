@@ -8,6 +8,10 @@ SGLANG_REQUIRED_PLUGINS checks, and _current_plugin_source context var reset.
 Run:  python -m pytest test/registered/unit/plugins/test_load_plugins.py -v
 """
 
+import sys
+import tempfile
+import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.plugins import (
@@ -299,6 +303,22 @@ def bad_hook_plugin():
     )
 
 
+# Imported by apply_hooks() while it resolves "lazy_hook_mod.kernel"; registering
+# here adds a target after apply_hooks() has listed the targets it will visit.
+_LAZY_HOOK_MODULE = """\
+from sglang.srt.plugins.hook_registry import HookRegistry
+
+
+def kernel():
+    return "k"
+
+
+HookRegistry.register(
+    "sglang.srt.plugins.no_such_function", lambda result: result, required=True
+)
+"""
+
+
 class TestLoadPluginsWithRealHookRegistry(CustomTestCase):
     """Tests for load_plugins() with real `HookRegistry`"""
 
@@ -309,6 +329,14 @@ class TestLoadPluginsWithRealHookRegistry(CustomTestCase):
     def tearDown(self):
         _reset_plugins_loaded()
         HookRegistry.reset()
+
+    def _make_target(self):
+        """Create a throwaway module with a function hooks can wrap."""
+        mod = types.ModuleType("late_hook_target")
+        vars(mod)["fn"] = lambda: "orig"
+        sys.modules[mod.__name__] = mod
+        self.addCleanup(sys.modules.pop, mod.__name__, None)
+        return mod, f"{mod.__name__}.fn"
 
     @patch("sglang.srt.plugins.envs")
     @patch("sglang.srt.plugins.entry_points")
@@ -339,6 +367,127 @@ class TestLoadPluginsWithRealHookRegistry(CustomTestCase):
         ]
 
         load_plugins()
+
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_required_plugin_import_time_hook_fail_to_apply(self, mock_eps, mock_envs):
+        """A hook registered while importing a required plugin is still attributed to it,
+        so a failure to apply it raises instead of being skipped as unowned."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.SGLANG_REQUIRED_PLUGINS.get.return_value = ("critical",)
+
+        def import_module_with_hook():
+            bad_hook_plugin()
+            return lambda: None
+
+        ep = _make_ep("critical")
+        ep.load.side_effect = import_module_with_hook
+        mock_eps.return_value = [ep]
+
+        with self.assertRaisesRegex(RuntimeError, "critical.*no_such_function"):
+            load_plugins()
+
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_late_required_plugins(self, mock_eps, mock_envs):
+        """Raise when a required hook registers too late."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.SGLANG_REQUIRED_PLUGINS.get.return_value = ("critical",)
+
+        _, target = self._make_target()
+
+        def early_apply_plugin():
+            HookRegistry.register(target, lambda result: result)
+            HookRegistry.apply_hooks()
+
+        def critical_plugin():
+            HookRegistry.register(target, lambda result: result)
+
+        mock_eps.return_value = [
+            _make_ep("trivial", load_fn=early_apply_plugin),
+            _make_ep("critical", load_fn=critical_plugin),
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "critical -> late_hook_target.fn"):
+            load_plugins()
+
+        self.assertIn(target, HookRegistry.failed_targets())
+
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_required_hook_applied_by_early_apply_does_not_raise(
+        self, mock_eps, mock_envs
+    ):
+        """A non-required hook that is applied late must not abort startup."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.SGLANG_REQUIRED_PLUGINS.get.return_value = ("critical",)
+
+        mod, target = self._make_target()
+        results = []
+
+        def critical_plugin():
+            HookRegistry.register(target, lambda result: results.append(result))
+            HookRegistry.apply_hooks()
+
+        def late_plugin():
+            HookRegistry.register(target, lambda result: result)
+
+        mock_eps.return_value = [
+            _make_ep("critical", load_fn=critical_plugin),
+            _make_ep("late", load_fn=late_plugin),
+        ]
+
+        load_plugins()
+        mod.fn()
+        self.assertEqual(results, ["orig"])
+
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points", return_value=[])
+    def test_required_hook_fail_to_apply_without_required_plugins(
+        self, mock_eps, mock_envs
+    ):
+        """Raise when hooks with register(required=True) fail to apply."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.SGLANG_REQUIRED_PLUGINS.get.return_value = ()
+
+        HookRegistry.register(
+            "sglang.srt.plugins.no_such_function",
+            lambda result: result,
+            required=True,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "unknown -> sglang.srt.plugins.no_such_function"
+        ):
+            load_plugins()
+
+    @patch("sglang.srt.plugins.envs")
+    @patch("sglang.srt.plugins.entry_points")
+    def test_required_hook_registered_during_apply_raises(self, mock_eps, mock_envs):
+        """A required hook registered while apply_hooks() imports a target module
+        lands on a target that call never visits; it must still abort startup."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_envs.SGLANG_PLUGINS.get.return_value = ""
+        mock_envs.SGLANG_REQUIRED_PLUGINS.get.return_value = ()
+
+        module_dir = self.enterContext(tempfile.TemporaryDirectory())
+        Path(module_dir, "lazy_hook_mod.py").write_text(_LAZY_HOOK_MODULE)
+        self.enterContext(patch.object(sys, "path", [module_dir, *sys.path]))
+        self.addCleanup(sys.modules.pop, "lazy_hook_mod", None)
+
+        def offload_plugin():
+            HookRegistry.register("lazy_hook_mod.kernel", lambda result: result)
+
+        mock_eps.return_value = [_make_ep("offload", load_fn=offload_plugin)]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "unknown -> sglang.srt.plugins.no_such_function"
+        ):
+            load_plugins()
 
 
 if __name__ == "__main__":
