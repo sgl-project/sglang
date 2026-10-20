@@ -28,7 +28,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_attn_backend,
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
@@ -424,7 +429,14 @@ class DecoderReplayTail:
                 gathered = input_ids.new_empty((sum(dp_rows), 1))
                 dp_gather_replicate(gathered, input_ids[:, None].clone(), tail_batch)
                 input_ids_global = gathered.squeeze(-1)
-            with self._break_context(tail_batch):
+            with (
+                (
+                    forward_context(get_forward_context(), forward_batch=tail_batch)
+                    if has_forward_context()
+                    else nullcontext()
+                ),
+                self._break_context(tail_batch),
+            ):
                 return self._layer_stack(
                     state,
                     positions=positions,

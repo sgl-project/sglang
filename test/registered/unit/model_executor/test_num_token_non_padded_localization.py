@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -37,6 +37,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     compute_local_num_token_non_padded_cpu,
     enable_num_token_non_padded,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_forward_context,
+    has_forward_context,
+)
+from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
+    RowBucketGraphRunner,
 )
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator

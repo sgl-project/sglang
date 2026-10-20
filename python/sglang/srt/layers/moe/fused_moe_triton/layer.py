@@ -1888,6 +1888,7 @@ def fused_moe_bypassed_piecewise_cuda_graph_impl(
             correction_bias=correction_bias,
             renormalize=renormalize,
             allow_routed_experts_capture=allow_routed_experts_capture,
+            layer_id=layer_id,
         ),
     )
     forward_context = get_tc_piecewise_forward_context()

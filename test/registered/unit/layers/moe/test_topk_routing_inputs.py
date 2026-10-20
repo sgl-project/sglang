@@ -5,13 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from sglang.srt.runtime_context import get_model
-from sglang.srt.configs.shared_experts import SharedExpertsConfig
 
 from sglang.srt.batch_overlap.operations import (
     ExecutionOperation,
     _StageExecutor,
 )
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -46,6 +45,7 @@ from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
+    get_model,
     get_parallel,
     get_resources,
 )
@@ -213,7 +213,7 @@ class TestTopKRoutingInputs(CustomTestCase):
         self.assertEqual(seen, [1, 3, 1, 3])
 
     def test_hash_router_uses_same_placement_and_bound(self):
-        router = HashTopK(2, 4, 0, 4, scoring_func="softmax", layer_id=0)
+        router = HashTopK(2, 4, vocab_size=4, scoring_func="softmax", layer_id=0)
         with envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
             with forward_context(
                 ForwardContext(attn_backend=object()), forward_batch=_batch(2)
@@ -488,7 +488,7 @@ class TestTopKRoutingInputs(CustomTestCase):
                         _ = output.router_logits
 
     def test_hash_npu_keeps_valid_ids_and_zero_padded_weights(self):
-        router = HashTopK(2, 4, 0, 4, scoring_func="softmax", layer_id=0)
+        router = HashTopK(2, 4, vocab_size=4, scoring_func="softmax", layer_id=0)
         with (
             patch.object(hash_topk_module, "_is_npu", True),
             envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False),
@@ -501,15 +501,17 @@ class TestTopKRoutingInputs(CustomTestCase):
         torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
 
     def test_hash_global_shared_column_stays_outside_expert_map(self):
-        router = HashTopK(
-            3,
-            4,
-            1,
-            4,
-            scoring_func="sqrtsoftplus",
-            routed_scaling_factor=2.0,
-            layer_id=0,
-        )
+        with get_model().override(
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+        ):
+            router = HashTopK(
+                2,
+                4,
+                vocab_size=4,
+                scoring_func="sqrtsoftplus",
+                routed_scaling_factor=2.0,
+                layer_id=0,
+            )
         with envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.override(False):
             with forward_context(
                 ForwardContext(attn_backend=object()), forward_batch=_batch(2)

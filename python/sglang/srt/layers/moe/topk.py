@@ -709,10 +709,10 @@ class TopK(BaseFusedOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        self._runner_backend_bound = False
         self.is_draft = (
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
+        self._runner_backend_bound = False
 
         shared_experts = get_model().shared_experts
         self.enable_waterfill = shared_experts.use_waterfill
@@ -2626,10 +2626,10 @@ def _post_process_topk_ids(
         # second zeroing here would be redundant (zeroing is idempotent).
 
     else:
-        if num_fused_shared_experts > 0:
-            shared_cols = topk_ids[:, -num_fused_shared_experts:]
+        if num_shared_topk_slots > 0:
+            shared_cols = topk_ids[:, -num_shared_topk_slots:]
             routed_cols = topk_ids_logical_to_physical(
-                topk_ids[:, :-num_fused_shared_experts], expert_location_dispatch_info
+                topk_ids[:, :-num_shared_topk_slots], expert_location_dispatch_info
             )
             _mask_topk_ids_padded_region(routed_cols, num_token_non_padded)
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)

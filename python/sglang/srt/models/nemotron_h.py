@@ -362,9 +362,7 @@ class NemotronHMoE(nn.Module):
             and is_in_breakable_cuda_graph()
             and is_sm120()
         ):
-            return self._forward_core_prefill_overlap(
-                hidden_states, num_token_non_padded
-            )
+            return self._forward_core_prefill_overlap(hidden_states)
         if _is_cuda and (
             not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
@@ -426,7 +424,6 @@ class NemotronHMoE(nn.Module):
     def _forward_core_prefill_overlap(
         self,
         hidden_states: torch.Tensor,
-        num_token_non_padded: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # A multi-stream graph per hybrid segment creates one internal stream
         # per executable. Keep each graph linear and launch shared experts on
@@ -442,12 +439,6 @@ class NemotronHMoE(nn.Module):
         topk_output = self.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=(
-                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                if not self.is_nextn
-                else None
-            ),
         )
         if self.use_latent_moe:
             hidden_states = self._apply_fc1_latent_proj(hidden_states)

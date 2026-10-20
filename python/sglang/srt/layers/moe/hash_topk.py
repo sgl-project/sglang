@@ -24,7 +24,7 @@ from sglang.srt.layers.moe.topk import (
     resolve_routing_inputs,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.runtime_context import get_exec, get_flags, get_model
+from sglang.srt.runtime_context import get_flags, get_model
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -78,11 +78,12 @@ class HashTopK(nn.Module):
                 "with fused shared experts; pass --disable-shared-experts-fusion."
             )
 
+    def routing_inputs(self):
+        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
+
     @property
     def num_shared_topk_slots(self) -> int:
         return self.shared_experts.num_shared_topk_slots
-    def routing_inputs(self):
-        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
 
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
@@ -265,9 +266,7 @@ class HashTopK(nn.Module):
 
         num_shared_topk_slots = self.num_shared_topk_slots
         routed_ids = (
-            topk_ids[:, :-num_shared_topk_slots]
-            if num_shared_topk_slots
-            else topk_ids
+            topk_ids[:, :-num_shared_topk_slots] if num_shared_topk_slots else topk_ids
         )
         log2phy_prob = None
         if (
@@ -282,22 +281,11 @@ class HashTopK(nn.Module):
             if lplb_solver is not None:
                 log2phy_prob = lplb_solver.solve(routed_ids)
 
-        recorder_topk_ids = None
-        if num_shared_topk_slots:
-            shared_cols = topk_ids[:, -num_shared_topk_slots:]
-            routed_cols = topk_ids[:, :-num_shared_topk_slots]
-            routed_cols = topk_ids_logical_to_physical(
-                topk_ids[:, :-num_shared_topk_slots],
-                expert_location_dispatch_info,
-                log2phy_prob,
-            )
-            recorder_topk_ids = routed_cols
-        else:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
-            )
-
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts):
+        routed_cols = topk_ids_logical_to_physical(
+            routed_ids, expert_location_dispatch_info, log2phy_prob
+        )
+        recorder_topk_ids = routed_cols if num_shared_topk_slots else None
+        if has_per_rank_fused_shared_slots(num_shared_topk_slots):
             num_physical_routed_experts = (
                 expert_location_dispatch_info.num_physical_experts
                 if expert_location_dispatch_info is not None
@@ -315,6 +303,12 @@ class HashTopK(nn.Module):
                     apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
                 ),
             )
+        elif num_shared_topk_slots:
+            topk_ids = torch.cat(
+                [routed_cols, topk_ids[:, -num_shared_topk_slots:]], dim=-1
+            )
+        else:
+            topk_ids = routed_cols
         if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         else:
