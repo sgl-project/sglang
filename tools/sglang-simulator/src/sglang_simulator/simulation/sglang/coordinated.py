@@ -133,6 +133,10 @@ class CoordinatedScheduler:
                     self._aborts.add(req.rid)
             elif kind in ("GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq"):
                 self._admin.append(req)
+            elif kind == "ShutdownReq" and (
+                self._finished or self.clock.run_id is None
+            ):
+                self._admin.append(req)
             else:
                 raise ProtocolError(f"unsupported request during coordination: {kind}")
 

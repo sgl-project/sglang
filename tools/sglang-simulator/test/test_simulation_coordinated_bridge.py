@@ -114,6 +114,37 @@ class FreezeGCReq:
     pass
 
 
+class ShutdownReq:
+    pass
+
+
+@pytest.mark.parametrize("finished", [False, True])
+def test_native_shutdown_outside_an_active_run(harness, finished):
+    if finished:
+
+        def driver(control):
+            control.send(encode_message(Ready("run", 0, [], finished=True)))
+            return decode_grant(control.recv())
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(harness.run_driver, driver)
+            assert harness.receive() == []
+            assert future.result(timeout=3).status == "FINISHED"
+    shutdown = ShutdownReq()
+    harness.payloads.put(shutdown)
+    assert harness.receive() == [shutdown]
+    assert harness.bridge.clock.now_ns == 0
+    assert harness.bridge._finished is finished
+
+
+def test_native_shutdown_cannot_silently_end_an_active_run(harness):
+    harness.bridge.clock.accept_ready(Ready("run", 0, [], next_wakeup_ns=10))
+    harness.payloads.put(ShutdownReq())
+    with pytest.raises(ProtocolError, match="unsupported request.*ShutdownReq"):
+        harness.receive()
+    assert not harness.bridge._finished
+
+
 class FakeScheduler:
     def __init__(self):
         self.abort_times = []
