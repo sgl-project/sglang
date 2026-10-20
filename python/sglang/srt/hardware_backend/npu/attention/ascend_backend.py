@@ -36,7 +36,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+)
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
@@ -349,7 +352,12 @@ class AscendAttnBackend(AttentionBackend):
         self.use_dsa = (
             getattr(model_runner.model_config, "index_head_dim", None) is not None
         )
-        if get_parallel().dcp_enabled and not self.is_draft_worker and not self.use_dsa:
+        parallel = get_parallel()
+        # Draft KV remains replicated even when the target uses DCP.
+        self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
+        self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
+        self.dcp_interleave_size = self.page_size if self.use_dsa else 1
+        if self.dcp_size > 1 and not self.use_dsa:
             supported_architectures = {
                 "KimiK3ForConditionalGeneration",
                 "KimiK3LinearForCausalLM",
@@ -507,11 +515,31 @@ class AscendAttnBackend(AttentionBackend):
 
     def _use_dense_mla_dcp_target(self) -> bool:
         """Only target workers read sharded KV and need local DCP metadata."""
-        return self._dense_mla_dcp_enabled() and not self.is_draft_worker
+        return self.use_mla and not self.use_dsa and self.dcp_size > 1
 
     def _use_dsa_dcp(self) -> bool:
         """DSA target attention uses page-interleaved KV and a replicated indexer."""
-        return self.use_dsa and get_parallel().dcp_enabled and not self.is_draft_worker
+        return self.use_dsa and self.dcp_size > 1
+
+    def is_dcp_mla_decode_phase(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this worker returns partial MLA attention for a DCP merge."""
+        if self.dcp_size <= 1:
+            return False
+        mode = forward_batch.forward_mode
+        if self.use_dsa:
+            return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
+        return self.use_mla and (mode.is_decode() or mode.is_target_verify())
+
+    def get_mla_dcp_graph_replay_lengths(
+        self, forward_batch: ForwardBatch, *, bs: int, query_len: int
+    ) -> list[int]:
+        """Build FIA's Host lengths independently of captured device buffers."""
+        assert self._use_dense_mla_dcp_target()
+        seq_lens_cpu = forward_batch.seq_lens.cpu()
+        if forward_batch.forward_mode.is_target_verify():
+            seq_lens_cpu = seq_lens_cpu + query_len
+        local_seq_lens = get_dcp_lens(seq_lens_cpu, self.dcp_size, self.dcp_rank)
+        return local_seq_lens.tolist() + [0] * (bs - local_seq_lens.numel())
 
     def _get_kv_lens_and_block_tables(
         self,
@@ -520,23 +548,22 @@ class AscendAttnBackend(AttentionBackend):
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP."""
-        parallel = get_parallel()
         if is_spec:
             local_kv_lens = get_dcp_chain_spec_lens(
                 kv_lens_cpu,
                 self.speculative_num_draft_tokens,
-                parallel.attn_dcp_size,
-                parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.dcp_interleave_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
-                parallel.attn_dcp_size,
-                parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.dcp_interleave_size,
             ).int()
-        page_stride = self.page_size * parallel.attn_dcp_size
+        page_stride = self.dcp_interleave_size * self.dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
         block_tables = (
             self.req_to_token[req_pool_indices, :max_len:page_stride] // page_stride
@@ -546,6 +573,26 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens, dim=0
             )
         return local_kv_lens, block_tables
+
+    def _init_dsa_dcp_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Prepare eager DSA reads from the existing global CPU lengths."""
+        metadata = self.forward_metadata
+        metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
+        is_spec = forward_batch.forward_mode.is_target_verify()
+        local_lens_cpu, block_tables = self._get_kv_lens_and_block_tables(
+            kv_lens_cpu=metadata.seq_lens_cpu_int,
+            req_pool_indices=forward_batch.req_pool_indices,
+            is_spec=is_spec,
+        )
+        local_lens = local_lens_cpu.to(device=self.device, dtype=torch.int32)
+        if is_spec:
+            metadata.dcp_spec_seq_lens_cpu_int = local_lens_cpu
+            metadata.dcp_spec_seq_lens = local_lens
+            metadata.dcp_spec_block_tables = block_tables
+        else:
+            metadata.dcp_seq_lens_cpu_int = local_lens_cpu
+            metadata.dcp_seq_lens = local_lens
+            metadata.dcp_block_tables = block_tables
 
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
@@ -584,108 +631,90 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        dense_mla_dcp_decode = self._use_dense_mla_dcp_target() and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        )
-        seq_lens_max = forward_batch.seq_lens.max()
-        if forward_batch.forward_mode.is_target_verify():
-            if (
-                forward_batch.spec_algorithm is not None
-                and forward_batch.spec_algorithm.is_dflash()
-            ):
-                # dflash_worker_v2 already publishes seq_lens_cpu as prefix +
-                # one verify block, which already covers the draft block.
-                seq_lens_max = forward_batch.seq_lens_cpu.max().item()
-            else:
-                # Overlap scheduling can publish the CPU sequence length one
-                # step ahead of the device tensor. FIA consumes seq_lens_cpu
-                # below, so derive the block-table width from the same source.
-                # Otherwise a page-aligned request can expose KV_S=N while
-                # asking FIA for N+1.
-                spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
-                seq_lens_max = (
-                    forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
-                )
-        elif (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is not None
+        if self._use_dense_mla_dcp_target() and self.is_dcp_mla_decode_phase(
+            forward_batch
         ):
-            seq_lens_max = forward_batch.seq_lens.max()
-            seq_lens_max += self.speculative_step_id + 1
-        else:
-            seq_lens_max = forward_batch.seq_lens.max()
-        if dense_mla_dcp_decode:
-            local_seq_lens = init_mla_dcp_metadata(
+            init_mla_dcp_metadata(
                 self.forward_metadata,
                 forward_batch,
                 self.req_to_token_pool.req_to_token,
                 self.page_size,
                 self.speculative_step_id,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
+            seq_lens_max = forward_batch.seq_lens.max()
+            if forward_batch.forward_mode.is_target_verify():
+                if (
+                    forward_batch.spec_algorithm is not None
+                    and forward_batch.spec_algorithm.is_dflash()
+                ):
+                    # DFlash's CPU lengths already include the verify block.
+                    seq_lens_max = forward_batch.seq_lens_cpu.max().item()
+                else:
+                    # Overlap may publish CPU lengths ahead of device lengths.
+                    # Size the page table from the same source FIA will read.
+                    spec_tokens_per_req = int(forward_batch.spec_info.draft_token_num)
+                    seq_lens_max = (
+                        forward_batch.seq_lens_cpu.max().item() + spec_tokens_per_req
+                    )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                seq_lens_max += self.speculative_step_id + 1
+
             self.forward_metadata.block_tables = (
                 self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, :seq_lens_max
                 ][:, :: self.page_size]
                 // self.page_size
             )
-        if self.is_hybrid_swa:
-            self.forward_metadata.block_tables_swa = (
-                (
-                    self.full_to_swa_index_mapping[
-                        self.req_to_token_pool.req_to_token[
-                            forward_batch.req_pool_indices, :seq_lens_max
-                        ]
-                    ][:, :: self.page_size]
-                    // self.page_size
+            if self.is_hybrid_swa:
+                self.forward_metadata.block_tables_swa = (
+                    (
+                        self.full_to_swa_index_mapping[
+                            self.req_to_token_pool.req_to_token[
+                                forward_batch.req_pool_indices, :seq_lens_max
+                            ]
+                        ][:, :: self.page_size]
+                        // self.page_size
+                    )
+                    .to(torch.int32)
+                    .contiguous()
                 )
-                .to(torch.int32)
-                .contiguous()
-            )
+
+            if forward_batch.seq_lens is not None:
+                self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
+            else:
+                self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
+                    self.device
+                ).int()
+            self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+            if forward_batch.forward_mode.is_target_verify():
+                spec_algorithm = forward_batch.spec_algorithm
+                if spec_algorithm is None or not spec_algorithm.is_dflash_family():
+                    self.forward_metadata.seq_lens_cpu_int += int(
+                        forward_batch.spec_info.draft_token_num
+                    )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
+
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
             self.forward_metadata.extend_seq_lens_cpu_int = (
                 forward_batch.extend_seq_lens.cpu().int()
             )
-        if dense_mla_dcp_decode:
-            self.forward_metadata.seq_lens = local_seq_lens
-        elif forward_batch.seq_lens is not None:
-            self.forward_metadata.seq_lens = forward_batch.seq_lens.int()
-        else:
-            self.forward_metadata.seq_lens = forward_batch.seq_lens_cpu.to(
-                self.device
-            ).int()
-
-        self.forward_metadata.seq_lens_cpu_int = (
-            local_seq_lens.cpu().int()
-            if dense_mla_dcp_decode
-            else forward_batch.seq_lens_cpu.int()
-        )
-        # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
-        # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
-        # only rebind the Host-side IntArray when captured as a Python list.
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
-
-        if forward_batch.forward_mode.is_target_verify():
-            spec_algorithm = forward_batch.spec_algorithm
-            if not dense_mla_dcp_decode and (
-                spec_algorithm is None or not spec_algorithm.is_dflash_family()
-            ):
-                self.forward_metadata.seq_lens_cpu_int += int(
-                    forward_batch.spec_info.draft_token_num
-                )
-        elif (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is not None
-            and not dense_mla_dcp_decode
-        ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
@@ -718,38 +747,7 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if self._use_dsa_dcp():
-            # Draft workers retain allocator-global cache slots and use the non-DCP
-            # attention path, so only target workers need DCP-specific metadata.
-            self.forward_metadata.dcp_origin_out_cache_loc = (
-                forward_batch.origin_out_cache_loc
-            )
-            if forward_batch.forward_mode.is_target_verify():
-                (
-                    self.forward_metadata.dcp_spec_seq_lens_cpu_int,
-                    self.forward_metadata.dcp_spec_block_tables,
-                ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                    is_spec=True,
-                )
-                self.forward_metadata.dcp_spec_seq_lens = (
-                    self.forward_metadata.dcp_spec_seq_lens_cpu_int.to(
-                        device=self.device, dtype=torch.int32
-                    )
-                )
-            else:
-                (
-                    self.forward_metadata.dcp_seq_lens_cpu_int,
-                    self.forward_metadata.dcp_block_tables,
-                ) = self._get_kv_lens_and_block_tables(
-                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
-                    req_pool_indices=forward_batch.req_pool_indices,
-                )
-                self.forward_metadata.dcp_seq_lens = (
-                    self.forward_metadata.dcp_seq_lens_cpu_int.to(
-                        device=self.device, dtype=torch.int32
-                    )
-                )
+            self._init_dsa_dcp_metadata(forward_batch)
 
         if (
             self.use_mla
@@ -800,6 +798,8 @@ class AscendAttnBackend(AttentionBackend):
                 self.page_size,
                 self.speculative_num_draft_tokens,
                 self.device,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             graph_num_pages = max(
@@ -814,7 +814,7 @@ class AscendAttnBackend(AttentionBackend):
             }
         # DCP decode needs its own block_table (different stride: dcp_page_size).
         if self._use_dsa_dcp():
-            dcp_page_size = self.page_size * get_parallel().attn_dcp_size
+            dcp_page_size = self.dcp_interleave_size * self.dcp_size
             total_context_len = graph_context_len + self.page_size - 1
             max_dcp_seq_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
             # The captured DSA indexer cache-write operation reads from this fixed
@@ -1087,6 +1087,8 @@ class AscendAttnBackend(AttentionBackend):
                 speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                 speculative_step_id=self.speculative_step_id,
                 in_capture=in_capture,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
             )
         else:
             metadata.block_tables[:bs, :max_seq_pages].copy_(
@@ -1542,7 +1544,7 @@ class AscendAttnBackend(AttentionBackend):
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             topk_indices = _expand_dsa_sparse_indices(topk_indices)
-            if get_parallel().dcp_enabled and not self.is_draft_worker:
+            if self._use_dsa_dcp():
                 return forward_dcp_sparse_attention(
                     q_nope=q_nope,
                     q_rope=q_pe,

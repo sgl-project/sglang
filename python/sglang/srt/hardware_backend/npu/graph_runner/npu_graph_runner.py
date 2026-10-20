@@ -44,12 +44,11 @@ from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     build_replay_fb_view,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     empty_context,
     get_bool_env_var,
@@ -133,13 +132,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
             for arch in (model_runner.model_config.hf_config.architectures or [])
         )
-        parallel = get_parallel()
-        self.mla_dcp_graph = (
-            model_runner.model_config.attention_arch == AttentionArch.MLA
-            and getattr(model_runner.model_config, "index_head_dim", None) is None
-            and parallel.dcp_enabled
-            and not model_runner.is_draft_worker
-        )
+        mla_backend = get_mla_dcp_backend(self.attn_backend)
+        use_mla_dcp = getattr(mla_backend, "_use_dense_mla_dcp_target", None)
+        self.mla_dcp_graph = use_mla_dcp is not None and use_mla_dcp()
         self.use_fias_v2_bsnd = (
             envs.SGLANG_NPU_USE_FIAS_V2_BSND.get()
             and model_runner.spec_algorithm.is_dspark()
@@ -384,7 +379,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if forward_batch.forward_mode.is_target_verify() and not mla_dcp_graph:
+            if mla_dcp_graph:
+                seq_lens = get_mla_dcp_backend(
+                    self._replay_attn_backend()
+                ).get_mla_dcp_graph_replay_lengths(
+                    forward_batch,
+                    bs=self.bs,
+                    query_len=self.captured_req_width,
+                )
+            elif forward_batch.forward_mode.is_target_verify():
                 # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
                 # replay; other algorithms keep the capture-time list, so
                 # recompute from the live batch as before — reading the
@@ -413,11 +416,6 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens_cpu = forward_batch.seq_lens.cpu()
                 if forward_batch.forward_mode.is_target_verify():
                     seq_lens_cpu = seq_lens_cpu + self.captured_req_width
-                if mla_dcp_graph:
-                    parallel = get_parallel()
-                    seq_lens_cpu = get_dcp_lens(
-                        seq_lens_cpu, parallel.dcp_size, parallel.dcp_rank
-                    )
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             output = self.backend.replay_with_input_update(
                 graph_key,

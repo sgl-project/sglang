@@ -23,28 +23,34 @@ def init_mla_dcp_metadata(
     req_to_token: torch.Tensor,
     page_size: int,
     speculative_step_id: int,
+    *,
+    dcp_size: int | None = None,
+    dcp_rank: int | None = None,
 ) -> torch.Tensor:
     """Build token-interleaved FIA metadata for eager decode/verify.
 
     The caller selects target dense MLA only; DSA's page-interleaved metadata
     and replicated draft KV do not use these builders.
     """
-    parallel = get_parallel()
+    if dcp_size is None or dcp_rank is None:
+        parallel = get_parallel()
+        dcp_size = parallel.dcp_size if dcp_size is None else dcp_size
+        dcp_rank = parallel.dcp_rank if dcp_rank is None else dcp_rank
     if forward_batch.forward_mode.is_target_verify():
         query_len = int(forward_batch.spec_info.draft_token_num)
         effective_seq_lens = forward_batch.seq_lens.to(torch.int64) + query_len
         metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
             effective_seq_lens,
             query_len,
-            parallel.dcp_size,
-            parallel.dcp_rank,
+            dcp_size,
+            dcp_rank,
             interleave_size=1,
         )
         metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
             forward_batch.seq_lens,
             query_len,
-            parallel.dcp_size,
-            parallel.dcp_rank,
+            dcp_size,
+            dcp_rank,
             local_query_lens=metadata.dcp_spec_seq_lens,
         )
     else:
@@ -61,9 +67,13 @@ def init_mla_dcp_metadata(
         forward_batch.req_pool_indices,
         effective_seq_lens,
         page_size,
-        parallel.dcp_size,
-        parallel.dcp_rank,
+        dcp_size,
+        dcp_rank,
     )
+    metadata.seq_lens = local_seq_lens
+    # Eager FIA consumes Host lengths. Graph capture/replay uses its separate
+    # fixed-buffer updater and keeps seq_lens_cpu_int unset for graph.update.
+    metadata.seq_lens_cpu_int = local_seq_lens.cpu().int()
     if metadata.dcp_mtp_attn_mask is not None:
         # FIA checks S2 against the full paged capacity, not just valid KV.
         required_mask_width = metadata.block_tables.shape[1] * page_size
@@ -88,11 +98,17 @@ def init_mla_dcp_graph_state(
     page_size: int,
     speculative_num_draft_tokens: int | None,
     device: torch.device,
+    *,
+    dcp_size: int | None = None,
+    dcp_rank: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Allocate local FIA page tables, lengths and mask at fixed graph addresses."""
-    parallel = get_parallel()
-    max_local_context_len = graph_context_len // parallel.dcp_size + int(
-        parallel.dcp_rank < graph_context_len % parallel.dcp_size
+    if dcp_size is None or dcp_rank is None:
+        parallel = get_parallel()
+        dcp_size = parallel.dcp_size if dcp_size is None else dcp_size
+        dcp_rank = parallel.dcp_rank if dcp_rank is None else dcp_rank
+    max_local_context_len = graph_context_len // dcp_size + int(
+        dcp_rank < graph_context_len % dcp_size
     )
     graph_num_pages = max(1, (max_local_context_len + page_size - 1) // page_size)
     buffers = {
@@ -129,9 +145,14 @@ def update_mla_dcp_graph_metadata(
     speculative_num_draft_tokens: int | None,
     speculative_step_id: int,
     in_capture: bool,
+    dcp_size: int | None = None,
+    dcp_rank: int | None = None,
 ) -> None:
     """Update captured FIA buffers in place without replay-time CPU length reads."""
-    parallel = get_parallel()
+    if dcp_size is None or dcp_rank is None:
+        parallel = get_parallel()
+        dcp_size = parallel.dcp_size if dcp_size is None else dcp_size
+        dcp_rank = parallel.dcp_rank if dcp_rank is None else dcp_rank
     if forward_mode.is_target_verify():
         query_len = int(speculative_num_draft_tokens)
         effective_seq_lens = seq_lens[:bs].to(torch.int64) + query_len
@@ -142,9 +163,7 @@ def update_mla_dcp_graph_metadata(
     else:
         effective_seq_lens = seq_lens[:bs].to(torch.int64)
 
-    max_local_len = max_len // parallel.dcp_size + int(
-        parallel.dcp_rank < max_len % parallel.dcp_size
-    )
+    max_local_len = max_len // dcp_size + int(dcp_rank < max_len % dcp_size)
     active_num_pages = min(
         metadata.block_tables.shape[1],
         max(1, (max_local_len + page_size - 1) // page_size),
@@ -154,8 +173,8 @@ def update_mla_dcp_graph_metadata(
         req_pool_indices[:bs],
         effective_seq_lens,
         page_size,
-        parallel.dcp_size,
-        parallel.dcp_rank,
+        dcp_size,
+        dcp_rank,
         num_pages=active_num_pages,
     )
     metadata.block_tables[:, :active_num_pages].copy_(dcp_block_tables)
@@ -170,16 +189,16 @@ def update_mla_dcp_graph_metadata(
             get_dcp_chain_spec_lens(
                 effective_seq_lens,
                 query_len,
-                parallel.dcp_size,
-                parallel.dcp_rank,
+                dcp_size,
+                dcp_rank,
                 interleave_size=1,
             )
         )
         dcp_mask = build_mla_dcp_mtp_mask(
             seq_lens[:bs],
             query_len,
-            parallel.dcp_size,
-            parallel.dcp_rank,
+            dcp_size,
+            dcp_rank,
             max_local_kv_len=active_num_pages * page_size,
             local_query_lens=metadata.dcp_spec_seq_lens,
         )
