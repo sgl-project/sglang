@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
     EncodingClient,
 )
+from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import fork_request
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.test.single_test_file.test_disagg_server import (
@@ -204,6 +205,10 @@ def _check_pipeline(model, num_frames, kind, parallelism="single"):
             async with EncodingClient(
                 f"tcp://{HOST}:{cluster.base_port}", device="cuda:1"
             ) as client:
+                invalid = fork_request(prepared[0])
+                invalid.seed = [1, 2]
+                with pytest.raises(RuntimeError, match="seed"):
+                    await client.encode(invalid, ["result.output"])
                 first, resized = await asyncio.gather(
                     *(client.encode(req, ["result.output"]) for req in prepared)
                 )
