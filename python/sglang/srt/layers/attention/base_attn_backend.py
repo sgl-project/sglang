@@ -194,8 +194,7 @@ class AttentionBackend(ABC):
     ) -> SharedReadEnds:
         """Return this batch's prefill read end, running the snapshot hook if allowed.
 
-        Speculative algorithms with a later draft reader are gated when the
-        event is published, after their stager has run.
+        Spec algorithms with a later draft reader are gated at publish time.
         """
         if (
             envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
@@ -213,13 +212,9 @@ class AttentionBackend(ABC):
     def _prepare_prefill_shared_reads(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> SharedReadEnds:
-        """Snapshot late prefill reads and return where this batch's reads end.
+        """Snapshot late shared reads; return PRE_REPLAY only if none remain.
 
-        Runs only for EXTEND, after metadata init, with the forward's query count.
-        Return PRE_REPLAY only when the forward reads no scheduler-shared buffer
-        after this point. An override keeps ``shared_read_ends(EXTEND)``
-        conservative, since captured breakable-graph metadata, full graphs, and
-        wrappers that do not forward this hook read that declaration instead.
+        Hook-skipping paths read ``shared_read_ends(EXTEND)``; keep it conservative.
         """
         return self.shared_read_ends(forward_batch.forward_mode)
 

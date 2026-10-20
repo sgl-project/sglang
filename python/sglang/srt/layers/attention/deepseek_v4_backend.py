@@ -2729,10 +2729,9 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
-        # Shared by the snapshot hook and the forward; a forward that goes sparse
-        # without a snapshotted cache would read req_to_token after read-done.
-        # sparse_prefill_fwd does not support SM120. The tail stays dense: its
-        # window floor lives in swa_page_indices, which the chunk cache ignores.
+        # Shared with the snapshot hook, so no forward builds the cache after read-done.
+        # The tail stays dense: its window floor lives in swa_page_indices, which
+        # the chunk cache ignores.
         return (
             not self.trtllm_attn
             and forward_batch.forward_mode.is_extend_without_speculative()
