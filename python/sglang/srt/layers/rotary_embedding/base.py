@@ -67,7 +67,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.kernels.ops.attention.utils import (
+    from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
         fused_qk_rope_reshape_and_cache,
     )
 

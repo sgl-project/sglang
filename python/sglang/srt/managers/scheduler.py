@@ -2563,6 +2563,7 @@ class Scheduler(
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
     def init_output_streamer(self) -> None:
