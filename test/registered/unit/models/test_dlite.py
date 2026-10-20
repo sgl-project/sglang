@@ -1,8 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
+import sglang.kernels as kernels
 import torch
 import torch.nn.functional as F
+from sglang.kernels.spec import KernelBackend
 from sglang.srt.models.dlite import DLiteDraftModel
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.runtime_context import SpawnRanks, reset_context
@@ -229,6 +231,8 @@ class TestDLiteDraftModel(unittest.TestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
+        kernels.set_fused_op_backend(KernelBackend.TORCH)
+        self.addCleanup(kernels.set_fused_op_backend, None)
         publish(
             ServerArgs(model_path="dummy", device="cpu", tp_size=1),
             role="test",

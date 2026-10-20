@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 import sglang.srt.arg_groups.speculative_hook as speculative_hook
 import torch
+from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.dlite_worker_v2 import DLiteWorkerV2, _commit_accept
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -67,6 +68,47 @@ def test_rejects_non_greedy_request():
         DLiteWorkerV2._validate_request_sampling(None, batch)
 
 
+@pytest.mark.parametrize(
+    ("top_k", "return_hidden_states", "enable_overlap", "expected"),
+    [
+        pytest.param(1, False, False, None, id="greedy"),
+        pytest.param(128, False, False, "greedy decoding only", id="stochastic"),
+        pytest.param(
+            1,
+            True,
+            False,
+            "return_hidden_states",
+            id="hidden_states_without_overlap",
+        ),
+        pytest.param(
+            1,
+            True,
+            True,
+            "return_hidden_states",
+            id="hidden_states_with_overlap",
+        ),
+    ],
+)
+def test_request_validation_enforces_dlite_contract(
+    top_k, return_hidden_states, enable_overlap, expected
+):
+    req = SimpleNamespace(
+        sampling_params=SimpleNamespace(top_k=top_k),
+        return_hidden_states=return_hidden_states,
+    )
+
+    error = validate_dflash_request(
+        req,
+        enable_overlap=enable_overlap,
+        algorithm="DLITE",
+    )
+
+    if expected is None:
+        assert error is None
+    else:
+        assert expected in error
+
+
 def test_server_args_reject_non_nvidia_cuda_platform():
     cfg = SimpleNamespace(device="cuda")
     platform = SimpleNamespace(is_cuda=lambda: False)
@@ -74,6 +116,52 @@ def test_server_args_reject_non_nvidia_cuda_platform():
         patch.object(speculative_hook, "resolving_view", return_value=cfg),
         patch.object(speculative_hook, "current_platform", platform),
         pytest.raises(ValueError, match="supports CUDA only"),
+    ):
+        speculative_hook._handle_dlite(SimpleNamespace())
+
+
+def test_server_args_reject_pdmux():
+    cfg = SimpleNamespace(
+        device="cuda",
+        speculative_draft_model_path="/draft",
+        pp_size=1,
+        attn_cp_size=1,
+        disaggregation_mode="null",
+        enable_two_batch_overlap=False,
+        enable_mixed_chunk=False,
+        enable_pdmux=True,
+        speculative_adaptive=False,
+        speculative_use_rejection_sampling=False,
+        speculative_use_block_verification=False,
+        speculative_draft_model_quantization=None,
+        speculative_num_steps=1,
+        speculative_eagle_topk=1,
+        json_model_override_args="{}",
+        trust_remote_code=False,
+        speculative_draft_model_revision="main",
+        speculative_num_draft_tokens=8,
+        max_running_requests=48,
+    )
+    platform = SimpleNamespace(is_cuda=lambda: True)
+    with (
+        patch.object(speculative_hook, "resolving_view", return_value=cfg),
+        patch.object(speculative_hook, "current_platform", platform),
+        patch.object(speculative_hook, "attn_dp_enabled_of", return_value=False),
+        patch.object(speculative_hook, "declare_resolution"),
+        patch.object(
+            speculative_hook,
+            "model_config_of",
+            return_value=SimpleNamespace(hf_text_config=SimpleNamespace()),
+        ),
+        patch(
+            "sglang.srt.utils.hf_transformers_utils.get_config",
+            return_value=SimpleNamespace(),
+        ),
+        patch(
+            "sglang.srt.speculative.dlite_utils.validate_dlite_target_compatibility",
+            return_value=SimpleNamespace(block_size=8),
+        ),
+        pytest.raises(ValueError, match="PDMux"),
     ):
         speculative_hook._handle_dlite(SimpleNamespace())
 
