@@ -13,6 +13,7 @@ import random
 import statistics
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -100,6 +101,9 @@ class SpsRow(msgspec.Struct, frozen=True):
     num_running_reqs: int
     num_verify_tokens: int
     step_time: float
+    verify_tokens_logical: int = -1
+    verify_tokens_actual: int = -1
+    verify_used_cuda_graph: Optional[bool] = None
 
 
 # Server-side per-step record feed: the DsparkInfoDumper 'core' +
@@ -113,6 +117,7 @@ INFO_RECORD_ENABLE_HINT = (
 
 class ServerContext(msgspec.Struct, frozen=True):
     base_url: str
+    control_url: str
     tokenizer_path: str
     tp_size: int
     dp_size: int
@@ -166,6 +171,7 @@ def out_paths(*, out: str) -> dict[str, Path]:
 def run_profile(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     batch_sizes: list[int],
     settings: RoundSettings,
     out: str,
@@ -204,8 +210,11 @@ def run_profile(
 
     context = fetch_server_context(
         base_url=base_url,
+        control_url=control_url,
         local_tokenizer_path=local_tokenizer_path,
-        allowed_modes=("compact", "cap-accept") if offdiag else ("static",),
+        # Cap-accept trims commit lengths, but still executes full-width target
+        # verify, so it cannot measure off-diagonal T(B, M).
+        allowed_modes=("compact",) if offdiag else ("static",),
     )
     vocab_size = len(get_tokenizer(context.tokenizer_path))
     batch_sizes = sorted(set(batch_sizes))
@@ -340,6 +349,7 @@ def fit_profile(
 def profile_all(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     batch_sizes: list[int],
     settings: RoundSettings,
     out: str,
@@ -352,6 +362,7 @@ def profile_all(
 ) -> None:
     run_profile(
         base_url=base_url,
+        control_url=control_url,
         batch_sizes=batch_sizes,
         settings=settings,
         out=out,
@@ -410,17 +421,20 @@ def build_table_from_summaries(
 def fetch_server_context(
     *,
     base_url: str,
+    control_url: Optional[str] = None,
     local_tokenizer_path: Optional[str],
     allowed_modes: tuple[str, ...] = ("static",),
 ) -> ServerContext:
-    response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
+    base_url = base_url.rstrip("/")
+    control_url = (control_url or base_url).rstrip("/")
+    response = requests.get(control_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     info = response.json()
 
     speculative_algorithm = info.get("speculative_algorithm")
     if speculative_algorithm != "DSPARK":
         raise ValueError(
-            f"Profile against a DSpark server: {base_url} reports "
+            f"Profile against a DSpark server: {control_url} reports "
             f"speculative_algorithm={speculative_algorithm!r}. The SPS table is "
             "measured from real static-mode DSpark verify steps; relaunch with "
             "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
@@ -434,7 +448,7 @@ def fetch_server_context(
 
     internal_states = info.get("internal_states") or []
     if not internal_states:
-        raise RuntimeError(f"{base_url}/server_info returned no internal_states.")
+        raise RuntimeError(f"{control_url}/server_info returned no internal_states.")
     sps_payloads = [state.get(INFO_RECORD_PAYLOAD_KEY) for state in internal_states]
     for rank_index, payload in enumerate(sps_payloads):
         if payload is None:
@@ -503,6 +517,7 @@ def fetch_server_context(
 
     return ServerContext(
         base_url=base_url,
+        control_url=control_url,
         tokenizer_path=tokenizer_path,
         tp_size=int(info.get("tp_size", 1) or 1),
         dp_size=dp_size,
@@ -637,76 +652,76 @@ def run_one_round(
     ):
         return None
 
-    if frac is not None:
-        set_forced_budget_frac(base_url=context.base_url, frac=frac)
+    with pinned_budget(control_url=context.control_url, frac=frac):
+        flush_cache(base_url=context.base_url)
+        watermarks = [
+            max((row.forward_ct for row in rows), default=-1)
+            for rows in fetch_rank_rows(base_url=context.control_url)
+        ]
 
-    flush_cache(base_url=context.base_url)
-    watermarks = [
-        max((row.forward_ct for row in rows), default=-1)
-        for rows in fetch_rank_rows(base_url=context.base_url)
-    ]
-
-    start_time = time.monotonic()
-    load_thread = start_load(
-        base_url=context.base_url,
-        num_requests=batch_size,
-        input_len=settings.input_len,
-        max_new_tokens=max_new_tokens,
-        temperature=settings.temperature,
-        vocab_size=vocab_size,
-        rng=rng,
-    )
-    reached_target = wait_for_aligned_steps(
-        context=context,
-        watermarks=watermarks,
-        batch_size_per_rank=batch_size_per_rank,
-        min_steady_steps=settings.min_steady_steps,
-        min_steady_seconds=settings.min_steady_seconds,
-        timeout_seconds=settings.round_timeout_seconds,
-    )
-    abort_all_requests(base_url=context.base_url)
-    load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
-    if load_thread.is_alive():
-        logger.warning(
-            "Load batch for bs=%s did not return within %.0fs after abort; "
-            "continuing with the collected records.",
-            batch_size,
-            LOAD_JOIN_TIMEOUT_SECONDS,
-        )
-    wall_seconds = time.monotonic() - start_time
-    if not reached_target:
-        logger.warning(
-            "Round bs=%s hit the %.0fs timeout before both gates (>=%s steady "
-            "steps and >=%.1fs) were met; proceeding with what was collected.",
-            batch_size,
-            settings.round_timeout_seconds,
-            settings.min_steady_steps,
-            settings.min_steady_seconds,
-        )
-
-    rank_rows = fetch_rank_rows(base_url=context.base_url)
-    if len(rank_rows) != len(watermarks):
-        raise RuntimeError(
-            f"DP rank count changed mid-profile: {len(watermarks)} -> {len(rank_rows)}."
-        )
-    new_rank_rows = [
-        [row for row in rows if row.forward_ct > watermark]
-        for rows, watermark in zip(rank_rows, watermarks)
-    ]
-    return postprocess_round(
-        rank_rows=new_rank_rows,
-        batch_size_per_rank=batch_size_per_rank,
-        dp_size=context.dp_size,
-        verify_num_draft_tokens=context.verify_num_draft_tokens,
-        min_steady_steps=settings.min_steady_steps,
-        load_info=LoadInfo(
+        start_time = time.monotonic()
+        load_thread = start_load(
+            base_url=context.base_url,
             num_requests=batch_size,
+            input_len=settings.input_len,
             max_new_tokens=max_new_tokens,
-            wall_seconds=round(wall_seconds, 3),
-            reached_target=reached_target,
-        ),
-        frac=frac,
-    )
+            temperature=settings.temperature,
+            vocab_size=vocab_size,
+            rng=rng,
+        )
+        try:
+            reached_target = wait_for_aligned_steps(
+                context=context,
+                watermarks=watermarks,
+                batch_size_per_rank=batch_size_per_rank,
+                min_steady_steps=settings.min_steady_steps,
+                min_steady_seconds=settings.min_steady_seconds,
+                timeout_seconds=settings.round_timeout_seconds,
+            )
+        finally:
+            abort_all_requests(base_url=context.control_url)
+            load_thread.join(timeout=LOAD_JOIN_TIMEOUT_SECONDS)
+        if load_thread.is_alive():
+            logger.warning(
+                "Load batch for bs=%s did not return within %.0fs after abort; "
+                "continuing with the collected records.",
+                batch_size,
+                LOAD_JOIN_TIMEOUT_SECONDS,
+            )
+        wall_seconds = time.monotonic() - start_time
+        if not reached_target:
+            logger.warning(
+                "Round bs=%s hit the %.0fs timeout before both gates (>=%s steady "
+                "steps and >=%.1fs) were met; proceeding with what was collected.",
+                batch_size,
+                settings.round_timeout_seconds,
+                settings.min_steady_steps,
+                settings.min_steady_seconds,
+            )
+
+        rank_rows = fetch_rank_rows(base_url=context.control_url)
+        if len(rank_rows) != len(watermarks):
+            raise RuntimeError(
+                f"DP rank count changed mid-profile: {len(watermarks)} -> {len(rank_rows)}."
+            )
+        new_rank_rows = [
+            [row for row in rows if row.forward_ct > watermark]
+            for rows, watermark in zip(rank_rows, watermarks)
+        ]
+        return postprocess_round(
+            rank_rows=new_rank_rows,
+            batch_size_per_rank=batch_size_per_rank,
+            dp_size=context.dp_size,
+            verify_num_draft_tokens=context.verify_num_draft_tokens,
+            min_steady_steps=settings.min_steady_steps,
+            load_info=LoadInfo(
+                num_requests=batch_size,
+                max_new_tokens=max_new_tokens,
+                wall_seconds=round(wall_seconds, 3),
+                reached_target=reached_target,
+            ),
+            frac=frac,
+        )
 
 
 def start_load(
@@ -765,7 +780,7 @@ def wait_for_aligned_steps(
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL_SECONDS)
         try:
-            rank_rows = fetch_rank_rows(base_url=context.base_url)
+            rank_rows = fetch_rank_rows(base_url=context.control_url)
         except Exception:
             logger.warning("Polling /server_info failed; retrying.", exc_info=True)
             continue
@@ -849,6 +864,18 @@ def set_forced_budget_frac(*, base_url: str, frac: Optional[float]) -> None:
         )
 
 
+@contextmanager
+def pinned_budget(*, control_url: str, frac: Optional[float]):
+    if frac is None:
+        yield
+        return
+    set_forced_budget_frac(base_url=control_url, frac=frac)
+    try:
+        yield
+    finally:
+        set_forced_budget_frac(base_url=control_url, frac=None)
+
+
 def fetch_rank_rows(*, base_url: str) -> list[list[SpsRow]]:
     response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
@@ -867,6 +894,9 @@ def fetch_rank_rows(*, base_url: str) -> list[list[SpsRow]]:
                     num_running_reqs=int(record["num_running_reqs"]),
                     num_verify_tokens=int(record["num_verify_tokens"]),
                     step_time=float(step_cpu_ms) / 1000.0,
+                    verify_tokens_logical=int(record.get("verify_tokens_logical", -1)),
+                    verify_tokens_actual=int(record.get("verify_tokens_actual", -1)),
+                    verify_used_cuda_graph=record.get("verify_used_cuda_graph"),
                 )
             )
         rank_rows.append(rows)
@@ -886,6 +916,12 @@ def postprocess_round(
     offdiag = frac is not None
     batch_size = batch_size_per_rank * dp_size
     expected_tokens = batch_size_per_rank * verify_num_draft_tokens
+    expected_logical = (
+        batch_size_per_rank
+        + int(frac * batch_size_per_rank * (verify_num_draft_tokens - 1))
+        if offdiag
+        else expected_tokens
+    )
 
     if len(rank_rows) != dp_size:
         raise RuntimeError(
@@ -918,6 +954,25 @@ def postprocess_round(
         rows_at_ct = [by_ct[ct] for by_ct in by_ct_per_rank]
         if all(row.num_running_reqs == batch_size_per_rank for row in rows_at_ct):
             for rank_index, row in enumerate(rows_at_ct):
+                if row.verify_used_cuda_graph is False:
+                    raise RuntimeError(
+                        f"DP rank {rank_index} at forward_ct={ct} fell back to eager; "
+                        "do not mix eager and CUDA graph costs in an SPS table."
+                    )
+                if offdiag and (
+                    row.verify_tokens_logical != expected_logical
+                    or row.verify_used_cuda_graph is not True
+                    or row.verify_tokens_actual < expected_logical
+                ):
+                    raise RuntimeError(
+                        f"DP rank {rank_index} at forward_ct={ct}: requested "
+                        f"M={expected_logical}, observed logical="
+                        f"{row.verify_tokens_logical}, actual="
+                        f"{row.verify_tokens_actual}, cuda_graph="
+                        f"{row.verify_used_cuda_graph}. The pinned budget must "
+                        "match real target rows. Check verify-all / graph-tier "
+                        "alignment and use a server that reports execution geometry."
+                    )
                 if not offdiag and row.num_verify_tokens < expected_tokens:
                     raise RuntimeError(
                         f"DP rank {rank_index} at forward_ct={ct} reports "
@@ -928,7 +983,9 @@ def postprocess_round(
                         "count is the replayed graph tier, which may exceed the "
                         "candidate count when a bs is not an exact capture tier."
                     )
-                aligned_verify_tokens.add(row.num_verify_tokens)
+                aligned_verify_tokens.add(
+                    row.verify_tokens_actual if offdiag else row.num_verify_tokens
+                )
             aligned_cts.append(ct)
 
     if len(aligned_cts) < ROUND_WARMUP_STEPS + min_steady_steps:
@@ -1246,6 +1303,9 @@ def append_round_files(
                             "forward_ct": row.forward_ct,
                             "num_running_reqs": row.num_running_reqs,
                             "num_verify_tokens": row.num_verify_tokens,
+                            "verify_tokens_logical": row.verify_tokens_logical,
+                            "verify_tokens_actual": row.verify_tokens_actual,
+                            "verify_used_cuda_graph": row.verify_used_cuda_graph,
                             "step_time": row.step_time,
                         }
                     )
@@ -1271,6 +1331,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "base_url": context.base_url,
+        "control_url": context.control_url,
         "tp_size": context.tp_size,
         "dp_size": context.dp_size,
         "verify_num_draft_tokens": context.verify_num_draft_tokens,
@@ -1375,6 +1436,14 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         default="",
         help="Base URL of the already-running DSpark server, e.g. "
         "http://localhost:30000. The profiler never launches a server.",
+    )
+    parser.add_argument(
+        "--control-url",
+        type=str,
+        default=None,
+        help="Optional direct Decode server URL for /server_info, forced-budget "
+        "control, record polling, and request abort. Keep --base-url pointed "
+        "at the PD router for /generate. Defaults to --base-url.",
     )
     parser.add_argument(
         "--fracs",
@@ -1543,6 +1612,7 @@ def cli_main() -> None:
     if args.command == "run":
         run_profile(
             base_url=args.base_url,
+            control_url=args.control_url,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,
@@ -1560,6 +1630,7 @@ def cli_main() -> None:
     else:
         profile_all(
             base_url=args.base_url,
+            control_url=args.control_url,
             batch_sizes=run_batch_sizes(args=args),
             settings=run_settings(args=args),
             out=args.out,

@@ -182,6 +182,66 @@ class TestCapturedVariantsReadStagedLayout(CustomTestCase):
     Replay stages the live lengths into the tier's registered layout, and both
     lookups must see them from the graphs of every variant."""
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA graph replay")
+    def test_both_cuda_graphs_follow_changing_live_layouts(self):
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = True
+        runner.max_bs = 8
+        runner.captured_req_width = WIDTH
+        runner.capture_num_tokens = [6, 12, 24, 48]
+        runner.device = "cuda"
+        runner._captured_ragged_layouts = {}
+        h = make_hasher("cuda", n=8)
+        history = h.history.clone()
+        slots = torch.zeros(8, dtype=torch.int64, device="cuda")
+        ids, positions = packed_inputs([6, 1], 12, "cuda")
+        graphs = []
+        with envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.override(False):
+            for _ in ("candidate_unfiltered", "candidate_filtered"):
+                layout = runner._capture_ragged_verify_layout(12)
+                batch = verify_batch(slots, positions, layout)
+                h(ids, batch)
+                token_req_indices(batch, num_tokens=12)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    hashes = h(ids, batch)
+                    requests = token_req_indices(batch, num_tokens=12)
+                graphs.append((graph, hashes, requests))
+
+        for lens in ([6, 1], [1], [0, 2, 0, 1], [1] * 8, [0] * 7 + [1], [3, 6]):
+            with self.subTest(lens=lens):
+                total = sum(lens)
+                live = packed_layout(lens, 12, "cuda")
+                runner._stage_ragged_verify_layout(live, 12)
+                slots.zero_()
+                slots[: len(lens)] = torch.arange(len(lens), device="cuda") + 1
+                new_ids, new_positions = packed_inputs(lens, 12, "cuda", seed=total)
+                ids.copy_(new_ids)
+                positions.copy_(new_positions)
+                eager = verify_batch(slots[: len(lens)], positions, live)
+                expected_hashes = h(ids, eager)
+                expected_requests = token_req_indices(eager, num_tokens=12)
+                if len(lens) == slots.numel():
+                    # With no spare request slot, padded_to_bucket assigns the
+                    # tail to the final real row, up to the verify-width cap.
+                    # Padding past that cap still maps to the ghost slot.
+                    tail_in_last_row = min(12 - total, WIDTH - lens[-1])
+                    expected_requests[total : total + tail_in_last_row] = slots[-1]
+                for graph, hashes, requests in graphs:
+                    graph.replay()
+                    torch.testing.assert_close(
+                        hashes[:total], expected_hashes[:total], rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        requests, expected_requests, rtol=0, atol=0
+                    )
+                torch.testing.assert_close(h.history, history, rtol=0, atol=0)
+
     def test_every_variant_maps_tokens_to_live_requests(self):
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,

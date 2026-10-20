@@ -347,7 +347,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and cfg.cp_strategy == "interleave"
         )
         if (
-            read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            (
+                cfg.disaggregation_mode == "prefill"
+                and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+            )
             or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
@@ -356,7 +359,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
+                "DeepSeek-V4.1 DSpark PD requires static verify on prefill, "
+                "Mooncake or NIXL, "
                 "DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "

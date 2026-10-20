@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -17,6 +18,8 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     logger,
     resolve_components,
     resolve_enabled_components,
+    resolve_target_verify_graph_num_tokens,
+    resolve_target_verify_num_tokens,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -84,6 +87,54 @@ def make_obs(
     )
 
 
+class TestTargetVerifyTokenCount(CustomTestCase):
+    def test_graph_capacity_uses_executed_dense_or_ragged_key(self):
+        # PD runtime reproduced bs15: 90 raw rows but a 16-request graph.
+        runner = SimpleNamespace(
+            _replay_graph_key=SimpleNamespace(size=16),
+            captured_req_width=6,
+            ragged_verify_mode=False,
+        )
+        self.assertEqual(
+            resolve_target_verify_graph_num_tokens(runner=runner, used_cuda_graph=True),
+            96,
+        )
+        runner.ragged_verify_mode = True
+        runner._replay_graph_key.size = 84
+        self.assertEqual(
+            resolve_target_verify_graph_num_tokens(runner=runner, used_cuda_graph=True),
+            84,
+        )
+        # Eager fallback must not reuse a stale key from the preceding step.
+        self.assertEqual(
+            resolve_target_verify_graph_num_tokens(
+                runner=runner, used_cuda_graph=False
+            ),
+            -1,
+        )
+
+    def test_only_compact_uses_ragged_graph_rows(self):
+        verify_ids_2d = torch.zeros((4, 6), dtype=torch.int64)
+        layout = type("Layout", (), {"graph_num_tokens": 9})()
+
+        self.assertEqual(
+            resolve_target_verify_num_tokens(
+                is_compact=False,
+                layout=layout,
+                verify_ids_2d=verify_ids_2d,
+            ),
+            24,
+        )
+        self.assertEqual(
+            resolve_target_verify_num_tokens(
+                is_compact=True,
+                layout=layout,
+                verify_ids_2d=verify_ids_2d,
+            ),
+            9,
+        )
+
+
 class TestResolveComponents(CustomTestCase):
     def test_empty_disables(self):
         self.assertEqual(resolve_components(()), set())
@@ -124,6 +175,29 @@ class TestResolveComponents(CustomTestCase):
 
 
 class TestCoreAndCpuTiming(CustomTestCase):
+    def test_logical_rows_are_measured_independently_of_budget_and_padding(self):
+        dumper, _ = make_dumper({"core"})
+        obs = make_obs(forward_ct=1, bs=4, num_verify_tokens=18)
+        obs.mode = "compact"
+        obs.budget = 4
+        obs.verify_lens = torch.tensor([6, 0, 1, 2], dtype=torch.int32)
+        obs.verify_tokens_actual = 24
+        dumper.observe_decode_step(obs)
+        # A later layout update must not change the preceding step's record.
+        obs.verify_lens.fill_(6)
+        record = dumper.dump()["records"][0]
+        self.assertEqual(record["verify_tokens_logical"], 9)
+        self.assertEqual(record["num_verify_tokens"], 18)
+        self.assertEqual(record["verify_tokens_actual"], 24)
+
+    def test_cap_accept_counts_full_target_work(self):
+        dumper, _ = make_dumper({"core"})
+        obs = make_obs(forward_ct=1)
+        obs.mode = "cap-accept"
+        obs.verify_lens = torch.ones(4, dtype=torch.int32)
+        dumper.observe_decode_step(obs)
+        self.assertEqual(dumper.dump()["records"][0]["verify_tokens_logical"], 24)
+
     def test_disabled_dumper_records_nothing(self):
         dumper, clock = make_dumper(set())
         dumper.begin_step()
@@ -172,6 +246,21 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(record["num_running_reqs"], 3)
         self.assertEqual(record["num_verify_tokens"], 18)
         self.assertEqual(record["mode"], "static")
+
+    def test_actual_rows_and_graph_fallback_survive_serialization(self):
+        dumper, _ = make_dumper({"core"})
+        for step, graph, actual, key in [(1, True, 96, 96), (2, False, 90, -1)]:
+            obs = make_obs(forward_ct=step, bs=15, num_verify_tokens=90)
+            obs.verify_tokens_graph_key = key
+            obs.verify_tokens_actual = actual
+            obs.verify_used_cuda_graph = graph
+            dumper.observe_decode_step(obs)
+        records = dumper.dump()["records"]
+        self.assertEqual([r["num_verify_tokens"] for r in records], [90, 90])
+        self.assertEqual([r["verify_tokens_actual"] for r in records], [96, 90])
+        self.assertEqual([r["verify_used_cuda_graph"] for r in records], [True, False])
+        self.assertEqual(records[0]["verify_tokens_graph_key"], 96)
+        self.assertEqual(records[1].get("verify_tokens_graph_key", -1), -1)
 
     def test_core_only_omits_timing_fields(self):
         dumper, clock = make_dumper({"core"})
