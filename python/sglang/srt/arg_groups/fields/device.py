@@ -9,7 +9,6 @@ from typing import (
 )
 
 import msgspec
-
 from sglang.srt.arg_groups.arg_utils import A, Derived
 
 
@@ -72,6 +71,10 @@ class Device(msgspec.Struct):
         "Set soft watchdog timeout in seconds. If a forward batch takes longer than this, the server will dump information for debugging.",
     ] = None
     sleep_on_idle: A[bool, "Reduce CPU usage when sglang is idle."] = False
+    python_thread_switch_interval: A[
+        Optional[float],
+        "Optional positive, finite Python thread switch interval in seconds for each scheduler process. Affects all Python threads in that process; unset preserves interpreter defaults. Does not change CPU affinity or thread priority.",
+    ] = None
     use_ray: A[
         bool,
         "Use Ray actors for scheduler process management.",

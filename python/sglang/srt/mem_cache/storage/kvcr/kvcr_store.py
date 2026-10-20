@@ -27,6 +27,13 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.storage.kvcr.delivery import (
+    Delivery,
+    block_chunks,
+    requested_results,
+    run_window,
+    validate_destination_spans,
+)
 from sglang.srt.mem_cache.storage.kvcr.hints import (
     peer_hint,
     rank_endpoint,
@@ -42,6 +49,28 @@ from sglang.srt.mem_cache.storage.kvcr.layout import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _allocate_dram_pool(length):
+    """Own process-private pages and permit THP before NIXL registers them.
+
+    mmap(-1, length) defaults to shared /dev/zero memory on Linux. Such pages
+    cannot use THP when the host's shmem policy is "never", even if anonymous
+    THP is available. No other process maps this pool; private anonymous memory
+    preserves ownership while avoiding that accidental restriction.
+    """
+    if not hasattr(mmap, "MAP_PRIVATE") or not hasattr(mmap, "MAP_ANONYMOUS"):
+        return mmap.mmap(-1, length)
+    allocation = mmap.mmap(-1, length, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    if hasattr(allocation, "madvise") and hasattr(mmap, "MADV_HUGEPAGE"):
+        try:
+            allocation.madvise(mmap.MADV_HUGEPAGE)
+        except OSError:
+            # Advice is optional: ordinary pages must remain fully functional
+            # on kernels that do not implement or permit transparent huge pages.
+            logger.debug("KVCR DRAM huge-page advice unavailable", exc_info=True)
+    return allocation
+
 
 # Pools HiCache restores as TRAILING_PAGES windows (SWA, its DeepSeek V4
 # compressor states, Mamba): a page need not have state in them.
@@ -100,16 +129,49 @@ class KVCRStore(HiCacheStorage):
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
+        from sglang.srt.mem_cache.storage.kvcr.numa_pool import node_option
+
+        self._local_dram_numa_node = node_option(
+            self._extra.get("local_dram_numa_node"), "local_dram_numa_node"
+        )
+        self._delivery_pipeline_window = self._extra.get("delivery_pipeline_window", 1)
+        if type(
+            self._delivery_pipeline_window
+        ) is not int or self._delivery_pipeline_window not in (1, 4):
+            raise ValueError("delivery_pipeline_window must be integer 1 or 4")
         if "startup_timeout_seconds" in self._extra and (
             type(self._extra["startup_timeout_seconds"]) is not int
             or self._extra["startup_timeout_seconds"] <= 0
         ):
             raise ValueError("startup_timeout_seconds must be a positive integer")
+        if (
+            "coalesce_remote_dram_descriptors" in self._extra
+            and type(self._extra["coalesce_remote_dram_descriptors"]) is not bool
+        ):
+            raise ValueError("coalesce_remote_dram_descriptors must be a boolean")
+        if "nixl_ucx_split_batch_size" in self._extra:
+            split = self._extra["nixl_ucx_split_batch_size"]
+            if type(split) is not int or not 1 <= split <= 2**32 - 1:
+                raise ValueError(
+                    "nixl_ucx_split_batch_size must be a positive uint32 integer"
+                )
         self.prefetch_batch_pages = self._extra.get(
             "prefetch_batch_pages", STORAGE_BATCH_SIZE
         )
         if type(self.prefetch_batch_pages) is not int or self.prefetch_batch_pages <= 0:
             raise ValueError("prefetch_batch_pages must be a positive integer")
+        self.query_batch_pages = self._extra.get(
+            "query_batch_pages", STORAGE_BATCH_SIZE
+        )
+        if (
+            type(self.query_batch_pages) is not int
+            or not 1 <= self.query_batch_pages <= 2048
+        ):
+            raise ValueError("query_batch_pages must be an integer from 1 to 2048")
+        if self.query_batch_pages != STORAGE_BATCH_SIZE and storage_config.is_mla_model:
+            raise ValueError(
+                "query_batch_pages opt-in requires a non-MLA KV-only layout"
+            )
         self._metrics = None
         if storage_config.enable_storage_metrics:
             from sglang.srt.observability.metrics_collector import StorageMetrics
@@ -157,6 +219,12 @@ class KVCRStore(HiCacheStorage):
         if storage_config.pp_size != 1:
             raise ValueError("KVCR HiCacheStorage currently requires PP=1")
         self.register_mem_pool_host(mem_pool_host)
+        if self.query_batch_pages != STORAGE_BATCH_SIZE and set(self._layouts) != {
+            "kv"
+        }:
+            raise ValueError(
+                "query_batch_pages opt-in requires a non-MLA KV-only layout"
+            )
 
     def register_mem_pool_host(self, mem_pool_host):
         self.mem_pool_host = mem_pool_host
@@ -167,6 +235,12 @@ class KVCRStore(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool, host_pool_name):
         name = str(host_pool_name)
         with self._lock:
+            if self.query_batch_pages != STORAGE_BATCH_SIZE and name != str(
+                PoolName.KV
+            ):
+                raise ValueError(
+                    "query_batch_pages opt-in requires a non-MLA KV-only layout"
+                )
             if self._share_replicated_mla and name not in ("kv", "indexer"):
                 raise ValueError(
                     "Shared MLA storage only supports replicated KV/indexer pools"
@@ -193,7 +267,6 @@ class KVCRStore(HiCacheStorage):
         from kvcr.config import KVCRBackendConfigs, KVCRConfig, LocalDramOptions
         from kvcr.control_channels import ZmqPeerControlChannel
         from kvcr.types import KVCRStartupError, RegionDescriptor
-
         from sglang.srt.mem_cache.storage.kvcr.diagnostics import DiagnosticStats
 
         if not self._layouts:
@@ -261,8 +334,14 @@ class KVCRStore(HiCacheStorage):
         with ExitStack() as resources:
             resources.callback(channel.close)
             for name, length in plans:
-                allocation = mmap.mmap(-1, length)
+                allocation = _allocate_dram_pool(length)
                 resources.callback(allocation.close)
+                if self._local_dram_numa_node is not None:
+                    from sglang.srt.mem_cache.storage.kvcr.numa_pool import (
+                        bind_new_private_pool,
+                    )
+
+                    bind_new_private_pool(allocation, self._local_dram_numa_node)
                 mappings.append(allocation)
                 address = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
                 allocations.append((name, address, length))
@@ -274,6 +353,14 @@ class KVCRStore(HiCacheStorage):
                     if "startup_timeout_seconds" in self._extra
                     else {}
                 )
+                # Leave the default off and omit the new keyword for older
+                # KVCR versions unless this experimental path is opted into.
+                if self._extra.get("coalesce_remote_dram_descriptors", False):
+                    startup_options["coalesce_remote_dram_descriptors"] = True
+                if "nixl_ucx_split_batch_size" in self._extra:
+                    startup_options["nixl_ucx_split_batch_size"] = self._extra[
+                        "nixl_ucx_split_batch_size"
+                    ]
                 self._runner = KVCR(
                     config=KVCRConfig(
                         nixl_agent_name=self._agent_name,
@@ -534,6 +621,8 @@ class KVCRStore(HiCacheStorage):
                     groups[name].append((identity, False))
             if not blocks:
                 return {name: [True] * len(group) for name, group in groups.items()}
+            if not is_set and self._delivery_pipeline_window == 4:
+                validate_destination_spans(blocks, self._layouts)
             described = time.perf_counter() if diagnostic else None
             started = time.perf_counter() if self._metrics is not None else None
             sequence = None
@@ -556,142 +645,158 @@ class KVCRStore(HiCacheStorage):
             aligned = time.perf_counter() if diagnostic else None
             with self._hint(extra_info, keys=None if is_set else blocks) as request_id:
                 prepared = time.perf_counter() if diagnostic else None
-                handle = (
-                    self._runner.deposit(blocks)
-                    if is_set
-                    else self._runner.deliver(blocks, request_id=request_id)
-                )
-                submitted = time.perf_counter() if diagnostic else None
-                # _wait releases the condition's recursive lock while sleeping.
-                result = self._wait(handle)
-                finished = time.perf_counter() if diagnostic else None
-                if diagnostic:
-                    logger.info(
-                        "KVCR L3 operation %s",
-                        json.dumps(
-                            {
-                                "epoch": time.time(),
-                                "start_epoch": entered_epoch,
-                                "agent": self._agent_name,
-                                "endpoint": self._control_endpoint,
-                                "operation": handle,
-                                "stage": "primary",
-                                "direction": "deposit" if is_set else "deliver",
-                                "source": (
-                                    self._operation_hint(extra_info, blocks)["actions"][
-                                        0
-                                    ]["payload"]["source_control_endpoint"]
-                                    if request_id is not None
-                                    else None
-                                ),
-                                "lock_wait_ms": (acquired - entered) * 1000,
-                                "prepare_ms": (prepared - acquired) * 1000,
-                                "descriptor_ms": (described - acquired) * 1000,
-                                "align_before_ms": (aligned - described) * 1000,
-                                "hint_ms": (prepared - aligned) * 1000,
-                                "submit_ms": (submitted - prepared) * 1000,
-                                "wait_ms": (finished - submitted) * 1000,
-                                "requested_blocks": len(blocks),
-                                "requested_spans": sum(map(len, blocks.values())),
-                                "pools": [str(t.name) for t in transfers],
-                                "failed_keys": [
-                                    key.decode()
-                                    for key in blocks
-                                    if key not in result or not result[key].success
-                                ],
-                            },
-                            separators=(",", ":"),
-                        ),
+                if not is_set and self._delivery_pipeline_window == 4:
+                    result = self._deliver_pipeline(
+                        blocks,
+                        transfers,
+                        extra_info,
+                        request_id,
+                        entered=entered,
+                        entered_epoch=entered_epoch,
+                        acquired=acquired,
+                        described=described,
+                        aligned=aligned,
+                        prepared=prepared,
                     )
-                if (
-                    not is_set
-                    and self._share_replicated_mla
-                    and self.config.tp_rank != 0
-                    and request_id is not None
-                ):
-                    failed = {
-                        key: refs
-                        for key, refs in blocks.items()
-                        if key not in result or not result[key].success
-                    }
+                else:
+                    handle = (
+                        self._runner.deposit(blocks)
+                        if is_set
+                        else self._runner.deliver(blocks, request_id=request_id)
+                    )
+                    submitted = time.perf_counter() if diagnostic else None
+                    # _wait releases the condition's recursive lock while sleeping.
+                    result = self._wait(handle)
+                    finished = time.perf_counter() if diagnostic else None
+                    if diagnostic:
+                        logger.info(
+                            "KVCR L3 operation %s",
+                            json.dumps(
+                                {
+                                    "epoch": time.time(),
+                                    "start_epoch": entered_epoch,
+                                    "agent": self._agent_name,
+                                    "endpoint": self._control_endpoint,
+                                    "operation": handle,
+                                    "stage": "primary",
+                                    "direction": "deposit" if is_set else "deliver",
+                                    "source": (
+                                        self._operation_hint(extra_info, blocks)[
+                                            "actions"
+                                        ][0]["payload"]["source_control_endpoint"]
+                                        if request_id is not None
+                                        else None
+                                    ),
+                                    "lock_wait_ms": (acquired - entered) * 1000,
+                                    "prepare_ms": (prepared - acquired) * 1000,
+                                    "descriptor_ms": (described - acquired) * 1000,
+                                    "align_before_ms": (aligned - described) * 1000,
+                                    "hint_ms": (prepared - aligned) * 1000,
+                                    "submit_ms": (submitted - prepared) * 1000,
+                                    "wait_ms": (finished - submitted) * 1000,
+                                    "requested_blocks": len(blocks),
+                                    "requested_spans": sum(map(len, blocks.values())),
+                                    "pools": [str(t.name) for t in transfers],
+                                    "failed_keys": [
+                                        key.decode()
+                                        for key in blocks
+                                        if key not in result or not result[key].success
+                                    ],
+                                },
+                                separators=(",", ":"),
+                            ),
+                        )
                     if (
-                        failed
-                        and self._operation_hint(extra_info, blocks)["actions"][0][
-                            "payload"
-                        ]["source_control_endpoint"]
-                        != self._owner_endpoint
+                        not is_set
+                        and self._share_replicated_mla
+                        and self.config.tp_rank != 0
+                        and request_id is not None
                     ):
-                        # An external hint must not hide this replica's own
-                        # TP0-resident pages. Retry only terminal misses, under
-                        # a fresh scope, while HiCache still owns every slot.
-                        # Successful external pages are never written again;
-                        # uncertain native transfers still terminate the worker.
-                        fallback_epoch = time.time() if diagnostic else None
-                        fallback_started = time.perf_counter() if diagnostic else None
-                        with self._hint(None, failed) as owner_request_id:
-                            fallback_prepared = (
-                                time.perf_counter() if diagnostic else None
-                            )
-                            fallback_handle = self._runner.deliver(
-                                failed, request_id=owner_request_id
-                            )
-                            fallback_submitted = (
-                                time.perf_counter() if diagnostic else None
-                            )
-                            recovered = self._wait(fallback_handle)
-                            fallback_finished = (
-                                time.perf_counter() if diagnostic else None
-                            )
-                        if diagnostic:
-                            logger.info(
-                                "KVCR L3 operation %s",
-                                json.dumps(
-                                    {
-                                        "epoch": time.time(),
-                                        "start_epoch": fallback_epoch,
-                                        "agent": self._agent_name,
-                                        "endpoint": self._control_endpoint,
-                                        "operation": fallback_handle,
-                                        "parent_operation": handle,
-                                        "stage": "replica-local-fallback",
-                                        "direction": "deliver",
-                                        "source": self._owner_endpoint,
-                                        "lock_wait_ms": 0,
-                                        "prepare_ms": (
-                                            fallback_prepared - fallback_started
-                                        )
-                                        * 1000,
-                                        "submit_ms": (
-                                            fallback_submitted - fallback_prepared
-                                        )
-                                        * 1000,
-                                        "wait_ms": (
-                                            fallback_finished - fallback_submitted
-                                        )
-                                        * 1000,
-                                        "requested_blocks": len(failed),
-                                        "requested_spans": sum(
-                                            map(len, failed.values())
-                                        ),
-                                        "pools": [str(t.name) for t in transfers],
-                                        "failed_keys": [
-                                            key.decode()
-                                            for key in failed
-                                            if key not in recovered
-                                            or not recovered[key].success
-                                        ],
-                                    },
-                                    separators=(",", ":"),
-                                ),
-                            )
-                        result = {
-                            **result,
-                            **{
-                                key: recovered[key]
-                                for key in failed
-                                if key in recovered
-                            },
+                        failed = {
+                            key: refs
+                            for key, refs in blocks.items()
+                            if key not in result or not result[key].success
                         }
+                        if (
+                            failed
+                            and self._operation_hint(extra_info, blocks)["actions"][0][
+                                "payload"
+                            ]["source_control_endpoint"]
+                            != self._owner_endpoint
+                        ):
+                            # An external hint must not hide this replica's own
+                            # TP0-resident pages. Retry only terminal misses, under
+                            # a fresh scope, while HiCache still owns every slot.
+                            # Successful external pages are never written again;
+                            # uncertain native transfers still terminate the worker.
+                            fallback_epoch = time.time() if diagnostic else None
+                            fallback_started = (
+                                time.perf_counter() if diagnostic else None
+                            )
+                            with self._hint(None, failed) as owner_request_id:
+                                fallback_prepared = (
+                                    time.perf_counter() if diagnostic else None
+                                )
+                                fallback_handle = self._runner.deliver(
+                                    failed, request_id=owner_request_id
+                                )
+                                fallback_submitted = (
+                                    time.perf_counter() if diagnostic else None
+                                )
+                                recovered = self._wait(fallback_handle)
+                                fallback_finished = (
+                                    time.perf_counter() if diagnostic else None
+                                )
+                            if diagnostic:
+                                logger.info(
+                                    "KVCR L3 operation %s",
+                                    json.dumps(
+                                        {
+                                            "epoch": time.time(),
+                                            "start_epoch": fallback_epoch,
+                                            "agent": self._agent_name,
+                                            "endpoint": self._control_endpoint,
+                                            "operation": fallback_handle,
+                                            "parent_operation": handle,
+                                            "stage": "replica-local-fallback",
+                                            "direction": "deliver",
+                                            "source": self._owner_endpoint,
+                                            "lock_wait_ms": 0,
+                                            "prepare_ms": (
+                                                fallback_prepared - fallback_started
+                                            )
+                                            * 1000,
+                                            "submit_ms": (
+                                                fallback_submitted - fallback_prepared
+                                            )
+                                            * 1000,
+                                            "wait_ms": (
+                                                fallback_finished - fallback_submitted
+                                            )
+                                            * 1000,
+                                            "requested_blocks": len(failed),
+                                            "requested_spans": sum(
+                                                map(len, failed.values())
+                                            ),
+                                            "pools": [str(t.name) for t in transfers],
+                                            "failed_keys": [
+                                                key.decode()
+                                                for key in failed
+                                                if key not in recovered
+                                                or not recovered[key].success
+                                            ],
+                                        },
+                                        separators=(",", ":"),
+                                    ),
+                                )
+                            result = {
+                                **result,
+                                **{
+                                    key: recovered[key]
+                                    for key in failed
+                                    if key in recovered
+                                },
+                            }
                 if sequence is not None:
                     self._runner.align_sequence(sequence, use_current_time=True)
                 if self._verify_transfer_bytes:
@@ -721,6 +826,124 @@ class KVCRStore(HiCacheStorage):
             ]
             for name, group in groups.items()
         }
+
+    def _deliver_pipeline(
+        self,
+        blocks,
+        transfers,
+        extra_info,
+        request_id,
+        *,
+        entered,
+        entered_epoch,
+        acquired,
+        described,
+        aligned,
+        prepared,
+    ):
+        """Run inside the primary hint; retain original per-handle diagnostics."""
+        seen_handles = set()
+        primary = run_window(
+            self,
+            (Delivery(chunk) for chunk in block_chunks(blocks)),
+            request_id,
+            seen_handles,
+        )
+        # No result objects or diagnostic callbacks are touched while any
+        # primary write is outstanding. In particular, a miss cannot stop drain.
+        result = requested_results(primary)
+        hint = self._operation_hint(extra_info, blocks) if request_id else None
+        source = (
+            hint["actions"][0]["payload"]["source_control_endpoint"] if hint else None
+        )
+        fallback = []
+        if (
+            self._share_replicated_mla
+            and self.config.tp_rank != 0
+            and request_id is not None
+            and source != self._owner_endpoint
+        ):
+            # Retain the primary chunk as the fallback's parent even if a
+            # subset of that chunk failed. Never resubmit successful entries.
+            for delivery in primary:
+                failed = {
+                    key: refs
+                    for key, refs in delivery.blocks.items()
+                    if key not in result or not result[key].success
+                }
+                if failed:
+                    fallback.append(Delivery(failed, delivery.operation))
+            if fallback:
+                failed_blocks = {
+                    key: refs for item in fallback for key, refs in item.blocks.items()
+                }
+                fallback_started = (
+                    time.perf_counter() if self._diagnostic_telemetry else None
+                )
+                with self._hint(None, failed_blocks) as owner_request_id:
+                    fallback_prepared = (
+                        time.perf_counter() if self._diagnostic_telemetry else None
+                    )
+                    fallback = run_window(
+                        self, fallback, owner_request_id, seen_handles
+                    )
+                result.update(requested_results(fallback))
+        if self._diagnostic_telemetry:
+            # Both phases are now terminal, including all misses. Logging,
+            # JSON encoding and user-defined result properties may all throw.
+            for chunk_index, delivery in enumerate([*primary, *fallback]):
+                is_primary = delivery.parent_operation is None
+                first_primary = delivery is primary[0]
+                first_fallback = bool(fallback) and delivery is fallback[0]
+                fields = {
+                    "epoch": delivery.finished_epoch,
+                    "start_epoch": delivery.prepared_epoch,
+                    "logical_start_epoch": entered_epoch,
+                    "delivery_pipeline_window": 4,
+                    "pipeline_chunk_index": chunk_index,
+                    "agent": self._agent_name,
+                    "endpoint": self._control_endpoint,
+                    "operation": delivery.operation,
+                    "stage": "primary" if is_primary else "replica-local-fallback",
+                    "direction": "deliver",
+                    "source": source if is_primary else self._owner_endpoint,
+                    "lock_wait_ms": (acquired - entered) * 1000 if first_primary else 0,
+                    "prepare_ms": (
+                        prepared - acquired
+                        if first_primary
+                        else fallback_prepared - fallback_started
+                        if first_fallback
+                        else 0
+                    )
+                    * 1000,
+                    "submit_ms": (delivery.submitted - delivery.prepared) * 1000,
+                    "wait_ms": (delivery.finished - delivery.submitted) * 1000,
+                    "requested_blocks": len(delivery.blocks),
+                    "requested_spans": sum(map(len, delivery.blocks.values())),
+                    "pools": [str(t.name) for t in transfers],
+                    "failed_keys": [
+                        key.decode()
+                        for key in delivery.blocks
+                        if key not in delivery.result
+                        or not delivery.result[key].success
+                    ],
+                }
+                if is_primary:
+                    fields.update(
+                        descriptor_ms=(described - acquired) * 1000
+                        if first_primary
+                        else 0,
+                        align_before_ms=(aligned - described) * 1000
+                        if first_primary
+                        else 0,
+                        hint_ms=(prepared - aligned) * 1000 if first_primary else 0,
+                    )
+                else:
+                    fields["parent_operation"] = delivery.parent_operation
+                logger.info(
+                    "KVCR L3 operation %s", json.dumps(fields, separators=(",", ":"))
+                )
+        return result
 
     def _record_metrics(self, transfers, blocks, results, *, elapsed, is_set):
         """Count completed logical pages once, but every transferred byte.

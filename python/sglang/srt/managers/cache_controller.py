@@ -22,7 +22,6 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
-
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -1315,8 +1314,9 @@ class HiCacheController:
         )
         operation.all_hash_values = page_hashes
 
-        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
-            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
+        batch_pages = self.storage_backend.query_batch_pages
+        for start in range(0, len(page_hashes), batch_pages):
+            batch_hashes = page_hashes[start : start + batch_pages]
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys, extra_info={"kv_hints": operation.kv_hints}
             )
