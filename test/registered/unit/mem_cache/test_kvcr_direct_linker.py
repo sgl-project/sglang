@@ -465,6 +465,10 @@ class TestKVCRDirectLinker(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "DMA still active"):
             self.linker.close()
         self.assertFalse(self.runtime.closed)
+        self.assertTrue(self.linker._thread.is_alive())
+        self.runtime.close_error = False
+        self.linker.close()
+        self.assertTrue(self.runtime.closed)
 
     def test_owner_failure_unblocks_finish_without_releasing_native_memory(self):
         """A poll failure after finish subscribes must not strand its waiter."""
@@ -491,10 +495,6 @@ class TestKVCRDirectLinker(CustomTestCase):
         finally:
             self.linker.close()
             waiter.join(timeout=2)
-        self.assertTrue(self.linker._thread.is_alive())
-        self.runtime.close_error = False
-        self.linker.close()
-        self.assertTrue(self.runtime.closed)
 
     def test_lookup_checks_all_and_trailing_boundaries_for_physical_pools(self):
         from sglang.srt.mem_cache.storage.kvcr.device_layout import KVCRLayout
