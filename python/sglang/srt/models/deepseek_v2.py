@@ -1401,7 +1401,9 @@ class DeepseekV2MoE(nn.Module):
                     pre_quant_input=pre_quant_input,
                 )
             topk_output = (
-                _hip_moe.smallm_router_topk_output(self, hidden_states)
+                _hip_moe.smallm_router_topk_output(
+                    self, hidden_states, num_token_non_padded
+                )
                 if _use_aiter_gfx95 and not use_vision_topk and dispatch_info is None
                 else None
             )

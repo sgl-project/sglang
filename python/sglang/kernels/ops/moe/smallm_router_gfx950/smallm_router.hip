@@ -182,13 +182,14 @@ extern "C" __global__ void __launch_bounds__(256) smallm_router_r2(Args a) { rou
 
 // GLM-5.x (noaux_tc, one group): rows [b*R, b*R+R) of W_gate (288 rows). The last block, one wave per token:
 // bf16-round, s = sigmoid, top-8 of s + bias (fp32, lowest id wins ties), w = s / sum(s) * rsf, slot 8 = shared
-// expert 288 with weight shared_w.
+// expert 288 with weight shared_w. Rows m >= *n_valid (CUDA-graph padding; n_valid may be null) get the
+// unfused path's padded row: routed ids 0, shared id 288, every weight 0.
 struct __attribute__((packed)) GlmArgs {
     const uint16_t* x; const uint16_t* wg; const float* bias;
-    int32_t* ids; float* wts; float* logits; int32_t* cnt;
+    int32_t* ids; float* wts; float* logits; int32_t* cnt; const int32_t* n_valid;
     int32_t tok, x_stride; float rsf, shared_w;
 };
-static_assert(sizeof(GlmArgs) == 72, "kernarg ABI drift: keep in sync with GlmArgs in __init__.py");
+static_assert(sizeof(GlmArgs) == 80, "kernarg ABI drift: keep in sync with GlmArgs in __init__.py");
 
 static constexpr int G_E = 288, G_TOPK = 8, G_SLOTS = G_TOPK + 1, G_LROW = 320, G_MAX_TOK = 16, G_J = 5;
 
@@ -214,11 +215,12 @@ __device__ __forceinline__ void glm_router_body(const GlmArgs& a) {
     __shared__ int s_flag;
     const int tid = threadIdx.x, lane = tid & 63, wave = tid >> 6, tok = a.tok, row0 = blockIdx.x * R;
 
-    // the top-k candidates are lane-major (lane L holds experts L*G_J ..): the last block's bias loads are
-    // issued here, ahead of its GEMV, instead of after the acquire
+    // the top-k candidates are lane-major (lane L holds experts L*G_J ..): the last block's bias and n_valid
+    // loads are issued here, ahead of its GEMV, instead of after the acquire
     float bias[G_J];
 #pragma unroll
     for (int j = 0; j < G_J; ++j) bias[j] = lane * G_J + j < G_E ? a.bias[lane * G_J + j] : 0.f;
+    const int n_valid = a.n_valid ? *a.n_valid : tok;
 
     uint32_t w[R][NC][NU];
 #pragma unroll
@@ -271,6 +273,7 @@ __device__ __forceinline__ void glm_router_body(const GlmArgs& a) {
     // agent-scope loads read past the XCD-local L2 the peers' write-through stores skipped; an acquire fence
     // would invalidate that L2 once per wave instead
     const int m = wave;
+    const bool pad = m >= n_valid;
     const float* lg = a.logits + m * G_LROW + lane * G_J;
     float s[G_J];
     uint32_t key[G_J], id[G_J];
@@ -315,11 +318,11 @@ __device__ __forceinline__ void glm_router_body(const GlmArgs& a) {
     float ssum = wave_sum(lane < G_TOPK ? mine_s : 0.f);
     ssum = ssum > 0.f ? ssum : 1.f;
     if (lane < G_TOPK) {
-        a.ids[m * G_SLOTS + lane] = mine_id;
-        a.wts[m * G_SLOTS + lane] = mine_s / ssum * a.rsf;
+        a.ids[m * G_SLOTS + lane] = pad ? 0 : mine_id;
+        a.wts[m * G_SLOTS + lane] = pad ? 0.f : mine_s / ssum * a.rsf;
     } else if (lane == G_TOPK) {
         a.ids[m * G_SLOTS + G_TOPK] = G_E;
-        a.wts[m * G_SLOTS + G_TOPK] = a.shared_w;
+        a.wts[m * G_SLOTS + G_TOPK] = pad ? 0.f : a.shared_w;
     }
 }
 

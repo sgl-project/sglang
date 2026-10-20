@@ -11,7 +11,7 @@ import tempfile
 
 import torch
 
-from sglang.kernels.ops.moe.smallm_moe_gfx950 import _check, _hip_lib, _hipcc, _Kernel
+from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_gfx95_supported
 
@@ -42,7 +42,8 @@ class Args(ctypes.Structure):
 class GlmArgs(ctypes.Structure):
     _pack_ = 1
     _fields_ = [
-        (n, ctypes.c_void_p) for n in ("x", "wg", "bias", "ids", "wts", "logits", "cnt")
+        (n, ctypes.c_void_p)
+        for n in ("x", "wg", "bias", "ids", "wts", "logits", "cnt", "n_valid")
     ] + [
         ("tok", ctypes.c_int32),
         ("x_stride", ctypes.c_int32),
@@ -58,15 +59,15 @@ def _load() -> bool:
     if _disabled:
         return False
     co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_router_"), "r.co")
-    cmd = [_hipcc(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
+    cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
         mod = ctypes.c_void_p()
-        _check(_hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
+        check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load")
         for r in (1, 2):
-            _kernels[r] = _Kernel(mod, f"smallm_router_r{r}")
+            _kernels[r] = HipKernel(mod, f"smallm_router_r{r}")
         for v in _GLM_VARIANTS:
-            _kernels[("glm", v)] = _Kernel(mod, "smallm_router_glm_r%d_t%d_w%d" % v)
+            _kernels[("glm", v)] = HipKernel(mod, "smallm_router_glm_r%d_t%d_w%d" % v)
     except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
         logger.warning("smallm_router disabled: %s", e)
         _kernels.clear()
@@ -170,9 +171,18 @@ def _glm_variant(tok):
     return (2, 8, 8) if tok <= 8 else (2, 8, 16)
 
 
-def smallm_router_glm(x, gate_weight, bias, rsf, shared_w=1.0, variant=None):
+def smallm_router_glm(
+    x,
+    gate_weight,
+    bias,
+    rsf,
+    shared_w=1.0,
+    variant=None,
+    num_token_non_padded=None,
+):
     """GLM-5.x noaux_tc router: (topk_weights [M, 9] fp32, topk_ids [M, 9] int32), slot 8 = shared expert 288, or
-    None if unavailable (build failure, first call under graph capture)."""
+    None if unavailable (build failure, first call under graph capture). Rows from num_token_non_padded (a
+    1-element device tensor) on get routed ids 0 and zero weights, as on the unfused path."""
     key = ("glm", x.device)
     ws = _ws.get(key)
     if ws is None:
@@ -187,9 +197,17 @@ def smallm_router_glm(x, gate_weight, bias, rsf, shared_w=1.0, variant=None):
     tok = x.shape[0]
     ids = torch.empty(tok, GLM_TOPK + 1, dtype=torch.int32, device=x.device)
     wts = torch.empty(tok, GLM_TOPK + 1, dtype=torch.float32, device=x.device)
+    n_valid = None
+    if num_token_non_padded is not None:
+        n_valid = num_token_non_padded.to(device=x.device, dtype=torch.int32)
     ptrs = (x, gate_weight, bias, ids, wts, *ws)
     args = GlmArgs(
-        *(t.data_ptr() for t in ptrs), tok, x.stride(0), float(rsf), float(shared_w)
+        *(t.data_ptr() for t in ptrs),
+        None if n_valid is None else n_valid.data_ptr(),
+        tok,
+        x.stride(0),
+        float(rsf),
+        float(shared_w),
     )
     variant = variant or _glm_variant(tok)
     stream = torch.cuda.current_stream().cuda_stream
@@ -199,7 +217,7 @@ def smallm_router_glm(x, gate_weight, bias, rsf, shared_w=1.0, variant=None):
     return wts, ids
 
 
-def glm_moe_topk_output(moe, hidden_states):
+def glm_moe_topk_output(moe, hidden_states, num_token_non_padded=None):
     """StandardTopKOutput for a GLM-5.x DeepseekV2MoE (sigmoid noaux_tc, one fused shared expert) on the aiter
     path, or None (unfused path)."""
     from sglang.srt.eplb.expert_distribution import (
@@ -258,7 +276,12 @@ def glm_moe_topk_output(moe, hidden_states):
     shared_w = cfg.fused_shared_experts_scaling_factor
     shared_w = 1.0 if shared_w is None else shared_w
     out = smallm_router_glm(
-        hidden_states, moe.gate.weight, cfg.correction_bias, rsf, shared_w
+        hidden_states,
+        moe.gate.weight,
+        cfg.correction_bias,
+        rsf,
+        shared_w,
+        num_token_non_padded=num_token_non_padded,
     )
     if out is None:
         return None

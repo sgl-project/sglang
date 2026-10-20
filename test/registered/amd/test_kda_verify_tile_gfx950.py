@@ -17,7 +17,7 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 )
 class TestKDAVerifyTileGfx950(CustomTestCase):
     def test_launch_config_boundaries(self):
-        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             _select_recurrent_launch_config as cfg,
         )
 
@@ -30,7 +30,7 @@ class TestKDAVerifyTileGfx950(CustomTestCase):
         self.assertEqual(cfg(1, 16, 16, 64, 64, True, True), (32, 1))
 
     def test_narrow_tile_is_bit_exact(self):
-        import sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent as R
+        import sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent as R
 
         torch.manual_seed(0)
         H, K, T = 16, 128, 6

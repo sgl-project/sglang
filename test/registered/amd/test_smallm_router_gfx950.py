@@ -104,6 +104,105 @@ class TestSmallMRouterGfx950(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(gids, ids) and torch.equal(gw, w))
 
+    def _glm_inputs(self, R, tok):
+        torch.manual_seed(0)
+        wg = self._ints(R.GLM_E, 4096, bound=1) / 64
+        bias = 7.4 + 0.4 * torch.rand(R.GLM_E, device="cuda")
+        return self._ints(tok, 4096, bound=2), wg, bias
+
+    def _assert_padded_rows(self, R, w, ids, n_valid, shared_w):
+        self.assertTrue(bool((ids[n_valid:, : R.GLM_TOPK] == 0).all()))
+        self.assertTrue(bool((ids[n_valid:, R.GLM_TOPK] == R.GLM_E).all()))
+        self.assertTrue(bool((w[n_valid:] == 0).all()))
+        self.assertTrue(bool((w[:n_valid, R.GLM_TOPK] == shared_w).all()))
+
+    def test_glm_router_padded_rows(self):
+        from sglang.kernels.ops.moe import smallm_router_gfx950 as R
+
+        rsf, shared_w = 2.5, 0.75
+        for tok in (4, 8, 16):
+            x, wg, bias = self._glm_inputs(R, tok)
+            w, ids = R.smallm_router_glm(x, wg, bias, rsf, shared_w)
+            for n_valid in (0, 1, tok - 1, tok):
+                n = torch.tensor(n_valid, dtype=torch.int32, device="cuda")
+                pw, pids = R.smallm_router_glm(
+                    x, wg, bias, rsf, shared_w, num_token_non_padded=n
+                )
+                msg = f"tok={tok} n_valid={n_valid}"
+                self.assertTrue(torch.equal(pids[:n_valid], ids[:n_valid]), msg)
+                self.assertTrue(torch.equal(pw[:n_valid], w[:n_valid]), msg)
+                self._assert_padded_rows(R, pw, pids, n_valid, shared_w)
+
+        # the bound is read at replay, as cuda_graph_runner refills it in place for each batch
+        n = torch.tensor(tok, dtype=torch.int32, device="cuda")
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            gw, gids = R.smallm_router_glm(
+                x, wg, bias, rsf, shared_w, num_token_non_padded=n
+            )
+        for n_valid in (tok, 5, 1):
+            n.fill_(n_valid)
+            g.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(gids[:n_valid], ids[:n_valid]), n_valid)
+            self.assertTrue(torch.equal(gw[:n_valid], w[:n_valid]), n_valid)
+            self._assert_padded_rows(R, gw, gids, n_valid, shared_w)
+
+    def test_glm_router_matches_unfused_path(self):
+        from sglang.kernels.ops.moe import smallm_router_gfx950 as R
+        from sglang.srt.configs.shared_experts import SharedExpertsConfig
+        from sglang.srt.layers.moe import topk as topk_mod
+
+        if not topk_mod._use_aiter:
+            self.skipTest("needs SGLANG_USE_AITER=1 (set by AMD CI)")
+        # the token count crosses GLM_MAX_TOK here, so rows 0..15 must route the same on both sides of it: the
+        # fused kernel at M = 16 and the aiter path that M = 17 falls back to, fp32 bias and padding included
+        rsf, shared_w = 2.5, 0.75
+        x, wg, bias = self._glm_inputs(R, R.GLM_MAX_TOK + 1)
+        cfg = topk_mod.TopKConfig(
+            top_k=R.GLM_TOPK + 1,
+            use_grouped_topk=True,
+            num_expert_group=1,
+            topk_group=1,
+            renormalize=True,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
+            correction_bias=bias,
+            fp32_correction_bias=True,
+            scoring_func="sigmoid",
+            routed_scaling_factor=rsf,
+            fused_shared_experts_scaling_factor=shared_w,
+        )
+        self.assertFalse(R.smallm_router_supported(x, R.GLM_MAX_TOK))
+        logits = (x.double() @ wg.double().T).bfloat16()
+        for n_valid in (None, R.GLM_MAX_TOK - 3):
+            n = None
+            if n_valid is not None:
+                n = torch.tensor(n_valid, dtype=torch.int32, device="cuda")
+            ref = topk_mod.select_experts(x, logits, cfg, num_token_non_padded=n)
+            x16 = x[: R.GLM_MAX_TOK]
+            self.assertTrue(R.smallm_router_supported(x16, R.GLM_MAX_TOK))
+            w, ids = R.smallm_router_glm(
+                x16, wg, bias, rsf, shared_w, num_token_non_padded=n
+            )
+            ref_ids = ref.topk_ids[: R.GLM_MAX_TOK].int()
+            ref_w = ref.topk_weights[: R.GLM_MAX_TOK].float()
+            # the routed slots are a set: order them by id on both sides
+            got = ids[:, : R.GLM_TOPK].sort(1)
+            exp = ref_ids[:, : R.GLM_TOPK].sort(1)
+            msg = f"n_valid={n_valid}"
+            self.assertTrue(torch.equal(got.values, exp.values), msg)
+            self.assertTrue(
+                torch.equal(ids[:, R.GLM_TOPK], ref_ids[:, R.GLM_TOPK]), msg
+            )
+            torch.testing.assert_close(
+                w[:, : R.GLM_TOPK].gather(1, got.indices),
+                ref_w[:, : R.GLM_TOPK].gather(1, exp.indices),
+                atol=1e-5,
+                rtol=1e-5,
+                msg=msg,
+            )
+            torch.testing.assert_close(w[:, R.GLM_TOPK], ref_w[:, R.GLM_TOPK], msg=msg)
+
     def test_glm_router_ties(self):
         from sglang.kernels.ops.moe import smallm_router_gfx950 as R
 

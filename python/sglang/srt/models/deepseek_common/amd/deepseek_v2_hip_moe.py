@@ -54,9 +54,13 @@ def forward_gate(
     return moe.gate(hidden_states, gemm_output_zero_allocator), None
 
 
-def smallm_router_topk_output(moe, hidden_states: torch.Tensor):
+def smallm_router_topk_output(
+    moe,
+    hidden_states: torch.Tensor,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+):
     """The one-launch gate + top-k of moe (a DeepseekV2MoE) on gfx950 small batches, or None
     when the shape or config is not covered (GLM-5.x only)."""
     from sglang.kernels.ops.moe.smallm_router_gfx950 import glm_moe_topk_output
 
-    return glm_moe_topk_output(moe, hidden_states)
+    return glm_moe_topk_output(moe, hidden_states, num_token_non_padded)
