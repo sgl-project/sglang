@@ -353,16 +353,9 @@ RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.t
 # Base image 1250 with ROCm 10.1.0 and args (Python 3.12 + torch 2.12)
 FROM $BASE_IMAGE_1250_ROCM1010 AS gfx1250-rocm1010
 ENV BUILD_VLLM="0"
-# The SDK's Triton keeps block pointers but faults on gfx1250 in the software
-# pipeliner from num_stages=2 up, and ships no triton_kernels. Build the same
-# revision as the rocm1000 flavor instead and put the block pointers back, so
-# this image has a pipeliner, triton_kernels and the FLA kernels at once.
-ENV BUILD_TRITON="1"
-ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
-# triton-lang/triton#10833 removed block pointers, which sglang's FLA kernels
-# (fla/, used by Qwen3-Next, MiniMax and Kimi Linear) still call. The revert is
-# pure Python: #9668 had already moved block pointers out of C++/MLIR.
-ENV TRITON_REVERT_COMMITS_DEFAULT="9debefe44117a44c274b05033cfe9e4858883b86"
+# Keep the SDK Triton. The rocm1000 source build drops block pointers and
+# triton_kernels (triton-lang/triton#10833). sglang still needs both.
+ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
@@ -405,8 +398,6 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
-ARG TRITON_REVERT_COMMITS=""
-ENV TRITON_REVERT_COMMITS="${TRITON_REVERT_COMMITS:-${TRITON_REVERT_COMMITS_DEFAULT}}"
 
 # ROCm 7.2 Triton (BUILD_TRITON=1 stages only). Both wheels are the same
 # upstream revision, triton-lang/triton@89002410. AITER only requires
@@ -1176,21 +1167,13 @@ RUN cd /tmp/whl \
 # torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         case "${GPU_ARCH}" in \
-          gfx1250-rocm1000|gfx1250-rocm1010) \
+          gfx1250-rocm1000) \
             echo "[Triton] gfx1250: building ${TRITON_COMMIT} from source"; \
             pip uninstall -y triton triton-rocm || true \
             && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
             && git clone ${TRITON_REPO} triton-custom \
             && cd triton-custom \
             && git checkout ${TRITON_COMMIT} \
-            && for rev in ${TRITON_REVERT_COMMITS}; do \
-                 echo "[Triton] reverting $rev"; \
-                 git -c user.email=build@sglang -c user.name=sglang-build \
-                     revert --no-commit "$rev" \
-                 || git checkout --ours -- Makefile; \
-                 git -c user.email=build@sglang -c user.name=sglang-build \
-                     commit -q -am "Revert $rev" || exit 1; \
-               done \
             && pip install -r python/requirements.txt \
             && pip install -e . \
             && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
@@ -1206,7 +1189,7 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
     fi
 
 # torch 2.11 still Requires-Dist: triton-rocm after the swap above.
-RUN case "${GPU_ARCH}" in *-rocm724|gfx1250-rocm1010) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
+RUN case "${GPU_ARCH}" in *-rocm724) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^\s;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
 # Performance environment variable.
