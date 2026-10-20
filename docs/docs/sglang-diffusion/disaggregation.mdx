@@ -163,18 +163,12 @@ Image pipelines use the same coordinator with `/v1/images/generations` or
 Keep the stage list unchanged and move the same roles onto two machines:
 
 ```mermaid
-flowchart LR
-    subgraph A["Node A: 2 GPUs"]
-        E["Encoder: GPU 0"]
-        V["Decoder: GPU 1"]
-        H["HTTP coordinator"]
-    end
-    subgraph B["Node B: 1 GPU"]
-        D["Denoiser: GPU 0"]
-    end
-    E -->|GPU tensors / RDMA| D
+flowchart TB
+    E["Node A / GPU 0: Encoder"]
+    D["Node B / GPU 0: Denoiser"]
+    V["Node A / GPU 1: Decoder"]
+    E -->|tensors / RDMA| D
     D -->|latents / RDMA| V
-    V --> H
 ```
 
 Replace the example private addresses below with your routable worker addresses.
