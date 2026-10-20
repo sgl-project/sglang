@@ -58,9 +58,10 @@ class DllmAlgorithm:
 
     @classmethod
     def validate_config(cls, config: dict[str, Any]) -> None:
-        cls._validate_config_keys(
-            config, ("block_size", "capture_input_preparation") + cls.config_keys
-        )
+        supported_keys = ("block_size",) + cls.config_keys
+        if cls.capture_input_preparation:
+            supported_keys += ("capture_input_preparation",)
+        cls._validate_config_keys(config, supported_keys)
 
     @classmethod
     def _validate_config_keys(
@@ -77,6 +78,8 @@ class DllmAlgorithm:
             raise ValueError(
                 f"Unknown configuration keys for {cls.__name__}: "
                 + ", ".join(unknown_keys)
+                + ". Supported keys: "
+                + ", ".join(sorted(f"{prefix}{key}" for key in supported_keys))
             )
 
     @classmethod
