@@ -1,17 +1,21 @@
 """Accuracy test for _expand_pool_topk_and_append_tail_batched_npu.
 
-The NPU Triton kernel lives in ``dsa_indexer_kpool._expand_pool_topk_and_append_tail_batched_npu``
+The NPU Triton kernel lives in ``sglang.kernels.ops.attention.kpool_topk_npu``
 and is a drop-in replacement for the PyTorch implementation of
 ``IndexerKPool._expand_pool_topk_and_append_tail_batched``. This test calls both
 implementations on identical inputs and compares the output token-level index
 tensors.
 """
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
+
 import pytest
 import torch
 import torch_npu  # noqa: F401
 
-from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import (
+from sglang.kernels.ops.attention.kpool_topk_npu import (
     _expand_pool_topk_and_append_tail_batched_npu,
 )
 
@@ -90,7 +94,7 @@ def _expand_pool_topk_and_append_tail_batched_ref(
 PAD_ROWS = 13
 
 
-def test_op(n_real: int, num_q_padded: int):
+def _check_op(n_real: int, num_q_padded: int):
     """Compare the NPU Triton kernel against the PyTorch reference."""
     torch.manual_seed(20)
 
@@ -136,7 +140,7 @@ def test_op(n_real: int, num_q_padded: int):
     ],
 )
 def test_expand_pool_topk_and_append_tail_batched(n_real: int, num_q_padded: int):
-    test_op(n_real, num_q_padded)
+    _check_op(n_real, num_q_padded)
 
 
 # endregion
@@ -145,11 +149,8 @@ def test_expand_pool_topk_and_append_tail_batched(n_real: int, num_q_padded: int
 # region main
 # ============================================================================
 
+
 if __name__ == "__main__":
-    test_op(2048, 2048)
-    test_op(1024, 2048)
-    test_op(1035, 2048)
-    test_op(4095, 4096)
+    import sys
 
-
-# endregion
+    sys.exit(pytest.main([__file__]))

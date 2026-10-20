@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import FormatSignature, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -88,3 +93,47 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+
+# Ascend implementations are inventoried lazily; importing this group does not
+# import torch_npu or compile Triton kernels.
+register_kernel(
+    KernelSpec(
+        op="kvcache.kpool_decode_update_and_maybe_write_cache_bf16",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.kpool_index_npu:kpool_decode_update_and_maybe_write_cache_bf16",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="kvcache.kpool_assemble_softmax_write_cache_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.kpool_index_npu:kpool_assemble_softmax_write_cache_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="kvcache.kpool_write_tail_and_maybe_compress_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.kpool_index_npu:kpool_write_tail_and_maybe_compress_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="kvcache.scatter_kpool_tail_updates_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.kpool_index_npu:scatter_kpool_tail_updates_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="kvcache.update_kpool_write_plan_triton_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.kpool_index_npu:update_kpool_write_plan_triton_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)

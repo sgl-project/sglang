@@ -59,11 +59,8 @@ class _FakePPRunner:
     is_pp_proxy_output_scattered = ModelRunner.is_pp_proxy_output_scattered
 
     def __init__(self, first_attn, last_ffn):
-        self.first_attn = first_attn
-        self.last_ffn = last_ffn
-
-    def _pp_boundary_stages(self):
-        return self.first_attn, self.last_ffn
+        layer = SimpleNamespace(attn_boundary=first_attn, ffn_boundary=last_ffn)
+        self.model = SimpleNamespace(modules=lambda: iter([layer]))
 
 
 class TestModelRunnerPPProxyRows(CustomTestCase):

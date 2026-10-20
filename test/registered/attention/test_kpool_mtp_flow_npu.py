@@ -1,5 +1,9 @@
 """Flow tests for Ascend DSA KPool target-verify and draft-extend-v2."""
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
+
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch

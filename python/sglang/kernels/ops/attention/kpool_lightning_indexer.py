@@ -20,10 +20,8 @@ Optimization highlights vs the original implementation:
   caused scattered global-memory reads.
 - **``tl.range`` pipelining**: the main loop uses ``tl.range`` to enable
   the compiler's software-pipelining pass.
-- **Fused logits + topk for small caches**: when ``SORT_SIZE <= 512``,
-  logits and topk are computed in a single kernel via in-kernel iterative
-  ``tl.argmax``, avoiding the HBM round-trip. For larger caches, falls
-  back to the two-phase approach (logits kernel + ``torch.topk``).
+- **Two-phase selection**: the Triton logits kernel is followed by
+  ``torch.topk`` over the causally masked logits.
 """
 
 from __future__ import annotations
@@ -31,11 +29,6 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-
-# ── Threshold: use fused single-kernel topk only for small caches ──
-# Beyond this, tl.argmax on large arrays causes excessive compilation time.
-_FUSED_TOPK_MAX_SORT_SIZE = 512
-
 
 # ── Optimized logits kernel: page-at-a-time access ──────────────────────
 
@@ -128,120 +121,6 @@ def _paged_mqa_logits_kernel(
         tl.store(log_ptrs, logits_page, mask=pool_ids < max_pool_len)
 
 
-# ── Fused logits + topk kernel (small caches only) ──────────────────────
-
-
-@triton.jit
-def _fused_paged_mqa_topk_kernel(
-    q_ptr,
-    k_cache_ptr,
-    weights_ptr,
-    pool_seqlens_ptr,
-    block_tables_ptr,
-    topk_indices_ptr,
-    logits_scratch_ptr,
-    q_stride_q,
-    q_stride_h,
-    q_stride_d,
-    k_stride_page,
-    k_stride_slot,
-    k_stride_h,
-    k_stride_d,
-    w_stride_q,
-    w_stride_h,
-    bt_stride_q,
-    bt_stride_page,
-    log_stride_q,
-    log_stride_pool,
-    out_stride_q,
-    out_stride_k,
-    n_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    page_size: tl.constexpr,
-    max_pool_len: tl.constexpr,
-    max_pages: tl.constexpr,
-    n_pool_topk: tl.constexpr,
-    SORT_SIZE: tl.constexpr,
-):
-    """Fused paged MQA logits + topk with page-at-a-time access.
-
-    Only used when SORT_SIZE <= _FUSED_TOPK_MAX_SORT_SIZE to avoid
-    excessive compilation time from tl.argmax on large arrays.
-    """
-    row = tl.program_id(0)
-
-    pool_seq_len = tl.load(pool_seqlens_ptr + row).to(tl.int32)
-
-    offs_h = tl.arange(0, n_heads)
-    offs_d = tl.arange(0, head_dim)
-    q = tl.load(
-        q_ptr
-        + row * q_stride_q
-        + offs_h[:, None] * q_stride_h
-        + offs_d[None, :] * q_stride_d
-    )
-    q_f32 = q.to(tl.float32)
-
-    w = tl.load(weights_ptr + row * w_stride_q + offs_h * w_stride_h)
-
-    slot_offs = tl.arange(0, page_size)
-
-    # ══ Phase 1: Compute logits page-by-page into scratch buffer ══
-    for page_iter in tl.range(0, max_pages):
-        pool_start = page_iter * page_size
-
-        page_id = tl.load(
-            block_tables_ptr + row * bt_stride_q + page_iter * bt_stride_page
-        ).to(tl.int64)
-
-        k_ptrs = (
-            k_cache_ptr
-            + page_id * k_stride_page
-            + slot_offs[:, None].to(tl.int64) * k_stride_slot
-            + offs_d[None, :] * k_stride_d
-        )
-        k = tl.load(k_ptrs)
-        k_f32 = k.to(tl.float32)
-
-        scores = tl.dot(q_f32, tl.trans(k_f32))
-        scores = tl.maximum(scores, 0.0)
-
-        weighted = scores * w[:, None]
-        logits_page = tl.sum(weighted, axis=0)
-
-        pool_ids = pool_start + slot_offs
-        valid = pool_ids < pool_seq_len
-        logits_page = tl.where(valid, logits_page, float("-inf"))
-
-        log_ptrs = logits_scratch_ptr + row * log_stride_q + pool_ids * log_stride_pool
-        tl.store(log_ptrs, logits_page, mask=pool_ids < max_pool_len)
-
-    # ══ Phase 2: Read logits from scratch and extract topk via argmax ══
-    offs_full = tl.arange(0, SORT_SIZE)
-    logits = tl.load(
-        logits_scratch_ptr + row * log_stride_q + offs_full * log_stride_pool,
-        mask=offs_full < max_pool_len,
-        other=float("-inf"),
-    )
-
-    logits = tl.where(offs_full < pool_seq_len, logits, float("-inf"))
-
-    for i in tl.static_range(n_pool_topk):
-        max_idx = tl.argmax(logits, axis=0)
-        tl.store(
-            topk_indices_ptr + row * out_stride_q + i * out_stride_k,
-            max_idx.to(tl.int32),
-        )
-        logits = tl.where(offs_full == max_idx, float("-inf"), logits)
-
-
-# ── Helpers ─────────────────────────────────────────────────────────────
-
-
-def _next_power_of_2(n: int) -> int:
-    return 1 << (n - 1).bit_length() if n > 1 else 1
-
-
 # ── Public API ──────────────────────────────────────────────────────────
 
 
@@ -324,13 +203,8 @@ def fused_topk_paged(
 ) -> torch.Tensor:
     """Fused paged MQA logits + causal mask + topk selection.
 
-    For small caches (``SORT_SIZE <= 512``): computes logits and extracts
-    top-k in a **single kernel launch** via in-kernel iterative argmax,
-    avoiding the HBM round-trip.
-
-    For larger caches: falls back to the optimized logits kernel +
-    ``torch.topk`` (the in-kernel argmax approach causes excessive
-    compilation time for large arrays).
+    Computes logits with the Triton paged kernel, then selects pools using
+    ``torch.topk``.
 
     Returns pool-level topk indices: (num_q, n_pool_topk) int32.
 
@@ -344,8 +218,7 @@ def fused_topk_paged(
         n_pool_topk: number of top pools to select
         page_size: page size of the index cache
     """
-    num_q, n_heads, head_dim = q_bf16.shape
-    max_pages = block_tables.shape[1]
+    num_q = q_bf16.shape[0]
 
     topk_indices = torch.full(
         (num_q, n_pool_topk), -1, dtype=torch.int32, device=q_bf16.device
@@ -355,11 +228,6 @@ def fused_topk_paged(
     if actual_topk == 0:
         return topk_indices
 
-    sort_size = _next_power_of_2(max_pool_len)
-
-    # ── Fast path: fused single-kernel for small caches ──
-
-    # ── Fallback: optimized logits kernel + torch.topk ──
     logits = fused_paged_mqa_logits(
         q_bf16,
         k_cache_bf16,

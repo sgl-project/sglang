@@ -808,11 +808,16 @@ class BaseMultimodalProcessor(ABC):
             getattr(processor, "video_processor", None),
         )
         if processor.__class__.__name__ == "Glm5NextProcessor" or any(
-            "glm5_next" in type(inner).__module__.lower()
+            any(
+                family in type(inner).__module__.lower()
+                for family in ("glm5_next", "glmga")
+            )
             or type(inner).__name__
             in {
                 "Glm5NextImageProcessor",
                 "Glm5NextVideoProcessor",
+                "GlmgaImageProcessor",
+                "GlmgaVideoProcessor",
             }
             for inner in inner_processors
             if inner is not None
@@ -821,22 +826,7 @@ class BaseMultimodalProcessor(ABC):
                 npu_apply_glm5_next_preprocess_patch,
             )
 
-            npu_apply_glm5_next_preprocess_patch(processor)
-            return "npu"
-
-        # Compatibility with older GLM5-Next processor builds whose concrete
-        # image/video classes still lived in the GLMGA namespace.
-        if any(
-            ".models.glmga." in type(inner).__module__
-            for inner in inner_processors
-            if inner is not None
-        ):
-            from sglang.srt.hardware_backend.npu.modules.glmga_processor import (
-                npu_apply_glmga_preprocess_patch,
-            )
-
-            npu_apply_glmga_preprocess_patch()
-            return "npu"
+            return "npu" if npu_apply_glm5_next_preprocess_patch(processor) else None
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.

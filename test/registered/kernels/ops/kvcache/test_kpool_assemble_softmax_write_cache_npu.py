@@ -1,5 +1,9 @@
 """Accuracy tests for the Ascend BF16 KPool assembly kernel."""
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
+
 import unittest
 from typing import Optional
 
@@ -10,7 +14,7 @@ try:
 except ImportError:
     torch_npu = None
 
-from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+from sglang.kernels.ops.kvcache.kpool_index_npu import (
     kpool_assemble_softmax_write_cache_npu,
 )
 from sglang.test.test_utils import CustomTestCase

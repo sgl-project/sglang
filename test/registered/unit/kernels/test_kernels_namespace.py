@@ -178,7 +178,14 @@ def test_import_stays_metadata_only():
         "'sglang.kernels.ops.attention.flash_attention_v4', "
         "'sglang.kernels.ops.attention.gemma_qkv_norm_rope', "
         "'sglang.kernels.ops.layernorm.rmsnorm_fanout', "
-        "'sglang.kernels.ops.speculative.row_argmax')) or any("
+        "'sglang.kernels.ops.speculative.row_argmax', "
+        "'sglang.kernels.ops.attention.kpool_bf16_index', "
+        "'sglang.kernels.ops.attention.kpool_decode_prepare_indexer', "
+        "'sglang.kernels.ops.attention.kpool_lightning_indexer', "
+        "'sglang.kernels.ops.attention.kpool_topk_npu', "
+        "'sglang.kernels.ops.kvcache.kpool_index_npu', "
+        "'sglang.kernels.ops.speculative.spec_tree_npu', "
+        "'sglang.kernels.ops.mamba.causal_conv1d_target_verify')) or any("
         "m.startswith('sglang.kernels.jit') for m in sys.modules) else 'CLEAN')"
     )
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
@@ -349,6 +356,41 @@ def test_deep_select_spec_matches_wrapper_architectures():
     assert spec.capabilities == frozenset(
         Cap.cuda(min_sm=sm, max_sm=sm) for sm in deep_select.SUPPORTED_CUDA_ARCHS
     )
+
+
+@pytest.mark.parametrize(
+    "op,backend",
+    [
+        (
+            "attention.expand_pool_topk_and_append_tail_batched_npu",
+            KernelBackend.TRITON,
+        ),
+        ("attention.fused_decode_prepare_indexer", KernelBackend.TRITON),
+        ("attention.fused_paged_mqa_logits", KernelBackend.TRITON),
+        ("attention.fused_topk_paged", KernelBackend.TRITON),
+        ("attention.build_pooled_page_table_64", KernelBackend.TORCH),
+        ("attention.gather_index_k_bf16_batched", KernelBackend.TORCH),
+        ("attention.bf16_paged_mqa_logits", KernelBackend.TORCH),
+        ("attention.bf16_ragged_mqa_logits", KernelBackend.TORCH),
+        (
+            "kvcache.kpool_decode_update_and_maybe_write_cache_bf16",
+            KernelBackend.TRITON,
+        ),
+        ("kvcache.kpool_assemble_softmax_write_cache_npu", KernelBackend.TRITON),
+        ("kvcache.kpool_write_tail_and_maybe_compress_npu", KernelBackend.TRITON),
+        ("kvcache.scatter_kpool_tail_updates_npu", KernelBackend.TRITON),
+        ("kvcache.update_kpool_write_plan_triton_npu", KernelBackend.TRITON),
+        ("speculative.build_full_tree_npu", KernelBackend.TRITON),
+        ("mamba.causal_conv1d_target_verify_npu", KernelBackend.TRITON),
+    ],
+)
+def test_ascend_kernel_inventory_is_npu_only(op, backend):
+    """Inventory tooling must not offer these Ascend implementations on CUDA/CPU."""
+    spec = K.registry.get_backend(op, backend)
+    assert spec.capabilities == frozenset({Cap.NPU})
+    assert K.capabilities_satisfied(spec.capabilities, PlatformInfo(device_type="npu"))
+    for platform in (_CPU, _SM90, _HIP):
+        assert not K.capabilities_satisfied(spec.capabilities, platform)
 
 
 if __name__ == "__main__":

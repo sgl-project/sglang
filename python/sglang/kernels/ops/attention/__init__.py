@@ -407,3 +407,71 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+# Ascend implementations are inventoried lazily; importing this group does not
+# import torch_npu or compile Triton kernels.
+register_kernel(
+    KernelSpec(
+        op="attention.expand_pool_topk_and_append_tail_batched_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.kpool_topk_npu:_expand_pool_topk_and_append_tail_batched_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_decode_prepare_indexer",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.kpool_decode_prepare_indexer:fused_decode_prepare_indexer",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_paged_mqa_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.kpool_lightning_indexer:fused_paged_mqa_logits",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.fused_topk_paged",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.kpool_lightning_indexer:fused_topk_paged",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.build_pooled_page_table_64",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.attention.kpool_bf16_index:build_pooled_page_table_64",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.gather_index_k_bf16_batched",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.attention.kpool_bf16_index:gather_index_k_bf16_batched",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.bf16_paged_mqa_logits",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.attention.kpool_bf16_index:bf16_paged_mqa_logits",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.bf16_ragged_mqa_logits",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.attention.kpool_bf16_index:bf16_ragged_mqa_logits",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)

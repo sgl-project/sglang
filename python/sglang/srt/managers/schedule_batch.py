@@ -119,7 +119,6 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (

@@ -56,3 +56,15 @@ register_kernel(
 )
 
 __all__ = []
+
+
+# Ascend implementations are inventoried lazily; importing this group does not
+# import torch_npu or compile Triton kernels.
+register_kernel(
+    KernelSpec(
+        op="speculative.build_full_tree_npu",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.spec_tree_npu:build_full_tree_npu",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)

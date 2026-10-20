@@ -10,54 +10,10 @@ from functools import wraps
 
 import torch
 
-
-def _npu_safe_flatten_patches(
-    patches: torch.Tensor,
-    patch_size: int,
-    merge_size: int,
-    temporal_patch_size: int,
-) -> tuple[torch.Tensor, int, int, int]:
-    """Flatten GLM5-Next patches without creating tensors above 8 dimensions."""
-    temporal_remainder = patches.shape[1] % temporal_patch_size
-    if temporal_remainder:
-        pad = temporal_patch_size - temporal_remainder
-        repeats = patches[:, -1:].expand(-1, pad, -1, -1, -1)
-        patches = torch.cat((patches, repeats), dim=1)
-
-    batch_size, num_frames, channel, resized_height, resized_width = patches.shape
-    grid_t = num_frames // temporal_patch_size
-    grid_h = resized_height // patch_size
-    grid_w = resized_width // patch_size
-
-    # This is equivalent to Transformers' 10-D view/permute, split into two
-    # transformations whose intermediate tensors have at most 8 dimensions.
-    patches = patches.reshape(
-        batch_size * grid_t,
-        temporal_patch_size * channel,
-        grid_h // merge_size,
-        merge_size,
-        patch_size,
-        grid_w // merge_size,
-        merge_size,
-        patch_size,
-    )
-    patches = patches.permute(0, 1, 2, 5, 3, 6, 4, 7)
-    patches = patches.reshape(
-        batch_size,
-        grid_t,
-        temporal_patch_size,
-        channel,
-        grid_h * grid_w,
-        patch_size,
-        patch_size,
-    )
-    patches = patches.permute(0, 1, 4, 3, 2, 5, 6)
-    flatten_patches = patches.reshape(
-        batch_size,
-        grid_t * grid_h * grid_w,
-        channel * temporal_patch_size * patch_size * patch_size,
-    )
-    return flatten_patches, grid_t, grid_h, grid_w
+from sglang.srt.hardware_backend.npu.modules.glm_vl_utils import (
+    _npu_safe_flatten_patches,
+    _patch_processor_method,
+)
 
 
 def npu_wrapper_glm5_next_image_patchify(func):
@@ -104,33 +60,47 @@ def npu_wrapper_glm5_next_video_patchify(func):
 _NPU_PATCH_MARKER = "_sglang_npu_safe_glm5_next_patchify"
 
 
-def _patch_processor_patchify(processor, wrapper) -> None:
-    """Patch the processor's actual class, including trust-remote-code classes."""
-    if processor is None:
-        return
-
-    processor_type = type(processor)
-    original = getattr(processor_type, "patchify", None)
-    if original is None or getattr(original, _NPU_PATCH_MARKER, False):
-        return
-
-    patched = wrapper(original)
-    setattr(patched, _NPU_PATCH_MARKER, True)
-    setattr(processor_type, "patchify", patched)
-
-
-def npu_apply_glm5_next_preprocess_patch(processor) -> None:
+def npu_apply_glm5_next_preprocess_patch(processor) -> bool:
     """Patch the concrete GLM5-Next processors held by ``processor``.
 
     ``trust_remote_code`` loads classes below ``transformers_modules.*`` rather
     than ``transformers.models.glm5_next.*``. Patching the instances' concrete
     classes covers both layouts without depending on a generated module name.
+    Image and video implementations may use different APIs in the same build.
+    Return True only when every present inner processor has a supported patch.
     """
-    _patch_processor_patchify(
-        getattr(processor, "image_processor", None),
-        npu_wrapper_glm5_next_image_patchify,
-    )
-    _patch_processor_patchify(
-        getattr(processor, "video_processor", None),
-        npu_wrapper_glm5_next_video_patchify,
-    )
+    patches = []
+    for kind, wrapper in (
+        ("image", npu_wrapper_glm5_next_image_patchify),
+        ("video", npu_wrapper_glm5_next_video_patchify),
+    ):
+        inner = getattr(processor, f"{kind}_processor", None)
+        if inner is None:
+            continue
+        inner_type = type(inner)
+        if callable(getattr(inner_type, "patchify", None)):
+            patches.append((inner, "patchify", wrapper, _NPU_PATCH_MARKER))
+        elif (
+            "glmga" in inner_type.__module__.lower()
+            or inner_type.__name__ in {"GlmgaImageProcessor", "GlmgaVideoProcessor"}
+        ) and callable(getattr(inner_type, "_preprocess", None)):
+            # Keep GLMGA dependencies lazy: current patchify processors do not
+            # need the legacy model namespace installed in Transformers.
+            from sglang.srt.hardware_backend.npu.modules.glmga_processor import (
+                _NPU_GLMGA_PATCH_MARKER,
+                npu_wrapper_glmga_image_preprocess,
+                npu_wrapper_glmga_video_preprocess,
+            )
+
+            legacy_wrapper = (
+                npu_wrapper_glmga_video_preprocess
+                if kind == "video"
+                else npu_wrapper_glmga_image_preprocess
+            )
+            patches.append(
+                (inner, "_preprocess", legacy_wrapper, _NPU_GLMGA_PATCH_MARKER)
+            )
+        else:
+            return False
+
+    return bool(patches) and all(_patch_processor_method(*args) for args in patches)

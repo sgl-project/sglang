@@ -6,11 +6,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.attention.kpool_topk_npu import (
+    _expand_pool_topk_and_append_tail_batched_npu,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
@@ -137,154 +138,6 @@ def _mqa_logits_row_chunks(
 # ============================================================================
 # NPU Triton kernel: expand pool-level topk indices to token-level
 # ============================================================================
-
-
-@triton.jit
-def _expand_pool_topk_and_append_tail_batched_npu_kernel(
-    pool_indices_ptr,
-    seq_lens_per_token_ptr,
-    out_ptr,
-    stride_pi0: tl.constexpr,
-    stride_pi1: tl.constexpr,
-    stride_o0: tl.constexpr,
-    stride_o1: tl.constexpr,
-    n_real,
-    N_POOL_TOPK: tl.constexpr,
-    POOL_SIZE: tl.constexpr,
-    TOPK: tl.constexpr,
-    TAIL_LEN: tl.constexpr,
-    NUM_CORES: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-):
-    """Expand pool-level topk indices to token-level and append tail tokens.
-
-    Each program processes BLOCK_M rows at a time with a stride of
-    NUM_CORES * BLOCK_M. Phase 1 expands a row block in parallel; phase 2
-    preserves the per-row layout while unrolling with static_range.
-    """
-    pid = tl.program_id(0)
-
-    for r0 in range(pid * BLOCK_M, n_real, NUM_CORES * BLOCK_M):
-        row_offs = r0 + tl.arange(0, BLOCK_M)  # [BLOCK_M]
-        row_mask = row_offs < n_real
-
-        # Phase 1: expand a BLOCK_M batch from pool indices to token indices.
-        p_offs = tl.arange(0, N_POOL_TOPK)
-        pid_val = tl.load(
-            pool_indices_ptr
-            + row_offs[:, None] * stride_pi0
-            + p_offs[None, :] * stride_pi1,
-            mask=row_mask[:, None],
-            other=0,
-        ).to(tl.int32)  # [BLOCK_M, N_POOL_TOPK]
-
-        base = pid_val * POOL_SIZE  # [BLOCK_M, N_POOL_TOPK]
-        o_offs = tl.arange(0, POOL_SIZE)  # [POOL_SIZE]
-
-        # [BLOCK_M, P, N] -> [BLOCK_M, N, P] -> [BLOCK_M, N * P]
-        tmp = o_offs[None, :, None] + base[:, None, :]  # [BLOCK_M, P, N]
-        tmp = tl.trans(tmp, [0, 2, 1])  # [BLOCK_M, N, P]
-        result = tl.reshape(tmp, (BLOCK_M, N_POOL_TOPK * POOL_SIZE))
-
-        col_offs = tl.arange(0, N_POOL_TOPK * POOL_SIZE)
-        tl.store(
-            out_ptr + row_offs[:, None] * stride_o0 + col_offs[None, :] * stride_o1,
-            result,
-            mask=row_mask[:, None],
-        )
-
-        # Phase 2: append each row's uncompressed tail.
-        for m in tl.static_range(BLOCK_M):
-            r = r0 + m
-            valid = r < n_real
-            seq_len = tl.load(
-                seq_lens_per_token_ptr + r,
-                mask=valid,
-                other=0,
-            ).to(tl.int32)
-            pool_len = seq_len // POOL_SIZE
-            tail_start = pool_len * POOL_SIZE
-            tail_count = seq_len - tail_start
-
-            t_offs = tl.arange(0, TAIL_LEN)
-            tail_vals = tl.where(t_offs < tail_count, tail_start + t_offs, -1)
-            tl.store(
-                out_ptr + r * stride_o0 + TOPK * stride_o1 + t_offs * stride_o1,
-                tail_vals,
-                mask=valid,
-            )
-
-
-def _expand_pool_topk_and_append_tail_batched_npu(
-    pool_indices: torch.Tensor,
-    seq_lens_per_token: torch.Tensor,
-    n_real: int,
-    num_q_padded: int,
-    pool_size: int,
-    index_topk: int,
-) -> torch.Tensor:
-    """Expand NPU pool-level top-k indices and append uncompressed tails.
-
-    Args:
-        pool_indices: Selected pool positions, shaped [>=n_real, n_pool_topk].
-        seq_lens_per_token: Request length for each query, shaped [>=n_real].
-        n_real: Number of valid query rows; later rows are masked.
-        num_q_padded: Output row count; padded rows contain -1.
-        pool_size: Number of tokens represented by one pool.
-        index_topk: Token-level top-k, equal to n_pool_topk * pool_size.
-
-    Returns:
-        Token indices shaped [num_q_padded, index_topk + pool_size - 1].
-    """
-    from sglang.srt.layers.attention.dsa.kpool_index_npu import (
-        _default_triton_num_programs,
-    )
-
-    n_pool_topk = pool_indices.shape[1]
-    tail_len = pool_size - 1
-    out_cols = index_topk + tail_len
-    # Align rows to eight int32 values (32 bytes).
-    out_cols_pad = (out_cols + 7) // 8 * 8
-
-    # Let the kernel mask rows beyond n_real so callers need not slice inputs.
-    n_real = min(n_real, pool_indices.shape[0], seq_lens_per_token.shape[0])
-
-    assert pool_indices.ndim == 2
-    assert pool_indices.shape[0] >= n_real
-    assert seq_lens_per_token.ndim == 1
-    assert seq_lens_per_token.shape[0] >= n_real
-    assert num_q_padded >= n_real
-    assert pool_indices.dtype == torch.int32
-    assert seq_lens_per_token.dtype == torch.int32
-    assert n_pool_topk * pool_size == index_topk
-
-    # Prefill padding rows with -1 and align the physical column count.
-    out = torch.full(
-        (num_q_padded, out_cols_pad), -1, dtype=torch.int32, device=pool_indices.device
-    )
-
-    assert out.stride(1) == 1
-
-    if n_real > 0:
-        num_cores = _default_triton_num_programs(pool_indices.device, n_real)
-        _expand_pool_topk_and_append_tail_batched_npu_kernel[(num_cores,)](
-            pool_indices,
-            seq_lens_per_token,
-            out,
-            pool_indices.stride(0),
-            pool_indices.stride(1),
-            out.stride(0),
-            out.stride(1),
-            n_real,
-            N_POOL_TOPK=n_pool_topk,
-            POOL_SIZE=pool_size,
-            TOPK=index_topk,
-            TAIL_LEN=tail_len,
-            NUM_CORES=num_cores,
-            BLOCK_M=4,
-        )
-
-    return out[:, :out_cols]
 
 
 def _a5_full_topk_for_short_sequences(topk_result, causal_lens):
@@ -2209,7 +2062,7 @@ class IndexerKPool(MultiPlatformOp):
         plan provides the ring-write offset for each request and masks rows for
         tokens that were not accepted during draft extend.
         """
-        from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+        from sglang.kernels.ops.kvcache.kpool_index_npu import (
             kpool_write_tail_and_maybe_compress_npu,
         )
 
@@ -2259,33 +2112,22 @@ class IndexerKPool(MultiPlatformOp):
     def _compress_write_extend_npu(
         self, x, key, gate_score, positions, forward_batch, layer_id, metadata
     ):
-        """NPU extend-step compress write (per-batch loop)."""
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (  # noqa: F401
-            scatter_kpool_tail_updates_bf16,
-        )
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
-            compute_pooled_write_locs,
-            kpool_softmax_write_cache_bf16,
-        )
-
+        """Execute the precomputed NPU extend cache-write and tail-update plan."""
         assert (
             forward_batch.seq_lens_cpu is not None
             and forward_batch.extend_seq_lens_cpu is not None
         )
 
         pool = get_token_to_kv_pool()
-        kpool = self.index_kpool
-        block_tables = metadata.get_page_table_64()
-        buf = pool.get_index_k_with_scale_buffer(layer_id)  # remove scale
+        buf = pool.get_index_k_with_scale_buffer(layer_id)
         tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
 
         attn_metadata = getattr(metadata, "attn_metadata", None)
         plan = getattr(attn_metadata, "kpool_extend_plan", None)
-        # rank0_log(f"====> _compress_write_extend_npu get kpool_extend_plan: {plan=}")
         if plan is not None:
             # The NPU index cache is BF16, so tail updates cannot reuse the GPU
             # FP8 scatter implementation.
-            from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+            from sglang.kernels.ops.kvcache.kpool_index_npu import (
                 kpool_assemble_softmax_write_cache_npu,
                 scatter_kpool_tail_updates_npu,
             )
@@ -2320,60 +2162,7 @@ class IndexerKPool(MultiPlatformOp):
 
             return None
 
-        assert plan is not None, "_compress_write_extend_npu rollback: for loop"
-        q_offset = 0
-        for i in range(forward_batch.batch_size):
-            q_len = int(forward_batch.extend_seq_lens_cpu[i])
-            if q_len == 0:
-                continue
-
-            req_pool_idx = forward_batch.req_pool_indices[i].to(torch.long)
-            key_chunk = key[q_offset : q_offset + q_len]
-            score_chunk = gate_score[q_offset : q_offset + q_len]
-            seq_len = int(forward_batch.seq_lens_cpu[i].item())
-            first_pos = seq_len - q_len
-            first_slot = first_pos % kpool
-
-            if first_slot != 0:
-                raise NotImplementedError(
-                    "NPU kpool extend requires kpool-aligned chunk starts."
-                )
-
-            pool_start_id = first_pos // kpool
-            n_pools = q_len // kpool
-            n_drain = n_pools * kpool
-
-            if n_pools > 0:
-                slot_k = key_chunk[:n_drain].view(n_pools, kpool, self.head_dim)
-                slot_score = score_chunk[:n_drain].view(n_pools, kpool, self.head_dim)
-                # Compute write locations
-                num_token_pages = (seq_len + pool.page_size - 1) // pool.page_size
-                token_page_table = block_tables[i, :num_token_pages].contiguous()
-                pool_ids = pool_start_id + torch.arange(
-                    n_pools, dtype=torch.int64, device=key.device
-                )
-                write_locs = compute_pooled_write_locs(
-                    token_page_table, pool_ids, kpool
-                )
-                kpool_softmax_write_cache_bf16(
-                    pool=pool,
-                    buf=buf,
-                    slot_k=slot_k,
-                    slot_score=slot_score,
-                    ape=self.index_kpool_compress_ape,
-                    loc=write_locs,
-                )
-
-            n_remain = q_len - n_drain
-            pool.set_compress_tail_for_request(
-                layer_id=layer_id,
-                req_pool_idx=req_pool_idx,
-                key_tail=key_chunk[n_drain:] if n_remain > 0 else key_chunk[:0],
-                score_tail=score_chunk[n_drain:] if n_remain > 0 else score_chunk[:0],
-                n_remain=n_remain,
-                dst_logical_start=first_pos + n_drain,
-            )
-            q_offset += q_len
+        assert plan is not None, "NPU DSA kpool extend requires kpool_extend_plan"
 
     @staticmethod
     def _expand_page_table_for_queries_npu(
@@ -2439,7 +2228,7 @@ class IndexerKPool(MultiPlatformOp):
         and the torch-side pool_seqlens / pool_block_tables construction, which
         torch.compile splits into ~13 small ops.
         """
-        from sglang.srt.layers.attention.dsa.kpool_decode_prepare_indexer import (
+        from sglang.kernels.ops.attention.kpool_decode_prepare_indexer import (
             fused_decode_prepare_indexer,
         )
 
@@ -2470,7 +2259,7 @@ class IndexerKPool(MultiPlatformOp):
         """
         import torch_npu
 
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
+        from sglang.kernels.ops.attention.kpool_bf16_index import (
             build_pooled_page_table_64,
         )
 
@@ -2535,7 +2324,7 @@ class IndexerKPool(MultiPlatformOp):
         """
         import torch_npu
 
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
+        from sglang.kernels.ops.attention.kpool_bf16_index import (
             build_pooled_page_table_64,
         )
 
@@ -2603,10 +2392,10 @@ class IndexerKPool(MultiPlatformOp):
         Both decode and extend use the same paged read path. The only difference
         is pool_seqlens: per-request for decode, per-token for extend/verify.
         """
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
+        from sglang.kernels.ops.attention.kpool_bf16_index import (
             build_pooled_page_table_64,
         )
-        from sglang.srt.layers.attention.dsa.kpool_lightning_indexer import (
+        from sglang.kernels.ops.attention.kpool_lightning_indexer import (
             fused_topk_paged,
         )
 
@@ -2706,7 +2495,7 @@ class IndexerKPool(MultiPlatformOp):
         token-level indices via _expand_pool_topk_and_append_tail_batched
         for consistent output with default and triton paths.
         """
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
+        from sglang.kernels.ops.attention.kpool_bf16_index import (
             bf16_paged_mqa_logits,
             build_pooled_page_table_64,
         )
@@ -2795,7 +2584,7 @@ class IndexerKPool(MultiPlatformOp):
         expands to token-level indices via _expand_pool_topk_and_append_tail_batched
         for consistent output with default and triton paths.
         """
-        from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
+        from sglang.kernels.ops.attention.kpool_bf16_index import (
             bf16_ragged_mqa_logits,
             build_pooled_page_table_64,
             gather_index_k_bf16_batched,

@@ -6,17 +6,21 @@ calls both implementations on identical inputs and compares the in-place updated
 ``tail_k`` / ``tail_score`` tensors.
 """
 
+from sglang.test.ci.ci_register import register_npu_ci
+
+register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
+
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch_npu  # noqa: F401
 
+from sglang.kernels.ops.kvcache.kpool_index_npu import (
+    scatter_kpool_tail_updates_npu,
+)
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     scatter_kpool_tail_updates,
-)
-from sglang.srt.layers.attention.dsa.kpool_index_npu import (
-    scatter_kpool_tail_updates_npu,
 )
 
 DEVICE = "npu"
@@ -110,7 +114,9 @@ def _create_test_inputs(
 # ============================================================================
 
 
-def test_op(n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype):
+def _check_op(
+    n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype
+):
     # 1. 参数合法性检查
     max_slots = n_rows * POOL_SIZE
     if total_tokens < max_slots:
@@ -184,73 +190,28 @@ def test_op(n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM,
 # region main
 # ============================================================================
 
-if __name__ == "__main__":
-    HEAD_DIM = 128
-    # 基础用例: 最小 POOL_SIZE=4, 最小 TAIL_SIZE=4
-    test_op(
-        n_rows=1,
-        total_tokens=16,
-        req_pool_size=4,
-        POOL_SIZE=4,
-        TAIL_SIZE=4,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    # 典型用例: 中等 n_rows
-    test_op(
-        n_rows=8,
-        total_tokens=64,
-        req_pool_size=16,
-        POOL_SIZE=4,
-        TAIL_SIZE=8,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    # TAIL_SIZE 边界: POOL_SIZE + 8 = 12
-    test_op(
-        n_rows=8,
-        total_tokens=64,
-        req_pool_size=16,
-        POOL_SIZE=4,
-        TAIL_SIZE=12,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    test_op(
-        n_rows=64,
-        total_tokens=320,
-        req_pool_size=128,
-        POOL_SIZE=4,
-        TAIL_SIZE=8,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    test_op(
-        n_rows=128,
-        total_tokens=640,
-        req_pool_size=256,
-        POOL_SIZE=4,
-        TAIL_SIZE=4,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    test_op(
-        n_rows=128,
-        total_tokens=640,
-        req_pool_size=256,
-        POOL_SIZE=4,
-        TAIL_SIZE=12,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.bfloat16,
-    )
-    test_op(
-        n_rows=4,
-        total_tokens=32,
-        req_pool_size=8,
-        POOL_SIZE=4,
-        TAIL_SIZE=8,
-        HEAD_DIM=HEAD_DIM,
-        dtype=torch.float16,
+
+@pytest.mark.parametrize(
+    "n_rows,total_tokens,req_pool_size,POOL_SIZE,TAIL_SIZE,HEAD_DIM,dtype",
+    [
+        (1, 16, 4, 4, 4, 128, torch.bfloat16),
+        (8, 64, 16, 4, 8, 128, torch.bfloat16),
+        (8, 64, 16, 4, 12, 128, torch.bfloat16),
+        (64, 320, 128, 4, 8, 128, torch.bfloat16),
+        (128, 640, 256, 4, 4, 128, torch.bfloat16),
+        (128, 640, 256, 4, 12, 128, torch.bfloat16),
+        (4, 32, 8, 4, 8, 128, torch.float16),
+    ],
+)
+def test_scatter_kpool_tail_updates(
+    n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype
+):
+    _check_op(
+        n_rows, total_tokens, req_pool_size, POOL_SIZE, TAIL_SIZE, HEAD_DIM, dtype
     )
 
-# endregion
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

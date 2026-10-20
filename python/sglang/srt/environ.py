@@ -1005,6 +1005,9 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    # Use the vendor's public normal-mode strategy option for affected NPU
+    # DeepEP deployments. ZBAL and low-latency-only buffers are unchanged.
+    SGLANG_USE_NPU_DEEPEP_ALLTOALL = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)

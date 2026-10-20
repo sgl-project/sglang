@@ -1111,7 +1111,7 @@ def update_kpool_write_plan_npu(
 
     if mode != "off":
         # ── Mode C (default "npu"): fused NPU-specific Triton kernel ──
-        from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+        from sglang.kernels.ops.kvcache.kpool_index_npu import (
             update_kpool_write_plan_triton_npu,
         )
 

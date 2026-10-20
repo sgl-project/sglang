@@ -16,7 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.npu import get_npu_vector_core_count
+from sglang.kernels.jit.utils.npu import get_npu_vector_core_count
 
 
 @triton.jit(do_not_specialize=["batch_size", "topk"])

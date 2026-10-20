@@ -71,19 +71,19 @@
 # 3. TORCH NATIVE REFERENCE IMPLEMENTATION
 # ═══════════════════════════════════════════════════════════════════════
 
-import torch
+from sglang.test.ci.ci_register import register_npu_ci
 
-from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+register_npu_ci(est_time=60, suite="full-1-npu-a3", nightly=True)
+
+import pytest
+import torch
+import torch_npu  # noqa: F401
+
+from sglang.kernels.ops.kvcache.kpool_index_npu import (
     kpool_decode_update_and_maybe_write_cache_bf16,
 )
 
-# Auto-detect device: prefer CUDA, fallback to NPU
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-elif hasattr(torch, "npu") and torch.npu.is_available():
-    DEVICE = "npu"
-else:
-    DEVICE = "cpu"
+DEVICE = "npu"
 
 
 def kpool_decode_update_and_maybe_write_cache_bf16_torch(
@@ -182,7 +182,7 @@ def kpool_decode_update_and_maybe_write_cache_bf16_torch(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-def verify_kernel():
+def test_decode_cache_write():
     """Verify BF16 Triton kernel against torch native reference."""
     device = DEVICE
     torch.manual_seed(42)
@@ -371,6 +371,7 @@ def verify_kernel():
         else torch.allclose(buf_triton, buf_torch, atol=2e-2)
     )
 
+    assert tail_ok and score_ok and buf_ok
     print(f"\n{'=' * 70}")
     if tail_ok and score_ok and buf_ok:
         print("  ✅ ALL CHECKS PASSED — Triton BF16 kernel matches torch native")
@@ -385,7 +386,7 @@ def verify_kernel():
     print(f"{'=' * 70}")
 
 
-def verify_edge_cases():
+def test_invalid_cache_loc():
     """Test edge cases: invalid positions, empty batch, etc."""
     device = DEVICE
     torch.manual_seed(99)
@@ -410,6 +411,8 @@ def verify_edge_cases():
         * 0.1
     )
     tail_score_torch = tail_score_triton.clone()
+    original_invalid_tail = tail_k_triton[1].clone()
+    original_invalid_score = tail_score_triton[1].clone()
 
     key = torch.randn(BATCH, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.1
     slot_score = torch.randn(BATCH, HEAD_DIM, dtype=torch.float32, device=device) * 0.1
@@ -465,7 +468,9 @@ def verify_edge_cases():
     buf_ok = torch.allclose(buf_triton, buf_torch, atol=2e-2)
 
     # Verify row 1 (invalid) was NOT written to tail
-    row1_unchanged_triton = torch.equal(tail_k_triton[1], tail_k_torch[1])
+    row1_unchanged_triton = torch.equal(tail_k_triton[1], original_invalid_tail)
+    assert row1_unchanged_triton
+    assert torch.equal(tail_score_triton[1], original_invalid_score)
 
     print("\n" + "=" * 70)
     print("Edge Case Test (invalid cache_loc=0)")
@@ -475,16 +480,12 @@ def verify_edge_cases():
     print(f"  buf match:       {buf_ok}")
     print(f"  Row 1 (invalid) tail unchanged: {row1_unchanged_triton}")
 
-    # Row 1 should not have been updated (cache_loc=0)
-    # Check that tail_k[1] at phys_slot for pos=5 is still original
-    # (compare against a fresh clone of the original)
-    orig_tail = tail_k_torch.clone()
-    # Actually we can't check this way since both modified the same tensor.
-    # Instead check that triton and torch agree (both should skip row 1).
+    assert tail_ok and score_ok and buf_ok
     print(f"  {'✅ PASSED' if (tail_ok and score_ok and buf_ok) else '❌ FAILED'}")
     print("=" * 70)
 
 
 if __name__ == "__main__":
-    verify_kernel()
-    verify_edge_cases()
+    import sys
+
+    sys.exit(pytest.main([__file__]))

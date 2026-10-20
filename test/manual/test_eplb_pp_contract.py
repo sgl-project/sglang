@@ -13,7 +13,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-
 ROOT = Path(__file__).resolve().parents[2]
 SRT = ROOT / "python/sglang/srt"
 

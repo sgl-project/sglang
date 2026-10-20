@@ -833,10 +833,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         out_cache_loc: torch.Tensor,
         round_scale: bool = False,
     ) -> None:
-        # from sglang.srt.layers.attention.dsa.kpool_bf16_index import (
-        #     kpool_decode_update_and_maybe_write_cache_bf16,
-        # )
-        from sglang.srt.layers.attention.dsa.kpool_index_npu import (
+        from sglang.kernels.ops.kvcache.kpool_index_npu import (
             kpool_decode_update_and_maybe_write_cache_bf16,
         )
 
