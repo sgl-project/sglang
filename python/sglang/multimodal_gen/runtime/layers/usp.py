@@ -103,7 +103,7 @@ def _a2a_staging_buffer(
         device_index = device.index
         if device_index is None:
             device_index = device_module.current_device()
-    key = (role, dtype, device.type, device_index)
+    key = (role, dtype, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
     if buffer is None or buffer.numel() < required_numel:
