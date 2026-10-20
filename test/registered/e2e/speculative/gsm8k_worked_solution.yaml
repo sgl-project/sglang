@@ -1,0 +1,4 @@
+user: |-
+  Solve the following math problem step by step. Show your calculations, then put the final answer inside \boxed{{}}.
+
+  {problem}

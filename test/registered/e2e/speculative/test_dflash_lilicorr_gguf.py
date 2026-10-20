@@ -1,6 +1,7 @@
 import base64
 import io
 import unittest
+from pathlib import Path
 
 import requests
 from PIL import Image, ImageDraw
@@ -9,13 +10,12 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestLiLiCorrGGUFServer(CustomTestCase, GSM8KMixin):
@@ -24,6 +24,11 @@ class TestLiLiCorrGGUFServer(CustomTestCase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.80
     gsm8k_num_threads = 4
     gsm8k_temperature = 0.0
+    gsm8k_backend = "sgl_eval"
+    gsm8k_chat_template_kwargs = {"enable_thinking": False}
+    gsm8k_prompt_yaml = Path(__file__).with_name("gsm8k_worked_solution.yaml")
+    gsm8k_max_tokens = 512
+    gsm8k_top_p = 1.0
 
     @classmethod
     def setUpClass(cls):
@@ -31,7 +36,7 @@ class TestLiLiCorrGGUFServer(CustomTestCase, GSM8KMixin):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=1200,
             other_args=[
                 "--trust-remote-code",
                 "--tp-size",

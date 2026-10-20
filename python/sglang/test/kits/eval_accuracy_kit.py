@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
@@ -92,6 +93,7 @@ def _run_sgl_eval(
     num_threads: int = 512,
     thinking: bool = True,
     chat_template_kwargs: Optional[dict] = None,
+    prompt_yaml: Optional[Path] = None,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
@@ -126,7 +128,7 @@ def _run_sgl_eval(
             else ({"thinking": True} if thinking else None)
         ),
     )
-    metrics = run_sgl_eval(args)
+    metrics = run_sgl_eval(args, prompt_yaml=prompt_yaml)
     score = metrics["score"]
     print(f"{eval_name} sgl-eval score={score:.4f}")
     _finalize_eval(
@@ -166,6 +168,8 @@ class GSM8KMixin:
     ``"run_eval"`` backend: OpenAI completion API, 5-shot; ``"sgl_eval"``: sgl-eval
     chat + boxed/sympy grader. The legacy ``gsm8k_accuracy_thres`` /
     ``gsm8k_num_questions`` are honored when the canonical knobs are unset.
+    ``gsm8k_chat_template_kwargs`` overrides the sgl-eval thinking template kwargs.
+    ``gsm8k_prompt_yaml`` selects a custom math prompt; other callers keep the default.
     """
 
     gsm8k_score_threshold: float = _THRESHOLD_NOT_SET
@@ -177,6 +181,8 @@ class GSM8KMixin:
     gsm8k_num_shots: int = 5  # run_eval backend only
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
     gsm8k_thinking: bool = False  # sgl_eval backend
+    gsm8k_chat_template_kwargs: Optional[dict] = None  # sgl_eval backend
+    gsm8k_prompt_yaml: Optional[Path] = None  # sgl_eval backend
     gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
     # None keeps the backend's default; set both to route the run through
     # the sampling path.
@@ -201,6 +207,8 @@ class GSM8KMixin:
                 num_examples=num_examples,
                 num_threads=self.gsm8k_num_threads,
                 thinking=self.gsm8k_thinking,
+                chat_template_kwargs=self.gsm8k_chat_template_kwargs,
+                prompt_yaml=self.gsm8k_prompt_yaml,
                 max_tokens=self.gsm8k_max_tokens,
                 temperature=self.gsm8k_temperature,
                 top_p=self.gsm8k_top_p,
