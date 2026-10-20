@@ -1105,27 +1105,32 @@ class MqaAttentionBase(nn.Module):
         return 64 if self.n_local_heads <= 64 else self.n_heads
 
     def _zero_padded_q(self, x, kernel_num_heads, attn_backend) -> torch.Tensor:
-        want = (x.shape[0], kernel_num_heads, self.head_dim)
-        if in_replay_tail_graph():
-            # A tail graph step captures every bucket on one metadata, so a buffer
-            # kept there would be freed under the earlier buckets' graphs; each
-            # capture allocates its own from the graph pool.
-            return x.new_zeros(*want)
-        # Eager steps reuse one buffer per step and shape; no consumer may keep it.
+        # One zeroed buffer per metadata, grown to the most rows it has served; each
+        # call takes a row slice. A graph that keeps the metadata keeps the buffer,
+        # so the buffer must not grow once a graph has captured it.
         meta = getattr(attn_backend, "forward_metadata", None)
-        q_padded = getattr(meta, "q_pad_buffer", None)
+        buf = getattr(meta, "q_pad_buffer", None)
         if (
-            q_padded is None
-            or tuple(q_padded.shape) != want
-            or q_padded.dtype != x.dtype
+            buf is None
+            or buf.shape[0] < x.shape[0]
+            or buf.shape[1:] != (kernel_num_heads, self.head_dim)
+            or buf.dtype != x.dtype
         ):
-            q_padded = x.new_zeros(*want)
+            assert not getattr(meta, "q_pad_captured", False), (
+                "the padded query buffer grew after a CUDA graph captured it"
+            )
+            buf = x.new_zeros(x.shape[0], kernel_num_heads, self.head_dim)
             if meta is not None:
                 try:
-                    meta.q_pad_buffer = q_padded
+                    meta.q_pad_buffer = buf
                 except (AttributeError, TypeError):
                     pass
-        return q_padded
+        if meta is not None and torch.cuda.is_current_stream_capturing():
+            try:
+                meta.q_pad_captured = True
+            except (AttributeError, TypeError):
+                pass
+        return buf[: x.shape[0]]
 
     def _wo_a_quant_freqs(
         self, forward_batch: ForwardBatch, q_rope: Optional[torch.Tensor]
