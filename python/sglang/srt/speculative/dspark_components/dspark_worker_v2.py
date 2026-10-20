@@ -941,7 +941,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         """
         00993641
         SparkVerifyPlanner.schedule_layout函数：
-        这里会调用 ScheduleVerifyLensTopk.execute，把计算得到额外6个名额按照surival的值，优先分配给更可能连续接受的位置，比如bs=3， 分配是【3,1,2】，再加上每个请求原本的1个anchor, 对应num_token=[4,2,3]
+        这里会调用 ScheduleVerifyLensTopk.execute，把计算得到额外6个名额按照surival的值，优先分配给更可能连续接受的请求，比如bs=3， 分别分配得到【3,1,2】，再加上每个请求原本的1个anchor, 对应num_token=[4,2,3]
         它把每请求的验证长度和本轮需要的执行容量，封装一下 layout 交给后端
         """
         layout = self._verify_planner.schedule_layout(
