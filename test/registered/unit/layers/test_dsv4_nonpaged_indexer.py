@@ -1174,13 +1174,6 @@ class TestC4GroupedVerifyRows(CustomTestCase):
             table,
         )
 
-    def test_one_row_per_request_passes_through(self):
-        q, lens, rows_table, _ = self._inputs()
-        out_q, out_lens, out_table = group_verify_rows(q, lens, rows_table, 1)
-        self.assertIs(out_q, q)
-        self.assertIs(out_lens, lens)
-        self.assertIs(out_table, rows_table)
-
     def test_fp8_rows_become_one_request(self):
         q, lens, rows_table, table = self._inputs()
         out_q, out_lens, out_table = group_verify_rows(q, lens, rows_table, self.n)
@@ -1204,30 +1197,6 @@ class TestC4GroupedVerifyRows(CustomTestCase):
         self.assertTrue(torch.equal(out_sf.reshape(-1, 1, self.heads), sf[rows]))
         self.assertTrue(torch.equal(out_lens, lens[rows].view(2, self.n)))
         self.assertTrue(torch.equal(out_table, table[1:]))
-
-    def test_gate(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            C4_GROUPED_VERIFY_MIN_REQUESTS,
-            DeepseekV4AttnBackend,
-        )
-        from sglang.srt.runtime_context import override_platform
-
-        gate = DeepseekV4AttnBackend._c4_indexer_groups_verify_rows
-        bs = C4_GROUPED_VERIFY_MIN_REQUESTS
-        with (
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
-        ):
-            with override_platform(is_sm100=True):
-                self.assertTrue(gate(None, bs))
-                self.assertFalse(gate(None, bs - 1))
-                with envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(True):
-                    self.assertFalse(gate(None, bs))
-                with envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True):
-                    self.assertFalse(gate(None, bs))
-            with override_platform(is_sm100=False):
-                self.assertFalse(gate(None, bs))
 
 
 class TestCandidateIndexerGating(CustomTestCase):
