@@ -42,6 +42,43 @@ class GigaChat3Detector(BaseFormatDetector):
         self.end_content: bool = False
         self._buffer: str = ""
         self.prev_tool_call_arr: list[dict] = []
+        self._func_json_start: int = -1
+        self._cached_func_name: str | None = None
+        self._args_start: int = -1
+        self._args_scan_pos: int = -1
+        self._args_brace_depth: int = 0
+        self._args_in_string: bool = False
+        self._args_escape: bool = False
+        self._args_close_idx: int | None = None
+        self._streamed_args_end: int = -1
+        self._parsed_args_dict: dict | None = None
+
+    def _advance_args_scan(self, text: str, end: int) -> None:
+        if self._args_close_idx is not None and self._args_close_idx <= end:
+            return
+        i = self._args_scan_pos
+        while i < end:
+            ch = text[i]
+            if self._args_in_string:
+                if self._args_escape:
+                    self._args_escape = False
+                elif ch == "\\":
+                    self._args_escape = True
+                elif ch == '"':
+                    self._args_in_string = False
+            else:
+                if ch == '"':
+                    self._args_in_string = True
+                elif ch == "{":
+                    self._args_brace_depth += 1
+                elif ch == "}":
+                    self._args_brace_depth -= 1
+                    if self._args_brace_depth == 0:
+                        self._args_close_idx = i + 1
+                        i += 1
+                        break
+            i += 1
+        self._args_scan_pos = i
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains a tool call marker"""
@@ -109,9 +146,12 @@ class GigaChat3Detector(BaseFormatDetector):
         current_text = self._buffer
         delta_text = new_text
         content = None
-        func_name = None
-        cur_args = None
-        m_func = REGEX_FUNCTION_CALL.search(current_text)
+
+        if self._func_json_start == -1:
+            m_func = REGEX_FUNCTION_CALL.search(current_text)
+            if m_func:
+                self._func_json_start = m_func.start(1)
+
         if not self.tool_started:
             m_content = REGEX_CONTENT_PATTERN.search(delta_text)
             if m_content:
@@ -120,29 +160,71 @@ class GigaChat3Detector(BaseFormatDetector):
             else:
                 if not self.end_content:
                     content = delta_text
-            if m_func:
+            if self._func_json_start != -1:
                 self.tool_started = True
                 logger.debug("[GigaChat3] Tool call started")
             if content:
                 return StreamingParseResult(normal_text=content)
-        if not m_func:
+        if self._func_json_start == -1:
             return StreamingParseResult()
-        json_tail = m_func.group(1).strip()
-        name_match = NAME_REGEX.search(json_tail)
-        if name_match:
-            func_name = name_match.group(1)
-        args_match = ARGS_REGEX.search(json_tail)
-        if args_match:
-            cur_args = args_match.group(1).strip()
-            if cur_args.endswith("</s>"):
-                cur_args = cur_args[: -len("</s>")]
-            if cur_args.endswith("}"):
-                try:
-                    candidate = cur_args[:-1].strip()
-                    json.loads(candidate, strict=False)
-                    cur_args = candidate
-                except json.JSONDecodeError:
-                    pass
+
+        if self._cached_func_name is None:
+            name_match = NAME_REGEX.search(current_text, self._func_json_start)
+            if name_match:
+                self._cached_func_name = name_match.group(1)
+        func_name = self._cached_func_name
+
+        if self._args_start == -1:
+            args_match = ARGS_REGEX.search(current_text, self._func_json_start)
+            if args_match:
+                pos = args_match.start(1)
+                n = len(current_text)
+                while pos < n and current_text[pos].isspace():
+                    pos += 1
+                if pos < n:
+                    self._args_start = pos
+                    self._args_scan_pos = pos
+                    self._streamed_args_end = pos
+
+        args_end = -1
+        if self._args_start != -1:
+            end = len(current_text)
+            while end > self._args_start and current_text[end - 1].isspace():
+                end -= 1
+            if current_text.endswith("</s>", self._args_start, end):
+                end -= 4
+                while end > self._args_start and current_text[end - 1].isspace():
+                    end -= 1
+            self._advance_args_scan(current_text, end)
+            if (
+                self._args_close_idx is not None
+                and end > self._args_close_idx
+                and current_text[end - 1] == "}"
+            ):
+                cand_end = end - 1
+                while (
+                    cand_end > self._args_start and current_text[cand_end - 1].isspace()
+                ):
+                    cand_end -= 1
+                if cand_end == self._args_close_idx:
+                    if self._parsed_args_dict is None:
+                        candidate = current_text[self._args_start : cand_end]
+                        try:
+                            self._parsed_args_dict = json.loads(candidate, strict=False)
+                        except json.JSONDecodeError:
+                            self._parsed_args_dict = None
+                    if self._parsed_args_dict is not None:
+                        end = cand_end
+                else:
+                    candidate = current_text[self._args_start : cand_end]
+                    try:
+                        self._parsed_args_dict = json.loads(candidate, strict=False)
+                        end = cand_end
+                    except json.JSONDecodeError:
+                        pass
+            if end > self._args_start:
+                args_end = end
+
         calls: List[ToolCallItem] = []
         if not self.prev_tool_call_arr:
             self.prev_tool_call_arr.append({})
@@ -160,26 +242,30 @@ class GigaChat3Detector(BaseFormatDetector):
                 )
             )
             return StreamingParseResult(calls=calls)
-        if cur_args is None:
+        if args_end == -1:
             return StreamingParseResult()
-        prev_args = self.prev_tool_call_arr[0].get("arguments_str", "")
-        if not prev_args:
-            delta_args = cur_args
-        elif cur_args.startswith(prev_args):
-            delta_args = cur_args[len(prev_args) :]
-        else:
+        if args_end < self._streamed_args_end:
+            prev_args = self.prev_tool_call_arr[0].get("arguments_str", "")
+            cur_args = current_text[self._args_start : args_end]
             logger.warning(
                 f"[GigaChat3] Arguments overlap mismatch. "
                 f"prev='{prev_args[:50]}...' cur='{cur_args[:50]}...'"
             )
             return StreamingParseResult()
+        delta_args = current_text[self._streamed_args_end : args_end]
         if not delta_args:
             return StreamingParseResult()
+        cur_args = current_text[self._args_start : args_end]
+        self._streamed_args_end = args_end
         self.prev_tool_call_arr[0]["arguments_str"] = cur_args
-        try:
-            args_dict = json.loads(cur_args, strict=False)
-            self.prev_tool_call_arr[0]["arguments"] = args_dict
-        except json.JSONDecodeError:
+        if self._args_close_idx is not None and args_end == self._args_close_idx:
+            if self._parsed_args_dict is None:
+                try:
+                    self._parsed_args_dict = json.loads(cur_args, strict=False)
+                except json.JSONDecodeError:
+                    self._parsed_args_dict = {}
+            self.prev_tool_call_arr[0]["arguments"] = self._parsed_args_dict
+        else:
             self.prev_tool_call_arr[0]["arguments"] = {}
         logger.debug(f"[GigaChat3] Sending args delta: '{delta_args[:100]}...'")
         calls.append(
