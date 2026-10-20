@@ -99,7 +99,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.11-cuda13.0
 
       - uses: ./.github/actions/download-rust-ext
         with:

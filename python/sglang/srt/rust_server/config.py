@@ -6,9 +6,10 @@ import json
 import logging
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
     _num_accelerators_per_dp_rank,
@@ -17,12 +18,17 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
+    get_lora,
+    get_memory,
     get_mm,
     get_model,
     get_observability,
+    get_parallel,
     get_schedule,
     get_serving,
+    get_spec,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.common import build_server_info
@@ -65,6 +71,38 @@ def _build_server_args(
         if get_serving().smg_grpc_mode or get_serving().grpc_mode
         else get_serving().grpc_port
     )
+    deployment_info = {
+        "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
+        "node_rank": get_parallel().node_rank,
+        "nnodes": get_parallel().nnodes,
+        "dp_size": get_parallel().num_dp_ranks,
+        "dp_rank": select_kv_publisher_dp_rank(
+            get_parallel().attn_dp_size,
+            get_parallel().attn_dp_rank,
+            get_parallel().dp_rank,
+        ),
+        "dist_init_addr": get_parallel().dist_init_addr,
+        "base_gpu_id": get_device().base_gpu_id,
+        "page_size": get_schedule().page_size,
+        "dcp_size": get_parallel().dcp_size,
+        "max_running_requests": get_schedule().max_running_requests,
+        "max_prefill_tokens": get_schedule().max_prefill_tokens,
+        "enable_dp_attention": get_parallel().attn_dp_size > 1,
+        "speculative_algorithm": get_spec().speculative_algorithm,
+        "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
+        "hicache_ratio": get_memory().hicache_ratio,
+        "hicache_size": get_memory().hicache_size,
+        "hicache_write_policy": get_memory().hicache_write_policy,
+        # Python's scheduler handshake only computes startup_time after all
+        # components have initialized, but the Rust frontend must start earlier
+        # to serve the disaggregation bootstrap registry. Read the already-
+        # initialized KV publisher directly instead of calling get_init_info()
+        # on a partially initialized scheduler.
+        "hicache_host_total_tokens": None,
+        "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
+            scheduler.page_size * get_parallel().dcp_size
+        ),
+    }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
     shm_writer = scheduler.load_snapshot_writer
@@ -120,17 +158,27 @@ def _build_server_args(
             if get_serving().preferred_sampling_params is not None
             else None
         ),
+        lora_ids={
+            ref.lora_name: ref.lora_id
+            for ref in (get_lora().lora_paths or [])
+            if ref.lora_name is not None
+        },
+        enable_strict_thinking=get_serving().enable_strict_thinking,
         limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
+        tokenizer_model_max_length=_tokenizer_model_max_length(
+            scheduler.tokenizer, mc.context_len
+        ),
         # Launch-time facts Python's /server_info reports from
         # scheduler_info / the package — stamped here so the rust endpoint
         # can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
         load_snapshot_path=shm_writer.path if shm_writer else None,
         load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
@@ -168,6 +216,17 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     # router reads this key to pick its protocol.
     info["enable_http2"] = False
     return json.dumps(info, default=str)
+
+
+def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:
+    """`/v1/tokenize`'s `max_model_len`, as `OpenAIServingTokenize` reports
+    it: the tokenizer's `model_max_length`, or the context length when that is
+    not a 64-bit integer (an unset HF value is a 1e30 sentinel). The Rust
+    field is signed, so the bound stops at 2**63."""
+    max_model_len = getattr(tokenizer, "model_max_length", -1)
+    if isinstance(max_model_len, int) and -(2**63) <= max_model_len < 2**63:
+        return max_model_len
+    return context_len
 
 
 def _partition_cores(

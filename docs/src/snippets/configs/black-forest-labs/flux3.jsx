@@ -9,6 +9,49 @@ const hardware = [
   { id: "rtx6000pro", label: "RTX PRO 6000 Blackwell", vram: "96GB", vendor: "consumer" },
 ];
 const hardwareLabels = { rtx5090: "RTX 5090", rtx6000pro: "RTX PRO 6000", h100: "H100", h200: "H200", b200: "B200", b300: "B300", gb200: "GB200", gb300: "GB300" };
+// Matched eager/BCG HTTP runs: 1 MP, batch 1, 80-token bucket, resident.
+const graphRuns = [
+  { hw: "gb300", variant: "distilled", quant: "bf16", mode: "t2i", execution: "eager" },
+  { hw: "gb300", variant: "distilled", quant: "nvfp4", mode: "t2i", execution: "bcg" },
+  { hw: "gb300", variant: "distilled", quant: "nvfp4", mode: "t2i", execution: "bcg", attention: "sdpa" },
+  { hw: "gb300", variant: "base", quant: "bf16", mode: "t2i", execution: "eager" },
+  { hw: "gb300", variant: "base", quant: "bf16", mode: "t2i", execution: "eager", attention: "sdpa" },
+  { hw: "gb300", variant: "base", quant: "bf16", mode: "i2i", execution: "eager" },
+  { hw: "gb300", variant: "distilled", quant: "nvfp4", mode: "i2i", execution: "eager" },
+  { hw: "gb300", variant: "base", quant: "nvfp4", mode: "t2i", execution: "eager" },
+  { hw: "h200", variant: "distilled", quant: "bf16", mode: "t2i", execution: "eager" },
+  { hw: "h200", variant: "base", quant: "bf16", mode: "t2i", execution: "eager" },
+  { hw: "h200", variant: "base", quant: "bf16", mode: "i2i", execution: "eager" },
+  { hw: "h200", variant: "base", quant: "bf16", mode: "t2i", execution: "eager", gpus_per_node: 2, tp_size: 2 },
+  { hw: "rtx5090", variant: "distilled", quant: "nvfp4", mode: "t2i", execution: "eager", attention: "sdpa" },
+  { hw: "rtx5090", variant: "distilled", quant: "nvfp4", mode: "i2i", execution: "eager", attention: "sdpa" },
+  { hw: "rtx5090", variant: "base", quant: "nvfp4", mode: "t2i", execution: "eager", attention: "sdpa" },
+].map((recipe) => ({
+  nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1,
+  placement: "resident", attention: "fa", quality: "lossless",
+  batch_size: 1, outputs: 1, ...recipe,
+}));
+const matches = (recipe, selection) => Object.entries(recipe).every(([key, value]) =>
+  ["id", "default"].includes(key) || String(selection[key]) === String(value));
+const measuredProfiles = [
+  ...["gb300", "h200"].flatMap((hw) => ["base", "distilled"].flatMap((variant) =>
+    (hw === "gb300" ? ["bf16", "fp8r", "nvfp4"] : ["bf16", "fp8r"])
+      .map((quant) => ({ hw, variant, quant, attention: "fa" })))),
+  ...["base", "distilled"].flatMap((variant) =>
+    (variant === "base" ? ["bf16", "fp8r", "nvfp4"] : ["fp8r", "nvfp4"])
+      .map((quant) => ({ hw: "rtx5090", variant, quant, attention: "sdpa" }))),
+  ...[{ tp_size: 2, ulysses_degree: 1 }, { tp_size: 1, ulysses_degree: 2 }]
+    .map((topology) => ({ hw: "h200", variant: "base", quant: "bf16",
+      attention: "fa", mode: "t2i", gpus_per_node: 2, ...topology })),
+  ...graphRuns.flatMap((recipe) => ["eager", "bcg"].map((execution) => ({ ...recipe, execution }))),
+  { hw: "rtx5090", variant: "base", quant: "bf16", mode: "t2i",
+    attention: "sdpa", quality: "lossless" },
+].map((recipe, index) => ({
+  id: `measured-${index}`, nodes: 1, gpus_per_node: 1,
+  tp_size: 1, ulysses_degree: 1, ring_degree: 1,
+  placement: "resident", execution: "eager", quality: "exact",
+  batch_size: 1, outputs: 1, default: index === 0, ...recipe,
+}));
 
 return {
   modelName: "FLUX.3",
@@ -17,8 +60,8 @@ return {
   groupHardware: true,
   matchDims: [],
   overlayDims: [
-    // Request-scope rows only shape the cURL payload: `sglang serve` rejects
-    // sampling flags, and one server serves both modes.
+    // Sampling fields belong to cURL; graph recipes also mirror their shapes
+    // into the server's warmup configuration.
     {
       id: "mode",
       title: "Request mode",
@@ -80,9 +123,9 @@ return {
       scope: "serve",
       docsHref: "/docs/sglang-diffusion/api/cli#component-residency",
       description: "A 1 MP, batch-1 workload fits resident on RTX 5090. Larger references or batches need additional headroom; use auto or offload when necessary.",
-      default: "auto",
+      default: "resident",
       options: [
-        { id: "auto", label: "Auto", recommended: true, flags: [] },
+        { id: "auto", label: "Auto", flags: [] },
         {
           id: "offload",
           label: "CPU offload",
@@ -101,19 +144,20 @@ return {
     },
     {
       id: "attention", title: "Attention", scope: "serve", default: "auto",
-      description: "Keep the backend fixed for numerical comparisons.",
+      description: "Recommended uses the measured recipe's backend; otherwise FlashAttention on datacenter GPUs and Torch SDPA on RTX 5090. Unmeasured settings remain unverified.",
       options: [
-        { id: "auto", label: "Platform default", flags: [], recommended: true },
-        { id: "sdpa", label: "Torch SDPA", flags: ["--attention-backend torch_sdpa"] },
-        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"] },
+        { id: "auto", label: "Recommended", flags: [], recommended: true },
+        { id: "sdpa", label: "Torch SDPA", flags: [] },
+        { id: "fa", label: "FlashAttention", flags: [] },
       ],
     },
     {
-      id: "execution", title: "Execution", scope: "serve", default: "eager",
-      description: "CUDA graphs can reduce launch overhead but reserve additional memory.",
+      id: "execution", title: "Execution", scope: "serve", default: "auto",
+      description: "Recommended uses BCG only for a measured latency win with resident weights and batch 1. Graphs reserve extra memory and replay only captured input shapes.",
       options: [
-        { id: "eager", label: "Eager", flags: [], recommended: true },
-        { id: "bcg", label: "Breakable CUDA graphs", flags: ["--enable-breakable-cuda-graph"], soft: true, softReason: "Not verified for every hardware and topology." },
+        { id: "auto", label: "Recommended", flags: [], recommended: true },
+        { id: "eager", label: "Eager", flags: [] },
+        { id: "bcg", label: "Breakable CUDA graphs", flags: [] },
       ],
     },
     {
@@ -181,13 +225,8 @@ return {
         nodes: { min: 1, max: 1 },
         gpus_per_node: { min: 1, max: 8 },
       },
-      verifiedRecipes: [{
-        id: "gb300-base-bf16", hw: "gb300", nodes: 1,
-        gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1,
-        variant: "base", quant: "bf16", placement: "resident", attention: "fa",
-        execution: "eager", quality: "exact", batch_size: 1, outputs: 1,
-        default: true,
-      }],
+      verifiedRecipes: measuredProfiles.filter((recipe) =>
+        recipe.variant === "base" && recipe.quant === "bf16" && recipe.ulysses_degree === 1 && recipe.quality === "exact"),
       autoTopology: (s) => ({
         tp_size: Number(s.gpus_per_node) || 1,
         ulysses_degree: 1,
@@ -233,17 +272,29 @@ return {
       if (Number(s.batch_size) > 1) {
         parallel.push(`--batching-max-size ${Number(s.batch_size)}`, `--batching-delay-ms ${Number(s.batch_delay) || 0}`);
       }
-      const testedProfile = (["gb300", "h200"].includes(s.hw) && s.attention === "fa"
-          && ["base", "distilled"].includes(s.variant)
-          && (s.quant === "bf16" || s.quality === "exact")
-          && (s.hw === "gb300" || s.quant !== "nvfp4"))
-        || (s.hw === "rtx5090" && s.attention === "sdpa"
-          && s.variant === "base" && s.quant === "bf16");
-      const verified = testedProfile && gpus === 1
-        && s.placement === "resident"
-        && s.execution === "eager" && ["exact", "lossless"].includes(s.quality)
-        && Number(s.batch_size) === 1 && Number(s.outputs) === 1;
+      const preferred = graphRuns.find(({ attention, execution, ...shape }) => matches(shape, { ...s, ...topology }));
+      const attention = s.attention === "auto"
+        ? preferred?.attention || (s.hw === "rtx5090" ? "sdpa" : "fa") : s.attention;
+      const selected = { ...s, ...topology, attention };
+      const best = graphRuns.find(({ execution, ...shape }) => matches(shape, selected));
+      selected.execution = s.execution === "auto" ? best?.execution || "eager" : s.execution;
+      parallel.push(`--attention-backend ${attention === "sdpa" ? "torch_sdpa" : "fa"}`);
+      if (selected.execution === "bcg") {
+        const warmup = { quality: s.quality };
+        if (s.mode === "i2i") Object.assign(warmup, { flux3_mode: "i2i", image_path: ["{{WARMUP_IMAGE}}"] });
+        parallel.push("--enable-breakable-cuda-graph", "--warmup-mode server",
+          "--warmup-resolutions 1024x1024", `--warmup-sampling-params '${JSON.stringify(warmup)}'`);
+      }
+      const verified = measuredProfiles.some((recipe) => matches(recipe, selected));
       const warnings = verified ? [] : ["This exact hardware, checkpoint and topology combination is not yet end-to-end verified."];
+      if (verified && s.mode === "i2i") {
+        warnings.push("Verified recipes cover 1 MP references and output, batch 1; larger inputs require separate capacity validation.");
+      }
+      if (selected.execution === "bcg") {
+        warnings.push(s.mode === "i2i"
+          ? "Warmup needs a server-local 1024x1024 reference. Longer prompt buckets, other reference sizes/counts, batches or quality settings can fall back to eager."
+          : "Graph capture reserves extra memory and covers the 80-token text bucket. Longer prompts, different shapes, batches or quality settings can fall back to eager.");
+      }
       if (s.hw === "rtx5090" && s.placement === "resident" && Number(s.batch_size) > 1) {
         warnings.push("Full-resolution batching needs additional activation memory. Use offload or batch 1 if the resident batch does not fit.");
       }
@@ -270,6 +321,8 @@ return {
           },
           resolvedSettings: {
             placement: s.placement === "resident" ? "GPU resident" : s.placement === "offload" ? "Layerwise offload" : "Auto",
+            attention: attention === "sdpa" ? "Torch SDPA" : "FlashAttention",
+            execution: selected.execution === "bcg" ? "Breakable CUDA graphs" : "Eager",
           },
         },
       };
@@ -289,6 +342,11 @@ return {
     INPUT_IMAGE: {
       target: "curl",
       label: "I2I input image",
+      default: "/data/flux3/reference.png",
+    },
+    WARMUP_IMAGE: {
+      target: "command",
+      label: "BCG warmup image (server path)",
       default: "/data/flux3/reference.png",
     },
   },
