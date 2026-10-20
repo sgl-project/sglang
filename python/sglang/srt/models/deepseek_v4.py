@@ -853,6 +853,24 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
 bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_sources)
 
 
+def deepseek_v4_tail_source_kv(layer, x, positions) -> None:
+    # As deepseek_v4_low_ratio_sources: the source layer's compressor over every
+    # live row, ahead of the tail, when the ratio-1/2 sources are not captured.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens == 0:
+        return
+    get_attn_backend().write_tail_source_kv(
+        layer=layer,
+        x=x[:real_num_tokens],
+        positions=positions[:real_num_tokens],
+        forward_batch=forward_batch,
+    )
+
+
+bcg_deepseek_v4_tail_source_kv = eager_on_graph(True)(deepseek_v4_tail_source_kv)
+
+
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -4066,12 +4084,18 @@ class DeepseekV4Model(nn.Module):
             if tail is not None and i == self.late_layer_start:
                 if self.tail_writes_source_kv:
                     source = self.layers[i]
-                    attn_backend.write_tail_source_kv(
-                        layer=source.self_attn,
-                        x=mhc.combine(source.attn_hc, state),
-                        positions=positions,
-                        forward_batch=forward_batch,
-                    )
+                    source_x = mhc.combine(source.attn_hc, state)
+                    if tail_in_graph and not attn_backend.low_ratio_prefill_graph:
+                        bcg_deepseek_v4_tail_source_kv(
+                            source.self_attn, source_x, positions
+                        )
+                    else:
+                        attn_backend.write_tail_source_kv(
+                            layer=source.self_attn,
+                            x=source_x,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                        )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the

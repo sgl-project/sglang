@@ -288,8 +288,8 @@ def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
             cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1,
         ),
         (
-            "prefill CUDA graphs",
-            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+            "prefill CUDA graphs on prefill",
+            not is_decode and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
         ),
         ("mixed prefill/decode", cfg.enable_mixed_chunk),
         ("LoRA", cfg.enable_lora),
@@ -312,6 +312,26 @@ def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
             server_args,
             "validate_deepseek_v41_encoder_only_prefill",
             enable_decoder_swa_bounded_replay=False,
+        )
+        return
+    # Decode runs each request's last window as an extend over its whole context.
+    # The breakable prefill graph replays it at any length: under the split the
+    # ratio-1/2 indexer runs as an eager break, so no candidate window bounds it.
+    # The DeepSeek-V4 default (disabled, for c4 capture memory) doesn't apply:
+    # V4.1 has no c4 layers.
+    locked = getattr(server_args, "_cuda_graph_config_locked", set())
+    changes = {}
+    if (Phase.PREFILL, "backend") not in locked:
+        changes["backend"] = Backend.BREAKABLE
+    if (Phase.PREFILL, "max_seq_len") not in locked:
+        changes["max_seq_len"] = model_config_of(server_args).context_len
+    if changes:
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_encoder_only_prefill",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, **changes
+            ),
         )
 
 
@@ -441,6 +461,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         prefill_graph.backend != Backend.DISABLED
         and prefill_graph.max_seq_len is None
         and not cp_breakable_prefill
+        # Encoder-only PD sizes its graphs in validate_deepseek_v41_encoder_only_prefill.
+        and not cfg.dsv41_encoder_only_prefill
     ):
         declare_resolution(
             server_args,

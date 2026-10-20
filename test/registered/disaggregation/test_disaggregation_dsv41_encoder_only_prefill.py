@@ -54,8 +54,6 @@ class TestDisaggregationDSV41EncoderOnlyPrefill(PDDisaggregationServerBase, GSM8
             "--tp",
             4,
             "--dsv41-encoder-only-prefill",
-            "--cuda-graph-backend-prefill",
-            "disabled",
             "--max-running-requests",
             "32",
             "--watchdog-timeout",

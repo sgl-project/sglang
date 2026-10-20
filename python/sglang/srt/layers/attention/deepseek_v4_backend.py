@@ -115,6 +115,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -1633,6 +1634,10 @@ class DeepseekV4AttnBackend(
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1
+            # Encoder-only PD decode graphs tails over contexts of any length; the
+            # captured indexer covers only the candidate window, so its sources run
+            # as an eager break, as in the decoder tail graph.
+            and not get_disagg().dsv41_encoder_only_prefill
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -3199,11 +3204,13 @@ class DeepseekV4AttnBackend(
         if (
             hoisted_req is not None
             and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
+            and hoisted_pos.shape[0] >= positions.shape[0]
         ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
+            # Bucket-sized under the prefill graph, real rows first; an eager
+            # break sees the live rows only. Inside the late-layer tail these
+            # are the tail's rows, which the batch's extend lengths don't give.
+            num_rows = positions.shape[0]
+            req, pos = hoisted_req[:num_rows], hoisted_pos[:num_rows]
         else:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
@@ -3395,6 +3402,9 @@ class DeepseekV4AttnBackend(
         freqs_cis = torch.view_as_real(layer.freqs_cis).flatten(-2)
         kv_cache = pool.get_extra_key_buffer(layer_id)
         page_size = pool.get_extra_key_page_size(layer_id)
+        # Bucket-sized under the prefill graph; an eager break passes live rows.
+        num_tokens = pos.shape[0]
+        raw_out_loc = core.raw_out_loc[:num_tokens]
         # The pool's page format: V4, or the V4.1 fp8 / fp4 layouts.
         kv_layout = (
             KVLayout.UNIFORM_FP8
@@ -3409,7 +3419,7 @@ class DeepseekV4AttnBackend(
                 compressor.wkv(x),
                 compressor.norm.weight.data,
                 pos,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3427,7 +3437,7 @@ class DeepseekV4AttnBackend(
                 compressor.norm.weight.data,
                 pos,
                 req,
-                core.raw_out_loc,
+                raw_out_loc,
                 compressor.norm.eps,
                 freqs_cis,
                 kv_cache,
@@ -3455,6 +3465,7 @@ class DeepseekV4AttnBackend(
             # out_loc is -1 for an incomplete group and 0 for padding;
             # the kernel suppresses both stores.
             assert out_loc is not None
+            out_loc = out_loc[:num_tokens]
             if pool.low_ratio_index_k_is_split(layer_id):
                 # ROCm keeps the index-K payload and scales in two buffers
                 from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (

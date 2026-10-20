@@ -7,7 +7,12 @@ from sglang.srt.arg_groups.deepseek_v4_hook import (
     validate_deepseek_v41_encoder_only_prefill,
 )
 from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    Phase,
+    PhaseConfig,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -42,7 +47,11 @@ class TestDsv41EncoderOnlyPrefillArgs(CustomTestCase):
             **fields,
         )
         # Checkpoint metadata without loading weights or downloading a model.
-        args._model_config = SimpleNamespace(hf_config=config or _v41_config())
+        args._model_config = SimpleNamespace(
+            hf_config=config or _v41_config(), context_len=1048576
+        )
+        # As the parsed CLI would record no explicit graph settings.
+        args._cuda_graph_config_locked = set()
         return args
 
     def test_roles_accept_the_official_layout(self):
@@ -60,6 +69,19 @@ class TestDsv41EncoderOnlyPrefillArgs(CustomTestCase):
         validate_deepseek_v41_encoder_only_prefill(
             self.make_args("decode", speculative_algorithm="DSPARK")
         )
+
+    def test_decode_graphs_tails_at_any_context(self):
+        args = self.make_args("decode")
+        validate_deepseek_v41_encoder_only_prefill(args)
+        prefill_graph = resolving_view(args).cuda_graph_config.prefill
+        self.assertEqual(prefill_graph.backend, Backend.BREAKABLE)
+        self.assertEqual(prefill_graph.max_seq_len, 1048576)
+        # An explicit setting stands.
+        args = self.make_args("decode")
+        args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
+        validate_deepseek_v41_encoder_only_prefill(args)
+        prefill_graph = resolving_view(args).cuda_graph_config.prefill
+        self.assertEqual(prefill_graph.backend, Backend.DISABLED)
 
     def test_decode_requires_decoder_replay(self):
         args = self.make_args("decode", enable_decoder_swa_bounded_replay=False)
