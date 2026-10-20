@@ -114,7 +114,6 @@ tensors directly into a registered transfer pool on its GPU:
 import asyncio
 
 from sglang.multimodal_gen.runtime.disaggregation.deployment.client import EncodingClient
-from sglang.multimodal_gen.runtime.pipelines_core import Req
 
 async def main():
     async with EncodingClient(
@@ -123,8 +122,8 @@ async def main():
         hostname="127.0.0.1",
     ) as client:
         requests = [
-            Req(prompt="A mountain landscape", image_path=None),
-            Req(prompt="A watercolor landscape", image_path=None),
+            {"prompt": "A mountain landscape", "image_path": None},
+            {"prompt": "A watercolor landscape", "image_path": None},
         ]
         results = await asyncio.gather(*(client.encode(req) for req in requests))
         embeddings = results[0]["extra.flux3_text"]

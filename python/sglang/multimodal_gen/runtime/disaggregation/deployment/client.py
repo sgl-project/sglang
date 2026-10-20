@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Async encoding client returning named tensors on the trainer's GPU."""
 
+import asyncio
+
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import (
@@ -24,8 +26,20 @@ class EncodingClient:
         self.timeout = timeout
         self.context = zmq.asyncio.Context()
         self.transport = TensorTransport(device, hostname, pool_size, ib_device)
+        self.pending = set()
+        self.closing = False
 
     async def encode(self, request, outputs=None):
+        if self.closing:
+            raise RuntimeError("Encoding client is closing")
+        task = asyncio.current_task()
+        self.pending.add(task)
+        try:
+            return await self._encode(request, outputs)
+        finally:
+            self.pending.discard(task)
+
+    async def _encode(self, request, outputs):
         result = await rpc(
             self.context,
             self.endpoint,
@@ -59,5 +73,11 @@ class EncodingClient:
         return self
 
     async def __aexit__(self, *exc):
-        self.transport.close()
-        self.context.term()
+        self.closing = True
+        for task in self.pending:
+            task.cancel()
+        await asyncio.gather(*self.pending, return_exceptions=True)
+        try:
+            self.transport.close()
+        finally:
+            self.context.destroy(linger=0)

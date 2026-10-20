@@ -17,6 +17,7 @@ import zmq
 import zmq.asyncio
 from torch.utils._pytree import tree_flatten, tree_leaves, tree_map, tree_unflatten
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
     fork_request,
     read_field,
@@ -27,6 +28,9 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import (
     rpc,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    resolve_sampling_params_cls,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
@@ -52,7 +56,13 @@ def run_partition(scheduler, req):
 def broadcast_request(scheduler, req):
     group = get_world_group()
     if req is not None:
-        leaves, spec = tree_flatten(vars(req))
+        state = dict(vars(req))
+        state["extra"] = dict(req.extra)
+        if "_deployment_result" in state["extra"]:
+            state["extra"]["_deployment_result"] = vars(
+                state["extra"]["_deployment_result"]
+            )
+        leaves, spec = tree_flatten(state)
         tensors = [(i, x) for i, x in enumerate(leaves) if isinstance(x, torch.Tensor)]
         metadata = [(i, tuple(t.shape), t.dtype) for i, t in tensors]
         leaves = [None if isinstance(x, torch.Tensor) else x for x in leaves]
@@ -75,6 +85,10 @@ def broadcast_request(scheduler, req):
         leaves[index] = tensor
     restored = object.__new__(Req)
     vars(restored).update(tree_unflatten(leaves, spec))
+    if "_deployment_result" in restored.extra:
+        restored.extra["_deployment_result"] = OutputBatch(
+            **restored.extra["_deployment_result"]
+        )
     return restored
 
 
@@ -93,6 +107,7 @@ class DeploymentWorker:
         self.scheduler = scheduler
         self.args = scheduler.server_args
         self.pipeline = scheduler.worker.pipeline
+        self.sampling_params_cls = resolve_sampling_params_cls(self.args)
         self.plan = self.pipeline.deployment_plan
         self.role = self.plan.roles[self.args.stage_role]
         self.device = torch.device(f"cuda:{scheduler.worker.local_rank}")
@@ -122,7 +137,26 @@ class DeploymentWorker:
         with self.lock:
             if len(self.results) >= self.args.disagg_max_slots_per_instance:
                 raise RuntimeError("Stage worker result capacity exhausted")
-        req = fork_request(message["request"])
+        incoming = message["request"]
+        if isinstance(incoming, dict):
+            params = self.sampling_params_cls()
+            req = Req(sampling_params=params, **incoming)
+            params._explicit_fields = set(incoming)
+            params._adjust(self.args)
+            params._validate()
+            req.validate()
+        else:
+            req = fork_request(incoming)
+            if type(req.sampling_params) is SamplingParams:
+                params = self.sampling_params_cls()
+                params._merge_with_user_params(req.sampling_params)
+                params._explicit_fields = vars(req.sampling_params).get(
+                    "_explicit_fields", set()
+                )
+                params._adjust(self.args)
+                params._validate()
+                req.sampling_params = params
+                req.validate()
         for source in message["sources"]:
             fields = source["fields"]
             values = await self.transport.receive(

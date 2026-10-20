@@ -41,7 +41,10 @@ from sglang.multimodal_gen.runtime.server_args import (
     prepare_server_args,
     set_global_server_args,
 )
-from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.common import (
+    is_port_available,
+    parse_tcp_host_port,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.utils.process import (
     kill_process_tree,
@@ -845,7 +848,11 @@ def launch_stage_deployment(server_args: ServerArgs):
         deployment = Deployment.load(server_args.stage_deployment)
         context = mp.get_context("spawn")
         processes = []
-        reserved = set()
+        reserved = {
+            parse_tcp_host_port(endpoint, "stage endpoint")[1]
+            for role in deployment.roles.values()
+            for endpoint in role.endpoints
+        }
         try:
             for name, role in deployment.roles.items():
                 if role.node != server_args.stage_node:

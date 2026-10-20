@@ -2162,6 +2162,14 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        if (
+            any(
+                value is not None
+                for value in (self.stage_role, self.stage_node, self.stage_endpoint)
+            )
+            and self.stage_deployment is None
+        ):
+            raise ValueError("Stage worker selectors require --stage-deployment")
         self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 

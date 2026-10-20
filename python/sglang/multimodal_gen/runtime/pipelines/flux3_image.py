@@ -86,15 +86,13 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
         ),
     )
 
-    def _needs_component(self, component, *affinities):
+    def _needs_component(self, server_args, component, *affinities):
         if self.deployment_plan is not None:
             return (
                 component
-                in self.deployment_plan.roles[self.server_args.stage_role].components
+                in self.deployment_plan.roles[server_args.stage_role].components
             )
-        return any(
-            self.server_args.disagg_role.includes_stage(role) for role in affinities
-        )
+        return any(server_args.disagg_role.includes_stage(role) for role in affinities)
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role not in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
@@ -129,11 +127,13 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
         device = get_local_torch_device()
         modules = {}
-        if self._needs_component("transformer", RoleType.DENOISER):
+        if self._needs_component(server_args, "transformer", RoleType.DENOISER):
             modules["transformer"] = self._load_transformer(
                 server_args, package, device
             )
-        if self._needs_component("vae", RoleType.IMAGE_ENCODER, RoleType.DECODER):
+        if self._needs_component(
+            server_args, "vae", RoleType.IMAGE_ENCODER, RoleType.DECODER
+        ):
             vae_device = (
                 torch.device("cpu")
                 if server_args.should_start_component_on_cpu("vae")
@@ -147,7 +147,7 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 vae, load_file(str(package.vae), device=str(vae_device)), assign=True
             )
             modules["vae"] = vae
-        if self._needs_component("text_encoder", RoleType.PROMPT_ENCODER):
+        if self._needs_component(server_args, "text_encoder", RoleType.PROMPT_ENCODER):
             modules["text_encoder"] = self._load_text_encoder(
                 server_args, package, device
             )

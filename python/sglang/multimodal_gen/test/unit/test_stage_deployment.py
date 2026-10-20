@@ -69,11 +69,15 @@ def test_contracts_compile_and_tensor_tree_round_trip():
     values = {
         "extra.text": (torch.arange(5), {"mask": torch.ones(5, dtype=torch.bool)}),
         "extra.image": None,
+        "empty": torch.empty(0, 3),
     }
     tensors, scalar = pack_fields(values)
     restored = unpack_fields(tensors, scalar)
     torch.testing.assert_close(restored["extra.text"][0], values["extra.text"][0])
     assert restored["extra.image"] is None
+    assert restored["empty"].shape == (0, 3)
+    with pytest.raises(ValueError):
+        unpack_fields({}, scalar)
     with pytest.raises(TypeError):
         pack_fields({"required": object()})
 
