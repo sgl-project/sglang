@@ -908,7 +908,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 )
             output = out
 
-        flat_ids = input_ids.reshape(-1)
+        flat_ids = input_ids.reshape(-1).long()
         if flat_ids.numel():
             if input_ids.device.type == "npu":
                 from sglang.srt.hardware_backend.npu.ple import gather_ple_uva_rows
@@ -920,7 +920,6 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
-            flat_ids = flat_ids.long()
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
                     flat_ids,
