@@ -31,8 +31,11 @@ from sglang.srt.runtime_context import (
 )
 
 try:
-    import flashinfer.mla._core as _fi_core
     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+    from flashinfer.utils import (
+        get_device_sm_count,
+        get_trtllm_gen_multi_ctas_kv_counter_bytes,
+    )
 except ImportError as exc:
     _flashinfer_import_error = exc
 else:
@@ -61,11 +64,6 @@ def _get_trtllm_workspace_buffer(device: torch.device) -> torch.Tensor:
     )
 
 
-_trtllm_semaphore_installed = False
-# Capacity is in query rows: requests x draft tokens for decode, sum_q for prefill.
-_trtllm_semaphore_rows: int = 0
-
-
 def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
     """Bound query rows across prefill chunks and speculative decode batches.
 
@@ -87,54 +85,50 @@ def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
     return max(rows, 1)
 
 
-def _install_persistent_trtllm_semaphores(capacity_rows: int) -> None:
-    """Install a persistent counter buffer sized by query rows.
+def _trtllm_counter_bytes(device: torch.device, num_rows: int, num_heads: int) -> int:
+    # Rows, not requests: the DSV4 VarSeq kernel indexes the counters by query row.
+    return get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        num_rows, num_heads, get_device_sm_count(device)
+    )
 
-    FlashInfer sizes this private buffer by request count, while the DSV4
-    VarSeq kernel indexes it by query row. Remove this workaround once
-    FlashInfer accepts a caller-owned buffer.
+
+def _get_trtllm_counter_buffer(
+    device: torch.device, capacity_rows: int, max_heads: int
+) -> torch.Tensor:
+    """Return the multi-CTA KV counter buffer shared by every trtllm launch.
+
+    Without a caller buffer FlashInfer zeroes a fresh one per call, a memset
+    node before each attention kernel in captured graphs. The kernel resets its
+    counters at the end of each launch, so one buffer serves all launches; like
+    the workspace, they run in order on the forward stream.
     """
-    global _trtllm_semaphore_installed, _trtllm_semaphore_rows
     if _flashinfer_import_error is not None:
         raise ImportError(
             "--dsv4-attn-backend trtllm requires FlashInfer sparse MLA support"
         ) from _flashinfer_import_error
-    _trtllm_semaphore_rows = max(_trtllm_semaphore_rows, capacity_rows)
-    if _trtllm_semaphore_installed:
-        return
-    _orig = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer
-    # Allocate once outside graph capture. Stream ordering and the kernel's
-    # counter reset make one shared buffer safe across launches.
-    state: dict = {}
-
-    def _patched(batch_size, num_qo_heads, sm_count, device):
-        buf = state.get("buf")
-        if buf is None or buf.device != device:
-            assert not torch.cuda.is_current_stream_capturing(), (
-                "persistent trtllm semaphore buffer must be created outside "
-                "graph capture (first call is expected during eager warmup)"
-            )
-            buf = _orig(_trtllm_semaphore_rows, num_qo_heads, sm_count, device)
-            state["buf"] = buf
-        return buf
-
-    _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer = _patched
-    _trtllm_semaphore_installed = True
-    logger.info(
-        "trtllm-gen multi-CTA semaphores: single persistent buffer sized for "
-        "%d query rows, shared across launches (flashinfer sizing WAR).",
-        _trtllm_semaphore_rows,
+    buffer = get_buffer(
+        "trtllm_dsv4_multi_ctas_kv_counter",
+        lambda: torch.zeros(
+            _trtllm_counter_bytes(device, capacity_rows, max_heads),
+            dtype=torch.uint8,
+            device=device,
+        ),
     )
+    _check_trtllm_query_rows(buffer, num_rows=capacity_rows, num_heads=max_heads)
+    return buffer
 
 
-def _check_trtllm_query_rows(num_rows: int) -> None:
+def _check_trtllm_query_rows(
+    counter_buffer: torch.Tensor, num_rows: int, num_heads: int
+) -> None:
     # A plain exception, not assert: an over-capacity launch scribbles past
-    # the semaphore buffer, so this must fire even under python -O.
-    if num_rows > _trtllm_semaphore_rows:
+    # the counter buffer, so this must fire even under python -O.
+    need = _trtllm_counter_bytes(counter_buffer.device, num_rows, num_heads)
+    if need > counter_buffer.numel():
         raise RuntimeError(
-            f"trtllm-gen launch with {num_rows} query rows exceeds the persistent "
-            f"semaphore capacity of {_trtllm_semaphore_rows} rows derived from "
-            "--chunked-prefill-size / --max-prefill-tokens / "
+            f"trtllm-gen launch with {num_rows} query rows x {num_heads} heads "
+            f"exceeds the persistent counter buffer of {counter_buffer.numel()} "
+            "bytes derived from --chunked-prefill-size / --max-prefill-tokens / "
             "--max-running-requests; lower --chunked-prefill-size."
         )
 
@@ -152,7 +146,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         topk=0,
         speculative_num_steps=0,
     ):
-        _install_persistent_trtllm_semaphores(_trtllm_query_row_capacity(model_runner))
         super().__init__(
             model_runner,
             skip_prefill=skip_prefill,
@@ -173,6 +166,12 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             "context parallelism (attn_cp_size > 1) yet."
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
+        # Launches pass the native per-rank heads or FlashMLA's 64-head pad.
+        self.trtllm_counter_buffer = _get_trtllm_counter_buffer(
+            device=self.device,
+            capacity_rows=_trtllm_query_row_capacity(model_runner),
+            max_heads=max(64, model_runner.model_config.num_attention_heads),
+        )
 
     def _forward_trtllm(
         self,
@@ -352,12 +351,15 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             seq_lens = core_attn_metadata.swa_topk_lengths[:bs]
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
-        _check_trtllm_query_rows(bs)
+        _check_trtllm_query_rows(
+            self.trtllm_counter_buffer, num_rows=bs, num_heads=num_heads
+        )
 
         out = trtllm_batch_decode_sparse_mla_dsv4(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
+            multi_ctas_kv_counter_buffer=self.trtllm_counter_buffer,
             sparse_indices=sparse_indices,
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,
@@ -485,7 +487,9 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         bmm1_scale, bmm2_scale = self._get_trtllm_bmm_scales(layer)
         assert attn_sink.dtype == torch.float32
         assert self.trtllm_workspace_buffer is not None
-        _check_trtllm_query_rows(sum_q)
+        _check_trtllm_query_rows(
+            self.trtllm_counter_buffer, num_rows=sum_q, num_heads=num_heads
+        )
 
         out_padded = None
         out_arg = None
@@ -502,6 +506,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
+            multi_ctas_kv_counter_buffer=self.trtllm_counter_buffer,
             sparse_indices=sparse_indices,
             compressed_kv_cache=compressed_kv_cache,
             sparse_topk_lens=sparse_topk_lens,

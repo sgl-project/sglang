@@ -711,10 +711,18 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             schedule.max_running_requests = 8192
             self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
 
-        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
-            trtllm._check_trtllm_query_rows(64)
-            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
-                trtllm._check_trtllm_query_rows(65)
+        # Counters cover query rows x heads, floored at the SM count.
+        with mock.patch.object(trtllm, "get_device_sm_count", return_value=148):
+            counter = torch.zeros(
+                trtllm._trtllm_counter_bytes(torch.device("cpu"), 64, 16),
+                dtype=torch.uint8,
+            )
+            trtllm._check_trtllm_query_rows(counter, num_rows=64, num_heads=16)
+            for rows, heads in ((65, 16), (64, 17)):
+                with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
+                    trtllm._check_trtllm_query_rows(
+                        counter, num_rows=rows, num_heads=heads
+                    )
 
     def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
