@@ -77,9 +77,8 @@ class TestDPAttentionMixedChunk(
 ):
     # Use full GSM8K dataset to avoid sampling variance.
     gsm8k_num_examples = 1319
-    # Moonlight bf16 GSM8K baseline is ~0.837; DP attention + mixed chunk adds
-    # run-to-run variance on NPU, so this threshold still needs calibration.
-    gsm8k_accuracy_thres = 0.80
+    # Moonlight bf16 GSM8K baseline is ~0.837.
+    gsm8k_accuracy_thres = 0.83
 
     @classmethod
     def setUpClass(cls):
