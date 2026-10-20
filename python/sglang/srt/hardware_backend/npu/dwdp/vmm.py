@@ -10,7 +10,7 @@ import torch
 
 from sglang.srt.layers.moe.dwdp.layout import PageAlignedLayout
 from sglang.srt.layers.moe.dwdp.page_pool import PagePool, compute_slot_sizes
-from sglang.srt.utils.alignment import align_down, align_up
+from sglang.srt.utils.cuda_vmm_utils import align_down, align_up
 
 
 def _check(ret, operation):

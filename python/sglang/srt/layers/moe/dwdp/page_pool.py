@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
-from sglang.srt.utils.alignment import align_up
+from sglang.srt.utils.cuda_vmm_utils import align_up
 
 if TYPE_CHECKING:
     from sglang.srt.utils.cuda_vmm_utils import VmmReservation
