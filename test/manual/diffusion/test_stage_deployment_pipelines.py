@@ -7,6 +7,7 @@ claiming that arbitrary stateful boundaries are transferable.
 """
 
 import asyncio
+import sys
 
 import pytest
 import torch
@@ -147,3 +148,7 @@ def test_external_contracts_match_monolithic(model, num_frames):
                     torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
 
         asyncio.run(check())
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

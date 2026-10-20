@@ -350,7 +350,7 @@ class _DisaggTestBase(CustomTestCase):
     gpu_layout: dict[str, list[int]] = {}
     extra_role_args: dict[str, list[str]] = {}
     warmup_kwargs: dict = {}
-    stage_groups: dict[str, list[str]] | None = None
+    stage_groups: dict[str, list[str | int]] | None = None
     stage_outputs: tuple[str, ...] | None = None
 
     cluster: DisaggCluster | None = None
