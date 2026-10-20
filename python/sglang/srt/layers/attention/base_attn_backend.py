@@ -198,7 +198,7 @@ class AttentionBackend(ABC):
         """
         if (
             envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
-            or envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.get()
+            or not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get()
         ):
             return SharedReadEnds.UNKNOWN
         if forward_batch.forward_mode != ForwardMode.EXTEND:

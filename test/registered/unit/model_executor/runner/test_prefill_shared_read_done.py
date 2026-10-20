@@ -67,9 +67,9 @@ def test_publishes_recorded_event_by_default():
     assert isinstance(published, _Event) and published.recorded
 
 
-def test_forced_prefill_coarse_barrier_skips_event():
+def test_disabled_when_flag_is_false():
     runner = _model_runner()
-    with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(True):
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(False):
         _prepare_and_publish(runner, _batch())
     assert runner.shared_read_done_event is None
 
@@ -80,7 +80,7 @@ def test_forced_prefill_coarse_barrier_skips_event():
 def test_dflash_family_target_prefill_publishes(algorithm):
     runner = _model_runner(spec_algorithm=algorithm)
     runner.prefill_shared_read_stager = Mock(return_value=False)
-    with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(False):
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         _prepare_and_publish(runner, _batch())
     published = runner.shared_read_done_event
     assert isinstance(published, _Event) and published.recorded
@@ -106,7 +106,7 @@ def test_speculative_prefill_publishes_only_after_staging(algorithm, staged):
     runner.prefill_shared_read_stager = calls.stage
     calls.stage.return_value = staged
     calls.Event.side_effect = _Event
-    with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(False):
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         _prepare_and_publish(runner, batch, SimpleNamespace(Event=calls.Event))
     assert calls.mock_calls == [call.stage(batch)] + ([call.Event()] if staged else [])
     published = runner.shared_read_done_event
@@ -131,14 +131,14 @@ def test_prefill_gates_skip_staging(enabled, mode, compliant):
         spec_algorithm=SpeculativeAlgorithm.EAGLE, compliant=compliant
     )
     runner.prefill_shared_read_stager = Mock(return_value=True)
-    with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(not enabled):
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
         _prepare_and_publish(runner, _batch(mode))
     runner.prefill_shared_read_stager.assert_not_called()
     assert runner.shared_read_done_event is None
 
 
 def test_gates_exclude_non_prefill_unsupported_algorithm_and_noncompliant_backend():
-    with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(False):
+    with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         for runner, batch in (
             # Verify/mixed/decode publish through the decode graph runner.
             (_model_runner(), _batch(ForwardMode.TARGET_VERIFY)),
@@ -174,7 +174,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
         for algorithm in SpeculativeAlgorithm:
             with self.subTest(algorithm=algorithm):
                 runner = _model_runner(spec_algorithm=algorithm)
-                with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(False):
+                with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
                     _prepare_and_publish(runner, _batch())
                 self.assertEqual(
                     runner.shared_read_done_event is not None, algorithm in allowed
@@ -191,7 +191,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
                 )
                 runner, batch = _model_runner(spec_algorithm=algorithm), _batch()
                 runner.prefill_shared_read_stager = Mock(return_value=False)
-                with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(False):
+                with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
                     _prepare_and_publish(runner, batch)
                 event = runner.shared_read_done_event
                 self.assertEqual(event is not None, expected)
@@ -201,7 +201,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
                 else:
                     runner.prefill_shared_read_stager.assert_called_once_with(batch)
 
-    def test_opt_in_does_not_bypass_mode_backend_or_opt_out(self):
+    def test_opt_in_does_not_bypass_mode_backend_or_flag(self):
         algorithm = _TargetOnlyPrefillAlgo("TEST_PREFILL", lambda _: object)
         cases = [(False, ForwardMode.EXTEND, SharedReadEnds.PRE_REPLAY)]
         cases.extend(
@@ -217,7 +217,7 @@ class TestPrefillReadDoneCapability(CustomTestCase):
         for enabled, mode, declared in cases:
             with self.subTest(enabled=enabled, mode=mode, declared=declared):
                 runner = _model_runner(spec_algorithm=algorithm, declared=declared)
-                with envs.SGLANG_FORCE_PREFILL_COARSE_WAR_BARRIER.override(not enabled):
+                with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
                     _prepare_and_publish(runner, _batch(mode))
                 self.assertIsNone(runner.shared_read_done_event)
 
