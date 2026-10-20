@@ -37,3 +37,12 @@ class DecodeContextParallelMetadata:
     dcp_extend_prefix_lens_sum: Optional[int] = None
     # DSA prefill: [bs, max_len] sequence position -> dcp_kv_buffer row.
     dsa_page_table_1: Optional[torch.Tensor] = None
+    # Set by the ROCm DSA backend when this extend attends the all-gathered
+    # prefix in dcp_kv_buffer instead of merging per-rank partials.
+    dsa_gathered_prefill: bool = False
+
+
+def is_dsa_dcp_gathered_prefill(
+    metadata: Optional[DecodeContextParallelMetadata],
+) -> bool:
+    return metadata is not None and metadata.dsa_gathered_prefill

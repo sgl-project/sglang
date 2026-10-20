@@ -21,6 +21,7 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+    is_dsa_dcp_gathered_prefill,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -30,9 +31,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_v_correction as apply_kv_b_lora_v_correction,
 )
-from sglang.srt.lora.deepseek_mla_correction import (
-    is_kv_b_lora_active,
-)
+from sglang.srt.lora.deepseek_mla_correction import is_kv_b_lora_active
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -133,7 +132,7 @@ class DeepseekMLAForwardMixin:
                 # DSA backend may plan a gathered prefix, in which case the MLA
                 # path attends this rank's heads instead of merging partials.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
-                and (not _is_hip or forward_batch.attn_dcp_metadata is None)
+                and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
             )
         )
 

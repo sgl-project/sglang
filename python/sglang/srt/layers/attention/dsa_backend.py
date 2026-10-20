@@ -99,6 +99,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp import is_dsa_dcp_gathered_prefill
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -1401,17 +1402,20 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
-        if _is_hip and self.dcp_size > 1:
+        # Re-plan only over this backend's own plan: another planner's metadata
+        # (prepare_context_parallel_metadata_for_dcp) is not ours to replace.
+        existing = forward_batch.attn_dcp_metadata
+        if (
+            _is_hip
+            and self.dcp_size > 1
+            and (existing is None or is_dsa_dcp_gathered_prefill(existing))
+        ):
             forward_batch.attn_dcp_metadata = self._plan_dcp_gathered_prefill(
                 forward_batch, page_table.shape[1]
             )
 
     def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
-        return (
-            _is_hip
-            and self.dcp_size > 1
-            and forward_batch.attn_dcp_metadata is not None
-        )
+        return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
 
     def _plan_dcp_gathered_prefill(
         self, forward_batch: ForwardBatch, page_table_width: int
@@ -1458,6 +1462,7 @@ class DeepseekSparseAttnBackend(
             forward_batch.seq_lens,
             page_table_width,
         )
+        dcp_meta.dsa_gathered_prefill = True
         return dcp_meta
 
     def _cal_indexer_k_start_end(
