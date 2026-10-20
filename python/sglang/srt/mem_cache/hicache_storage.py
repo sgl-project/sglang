@@ -11,7 +11,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
-
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -193,10 +192,15 @@ class HiCacheStorage(ABC):
     # A rank-local store must override this to retain every shard's writer.
     requires_rank_local_backup = False
 
-    # Read batching only; write/query batches retain STORAGE_BATCH_SIZE. All
+    # Read batching only; writes retain STORAGE_BATCH_SIZE. All
     # ranks participating in prefetch ACK reduction must use the same value,
     # including after a failed batch, to preserve their collective sequence.
     prefetch_batch_pages = STORAGE_BATCH_SIZE
+
+    # Ordinary KV prefix lookups can amortize request-scoped metadata parsing
+    # independently of payload reads. Backends keep the historical default;
+    # hybrid pool queries retain their own full-chain boundary contract.
+    query_batch_pages = STORAGE_BATCH_SIZE
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):

@@ -10,7 +10,6 @@ from collections import defaultdict
 from functools import lru_cache
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
@@ -90,6 +89,10 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
+    elif allocator_type == "kvcr":
+        from sglang.srt.mem_cache.storage.kvcr.numa_pool import allocator_for_config
+
+        return allocator_for_config(get_memory().hicache_storage_backend_extra_config)
     elif allocator_type == "mori":
         try:
             from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
@@ -190,6 +193,12 @@ def _cuda_host_register(
         # cudaHostUnregister to receive each base pointer, not just the tensor's
         # original base once after several independent registrations.
         setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, registered_ranges)
+        if hasattr(buffer, "_sglang_owned_numa_host_proof"):
+            from sglang.srt.mem_cache.storage.kvcr.numa_pool import (
+                audit_registered_host,
+            )
+
+            audit_registered_host(buffer, registered_ranges)
     except Exception:
         remaining_ranges = _cuda_host_unregister_ranges(
             cudart, registered_ranges, operation="registration rollback"

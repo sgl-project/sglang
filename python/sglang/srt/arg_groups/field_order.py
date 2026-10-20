@@ -521,5 +521,18 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    # Freeze the previously appended fields before adding another namespace leaf.
+    "qsa_indexer_dtype",
+    "disaggregation_decode_allocation_policy",
+    "speculative_boundary_reduction",
+    "speculative_use_block_verification",
+    "speculative_draft_sink_size",
+    "disable_aiter_allreduce_fusion_in_prefill",
+    "disable_aiter_allreduce_fusion_in_decode",
+    "dsa_triton_union",
+    "enable_dsa_fused_indexer",
+    "enable_cp_tp_group_sharing",
+    "grpc_response_timeout_secs",
+    "python_thread_switch_interval",
 )
 # fmt: on

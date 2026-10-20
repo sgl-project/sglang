@@ -105,6 +105,16 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+def validate_python_thread_scheduling(server_args: Any) -> None:
+    from sglang.srt.managers.scheduler_components.thread_scheduling import (
+        validate_python_thread_switch_interval,
+    )
+
+    validate_python_thread_switch_interval(
+        resolving_view(server_args).python_thread_switch_interval
+    )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
