@@ -12,10 +12,9 @@ import msgspec
 import torch
 import torch.distributed as dist
 
-from sglang.srt.environ import envs
-from sglang.srt.megakernels.binding import MegakernelBinding
-from sglang.srt.megakernels.guards import deadline_s, device_isa
-from sglang.srt.megakernels.spec import (
+from sglang.kernels.low_latency_kernels.megakernels.binding import MegakernelBinding
+from sglang.kernels.low_latency_kernels.megakernels.guards import deadline_s, device_isa
+from sglang.kernels.low_latency_kernels.megakernels.spec import (
     FLAG,
     BuildContext,
     BuiltMegakernel,
@@ -25,6 +24,7 @@ from sglang.srt.megakernels.spec import (
     find_spec,
     spec_registered,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
     get_context,

@@ -11,10 +11,8 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.monokernels.guards import deadline_s, device_isa
-from sglang.srt.monokernels.spec import (
+from sglang.kernels.low_latency_kernels.monokernels.guards import deadline_s, device_isa
+from sglang.kernels.low_latency_kernels.monokernels.spec import (
     BuildContext,
     BuiltMonokernels,
     Feature,
@@ -25,6 +23,8 @@ from sglang.srt.monokernels.spec import (
     find_spec,
     spec_registered,
 )
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import (
     attention_backends,
     get_context,

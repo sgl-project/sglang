@@ -20,6 +20,8 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.low_latency_kernels.monokernels.runtime import is_metadata_unread
+from sglang.kernels.low_latency_kernels.monokernels.spec import StepMetadata
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,
@@ -108,8 +110,6 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.dsv41_request_window import window_layout
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.monokernels.runtime import is_metadata_unread
-from sglang.srt.monokernels.spec import StepMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

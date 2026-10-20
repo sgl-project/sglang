@@ -5,8 +5,11 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.kernels.low_latency_kernels.megakernels.runtime import (
+    megakernel_agree,
+    megakernel_draft_sampler,
+)
 from sglang.srt.layers.dp_attention import get_dp_tp_group
-from sglang.srt.megakernels.runtime import megakernel_agree, megakernel_draft_sampler
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,

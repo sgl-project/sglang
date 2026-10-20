@@ -25,6 +25,10 @@ from typing import Callable, List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.kernels.low_latency_kernels.megakernels.runtime import install_megakernel
+from sglang.kernels.low_latency_kernels.monokernels.runtime import (
+    install_monokernel_forward,
+)
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -92,7 +96,6 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
-from sglang.srt.megakernels.runtime import install_megakernel
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -188,7 +191,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.monokernels.runtime import install_monokernel_forward
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,

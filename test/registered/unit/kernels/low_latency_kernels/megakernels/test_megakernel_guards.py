@@ -6,9 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.megakernels import guards, runtime
-from sglang.srt.megakernels import spec as registry
-from sglang.srt.megakernels.guards import megakernel_disable_reasons
+from sglang.kernels.low_latency_kernels.megakernels import guards, runtime
+from sglang.kernels.low_latency_kernels.megakernels import spec as registry
+from sglang.kernels.low_latency_kernels.megakernels.guards import (
+    megakernel_disable_reasons,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

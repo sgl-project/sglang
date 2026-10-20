@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.kernels.low_latency_kernels.monokernels.spec import (
+    Feature,
+    MonoSpec,
+    NumericsKind,
+    find_spec,
+)
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     declare_resolution,
@@ -16,7 +22,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.monokernels.spec import Feature, MonoSpec, NumericsKind, find_spec
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

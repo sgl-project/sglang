@@ -9,9 +9,7 @@ from typing import Any, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
-from sglang.srt.environ import envs
-from sglang.srt.megakernels.spec import (
+from sglang.kernels.low_latency_kernels.megakernels.spec import (
     ENTRY_POINT,
     FLAG,
     Feature,
@@ -19,6 +17,8 @@ from sglang.srt.megakernels.spec import (
     find_spec,
     registered_architectures,
 )
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.environ import envs
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 
 logger = logging.getLogger(__name__)

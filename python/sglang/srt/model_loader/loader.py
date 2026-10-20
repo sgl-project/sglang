@@ -40,6 +40,9 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.kernels.low_latency_kernels.monokernels.runtime import (
+    monokernel_weights_iterator,
+)
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
@@ -47,7 +50,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.monokernels.runtime import monokernel_weights_iterator
 from sglang.srt.runtime_context import (
     get_exec,
     get_model,

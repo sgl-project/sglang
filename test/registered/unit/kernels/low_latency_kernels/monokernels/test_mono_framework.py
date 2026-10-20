@@ -9,23 +9,16 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import (
-    Phase,
-    default_cuda_graph_config,
-    with_phase,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.monokernels import guards, runtime
-from sglang.srt.monokernels import spec as registry
-from sglang.srt.monokernels.guards import (
+from sglang.kernels.low_latency_kernels.monokernels import guards, runtime
+from sglang.kernels.low_latency_kernels.monokernels import spec as registry
+from sglang.kernels.low_latency_kernels.monokernels.guards import (
     MAX_DEADLINE_S,
     covered_capture_sizes,
     deadline_s,
     features_in_use,
     monokernel_disable_reasons,
 )
-from sglang.srt.monokernels.spec import (
+from sglang.kernels.low_latency_kernels.monokernels.spec import (
     DeviceLimits,
     Feature,
     MonoSpec,
@@ -35,6 +28,13 @@ from sglang.srt.monokernels.spec import (
     ShapeKey,
     StepMetadata,
 )
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import (
+    Phase,
+    default_cuda_graph_config,
+    with_phase,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci

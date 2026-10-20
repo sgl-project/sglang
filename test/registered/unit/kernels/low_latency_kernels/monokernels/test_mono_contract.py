@@ -5,13 +5,13 @@ import unittest
 from functools import lru_cache
 from pathlib import Path
 
-from sglang.srt.monokernels import spec
+import sglang
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, stage="base-a", runner_config="cpu")
 
-ROOT = Path(spec.__file__).resolve().parents[2]  # python/sglang
+ROOT = Path(sglang.__file__).resolve().parent  # python/sglang
 
 # Names the framework reads that its CPU tests reach only through fakes: GPU runner,
 # batch and process-group attributes, string protocols, and server arguments read

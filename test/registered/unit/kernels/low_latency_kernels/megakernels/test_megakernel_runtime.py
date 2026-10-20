@@ -9,9 +9,9 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.srt.megakernels import runtime
-from sglang.srt.megakernels import spec as registry
-from sglang.srt.megakernels.binding import MegakernelBinding
+from sglang.kernels.low_latency_kernels.megakernels import runtime
+from sglang.kernels.low_latency_kernels.megakernels import spec as registry
+from sglang.kernels.low_latency_kernels.megakernels.binding import MegakernelBinding
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
