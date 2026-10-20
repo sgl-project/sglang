@@ -767,7 +767,9 @@ def test_stale_handle_reads_raise_key_error_without_poisoning_the_core():
 
 
 def test_stale_match_finalizer_handles_raise_key_error_without_poisoning_the_core():
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     core = RustUnifiedTreeCoreInspector(
         CacheInitParams(
@@ -5045,9 +5047,10 @@ def test_bigram_insert_value_shorter_than_the_bigram_count_raises():
 
 
 def test_stale_inspection_handles_raise_key_error_or_report_absence():
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
-
     from sglang.srt.mem_cache.unified_cache.components import EvictLayer
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     core = RustUnifiedTreeCoreInspector(
         CacheInitParams(
