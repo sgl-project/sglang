@@ -491,8 +491,9 @@ def capture_prefill_graph(
         from sglang.srt.layers.cp.base import is_interleave
 
         if is_interleave():
-            # The performance probe captures the target body only. Draft
-            # prefill keeps the validated eager CP embedding/hidden-state path.
+            # EagleWorkerV2 requests capture again with force_for_draft_worker=True
+            # after init_lm_head, bypassing the guard above. The interleave adapter
+            # supports only target prefill; draft CP must stay eager on that call too.
             return result(None)
 
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server

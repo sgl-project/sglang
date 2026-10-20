@@ -10,7 +10,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -79,19 +78,8 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 f"{name}={count} must be divisible by --tp-size={cfg.tp_size}."
             )
 
-    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
-
-    prefill_backend = Backend.DISABLED
-    if (
-        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
-        and supports_prefill_cp_bcg(server_args)
-    ):
-        prefill_backend = Backend.BREAKABLE
     declare_resolution(
         server_args,
         "resolve_cp_tp_group_sharing",
         enable_cp_tp_group_sharing=True,
-        cuda_graph_config=with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=prefill_backend
-        ),
     )
