@@ -702,6 +702,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
     pub(crate) enable_hicache: bool,
+    /// One insert may omit mamba when the destination leaf already has it.
+    /// Stays false so a donate path that forgot `mamba_value` still panics.
+    pub(crate) allow_missing_mamba_insert: bool,
     /// Whether the host tier stages one node per FIFO backup intent rather than
     /// caching windows; buffer mode sizes its storage keys off a single node.
     pub(crate) is_host_memory_buffer_only: bool,
@@ -1046,6 +1049,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
+            allow_missing_mamba_insert: false,
             is_host_memory_buffer_only: false,
             enable_storage: false,
             enable_external_cache_linker: false,
@@ -3631,6 +3635,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Mark the host tier (HiCache) as wired.
     pub fn set_hicache_enabled(&mut self) {
         self.enable_hicache = true;
+    }
+
+    /// Let one host-only insert omit mamba when the leaf already has it.
+    pub fn set_allow_missing_mamba_insert(&mut self, enabled: bool) {
+        self.allow_missing_mamba_insert = enabled;
     }
 
     /// Mark the host tier as buffer-only; wired after the host pools are built.

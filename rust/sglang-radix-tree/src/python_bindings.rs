@@ -1735,6 +1735,11 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().set_hicache_enabled());
             }
 
+            /// Let one host-only insert omit mamba when the leaf already has it.
+            fn set_allow_missing_mamba_insert(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_allow_missing_mamba_insert(enabled));
+            }
+
             /// Whether the host tier (HiCache) is wired.
             fn enable_hicache(&self, py: Python<'_>) -> bool {
                 py.detach(|| self.core().enable_hicache())
@@ -3192,6 +3197,18 @@ macro_rules! tree_core_binding {
             fn set_hicache_enabled(&self, py: Python<'_>) -> PyResult<()> {
                 catch_native_panic(|| {
                     self.inner.set_hicache_enabled(py);
+                    Ok(())
+                })
+            }
+
+            /// Let one host-only insert omit mamba when the leaf already has it.
+            fn set_allow_missing_mamba_insert(
+                &self,
+                py: Python<'_>,
+                enabled: bool,
+            ) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_allow_missing_mamba_insert(py, enabled);
                     Ok(())
                 })
             }

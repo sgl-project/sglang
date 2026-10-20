@@ -201,7 +201,12 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         result: &mut InsertResult,
         cache_actions: &mut Vec<CacheAction>,
     ) {
-        if params.mamba_value.is_none()
+        if params.mamba_value.is_none() && params.mamba_host_value.is_none() {
+            if tree_core.allow_missing_mamba_insert {
+                result.mamba_exist = true;
+                return;
+            }
+        } else if params.mamba_value.is_none()
             && let Some(host_value) = params.mamba_host_value.as_ref()
         {
             self.commit_host_only_checkpoint(

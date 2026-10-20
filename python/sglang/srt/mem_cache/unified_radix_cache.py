@@ -1213,7 +1213,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        result = self.insert(insert_params)
+        reuse_existing_mamba = False
+        for comp in self._components_tuple:
+            materialize = getattr(comp, "materialize_host_only_checkpoint", None)
+            if materialize is not None:
+                reuse_existing_mamba = (
+                    materialize(insert_params, radix_key) or reuse_existing_mamba
+                )
+        if reuse_existing_mamba:
+            self.tree_core.set_allow_missing_mamba_insert(True)
+        try:
+            result = self.insert(insert_params)
+        finally:
+            if reuse_existing_mamba:
+                self.tree_core.set_allow_missing_mamba_insert(False)
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined

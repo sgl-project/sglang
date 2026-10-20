@@ -428,6 +428,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
+        self.allow_missing_mamba_insert = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
@@ -2425,6 +2426,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
+        """Let one host-only insert omit mamba when the leaf already has it."""
+        self.allow_missing_mamba_insert = bool(enabled)
 
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True

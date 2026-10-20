@@ -875,6 +875,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
 
+    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
+        self._binding.set_allow_missing_mamba_insert(bool(enabled))
+
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 

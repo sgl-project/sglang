@@ -266,6 +266,65 @@ class MambaComponent(TreeComponent):
             device_pool, host_indices, device_indices
         )
         insert_params.mamba_host_value = host_indices
+        insert_params.mamba_host_src = None
+
+    def _stash_host_checkpoint_source(
+        self, insert_params: InsertParams, slot: torch.Tensor
+    ) -> None:
+        """Remember the GPU slot. The D2H runs in materialize, after the key exists."""
+        insert_params.mamba_host_src = slot.reshape(-1).to(dtype=torch.int64)
+
+    def materialize_host_only_checkpoint(
+        self, insert_params: InsertParams, key
+    ) -> bool:
+        """Copy the stashed slot, unless this key already ends on a mamba node.
+
+        Returns True when the insert should keep the node's existing mamba and
+        both insert values stay None. The caller then allows that one insert.
+        """
+        src = insert_params.mamba_host_src
+        if src is None:
+            return False
+        if self._can_omit_existing_mamba() and self._destination_has_mamba(key):
+            insert_params.mamba_host_src = None
+            return True
+        self._copy_mamba_slot_to_host(insert_params, src)
+        return False
+
+    def _can_omit_existing_mamba(self) -> bool:
+        """The tree can accept an insert that leaves both mamba values empty.
+
+        An older radix-tree binary has no setter and still panics on that
+        insert, so this process keeps the copy-then-drop path.
+        """
+        tree = self.cache.tree_core
+        if hasattr(tree, "allow_missing_mamba_insert"):
+            return True
+        binding = getattr(tree, "_binding", None)
+        return binding is not None and hasattr(
+            binding, "set_allow_missing_mamba_insert"
+        )
+
+    def _destination_has_mamba(self, key) -> bool:
+        """True when match ends on this key and that node already holds mamba.
+
+        Uses the tree walk only. It does not COW a GPU slot.
+        """
+        if len(key) == 0:
+            return False
+        result = self.cache.tree_core.match_prefix(MatchPrefixParams(key=key))
+        self.cache._apply_cache_actions(list(result.cache_actions))
+        node = result.best_match_node
+        if node is None:
+            return False
+        node_id = node if isinstance(node, int) else node.id
+        paths = self.cache.tree_core.collect_path_info([node_id])
+        if not paths or not paths[0] or paths[0][-1].path_end != len(key):
+            return False
+        ct = self.component_type
+        if self.cache.tree_core.get_component_device_value(node_id, ct) is not None:
+            return True
+        return self.cache.tree_core.component_has_host_value_only(node_id, ct)
 
     def _release_unused_host_checkpoint(
         self,
@@ -310,6 +369,12 @@ class MambaComponent(TreeComponent):
         if params.mamba_host_value is not None:
             assert params.mamba_value is None
             self._commit_host_only_checkpoint(node, params, result, cache_actions)
+            return
+        if params.mamba_value is None and getattr(
+            self.tree_core, "allow_missing_mamba_insert", False
+        ):
+            # The caller probed this leaf and left both values empty on purpose.
+            result.mamba_exist = True
             return
         assert params.mamba_value is not None
         if is_new_leaf:
@@ -720,7 +785,7 @@ class MambaComponent(TreeComponent):
             else:
                 active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
             if self._mamba_host_only_checkpoint():
-                self._copy_mamba_slot_to_host(insert_params, active_value)
+                self._stash_host_checkpoint_source(insert_params, active_value)
                 return cache_len
             if self.int8_ckpt_pool is not None:
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
@@ -740,7 +805,7 @@ class MambaComponent(TreeComponent):
                     src_slot = req.kv.mamba_pool_idx
                 if int(src_slot.reshape(-1)[0].item()) < 0:
                     return 0
-                self._copy_mamba_slot_to_host(insert_params, src_slot)
+                self._stash_host_checkpoint_source(insert_params, src_slot)
                 return cache_len
             # Donate the mamba index to the radix cache instead of copying.
             if self.int8_ckpt_pool is not None:

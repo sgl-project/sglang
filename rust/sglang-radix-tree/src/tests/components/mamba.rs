@@ -648,6 +648,32 @@ fn insert_without_a_mamba_value_panics() {
 }
 
 #[test]
+fn missing_mamba_insert_keeps_the_existing_checkpoint_when_allowed() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    tc.set_hicache_enabled();
+    let key = vec![1, 2];
+    let mut params = insert_params_mamba(&key, &[10, 11], None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    tc.insert(&params);
+
+    tc.set_allow_missing_mamba_insert(true);
+    let result = tc.insert(&insert_params_mamba(&key, &[10, 11], None));
+    assert!(result.mamba_exist);
+    let leaf = tc
+        .arena
+        .resolve(result.last_device_node_id.expect("inserted leaf"))
+        .expect("live leaf");
+    assert!(
+        tc.arena
+            .node(leaf)
+            .try_host_value(MAMBA)
+            .expect("host checkpoint")
+            .equal(&Tensor::from_slice(&[42i64]))
+    );
+    tc.set_allow_missing_mamba_insert(false);
+}
+
+#[test]
 fn insert_host_only_checkpoint_keeps_no_gpu_slot() {
     let mut tc = mamba_core(/* page_size = */ 1);
     tc.set_hicache_enabled();
