@@ -217,7 +217,7 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     Only on ROCm; elsewhere the draft keeps a replicated pool and attends it
     with dcp_size 1.
     """
-    return dcp_size > 1 and get_platform().is_hip and is_deepseek_dsa(config)
+    return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
 
 
 def is_glm_moe_dsa(config) -> bool:
