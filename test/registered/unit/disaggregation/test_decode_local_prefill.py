@@ -20,6 +20,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.load_inquirer import (
     SchedulerLoadInquirer,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -161,6 +162,32 @@ class TestDecodeLocalPrefillScheduler(CustomTestCase):
         scheduler.get_next_batch_to_run.assert_called_once_with(
             running_batch, last_batch
         )
+
+    def test_prebuilt_admission_counts_local_requests_joining(self):
+        scheduler = self._scheduler()
+        scheduler.max_running_requests = 4
+        scheduler.req_to_token_pool = SimpleNamespace(size=8)
+        scheduler.token_to_kv_pool_allocator = None
+        scheduler.enable_overlap = False
+        scheduler.model_config = None
+        scheduler.spec_algorithm = None
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.chunked_req = _req("chunked", True)
+        last_batch = SimpleNamespace(
+            reqs=[_req("prefilled", True), scheduler.chunked_req],
+            forward_mode=ForwardMode.EXTEND,
+        )
+        transferred = [MagicMock(kv=SimpleNamespace(kv_committed_len=None))] * 3
+        scheduler.disagg_decode_prebuilt_queue = list(transferred)
+        running_batch = SimpleNamespace(batch_size=lambda: 1)
+
+        joining = scheduler._num_local_prefill_reqs_joining(last_batch)
+        with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
+            scheduler._get_new_prebuilt_batch(running_batch, joining)
+
+        # 4 slots: 1 running, 2 local requests joining, so 1 transferred fits.
+        self.assertEqual(joining, 2)
+        self.assertEqual(len(scheduler.disagg_decode_prebuilt_queue), 2)
 
     def test_abort_releases_kv_only_for_transferred_requests(self):
         scheduler = self._scheduler()

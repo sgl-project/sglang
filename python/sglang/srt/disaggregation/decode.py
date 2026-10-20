@@ -3185,7 +3185,9 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        new_prebuilt_batch = self.get_new_prebuilt_batch(
+            running_batch, self._num_local_prefill_reqs_joining(last_batch)
+        )
         if new_prebuilt_batch:
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
@@ -3216,10 +3218,25 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _num_local_prefill_reqs_joining(
+        self: Scheduler, last_batch: Optional[ScheduleBatch]
+    ) -> int:
+        """Local prefill requests that join the running batch later in this step."""
+        joining = set()
+        if (
+            last_batch is not None
+            and last_batch.forward_mode.is_extend()
+            and self.disagg_decode_prebuilt_queue is not None
+        ):
+            joining.update(last_batch.reqs)
+        if self.chunked_req is not None:
+            joining.add(self.chunked_req)
+        return len(joining)
+
     def get_new_prebuilt_batch(
-        self, running_batch: ScheduleBatch
+        self, running_batch: ScheduleBatch, num_joining_reqs: int = 0
     ) -> Optional[ScheduleBatch]:
-        batch = self._get_new_prebuilt_batch(running_batch)
+        batch = self._get_new_prebuilt_batch(running_batch, num_joining_reqs)
         if batch is None:
             return None
         # Verify after host restore and before process_prebuilt caches any KV.
@@ -3285,7 +3302,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _get_new_prebuilt_batch(
-        self: Scheduler, running_batch: ScheduleBatch
+        self: Scheduler, running_batch: ScheduleBatch, num_joining_reqs: int = 0
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -3300,7 +3317,7 @@ class SchedulerDisaggregationDecodeMixin:
         if self.enable_priority_scheduling:
             self.policy.calc_priority(prebuilt_reqs, running_batch)
 
-        curr_batch_size = running_batch.batch_size()
+        curr_batch_size = running_batch.batch_size() + num_joining_reqs
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
