@@ -174,6 +174,7 @@ def bind_new_mapping_before_use(allocation, node, *, shared):
 
 def allocate_bound_host(dims, dtype, device, node):
     import torch
+
     from sglang.srt.environ import envs
 
     if device != "cpu":
