@@ -308,45 +308,6 @@ class C_HostKVCacheHook(BaseHook):
         target.__init__ = wrapped_init
 
 
-class C_PackedSingleKVPoolHook(BaseHook):
-    """Allocate byte-packed single KV pools from their runtime geometry."""
-
-    HOOK_CLASS_NAME = r".*SingleKVPool$"
-    HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\..+$"
-    REGEX = True
-    REQUIRED = False
-
-    @classmethod
-    def hook(cls, target):
-        original_create_buffer = target.create_buffer
-
-        def wrapped_create_buffer(self, *, num_pages: int):
-            if self.store_dtype != torch.uint8 or not hasattr(
-                self, "get_bytes_per_token"
-            ):
-                return original_create_buffer(self, num_pages=num_pages)
-
-            try:
-                return original_create_buffer(self, num_pages=num_pages)
-            except AssertionError:
-                # Some packed pools validate production-only geometry. Simulation
-                # still needs a correctly sized byte buffer for dummy model configs.
-                pass
-
-            bytes_per_token = self.get_bytes_per_token()
-            self.kv_cache_total_dim = bytes_per_token
-            bytes_per_page = self.page_size * bytes_per_token
-            self.bytes_per_page_padded = (bytes_per_page + 575) // 576 * 576
-            return torch.zeros(
-                num_pages,
-                self.bytes_per_page_padded,
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-
-        target.create_buffer = wrapped_create_buffer
-
-
 class C_GenericHostKVCacheSubclassHook(BaseHook):
     HOOK_CLASS_NAME = r".*(?:PoolHost|HostPool)$"
     HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.(memory_pool_host|pool_host\..+)$"

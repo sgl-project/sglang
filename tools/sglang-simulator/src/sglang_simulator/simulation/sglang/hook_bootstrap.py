@@ -49,7 +49,6 @@ def install_simulator_hooks() -> None:
             mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
             mem_pool_host.C_MHATokenToKVPoolHostHook,
             mem_pool_host.C_HostKVCacheHook,
-            mem_pool_host.C_PackedSingleKVPoolHook,
             mem_pool_host.C_GenericHostKVCacheSubclassHook,
         ]
     )

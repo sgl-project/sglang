@@ -1,3 +1,5 @@
+from contextvars import ContextVar
+
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
@@ -134,7 +136,29 @@ class C_KVCacheConfiguratorHook(BaseHook):
     def hook(cls, target):
         original_configure = target.configure
         original_init_pools = target._init_pools
+        original_build_dsv4_pool = getattr(target, "_build_dsv4_kv_pool", None)
         supports_cpu_fp8_quant_method = hasattr(target, "_build_mha_quant_method")
+        logical_geometry = ContextVar("simulator_logical_pool_geometry", default=())
+
+        def packed_geometry_for(configurator):
+            for owner, attributes in reversed(logical_geometry.get()):
+                if owner is configurator:
+                    return attributes
+            return None
+
+        def wrapped_build_dsv4_pool(self, *args, **kwargs):
+            attributes = packed_geometry_for(self)
+            if attributes is None:
+                return original_build_dsv4_pool(self, *args, **kwargs)
+
+            compacted = {name: getattr(self.model_config, name) for name in attributes}
+            try:
+                for name, value in attributes.items():
+                    setattr(self.model_config, name, value)
+                return original_build_dsv4_pool(self, *args, **kwargs)
+            finally:
+                for name, value in compacted.items():
+                    setattr(self.model_config, name, value)
 
         def wrapped_configure(self, *args, **kwargs):
             if not (
@@ -222,9 +246,9 @@ class C_KVCacheConfiguratorHook(BaseHook):
             return available_bytes
 
         def wrapped_init_pools(self, *args, **kwargs):
-            # Pool payload is never read during simulation. Preserve the native
-            # pool classes and allocator wiring, but allocate minimal payload
-            # dimensions and restore their logical metadata afterwards.
+            # Keep legacy payload compaction for ordinary pools. Packed native
+            # factories need their original dimensions throughout construction,
+            # including nested pools and native layout validation.
             compact_attrs = (
                 "qk_nope_head_dim",
                 "qk_rope_head_dim",
@@ -236,18 +260,27 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 "linear_key_head_dim",
                 "linear_conv_kernel_dim",
             )
-            original_attrs = {
+            entry_attrs = {
                 name: getattr(self.model_config, name)
                 for name in compact_attrs
                 if hasattr(self.model_config, name)
             }
+            original_attrs = packed_geometry_for(self)
+            if original_attrs is None:
+                original_attrs = entry_attrs
+            token = logical_geometry.set(
+                (*logical_geometry.get(), (self, original_attrs))
+            )
             try:
-                for name in original_attrs:
+                for name in entry_attrs:
                     setattr(self.model_config, name, 1)
                 pools = original_init_pools(self, *args, **kwargs)
             finally:
-                for name, value in original_attrs.items():
-                    setattr(self.model_config, name, value)
+                try:
+                    for name, value in entry_attrs.items():
+                        setattr(self.model_config, name, value)
+                finally:
+                    logical_geometry.reset(token)
 
             token_pool = pools.token_to_kv_pool
             for name, value in original_attrs.items():
@@ -282,3 +315,5 @@ class C_KVCacheConfiguratorHook(BaseHook):
         target.configure = wrapped_configure
         target._profile_available_bytes = override_profile_available_bytes
         target._init_pools = wrapped_init_pools
+        if callable(original_build_dsv4_pool):
+            target._build_dsv4_kv_pool = wrapped_build_dsv4_pool

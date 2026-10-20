@@ -15,6 +15,12 @@ with recent SGLang releases. The current integration is validated with `v0.5.16`
 `v0.5.17`, `v0.5.18`, and `main`. Compatibility code uses API and capability
 checks instead of branching on version numbers.
 
+The native `_build_dsv4_kv_pool` factory, when available, retains its original
+dimensions, layout checks and real CPU buffers. Use a small explicit token
+capacity for metadata checks. This path does not qualify older packed factories
+without that seam, virtualize payload storage or establish large-capacity model
+support.
+
 ## Requirements
 
 - A compatible SGLang checkout. The simulator uses the SGLang source from the
