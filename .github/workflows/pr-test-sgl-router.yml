@@ -60,6 +60,7 @@ jobs:
               - 'rust/sglang-api-types/**'
               - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
+              - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       - name: Decide
         id: decide

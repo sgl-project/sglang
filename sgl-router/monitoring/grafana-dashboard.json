@@ -2301,8 +2301,7 @@
   "schemaVersion": 39,
   "tags": [
     "sglang",
-    "sgl-router",
-    "experimental"
+    "sgl-router"
   ],
   "templating": {
     "list": [
@@ -2380,7 +2379,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "SGLang Router (experimental)",
+  "title": "SGLang Router",
   "uid": "sgl-router-experimental",
   "version": 1,
   "weekStart": ""
