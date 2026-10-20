@@ -127,13 +127,15 @@ def apply_fp4_marlin_linear(
         use_fp32_reduce=use_fp32_reduce,
     )
 
-    if bias is not None:
-        output.add_(bias)
-
     # A narrowed N dimension has the padded row stride, so materialize it
     # before reshaping. This is only needed for a TP shard that was padded.
     if padded_size_n != size_n:
         output = output[:, :size_n].contiguous()
+
+    # This GEMM takes no bias, so it is added here, to the output in logical
+    # channel order: `bias` is the layer's unpermuted, unpadded bias.
+    if bias is not None:
+        output.add_(bias)
     return output.reshape(out_shape)
 
 
@@ -205,12 +207,10 @@ def prepare_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     layer.weight_global_scale = torch.nn.Parameter(
         weight_global_scale, requires_grad=False
     )
-
-    if hasattr(layer, "bias") and layer.bias is not None:
-        assert layer.bias.shape == (part_size_n,)
-        bias = torch.nn.functional.pad(layer.bias, (0, padded_size_n - part_size_n))
-        bias = marlin_permute_bias(bias)
-        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+    # layer.bias is left in logical order and length: apply_fp4_marlin_linear
+    # adds it after the GEMM, and with skip_bias_add the linear layer returns it
+    # to its caller. Only the MoE kernel, which applies bias in-kernel, needs it
+    # permuted.
 
 
 def prepare_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
@@ -282,12 +282,8 @@ def prepare_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
     weight_scale = mxfp4_marlin_process_scales(weight_scale, input_dtype=param_dtype)
     layer.weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
-
-    if hasattr(layer, "bias") and layer.bias is not None:
-        assert layer.bias.shape == (part_size_n,)
-        bias = torch.nn.functional.pad(layer.bias, (0, padded_size_n - part_size_n))
-        bias = marlin_permute_bias(bias)
-        layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+    # layer.bias stays in logical order and length; see
+    # prepare_nvfp4_layer_for_marlin.
 
 
 def mxfp4_marlin_process_scales(

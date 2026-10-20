@@ -16,9 +16,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
+SHM_ALLTOALL_MAX_BYTES = 32 * 1024 * 1024
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -50,6 +52,11 @@ def uncached_a2a_staging():
         _UNCACHED_STAGING -= 1
 
 
+# Accelerators whose device module exposes is_current_stream_capturing() and can
+# run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
+_A2A_DEVICE_TYPES = ("cuda", "xpu")
+
+
 def drop_a2a_staging_buffers() -> None:
     """Release the cached all-to-all staging buffers on this rank.
 
@@ -59,8 +66,9 @@ def drop_a2a_staging_buffers() -> None:
     """
     if not _A2A_STAGING_BUFFERS:
         return
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        device_module.synchronize()
     _A2A_STAGING_BUFFERS.clear()
 
 
@@ -73,23 +81,23 @@ def _a2a_staging_buffer(
     next collective with the same role overwrites it. Keep one grow-only
     backing allocation per (role, dtype, device), then return an exact-shape
     view into that allocation. This removes per-block allocator churn without
-    retaining one CUDA tensor for every request shape seen by the worker.
-    Bypassed under autograd and CUDA graph capture: a buffer first allocated
-    while capturing would live in the graph's private memory pool and must
-    not be shared with eager replays.
+    retaining one device tensor for every request shape seen by the worker.
+    Bypassed under autograd and graph capture: a buffer first allocated while
+    capturing would live in the graph's private memory pool and must not be
+    shared with eager replays.
     """
     if (
         _UNCACHED_STAGING
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
-        or device.type != "cuda"
-        or torch.cuda.is_current_stream_capturing()
+        or device.type not in _A2A_DEVICE_TYPES
+        or torch.get_device_module(device).is_current_stream_capturing()
     ):
         return torch.empty(shape, dtype=dtype, device=device)
 
     device_index = device.index
     if device_index is None:
-        device_index = torch.cuda.current_device()
+        device_index = torch.get_device_module(device).current_device()
     key = (role, dtype, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
@@ -105,7 +113,8 @@ def _a2a_staging_buffer(
 
 
 def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Tensor:
-    ulysses_pg = get_sp_group().ulysses_group
+    sp_group = get_sp_group()
+    ulysses_pg = sp_group.ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten().contiguous()
@@ -124,9 +133,21 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
         output = torch.empty_like(x)
     else:
         output = _a2a_staging_buffer(role, x.shape, x.dtype, x.device)
+
     # USP calls this collective many times per denoising step and waits
     # immediately, so avoid the extra wrapper overhead of functional collectives.
-    torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+    handle = sp_group.ulysses_shm_handle
+    input_bytes = x.numel() * x.element_size()
+    if (
+        current_platform.is_cpu()
+        and handle is not None
+        and handle >= 0
+        and input_bytes <= SHM_ALLTOALL_MAX_BYTES
+    ):
+        torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
+    else:
+        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+
     return output.reshape(x_shape)
 
 
@@ -402,7 +423,7 @@ def _usp_input_all_to_all_packed_qkv(
     h_local = h_global // world_size
 
     if (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.dtype == k.dtype == v.dtype
         and q.stride(-1) == k.stride(-1) == v.stride(-1) == 1
@@ -454,7 +475,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        q.is_cuda
+        q.device.type in _A2A_DEVICE_TYPES
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype

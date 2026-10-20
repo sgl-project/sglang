@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
+import copy
 import gc
 import json
 import tempfile
@@ -758,6 +759,58 @@ class ServingChatTestCase(CustomTestCase):
             self.chat._validate_request(req),
             "return_sampling_mask requires return_meta_info=true.",
         )
+
+    def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
+        self,
+    ):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            logprobs=True,
+            top_logprobs=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_output_top_logprobs requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_flat_output_top_logprobs_default_to_b64(self):
+        self.tm.tokenizer = None
+        # (request flags, expected flat output, expected b64)
+        cases = (
+            ({"return_flat_raw_output_top_logprobs": True}, True, True),
+            (
+                {
+                    "return_flat_raw_output_top_logprobs": True,
+                    "return_flat_raw_top_logprobs_b64": False,
+                },
+                True,
+                False,
+            ),
+            ({}, False, False),
+        )
+        for flags, flat, b64 in cases:
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                logprobs=True,
+                top_logprobs=2,
+                return_meta_info=True,
+                **flags,
+            )
+            with self.subTest(flags=flags):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                # The b64 default must not trip GenerateReqInput validation.
+                adapted.normalize_batch_and_arguments()
+
+                self.assertEqual(adapted.top_logprobs_num, 2)
+                self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
+                self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -2939,6 +2992,152 @@ class ServingChatTestCase(CustomTestCase):
         }
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             OpenAIServingChat(tm, TemplateManager())
+
+    def test_dsv41_rejects_image_placeholder_in_text(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        for role in ("user", "tool"):
+            with self.subTest(role=role):
+                with self.assertRaises(ValueError):
+                    encoding_dsv41.encode_messages(
+                        [
+                            {
+                                "role": role,
+                                "content": f"hi {encoding_dsv41.IMAGE_PLACEHOLDER}",
+                            }
+                        ],
+                        thinking_mode="chat",
+                    )
+
+    def test_dsv41_tool_result_images_follow_prompt_order(self):
+        """Out-of-order tool results are sorted by call order; images must follow."""
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        image = encoding_dsv41.IMAGE_PLACEHOLDER
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "history.png"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": name,
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"},
+                    }
+                    for name in ("a", "b")
+                ],
+            },
+        ]
+        results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": name,
+                "content": [
+                    {"type": "text", "text": f"result {name}"},
+                    {"type": "image_url", "image_url": {"url": f"{name}.png"}},
+                ],
+            }
+            for name in ("b", "a")
+        ]
+
+        for input_format in (
+            "content_blocks",
+            "tool_messages",
+            "tool_content_blocks",
+            "context",
+        ):
+            with self.subTest(input_format=input_format):
+                if input_format in ("tool_messages", "tool_content_blocks"):
+                    content_field = (
+                        "content_blocks"
+                        if input_format == "tool_content_blocks"
+                        else "content"
+                    )
+                    messages = history + [
+                        {
+                            "role": "tool",
+                            "tool_call_id": block["tool_use_id"],
+                            content_field: block["content"],
+                        }
+                        for block in results
+                    ]
+                    context = []
+                elif input_format == "context":
+                    messages = [{"role": "user", "content_blocks": results}]
+                    context = history
+                else:
+                    messages = history + [{"role": "user", "content_blocks": results}]
+                    context = []
+                original = copy.deepcopy((messages, context))
+
+                prompt, media = encoding_dsv41.encode_messages(
+                    messages,
+                    thinking_mode="chat",
+                    context=context,
+                    return_multi_modal_data=True,
+                )
+
+                self.assertTrue(
+                    prompt.endswith(
+                        f"<｜User｜><tool_result>result a\n\n{image}</tool_result>\n\n"
+                        f"<tool_result>result b\n\n{image}</tool_result>"
+                        "<｜Assistant｜></think>"
+                    ),
+                    prompt,
+                )
+                expected_urls = (
+                    ["a.png", "b.png"] if context else ["history.png", "a.png", "b.png"]
+                )
+                self.assertEqual(
+                    media,
+                    {"images": [{"url": url} for url in expected_urls]},
+                )
+                self.assertEqual((messages, context), original)
+
+    def test_dsv41_drop_thinking_without_tools(self):
+        """Tool results do not start a new turn, so current-turn reasoning is kept."""
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        messages = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+            {"role": "user", "content": "q2"},
+            {
+                "role": "assistant",
+                "reasoning_content": "r2",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "value"},
+        ]
+        prompt = encoding_dsv41.encode_messages(
+            messages, thinking_mode="thinking", drop_thinking=True
+        )
+        self.assertIn(
+            "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>", prompt
+        )
+        self.assertNotIn("r1", prompt)
+        self.assertIn("<think>r2</think>", prompt)
+        self.assertTrue(
+            prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
+        )
+
+        next_turn = encoding_dsv41.encode_messages(
+            messages + [{"role": "user", "content": "q3"}],
+            thinking_mode="thinking",
+        )
+        self.assertNotIn("r2", next_turn)
+        self.assertTrue(next_turn.endswith("q3<｜Assistant｜><think>"))
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""

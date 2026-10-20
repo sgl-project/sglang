@@ -79,7 +79,7 @@ def _make_weight(fmt, rows, cols, dtype):
     return fp4, scales, None, ref.to(dtype)
 
 
-def _build_linear(fmt, dtype, w4a4):
+def _build_linear(fmt, dtype, w4a4, size_n=SIZE_N):
     """A w4a4 checkpoint is served weight-only; its activation quantization is
     dropped, not applied, so it must match the a16 numbers."""
     if fmt == "nvfp4":
@@ -89,13 +89,13 @@ def _build_linear(fmt, dtype, w4a4):
     layer = torch.nn.Module()
     scheme.create_weights(
         layer=layer,
-        output_partition_sizes=[SIZE_N],
+        output_partition_sizes=[size_n],
         input_size_per_partition=SIZE_K,
         params_dtype=dtype,
         weight_loader=lambda *args, **kwargs: None,
     )
     layer.to("cuda")
-    fp4, scales, divisor, ref = _make_weight(fmt, SIZE_N, SIZE_K, dtype)
+    fp4, scales, divisor, ref = _make_weight(fmt, size_n, SIZE_K, dtype)
     layer.weight_packed.data.copy_(fp4)
     layer.weight_scale.data.copy_(scales)
     if divisor is not None:
@@ -129,6 +129,46 @@ def test_linear_matches_dequant_reference(fmt, dtype, w4a4):
     assert torch.isfinite(out).all()
     rel = _rel_err(out, x @ weight_ref.T)
     assert rel < 0.02, f"relative error {rel:.4f} too large"
+
+
+@requires_fp4_marlin
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
+# 192 is Marlin-aligned; 160 is padded to 192 at load and cropped after the GEMM.
+@pytest.mark.parametrize("size_n", [SIZE_N, 160])
+def test_marlin_linear_bias(fmt, size_n):
+    """The bias is added after the GEMM, so it must stay in logical channel
+    order and length: permuting or padding it misplaces it per channel. The
+    bias left on the layer is also what a linear with skip_bias_add returns
+    to its caller, so it must come back unchanged."""
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    scheme, layer, weight_ref = _build_linear(fmt, dtype, False, size_n=size_n)
+    # A per-channel ramp: any reordering of the bias shows up as a mismatch.
+    bias = torch.arange(size_n, dtype=dtype, device="cuda") / size_n
+    layer.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
+    scheme.process_weights_after_loading(layer)
+    assert layer.bias.shape == (size_n,)
+    torch.testing.assert_close(layer.bias, bias, rtol=0, atol=0)
+
+    def forward(x):
+        # Bias added by the scheme, as a linear without skip_bias_add calls it,
+        # and bias skipped and returned, as with skip_bias_add; the caller adds it.
+        return (
+            scheme.apply_weights(layer, x, layer.bias),
+            scheme.apply_weights(layer, x, None) + layer.bias,
+        )
+
+    # With zero input the output is exactly the bias, channel by channel.
+    zero = torch.zeros((SIZE_M, SIZE_K), dtype=dtype, device="cuda")
+    for actual in forward(zero):
+        torch.testing.assert_close(actual, bias.expand_as(actual), rtol=0, atol=0)
+
+    x = torch.randn((2, SIZE_M, SIZE_K), dtype=dtype, device="cuda") / 10
+    expected = x @ weight_ref.T + bias
+    for actual in forward(x):
+        assert actual.shape == (2, SIZE_M, size_n)
+        rel = _rel_err(actual, expected)
+        assert rel < 0.02, f"relative error {rel:.4f} too large"
 
 
 @requires_fp4_marlin
