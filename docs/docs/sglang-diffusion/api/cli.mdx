@@ -118,6 +118,19 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
+### Disaggregated serving
+
+- `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
+- `--disagg-server-addr {TCP_ENDPOINT}`: head scheduler endpoint used by workers for registration and result routing.
+- `--encoder-urls {ENDPOINTS}`: combined encoder pool on the head. For split encoding, replace it with both `--prompt-encoder-urls` and `--image-encoder-urls`; do not mix the two topologies.
+- `--denoiser-urls {ENDPOINTS}` and `--decoder-urls {ENDPOINTS}`: downstream worker pools on the head. Each pool URL flag accepts a quoted, semicolon-separated list of TCP endpoints.
+- `--disagg-p2p-hostname {HOST}` and `--disagg-ib-device {DEVICE}`: worker address and optional RDMA device for tensor transfers. The advertised worker address and scheduler port must match its entry in the head's URL list.
+- `--disagg-transfer-pool-size {BYTES}`: transfer buffer per worker (default: 268435456 bytes). Include space for incoming tensors, outgoing tensors, and preallocated receive slots.
+
+See [Disaggregated diffusion](/docs/sglang-diffusion/disaggregation#flux3-split-encoding)
+for deployment commands, ports, and the validation scope. Generation and editing
+still use the existing image APIs; encoding is not exposed as a standalone API.
+
 ### Sampling and output
 
 - `--prompt {PROMPT}` and `--negative-prompt {PROMPT}`
