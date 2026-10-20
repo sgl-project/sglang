@@ -19,15 +19,20 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+    BuildCausalSwaPageIndices,
+    BuildPageTablePositions,
+    ExpandPrefillCausally,
+    late_layer_tail_layout,
+    late_layer_tail_lens,
+)
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
 )
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
-    cast_q_fp8_for_q8kv8_prefill,
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsv4,
     fp8_dtype,
-    gather_dequant_requant_fp8_paged,
-    q8kv8_padded_num_heads,
+    gather_dequant_requant_fp8_paged_dsv4,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
@@ -35,14 +40,6 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
-)
-from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-    BuildCausalSwaPageIndices,
-    BuildPageTablePositions,
-    ExpandPrefillCausally,
-    late_layer_tail_layout,
-    late_layer_tail_lens,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
     BuildBlockSeqLensCausal,
@@ -75,6 +72,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     expand_index_page_table,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
@@ -1048,6 +1046,8 @@ class DSV4Metadata:
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
     q_pad_buffer: Optional[torch.Tensor] = None
+    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
+    q_pad_captured: bool = False
 
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
@@ -1279,6 +1279,8 @@ class DeepseekV4AttnBackend(
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
         # Set by write_tail_source_kv until exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
+        # The live batch of the prefill-graph replay; a tail break needs its exact rows.
+        self.prefill_graph_replay_batch: Optional[ForwardBatch] = None
         # Prefill CUDA graph tail block (bounded replay inside the graph): row
         # capacity, persistent index/location buffers, held metadata per block size.
         self._bcg_tail_capacity: Optional[int] = None
@@ -1413,6 +1415,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        rows_per_request: int = 1,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1450,6 +1453,7 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            rows_per_request=rows_per_request,
         )
 
     def init_forward_metadata_decode(
@@ -1836,7 +1840,7 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
             if is_cp_active(forward_batch)
@@ -1876,6 +1880,7 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_req_indices = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
                 tail_lens.to(torch.int64),
+                output_size=sum(tail_lens_cpu),
             )
             positions = _tail_rows(
                 forward_batch.positions,
@@ -2241,16 +2246,25 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
+        rows_per_request = 1 if is_ragged else num_draft_tokens
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata,
+                    compress_ratio=1,
+                    rows_per_request=rows_per_request,
+                )
                 if 1 in low
                 else None
             ),
             c2_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata,
+                    compress_ratio=2,
+                    rows_per_request=rows_per_request,
+                )
                 if 2 in low
                 else None
             ),
@@ -3081,6 +3095,7 @@ class DeepseekV4AttnBackend(
             static_metadata,
             two_level=self._prefill_graph_two_level(),
         )
+        self.prefill_graph_replay_batch = forward_batch
         self.forward_metadata = capture_metadata
         self._activate_request_window()
         self.tail_forward_metadata = (
@@ -4117,7 +4132,7 @@ class DeepseekV4AttnBackend(
                 )
 
                 return swapab_attention(
-                    q[..., :16, :],
+                    q[..., : layer.tp_q_head_num, :],
                     swa_k_cache,
                     swa_page_indices,
                     swa_topk_lengths,
@@ -4244,14 +4259,14 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
-            dequantize_k_cache_paged(
+            dequantize_k_cache_paged_dsv4(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
                 layout=token_to_kv_pool.get_extra_key_layout(layer_id),
             )
-        dequantize_k_cache_paged(
+        dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -4288,6 +4303,11 @@ class DeepseekV4AttnBackend(
         attn_sink: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Pad TP-local heads to the SM90 kernel's 64-head CTA granularity."""
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+            cast_q_fp8_for_q8kv8_prefill,
+            q8kv8_padded_num_heads,
+        )
+
         num_tokens, num_heads, head_dim = q.shape
         padded_heads = q8kv8_padded_num_heads(num_heads)
 
@@ -4417,14 +4437,14 @@ class DeepseekV4AttnBackend(
         # The Q8KV8 gather reads the 584-byte V4 layout only (its kernel is SM90).
         assert token_to_kv_pool.get_swa_key_layout() is KVLayout.V4
         if compressed_slice is not None:
-            gather_dequant_requant_fp8_paged(
+            gather_dequant_requant_fp8_paged_dsv4(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
             )
 
-        gather_dequant_requant_fp8_paged(
+        gather_dequant_requant_fp8_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
@@ -4544,11 +4564,11 @@ class DeepseekV4AttnBackend(
         )
         build_pages = BuildPageTablePositions.execute
         if small_metadata:
+            from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
+                build_page_table_positions_small,
+            )
             from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
                 build_low_ratio_metadata,
-            )
-            from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
-                build_page_table_positions_small,
             )
 
             build_pages = build_page_table_positions_small
