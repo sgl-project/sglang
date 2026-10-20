@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
@@ -906,6 +907,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         kv_pool.page_size,
                         slot_layer_ids=slot_layer_ids,
                     )
+        if get_disagg().nixl_use_cpu_buffer:
+            kv_manager.set_cpu_kv_buffers(self.token_to_kv_pool)
         return kv_manager
 
     def add(
@@ -2892,8 +2895,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._skipped_checksum_signatures: set = set()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.enable_cpu_buffer = get_disagg().nixl_use_cpu_buffer
         self.enable_deferred_kv_release = (
-            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+            self.enable_cpu_buffer
+            or envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
@@ -3282,7 +3287,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                requires_host_drain = self._is_host_destination(decode_req)
+                requires_host_drain = self._requires_strict_drain(decode_req)
                 deferred_release_enabled = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
@@ -3469,6 +3474,16 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 outcome=outcome,
             )
 
+    def _requires_strict_drain(self, decode_req: DecodeRequest) -> bool:
+        # CPU-buffer PD also writes directly to the request's auxiliary slot.
+        # Keep both that slot and the host KV region until all ranks drain.
+        if isinstance(decode_req.kv_receiver, FakeKVReceiver):
+            # Warmup/health checks publish no remote destinations to drain.
+            return False
+        return getattr(self, "enable_cpu_buffer", False) or self._is_host_destination(
+            decode_req
+        )
+
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
         if not self._deferred_releases:
@@ -3478,7 +3493,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ready = []
         releases = list(self._deferred_releases.items())
         for decode_req, _, deadline, _, required_acks in releases:
-            if self._is_host_destination(decode_req):
+            if self._requires_strict_drain(decode_req):
                 # A timeout cannot prove that a remote write has stopped.
                 is_drained = decode_req.kv_receiver.is_abort_release_safe()
                 is_ready = is_drained
