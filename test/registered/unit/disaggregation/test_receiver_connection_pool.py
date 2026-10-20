@@ -171,6 +171,7 @@ class TestReceiverControlMessages(CustomTestCase):
             kv_layer_ids=[7],
             aux_data_ptrs=[0x2000],
             state_data_ptrs=[[0x3000]],
+            state_data_lens=[[512]],
             state_item_lens=[[32]],
             state_dim_per_tensor=[[4]],
             state_layer_ids=[[7]],
@@ -261,6 +262,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 layer,
                 b"1",
                 b"0",
+                struct.pack("<IIQ", 1, 8, 512),
             ],
             "mori": [
                 b"MoriMsgGuard",

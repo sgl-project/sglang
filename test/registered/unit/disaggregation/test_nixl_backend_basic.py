@@ -294,7 +294,6 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
                             peer.dst_state_data_ptrs,
                             [[2]],
                             0,
-                            "7_state_0",
                             1,
                         )
                     )
