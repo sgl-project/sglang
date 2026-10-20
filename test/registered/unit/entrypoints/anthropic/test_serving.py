@@ -41,13 +41,16 @@ class _FakeOpenAIServingChat:
         self.supports_inline_system = detect_inline_system_support(chat_template)
 
     def supports_native_reasoning_history(self):
-        from sglang.srt.entrypoints.openai import chat_encoding
+        from sglang.srt.parser.jinja_template_utils import (
+            template_reads_reasoning,
+            template_reads_thinking,
+        )
 
         chat_template = self.tokenizer_manager.tokenizer.chat_template
         return (
             self.native_reasoning_history
-            or chat_encoding.template_reads_reasoning(chat_template)
-            or chat_encoding.template_reads_thinking(chat_template)
+            or template_reads_reasoning(chat_template)
+            or template_reads_thinking(chat_template)
         )
 
     def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
@@ -1125,11 +1128,13 @@ class TestAnthropicServing(unittest.TestCase):
         """Templates that inspect ``message.thinking`` (e.g. gpt-oss) receive
         ``reasoning_content`` instead of splicing ``<|channel|>`` tags into content.
         """
+        from pathlib import Path
+
         gpt_oss_template = (
-            "{%- for message in messages -%}"
-            "{%- if 'thinking' in message -%}{{ message.thinking }}{%- endif -%}"
-            "{%- endfor -%}"
-        )
+            Path(__file__).resolve().parent.parent
+            / "openai"
+            / "gpt_oss_20b_chat_template.jinja"
+        ).read_text(encoding="utf-8")
         serving = self._serving(chat_template=gpt_oss_template)
         request = self._anthropic_request(
             stream=False,
@@ -1149,6 +1154,7 @@ class TestAnthropicServing(unittest.TestCase):
         assistant_msg = next(m for m in chat_request.messages if m.role == "assistant")
         self.assertEqual(assistant_msg.reasoning_content, "analysis step")
         self.assertEqual(assistant_msg.content, "final answer")
+        self.assertNotIn("<|channel|>", assistant_msg.content)
 
     def test_redacted_thinking_history_is_rejected(self):
         """``redacted_thinking`` cannot be rendered by local parsers."""

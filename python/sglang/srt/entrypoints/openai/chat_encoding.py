@@ -224,25 +224,6 @@ def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
     return spec is not None
 
 
-def template_reads_reasoning(template: Any) -> bool:
-    """True when the Jinja chat template inspects `reasoning_content`."""
-    if not isinstance(template, str):
-        return False
-    return "reasoning_content" in template
-
-
-def template_reads_thinking(template: Any) -> bool:
-    """True when the Jinja chat template inspects `message.thinking` / `thinking`
-    (e.g. `openai/gpt-oss-*` Harmony templates)."""
-    if not isinstance(template, str):
-        return False
-    return (
-        ".thinking" in template
-        or '"thinking" in ' in template
-        or "'thinking' in " in template
-    )
-
-
 def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     """Whether the encoder for ``spec`` returns pre-tokenized prompt ids.
 

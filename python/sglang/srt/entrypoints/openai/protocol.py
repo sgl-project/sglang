@@ -740,22 +740,19 @@ class ChatCompletionMessageGenericParam(BaseModel):
     phase: Optional[Literal["commentary", "final_answer"]] = None
     reasoning_content: Optional[str] = None
     thinking: Optional[str] = Field(default=None, exclude=True)
-    reasoning: Optional[str] = Field(default=None, exclude=True)
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_reasoning_aliases(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        if data.get("reasoning_content") is None:
-            for alias in ("thinking", "reasoning"):
-                value = data.get(alias)
-                if isinstance(value, str):
-                    data = dict(data)
-                    data["reasoning_content"] = value
-                    break
+    def _normalize_thinking_alias(cls, data: Any) -> Any:
+        if (
+            isinstance(data, dict)
+            and data.get("reasoning_content") is None
+            and isinstance(data.get("thinking"), str)
+        ):
+            data = dict(data)
+            data["reasoning_content"] = data["thinking"]
         return data
 
     @field_validator("role", mode="before")

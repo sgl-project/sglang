@@ -108,6 +108,8 @@ from sglang.srt.parser.hunyuan_reasoning import (
 from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
+    template_reads_reasoning,
+    template_reads_thinking,
 )
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
@@ -1685,15 +1687,6 @@ class OpenAIServingChat(OpenAIServingBase):
         else:
             if self.template_manager.jinja_template_may_reorder_tool_results:
                 messages = self._canonicalize_tool_message_order(messages)
-            tokenizer_chat_template = (
-                self.tokenizer_manager.tokenizer.chat_template
-                if self.tokenizer_manager.tokenizer is not None
-                else None
-            )
-            populates_thinking_field = (
-                chat_encoding.template_reads_thinking(tokenizer_chat_template)
-                and not chat_encoding.template_reads_reasoning(tokenizer_chat_template)
-            )
             for msg_dict in copy.deepcopy(messages):
                 if msg_dict.get("content") is None:
                     msg_dict["content"] = ""
@@ -1712,13 +1705,17 @@ class OpenAIServingChat(OpenAIServingBase):
                     processed_msg["role"], processed_msg.get("content")
                 )
                 if (
-                    populates_thinking_field
-                    and processed_msg.get("role") == "assistant"
+                    processed_msg.get("role") == "assistant"
                     and processed_msg.get("reasoning_content") is not None
                     and "thinking" not in processed_msg
+                    and self._populates_thinking_field()
                 ):
                     processed_msg["thinking"] = processed_msg["reasoning_content"]
-                    if processed_msg.get("tool_calls") and processed_msg.get("content"):
+                    if (
+                        self.is_gpt_oss
+                        and processed_msg.get("tool_calls")
+                        and processed_msg.get("content")
+                    ):
                         processed_msg["thinking"] = (
                             f"{processed_msg['thinking']}\n{processed_msg['content']}"
                         )
@@ -2870,6 +2867,16 @@ class OpenAIServingChat(OpenAIServingBase):
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
 
+    def _populates_thinking_field(self) -> bool:
+        chat_template = (
+            self.tokenizer_manager.tokenizer.chat_template
+            if self.tokenizer_manager.tokenizer is not None
+            else None
+        )
+        return template_reads_thinking(chat_template) and not template_reads_reasoning(
+            chat_template
+        )
+
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder or Jinja template takes history as
         ``reasoning_content`` rather than via :meth:`wrap_reasoning_history`.
@@ -2881,9 +2888,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.tokenizer_manager.tokenizer is not None
             else None
         )
-        return chat_encoding.template_reads_reasoning(
+        return template_reads_reasoning(chat_template) or template_reads_thinking(
             chat_template
-        ) or chat_encoding.template_reads_thinking(chat_template)
+        )
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.

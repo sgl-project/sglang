@@ -122,6 +122,53 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
         return "string"
 
 
+def _jinja_template_reads_field(chat_template: str, field: str) -> bool:
+    if not isinstance(chat_template, str):
+        return False
+
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_field(node: jinja2.nodes.Node) -> bool:
+        return isinstance(node, jinja2.nodes.Const) and node.value == field
+
+    if any(node.attr == field for node in jinja_ast.find_all(jinja2.nodes.Getattr)):
+        return True
+
+    if any(is_field(node.arg) for node in jinja_ast.find_all(jinja2.nodes.Getitem)):
+        return True
+
+    for call in jinja_ast.find_all(jinja2.nodes.Call):
+        if (
+            isinstance(call.node, jinja2.nodes.Getattr)
+            and call.node.attr == "get"
+            and call.args
+            and is_field(call.args[0])
+        ):
+            return True
+
+    for compare in jinja_ast.find_all(jinja2.nodes.Compare):
+        if is_field(compare.expr) and any(
+            op.op in ("in", "notin") for op in compare.ops
+        ):
+            return True
+
+    attribute_filters = {"map", "rejectattr", "selectattr"}
+    for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
+        if filter_node.name not in attribute_filters:
+            continue
+        if filter_node.args and is_field(filter_node.args[0]):
+            return True
+        if any(
+            keyword.key == "attribute" and is_field(keyword.value)
+            for keyword in filter_node.kwargs
+        ):
+            return True
+
+    return False
+
+
 def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     """Detect templates that associate tool results with tool_calls by tool_call_id.
 
@@ -136,48 +183,15 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     consistent for those templates too; it only reorders prompts the client
     had already sent out of tool_calls order.
     """
-    if not isinstance(chat_template, str):
-        return False
+    return _jinja_template_reads_field(chat_template, "tool_call_id")
 
-    jinja_ast = _try_extract_ast(chat_template)
-    if jinja_ast is None:
-        return False
 
-    def is_tool_call_id(node: jinja2.nodes.Node) -> bool:
-        return isinstance(node, jinja2.nodes.Const) and node.value == "tool_call_id"
+def template_reads_reasoning(chat_template: str) -> bool:
+    return _jinja_template_reads_field(chat_template, "reasoning_content")
 
-    if any(
-        node.attr == "tool_call_id" for node in jinja_ast.find_all(jinja2.nodes.Getattr)
-    ):
-        return True
 
-    if any(
-        is_tool_call_id(node.arg) for node in jinja_ast.find_all(jinja2.nodes.Getitem)
-    ):
-        return True
-
-    for call in jinja_ast.find_all(jinja2.nodes.Call):
-        if (
-            isinstance(call.node, jinja2.nodes.Getattr)
-            and call.node.attr == "get"
-            and call.args
-            and is_tool_call_id(call.args[0])
-        ):
-            return True
-
-    attribute_filters = {"map", "rejectattr", "selectattr"}
-    for filter_node in jinja_ast.find_all(jinja2.nodes.Filter):
-        if filter_node.name not in attribute_filters:
-            continue
-        if filter_node.args and is_tool_call_id(filter_node.args[0]):
-            return True
-        if any(
-            keyword.key == "attribute" and is_tool_call_id(keyword.value)
-            for keyword in filter_node.kwargs
-        ):
-            return True
-
-    return False
+def template_reads_thinking(chat_template: str) -> bool:
+    return _jinja_template_reads_field(chat_template, "thinking")
 
 
 def process_content_for_template_format(
@@ -207,6 +221,15 @@ def process_content_for_template_format(
     if not isinstance(msg_dict.get("content"), list):
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
+
+    thinking_parts = []
+    for chunk in msg_dict["content"]:
+        if isinstance(chunk, dict) and chunk.get("type") in ("thinking", "reasoning"):
+            thinking_val = chunk.get("thinking")
+            if thinking_val is None:
+                thinking_val = chunk.get("text")
+            if isinstance(thinking_val, str):
+                thinking_parts.append(thinking_val)
 
     if content_format == "openai" or use_dpsk_v32_encoding:
         # OpenAI format: preserve structured content list, normalize types
@@ -277,19 +300,12 @@ def process_content_for_template_format(
                 elif chunk_type == "tool_reference":
                     # Preserve this extension because GLM templates resolve referenced tool schemas by function name.
                     processed_content_parts.append(chunk)
-                elif chunk_type in ("thinking", "reasoning"):
-                    thinking_val = chunk.get("thinking")
-                    if thinking_val is None:
-                        thinking_val = chunk.get("text")
-                    if (
-                        isinstance(thinking_val, str)
-                        and msg_dict.get("reasoning_content") is None
-                    ):
-                        msg_dict["reasoning_content"] = thinking_val
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
         }
+        if thinking_parts and new_msg.get("reasoning_content") is None:
+            new_msg["reasoning_content"] = "\n".join(thinking_parts)
         if use_dpsk_v32_encoding:
             new_msg["content"] = " ".join(text_parts) if text_parts else ""
         else:
@@ -299,17 +315,9 @@ def process_content_for_template_format(
     elif content_format == "string":
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
-        thinking_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict):
-                if chunk.get("type") in ("text", "input_text"):
-                    text_parts.append(chunk["text"])
-                elif chunk.get("type") in ("thinking", "reasoning"):
-                    thinking_val = chunk.get("thinking")
-                    if thinking_val is None:
-                        thinking_val = chunk.get("text")
-                    if isinstance(thinking_val, str):
-                        thinking_parts.append(thinking_val)
+            if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
+                text_parts.append(chunk["text"])
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
             # need to be inserted differently
