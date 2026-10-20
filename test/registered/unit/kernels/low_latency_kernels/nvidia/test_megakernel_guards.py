@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.kernels.low_latency_kernels.megakernels import guards, runtime
-from sglang.kernels.low_latency_kernels.megakernels import spec as registry
-from sglang.kernels.low_latency_kernels.megakernels.guards import (
+from sglang.kernels.low_latency_kernels.nvidia import guards, runtime
+from sglang.kernels.low_latency_kernels.nvidia import spec as registry
+from sglang.kernels.low_latency_kernels.nvidia.guards import (
     megakernel_disable_reasons,
 )
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -28,8 +28,8 @@ sglang/kernels/
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
-  low_latency_kernels/  # low-latency kernel backend: small-batch decode kernels
-                        # and the megakernel / monokernel interfaces
+  low_latency_kernels/  # low-latency kernel backend: external low-latency
+                        # kernel libraries, as <hardware>/<model>/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -133,25 +133,26 @@ agent_kernels = [
 
 ## Low-latency kernel backend: `low_latency_kernels/`
 
-This directory holds kernels for small-batch decode, where launch gaps and
-collective latency dominate a step; `KernelBackend.LOW_LATENCY` records them.
-Like the agent backends it is an implementation home, not an operator group,
-and it holds two kinds of code (details in `low_latency_kernels/README.md`):
+This directory integrates external low-latency kernel libraries, whose kernels
+run small-batch decode where launch gaps and collective latency dominate a
+step; `KernelBackend.LOW_LATENCY` records them. It is organized by hardware,
+then model: `low_latency_kernels/<hardware>/` holds the whole-step interface to
+that hardware's library and `<hardware>/<model>/` its model-specific
+integration (details in `low_latency_kernels/README.md`).
 
-- **Operator kernels**, such as one model's fused small-batch decode chain.
-  Each public op registers into its logical group with
-  `KernelSpec(op="<group>.<name>", backend=KernelBackend.LOW_LATENCY, target="sglang.kernels.low_latency_kernels.<mod>:<fn>")`,
-  and runtime code imports the `ops.<group>` facade; `test_kernels_namespace.py`
-  enforces the pairing.
-- **Whole-step interfaces**: `megakernels/` (`--enable-nvidia-megakernel`) and
-  `monokernels/` (`--enable-amd-monokernel`) check the configuration at
-  argument resolution, build a plugin's spec once the model is prepared, and
-  route the covered decode and verify steps through it. The kernels stay in
-  their own libraries,
-  [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) and
-  [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono). Because they
-  replace a model's forward, these two read `srt` runtime state and `srt`
-  imports them directly; operator kernels must not.
+- `nvidia/` (`--enable-nvidia-megakernel`) integrates
+  [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega).
+- `amd/` (`--enable-amd-monokernel`) integrates
+  [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono).
+
+Each interface checks the configuration at argument resolution, builds the
+library's spec once the model is prepared, and routes the covered decode and
+verify steps through it; the kernels stay in the libraries. Because they
+replace a model's forward, these interfaces read `srt` runtime state and `srt`
+imports them directly; operator kernels must not. An operator exposed from
+here registers into its logical group with
+`KernelSpec(op="<group>.<name>", backend=KernelBackend.LOW_LATENCY, target="sglang.kernels.low_latency_kernels.<hardware>.<model>.<mod>:<fn>")`;
+`test_kernels_namespace.py` enforces the pairing.
 
 ## How it works
 

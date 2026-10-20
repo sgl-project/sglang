@@ -40,7 +40,7 @@ import huggingface_hub
 import numpy as np
 import torch
 
-from sglang.kernels.low_latency_kernels.monokernels.runtime import (
+from sglang.kernels.low_latency_kernels.amd.runtime import (
     monokernel_weights_iterator,
 )
 from sglang.srt.constants import GIB_BYTES

@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 import torch
 
-from sglang.kernels.low_latency_kernels.megakernels.spec import (
+from sglang.kernels.low_latency_kernels.nvidia.spec import (
     ENTRY_POINT,
     FLAG,
     Feature,

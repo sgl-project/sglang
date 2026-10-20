@@ -20,8 +20,8 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.low_latency_kernels.monokernels.runtime import is_metadata_unread
-from sglang.kernels.low_latency_kernels.monokernels.spec import StepMetadata
+from sglang.kernels.low_latency_kernels.amd.runtime import is_metadata_unread
+from sglang.kernels.low_latency_kernels.amd.spec import StepMetadata
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
     low_ratio_compression_metadata,

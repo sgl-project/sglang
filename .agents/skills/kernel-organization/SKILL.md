@@ -44,12 +44,12 @@ logical grouping and remove the old `_jit_` filename prefix.
   FlashInfer). They are backends, not groups: register their public ops in the
   logical group with a `KernelSpec` whose target points into them, and do not
   reorganize those directories.
-- Low-latency kernels live in `kernels/low_latency_kernels/`
-  (`KernelBackend.LOW_LATENCY`), a backend like the agent ones: register a
-  small-batch decode op in its logical group with a `KernelSpec` that points
-  into it. Its `megakernels/` and `monokernels/` are the whole-step interfaces
-  behind `--enable-nvidia-megakernel` and `--enable-amd-monokernel`; the plugin
-  kernels stay in sgl-nvidia-mega and sgl-amd-mono.
+- External low-latency kernel libraries are integrated in
+  `kernels/low_latency_kernels/<hardware>/<model>/` (`KernelBackend.LOW_LATENCY`),
+  a backend like the agent ones. `nvidia/` and `amd/` hold the whole-step
+  interfaces behind `--enable-nvidia-megakernel` and `--enable-amd-monokernel`;
+  the kernels stay in sgl-nvidia-mega and sgl-amd-mono. An op exposed from there
+  registers in its logical group with a `KernelSpec` that points into it.
 - Keep shared build/runtime infrastructure (including the Helion runtime
   helper) in `kernels/jit`; operator wrappers call it from their logical group.
   Keep process groups, communicator state, workspace classes, model dispatch,

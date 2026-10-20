@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import torch
 from msgspec.structs import replace
 
-from sglang.kernels.low_latency_kernels.megakernels import spec as registry
-from sglang.kernels.low_latency_kernels.megakernels.spec import (
+from sglang.kernels.low_latency_kernels.nvidia import spec as registry
+from sglang.kernels.low_latency_kernels.nvidia.spec import (
     Feature,
     MegakernelSpec,
     Numerics,

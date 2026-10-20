@@ -83,7 +83,7 @@ class BuildContext(msgspec.Struct, frozen=True):
     widths: tuple[int, ...]  # step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
-    # SGLang's runtime state for this model (megakernels/binding.py)
+    # SGLang's runtime state for this model (nvidia/binding.py)
     binding: Any = None
 
 
@@ -110,7 +110,7 @@ class BuiltMegakernel(Protocol):
     noise.offset once per sampled block.
 
     SGLang's runtime state reaches a build as BuildContext.binding and a covered
-    step as Step.view (megakernels/binding.py, which also lists what else may be
+    step as Step.view (nvidia/binding.py, which also lists what else may be
     called, written or read).
     """
 
