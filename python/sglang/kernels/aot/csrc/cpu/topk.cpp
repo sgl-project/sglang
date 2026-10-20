@@ -286,9 +286,7 @@ void topk_softmax_kernel_impl(
 
 template <typename scalar_t>
 inline float router_dot_fp32_accum(
-    const scalar_t* __restrict__ hidden_states,
-    const float* __restrict__ router_weight,
-    int64_t hidden_dim) {
+    const scalar_t* __restrict__ hidden_states, const float* __restrict__ router_weight, int64_t hidden_dim) {
   using fVec = at::vec::Vectorized<float>;
   constexpr int64_t kVecSize = fVec::size();
 
@@ -536,7 +534,7 @@ void biased_grouped_topk_kernel_impl(
       topk,                               \
       renormalize);
 
-#define LAUNCH_FUSED_MOE_ROUTER_KERNEL() \
+#define LAUNCH_FUSED_MOE_ROUTER_KERNEL()  \
   fused_moe_router_kernel_impl<scalar_t>( \
       topk_weights.data_ptr<float>(),     \
       topk_ids.data_ptr<int32_t>(),       \
