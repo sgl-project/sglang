@@ -89,8 +89,9 @@ class DsparkDraftSampler:
         if not self.greedy_draft:
             # The megakernel leaves temperature-0 rows' logits unwritten; a mixed accept
             # still reads them.
+            width = _step_logits_width(self.model, self.sharded_accept)
             self.step_logits = torch.zeros(
-                (self.max_bs, self.gamma, _step_logits_width(self.model)),
+                (self.max_bs, self.gamma, width),
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             )
