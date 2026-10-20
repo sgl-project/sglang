@@ -21,8 +21,8 @@ from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
     _select_wide_vec_phase_b_unroll,
     gated_delta_rule_mtp,
 )
-from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
     commit_gdn_replayssm_fold_all_layers,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
