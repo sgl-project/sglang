@@ -243,17 +243,19 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
             port=self.port,
             model_path=self.model_config.get("model_path"),
             dataset_name="generated-shared-prefix",
-            num_prompts=96,
-            input_len=64000,
+            input_len=131072,
             output_len=1024,
-            max_concurrency=32,
+            max_concurrency=8,
             gsp_num_groups=3,
-            gsp_prompts_per_group=32,
-            seed=42,
-            warmup_requests=16,
+            gsp_prompts_per_group=8,
+            seed=100,
+            warmup_requests=8,
+            repeat_rate=0.9,
             cache_report=True,
             min_host_hit_rate_pct=0
         )
+
+
 
 
 # class TestNPUDeepSeekV4Flash0731W8A81P1D16PIn128kOut1k90PrefixCache(TestNpuPerfMultiNodePdSepTestCaseBase):
