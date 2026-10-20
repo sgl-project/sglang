@@ -1949,11 +1949,41 @@ class MQALayer(MqaAttentionBase):
             q = q.view(-1, self.n_local_heads, self.head_dim)
             q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
+            # READ-ONLY write-side staged probe (env: DSV4_DUMP_WSTAGE). Hashes
+            # the KV row at each stage of the L0 KV write, keyed by absolute
+            # position, so a MISS-vs-HIT diff isolates GEMM (S1) vs norm (S2) vs
+            # rope (S3) vs epilog (S4/S5). Disabled => empty row list, no import;
+            # never touches compute. Guarded end to end.
+            _wstage = None
+            _wstage_rows = []
+            try:
+                import os as _wstage_os
+
+                if _wstage_os.environ.get("DSV4_DUMP_WSTAGE"):
+                    from sglang.srt.hardware_backend.npu.dsv4 import (
+                        dsv4_wstage_probe as _wstage,
+                    )
+
+                    _wstage_rows = _wstage.select_rows(positions)
+            except Exception:
+                _wstage = None
+                _wstage_rows = []
+
+            if _wstage is not None:
+                # S0 pre-GEMM layer input feeding the projection (optional).
+                _wstage.emit_bf16("S0", self.layer_id, x_linear, _wstage_rows)
+
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
             else:
                 kv, _ = self.wkv(x)
+            if _wstage is not None:
+                # S1 post-GEMM bf16 kv, before kv_norm.
+                _wstage.emit_bf16("S1", self.layer_id, kv, _wstage_rows)
             kv = self.kv_norm(kv)
+            if _wstage is not None:
+                # S2 post-norm bf16 kv, before the RoPE call.
+                _wstage.emit_bf16("S2", self.layer_id, kv, _wstage_rows)
 
             cos4, sin4 = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
@@ -1965,6 +1995,9 @@ class MQALayer(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=self.qk_nope_head_dim,
             )
+            if _wstage is not None:
+                # S3 post-rope bf16 kv (rotated in place above).
+                _wstage.emit_bf16("S3", self.layer_id, kv, _wstage_rows)
             kv_for_cache = kv
             if use_cp:
                 kv_for_cache = cp_gather_full_sequence_states(
@@ -4785,6 +4818,88 @@ class DeepseekV4Model(nn.Module):
                         prev_post=prev_post,
                         prev_comb=prev_comb,
                     )
+                if __import__("os").environ.get("DSV4_DUMP_LHID"):
+                    import hashlib as _hl
+                    import os as _os
+
+                    _pos = forward_batch.positions
+                    _lastpos = int(_pos.reshape(-1)[-1].item()) if _pos.numel() else -1
+                    _lo = _os.environ.get("DSV4_DUMP_MIN_POS")
+                    _hi = _os.environ.get("DSV4_DUMP_MAX_POS")
+                    _win = _lastpos >= 0
+                    if _win and _lo is not None and _lastpos < int(_lo):
+                        _win = False
+                    if _win and _hi is not None and _lastpos > int(_hi):
+                        _win = False
+                    # optional layer filter: DSV4_DUMP_LHID_LAYERS="0,1,2,3"
+                    # (unset => all layers). Keep the log small when only the
+                    # first divergent layers matter.
+                    _lay = _os.environ.get("DSV4_DUMP_LHID_LAYERS")
+                    if _win and _lay and str(i) not in {
+                        x.strip() for x in _lay.split(",") if x.strip()
+                    }:
+                        _win = False
+                    if _win:
+                        _parts = []
+                        _hpos = ""
+                        if hidden_states.numel():
+                            _arr = (
+                                hidden_states.detach()
+                                .reshape(-1)
+                                .to(torch.float32)
+                                .cpu()
+                                .numpy()
+                            )
+                            _h = _hl.md5(_arr.tobytes()).hexdigest()[:16]
+                            _pflat = _pos.reshape(-1).to(torch.int64).cpu()
+                            _hp = _pflat // 128
+                            _hh = hidden_states.detach().to(torch.float32).cpu()
+                            for _b in torch.unique(_hp).tolist():
+                                _m = _hp == _b
+                                _parts.append(
+                                    f"{_b}:"
+                                    + _hl.md5(
+                                        _hh[_m].contiguous().numpy().tobytes()
+                                    ).hexdigest()[:8]
+                                )
+                            # S252: per-ABSOLUTE-POSITION single-row hash
+                            # (alignment-correct template, cf. [IDXIN] qpos=).
+                            # ``md5`` above is whole-tensor and ``blkx`` is
+                            # per-c128-block, so neither isolates ONE row: a MISS
+                            # full prefill (ntok=17523) and a HIT suffix prefill
+                            # (ntok=1139) are shape-confounded. ``hpos=[pos:md5|..]``
+                            # hashes the row for each absolute position p in
+                            # [DSV4_DUMP_MIN_POS, DSV4_DUMP_MAX_POS], so MISS-vs-HIT
+                            # is compared at the SAME absolute position for the
+                            # per-layer sweep. Emitted only in the WINDOWED mode
+                            # (both bounds set); additive/read-only.
+                            if (
+                                _lo is not None
+                                and _hi is not None
+                                and _pflat.numel() == _hh.shape[0]
+                            ):
+                                _hparts = []
+                                for _r in range(_pflat.numel()):
+                                    _pv = int(_pflat[_r])
+                                    if int(_lo) <= _pv <= int(_hi):
+                                        _hparts.append(
+                                            f"{_pv}:"
+                                            + _hl.md5(
+                                                _hh[_r]
+                                                .contiguous()
+                                                .numpy()
+                                                .tobytes()
+                                            ).hexdigest()[:8]
+                                        )
+                                _hpos = " hpos=[" + "|".join(_hparts) + "]"
+                        else:
+                            _h = "empty"
+                        print(
+                            f"[LHID] layer={i} lastpos={_lastpos} "
+                            f"ntok={int(hidden_states.shape[0])} md5={_h} "
+                            f"blkx={_parts[-8:]}{_hpos}",
+                            flush=True,
+                        )
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
                         completed = layer.hc_post(
