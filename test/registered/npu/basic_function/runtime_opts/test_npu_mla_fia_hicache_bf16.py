@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     MOONLIGHT_16B_A3B_MODEL_PATH,
 )
@@ -44,7 +43,7 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
         cls.models = TEST_MODEL_MATRIX.keys()
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.fia_args = [
+        cls.fia_hicache_args = [
             "--trust-remote-code",
             "--disable-cuda-graph",
             "--mem-fraction-static",
@@ -57,28 +56,12 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
             "bfloat16",
             "--tp-size",
             2,
-            "--disable-radix-cache",
-        ]
-        # HiCache is mutually exclusive with --disable-radix-cache.
-        cls.hicache_args = [
-            "--trust-remote-code",
-            "--mem-fraction-static",
-            0.8,
-            "--attention-backend",
-            "ascend",
-            "--device",
-            "npu",
-            "--dtype",
-            "bfloat16",
-            "--tp-size",
-            2,
             "--enable-hierarchical-cache",
-            # 8 GB per rank: enough for GSM8K and keeps pinned host memory small.
             "--hicache-size",
-            8,
+            2 if _is_pr_pipeline else 10,
         ]
 
-    def test_a_gsm8k_fia(self):
+    def test_gsm8k_fia_hicache(self):
         os.environ["ASCEND_USE_FIA"] = "true"
         for model in self.models:
             with self.subTest(model=model):
@@ -87,7 +70,7 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
                     self.base_url,
                     timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                     other_args=[
-                        *self.fia_args,
+                        *self.fia_hicache_args,
                     ],
                 )
 
@@ -96,43 +79,6 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase):
                         run_npu_pr_smoke(self.base_url)
                     else:
                         print(f"##=== Testing accuracy: {model} ===##")
-
-                        args = SimpleNamespace(
-                            num_shots=5,
-                            data_path=None,
-                            num_questions=1319,
-                            max_new_tokens=512,
-                            parallel=128,
-                            host=self.url.hostname,
-                            port=int(self.url.port),
-                        )
-
-                        metrics = run_eval_few_shot_gsm8k(args)
-                        self.assertGreaterEqual(
-                            metrics["accuracy"],
-                            TEST_MODEL_MATRIX[model]["accuracy"],
-                        )
-                finally:
-                    kill_process_tree(process.pid)
-
-    def test_b_gsm8k_hicache(self):
-        os.environ.pop("ASCEND_USE_FIA", None)
-        for model in self.models:
-            with self.subTest(model=model):
-                process = popen_launch_server(
-                    model,
-                    self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                    other_args=[
-                        *self.hicache_args,
-                    ],
-                )
-
-                try:
-                    if _is_pr_pipeline:
-                        run_npu_pr_smoke(self.base_url)
-                    else:
-                        print(f"##=== Testing accuracy with HiCache: {model} ===##")
 
                         args = SimpleNamespace(
                             num_shots=5,
