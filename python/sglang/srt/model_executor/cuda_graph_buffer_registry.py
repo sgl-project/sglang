@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -58,6 +59,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        fast_path = envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
+        if fast_path and _has_foreach_copy and _one_dense_int_pair(dsts, srcs):
+            # One foreach launch already writes what the small copy would; that kernel
+            # pays off only across dtype pairs, and costs per-pair host checks.
+            torch._foreach_copy_(dsts, srcs)
+            return
         from sglang.kernels.ops.memory.small_copy import try_small_copy
 
         if try_small_copy(dsts, srcs):
@@ -72,6 +79,17 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         groups[key][1].append(src)
     for group_dsts, group_srcs in groups.values():
         _foreach_copy(group_dsts, group_srcs)
+
+
+def _one_dense_int_pair(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    # One integer / bool (dst, src) dtype pair over contiguous tensors.
+    pair = (dsts[0].dtype, srcs[0].dtype)
+    if any(dtype.is_floating_point or dtype.is_complex for dtype in pair):
+        return False
+    return all(
+        (dst.dtype, src.dtype) == pair and dst.is_contiguous() and src.is_contiguous()
+        for dst, src in zip(dsts, srcs)
+    )
 
 
 class PaddingPolicy(Enum):
@@ -419,13 +437,19 @@ class CudaGraphBufferRegistry:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Phase 1: reset padded regions where it matters.
-        for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None:
-                continue
-            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-            padded_n = slot._padded_n(padded_bs, padded_num_tokens)
-            slot.reset_padding(raw_n, padded_n)
+        # Phase 1: reset padded regions where it matters (none when neither
+        # axis is padded: reset_padding is then a no-op for every slot).
+        if (
+            not envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
+            or raw_bs < padded_bs
+            or raw_num_tokens < padded_num_tokens
+        ):
+            for slot in self._slots.values():
+                if not slot.enabled or slot.buffer is None:
+                    continue
+                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
+                padded_n = slot._padded_n(padded_bs, padded_num_tokens)
+                slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
         gpu_dsts: List[torch.Tensor] = []

@@ -1571,6 +1571,9 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+    # Graph-input fill fast paths: skip the padding reset of an unpadded replay and copy
+    # one dense integer dtype pair with a single foreach launch.
+    SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
