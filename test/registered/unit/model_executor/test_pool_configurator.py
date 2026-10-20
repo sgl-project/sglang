@@ -1831,6 +1831,7 @@ class TestNPUCompactDSAIndexerSizing(CustomTestCase):
         hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
             index_head_dim=128,
+            index_topk=2048,
             indexer_types=[
                 "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
             ],
@@ -1899,6 +1900,7 @@ class TestNPUCompactDSAIndexerSizing(CustomTestCase):
         hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
             index_head_dim=128,
+            index_topk=2048,
             indexer_types=[
                 "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
             ],
@@ -1969,6 +1971,7 @@ class TestNPUCompactDSAIndexerSizing(CustomTestCase):
         hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
             index_head_dim=128,
+            index_topk=2048,
             indexer_types=[
                 "full" if i < 2 or (i - 2) % 4 == 0 else "shared" for i in range(78)
             ],

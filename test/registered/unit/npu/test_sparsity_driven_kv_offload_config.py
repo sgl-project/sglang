@@ -41,6 +41,7 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
     def test_glm52_indexer_owner_ids_use_model_layer_ids(self):
         hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
             indexer_types=_glm_indexer_types(),
         )
 
