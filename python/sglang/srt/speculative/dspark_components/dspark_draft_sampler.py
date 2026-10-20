@@ -16,8 +16,11 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     step_logits_width,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
+
+_is_xpu = is_xpu()
 
 
 class DsparkDraftSampler:
@@ -109,7 +112,13 @@ class DsparkDraftSampler:
     def _step_logits(self, base_logits: torch.Tensor) -> torch.Tensor:
         if self.step_logits is None:
             # The runner's warmup calls the tail eagerly before capture.
-            assert not torch.cuda.is_current_stream_capturing()
+            # torch.cuda's capture query raises on XPU builds.
+            capturing = (
+                torch.xpu.is_current_stream_capturing()
+                if _is_xpu
+                else torch.cuda.is_current_stream_capturing()
+            )
+            assert not capturing
             self.step_logits = torch.empty(
                 (self.max_bs, self.gamma, _step_logits_width(self.model)),
                 dtype=self.markov_head.step_logits_dtype(base_logits.dtype),

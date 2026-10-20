@@ -174,7 +174,7 @@ class DecoderReplayTail:
     ) -> Tuple[bool, Optional[List[int]]]:
         """Whether this step uses a tail graph and, under DP attention, every rank's
         tail rows; also feeds the warm gate."""
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
@@ -261,7 +261,7 @@ class DecoderReplayTail:
     def breaks_out_of_prefill_graph(
         self, tail: LateLayerTail, *, num_tokens: int
     ) -> bool:
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 

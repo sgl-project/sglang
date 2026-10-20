@@ -31,7 +31,7 @@ _HC_NORM_KERNELS = [
     ("hc_combine_norm", "hc_combine_norm"),
     ("mhc_post_split_h", "mhc_post_split_h"),
     ("hc_combine_norm", "hc_combine_norm_mxfp8"),
-    ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+    ("rmsnorm_mxfp8", "rmsnorm_mxfp8"),
 ]
 for _mod, _fn in _HC_NORM_KERNELS:
     register_kernel(
@@ -43,14 +43,12 @@ for _mod, _fn in _HC_NORM_KERNELS:
     )
 del _mod, _fn
 
-# The fused-rmsnorm variants physically live in the shared fused-pointwise
-# collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
     register_kernel(
         KernelSpec(
             op=f"layernorm.{_fn}",
             backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.elementwise.elementwise:{_fn}",
+            target=f"sglang.kernels.ops.layernorm.fused_rmsnorm:{_fn}",
         )
     )
 del _fn
@@ -84,3 +82,34 @@ register_kernel(
         ),
     )
 )
+
+# Muse Spark fused norms. The per-layer ops are inventoried through their class
+# methods; the NVFP4 quant op through its module-level instance.
+for _op, _target, _backends in (
+    (
+        "muse_spark_norm_gate",
+        "muse_spark_norm_gate:FusedRMSNormGate",
+        ("torch", "jit", "helion", "triton"),
+    ),
+    (
+        "muse_spark_norm_residual",
+        "muse_spark_norm_residual:FusedPostNormResidualPreNorm",
+        ("torch", "jit", "triton"),
+    ),
+    (
+        "muse_spark_rmsnorm_nvfp4_quant",
+        "muse_spark_rmsnorm_nvfp4_quant:_FUSED_NORM_FP4_QUANT",
+        ("torch", "jit", "helion"),
+    ),
+):
+    for _bk in _backends:
+        register_kernel(
+            KernelSpec(
+                op=f"layernorm.{_op}",
+                backend=KernelBackend(_bk),
+                target=f"sglang.kernels.ops.layernorm.{_target}."
+                + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+                capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+            )
+        )
+del _op, _target, _backends, _bk

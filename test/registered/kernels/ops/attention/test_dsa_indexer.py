@@ -953,7 +953,7 @@ class TestDSAIndexer(CustomTestCase):
     @patch(
         "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
     )
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_extend_mode(
         self,
         mock_act_quant,
@@ -1048,7 +1048,7 @@ class TestDSAIndexer(CustomTestCase):
     @patch(
         "sglang.srt.layers.attention.dsa.dsa_indexer.resolve_paged_mqa_logits_metadata_fn"
     )
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_decode_mode(
         self,
         mock_act_quant,
