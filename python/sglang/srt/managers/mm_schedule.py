@@ -229,9 +229,11 @@ def _can_batch_cross_request_image_misses(
 
     CUDA keeps the existing cross-request batching behavior. HIP and XPU retain
     their per-request paths because those backends have not been validated for
-    this optimization. On NPU, limit the initial enablement to Qwen3-VL image
-    encoders, whose ``get_image_feature`` already accepts multiple items and
-    materializes them as one packed visual batch.
+    this optimization. On NPU, batching is limited to models that declare
+    ``supports_batched_image_encoding`` — archs whose ``get_image_feature``
+    has been validated to accept multiple items as one packed visual batch —
+    and stays opt-in via the patch budget plus the conservative guards on
+    unvalidated dimensions (cuda graph, encoder DP, quantization, TP > 1).
     """
     if _is_hip or _is_xpu:
         return False
