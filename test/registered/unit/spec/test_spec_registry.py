@@ -42,6 +42,9 @@ class TestFromString(_RegistryIsolated):
         self.assertIs(
             SpeculativeAlgorithm.from_string("NGRAM"), SpeculativeAlgorithm.NGRAM
         )
+        self.assertIs(
+            SpeculativeAlgorithm.from_string("DLITE"), SpeculativeAlgorithm.DLITE
+        )
 
     def test_builtin_name_is_case_insensitive(self):
         self.assertIs(
@@ -153,6 +156,7 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertFalse(self.algo.is_eagle3())
         self.assertFalse(self.algo.is_frozen_kv_mtp())
         self.assertFalse(self.algo.is_dflash())
+        self.assertFalse(self.algo.is_dlite())
         self.assertFalse(self.algo.is_standalone())
         self.assertFalse(self.algo.is_ngram())
         self.assertTrue(self.algo.is_speculative())

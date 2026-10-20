@@ -1101,6 +1101,8 @@ class ModelRunner:
             eagle_aux_hidden_state_layer_ids=self.spec_aux_config.eagle_aux_hidden_state_layer_ids,
             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
+            dlite_use_aux_hidden_state=self.spec_aux_config.dlite_use_aux_hidden_state,
+            dlite_target_layer_ids=self.spec_aux_config.dlite_target_layer_ids,
             is_dspark=self.spec_algorithm.is_dspark(),
         )
         # Resolve before building: backends read the pair off the runner while

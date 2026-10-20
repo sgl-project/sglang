@@ -44,6 +44,8 @@ def configure_aux_hidden_state_capture(
     eagle_aux_hidden_state_layer_ids,
     dflash_use_aux_hidden_state: bool,
     dflash_target_layer_ids,
+    dlite_use_aux_hidden_state: bool,
+    dlite_target_layer_ids,
     is_dspark: bool,
 ) -> None:
     """Configure auxiliary hidden state capture for speculative decoding.
@@ -64,6 +66,13 @@ def configure_aux_hidden_state_capture(
                 "set_dspark_layers_to_capture nor set_dflash_layers_to_capture, "
                 "one of which is required for DFLASH/DSPARK."
             )
+    if dlite_use_aux_hidden_state:
+        if not hasattr(model, "set_dlite_layers_to_capture"):
+            raise ValueError(
+                f"Model {model.__class__.__name__} does not implement "
+                "set_dlite_layers_to_capture, which DLite requires."
+            )
+        model.set_dlite_layers_to_capture(dlite_target_layer_ids)
 
 
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:

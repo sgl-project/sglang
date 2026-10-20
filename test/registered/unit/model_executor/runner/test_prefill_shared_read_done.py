@@ -64,7 +64,12 @@ def test_disabled_when_flag_is_false():
 
 
 @pytest.mark.parametrize(
-    "algorithm", (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK)
+    "algorithm",
+    (
+        SpeculativeAlgorithm.DFLASH,
+        SpeculativeAlgorithm.DLITE,
+        SpeculativeAlgorithm.DSPARK,
+    ),
 )
 def test_dflash_family_target_prefill_publishes(algorithm):
     runner = _model_runner(spec_algorithm=algorithm)
@@ -156,10 +161,11 @@ class _TargetOnlyPrefillAlgo(CustomSpecAlgo):
 
 
 class TestPrefillReadDoneCapability(CustomTestCase):
-    def test_builtin_allowlist_is_unchanged(self):
+    def test_builtin_allowlist(self):
         allowed = {
             SpeculativeAlgorithm.NONE,
             SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DLITE,
             SpeculativeAlgorithm.DSPARK,
         }
         for algorithm in SpeculativeAlgorithm:

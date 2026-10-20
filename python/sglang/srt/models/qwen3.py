@@ -535,6 +535,8 @@ class Qwen3Model(Qwen2Model):
         hidden_states = residual_batch.final_norm(
             hidden_states, forward_batch, self.norm, skip_empty=True
         )
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.capture(hidden_states)
         return (
             (hidden_states, aux_hidden_states) if aux_hidden_states else hidden_states
         )
@@ -803,6 +805,27 @@ class Qwen3ForCausalLM(nn.Module):
         # SGLang captures "before layer i". To capture the hidden state after target
         # layer `k` (HF-style), we capture before layer `k + 1`.
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dlite_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError("DLite requires explicit target layer ids.")
+
+        layer_ids = [int(layer_id) for layer_id in layer_ids]
+        invalid = [
+            layer_id
+            for layer_id in layer_ids
+            if not 0 <= layer_id < int(self.config.num_hidden_layers)
+        ]
+        if invalid:
+            raise ValueError(
+                f"DLite target layer ids are out of range for Qwen3: {invalid}."
+            )
+        self.capture_aux_hidden_states = True
+        # HF hidden_states[k + 1] is the output of layer k. The final entry is
+        # captured after final_norm by Qwen3Model.forward.
+        self.model.layers_to_capture = [layer_id + 1 for layer_id in layer_ids]
 
 
 EntryClass = Qwen3ForCausalLM

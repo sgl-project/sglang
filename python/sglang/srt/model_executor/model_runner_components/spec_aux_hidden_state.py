@@ -44,6 +44,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_target_layer_ids: Any = None
     # DFLASH draft KV bytes/token; None when unresolved.
     dflash_draft_cell_size_per_token: int | None = None
+    dlite_use_aux_hidden_state: bool = False
+    dlite_target_layer_ids: Any = None
     # DeepSeek-V4 DSpark draft stages (DeepseekV4ForCausalLMDSpark.num_stages); a
     # bundled head inherits the target's num_hidden_layers, so that overcounts.
     dspark_num_stages: Optional[int] = None
@@ -70,6 +72,13 @@ def resolve_spec_aux_hidden_state_config(
         is_draft_worker=is_draft_worker,
     )
     _resolve_dflash_aux_hidden_state(
+        config=config,
+        server_args=server_args,
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
+    _resolve_dlite_aux_hidden_state(
         config=config,
         server_args=server_args,
         model_config=model_config,
@@ -154,7 +163,11 @@ def _resolve_dflash_aux_hidden_state(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
-    if spec_algorithm.is_dflash_family() and not is_draft_worker:
+    if (
+        spec_algorithm.is_dflash_family()
+        and not getattr(spec_algorithm, "is_dlite", lambda: False)()
+        and not is_draft_worker
+    ):
         from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
         # Select target layers to capture for building draft context features.
@@ -235,6 +248,35 @@ def _resolve_dflash_aux_hidden_state(
             draft_model_config=draft_model_config,
             draft_num_layers=int(draft_num_layers),
         )
+
+
+def _resolve_dlite_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
+    if not spec_algorithm.is_dlite() or is_draft_worker:
+        return
+
+    from sglang.srt.speculative.dlite_utils import (
+        validate_dlite_target_compatibility,
+    )
+
+    draft_model_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=get_spec().speculative_draft_model_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    draft = validate_dlite_target_compatibility(
+        target_hf_config=model_config.hf_text_config,
+        draft_hf_config=draft_model_config.hf_config,
+    )
+    config.dlite_use_aux_hidden_state = True
+    config.dlite_target_layer_ids = list(draft.target_layer_ids)
 
 
 def _resolve_dflash_draft_cell_size(
