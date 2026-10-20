@@ -1348,13 +1348,6 @@ class MiniCPMV4_5(MiniCPMBaseModel):
             data_start_token_ids=[im_start_id],
         )
 
-        return pad_mm_token_pairs(
-            input_ids,
-            image_inputs,
-            data_token_pairs=media_token_pairs,
-            data_start_token_ids=[im_start_id],
-        )
-
     def eval(self):
         super().eval()
         return self
