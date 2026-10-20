@@ -43,6 +43,7 @@ _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
 try:
@@ -101,7 +102,7 @@ def _map_topk_ids_to_local_experts(
     )
 
 
-def _keeps_global_expert_ids(backend) -> bool:
+def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
     return backend is not None and (
         backend.is_flashinfer_cutlass()
         or backend.is_flashinfer_cutedsl()
@@ -136,7 +137,7 @@ class StandardDispatcher(BaseDispatcher):
                 _keeps_global_expert_ids(get_moe_runner_backend())
                 != self.skip_local_expert_mapping
             )
-            and get_lora().enable_lora
+            and (get_lora().enable_lora or get_lora().lora_paths)
         ):
             raise ValueError(
                 "LoRA with expert parallelism requires the layer's MoE runner "

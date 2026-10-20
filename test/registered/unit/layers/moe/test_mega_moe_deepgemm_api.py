@@ -219,6 +219,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             mega_l2_weights=object(),
             should_fuse_routed_scaling_factor_in_topk=True,
             moe_runner_config=SimpleNamespace(swiglu_limit=None),
+            uses_expert_location=False,
             _mega_moe_weights_built=True,
             _mega_moe_nvfp4=False,
         )

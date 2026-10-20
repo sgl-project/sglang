@@ -1,6 +1,6 @@
 # sgl-kernel Metal kernels
 
-Custom Apple Metal kernels for the MLX backend on Apple Silicon. Shader sources (`*.metal`) and C++ host / nanobind sources (`*.cpp`) in this directory are compiled by [`sgl-kernel/setup_metal.py`](../../setup_metal.py) into the native Metal extension and the `sgl_metal_kernels.metallib` archive, then exposed through public Python wrappers in [`python/sgl_kernel/metal.py`](../../python/sgl_kernel/metal.py).
+Custom Apple Metal kernels for the MLX backend on Apple Silicon. Shader sources (`*.metal`) and C++ host / nanobind sources (`*.cpp`) in this directory are compiled by [`sgl-kernel/setup_metal.py`](../../setup_metal.py) into the native Metal extension and the `_metal.metallib` archive, then exposed through public Python wrappers in [`python/sgl_kernel/metal.py`](../../python/sgl_kernel/metal.py).
 
 ## Kernels
 

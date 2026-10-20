@@ -80,6 +80,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -745,8 +746,12 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
+        uses_expert_location = not (is_nextn and is_deepseek_v4)
+        num_redundant_experts = (
+            get_exec().moe.ep_num_redundant_experts if uses_expert_location else 0
+        )
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
+            num_experts=num_experts_for_moe + num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -759,6 +764,7 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
+            uses_expert_location=uses_expert_location,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
@@ -2320,6 +2326,20 @@ class DeepseekV2AttentionMLA(
             state.hidden_states_after_attn = result[0]
         else:
             state.hidden_states_after_attn = result
+
+    def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
+        # CP V2: gather the rank-local latent KV into full sequence order
+        # (the Ascend sparse attention reads the full KV pool).
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        latent_cache_output = cp_gather_full_sequence_states(
+            latent_cache.contiguous(),
+            forward_batch,
+            torch.npu.current_stream(),
+        )
+        k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
+        return k_nope, k_pe
 
     def forward(
         self,
