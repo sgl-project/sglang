@@ -459,7 +459,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         token_to_kv_pool = self.token_to_kv_pool
         swa_buf = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
-        swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
+        swa_page_size = token_to_kv_pool.get_swa_key_page_size()
         swa_kv_cache = swa_buf.view(swa_buf.shape[0], 1, swa_page_size, 512)
         if compress_ratio == 0:
             compressed_kv_cache = swa_kv_cache
@@ -632,11 +632,13 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = sum(int(x) for x in extend_seq_lens_cpu)
             # q may be padded past the real extend tokens; pad rows sit at the end.
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            # SWA columns are bounded by causal lengths, not -1 sentinels; tail rows
-            # use their floored SWA counts, since window KV below the floor is unwritten.
-            seq_lens_i32 = (
-                core.swa_topk_lengths if tail is not None else core.seq_lens_casual
-            )[:sum_q].to(torch.int32)
+            # SWA columns are bounded by causal lengths, not -1 sentinels; tail and
+            # request-window rows use their floored SWA counts, since window KV below
+            # the floor is unwritten.
+            floored = tail is not None or core.request_window_layout is not None
+            seq_lens_i32 = (core.swa_topk_lengths if floored else core.seq_lens_casual)[
+                :sum_q
+            ].to(torch.int32)
             assert seq_lens_i32.shape == (sum_q,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (sum_q, seq_lens_i32)
         sum_q, seq_lens = core.trtllm_prefill_qmeta
