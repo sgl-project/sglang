@@ -163,6 +163,15 @@ class DecoderReplayTail:
             max_rows=max_rows,
         )
 
+    @staticmethod
+    def _can_capture_moe_bound(forward_batch: ForwardBatch) -> bool:
+        # The row runner replaces only the local count with a graph-owned buffer.
+        bound = forward_batch.moe_num_token_non_padded()
+        return bound is None or (
+            bound is forward_batch.num_token_non_padded
+            and bound is not forward_batch.global_num_token_non_padded
+        )
+
     def plan(
         self,
         tail: Optional[LateLayerTail],
@@ -199,6 +208,7 @@ class DecoderReplayTail:
             or get_global_expert_distribution_recorder().recording
             or not self.runner.warm
             or (tail is not None and tail.cp_metadata is not None)
+            or not self._can_capture_moe_bound(forward_batch)
         ):
             return False, None
         if not dp:
@@ -681,6 +691,7 @@ def _tail_layers_in_prefill_graph(
         if (
             not get_flags().dp.capturing_prefill_graph
             and runner.warm
+            and tail_layers._can_capture_moe_bound(forward_batch)
             and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
         ):
             residual, pre, aux = tail_layers.run(**kwargs)
