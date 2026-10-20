@@ -965,6 +965,7 @@ class ModelRunner:
                 pp_size=self.ps.pp_size,
                 is_speculative=self.spec_algorithm.is_speculative(),
             ),
+            sliding_window_size=self.sliding_window_size,
         )
 
     def post_capture_resize_kv_pool(self):
