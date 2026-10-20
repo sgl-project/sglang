@@ -70,9 +70,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
-    s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
+    s.server_args = MagicMock()
     s.running_batch = MagicMock()
     s.running_batch.is_empty.return_value = True
+    s.running_batch.batch_size.return_value = 0
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []

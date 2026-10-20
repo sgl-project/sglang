@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
@@ -157,7 +158,10 @@ class MooncakeStoreConfig:
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
             ),
-            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
+            # Fall back to MOONCAKE_PROTOCOL (not its default) so an image or
+            # deployment that sets it, e.g. MOONCAKE_PROTOCOL=efa, is honored
+            # when the config file omits "protocol".
+            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
             master_server_address=config.get(
                 "master_server_address", envs.MOONCAKE_MASTER.default
@@ -236,7 +240,8 @@ class MooncakeStoreConfig:
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
             ),
-            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
+            # See from_file(): honor MOONCAKE_PROTOCOL when "protocol" is omitted.
+            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
             device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
             master_server_address=extra_config.get(
                 "master_server_address", envs.MOONCAKE_MASTER.default
@@ -768,6 +773,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
 
+        if isinstance(host_pool, DevicePoolEntry):
+            # A direct-linker entry packs every buffer of a page into one object.
+            object_name = "k" if transfer.name == PoolName.KV else transfer.name
+            suffix = f"_{self.mla_suffix}_{object_name}"
+            return [f"{page_key}{suffix}" for page_key in page_keys], 1
+
         # Suffix order must match get_page_buffer_meta() for one page, because
         # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
@@ -888,11 +899,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             all_component_keys.extend(component_keys)
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
-        all_exists = (
-            self._batch_exist(all_component_keys, extra_info)
-            if all_component_keys
-            else []
-        )
+        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
                 break
@@ -1430,7 +1437,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys, extra_info)
+        exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1482,21 +1489,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(
-        self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> List[int]:
-        pp_rank = (
-            (extra_info.extra_info or {}).get("pp_rank")
-            if extra_info is not None
-            else None
-        )
-        if pp_rank is not None:
-            # PP is the last rank field before the pool suffix. Replace from
-            # the right so an identical TP rank or backend tag stays unchanged.
-            key_strs = [
-                f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
-                for key in key_strs
-            ]
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):

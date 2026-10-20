@@ -575,7 +575,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         if not dsa_indexer._is_cuda:
             self.skipTest("requires CUDA indexer writers")
 
-        from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+        from sglang.kernels.ops.quantization.act_quant_triton import act_quant
         from sglang.srt.mem_cache.page_interleave import (
             PageInterleavePlacement,
             PageShardSpec,
@@ -1028,7 +1028,7 @@ def _check_attention_batch(check, requests, *, generation, prefill_impl, topk_ba
 
 
 def _run_attention(rank, world, init_method):
-    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.quantization.act_quant_triton import act_quant
     from sglang.srt.distributed.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
