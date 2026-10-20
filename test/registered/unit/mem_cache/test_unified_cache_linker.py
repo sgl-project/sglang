@@ -155,9 +155,9 @@ class _FakeExternalTreeCore:
 
     def finish_external_linker_offload(self, node_ids, ack_id, success):
         nodes = [self.nodes[node_id] for node_id in node_ids]
-        assert all(
-            node.write_through_pending_id == ack_id for node in nodes
-        ), "invalid external offload state"
+        assert all(node.write_through_pending_id == ack_id for node in nodes), (
+            "invalid external offload state"
+        )
         for node in nodes:
             node.write_through_pending_id = None
             node.external_cache_stored |= success
@@ -1706,12 +1706,9 @@ def full_linker_component():
     return SimpleNamespace(
         component_type=ComponentType.FULL,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
-        update_external_linker_load=lambda phase,
-        req,
-        full_transfer,
-        transfer,
-        prefix_len,
-        **kwargs: (transfer),
+        update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
+            transfer
+        ),
     )
 
 
