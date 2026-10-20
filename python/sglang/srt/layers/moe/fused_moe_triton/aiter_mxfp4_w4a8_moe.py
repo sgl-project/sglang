@@ -16,9 +16,16 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 _TDM_DISABLED = False
+# gfx1250 gpt-oss recipe: downcast the num_tokens activation rows to fp8 FIRST and let GEMM 1 gather
+# them (gather_indx), instead of a torch gather of num_tokens*topk bf16 rows then a downcast of
+# all of them. Needs GEMM 1 on aiter's plain-Triton kernel (AITER_A8W4_BACKEND[_BY_N]=triton):
+# the gluon kernel gathers with TDM, which does not compile on gfx1250.
+_KERNEL_GATHER = os.environ.get("SGLANG_GFX1250_W4A8_KERNEL_GATHER", "0") not in ("", "0", "false")
 
 
 def _import_aiter_w4a8():
@@ -160,12 +167,17 @@ def aiter_w4a8_gfx1250_forward(
 
     # gfx1250: the in-kernel gather is broken, so we pass gather_indx=None to
     # moe_gemm_a8w4 and perform the gather ourselves.
-    gather_src = gather_idx.to(torch.long) // topk
-    x = hidden_states[gather_src]
-    if apply_router_weight_on_input:
-        # Router weights must be applied in bf16 before quantization.
-        x = x * gammas[:, None].to(x.dtype)
-    x_fp8 = downcast_to_static_fp8(x, a13_scale)
+    if _KERNEL_GATHER and not apply_router_weight_on_input:
+        x_fp8 = downcast_to_static_fp8(hidden_states, a13_scale)
+        gemm1_gather = gather_idx
+    else:
+        gather_src = gather_idx.to(torch.long) // topk
+        x = hidden_states[gather_src]
+        if apply_router_weight_on_input:
+            # Router weights must be applied in bf16 before quantization.
+            x = x * gammas[:, None].to(x.dtype)
+        x_fp8 = downcast_to_static_fp8(x, a13_scale)
+        gemm1_gather = None
 
     # GEMM1: FP8 activations x MXFP4 weights, fused SwiGLU, requantize the
     # intermediate to FP8 using the down_proj activation scale (a2_scale) so
@@ -179,7 +191,7 @@ def aiter_w4a8_gfx1250_forward(
         a2_scale,
         w13_weight_bias,
         routing_data,
-        gather_indx=None,
+        gather_indx=gemm1_gather,
         scatter_indx=None,
         gammas=None,
         swizzle_mx_scale=None,
