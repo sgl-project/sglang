@@ -1515,23 +1515,39 @@ class DeepseekV4HipRadixBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
+
         bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
-        seq_lens = seq_lens + num_draft_tokens
-        extend_seq_lens = raw_metadata.extend_seq_lens
-        if extend_seq_lens is None or extend_seq_lens.numel() != bs:
-            extend_seq_lens = torch.full_like(seq_lens, num_draft_tokens)
+        need_compress = self.need_compress
+        # the lengths with the block and the extend lengths feed only the unified
+        # KV's prefill meta and the c4 / c128 compressors
+        if is_unified_kv_triton() or (need_compress and (self.has_c4 or self.has_c128)):
+            seq_lens = seq_lens + num_draft_tokens
+            extend_seq_lens = raw_metadata.extend_seq_lens
+            if extend_seq_lens is None or extend_seq_lens.numel() != bs:
+                extend_seq_lens = torch.full_like(seq_lens, num_draft_tokens)
+            else:
+                extend_seq_lens = extend_seq_lens.to(
+                    device=seq_lens.device, dtype=seq_lens.dtype
+                )
+            extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
+            offset = 0
         else:
-            extend_seq_lens = extend_seq_lens.to(
-                device=seq_lens.device, dtype=seq_lens.dtype
-            )
-        extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
+            extend_seq_lens = None
+            offset = num_draft_tokens
 
         seq_lens_casual, req_pool_indices_repeated, positions, window_lens = (
             self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices, window=SWA_WINDOW
+                bs,
+                num_draft_tokens,
+                seq_lens,
+                req_pool_indices,
+                seq_lens_offset=offset,
+                window=SWA_WINDOW,
             )
         )
-        need_compress = self.need_compress
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
