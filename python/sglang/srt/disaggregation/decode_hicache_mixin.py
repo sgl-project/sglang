@@ -101,6 +101,7 @@ class DecodeHiCachePreallocMixin:
                     prefix_keys,
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    kv_hints=req.kv_hints,
                 )
 
         return DecodePrefixMatch(
@@ -147,6 +148,7 @@ class DecodeHiCachePreallocMixin:
                 extra_key=req.extra_key,
                 cache_salt=req.cache_salt,
                 storage_hit_end=matched_len + prefix_match.l3_storage_hit_length,
+                kv_hints=req.kv_hints,
             )
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle

@@ -294,7 +294,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         # and runtime attachment on the same requested host layout.
         return
     if (
-        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache", "kvcr")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return

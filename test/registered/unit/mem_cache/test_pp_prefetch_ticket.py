@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -37,6 +38,7 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
@@ -115,7 +117,27 @@ class TestPrefetchAckSchema(unittest.TestCase):
         self.assertEqual(reduced[0], reduced[1])
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
+    def test_decode_storage_query_delivers_hint_to_controller(self):
+        hint = {"protocol_version": "0.1", "message_id": "decode-query"}
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True, is_eagle=False)
+        cache.page_size = cache.prefetch_threshold = 4
+
+        def query(operation):
+            # Observable hit length changes only if the request envelope
+            # survives UnifiedRadixCache -> PrefetchOperation -> controller.
+            return [], 8 if operation.kv_hints == hint else 0
+
+        cache.cache_controller = SimpleNamespace(
+            prefetch_rate_limited=lambda: False, _storage_hit_query=query
+        )
+        cache._all_reduce_attn_groups = Mock()
+        self.assertEqual(
+            cache.query_storage_hit_length(0, list(range(8)), kv_hints=hint), 8
+        )
+        self.assertEqual(cache.query_storage_hit_length(0, list(range(8))), 0)
+
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
@@ -150,7 +172,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c.storage_backend_type = "mooncake"
-        c.storage_backend = Mock()
+        c.storage_backend = Mock(
+            prefetch_batch_pages=1,
+            supports_combined_page_reads=False,
+            supports_combined_page_writes=False,
+        )
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
         c._host_pool_schemas = []
@@ -837,6 +863,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.free.assert_called_once_with(kv, pool=PoolName.KV)
         c.page_get_func = Mock(return_value=1)
         c.storage_backend = Mock()
+        c.storage_backend.prefetch_batch_pages = 1
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
         with (
             patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
