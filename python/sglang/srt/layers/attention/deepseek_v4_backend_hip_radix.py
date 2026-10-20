@@ -691,6 +691,8 @@ class DSV4Metadata:
     low_ratio_pos_i64: Optional[torch.Tensor] = None
     # Per-step scratch for the TP-padded query heads (models/deepseek_v4.py).
     q_pad_buffer: Optional[torch.Tensor] = None
+    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
+    q_pad_captured: bool = False
     # low-ratio FlyDSL indexer workspaces by ratio; address-pinned like the c4 ones, rebuilt in place
     fp4_low_ratio_decode_workspaces: Dict[
         int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]
@@ -746,7 +748,10 @@ class DSV4Metadata:
         )
 
     # allocated inside a captured segment (graph-pool storage), so a refresh must keep it
-    BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = ("q_pad_buffer",)
+    BREAKABLE_CUDA_GRAPH_KEEP_FIELDS: ClassVar[Tuple[str, ...]] = (
+        "q_pad_buffer",
+        "q_pad_captured",
+    )
 
     def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4Metadata) -> None:
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(

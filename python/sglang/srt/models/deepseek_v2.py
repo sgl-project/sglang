@@ -746,8 +746,12 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
+        uses_expert_location = not (is_nextn and is_deepseek_v4)
+        num_redundant_experts = (
+            get_exec().moe.ep_num_redundant_experts if uses_expert_location else 0
+        )
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=num_experts_for_moe + get_exec().moe.ep_num_redundant_experts,
+            num_experts=num_experts_for_moe + num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
             top_k=top_k_for_moe,
             hidden_size=config.hidden_size,
@@ -760,6 +764,7 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
+            uses_expert_location=uses_expert_location,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
