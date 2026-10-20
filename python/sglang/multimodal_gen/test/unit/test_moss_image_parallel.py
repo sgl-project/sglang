@@ -128,6 +128,11 @@ def _worker(mode):
     dist.destroy_process_group()
 
 
+@pytest.mark.skipif(
+    torch.version.hip is not None,
+    reason="ROCm builds query GPU 0 while importing sglang, which fails with the "
+    "GPUs hidden for these CPU workers",
+)
 @pytest.mark.parametrize("mode", ["sp", "cfg"])
 def test_two_rank_moss_image_matches_serial(mode):
     result = subprocess.run(

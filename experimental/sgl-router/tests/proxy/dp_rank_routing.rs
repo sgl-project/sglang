@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
 use sgl_router::config::{Config, DpRankPolicy, PolicyKind, StickyConfig, StickyFallbackKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
@@ -18,6 +18,9 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::state::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
+};
+use sgl_router::state::load_monitor::router_inflight_load::{
+    RouterInflightLoadRegistry, SystemTimeClock,
 };
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
@@ -73,7 +76,10 @@ fn router(
     let policies = Arc::new(build_registry(&cfg, Arc::clone(&tree), Arc::clone(&oracle)).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    let mut ctx = AppContext::new(cfg, tokenizers, proxy, registry, policies);
+    let stale = Duration::from_secs(cfg.router_inflight_load.stale_request_timeout_secs);
+    let inflight = RouterInflightLoadRegistry::new(Arc::new(SystemTimeClock), stale);
+    let mut ctx =
+        AppContext::with_router_inflight_load(cfg, tokenizers, proxy, registry, policies, inflight);
     ctx.dp_rank_prefix_provider = Some(RadixTreePrefixProvider::new(tree, oracle));
     build_router(Arc::new(ctx))
 }
@@ -166,6 +172,99 @@ async fn pd_room_maps_decode_to_the_prefill_rank() {
         .as_u64()
         .unwrap();
     assert_eq!(room % 4, rank.parse::<u64>().unwrap());
+}
+
+async fn send_together(app: &axum::Router, count: usize, stream: bool) -> Vec<StatusCode> {
+    let send = |_| async move {
+        let mut body = body();
+        body["stream"] = json!(stream);
+        let request = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(KEY, "conv")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        status
+    };
+    futures::future::join_all((0..count).map(send)).await
+}
+
+fn one_decode_slot() -> Config {
+    let mut cfg = sticky_config();
+    cfg.proxy.decode_dispatch_limit = std::num::NonZeroU32::new(1);
+    cfg
+}
+
+#[tokio::test]
+async fn decode_dispatch_limit_gates_decode_per_prefill_rank() {
+    let prefill = MockWorker::start_hanging(Duration::from_millis(800)).await;
+    let decode = MockWorker::start(vec!["data: chunk\n\n"]).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    for (stream, waits) in [(false, true), (true, false)] {
+        let app = router(one_decode_slot(), &workers, Default::default());
+        let start = Instant::now();
+        let statuses = send_together(&app, 2, stream).await;
+        assert!(statuses.iter().all(StatusCode::is_success));
+        let waited = start.elapsed() >= Duration::from_millis(700);
+        assert_eq!(waited, waits, "stream={stream}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_expiring_before_decode_aborts_its_prefill() {
+    let prefill = MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let decode = MockWorker::start(vec![]).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let mut cfg = one_decode_slot();
+    cfg.router_inflight_load.stale_request_timeout_secs = 1;
+    let app = router(cfg, &workers, Default::default());
+    assert_eq!(send_together(&app, 1, false).await, [StatusCode::OK]);
+    assert_eq!(
+        send_together(&app, 1, false).await,
+        [StatusCode::GATEWAY_TIMEOUT]
+    );
+    let start = Instant::now();
+    while prefill.abort_log.lock().unwrap().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(2), "no prefill abort");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let aborted = prefill.abort_log.lock().unwrap().clone();
+    assert_eq!(aborted.len(), 1);
+    assert_eq!(aborted[0]["rid"], prefill.captured_json().await["rid"]);
+    assert_ne!(aborted[0]["rid"], decode.captured_json().await["rid"]);
+}
+
+#[tokio::test]
+async fn a_failed_decode_frees_its_slot() {
+    let prefill = MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let decode =
+        MockWorker::start_returning_error(StatusCode::INTERNAL_SERVER_ERROR, json!({})).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let app = router(one_decode_slot(), &workers, Default::default());
+    let start = Instant::now();
+    for _ in 0..2 {
+        assert_eq!(
+            send_together(&app, 1, false).await,
+            [StatusCode::INTERNAL_SERVER_ERROR]
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a failed decode kept its slot"
+    );
 }
 
 #[tokio::test]

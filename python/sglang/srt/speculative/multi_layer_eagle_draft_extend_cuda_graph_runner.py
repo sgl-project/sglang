@@ -227,7 +227,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
@@ -412,11 +413,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         output_cache_loc_backup = forward_batch.out_cache_loc
         hidden_states_backup = forward_batch.spec_info.hidden_states
 
-        ret = self.model_runner.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-        )
+        with self.model_context():
+            ret = self.model_runner.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+            )
 
         if self.eagle_worker.chain_mtp_hidden_states and ret.hidden_states is not None:
             buffers.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
@@ -1083,7 +1085,8 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
             with device_timer_ctx(
                 first.model_runner.device_timer, "eagle_draft_extend"
             ):
-                outs = first.backend.replay(shape_key, self._replay_spec_info)
+                with first.model_context():
+                    outs = first.backend.replay(shape_key, self._replay_spec_info)
             raw_bs = self.raw_bs
             self._cached = {}
             non_null = [r for r in self.runners if r is not None]

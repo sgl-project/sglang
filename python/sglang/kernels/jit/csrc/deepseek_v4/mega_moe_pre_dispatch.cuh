@@ -43,7 +43,7 @@ struct MegaMoEPreDispatchParams {
   uint32_t top_k;
 };
 
-// kGroupSize must match sglang_per_token_group_quant_fp8_ue8m0(group_size=).
+// kGroupSize must match the consuming MoE's activation scale group (quant_group_size).
 // kMultiChunk covers rows too wide for one chunk per thread. It is a template
 // parameter rather than a runtime check because this kernel is issue-bound: the
 // loop bookkeeping alone costs ~10% on the rows that fit a single chunk.

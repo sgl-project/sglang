@@ -1,16 +1,17 @@
 """CPU unit tests for NVFP4 fused-MoE GEMM1 global-scale handling.
 
 w13 fuses the gate (w1) and up (w3) projections, which can carry separate NVFP4
-weight scales. These tests pin the two helpers that handle that: the gate/up
-split in _compute_gemm1_alphas and the TRT-LLM up-half output scalar in
-_compute_g1_scale_c. Both are plain tensor ops, so they run on CPU.
+weight scales. These tests pin the helpers that handle that: the gate/up split
+in _compute_gemm1_alphas, the TRT-LLM up-half output scalar in
+_compute_g1_scale_c, and the TRT-LLM SwiGLU beta/clamp in
+_compute_trtllm_gated_act_params. All are plain tensor ops, so they run on CPU.
 
 The full TRT-LLM path only runs on Blackwell, and most checkpoints ship
 near-equal gate/up scales, so this regression wouldn't surface in an accuracy
 eval -- hence the direct contract tests. The wiring around the helpers (Marlin's
 single-scale collapse, the w1/w3 mismatch warning, and registering g1_alphas /
 g1_alphas_up in process_weights_after_loading) needs the GPU kernels and is
-covered on-device.
+not covered here.
 
 Shapes and scale magnitudes follow real NVFP4 MoE checkpoints rather than toy
 sizes, so a failure looks like one a real checkpoint would hit.
@@ -33,7 +34,10 @@ import torch
 # schemes package; the quantization-package-first order masks it. The isort
 # guards keep that order.
 # isort: off
-from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
+from sglang.srt.layers.quantization.modelopt_quant import (
+    _compute_gemm1_alphas,
+    _compute_trtllm_gated_act_params,
+)
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     _align_fp4_moe_weights,
     _compute_g1_scale_c,
@@ -350,6 +354,56 @@ def _generate_fp4_moe_weights(
 
 def _byte_sum(t: torch.Tensor) -> int:
     return t.view(torch.uint8).to(torch.int64).sum().item()
+
+
+class TestTrtllmGatedActParams(CustomTestCase):
+    """TRT-LLM SwiGLU params in raw GEMM1 accumulator units."""
+
+    def test_beta_uses_up_alpha_and_clamp_uses_gate_alpha(self):
+        """With distinct gate/up global scales, beta must be in up-half units
+        and the shared clamp limit in gate-half units."""
+        swiglu_limit = 7.0
+        for i, (name, num_experts, _, _, _) in enumerate(GATED_CONFIGS):
+            with self.subTest(config=name):
+                g1_alphas = _global_scales(num_experts, 1, seed=i)
+                g1_alphas_up = _global_scales(num_experts, 1, seed=300 + i)
+
+                params = _compute_trtllm_gated_act_params(
+                    activation="silu",
+                    gemm1_alpha=1.702,
+                    gemm1_clamp_limit=None,
+                    swiglu_limit=swiglu_limit,
+                    g1_alphas=g1_alphas,
+                    g1_alphas_up=g1_alphas_up,
+                )
+
+                torch.testing.assert_close(params["gemm1_beta"], 1.0 / g1_alphas_up)
+                torch.testing.assert_close(
+                    params["gemm1_clamp_limit"], swiglu_limit / g1_alphas
+                )
+
+    def test_situ_passes_linear_scale_unscaled_without_clamp(self):
+        """SiTU gets no clamp limit, and its beta is the configured linear scale
+        as-is, independent of the GEMM1 alphas."""
+        num_experts = GATED_CONFIGS[0][1]
+        g1_alphas = _global_scales(num_experts, 1, seed=0)
+
+        params = _compute_trtllm_gated_act_params(
+            activation="situ",
+            gemm1_alpha=4.0,
+            gemm1_clamp_limit=25.0,
+            swiglu_limit=7.0,
+            g1_alphas=g1_alphas,
+            g1_alphas_up=_global_scales(num_experts, 1, seed=1),
+        )
+
+        self.assertNotIn("gemm1_clamp_limit", params)
+        torch.testing.assert_close(
+            params["gemm1_beta"], torch.full((num_experts,), 25.0)
+        )
+        torch.testing.assert_close(
+            params["gemm1_alpha"], torch.full((num_experts,), 4.0)
+        )
 
 
 class TestTrtllmNvfp4HiddenAlignment(CustomTestCase):

@@ -1,4 +1,4 @@
-// Row sum over [N, K] fp32, bitwise-identical to `sglang.kernels.ops.muse_spark.triton_sum`.
+// Row sum over [N, K] fp32, bitwise-identical to `sglang.test.kernels.triton_sum`.
 //
 // The point of that Triton kernel is a reduction order fixed by the compiler
 // rather than by the CUDA runtime version, so this kernel reproduces tl.sum's

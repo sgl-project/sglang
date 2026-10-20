@@ -55,8 +55,8 @@ impl WorkerRegistry {
     }
 
     /// Add a worker, optionally supplying a circuit-breaker config, and with
-    /// the engine profile resolved for it. Pass `None` to use the
-    /// circuit-breaker default (threshold = 3).
+    /// the engine profile resolved for it. Pass `None` for a breaker that
+    /// never opens.
     ///
     /// Re-adding an existing `WorkerId` is an upsert: the prior entry's
     /// `by_model` memberships are cleared first so a model that the new
@@ -307,7 +307,21 @@ mod tests {
             WireProtocol::default(),
         )
         .unwrap();
-        assert_eq!(r.get(&WorkerId("p".into())).unwrap().breaker.config(), &cb);
+        assert_eq!(
+            r.get(&WorkerId("p".into())).unwrap().breaker.config(),
+            Some(&cb)
+        );
+    }
+
+    #[test]
+    fn breaker_without_config_never_opens() {
+        let r = WorkerRegistry::default();
+        r.add(spec("p", WorkerMode::Prefill, &["m"])).unwrap();
+        let worker = r.get(&WorkerId("p".into())).unwrap();
+        for _ in 0..10 {
+            worker.breaker.record_failure();
+        }
+        assert!(worker.breaker.would_allow());
     }
 
     #[test]

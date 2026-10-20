@@ -7,6 +7,7 @@
 /python/sglang/kernels @DarkSharpness @HaiShaw @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian @triple-mu @niehen6174
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
+/python/sglang/kernels/ops/attention/linear @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/kernels/ops/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/kernels/jit/csrc/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174
@@ -107,6 +108,7 @@
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
 /python/sglang/kernels/ops/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/ops/embeddings/ngram_embedding.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator

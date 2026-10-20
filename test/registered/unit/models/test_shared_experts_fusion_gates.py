@@ -1,18 +1,4 @@
-"""Every MoE family's fusion gate, asked the way the loader asks it.
-
-`install_shared_experts_fusion_decision` calls
-`<model class>.shared_experts_fusion_disable_reason(hf_config, quant_config)`
-before the model is built, so the gate must answer from the config and
-quantization it is handed — no instance, no layers. These cases pin each
-family's branch table, which matters because most of these checkpoints cannot
-be run on a single dev box: a wrong answer here is a silently wrong weight
-remap (the loader remaps `mlp.shared_experts` into a fused slot the layers
-never allocated), not a crash.
-
-Conditions that depend on the device or the parallel topology are exercised
-through `get_parallel().override(...)`; the ones that are pure config /
-quantization are exercised directly.
-"""
+"""Model fusion gates must reject unsupported layouts before construction."""
 
 import importlib.util
 import sys
@@ -733,32 +719,18 @@ class TestBailingMoeV3Gate(_FusionGateCase):
 
         self.assertIn("different quant methods", reason)
 
-    def test_nextn_constructor_calls_v3_fusion_setup(self):
-        bailing_moe_v3, bailing_moe_nextn = _import_bailing_modules()
+    def test_nextn_fuses_the_v3_count_only_for_a_v3_checkpoint(self):
+        # The NextN entry class builds Ling-V3 layers that read the fused count
+        # for a V3 checkpoint, and V2.5 layers that never fuse otherwise.
+        _, bailing_moe_nextn = _import_bailing_modules()
+        nextn = bailing_moe_nextn.BailingMoeForCausalLMNextN
 
         config = SimpleNamespace(
-            architectures=["BailingMoeForCausalLMNextN"],
-            model_type="bailing_hybrid",
-            use_kda=True,
-            num_shared_experts=1,
-            vocab_size=32000,
-            hidden_size=4096,
+            model_type="bailing_hybrid", use_kda=True, num_shared_experts=1
         )
-        self._seed(enable_dp_lm_head=False)
-        with (
-            get_parallel().override(tp_size=1, moe_ep_size=1),
-            unittest.mock.patch.object(
-                bailing_moe_v3,
-                "is_shared_experts_fusion_disabled",
-                return_value=False,
-            ),
-            unittest.mock.patch.object(bailing_moe_nextn, "BailingMoEModelNextN"),
-            unittest.mock.patch.object(bailing_moe_nextn, "ParallelLMHead"),
-            unittest.mock.patch.object(bailing_moe_nextn, "LogitsProcessor"),
-        ):
-            model = bailing_moe_nextn.BailingMoeForCausalLMNextN(config)
-
-        self.assertEqual(model.num_fused_shared_experts, 1)
+        self.assertEqual(nextn.num_fusable_shared_experts(config), 1)
+        config.use_kda = False
+        self.assertEqual(nextn.num_fusable_shared_experts(config), 0)
 
 
 class TestQwen3_5Gate(_FusionGateCase):
@@ -791,15 +763,7 @@ class TestQwen3_5Gate(_FusionGateCase):
 
 
 class TestWrapperEntryClassGates(_FusionGateCase):
-    """A wrapper model answers with the config it hands its nested family.
-
-    The loader asks the class it instantiates, which for these models is the
-    wrapper — not the DeepSeek/Qwen3.5 body inside it. Each wrapper therefore
-    delegates to its family's gate with the config (and quantization) the
-    nested construction uses; these cases pin *what gets handed over*, because
-    handing over the top-level config instead would answer for the wrong
-    checkpoint (or raise on a config that has no expert counts at all).
-    """
+    """Wrapper gates must use the config and quantization of their nested model."""
 
     def _recording_gate(self, family_cls):
         seen = {}
@@ -838,6 +802,9 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             ),
             "an encoder-only Kimi-VL builds no language model",
         )
+        count = KimiVLForConditionalGeneration.num_fusable_shared_experts
+        self.assertEqual(count(config), 1)
+        self.assertEqual(count(SimpleNamespace(encoder_only=True, text_config=None)), 0)
 
     def test_kimi_k25_hands_over_its_text_config(self):
         from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
@@ -870,6 +837,9 @@ class TestWrapperEntryClassGates(_FusionGateCase):
                 SimpleNamespace(encoder_only=True, text_config=None),
             )
         )
+        count = KimiK25ForConditionalGeneration.num_fusable_shared_experts
+        self.assertEqual(count(config), 1)
+        self.assertEqual(count(SimpleNamespace(encoder_only=True, text_config=None)), 0)
 
     def test_pixtral_only_asks_for_its_mla_backbone(self):
         from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
@@ -890,12 +860,11 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             )
         self.assertIs(seen["config"], mla_text)
         # A GQA text config builds the dense Mistral backbone instead.
-        self.assertIsNone(
-            self._reason(
-                PixtralForConditionalGeneration,
-                SimpleNamespace(text_config=SimpleNamespace(model_type="mistral")),
-            )
-        )
+        gqa = SimpleNamespace(text_config=SimpleNamespace(model_type="mistral"))
+        self.assertIsNone(self._reason(PixtralForConditionalGeneration, gqa))
+        count = PixtralForConditionalGeneration.num_fusable_shared_experts
+        self.assertEqual(count(SimpleNamespace(text_config=mla_text)), 1)
+        self.assertEqual(count(gqa), 0)
 
     def test_dots_vlm_hands_over_the_language_config(self):
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -912,6 +881,11 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             self._reason(DotsVLMForCausalLM, config, _quant("fp8"))
         self.assertIs(seen["config"], language_config)
         self.assertEqual(seen["quant"].get_name(), "fp8")
+        count = DotsVLMForCausalLM.num_fusable_shared_experts
+        self.assertEqual(count(config), 1)
+        self.assertEqual(
+            count(SimpleNamespace(encoder_only=True, language_config=None)), 0
+        )
 
     def test_deepseek_vl2_mirrors_its_unquantized_language_model(self):
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -935,12 +909,11 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             seen["quant"], "the language model is constructed without quantization"
         )
         # deepseek-vl2-tiny forbids MLA and builds the dense model instead.
-        self.assertIsNone(
-            self._reason(
-                DeepseekVL2ForCausalLM,
-                SimpleNamespace(language_config=SimpleNamespace(use_mla=False)),
-            )
-        )
+        tiny = SimpleNamespace(language_config=SimpleNamespace(use_mla=False))
+        self.assertIsNone(self._reason(DeepseekVL2ForCausalLM, tiny))
+        count = DeepseekVL2ForCausalLM.num_fusable_shared_experts
+        self.assertEqual(count(SimpleNamespace(language_config=language_config)), 1)
+        self.assertEqual(count(tiny), 0)
 
     def test_deepseek_ocr_only_asks_for_its_moe_branches(self):
         from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
@@ -976,6 +949,10 @@ class TestWrapperEntryClassGates(_FusionGateCase):
             text_config=SimpleNamespace(topk_method="greedy", use_mla=False),
         )
         self.assertIsNone(self._reason(DeepseekOCRForCausalLM, dense))
+        count = DeepseekOCRForCausalLM.num_fusable_shared_experts
+        self.assertEqual(count(moe_config), 1)
+        self.assertEqual(count(ocr2), 0)
+        self.assertEqual(count(dense), 0)
 
     def test_minicpmv_entries_delegate_to_the_qwen3_5_gate(self):
         from sglang.srt.models.minicpmv import (

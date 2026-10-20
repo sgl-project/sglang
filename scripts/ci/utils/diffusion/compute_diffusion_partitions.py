@@ -283,11 +283,7 @@ def main():
         print(f"Error: {exc}")
         sys.exit(1)
 
-    suites = collect_diffusion_suites(
-        case_config_path,
-        run_suite_path,
-        baseline_path,
-    )
+    suites = collect_diffusion_suites(case_config_path, baseline_path)
     validate_suite_case_coverage(suites)
 
     requested_case_ids = set(args.case_ids or [])

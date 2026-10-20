@@ -13,10 +13,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.attention.flashattention_backend import (
-    normal_decode_set_metadata,
-)
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.kernels.ops.attention.metadata import normal_decode_set_metadata
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -26,7 +23,7 @@ from sglang.test.ci.ci_register import (
 from sglang.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in base-b (fast attention/kernel tests)
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=17, suite="stage-b-test-1-gpu-large-amd")
 # The XPU attention backend calls the same fused kernel (Triton XPU backend).
 register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
@@ -43,7 +40,7 @@ def reference_normal_decode_set_metadata(
     seq_len_delta: int,
     page_size: int,
     swa_page_table: torch.Tensor = None,
-    token_to_kv_pool=None,
+    full_to_swa_index_mapping=None,
 ):
     """
     Reference implementation using original PyTorch operations.
@@ -62,8 +59,8 @@ def reference_normal_decode_set_metadata(
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
 
-    if swa_page_table is not None and token_to_kv_pool is not None:
-        swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
+    if swa_page_table is not None and full_to_swa_index_mapping is not None:
+        swa_page_indices = full_to_swa_index_mapping[page_indices]
         swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
 
 
@@ -151,13 +148,12 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
 
         # SWA setup if needed
         swa_page_table = None
-        token_to_kv_pool = None
+        full_to_swa_index_mapping = None
         if has_swa:
             swa_page_table = torch.zeros(
                 (batch_size, max_seq_pages + 10), dtype=torch.int32, device=self.device
             )
-            # Create a simple SWA KV pool for testing
-            token_to_kv_pool = self._create_swa_kv_pool(10000, page_size)
+            full_to_swa_index_mapping = torch.randperm(10000, device=self.device).int()
 
         return {
             "cache_seqlens_int32": cache_seqlens_int32,
@@ -171,32 +167,8 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             "seq_len_delta": seq_len_delta,
             "page_size": page_size,
             "swa_page_table": swa_page_table,
-            "token_to_kv_pool": token_to_kv_pool,
+            "full_to_swa_index_mapping": full_to_swa_index_mapping,
         }
-
-    def _create_swa_kv_pool(self, size: int, page_size: int):
-        """Create a mock SWA KV pool for testing that inherits from SWAKVPool."""
-
-        # Create a minimal mock that inherits from SWAKVPool to pass isinstance check
-        class MinimalSWAKVPool(SWAKVPool):
-            def __init__(self, size, device):
-                # Don't call super().__init__() to avoid complex initialization
-                # Just set the minimal attributes needed for the test
-                self.full_to_swa_index_mapping = torch.arange(
-                    size, dtype=torch.int32, device=device
-                )
-                # Add some randomness to simulate real SWA mapping
-                self.full_to_swa_index_mapping = (
-                    self.full_to_swa_index_mapping
-                    + torch.randint(0, 100, (size,), device=device)
-                ) % size
-                self.device = device
-
-            def translate_loc_from_full_to_swa(self, page_indices):
-                """Mock translation method."""
-                return self.full_to_swa_index_mapping[page_indices]
-
-        return MinimalSWAKVPool(size, self.device)
 
     def _run_test(
         self,
@@ -232,7 +204,7 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["seq_len_delta"],
             test_data["page_size"],
             ref_data["swa_page_table"],
-            test_data["token_to_kv_pool"],
+            test_data["full_to_swa_index_mapping"],
         )
 
         # Run fused Triton implementation
@@ -247,7 +219,7 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["seq_len_delta"],
             test_data["page_size"],
             test_data["swa_page_table"],
-            test_data["token_to_kv_pool"],
+            test_data["full_to_swa_index_mapping"],
         )
 
         # Compare results
@@ -286,7 +258,7 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
                 f"swa_page_table mismatch at bs={batch_size}, page_size={page_size}",
             )
 
-    # Test cases for page_size=1 (uses specialized kernel _fused_metadata_kernel_ps1_no_swa)
+    # Test cases for page_size=1
     def test_page_size_1_small_batch(self):
         """Test with page_size=1, small batch."""
         self._run_test(batch_size=2, max_seq_len=128, page_size=1, has_swa=False)
@@ -305,7 +277,7 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             batch_size=8, max_seq_len=200, page_size=1, has_swa=False, seq_len_delta=5
         )
 
-    # Test cases for page_size > 1 (uses general kernel _fused_metadata_kernel_general)
+    # Test cases for page_size > 1
     def test_page_size_16_small_batch(self):
         """Test with page_size=16, small batch."""
         self._run_test(batch_size=4, max_seq_len=256, page_size=16, has_swa=False)
@@ -368,7 +340,7 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             test_data["seq_len_delta"],
             test_data["page_size"],
             test_data["swa_page_table"],
-            test_data["token_to_kv_pool"],
+            test_data["full_to_swa_index_mapping"],
         )
 
         # Verify no crashes and basic properties

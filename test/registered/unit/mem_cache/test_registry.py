@@ -8,6 +8,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
@@ -204,9 +205,14 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
-        params = MagicMock(sliding_window_size=128, page_size=64)
-        params.token_to_kv_pool_allocator = MagicMock(
-            spec=DeepSeekV4HiSparseTokenToKVPoolAllocator
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=MagicMock(
+                spec=DeepSeekV4HiSparseTokenToKVPoolAllocator
+            ),
+            page_size=64,
+            sliding_window_size=128,
         )
         component = SWAComponent(MagicMock(), params)
         self.assertEqual(component.full_window_pages, 2)

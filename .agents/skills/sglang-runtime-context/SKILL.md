@@ -135,16 +135,23 @@ bag to override at all.
   instance: **constructor arguments** (`ModelRunner(draft_attention_backend=...)`,
   `MMEncoder(gpu_id=...)`) and **runner attributes holding the resolved value**
   (`model_runner.kv_cache_dtype_str`, `prefill_attention_backend_str`,
-  `num_fused_shared_experts`, `linear_attn_backends`) — threaded to consumers as
+  `linear_attn_backends`) — threaded to consumers as
   arguments, never backfilled onto a shared object. A per-runner choice also stays
   *out* of the bags: recording it there is how a second runner inherits the first
-  one's answer, which is exactly the bug `linear_attn_backends` replaced. The one sanctioned bend in that rule is
-  *scoped*: `ModelRunner._load_format_scope` exposes the draft's
-  `--speculative-draft-load-format` through `get_model().override(load_format=...)`
-  for exactly the duration of the draft build, because model construction
-  reads that bag leaf — the override restores on exit, so nothing outlives
-  the scope. When there is a runner in hand, read its
-  stamp; that is a different rule from "read the instance".
+  one's answer, which is exactly the bug `linear_attn_backends` replaced. The two
+  sanctioned bends in that rule are *scoped*. `ModelRunner._load_format_scope`
+  exposes the draft's `--speculative-draft-load-format` through
+  `get_model().override(load_format=...)` for exactly the duration of the draft
+  build, because model construction reads that bag leaf — the override restores
+  on exit, so nothing outlives the scope. The shared-expert layout is another scoped view:
+  `get_model().shared_experts` selects the immutable `SharedExpertsConfig` owned
+  by the loaded model (`model.shared_experts_config`). The loader binds it for
+  construction, and runners bind it for execution, warmup and graph capture.
+  Both the fused count and ordinary TopK slot count belong to this object;
+  neither is a separately mutable flag. A scope selects a built layout and
+  restores the previous reference on exit, including exceptions. It cannot
+  resize weights, buffers or a captured graph. When the model is in hand, read
+  its owned config directly (as the routed-experts capturer does).
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
   `entrypoints/`, and the tokenizer-process multimodal processors read the bags.
   The old justification for keeping them on `self.server_args` ("several
@@ -327,7 +334,8 @@ where an object was handed one; it is not a global accessor.
   dist init to answer.
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
-  `draft_attention_backend`, `num_fused_shared_experts` on the model).
+  `draft_attention_backend`); for what the model's layers bake in at
+  construction, the layer (`num_fused_shared_experts` on a MoE block).
 
 `self.server_args.field` is still right for handed per-instance config (see
 "Reads that legitimately stay on a ServerArgs instance" above for the full set —
@@ -451,13 +459,18 @@ Never assign `server_args` fields from model code. Declare instead
   its checkpoint drives (shared-experts fusion) is a question the *loader* asks
   the model class — `shared_experts_fusion_disable_reason(hf_config,
   quant_config)`, a classmethod answering without an instance — at the single
-  model-instantiation point, and
-  `install_shared_experts_fusion_decision` writes the answer to the ACTIVE moe
-  flag before that model's layers build and read it
-  (`is_shared_experts_fusion_disabled`, config-intent fallback).
-  `draft_model_build_scope` brackets every draft build and routes the draft's
-  answer to the speculative leaf, so a draft's decision never overwrites the
-  target's. A process-level load-time fact (the sm80 dtype fallback —
+  model-instantiation point, together with how many shared experts it fuses
+  (`num_fusable_shared_experts(hf_config)`; an entry class without both hooks
+  fuses none). `resolve_shared_experts_config` returns one immutable config;
+  the loader scopes it through `get_model().override(shared_experts=config)`
+  while building and retains it on the resulting model. `num_shared_topk_slots`
+  derives from the fused count and frozen Waterfill policy, so ordinary routing
+  and Waterfill cannot both claim the shared slots. `TopK`/`HashTopK` retain the
+  same config; `top_k` counts only routed experts at construction.
+  `draft_model_build_scope` still selects draft boundary/MMA preferences; it
+  does not save shared-expert flags. Target and draft each own their layout.
+  These values have model lifetime, so they do not belong in `get_forward()`.
+  A process-level load-time fact (the sm80 dtype fallback —
   device-driven, identical for every runner) records directly via
   `get_context().override`.
 

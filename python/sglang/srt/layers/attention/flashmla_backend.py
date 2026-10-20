@@ -12,7 +12,7 @@ import torch
 import triton
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
-from sglang.kernels.ops.attention.utils import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashmla_kv_indices_triton,
     get_num_kv_index_blocks_flashmla,
 )

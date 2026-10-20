@@ -7,6 +7,9 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_n
     NEOLLMConfig,
     NEOMoELLMConfig,
 )
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_fm_modules import (
+    FlowMatchingHead,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3ForCausalLM,
 )
@@ -83,3 +86,19 @@ def test_sensenova_backbone_prefix_cache_and_generation(moe, dtype):
     kwargs["image_gen_indicators"][0, 0] = False
     with pytest.raises(NotImplementedError, match="Mixed und/gen"):
         model.model(**kwargs)
+
+
+@torch.inference_mode()
+def test_sensenova_deep_fm_head_maps_tokens_with_timesteps():
+    """Checkpoints with fm_head_layers > 2 build FlowMatchingHead, which must
+    construct and map (tokens, hidden) plus per-token timesteps to pixels."""
+    head = FlowMatchingHead(input_dim=8, out_dim=12, dim=16, layers=3)
+    assert {
+        "net.time_embed.mlp.0.weight",
+        "net.input_proj.weight",
+        "net.res_blocks.2.adaLN_modulation.1.weight",
+        "net.final_layer.adaLN_modulation.1.weight",
+        "net.final_layer.linear.weight",
+    } <= set(head.state_dict())
+    out = head(torch.randn(5, 8), torch.rand(()).repeat(5))
+    assert out.shape == (5, 12)

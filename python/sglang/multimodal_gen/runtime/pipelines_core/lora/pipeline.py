@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     load_peft_config,
     scale_fused_sections,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import LORA_MERGE_MODES, ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -342,10 +343,8 @@ class LoRAPipeline(ComposedPipelineBase):
             yield []
             return
 
-        # clear device cache to free up unused memory
-        if torch.get_device_module().is_available():
-            torch.get_device_module().synchronize()
-            torch.get_device_module().empty_cache()
+        current_platform.synchronize()
+        current_platform.empty_cache()
 
         offload_disabled_modules = []
         for module_name in module_names:
@@ -851,6 +850,11 @@ class LoRAPipeline(ComposedPipelineBase):
                             for n in lora_nicknames
                         )
                         if not has_any_lora:
+                            # A previous adapter may still be merged here.
+                            if clear_existing:
+                                if layer.merged:
+                                    layer.unmerge_lora_weights()
+                                layer.clear_lora_weights()
                             layer.disable_lora = True
 
         if rank == 0:

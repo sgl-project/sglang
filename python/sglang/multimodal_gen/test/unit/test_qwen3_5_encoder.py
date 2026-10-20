@@ -101,10 +101,15 @@ def test_native_encoder_registry_and_checkpoint(small_text_encoder):
 
 @pytest.mark.parametrize("backend", [None, "torch_sdpa", "fa"])
 def test_text_attention_default_and_explicit_selection(small_text_encoder, backend):
-    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+    from sglang.multimodal_gen.runtime.platforms import (
+        AttentionBackendEnum,
+        current_platform,
+    )
 
     if backend == "fa" and not torch.cuda.is_available():
         pytest.skip("FA selection requires CUDA")
+    if backend == "fa" and current_platform.is_rocm():
+        pytest.skip("the platform currently resolves FA to SDPA on ROCm")
     get_global_server_args().attention_backend = backend
     config = Qwen3_5EncoderConfig()
     config.update_model_arch(small_text_encoder.config.to_dict())

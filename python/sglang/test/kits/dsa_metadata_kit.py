@@ -96,13 +96,24 @@ def addresses(metadata):
     }
 
 
+def _topk_v2_plan_lengths(metadata, name):
+    if name == "topk_v2_plan":
+        return metadata.dsa_seqlens_expanded
+    if name == "pooled_topk_v2_plan":
+        return metadata.pooled_cache_seqlens_int32
+    if name == "kpool.pool_topk_v2_plan":
+        return metadata.kpool_write_plan.pool_seqlens_per_q
+    return None
+
+
 def assert_metadata_equal(test, actual, expected):
     actual_buffers, expected_buffers = tensor_buffers(actual), tensor_buffers(expected)
     test.assertEqual(actual_buffers.keys(), expected_buffers.keys())
     for name, value in actual_buffers.items():
         reference = expected_buffers[name]
-        if name == "topk_v2_plan":
-            if not topk_v2_plan_is_written(expected.dsa_seqlens_expanded):
+        plan_lengths = _topk_v2_plan_lengths(expected, name)
+        if plan_lengths is not None:
+            if not topk_v2_plan_is_written(plan_lengths):
                 continue
             # Unused plan rows are intentionally uninitialized. Active rows are
             # compacted by atomicAdd, so compare them in request order.

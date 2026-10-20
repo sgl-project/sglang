@@ -219,6 +219,87 @@ mod pd_routing_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Prefill gets both requests at once; the second decode waits for a slot.
+    #[tokio::test]
+    async fn test_pd_decode_dispatch_limit_holds_decode_not_prefill() {
+        use std::time::{Duration, Instant};
+
+        use crate::common::mock_worker::take_request_arrivals;
+
+        let (prefill_port, decode_port) = (19858, 19859);
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{prefill_port}"), None)],
+                vec![format!("http://127.0.0.1:{decode_port}")],
+            )
+            .round_robin_policy()
+            .decode_dispatch_limit(1)
+            .host("127.0.0.1")
+            .port(3858)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let slow = |mut worker: MockWorkerConfig| {
+            worker.response_delay_ms = 600;
+            worker
+        };
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                slow(TestWorkerConfig::prefill(prefill_port)),
+                slow(TestWorkerConfig::decode(decode_port)),
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        take_request_arrivals(prefill_port);
+        take_request_arrivals(decode_port);
+
+        let send = || {
+            let app = app.clone();
+            async move {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"text": "hi", "stream": false}).to_string(),
+                    ))
+                    .unwrap();
+                app.oneshot(request).await.unwrap().status()
+            }
+        };
+        let start = Instant::now();
+        let statuses = tokio::join!(send(), send());
+        assert_eq!(statuses, (StatusCode::OK, StatusCode::OK));
+
+        let since_start = |port| {
+            let mut arrivals: Vec<_> = take_request_arrivals(port)
+                .into_iter()
+                .map(|t| t - start)
+                .collect();
+            arrivals.sort();
+            arrivals
+        };
+        let prefill = since_start(prefill_port);
+        let decode = since_start(decode_port);
+        assert!(
+            prefill.len() == 2 && prefill[1] < Duration::from_millis(300),
+            "{prefill:?}"
+        );
+        assert!(
+            decode.len() == 2
+                && decode[0] < Duration::from_millis(300)
+                && decode[1] >= Duration::from_millis(500),
+            "{decode:?}"
+        );
+        ctx.shutdown().await;
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +402,8 @@ mod pd_responses_routing_tests {
             retry_config: RetryConfig::default(),
             api_key: None,
             enable_igw: false,
+            decode_gate: None,
+            request_timeout: Duration::from_secs(600),
         }
     }
 

@@ -61,7 +61,7 @@ def fused_topk_npu(
         if renormalize:
             topk_weights = l1_norm(
                 topk_weights
-                if topk_config.num_fused_shared_experts == 0
+                if topk_config.num_shared_topk_slots == 0
                 else topk_weights[:, :-1]
             )
         topk_weights = topk_weights.to(torch.float32)

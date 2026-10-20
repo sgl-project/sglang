@@ -87,6 +87,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -799,6 +800,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 tokenizer,
                 output_logprobs=output_logprobs,
                 require_reasoning=require_reasoning,
+                output_ids=final_res.get("output_ids"),
+                finish_reason=meta_info.get("finish_reason") if meta_info else None,
             )
 
             if meta_info is not None:
@@ -1022,8 +1025,84 @@ class OpenAIServingResponses(OpenAIServingChat):
         output_logprobs: Optional[list] = None,
         *,
         require_reasoning: bool,
+        output_ids: Optional[list[int]] = None,
+        finish_reason: Optional[dict[str, Any]] = None,
     ):
         chat_tools = self._response_tools_to_chat_tools(request)
+        custom_names = custom_tool_names(request.tools)
+        encoding_output = self._encoding_output()
+        if encoding_output is not None:
+            required_json = self._uses_required_tool_json(request, chat_tools)
+            reasoning_content, content, calls = encoding_output.parse_responses_output(
+                output_ids=output_ids or [],
+                finish_reason=finish_reason,
+                separate_reasoning=bool(self.reasoning_parser),
+                parse_tool_calls=(
+                    self._tool_call_parsing_enabled(request, chat_tools)
+                    and not required_json
+                ),
+            )
+            if required_json and content:
+                content, tool_call_items = self._parse_required_tool_json(
+                    content, custom_names
+                )
+            else:
+                tool_call_items = [
+                    self._make_tool_call_item(call.name, call.parameters, custom_names)
+                    for call in calls
+                ]
+        else:
+            reasoning_content, content, tool_call_items = self._parse_text_output(
+                request,
+                final_output,
+                chat_tools,
+                custom_names,
+                require_reasoning=require_reasoning,
+            )
+
+        output_items = []
+        if reasoning_content:
+            output_items.append(
+                self._make_reasoning_item(
+                    request,
+                    reasoning_content,
+                    item_id=f"rs_{random_uuid()}",
+                    status=None,
+                )
+            )
+        if content:
+            output_text = ResponseOutputText(
+                text=content,
+                annotations=[],  # TODO
+                type="output_text",
+                # logprobs cover all generated tokens, not just the stripped content.
+                logprobs=output_logprobs,
+            )
+            message = ResponseOutputMessage(
+                phase="commentary" if tool_call_items else "final_answer",
+                id=f"msg_{random_uuid()}",
+                content=[output_text],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+            output_items.append(message)
+        output_items.extend(tool_call_items)
+        return output_items
+
+    def _parse_text_output(
+        self,
+        request: ResponsesRequest,
+        final_output: Any,
+        chat_tools: list[Tool],
+        custom_names: set[str],
+        *,
+        require_reasoning: bool,
+    ) -> tuple[
+        Optional[str],
+        Any,
+        list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]],
+    ]:
         if self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
@@ -1046,20 +1125,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_content = None
             content = final_output
 
-        output_items = []
-        if reasoning_content:
-            output_items.append(
-                self._make_reasoning_item(
-                    request,
-                    reasoning_content,
-                    item_id=f"rs_{random_uuid()}",
-                    status=None,
-                )
-            )
-
         tool_choice = request.effective_tool_choice()
         is_required = tool_choice == "required" or isinstance(tool_choice, dict)
-        custom_names = custom_tool_names(request.tools)
         tool_call_items: list[
             Union[ResponseFunctionToolCall, ResponseCustomToolCall]
         ] = []
@@ -1101,45 +1168,32 @@ class OpenAIServingResponses(OpenAIServingChat):
             and not parsed_via_native
             and not detector_owns_format
         ):
-            try:
-                tool_call_data = orjson.loads(content)
-                if isinstance(tool_call_data, dict):
-                    tool_call_data = [tool_call_data]
-                if isinstance(tool_call_data, list):
-                    for tool in tool_call_data:
-                        if not isinstance(tool, dict) or "name" not in tool:
-                            continue
-                        arguments = json.dumps(
-                            tool.get("parameters", {}), ensure_ascii=False
-                        )
-                        tool_call_items.append(
-                            self._make_tool_call_item(
-                                tool["name"], arguments, custom_names
-                            )
-                        )
-                    content = ""
-            except Exception as e:
-                logger.error("Required tool JSON parse error: %s", e)
+            content, json_items = self._parse_required_tool_json(content, custom_names)
+            tool_call_items.extend(json_items)
+        return reasoning_content, content, tool_call_items
 
-        if content:
-            output_text = ResponseOutputText(
-                text=content,
-                annotations=[],  # TODO
-                type="output_text",
-                # logprobs cover all generated tokens, not just the stripped content.
-                logprobs=output_logprobs,
-            )
-            message = ResponseOutputMessage(
-                phase="commentary" if tool_call_items else "final_answer",
-                id=f"msg_{random_uuid()}",
-                content=[output_text],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-            output_items.append(message)
-        output_items.extend(tool_call_items)
-        return output_items
+    def _parse_required_tool_json(
+        self, content: str, custom_names: set[str]
+    ) -> tuple[str, list[Union[ResponseFunctionToolCall, ResponseCustomToolCall]]]:
+        tool_call_items = []
+        try:
+            tool_call_data = orjson.loads(content)
+            if isinstance(tool_call_data, dict):
+                tool_call_data = [tool_call_data]
+            if isinstance(tool_call_data, list):
+                for tool in tool_call_data:
+                    if not isinstance(tool, dict) or "name" not in tool:
+                        continue
+                    arguments = json.dumps(
+                        tool.get("parameters", {}), ensure_ascii=False
+                    )
+                    tool_call_items.append(
+                        self._make_tool_call_item(tool["name"], arguments, custom_names)
+                    )
+                content = ""
+        except Exception as e:
+            logger.error("Required tool JSON parse error: %s", e)
+        return content, tool_call_items
 
     def _make_response_output_items_with_harmony(
         self,
@@ -1159,9 +1213,36 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items.extend(last_items)
         return output_items
 
+    def _tool_call_parsing_enabled(
+        self, request: ResponsesRequest, chat_tools: list[Tool]
+    ) -> bool:
+        return bool(
+            chat_tools and self.tool_call_parser and request.tool_choice != "none"
+        )
+
     @staticmethod
     def _tool_parser_owns_format(parser: FunctionCallParser) -> bool:
         return parser.owns_tool_format()
+
+    def _uses_required_tool_json(
+        self, request: ResponsesRequest, chat_tools: list[Tool]
+    ) -> bool:
+        """Whether required/named tool output is constrained to the generic JSON
+        array, rather than to the configured detector's native framing."""
+        tool_choice = request.effective_tool_choice()
+        if not chat_tools or not (
+            tool_choice == "required" or isinstance(tool_choice, dict)
+        ):
+            return False
+        if not self.tool_call_parser:
+            return True
+        probe = FunctionCallParser(
+            chat_tools,
+            self.tool_call_parser,
+            tokenizer=self.tokenizer_manager.tokenizer,
+            tool_choice=tool_choice,
+        )
+        return not self._tool_parser_owns_format(probe)
 
     @staticmethod
     def _chat_tool_choice(tool_choice: Any) -> Any:
@@ -1998,29 +2079,33 @@ class OpenAIServingResponses(OpenAIServingChat):
         chat_tools = self._response_tools_to_chat_tools(request)
         custom_names = custom_tool_names(request.tools)
         tool_choice = request.effective_tool_choice()
-        is_required = tool_choice == "required" or isinstance(tool_choice, dict)
+        required_json = self._uses_required_tool_json(request, chat_tools)
+        encoding_output = self._encoding_output()
+        token_stream = (
+            encoding_output.new_responses_stream(
+                separate_reasoning=bool(self.reasoning_parser),
+                parse_tool_calls=(
+                    self._tool_call_parsing_enabled(request, chat_tools)
+                    and not required_json
+                ),
+            )
+            if encoding_output is not None
+            else None
+        )
         tool_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
-        if chat_tools and request.tool_choice != "none":
-            detector_owns_format = False
-            if self.tool_call_parser:
-                probe = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    tool_choice=tool_choice,
-                )
-                detector_owns_format = self._tool_parser_owns_format(probe)
-            if is_required and not detector_owns_format:
-                tool_parser = JsonArrayParser()
-            elif self.tool_call_parser:
-                tool_parser = FunctionCallParser(
-                    chat_tools,
-                    self.tool_call_parser,
-                    tokenizer=self.tokenizer_manager.tokenizer,
-                    tool_choice=tool_choice,
-                )
+        if required_json:
+            tool_parser = JsonArrayParser()
+        elif token_stream is None and self._tool_call_parsing_enabled(
+            request, chat_tools
+        ):
+            tool_parser = FunctionCallParser(
+                chat_tools,
+                self.tool_call_parser,
+                tokenizer=self.tokenizer_manager.tokenizer,
+                tool_choice=tool_choice,
+            )
         reasoning_parser_obj: Optional[ReasoningParser] = None
-        if self.reasoning_parser:
+        if token_stream is None and self.reasoning_parser:
             reasoning_parser_obj = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=True,
@@ -2308,36 +2393,45 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 finish_reason = meta.get("finish_reason") or finish_reason
 
-                text = chunk.get("text", "") or ""
-                if incremental:
-                    delta = text
-                else:
-                    delta = text[stream_offset:]
-                    stream_offset = len(text)
-                if not delta and finish_reason is None:
-                    continue
-                # finish_reason is sticky, so it would otherwise re-flush.
-                flush = (
-                    not flushed
-                    and finish_reason is not None
-                    and finish_reason.get("type") != "abort"
-                )
-                flushed = flushed or flush
-
-                if reasoning_parser_obj is not None:
-                    reasoning_chunk, delta = reasoning_parser_obj.parse_stream_chunk(
-                        delta
+                token_calls: list[ToolCallItem] = []
+                if token_stream is not None:
+                    reasoning_chunk, delta, token_calls = token_stream.step(
+                        chunk, finish_reason
                     )
-                    if flush:
-                        end_reasoning, end_normal = (
-                            reasoning_parser_obj.parse_stream_end()
-                        )
-                        if end_reasoning:
-                            reasoning_chunk = (reasoning_chunk or "") + end_reasoning
-                        if end_normal:
-                            delta = (delta or "") + end_normal
+                    flush = False
                 else:
-                    reasoning_chunk = None
+                    text = chunk.get("text", "") or ""
+                    if incremental:
+                        delta = text
+                    else:
+                        delta = text[stream_offset:]
+                        stream_offset = len(text)
+                    if not delta and finish_reason is None:
+                        continue
+                    # finish_reason is sticky, so it would otherwise re-flush.
+                    flush = (
+                        not flushed
+                        and finish_reason is not None
+                        and finish_reason.get("type") != "abort"
+                    )
+                    flushed = flushed or flush
+
+                    if reasoning_parser_obj is not None:
+                        reasoning_chunk, delta = (
+                            reasoning_parser_obj.parse_stream_chunk(delta)
+                        )
+                        if flush:
+                            end_reasoning, end_normal = (
+                                reasoning_parser_obj.parse_stream_end()
+                            )
+                            if end_reasoning:
+                                reasoning_chunk = (
+                                    reasoning_chunk or ""
+                                ) + end_reasoning
+                            if end_normal:
+                                delta = (delta or "") + end_normal
+                    else:
+                        reasoning_chunk = None
 
                 if reasoning_chunk:
                     if message_state["open"]:
@@ -2412,12 +2506,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                             )
                         )
 
-                if not delta and not flush:
+                if not delta and not flush and not token_calls:
                     continue
 
                 if isinstance(tool_parser, JsonArrayParser):
                     sp = tool_parser.parse_streaming_increment(delta, chat_tools)
                     normal_text, tool_calls = sp.normal_text or "", sp.calls
+                elif token_stream is not None:
+                    normal_text, tool_calls = delta, token_calls
                 elif tool_parser is not None:
                     normal_text, tool_calls = tool_parser.parse_stream_chunk(delta)
                     if flush:

@@ -55,7 +55,7 @@ pub struct BucketSpec {
 }
 
 /// Omitted fields mean every engine of the role and `--policy` (power-of-two on
-/// decode); admission limits left unset take `--max-in-flight` / `--max-kv-usage`,
+/// decode); admission limits left unset take `--max-inflight-requests` / `--max-kv-usage`,
 /// and affinity settings left unset take `--affinity-*`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]

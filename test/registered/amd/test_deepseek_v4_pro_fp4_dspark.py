@@ -17,7 +17,7 @@ import requests
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import MAX_FUSED_ROWS
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
@@ -163,11 +163,15 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         keep = loc >= 0
         expected[loc[keep].long()] = kv[keep]
 
-        runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified)
+        dsv4_unified_kv_store.scatter_bf16_into_unified(
+            kv=kv, loc=loc, unified_kv=unified
+        )
         self.assertTrue(torch.equal(unified, expected))
 
         with self.assertRaises(AssertionError):
-            runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified.t())
+            dsv4_unified_kv_store.scatter_bf16_into_unified(
+                kv=kv, loc=loc, unified_kv=unified.t()
+            )
 
 
 class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):

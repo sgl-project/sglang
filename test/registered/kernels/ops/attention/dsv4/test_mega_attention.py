@@ -5,7 +5,6 @@ from unittest.mock import patch
 import torch
 from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import quantize_k_cache_v41
 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     interleave_output_columns,
     interleave_query_rows,
@@ -15,6 +14,7 @@ from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
 from sglang.srt.models.deepseek_v4 import _fp8_wo_a_einsum
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+    quantize_k_cache_v41,
     quantize_k_cache_v41_fp4,
 )
 from sglang.test.test_utils import CustomTestCase

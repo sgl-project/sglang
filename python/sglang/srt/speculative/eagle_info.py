@@ -177,6 +177,10 @@ class EagleDraftInput(SpecInput):
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
+    # The window-clipped counterpart of the pair above, for the draft's
+    # sliding-window layers; None on a pool with no window side.
+    window_kv_indptr: torch.Tensor = None
+    window_kv_indices: torch.Tensor = None
 
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1

@@ -49,6 +49,14 @@ def _ring_pair_via_impl(impl, q, k_shard, v_shard):
 class RingReplicatedBase(unittest.TestCase):
     B, S_SHARD, REP, H, D = 1, 6, 3, 2, 8
 
+    def setUp(self):
+        self.enterContext(
+            patch(
+                f"{_LAYER}._usp_input_all_to_all_qkv",
+                side_effect=lambda q, k, v: (q, k, v),
+            )
+        )
+
     def _attn(self):
         obj = USPAttention.__new__(USPAttention)
         obj.skip_sequence_parallel = False

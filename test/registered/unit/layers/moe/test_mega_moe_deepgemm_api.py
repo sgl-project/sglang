@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, call, patch
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -234,6 +235,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=0,
             layer_id=0,
             routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )
@@ -453,7 +455,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             topk=SimpleNamespace(
                 topk_config=TopKConfig(
                     top_k=2 + fused_shared,
-                    num_fused_shared_experts=fused_shared,
+                    shared_experts=SharedExpertsConfig(
+                        num_fused_shared_experts=fused_shared
+                    ),
                     renormalize=True,
                     routed_scaling_factor=2.0,
                     apply_routed_scaling_factor_on_output=scale_in_topk,
@@ -463,6 +467,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
             num_fused_shared_experts=fused_shared,
             layer_id=0,
             routed_scaling_factor=2.0,
+            routed_scaling_factor_fused_in_topk=scale_in_topk,
             mega_shared_l1_weights=None,
             mega_shared_l2_weights=None,
         )

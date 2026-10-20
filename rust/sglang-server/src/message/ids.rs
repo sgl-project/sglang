@@ -74,8 +74,9 @@ impl Rid {
     /// so the second would evict the first's sink, 500 that client mid-generation
     /// and deliver its remaining chunks to the second's connection. Uniquifying
     /// here makes the collision unrepresentable rather than something a duplicate
-    /// check has to catch — no in-flight registry, no admission/release ordering
-    /// to get wrong, and both clients get served instead of the second being 400'd.
+    /// check has to catch. The core's explicit-cancellation index groups public
+    /// IDs but does not assign identity: both clients get served instead of the
+    /// second being 400'd, and an old internal abort cannot affect an ID reuse.
     ///
     /// The client never sees this: [`client_facing`](Self::client_facing) strips it
     /// back off for `meta_info.id`. Only the scheduler wire and its logs carry the

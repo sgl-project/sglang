@@ -39,7 +39,11 @@ class TestDSAHostRelease(CustomTestCase):
             index_head_dim=128,
         )
         anchor = MLATokenToKVPoolHost(
-            pool,
+            pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
             host_to_device_ratio=2,
             host_size=0,
             page_size=64,

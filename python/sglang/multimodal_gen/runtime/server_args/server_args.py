@@ -486,9 +486,6 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
-    _automatic_component_attention_backend_keys: set[str] = field(
-        default_factory=set, init=False, repr=False
-    )
     _required_resident_components: set[str] = field(
         default_factory=set, init=False, repr=False
     )
@@ -636,8 +633,6 @@ class ServerArgs(DisaggServerArgsMixin):
     decoder_sp: int | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
-    pool_control_endpoint: str | None = None
-    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -1183,7 +1178,6 @@ class ServerArgs(DisaggServerArgsMixin):
                     logger.info(
                         "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
                     )
-                    self._automatic_component_attention_backend_keys.add("text_encoder")
                 else:
                     logger.warning(
                         "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
@@ -1222,7 +1216,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 "encoder; laser_attn applies to the transformer"
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
-            self._automatic_component_attention_backend_keys.add("text_encoder")
 
         if self.ring_degree > 1:
             if (
@@ -1463,15 +1456,6 @@ class ServerArgs(DisaggServerArgsMixin):
     ) -> None:
         """Select a component's backend on the user's behalf."""
         self.component_attention_backends[component_name] = backend
-        self._automatic_component_attention_backend_keys.add(component_name)
-
-    def is_component_attention_backend_automatic(
-        self, component_name: str | None
-    ) -> bool:
-        return (
-            component_name is not None
-            and component_name in self._automatic_component_attention_backend_keys
-        )
 
     def resolve_component_backend_by_role(
         self, *component_names: str | None

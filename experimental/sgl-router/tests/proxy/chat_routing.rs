@@ -70,13 +70,14 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
     let cfg = config_for(url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    let _ = registry.add(WorkerSpec {
+    let spec = WorkerSpec {
         id: WorkerId("w1".into()),
         url: url.to_string(),
         mode: WorkerMode::Plain,
         model_ids: vec![ModelId("tiny".into())],
         ..Default::default()
-    });
+    };
+    let _ = registry.add_with_cb(spec, Some(Default::default()), WireProtocol::default());
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     // Per-request worker URLs flow from the registry through
     // `forward_*_to(&worker.url, ...)`; the proxy itself is URL-less.

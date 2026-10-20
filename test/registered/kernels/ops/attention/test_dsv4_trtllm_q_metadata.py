@@ -3,7 +3,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.dsv4.elementwise import fused_q_norm_rope
+from sglang.kernels.ops.attention.dsv4.norm_rope import fused_q_norm_rope
 from sglang.kernels.ops.attention.dsv4.trtllm_metadata import pack_sparse_tail
 from sglang.test.ci.ci_register import register_cuda_ci
 

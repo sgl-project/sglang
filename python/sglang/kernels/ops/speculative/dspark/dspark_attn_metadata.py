@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import msgspec
 import torch
@@ -35,12 +35,14 @@ class ComputeDsparkWindowGather:
         req_pool_indices_repeated: torch.Tensor,
         block_size: int,
         swa_window: int,
+        valid_from: Optional[torch.Tensor] = None,
     ) -> DsparkWindowGather:
         return compute_dspark_window_gather(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
             block_size=block_size,
             swa_window=swa_window,
+            valid_from=valid_from,
         )
 
     @classmethod
@@ -51,12 +53,14 @@ class ComputeDsparkWindowGather:
         req_pool_indices_repeated: torch.Tensor,
         block_size: int,
         swa_window: int,
+        valid_from: Optional[torch.Tensor] = None,
     ) -> DsparkWindowGather:
         return compute_dspark_window_gather_triton(
             seq_lens_casual=seq_lens_casual,
             req_pool_indices_repeated=req_pool_indices_repeated,
             block_size=block_size,
             swa_window=swa_window,
+            valid_from=valid_from,
         )
 
 
@@ -129,6 +133,7 @@ def compute_dspark_window_gather(
     req_pool_indices_repeated: torch.Tensor,
     block_size: int,
     swa_window: int,
+    valid_from: Optional[torch.Tensor] = None,
 ) -> DsparkWindowGather:
     seq_lens_casual = seq_lens_casual.to(torch.int32)
     num_q = seq_lens_casual.size(0)
@@ -143,6 +148,12 @@ def compute_dspark_window_gather(
     prefix_lens = (seq_lens_casual[first_token] - 1).to(torch.int32)
     context_lens = torch.clamp(prefix_lens, max=swa_window).to(torch.int32)
     req_pool_indices_per_request = req_pool_indices_repeated[first_token]
+    if valid_from is not None:
+        # The window keeps its last context_lens positions; none may sit below
+        # the request's valid_from.
+        rows_written = prefix_lens - valid_from[req_pool_indices_per_request.long()]
+        context_lens = torch.minimum(context_lens, rows_written.clamp(min=0))
+        context_lens = context_lens.to(torch.int32)
 
     offsets = (
         prefix_lens.to(torch.int64).unsqueeze(1)
@@ -170,15 +181,22 @@ def _window_gather_kernel(
     req_pool_out_ptr,
     offsets_ptr,
     invalid_ptr,
+    valid_from_ptr,
     block_size,
     swa_window,
     W_BLOCK: tl.constexpr,
+    HAS_VALID_FROM: tl.constexpr,
 ):
     i = tl.program_id(0)
     ft = i * block_size
     prefix = tl.load(seq_lens_casual_ptr + ft).to(tl.int64) - 1
-    tl.store(context_lens_ptr + i, tl.minimum(prefix, swa_window).to(tl.int32))
-    tl.store(req_pool_out_ptr + i, tl.load(req_pool_rep_ptr + ft))
+    req_pool = tl.load(req_pool_rep_ptr + ft)
+    context_len = tl.minimum(prefix, swa_window)
+    if HAS_VALID_FROM:
+        valid_from = tl.load(valid_from_ptr + req_pool.to(tl.int64))
+        context_len = tl.minimum(context_len, tl.maximum(prefix - valid_from, 0))
+    tl.store(context_lens_ptr + i, context_len.to(tl.int32))
+    tl.store(req_pool_out_ptr + i, req_pool)
     col = tl.arange(0, W_BLOCK)
     cmask = col < swa_window
     off = prefix - swa_window + col
@@ -192,6 +210,7 @@ def compute_dspark_window_gather_triton(
     req_pool_indices_repeated: torch.Tensor,
     block_size: int,
     swa_window: int,
+    valid_from: Optional[torch.Tensor] = None,
 ) -> DsparkWindowGather:
     seq_lens_casual = seq_lens_casual.to(torch.int32).contiguous()
     num_q = seq_lens_casual.size(0)
@@ -214,9 +233,11 @@ def compute_dspark_window_gather_triton(
         req_pool_out,
         offsets,
         invalid,
+        valid_from if valid_from is not None else context_lens,
         block_size,
         swa_window,
         W_BLOCK=W_BLOCK,
+        HAS_VALID_FROM=valid_from is not None,
     )
     return DsparkWindowGather(
         num_q=num_q,

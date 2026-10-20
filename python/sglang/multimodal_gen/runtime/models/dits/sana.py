@@ -117,10 +117,6 @@ def sana_ln_modulate(
                 _eager_ln_modulate(norm, x, scale, shift),
                 sig=sig,
                 logger=logger,
-                mismatch_msg=(
-                    "Sana fused LN+modulate fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
             )
             _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
             return result
@@ -199,10 +195,6 @@ def sana_conv_bias_silu(
         out,
         F.silu(raw + conv.bias[None, :, None, None]),
         logger=logger,
-        mismatch_msg=(
-            "Sana fused conv bias-SiLU path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 
@@ -240,10 +232,6 @@ def sana_conv_bias_glu(
         out,
         hidden_states * F.silu(gate),
         logger=logger,
-        mismatch_msg=(
-            "Sana fused conv bias-GLU path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 

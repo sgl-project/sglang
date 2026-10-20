@@ -22,11 +22,23 @@ Select **Docker** in the command panel to launch the matching image. The **Pytho
 The first launch in a fresh container spends about five extra minutes compiling JIT kernels for the speculative-decoding graphs (about 4–5 minutes once, then about 30 seconds). Mount a persistent cache volume, for example `-v ~/.cache:/root/.cache`, to skip it on later starts.
 </Note>
 
+<Note>
+**AMD MI325X / MI350X:** the published ROCm images predate the ROCm gated-MLA fix that Ling-3.1-flash needs; without it the server fails while capturing decode CUDA graphs. Until a ROCm image includes the fix, build a thin image that switches the nightly's editable SGLang source to the Ling-3.1-flash branch (use the `mi35x` base for MI350X), then substitute it for the image in the generated Docker command:
+
+```dockerfile Dockerfile
+FROM lmsysorg/sglang-rocm:v0.5.21-rocm724-mi30x-20261013
+RUN cd /sgl-workspace/sglang \
+ && git fetch https://github.com/sgl-project/sglang.git bailing-v3-day0 \
+ && git checkout FETCH_HEAD
+```
+</Note>
+
 </Accordion>
 
 Pick your hardware to generate the launch command:
 
-- **Low-Latency** — single-user chat and interactive requests, with NEXTN speculative decoding. Verified on H200 and GB300; H20-3e, H800, H100, and B200 recipes are provided unverified.
+- **Low-Latency** — TP-only (EP=1) with NEXTN speculative decoding for single-user chat and interactive requests. Verified on H200.
+- **High-Throughput** — expert-parallel (EP) serving for batch and multi-user traffic: TP8 + EP8 on H200/H800/H100/B200-class nodes, TP4 + EP4 on GB300, TP8 + EP8 with AITER on AMD MI300X/MI325X/MI350X/MI355X (without speculative decoding). Verified on H200 and GB300; other platforms are unverified. AMD MI325X and MI350X recipes (TP8 + EP8 with AITER, without speculative decoding) are provided unverified; the MI325X accuracy in the benchmark card was measured by AMD.
 
 For prefix-heavy multi-turn workloads, enable **HiCache** in the Playground after starting the Mooncake services in §3.3. The combination is verified: prefix hits return from Mooncake L3 on every TP rank.
 
@@ -60,6 +72,8 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 - On H200, enable `SGLANG_ENABLE_FP8_BLOCK_GEMV=1` and `SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT=1`. Both are included in the generated commands; they are no-ops on GB300 (SM10x).
 - Leave `--mem-fraction-static` at its default. SGLang auto-selects the `ling3` reasoning and tool-call parsers for this architecture; you can change the parser settings in the Playground.
 - **NEXTN:** add `--speculative-algorithm NEXTN` for built-in MTP speculative decoding. Measured acceptance length is 2.61 on random tokens and 2.13 on real-text probes.
+- **Long context:** the checkpoint supports 262,144 tokens natively. For up to 1,048,576 tokens, add the YaRN override from §3.4.
+- **Topology:** the Low-Latency recipe runs TP-only (no `--ep-size`) and is clearly faster at batch size 1 (about 9-13% lower TPOT on H200, verified on both 2048/512 and 8192/1024 workloads). At concurrency 16-32 the two recipes deliver the same throughput within ~2%. TP-only relies on the loader's TP-requant support; it fails loudly at startup on builds without it.
 - For prefix-heavy, multi-turn workloads, select **Cache fork and tail** in the Playground. It combines `--mamba-radix-cache-strategy extra_buffer`, `--chunked-prefill-size 4096`, and `SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK=1`. GPU checks confirmed both fork and tail states are cached, saving about 576 tokens per subsequent turn in the measured workload.
 
 ### Playground support
@@ -71,7 +85,7 @@ The model has about 560B total parameters (512 routed experts with 8 active plus
 
 ### Performance
 
-On H200 TP8 + EP8 with NEXTN and the decode gates enabled, batch-size-1 output throughput measures **251.2 tokens/s**. GB300 NEXTN batch-size-1 result: `180.0 tok/s (TPOT 5.14 ms, accept 2.59)`.
+On H200 TP8 with NEXTN and the decode gates enabled, batch-size-1 output throughput measures **269.2 tokens/s** (TP8 + EP8: 239.5 tokens/s). GB300 TP4 with NEXTN measures **175.3 tokens/s** (`TPOT 5.22 ms, accept 2.60`; TP4 + EP4: 160.0 tokens/s).
 
 Acceptance length is the mean number of tokens accepted per speculative verification step, including the target bonus token:
 
@@ -108,7 +122,7 @@ python3 -m sglang.bench_serving \
   --flush-cache --seed 11
 ```
 
-For the concurrency-32 row in the benchmark widget:
+For the saturation row in the benchmark widget, launch the H200 **High-Throughput** recipe instead and run:
 
 ```bash Command
 python3 -m sglang.bench_serving \
@@ -116,9 +130,9 @@ python3 -m sglang.bench_serving \
   --host localhost --port 30000 \
   --model inclusionAI/Ling-3.1-flash \
   --dataset-name random \
-  --random-input-len 4096 --random-output-len 512 \
+  --random-input-len 8192 --random-output-len 1024 \
   --random-range-ratio 1 \
-  --num-prompts 96 --max-concurrency 32 \
+  --num-prompts 256 --max-concurrency 48 \
   --flush-cache --seed 11
 ```
 
@@ -133,7 +147,7 @@ sgl-eval run gsm8k \
   --num-threads 32
 ```
 
-Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. For the H200 NEXTN recipe, compare the stop rate with the measured 99.85%; accuracy alone can hide generations that reach the token limit.
+Evaluate all 1,319 questions and inspect completion reasons as well as accuracy. For the H200 NEXTN recipes, compare the stop rate with the measured 99.77% (Low-Latency) or 99.92% (High-Throughput); accuracy alone can hide generations that reach the token limit.
 
 </Accordion>
 
@@ -277,29 +291,47 @@ print(follow_up.choices[0].message.content)
 
 ```json Output
 {
-  "message": {
-    "role": "assistant",
-    "content": "",
-    "reasoning_content": "The user wants to know the current weather in Hangzhou. I'll call the get_weather function with city \"Hangzhou\". The unit parameter is optional - I'll use celsius as default since Hangzhou is in China.",
-    "tool_calls": [
-      {
-        "id": "call_2bae8419df9d44f2bb54c22f",
-        "index": 0,
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "arguments": "{\"city\": \"Hangzhou\", \"unit\": \"celsius\"}"
-        }
-      }
-    ]
-  },
-  "finish_reason": "tool_calls"
+  "content": "",
+  "role": "assistant",
+  "tool_calls": [
+    {
+      "id": "call_ecd286d7dccb4c70a8c9c586",
+      "function": {
+        "arguments": "{\"city\": \"Hangzhou\", \"unit\": \"celsius\"}",
+        "name": "get_weather"
+      },
+      "type": "function",
+      "index": 0
+    }
+  ],
+  "reasoning_content": "The user is asking about the current weather in Hangzhou. I need to call the get_weather function with the city parameter set to \"Hangzhou\". The unit parameter is optional - I'll default to celsius since that's commonly used in China."
 }
 ```
 
-The follow-up assistant turn answers with both `reasoning_content` and `content` populated.
+</Accordion>
+
+<Accordion title="Example Output (follow-up)">
+
+```text Output
+The user asked about the weather in Hangzhou and I got the result. Let me provide a natural response.
+The weather in Hangzhou right now is sunny with a temperature of 22°C. It's a pleasant day!
+```
+
+The first line is `reasoning_content`; the second is `content`. `finish_reason` is `stop`.
 
 </Accordion>
+
+### 3.4 Long context with YaRN (up to 1M tokens)
+
+The model's native context is 262,144 tokens. Verified on H200 and GB300, YaRN extrapolation serves up to **1,048,576 tokens**:
+
+```bash Command
+--json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144, "rope_theta": 6000000, "partial_rotary_factor": 0.5}, "max_position_embeddings": 1048576}'
+```
+
+Add it to the Low-Latency serve command. All four keys are required: the override replaces the checkpoint's RoPE parameters, so omitting `rope_theta` or `partial_rotary_factor` silently changes the RoPE base, and omitting `max_position_embeddings` keeps the 262,144 limit. Only enable it for prompts beyond 256K.
+
+Verification on the current checkpoint: a fact planted at token 700,023 of a 900,022-token prompt is retrieved exactly, NEXTN acceptance stays about 2.1 at 900K, and a 300,101-token prompt is answered correctly (H200 TTFT 15.4 s, GB300 12.6 s). One 1M-token request fits alongside normal serving traffic on both platforms.
 
 ### 3.3 HiCache with Mooncake
 

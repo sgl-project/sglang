@@ -50,18 +50,6 @@ def flux3_image_dit_config_from_package(package: Flux3ImagePackage) -> Flux3DiTC
     )
 
 
-def flux3_image_quantization_name(
-    quant_config: QuantizationConfig | None,
-) -> str | None:
-    if quant_config is None:
-        return None
-    name = quant_config.get_name()
-    return {
-        "modelopt_fp4": "nvfp4",
-        "rowwise_fp8": "rowwise-fp8",
-    }.get(name, name)
-
-
 def resolve_flux3_image_dit_quant_config(
     dit_path: str,
     quantization: str | None = None,

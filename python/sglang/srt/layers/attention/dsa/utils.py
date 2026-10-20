@@ -73,9 +73,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     """Whether this runtime can serve the gfx950 fused indexer: aiter with
     preshuffled paged MQA, and kernels that build.
 
-    Reached only on gfx950, since fused_decode.supported_hardware() is evaluated
-    first. Every decline here is therefore a configuration or toolchain error;
-    it is logged, as a warning when the path was asked for by name."""
+    Reached only on gfx950, since gfx950_fused_indexer.supported_hardware() is
+    evaluated first. Every decline here is therefore a configuration or toolchain
+    error; it is logged, as a warning when the path was asked for by name."""
     from sglang.srt.runtime_context import get_exec
 
     requested = get_exec().kernel.enable_dsa_fused_indexer
@@ -91,9 +91,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
         log("gfx950 fused DSA indexer disabled: %s", reason)
         return False
 
-    # No hardware term here: fused_decode.supported_hardware() is the hardware
-    # half of the gate and runs first, so anything reaching this point is
-    # already on gfx950. What is left is what a deployment can get wrong.
+    # No hardware term here: gfx950_fused_indexer.supported_hardware() is the
+    # hardware half of the gate and runs first, so anything reaching this point
+    # is already on gfx950. What is left is what a deployment can get wrong.
     if not get_bool_env_var("SGLANG_USE_AITER"):
         return _refuse("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():
@@ -110,7 +110,9 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
 def gfx950_model_shape_supported(**kwargs) -> bool:
     """Static per-model half of the gate: shapes and dtypes that cannot change
     after load."""
-    from sglang.kernels.ops.attention.dsa.hip_gfx950 import model_shape_supported
+    from sglang.srt.layers.attention.dsa.gfx950_fused_indexer import (
+        model_shape_supported,
+    )
 
     return model_shape_supported(**kwargs)
 

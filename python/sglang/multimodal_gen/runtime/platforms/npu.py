@@ -62,17 +62,6 @@ class NPUPlatformBase(Platform):
         return int(device_props.total_memory)
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable NPU "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
     def inference_mode(cls):
         # npu kernels in diffusion paths may need tensor version counters
         return torch.no_grad()

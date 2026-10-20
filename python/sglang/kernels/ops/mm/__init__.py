@@ -1,7 +1,7 @@
 """Multimodal input-processing kernels; implementations are imported lazily."""
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 __all__ = ["process"]
 
@@ -12,7 +12,7 @@ register_kernel(
         op="mm.normalize_and_patchify",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mm.process.image:normalize_and_patchify",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 

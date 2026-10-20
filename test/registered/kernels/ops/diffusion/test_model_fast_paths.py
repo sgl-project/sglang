@@ -41,25 +41,16 @@ import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
 from sglang.kernels.ops.diffusion import (
+    FUSED_LN_MODULATE,
+    HUNYUAN_QKNORM,
+    LTX2_QKNORM_SPLIT_ROPE,
+    LTX2_RMS_NORM_MODULATE,
+    QWEN_IMAGE_ADDED_QKV,
     BitExactFusionGate,
     can_use_wan_rmsnorm_silu,
     fused_ltx2_rms_norm_modulate,
     hunyuan_qkv_rope_pack,
-    mark_fused_ln_modulate_site,
-    mark_hunyuan_qknorm_site,
-    mark_ltx2_qknorm_split_rope_site,
-    mark_ltx2_rms_norm_modulate_site,
-    mark_qwen_image_added_qkv_site,
-    mount_fused_ln_modulate,
-    mount_hunyuan_qknorm,
-    mount_ltx2_qknorm_split_rope,
-    mount_ltx2_rms_norm_modulate,
-    mount_qwen_image_added_qkv,
     try_flux2_token_cat_nvfp4,
-    unmount_hunyuan_qknorm,
-    unmount_ltx2_qknorm_split_rope,
-    unmount_ltx2_rms_norm_modulate,
-    unmount_qwen_image_added_qkv,
     wan_rmsnorm_silu,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
@@ -379,8 +370,8 @@ def test_flux_norm_modulate_bitexact_supersedes_high_fold():
     # With the quality="high" affine fold mounted, the bit-exact kernel
     # still takes priority, so the site output stays lossless.
     site = torch.nn.Module()
-    mark_fused_ln_modulate_site(site)
-    assert mount_fused_ln_modulate(site)
+    FUSED_LN_MODULATE.mark(site)
+    assert FUSED_LN_MODULATE.mount(site)
     norm, x, shift, scale = _flux_site_inputs((1, 128, 3072), 6, seed=1)
     out = _flux_norm_modulate(site, norm, x, scale, shift)
     assert torch.equal(out, _flux_eager(norm, x, scale, shift))
@@ -571,7 +562,7 @@ def _added_qkv_attention(packed):
     attention.use_fused_added_qkv = True
     attention._unquantized_added_qkv_is_packed = True
     attention.to_added_qkv = packed
-    mark_qwen_image_added_qkv_site(attention)
+    QWEN_IMAGE_ADDED_QKV.mark(attention)
     return attention
 
 
@@ -606,7 +597,7 @@ def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
         for actual, expected in zip(actual_lossless, expected_lossless)
     )
 
-    assert mount_qwen_image_added_qkv(attention)
+    assert QWEN_IMAGE_ADDED_QKV.mount(attention)
     actual_high = attention._get_added_qkv_projections(x)
     expected_high = tuple(
         tensor.contiguous()
@@ -618,7 +609,7 @@ def test_qwen_added_qkv_lossless_uses_three_reference_gemms():
         for actual, expected in zip(actual_high, expected_high)
     )
 
-    unmount_qwen_image_added_qkv(attention)
+    QWEN_IMAGE_ADDED_QKV.unmount(attention)
     attention._get_added_qkv_projections(x)
     assert packed.calls == 1
 
@@ -996,12 +987,12 @@ def test_longcat_qknorm_rope_is_bit_exact():
 
 def test_ltx2_qknorm_split_rope_hopper_site_is_quality_gated():
     attention = nn.Module()
-    mark_ltx2_qknorm_split_rope_site(attention)
-    assert not ltx2_module.ltx2_qknorm_split_rope_active(attention)
-    assert mount_ltx2_qknorm_split_rope(attention)
-    assert ltx2_module.ltx2_qknorm_split_rope_active(attention)
-    unmount_ltx2_qknorm_split_rope(attention)
-    assert not ltx2_module.ltx2_qknorm_split_rope_active(attention)
+    LTX2_QKNORM_SPLIT_ROPE.mark(attention)
+    assert not LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
+    assert LTX2_QKNORM_SPLIT_ROPE.mount(attention)
+    assert LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
+    LTX2_QKNORM_SPLIT_ROPE.unmount(attention)
+    assert not LTX2_QKNORM_SPLIT_ROPE.is_enabled(attention)
 
 
 def _ltx2_eager(rms, x, scale, shift, eps):
@@ -1022,7 +1013,7 @@ def test_ltx2_lossless_default_is_bitexact(hidden):
     # A marked-but-unmounted site uses only the self-verified bit-exact
     # modulate fast path after the reference aten RMSNorm.
     block = nn.Module()
-    mark_ltx2_rms_norm_modulate_site(block)
+    LTX2_RMS_NORM_MODULATE.mark(block)
     rms, x, scale, shift = _ltx2_inputs(hidden)
     out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
     assert torch.equal(out, _ltx2_eager(rms, x, scale, shift, 1e-6))
@@ -1030,7 +1021,7 @@ def test_ltx2_lossless_default_is_bitexact(hidden):
 
 def test_ltx2_lossless_compile_keeps_expression_visible_to_inductor(monkeypatch):
     block = nn.Module()
-    mark_ltx2_rms_norm_modulate_site(block)
+    LTX2_RMS_NORM_MODULATE.mark(block)
     rms, x, scale, shift = _ltx2_inputs(2048, seq=126)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(
@@ -1047,8 +1038,8 @@ def test_ltx2_lossless_compile_keeps_expression_visible_to_inductor(monkeypatch)
 @pytest.mark.parametrize("hidden", [4096, 2048])
 def test_ltx2_mounted_high_uses_fused_kernel(hidden):
     block = nn.Module()
-    mark_ltx2_rms_norm_modulate_site(block)
-    assert mount_ltx2_rms_norm_modulate(block)
+    LTX2_RMS_NORM_MODULATE.mark(block)
+    assert LTX2_RMS_NORM_MODULATE.mount(block)
     try:
         rms, x, scale, shift = _ltx2_inputs(hidden)
         out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
@@ -1058,7 +1049,7 @@ def test_ltx2_mounted_high_uses_fused_kernel(hidden):
         ref = _ltx2_eager(rms, x, scale, shift, 1e-6)
         assert torch.allclose(out.float(), ref.float(), atol=3e-2, rtol=1e-2)
     finally:
-        unmount_ltx2_rms_norm_modulate(block)
+        LTX2_RMS_NORM_MODULATE.unmount(block)
 
 
 # -------------------------------------------------------------------------
@@ -1139,7 +1130,7 @@ def test_hunyuan_qkv_rope_pack_uses_int64_row_offsets():
 def test_hunyuan_quality_qknorm_matches_rmsnorm():
     torch.manual_seed(1)
     site = torch.nn.Module()
-    mark_hunyuan_qknorm_site(site)
+    HUNYUAN_QKNORM.mark(site)
     q_norm = RMSNorm(128, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
     k_norm = RMSNorm(128, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
     packed = torch.randn(1, 257, 3, 24, 128, device="cuda", dtype=torch.bfloat16)
@@ -1151,12 +1142,12 @@ def test_hunyuan_quality_qknorm_matches_rmsnorm():
     assert torch.equal(q_unmounted, q_ref)
     assert torch.equal(k_unmounted, k_ref)
 
-    assert mount_hunyuan_qknorm(site)
+    assert HUNYUAN_QKNORM.mount(site)
     q_out, k_out = _hunyuan_qknorm(site, q, k, q_norm, k_norm)
     torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
 
-    unmount_hunyuan_qknorm(site)
+    HUNYUAN_QKNORM.unmount(site)
     q_unmounted, k_unmounted = _hunyuan_qknorm(site, q, k, q_norm, k_norm)
     assert torch.equal(q_unmounted, q_ref)
     assert torch.equal(k_unmounted, k_ref)
@@ -1164,12 +1155,12 @@ def test_hunyuan_quality_qknorm_matches_rmsnorm():
 
 def test_hunyuan_quality_qknorm_stays_unmounted_without_cute_kernel():
     site = torch.nn.Module()
-    mark_hunyuan_qknorm_site(site)
+    HUNYUAN_QKNORM.mark(site)
 
     with patch.object(hunyuan_qknorm, "_get_qk_rmsnorm_cute", return_value=None):
-        assert not mount_hunyuan_qknorm(site)
+        assert not HUNYUAN_QKNORM.mount(site)
 
-    assert not hunyuan_qknorm._FUSION.is_enabled(site)
+    assert not HUNYUAN_QKNORM.is_enabled(site)
 
 
 # -------------------------------------------------------------------------

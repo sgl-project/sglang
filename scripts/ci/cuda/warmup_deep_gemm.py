@@ -75,7 +75,7 @@ CRASH_MARKERS = (
 # this warms the directory the server will actually compile into; duplicating
 # the default here is what let the two drift apart.
 os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
-os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
+os.environ["DG_JIT_USE_NVRTC"] = "1" if envs.SGLANG_DG_USE_NVRTC.get() else "0"
 
 BLOCK_SIZE = 128
 

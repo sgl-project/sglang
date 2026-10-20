@@ -126,7 +126,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             and config.scoring_func == "sigmoid"
             and config.correction_bias is not None
             and config.custom_routing_function is None
-            and config.num_fused_shared_experts == 0
+            and config.num_shared_topk_slots == 0
             and not config.torch_native
         )
         self._bypassed_routing_method = (

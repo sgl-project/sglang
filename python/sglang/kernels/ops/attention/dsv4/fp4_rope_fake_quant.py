@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import FP4_AMAX_FLOOR
+from sglang.kernels.ops.quantization.fp4_fake_quant import FP4_AMAX_FLOOR
 
 
 @triton.jit

@@ -116,6 +116,7 @@ def runtime(monkeypatch):
             is_hash=False,
             layer_id=0,
             routed_scaling_factor=1.0,
+            routed_scaling_factor_fused_in_topk=True,
         )
         forward_batch = (
             None

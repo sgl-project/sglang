@@ -79,27 +79,6 @@ _NORM_MOD_FUSION = BitExactFusionGate("MOSSImage RMSNorm + modulation")
 _NORM_ROPE_FUSION = BitExactFusionGate("MOSSImage RMSNorm + RoPE")
 
 
-def _fused_or_native(gate, eligible, fused, native, sig=None):
-    if eligible and not gate.disabled:
-        verified = gate.is_verified(sig)
-        if verified or not (
-            torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
-        ):
-            try:
-                out = fused()
-            except ValueError:
-                raise
-            except Exception as exc:
-                gate.on_exception(exc, logger=logger)
-            else:
-                return (
-                    out
-                    if verified
-                    else gate.accept_or_fallback(out, native(), sig=sig, logger=logger)
-                )
-    return native()
-
-
 def validate_skip_layers(skip_layers, num_layers):
     try:
         skip_layers = tuple(skip_layers)
@@ -142,14 +121,16 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return _fused_or_native(
-            _RMSNORM_FUSION,
-            can_use_rmsnorm_cast_before_weight(
-                device=x.device, dtype=x.dtype, contiguous=x.is_contiguous()
-            ),
+        if not can_use_rmsnorm_cast_before_weight(
+            device=x.device, dtype=x.dtype, contiguous=x.is_contiguous()
+        ):
+            return self.forward_native(x)
+        return _RMSNORM_FUSION.run(
             lambda: rmsnorm_cast_before_weight_bitexact(x, self.weight),
             lambda: self.forward_native(x),
             sig=(x.device.index, x.dtype, x.shape[-1], x.numel() // x.shape[-1] >= 16),
+            logger=logger,
+            reraise=(ValueError,),
         )
 
     def forward_native(self, x):
@@ -164,11 +145,13 @@ def _situ_native(hidden, gate):
 
 
 def _situ(hidden, gate):
-    return _fused_or_native(
-        _SITU_FUSION,
-        can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype),
+    if not can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype):
+        return _situ_native(hidden, gate)
+    return _SITU_FUSION.run(
         lambda: fused_situ_softcap_mul_bitexact(hidden, gate),
         lambda: _situ_native(hidden, gate),
+        logger=logger,
+        reraise=(ValueError,),
     )
 
 
@@ -186,11 +169,13 @@ def _rotate_native(x, rope):
 
 def _rotate(x, rope):
     sin, cos = (part.flatten(0, 1) for part in rope)
-    return _fused_or_native(
-        _ROPE_FUSION,
-        x.is_cuda and x.dtype is torch.bfloat16,
+    if not (x.is_cuda and x.dtype is torch.bfloat16):
+        return _rotate_native(x, rope)
+    return _ROPE_FUSION.run(
         lambda: fused_rope_rotate_half_bitexact(x, cos, sin),
         lambda: _rotate_native(x, rope),
+        logger=logger,
+        reraise=(ValueError,),
     )
 
 
@@ -206,34 +191,38 @@ def _attention(q, k, v, rope, heads, attention, attn_mask_meta=None):
 
 
 def _norm_modulate(norm, x, scale, shift):
-    return _fused_or_native(
-        _NORM_MOD_FUSION,
-        can_use_rmsnorm_cast_before_weight_modulate(
-            device=x.device,
-            dtype=x.dtype,
-            dim=x.shape[-1],
-            rows=x.numel() // x.shape[-1],
-        ),
+    if not can_use_rmsnorm_cast_before_weight_modulate(
+        device=x.device,
+        dtype=x.dtype,
+        dim=x.shape[-1],
+        rows=x.numel() // x.shape[-1],
+    ):
+        return modulate_scale_shift(norm(x), scale, shift)
+    return _NORM_MOD_FUSION.run(
         lambda: rmsnorm_cast_before_weight_modulate_bitexact(
             x, norm.weight, scale, shift
         ),
         lambda: modulate_scale_shift(norm(x), scale, shift),
+        logger=logger,
+        reraise=(ValueError,),
     )
 
 
 def _norm_rope(norm, x, rope, heads):
     x = x.unflatten(-1, (heads, -1))
     sin, cos = (part.flatten(0, 1) for part in rope)
-    return _fused_or_native(
-        _NORM_ROPE_FUSION,
-        can_use_rmsnorm_cast_before_weight_rope(
-            device=x.device,
-            dtype=x.dtype,
-            dim=x.shape[-1],
-            rows=x.numel() // x.shape[-1],
-        ),
+    if not can_use_rmsnorm_cast_before_weight_rope(
+        device=x.device,
+        dtype=x.dtype,
+        dim=x.shape[-1],
+        rows=x.numel() // x.shape[-1],
+    ):
+        return _rotate(norm(x), rope).flatten(2)
+    return _NORM_ROPE_FUSION.run(
         lambda: rmsnorm_cast_before_weight_rope_bitexact(x, norm.weight, cos, sin),
         lambda: _rotate(norm(x), rope),
+        logger=logger,
+        reraise=(ValueError,),
     ).flatten(2)
 
 

@@ -18,6 +18,8 @@ class EncoderMediaProcessorConfig:
 
     image_decode_mode: bool | str = False
     preserve_media_metadata: bool = False
+    preprocess_off_event_loop: bool = False
+    audio_sample_rate: int | None = None
 
 
 @runtime_checkable

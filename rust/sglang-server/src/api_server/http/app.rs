@@ -13,6 +13,7 @@ use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
+use crate::message::request::GenerationPolicy;
 use crate::utils::environ;
 
 /// HTTP adapter state: the shared core capability, immutable server
@@ -25,6 +26,7 @@ use crate::utils::environ;
 pub(super) struct AppState {
     pub(super) core: CoreHandle,
     pub(super) server_args: Arc<ServerArgs>,
+    pub(super) generation_policy: GenerationPolicy,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
 }
 
@@ -69,9 +71,11 @@ pub async fn serve(
     shutdown: flume::Receiver<()>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    let generation_policy = GenerationPolicy::from(server_args.as_ref());
     let state = Arc::new(AppState {
         core,
         server_args: server_args.clone(),
+        generation_policy,
         chat_formatter,
     });
     // Cancelled with the api runtime on shutdown.

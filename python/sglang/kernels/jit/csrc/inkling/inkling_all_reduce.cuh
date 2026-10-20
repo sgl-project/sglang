@@ -12,16 +12,13 @@
 // slice S_r (in any buffer), so there is no write-write conflict, and each
 // per-element load completes before its store (data dependency).
 //
-// Two variants:
-//   * ..._kernel  (v1): no in-kernel sync; the caller fences with the symm-mem
-//     handle's barrier() on each side (3 launches total).
-//   * ..._fused_kernel (v2): an in-kernel per-block system barrier (entry:
-//     producers done + visible; exit: broadcasts done + visible), so the whole
-//     all-reduce is a single launch. The barrier uses a DEDICATED symmetric
-//     flags buffer (independent of torch's signal pad, so no interference with
-//     multimem) and a device-resident monotonic epoch counter per block, which
-//     keeps advancing across launches -- including CUDA-graph replays -- so
-//     flags never go stale (spin is `flag < epoch`, epoch strictly increasing).
+// ..._fused_kernel (v2) uses an in-kernel per-block system barrier (entry:
+// producers done + visible; exit: broadcasts done + visible), so the whole
+// all-reduce is a single launch. The barrier uses a DEDICATED symmetric
+// flags buffer (independent of torch's signal pad, so no interference with
+// multimem) and a device-resident monotonic epoch counter per block, which
+// keeps advancing across launches -- including CUDA-graph replays -- so
+// flags never go stale (spin is `flag < epoch`, epoch strictly increasing).
 //
 // Fusion seam: the reduced `result` Storage below is where an epilogue (RMSNorm
 // / short-conv / bias) plugs in -- applied in registers before the broadcast
@@ -160,15 +157,6 @@ __device__ __forceinline__ void two_shot_reduce_local(DType* (&input)[kNumGPU], 
     for (uint32_t i = 0; i < kNumGPU; ++i)
       result.store(input[i], v);
   }
-}
-
-// v1: no in-kernel barrier (caller fences via hdl.barrier()).
-template <typename DType, uint32_t kNumGPU>
-__global__ __launch_bounds__(1024, 1) void inkling_two_shot_all_reduce_kernel(
-    void* const* __restrict__ peer_ptrs, const uint32_t rank, const uint32_t num_items) {
-  DType* input[kNumGPU];
-  const uint32_t local_vecs = slice_setup<DType, kNumGPU>(input, peer_ptrs, rank, num_items);
-  two_shot_reduce_local<DType, kNumGPU>(input, local_vecs);
 }
 
 // v2: single-launch, fused entry + exit system barrier. `shared` (optional):
@@ -408,7 +396,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_multimem_full_oneshot_kernel(
   // NO exit barrier: result is local & complete; input reuse is caller-managed.
 }
 
-// Blocks needed to cover this rank's two-shot slice (v1/v2/v3 partition).
+// Blocks needed to cover this rank's two-shot slice (v2/v3 partition).
 template <typename DType, uint32_t kNumGPU>
 uint32_t work_num_blocks(uint32_t n, uint32_t block_size) {
   using Trait = InklingAllReduceTrait<DType, kNumGPU>;
@@ -481,22 +469,6 @@ void validate(tvm::ffi::TensorView buf, int64_t peer_ptrs_dev, int64_t rank, int
   RuntimeCheck(std::bit_cast<intptr_t>(buf.data_ptr()) % 16 == 0, "buffer not 16B aligned");
   RuntimeCheck(peer_ptrs_dev != 0, "peer_ptrs_dev is null");
   RuntimeCheck(rank >= 0 && rank < kNumGPU, "rank out of range");
-}
-
-template <typename DType, uint32_t kNumGPU>
-void inkling_two_shot_all_reduce(
-    tvm::ffi::TensorView local_buffer, int64_t peer_ptrs_dev, int64_t rank, int64_t num_items) {
-  using namespace host;
-  uint32_t n;
-  validate<DType, kNumGPU>(local_buffer, peer_ptrs_dev, rank, num_items, n);
-  const auto device = local_buffer.device();
-  const uint32_t num_blocks = work_num_blocks<DType, kNumGPU>(n, 1024u);  // no in-kernel barrier -> uncapped
-  const auto stream = LaunchKernel::resolve_device(device);
-  LaunchKernel(num_blocks, 1024u, stream)(
-      inkling_two_shot_all_reduce_kernel<DType, kNumGPU>,
-      reinterpret_cast<void* const*>(peer_ptrs_dev),
-      static_cast<uint32_t>(rank),
-      n);
 }
 
 template <typename DType, uint32_t kNumGPU>

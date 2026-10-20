@@ -20,12 +20,6 @@ def _require_cuda() -> None:
         pytest.skip("CUDA is required for CUDA IPC tests")
 
 
-def test_pickle_copies_cuda_tensor_through_host() -> None:
-    _require_cuda()
-    tensor = torch.ones(16, 90, 160, device="cuda", dtype=torch.bfloat16)
-    assert len(pickle.dumps(tensor)) > tensor.nbytes
-
-
 def test_ipc_handle_pickle_is_much_smaller_than_tensor() -> None:
     _require_cuda()
     tensor = torch.ones(16, 90, 160, device="cuda", dtype=torch.bfloat16)

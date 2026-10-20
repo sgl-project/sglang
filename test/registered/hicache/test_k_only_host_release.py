@@ -32,7 +32,18 @@ class TestKOnlyHostRelease(CustomTestCase):
         main_pool = MHATokenToKVPool(**common)
         index_pool = MHATokenToKOnlyPool(**common)
         anchor = MHATokenToKVPoolHost(
-            main_pool, 2, 0, 64, "layer_first", pin_memory=False
+            main_pool.get_device_pool_infos()[0].buffer_info,
+            2,
+            0,
+            64,
+            "layer_first",
+            pin_memory=False,
+            device_capacity_tokens=main_pool.size
+            if main_pool.host_capacity_tokens is None
+            else main_pool.host_capacity_tokens,
+            start_layer=main_pool.start_layer,
+            end_layer=main_pool.end_layer,
+            write_back_staging=main_pool.hicache_write_back_staging,
         )
         self.addCleanup(anchor.destroy)
         host = MHATokenToKOnlyPoolHost(index_pool, anchor, "layer_first")

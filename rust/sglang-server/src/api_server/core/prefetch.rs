@@ -10,7 +10,7 @@
 //! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
@@ -22,7 +22,7 @@ use crate::multi_modality::payload::io_sources;
 
 /// Global bound on concurrent media fetches across all in-flight requests;
 /// excess acquisitions queue on the semaphore without holding a thread.
-static PERMITS: Semaphore = Semaphore::const_new(32);
+static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
 
 /// Fill [`MmData::prefetched`] for every request, all fetches across the batch
 /// concurrent. Any failure rejects the call (a 400, as on the Python path).
@@ -96,24 +96,41 @@ async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Byt
     futures::future::try_join_all(sources.into_iter().map(|src| {
         let budget = Arc::clone(&budget);
         async move {
-            let _permit = PERMITS.acquire().await.expect("semaphore never closed");
             // Blocking I/O: parks a lazily-spawned blocking-pool thread, never
             // an API worker. Those threads are pinned round-robin over the api
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
-            tokio::task::spawn_blocking(move || {
+            run_blocking_bounded(Arc::clone(&PERMITS), move || {
                 if src.starts_with('/') || src.starts_with("file://") {
                     fetch_local_file_budgeted(&src, &budget)
                 } else {
                     fetch_bytes_budgeted(&src, &budget)
                 }
             })
-            .await
-            .map_err(|e| format!("media prefetch: {e}"))?
+            .await?
             .map(Bytes::from)
         }
     }))
     .await
+}
+
+async fn run_blocking_bounded<F, T>(permits: Arc<Semaphore>, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = permits
+        .acquire_owned()
+        .await
+        .expect("semaphore never closed");
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit with the blocking operation: dropping the async
+        // caller cannot make uncancellable work disappear from the bound.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| format!("media prefetch: {e}"))
 }
 
 #[cfg(test)]
@@ -309,5 +326,41 @@ mod tests {
         std::fs::remove_dir_all(base).ok();
         assert_eq!(fetched.len(), 2);
         assert!(error.contains("request media byte budget"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_release_blocking_permit_early() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let task_permits = Arc::clone(&permits);
+        let task = tokio::spawn(async move {
+            run_blocking_bounded(task_permits, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .await
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the blocking operation must retain its permit after caller cancellation"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(permits.available_permits(), 1);
     }
 }

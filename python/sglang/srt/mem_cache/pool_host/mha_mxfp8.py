@@ -23,7 +23,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPoolMXFP8
+from sglang.srt.mem_cache.device_pool_info import KVScaleLayout, MHABufferInfo
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
@@ -36,11 +36,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
 
 
 class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
-    device_pool: MHATokenToKVPoolMXFP8
-
     def __init__(
         self,
-        device_pool: MHATokenToKVPoolMXFP8,
+        buffer_info: MHABufferInfo,
         host_to_device_ratio: float,
         host_size: int,
         page_size: int,
@@ -49,29 +47,38 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         device: str = "cpu",
         allocator_type: str = "default",
         *,
-        mtp_draft_device_pools: Sequence = (),
+        device_capacity_tokens: int,
+        start_layer: int,
+        end_layer: int,
+        draft_buffer_infos: Sequence[MHABufferInfo] = (),
+        write_back_staging: tuple[torch.Tensor, torch.Tensor] | None = None,
         pool_label: str = "kv",
     ):
         if layout != "page_first":
             raise NotImplementedError(
                 f"MXFP8 KV host pool supports only the page_first layout, got {layout!r}."
             )
-        if mtp_draft_device_pools:
+        if draft_buffer_infos:
             raise NotImplementedError(
                 "MXFP8 KV host pool does not pack MTP draft KV layers."
             )
-        if not device_pool.mxfp8_sf_interleaved:
+        interleaved = (
+            buffer_info.scales is not None
+            and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED
+        )
+        if not interleaved:
             raise NotImplementedError(
                 "MXFP8 KV host pool requires the interleaved (page_size=128) scale layout."
             )
-        # Bytes of UE8M0 scales one page holds per layer; needed by
-        # get_size_per_token before the base constructor sizes the pool.
-        self.k_sf_page_bytes = device_pool.k_scale_buffer[0][0].numel()
-        self.v_sf_page_bytes = device_pool.v_scale_buffer[0][0].numel()
+        k_scales = buffer_info.scales.k
+        v_scales = buffer_info.scales.v
+        # HostKVCache calls get_size_per_token during base initialization.
+        self.k_sf_page_bytes = k_scales[0][0].numel()
+        self.v_sf_page_bytes = v_scales[0][0].numel()
         self.k_scale_host: torch.Tensor | None = None
         self.v_scale_host: torch.Tensor | None = None
         super().__init__(
-            device_pool,
+            buffer_info,
             host_to_device_ratio,
             host_size,
             page_size,
@@ -79,13 +86,17 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
             pin_memory,
             device,
             allocator_type,
+            device_capacity_tokens=device_capacity_tokens,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            write_back_staging=write_back_staging,
             pool_label=pool_label,
         )
-        if self.page_size != device_pool.page_size:
+        if self.page_size != buffer_info.page_size:
             raise ValueError(
                 "MXFP8 KV host pool moves scales per page, so the host page size "
                 f"({self.page_size}) must equal the device page size "
-                f"({device_pool.page_size})."
+                f"({buffer_info.page_size})."
             )
         if not self.can_use_write_back_jit or not all(
             can_use_write_back_jit_kernel(element_size=size)
@@ -95,15 +106,15 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
                 "MXFP8 KV host pool needs the staged JIT write-back kernel "
                 "(io_backend='kernel', page_first layout, CUDA or HIP)."
             )
-        self._init_scale_buffers()
+        self._init_scale_buffers(k_scales, v_scales)
 
     def get_size_per_token(self):
         payload = super().get_size_per_token()
         scales = (self.k_sf_page_bytes + self.v_sf_page_bytes) // self.page_size
         return payload + scales * self.layer_num
 
-    def _init_scale_buffers(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+    def _init_scale_buffers(self, k_scales, v_scales):
+        alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         # Host: page-first like the payload, one contiguous scale block per
         # (page, layer) so a page's layers are a single memcpy span.
         self.k_scale_host = alloc_func(
@@ -126,32 +137,30 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
 
         # Device: each layer's interleaved scale tensor as [page, bytes] rows.
         self.k_scale_device_rows = [
-            buf.view(torch.uint8).reshape(buf.shape[0], -1)
-            for buf in self.device_pool.k_scale_buffer
+            buf.view(torch.uint8).reshape(buf.shape[0], -1) for buf in k_scales
         ]
         self.v_scale_device_rows = [
-            buf.view(torch.uint8).reshape(buf.shape[0], -1)
-            for buf in self.device_pool.v_scale_buffer
+            buf.view(torch.uint8).reshape(buf.shape[0], -1) for buf in v_scales
         ]
         self.k_scale_device_ptrs = torch.tensor(
             [rows.data_ptr() for rows in self.k_scale_device_rows],
             dtype=torch.uint64,
-            device=self.device_pool.device,
+            device=self._transfer_device,
         )
         self.v_scale_device_ptrs = torch.tensor(
             [rows.data_ptr() for rows in self.v_scale_device_rows],
             dtype=torch.uint64,
-            device=self.device_pool.device,
+            device=self._transfer_device,
         )
         self.k_scale_staging = torch.empty(
             (self.staging_page_capacity, self.layer_num, self.k_sf_page_bytes),
             dtype=torch.uint8,
-            device=self.device_pool.device,
+            device=self._transfer_device,
         )
         self.v_scale_staging = torch.empty(
             (self.staging_page_capacity, self.layer_num, self.v_sf_page_bytes),
             dtype=torch.uint8,
-            device=self.device_pool.device,
+            device=self._transfer_device,
         )
 
     def _page_ids(self, indices: torch.Tensor) -> torch.Tensor:
@@ -209,9 +218,9 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
             raise NotImplementedError(
                 f"MXFP8 KV host pool supports only io_backend='kernel', got {io_backend!r}."
             )
-        if not self._is_device_layer_owned(device_pool, layer_id):
+        if not 0 <= layer_id < self.target_layer_num:
             return
-        host_layer_id = self._host_layer_index(layer_id)
+        host_layer_id = layer_id
         device_pages = self._page_ids(device_indices)
         host_pages = self._page_ids(host_indices)
         for dst_rows, src_rows, sf_page_bytes in (

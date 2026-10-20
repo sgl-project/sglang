@@ -107,6 +107,10 @@ class HybridAttnBackend(AttentionBackend):
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
 
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        return self.prefill_backend.prefill_cuda_graph_default_max_seq_len
+
     def prepare_full_cuda_graph_chunked_prefix(
         self,
         forward_batch: ForwardBatch,

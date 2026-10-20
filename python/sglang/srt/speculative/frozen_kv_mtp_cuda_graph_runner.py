@@ -203,7 +203,8 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width

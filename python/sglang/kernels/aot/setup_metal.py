@@ -13,22 +13,22 @@
 # limitations under the License.
 # ==============================================================================
 
-import importlib
 import os
 import platform
 import shutil
 import subprocess
 import sys
-import sysconfig
 from pathlib import Path
 
 root = Path(__file__).parent.resolve()
 
 
 _BUILD_REQUIRES = [
-    ("setuptools", "setuptools"),
-    ("mlx", "mlx"),
-    ("nanobind", "nanobind"),
+    "setuptools>=80",
+    "mlx==0.32.4",
+    "nanobind==3.1.0",
+    "cmake>=3.25",
+    "ninja",
 ]
 
 
@@ -54,21 +54,7 @@ def _ensure_toolchain():
 
 
 def _ensure_build_requires():
-    missing = []
-    for import_name, pip_name in _BUILD_REQUIRES:
-        try:
-            importlib.import_module(import_name)
-        except ImportError:
-            missing.append(pip_name)
-    if not missing:
-        return
-    print(
-        f"[sgl-kernel:metal] installing build requirements: {missing}",
-        flush=True,
-    )
-    subprocess.check_call(
-        [sys.executable, "-m", "pip", "install", "--upgrade", *missing]
-    )
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *_BUILD_REQUIRES])
 
 
 # Section 1: Prerequisites
@@ -78,8 +64,8 @@ os.chdir(root)
 
 
 # Section 2: Build and install
-from setuptools import Extension, find_packages, setup  # noqa: E402
-from setuptools.command.build_ext import build_ext  # noqa: E402
+from mlx.extension import BuildExtension, MetalExtension  # noqa: E402
+from setuptools import find_packages, setup  # noqa: E402
 
 
 def _get_version():
@@ -89,11 +75,6 @@ def _get_version():
                 return line.split("=")[1].strip().strip('"')
 
 
-operator_namespace = "sgl_kernel"
-metallib_name = "sgl_metal_kernels.metallib"
-
-# Metal shader sources (compiled with `xcrun metal`) and C++ host sources
-# (compiled with `c++`). Add new kernels by appending to these lists.
 metal_shader_sources = [
     "csrc/metal/rope_pool_fused.metal",
 ]
@@ -101,198 +82,27 @@ cxx_sources = [
     "csrc/metal/rope_pool_fused.cpp",
 ]
 
-# Header search paths shared by both the Metal shader compiler and the C++
-# host compiler.
-include_dirs = [
-    root / "csrc",
-    root / "csrc" / "metal",
-]
-
-cxx_flags = ["-std=c++17", "-O3", "-fvisibility=hidden"]
-metal_flags = ["-O3"]
-frameworks = ["Metal", "Foundation", "QuartzCore"]
-libraries = ["mlx"]
-
-
-class BuildMetalExtension(build_ext):
-    def build_extension(self, ext):
-        if sys.platform != "darwin" or platform.machine() != "arm64":
-            raise RuntimeError("setup_metal.py only supports macOS (Apple Silicon).")
-
-        ext_path = Path(self.get_ext_fullpath(ext.name))
-        ext_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Use ccache for the C++ compiles when it is on PATH. ccache does not
-        # support `.metal` sources (unsupported source language), so the Metal
-        # shader compile is left untouched.
-        ccache = shutil.which("ccache")
-        cxx_cmd = [ccache, "c++"] if ccache else ["c++"]
-        if ccache:
-            print(f"[sgl-kernel:metal] using ccache at {ccache}", flush=True)
-
-        python_exe = Path(sys.executable)
-        python_include = Path(sysconfig.get_paths()["include"])
-        python_lib = Path(sysconfig.get_config_var("LIBDIR"))
-        # Match the deployment target that Python itself was built against
-        # unless the user overrides it. MLX's prebuilt wheels may require a
-        # higher minimum; in that case set MACOSX_DEPLOYMENT_TARGET explicitly.
-        deployment_target = os.environ.get(
-            "MACOSX_DEPLOYMENT_TARGET",
-            str(sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET") or "11.0"),
-        )
-
-        def _python_eval(expr: str) -> str:
-            return subprocess.check_output(
-                [str(python_exe), "-c", expr], text=True
-            ).strip()
-
-        nanobind_dir = Path(
-            _python_eval("import nanobind; print(nanobind.__path__[0])")
-        )
-        mlx_dir = Path(_python_eval("import mlx.core as mx; print(mx.__file__)"))
-        mlx_site = mlx_dir.parent
-        mlx_include = mlx_site / "include"
-        mlx_lib = mlx_site / "lib"
-
-        generated_dir = root / "build" / "metal"
-        generated_dir.mkdir(parents=True, exist_ok=True)
-
-        metallib_path = generated_dir / metallib_name
-        metal_std = os.environ.get("SGL_METAL_STD", "metal3.1")
-
-        ext_include_dirs = [Path(p) for p in (ext.include_dirs or [])]
-        host_includes = [
-            python_include,
-            nanobind_dir / "include",
-            nanobind_dir / "ext" / "robin_map" / "include",
-            mlx_include,
-            mlx_include / "metal_cpp",
-        ]
-        all_includes = ext_include_dirs + host_includes
-        include_args = [f"-I{p}" for p in all_includes]
-        # `xcrun metal` accepts `-I` for header search; reuse the project
-        # include dirs so shaders can include shared MSL headers.
-        metal_include_args = [f"-I{p}" for p in ext_include_dirs]
-
-        if not metal_shader_sources:
-            raise RuntimeError("metal_shader_sources is empty; nothing to compile")
-
-        air_paths = []
-        for rel in metal_shader_sources:
-            metal_src = root / rel
-            if not metal_src.is_file():
-                raise RuntimeError(f"metal shader source not found: {metal_src}")
-            air_path = generated_dir / (metal_src.stem + ".air")
-            self.spawn(
-                [
-                    "xcrun",
-                    "-sdk",
-                    "macosx",
-                    "metal",
-                    f"-std={metal_std}",
-                    *metal_flags,
-                    *metal_include_args,
-                    "-c",
-                    str(metal_src),
-                    "-o",
-                    str(air_path),
-                ]
-            )
-            air_paths.append(str(air_path))
-
-        self.spawn(
-            [
-                "xcrun",
-                "-sdk",
-                "macosx",
-                "metallib",
-                *air_paths,
-                "-o",
-                str(metallib_path),
-            ]
-        )
-
-        cflags = [
-            *cxx_flags,
-            f"-mmacosx-version-min={deployment_target}",
-            *include_args,
-        ]
-
-        ldflags = [
-            "-shared",
-            "-undefined",
-            "dynamic_lookup",
-            f"-mmacosx-version-min={deployment_target}",
-            f"-L{python_lib}",
-            f"-L{mlx_lib}",
-            f"-Wl,-rpath,{mlx_lib}",
-            *[f"-l{lib}" for lib in libraries],
-            *[arg for fw in frameworks for arg in ("-framework", fw)],
-        ]
-
-        objects = []
-        for src in ext.sources:
-            src_path = Path(src)
-            obj_path = generated_dir / (src_path.stem + ".o")
-            compile_cmd = [
-                *cxx_cmd,
-                *cflags,
-                "-c",
-                str(src_path),
-                "-o",
-                str(obj_path),
-            ]
-            self.spawn(compile_cmd)
-            objects.append(str(obj_path))
-
-        nanobind_src = nanobind_dir / "src" / "nb_combined.cpp"
-        nanobind_obj = generated_dir / "nb_combined.o"
-        nanobind_cmd = [
-            *cxx_cmd,
-            *cflags,
-            "-DNB_COMPACT_ASSERTIONS",
-            "-DNB_BUILD",
-            "-DNB_SHARED",
-            "-c",
-            str(nanobind_src),
-            "-o",
-            str(nanobind_obj),
-        ]
-        self.spawn(nanobind_cmd)
-        objects.append(str(nanobind_obj))
-
-        link_cmd = [
-            "c++",
-            *objects,
-            *ldflags,
-            "-o",
-            str(ext_path),
-        ]
-        self.spawn(link_cmd)
-
-        # Stage the metallib next to the freshly-linked extension so that
-        # `install_lib` picks it up via `package_data={"sgl_kernel": ["*.metallib"]}`.
-        staged_metallib = ext_path.parent / metallib_path.name
-        if metallib_path.resolve() != staged_metallib.resolve():
-            shutil.copy2(metallib_path, staged_metallib)
-
-
-ext_modules = [
-    Extension(
-        name=f"{operator_namespace}._metal",
-        sources=cxx_sources,
-        include_dirs=[str(p) for p in include_dirs],
-        language="c++",
-    )
-]
-
 setup(
     name="sglang-kernel",
     version=_get_version(),
     packages=find_packages(where="python"),
     package_dir={"": "python"},
-    package_data={"sgl_kernel": ["*.metallib"]},
+    package_data={"sgl_kernel": ["*.metallib", "*.pyi"]},
     include_package_data=True,
-    ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildMetalExtension},
+    ext_modules=[
+        MetalExtension(
+            name="sgl_kernel._metal",
+            sources=[*cxx_sources, *metal_shader_sources],
+            include_dirs=["csrc", "csrc/metal"],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "metal": [
+                    "-O3",
+                    "-ffast-math",
+                    f"-std={os.environ.get('SGL_METAL_STD', 'metal3.1')}",
+                ],
+            },
+        )
+    ],
+    cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

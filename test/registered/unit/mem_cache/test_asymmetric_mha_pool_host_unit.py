@@ -24,6 +24,7 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     host.layout = layout
     host.page_size = 2
     host.layer_num = 3
+    host.target_layer_num = 3
     host.head_num = 2
     host.head_dim = 4
     host.v_head_dim = 6
@@ -85,8 +86,27 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
     def test_factory_selects_asymmetric_pool_for_mismatched_kv_dims(self):
-        symmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=4)
-        asymmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=6)
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        def info(v_head_dim):
+            return (
+                MHATokenToKVPool(
+                    size=8,
+                    page_size=2,
+                    dtype=torch.float16,
+                    head_num=1,
+                    head_dim=4,
+                    v_head_dim=v_head_dim,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                )
+                .get_device_pool_infos()[0]
+                .buffer_info
+            )
+
+        symmetric_pool = info(4)
+        asymmetric_pool = info(6)
 
         self.assertIs(get_mha_host_pool_cls(symmetric_pool), MHATokenToKVPoolHost)
         self.assertIs(
@@ -110,7 +130,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             enable_memory_saver=False,
         )
         host = AsymmetricMHATokenToKVPoolHost(
-            device_pool=device,
+            buffer_info=device.get_device_pool_infos()[0].buffer_info,
             host_to_device_ratio=2.0,
             host_size=0,
             page_size=2,
@@ -118,6 +138,12 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             pin_memory=False,
             device="cpu",
             allocator_type="default",
+            device_capacity_tokens=device.size
+            if device.host_capacity_tokens is None
+            else device.host_capacity_tokens,
+            start_layer=device.start_layer,
+            end_layer=device.end_layer,
+            write_back_staging=device.hicache_write_back_staging,
         )
         self.assertTrue(host.device_rows_packed)
 
@@ -125,13 +151,12 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         host = _make_host("page_first")
         host.page_num = 4
         host.v_head_dim = 8
-        host.device_pool = SimpleNamespace(
-            device="cuda",
+        buffer_info = SimpleNamespace(
+            device=torch.device("cuda"),
             head_num=host.head_num,
             head_dim=host.head_dim,
             v_head_dim=host.v_head_dim,
-            store_dtype=host.dtype,
-            hicache_write_back_staging=None,
+            dtype=host.dtype,
         )
         cpu_empty = torch.empty
 
@@ -156,7 +181,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
                 side_effect=_cpu_empty,
             ),
         ):
-            host._init_write_back_staging_buffers()
+            host._init_write_back_staging_buffers(buffer_info, None)
 
         self.assertTrue(host.can_use_write_back_jit)
         self.assertEqual(host.staging_page_capacity, 4)

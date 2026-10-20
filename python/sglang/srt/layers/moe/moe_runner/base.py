@@ -53,6 +53,9 @@ class MoeRunnerConfig:
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
+    # With no_combine: still apply the router weight, leaving only the top-k sum to
+    # the caller (triton and marlin runners).
+    no_combine_keep_router_weight: bool = False
     routed_scaling_factor: Optional[float] = None
     gemm1_alpha: Optional[float] = None
     gemm1_beta: Optional[float] = None

@@ -20,6 +20,9 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
     _cuda_host_unregister,
+    alloc_with_host_register,
+    alloc_with_pin_memory,
+    alloc_with_pin_memory_xpu,
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -546,6 +549,33 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+    def test_null_pinned_allocation_raises(self):
+        """On XPU a null pinned buffer must fail at allocation, not at first transfer."""
+        gib = 1024**3
+
+        def alloc(buffer):
+            with mock.patch.object(torch, "empty", return_value=buffer):
+                return alloc_with_pin_memory_xpu(
+                    (buffer.numel(),),
+                    dtype=torch.uint8,
+                    device="cpu",
+                    pin_memory=True,
+                    allocator=None,
+                )
+
+        with self.assertRaisesRegex(RuntimeError, r"2\.0 GiB .* null pointer"):
+            alloc(_FakeBuffer(0, 2 * gib))
+        # An empty tensor has data_ptr() == 0 on every backend and is not a failure.
+        empty = _FakeBuffer(0, 0)
+        self.assertIs(alloc(empty), empty)
+
+    def test_only_xpu_uses_the_null_checked_allocator(self):
+        self.assertIs(ALLOC_MEMORY_FUNCS["xpu"], alloc_with_pin_memory_xpu)
+        for device in ("npu", "musa"):
+            self.assertIs(ALLOC_MEMORY_FUNCS[device], alloc_with_pin_memory)
+        # CUDA and ROCm ("cuda") keep the cudaHostRegister default.
+        self.assertIs(ALLOC_MEMORY_FUNCS.default_factory(), alloc_with_host_register)
 
 
 if __name__ == "__main__":

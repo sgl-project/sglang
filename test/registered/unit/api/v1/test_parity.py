@@ -53,11 +53,9 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "image_max_dynamic_patch",
         "images_config",
         "input_embeds",
-        "kv_hints",
         "log_metrics",
         "lora_id",
         "max_dynamic_patch",
-        "max_thinking_tokens",
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
@@ -78,7 +76,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_routed_experts",
         "return_sampling_mask",
         "routed_experts_start_len",
-        "routing_key",
         "sampling_logprobs_mode",
         "session_id",
         "token_indices_to_pool",
@@ -110,6 +107,11 @@ def compact(value) -> str:
 def load_fixtures():
     with open(FIXTURES) as f:
         return json.load(f)["cases"]
+
+
+# Schema-only sampling inputs the Rust server lowers before the scheduler
+# (choice -> regex); Python's SamplingParams never receives them.
+SCHEMA_ONLY_SAMPLING_FIELDS = frozenset({"choice"})
 
 
 class TestCrossLanguageFixtures(CustomTestCase):
@@ -152,7 +154,10 @@ class TestRequestFieldParity(CustomTestCase):
             for name in PySamplingParams.__struct_fields__
             if name not in DERIVED_SAMPLING_FIELDS
         ]
-        self.assertEqual(set(python_api), set(SamplingParams.__struct_fields__))
+        self.assertEqual(
+            set(python_api),
+            set(SamplingParams.__struct_fields__) - SCHEMA_ONLY_SAMPLING_FIELDS,
+        )
         self.assertEqual(
             set(PySamplingParams.__struct_fields__) - set(python_api),
             DERIVED_SAMPLING_FIELDS,

@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import (
@@ -153,6 +154,10 @@ class _DummyTpGroup:
 
 
 class _TinyDraftModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.shared_experts_config = SharedExpertsConfig()
+
     def forward(self, *args, **kwargs):
         raise RuntimeError("EAGLEDraftCudaGraphRunner should call worker.draft_forward")
 
