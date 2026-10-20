@@ -154,3 +154,11 @@ for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
         )
     )
 del _fn
+register_kernel(
+    KernelSpec(
+        op="mamba.zero_rows_past_batch",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.pad_rows:zero_rows_past_batch",
+        capabilities=CUDA_ONLY,
+    )
+)
