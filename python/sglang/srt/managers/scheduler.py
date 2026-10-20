@@ -5176,6 +5176,7 @@ class Scheduler(
         self.dp_attn_adapter.drop_sync_wait_carry()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
+        self.metrics_reporter.maybe_report_idle_stats()
 
         # Publish before the fully-idle gate: a no-batch-but-not-idle stall
         # (queues parked under KV pressure / disagg transfer) has no
@@ -5811,6 +5812,7 @@ class Scheduler(
         # idle log by resetting the rate-limit timestamp, and flush pending
         # KV events.
         self.metrics_reporter.last_gen_throughput = 0.0
+        self.metrics_reporter.stats.gen_throughput = 0.0
         if self.metrics_reporter.current_scheduler_metrics_enabled:
             self.metrics_reporter.metrics_collector.last_log_time = 0.0
             self.metrics_reporter._maybe_log_idle_metrics()
