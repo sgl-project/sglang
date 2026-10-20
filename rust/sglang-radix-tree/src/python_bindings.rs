@@ -2345,7 +2345,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         medium: &str,
     ) -> PyResult<()> {
         let medium = parse_storage_medium(medium)?;
-        py.allow_threads(|| self.core().record_external_cache_store(&node_ids, medium))
+        py.detach(|| self.core().record_external_cache_store(&node_ids, medium))
             .map_err(node_access_error)
     }
 
@@ -2356,7 +2356,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         medium: Option<&str>,
     ) -> PyResult<()> {
         let medium = medium.map(parse_storage_medium).transpose()?;
-        py.allow_threads(|| self.core().remove_external_cache_storage(&hashes, medium));
+        py.detach(|| self.core().remove_external_cache_storage(&hashes, medium));
         Ok(())
     }
 
