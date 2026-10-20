@@ -198,6 +198,12 @@ class TestNvFp4MoeDispatch(CustomTestCase):
         expected = (ids.float() * weights).sum(dim=-1, keepdim=True).expand_as(hidden)
         fake_flashinfer = ModuleType("flashinfer.fused_moe")
         fake_flashinfer.Fp8QuantizationType = SimpleNamespace(MxFp8=1, DeepSeekFp8=0)
+        fake_core = ModuleType("flashinfer.fused_moe.core")
+        fake_core.ActivationType = SimpleNamespace(
+            Swiglu=SimpleNamespace(value=0),
+            Geglu=SimpleNamespace(value=1),
+            Situ=SimpleNamespace(value=2),
+        )
 
         def routed_result(kwargs):
             self.assertEqual(kwargs["routing_method_type"], RoutingMethodType.TopK)
@@ -247,7 +253,13 @@ class TestNvFp4MoeDispatch(CustomTestCase):
         )
         with (
             get_parallel().override(tp_group=None),
-            mock.patch.dict(sys.modules, {"flashinfer.fused_moe": fake_flashinfer}),
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "flashinfer.fused_moe": fake_flashinfer,
+                    "flashinfer.fused_moe.core": fake_core,
+                },
+            ),
             mock.patch.object(kernels, "is_allocation_symmetric", return_value=False),
             mock.patch.object(kernels, "trtllm_moe_enable_pdl", return_value=False),
             mock.patch.object(
