@@ -966,6 +966,10 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Under CUDA-graph capture, keep the aiter custom collectives off per-graph registered
+    # buffers (parallel_state.py, custom_all_reduce.py). DeepSeek-V4.1 with DP attention
+    # on ROCm turns it on by default (deepseek_v4_hook.py).
+    SGLANG_AITER_CAPTURE_COPY_IN = EnvBool(False)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

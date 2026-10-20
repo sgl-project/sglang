@@ -86,10 +86,11 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 # Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
-# through the pre-registered IPC pool instead of registering graph-pool tensors:
+# through the pre-registered IPC pool (and keep the aiter custom all-reduce off
+# graph registration, custom_all_reduce.py) instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
-# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
-_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
+# rows / NaN under DP attention + TP MoE on MI355X).
+_AITER_CAPTURE_COPY_IN = envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 

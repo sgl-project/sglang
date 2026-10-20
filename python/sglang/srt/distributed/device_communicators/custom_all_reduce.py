@@ -426,9 +426,11 @@ def dispatch_custom_allreduce(
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            # Same contract as the all-gather / reduce-scatter copy-in in parallel_state.
+            capture_copy_in = envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=not (tms_cudagraph or capture_copy_in),
             )
         except ImportError as e:
             logger.warning(
