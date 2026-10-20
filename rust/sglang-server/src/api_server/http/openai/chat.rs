@@ -25,6 +25,7 @@ use dynamo_protocols::types::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use serde_json::Value;
 use sglang_processor::{
     ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
     tool_call_stream,
@@ -32,6 +33,7 @@ use sglang_processor::{
 
 use super::completions::completion_usage;
 use super::pd_routing::PDRoutingFields;
+use super::template::render_chat;
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
@@ -60,17 +62,21 @@ pub(super) struct ChatRequest {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
+    body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+        }
+    };
     let ChatRequest {
         request,
         chat_template_kwargs,
         routing,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
+    } = match serde_json::from_value(body.clone()) {
+        Ok(request) => request,
+        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
@@ -146,7 +152,7 @@ async fn chat_completions(
     let tools_slice = tools.as_deref().unwrap_or_default();
 
     let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
+        match prepare_chat_request(&state, &body, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
@@ -272,6 +278,7 @@ async fn chat_completions(
 /// `skip_special_tokens`, since the template owns its special tokens).
 pub(super) async fn prepare_chat_request(
     state: &AppState,
+    body: &Value,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, String), Response> {
@@ -287,7 +294,7 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
+    let prompt = render_chat(&formatter, body, &request, kwargs).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
@@ -341,8 +348,8 @@ fn merge_template_stops(request: &mut CreateChatCompletionRequest, formatter: &C
         return;
     };
     let mut stops = match template_stops {
-        OneOrMany::One(one) => vec![one],
-        OneOrMany::Many(many) => many,
+        sglang_processor::OneOrMany::One(one) => vec![one],
+        sglang_processor::OneOrMany::Many(many) => many,
     };
     if let Some(request_stop) = &request.stop {
         let Some(request_stops) = request_stop.strings() else {
@@ -851,7 +858,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
     matches!(
         reasoning_parser,
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "deepseek-v41" | "glm45" | "qwen3")
     ) && prompt.trim_end_matches('\n').ends_with("<think>")
 }
 
@@ -949,13 +956,11 @@ mod tests {
     /// the request's own stops.
     #[test]
     fn template_stops_merge_before_request_stops() {
-        let chatml = super::super::template::builtin_template("chatml").unwrap();
-        let formatter = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter { spec: chatml },
-        ));
+        let formatter =
+            sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap();
         assert_eq!(
             formatter.stop_strs(),
-            Some(crate::message::types::OneOrMany::Many(vec![
+            Some(sglang_processor::OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into()
             ]))
@@ -1002,22 +1007,13 @@ mod tests {
         assert_eq!(req.stop, Some(Stop::TokenIdArray(vec![2, 3])));
     }
 
-    /// The HuggingFace renderer carries no template stops (Python's jinja path
-    /// keeps only the request's stops), so the request is left unchanged.
+    /// A formatter without template stops (Python's jinja path keeps only the
+    /// request's stops) leaves the request unchanged.
     #[test]
-    fn huggingface_formatter_leaves_request_stops_alone() {
+    fn formatter_without_stops_leaves_request_stops_alone() {
         let mut req = request();
         req.stop = Some(Stop::String("x".into()));
-        // A prompt formatter is not constructible here without a tokenizer; the
-        // empty-legacy-spec twin proves the merge is formatter-gated, and the
-        // `HuggingFace` arm returns `None` by construction (see `stop_strs`).
-        let legacy = super::super::ChatFormatter::Legacy(Box::new(
-            super::super::template::LegacyFormatter {
-                spec: super::super::template::LegacySpec::default(),
-            },
-        ));
-        assert!(legacy.stop_strs().is_none());
-        merge_template_stops(&mut req, &legacy);
+        merge_template_stops(&mut req, &super::super::ChatFormatter::KimiK3);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
     }
 
@@ -1249,14 +1245,11 @@ mod tests {
                     metadata: CoreMetadata::from(args.as_ref()),
                 },
             );
-            let formatter =
-                dynamo_renderer::kimi_k3_formatter_for(&Some("kimi_k3".into()), "kimi_k3", false)
-                    .unwrap();
             let state = Arc::new(super::super::AppState {
                 core,
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
-                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+                chat_formatter: Some(super::super::ChatFormatter::KimiK3),
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1281,7 +1274,7 @@ mod tests {
             });
             let response = post_json(super::super::routes().with_state(state), "/v1/chat/completions", serde_json::json!({
                 "model":"model", "stream":stream,
-                "messages":[{"role":"system","tools":[{"name":"lookup","parameters":{"type":"object","properties":{}}}]},
+                "messages":[{"role":"system","tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}]},
                             {"role":"user","content":"Call lookup"}],
                 "tool_choice":{"type":"function","function":{"name":"lookup"}},
                 "chat_template_kwargs":{"thinking":false}
