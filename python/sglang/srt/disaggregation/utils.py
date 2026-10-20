@@ -1854,6 +1854,16 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     return None
 
 
+def dsv41_encoder_prefix_len(prompt_len: int, window: int) -> int:
+    """Prompt tokens a DeepSeek-V4.1 encoder-only prefill covers.
+
+    Decode runs the final window through the full model on top of this prefix,
+    reading its transferred encoder SWA, so the split matches collocated
+    decoder SWA bounded replay.
+    """
+    return max(0, prompt_len - window)
+
+
 def prepare_abort(req: Req, error_message: str, status_code=None):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 

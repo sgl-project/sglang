@@ -249,6 +249,69 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
+    """Validate the asymmetric PD split; runs after decoder replay is resolved."""
+    cfg = resolving_view(server_args)
+    if not cfg.dsv41_encoder_only_prefill:
+        return
+    hf_config = model_config_of(server_args).hf_config
+    if hf_config.model_type != "deepseek_v41":
+        raise ValueError("--dsv41-encoder-only-prefill requires DeepSeek-V4.1")
+    kv_sources = tuple(hf_config.kv_source_layer_ids)
+    boundary = max(kv_sources)
+    if (
+        hf_config.compress_ratios[boundary] not in (1, 2)
+        or boundary not in hf_config.index_source_layer_ids
+        or boundary in hf_config.engram_layer_ids
+        or not hf_config.hc_pre_from_prev_sublayer
+    ):
+        raise ValueError(
+            "--dsv41-encoder-only-prefill requires the last KV source layer to own "
+            "ratio-1/2 Main-KV and Indexer-K, not to be an Engram layer, and the "
+            "shifted mHC topology"
+        )
+    is_decode = cfg.disaggregation_mode == "decode"
+    incompatible = (
+        ("modes other than PD prefill/decode", cfg.disaggregation_mode == "null"),
+        (
+            "transfer backends other than Mooncake",
+            cfg.disaggregation_transfer_backend != "mooncake",
+        ),
+        ("speculative decoding", cfg.speculative_algorithm is not None),
+        ("pipeline parallelism", cfg.pp_size != 1),
+        (
+            "context parallelism",
+            cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1,
+        ),
+        ("DP attention on prefill", not is_decode and attn_dp_enabled_of(cfg)),
+        (
+            "prefill CUDA graphs",
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
+        ("mixed prefill/decode", cfg.enable_mixed_chunk),
+        ("LoRA", cfg.enable_lora),
+        ("decode radix cache", cfg.disaggregation_decode_enable_radix_cache),
+        ("decode KV offload", cfg.disaggregation_decode_enable_offload_kvcache),
+        ("KV checksums", cfg.disaggregation_enable_kv_checksum),
+        # Decode runs the final window with layers from the last KV source on
+        # floored at the window start, the same numerics as collocated replay.
+        (
+            "decode without decoder SWA bounded replay",
+            is_decode and not cfg.enable_decoder_swa_bounded_replay,
+        ),
+    )
+    for feature, enabled in incompatible:
+        if enabled:
+            raise ValueError(f"--dsv41-encoder-only-prefill does not support {feature}")
+    if not is_decode:
+        # Prefill stops at the last KV source and never runs the decoder layers.
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_encoder_only_prefill",
+            enable_decoder_swa_bounded_replay=False,
+        )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
         is_unified_kv_triton,

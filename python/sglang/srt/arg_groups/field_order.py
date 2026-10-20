@@ -434,6 +434,7 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_decode_extra_slots",
     "disaggregation_decode_polling_interval",
     "optimistic_prefill_attempts",
+    "dsv41_encoder_only_prefill",
     "encoder_only",
     "language_only",
     "language_model_only",

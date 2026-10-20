@@ -193,6 +193,7 @@ class DeepseekV41Indexer(nn.Module):
         head_dim: int,
         quant_config: Optional[QuantizationConfig],
         prefix: str,
+        key_only: bool = False,
     ):
         super().__init__()
         self.n_heads = config.index_n_heads
@@ -206,30 +207,32 @@ class DeepseekV41Indexer(nn.Module):
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
         self.softmax_scale = self.index_head_dim**-0.5
-        self.wq_b = ReplicatedLinear(
-            config.q_lora_rank,
-            self.n_heads * self.index_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("wq_b", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            config.hidden_size,
-            self.n_heads,
-            bias=False,
-            params_dtype=torch.bfloat16,
-            quant_config=None,
-            prefix=add_prefix("weights_proj", prefix),
-        )
-        # -1 off gfx950 or for shapes the split-K GEMV lacks
-        self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
-            n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
-        )
-        # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
-        self.weights_proj_small_max_m = _small_weights_proj_max_m(
-            self.n_heads, config.hidden_size
-        )
+        self.key_only = key_only
+        if not key_only:
+            self.wq_b = ReplicatedLinear(
+                config.q_lora_rank,
+                self.n_heads * self.index_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                params_dtype=torch.bfloat16,
+                prefix=add_prefix("wq_b", prefix),
+            )
+            self.weights_proj = ReplicatedLinear(
+                config.hidden_size,
+                self.n_heads,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                quant_config=None,
+                prefix=add_prefix("weights_proj", prefix),
+            )
+            # -1 off gfx950 or for shapes the split-K GEMV lacks
+            self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
+                n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
+            )
+            # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
+            self.weights_proj_small_max_m = _small_weights_proj_max_m(
+                self.n_heads, config.hidden_size
+            )
         if self.owns_k:
             self.wk = nn.Linear(
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
@@ -262,12 +265,16 @@ class DeepseekV41Indexer(nn.Module):
     ) -> torch.Tensor:
         """freqs per token, or the whole table with positions (gathered inside the
         fused RoPE launch)."""
+        if self.key_only:
+            raise RuntimeError("key-only indexer cannot score queries")
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
         return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
+        if self.key_only:
+            raise RuntimeError("key-only indexer cannot score head weights")
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
             from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
 

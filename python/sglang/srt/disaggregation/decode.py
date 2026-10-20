@@ -59,6 +59,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    dsv41_encoder_prefix_len,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -812,6 +813,34 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             is_retracted = False
             is_rebootstrap = True
 
+        if get_disagg().dsv41_encoder_only_prefill and not is_retracted:
+            unsupported, status_code = None, HTTPStatus.BAD_REQUEST
+            if is_rebootstrap:
+                # Replaying an emitted boundary token through the tail extend is
+                # not wired; fail the request rather than resample it.
+                unsupported = "decode retraction"
+                status_code = HTTPStatus.SERVICE_UNAVAILABLE
+            elif req.multimodal_inputs is not None:
+                unsupported = "multimodal prompts"
+            elif req.return_logprob and (
+                0 <= req.logprob_start_len < len(req.origin_input_ids)
+            ):
+                # Prefill computes no logits for the prefix it covers.
+                unsupported = "prompt logprobs"
+            if unsupported is not None:
+                prepare_abort(
+                    req,
+                    f"--dsv41-encoder-only-prefill does not support {unsupported}",
+                    status_code=status_code,
+                )
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return
+            # Prefill sends the encoder prefix; the tail extend here runs the rest.
+            req.dsv41_tail_start = dsv41_encoder_prefix_len(
+                len(req.origin_input_ids),
+                self.scheduler.model_config.sliding_window_size,
+            )
+
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
@@ -925,6 +954,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     @staticmethod
     def _pre_alloc_fill_len(req: Req) -> int:
+        if req.dsv41_tail_start is not None:
+            # Only the transferred encoder prefix; the tail extend allocates the
+            # rest like a later prefill chunk.
+            return req.dsv41_tail_start
         if getattr(req, "pd_rebootstrap_in_progress", False):
             # pause_generation(retract) already popped the boundary token out of
             # output_ids (it is replayed via the decode-side override at commit
@@ -1605,6 +1638,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=num_device_preallocated + 1,
                 )
             decode_req.req.kv.cache_protected_len = total_prefix_len
+            if decode_req.req.dsv41_tail_start is not None:
+                # Prefill sends only the encoder prefix; the rest runs here.
+                origin_input_len = decode_req.req.dsv41_tail_start
 
             page_size = self.token_to_kv_pool_allocator.page_size
             kv_transfer_page_size = page_size
@@ -2524,6 +2560,26 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if prealloc_queue is not None:
             prealloc_queue.note_destinations_queued(len(decode_reqs))
 
+    @staticmethod
+    def _commit_cached_tokens(req: Req, cached_tokens: torch.Tensor) -> None:
+        req.cached_tokens = cached_tokens[0].item()
+        # The prefill node already reported its prefix-cache hit in
+        # cached_tokens[0]. Seed already_computed with it so that
+        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
+        # only adds decode-side reuse *beyond* what prefill counted, instead of
+        # double-counting the shared prompt prefix (which would make
+        # cached_tokens exceed prompt_tokens when decode radix cache is on).
+        req.already_computed = req.cached_tokens
+        req.cached_tokens_device = cached_tokens[1].item()
+        req.cached_tokens_host = cached_tokens[2].item()
+        req.cached_tokens_storage = cached_tokens[3].item()
+        # Multimodal prompt token counts packed into cached_tokens slots 4-6
+        # by the prefill node (see MetadataBuffers.set_buf).
+        req.mm_image_tokens = cached_tokens[4].item()
+        req.mm_audio_tokens = cached_tokens[5].item()
+        req.mm_video_tokens = cached_tokens[6].item()
+        req.mm_token_counts_ready = True
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         # Preserve the checksum before the metadata slot is freed so it can be
         # re-verified when the request enters a batch, including after retraction.
@@ -2599,6 +2655,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         self._commit_hicache_local_restore_to_req(decode_req)
 
+        if decode_req.req.dsv41_tail_start is not None:
+            # Prefill sampled nothing; the tail extend here samples the first token.
+            self._commit_cached_tokens(decode_req.req, cached_tokens)
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            decode_req.req.time_stats.set_wait_queue_entry_time()
+            return
+
         # Case 3: Success - commit the transfer
         # PD true-retraction rebootstrap: the prefill recomputed the prefix KV
         # under the current weights and sampled a fresh handoff token, but when
@@ -2633,23 +2697,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
                 decode_req.req, committed_output_id
             )
-        decode_req.req.cached_tokens = cached_tokens[0].item()
-        # The prefill node already reported its prefix-cache hit in
-        # cached_tokens[0]. Seed already_computed with it so that
-        # prepare_for_prebuilt's `cached_tokens += pre_len - already_computed`
-        # only adds decode-side reuse *beyond* what prefill counted, instead of
-        # double-counting the shared prompt prefix (which would make
-        # cached_tokens exceed prompt_tokens when decode radix cache is on).
-        decode_req.req.already_computed = decode_req.req.cached_tokens
-        decode_req.req.cached_tokens_device = cached_tokens[1].item()
-        decode_req.req.cached_tokens_host = cached_tokens[2].item()
-        decode_req.req.cached_tokens_storage = cached_tokens[3].item()
-        # Multimodal prompt token counts packed into cached_tokens slots 4-6
-        # by the prefill node (see MetadataBuffers.set_buf).
-        decode_req.req.mm_image_tokens = cached_tokens[4].item()
-        decode_req.req.mm_audio_tokens = cached_tokens[5].item()
-        decode_req.req.mm_video_tokens = cached_tokens[6].item()
-        decode_req.req.mm_token_counts_ready = True
+        self._commit_cached_tokens(decode_req.req, cached_tokens)
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -3153,13 +3201,119 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    def _merge_dsv41_tail_extend(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> ScheduleBatch:
+        """Merge the previous step's tail extend into the decode batch.
+
+        As in collocated serving, the merge precedes the extend's result
+        processing under overlap: its first tokens reach the decode inputs
+        through the future map, and finished requests leave in a later filter.
+        """
+        last_batch = self.last_batch
+        if (
+            last_batch is None
+            or last_batch is running_batch
+            or not last_batch.forward_mode.is_extend()
+        ):
+            return running_batch
+        last_batch.filter_batch()
+        if last_batch.is_empty():
+            return running_batch
+        if running_batch.is_empty():
+            return last_batch
+        running_batch.merge_batch(last_batch)
+        return running_batch
+
+    def _get_new_dsv41_tail_extend_batch(
+        self: Scheduler, running_batch: ScheduleBatch
+    ) -> Optional[ScheduleBatch]:
+        """Run the final window of transferred prompts on top of their prefix.
+
+        The transferred encoder prefix and its SWA window stand where a previous
+        prefill chunk would leave them, so the tail is an ordinary extend; the
+        decoder SWA bounded replay floors the decoder layers at its start.
+        """
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+        if not self.waiting_queue:
+            return None
+        last_batch = self.last_batch
+        if (
+            not running_batch.is_empty()
+            and last_batch is not None
+            and last_batch.forward_mode.is_extend()
+        ):
+            # Alternate with decode so a stream of arrivals cannot starve it.
+            return None
+
+        num_free_reqs = (
+            min(self.req_to_token_pool.size, self.max_running_requests)
+            - running_batch.batch_size()
+        )
+        can_run_list: List[Req] = []
+        num_tokens = 0
+        for req in self.waiting_queue:
+            tail_len = len(req.full_untruncated_fill_ids) - req.dsv41_tail_start
+            if len(can_run_list) >= num_free_reqs or (
+                can_run_list and num_tokens + tail_len > self.max_prefill_tokens
+            ):
+                break
+            can_run_list.append(req)
+            num_tokens += tail_len
+        if not can_run_list:
+            return None
+        self.waiting_queue = self.waiting_queue[len(can_run_list) :]
+
+        for req in can_run_list:
+            if req.kv.kv_allocated_len == 0:
+                # A prompt within one window transferred nothing: extend it whole
+                # in a fresh row, like a new collocated request.
+                self.req_to_token_pool.free(req)
+            req.prefix_len = req.dsv41_tail_start
+            req.extend_end = len(req.full_untruncated_fill_ids)
+            # The transferred prefix was computed, not hit; prefill reported its
+            # cache hits already.
+            req.already_computed = req.prefix_len
+            req._cache_breakdown_computed = True
+            req.dsv41_tail_start = None
+        set_time_batch(can_run_list, "set_forward_entry_time")
+
+        new_batch = ScheduleBatch.init_new(
+            can_run_list,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        new_batch.prepare_for_extend()
+        return new_batch
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
-        # Process pending prebuilt batch: output processing + filter + merge
-        new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
+        if get_disagg().dsv41_encoder_only_prefill:
+            running_batch = self._merge_dsv41_tail_extend(running_batch)
+            tail_batch = self._get_new_dsv41_tail_extend_batch(running_batch)
+            if tail_batch is not None:
+                # The tail is an extend forward; running decodes wait one step.
+                tail_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+                    tail_batch
+                )
+                set_schedule_time_batch(tail_batch)
+                return NextBatchPlan(
+                    batch_to_run=tail_batch, running_batch=running_batch
+                )
+            # Every request runs the tail extend; none is prebuilt.
+            new_prebuilt_batch = None
+        else:
+            # Process pending prebuilt batch: output processing + filter + merge
+            new_prebuilt_batch = self.get_new_prebuilt_batch(running_batch)
         if new_prebuilt_batch:
             assert self.chunked_req is None
             self.batch_result_processor.process_batch_result_prebuilt(
