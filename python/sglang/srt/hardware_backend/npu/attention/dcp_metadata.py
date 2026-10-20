@@ -71,9 +71,6 @@ def init_mla_dcp_metadata(
         dcp_rank,
     )
     metadata.seq_lens = local_seq_lens
-    # Eager FIA consumes Host lengths. Graph capture/replay uses its separate
-    # fixed-buffer updater and keeps seq_lens_cpu_int unset for graph.update.
-    metadata.seq_lens_cpu_int = local_seq_lens.cpu().int()
     if metadata.dcp_mtp_attn_mask is not None:
         # FIA checks S2 against the full paged capacity, not just valid KV.
         required_mask_width = metadata.block_tables.shape[1] * page_size
@@ -89,6 +86,9 @@ def init_mla_dcp_metadata(
                 dim=-1,
             )
         metadata.dcp_mtp_attn_mask = mask.contiguous()
+    # Submit all device-side preparation before the existing Host length copy.
+    # Graph capture/replay uses its fixed-buffer updater instead.
+    metadata.seq_lens_cpu_int = local_seq_lens.cpu().int()
     return local_seq_lens
 
 
