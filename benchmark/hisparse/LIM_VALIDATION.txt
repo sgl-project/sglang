@@ -142,7 +142,8 @@ and the external registered-host helper. Inspect their defaults or override
 TASK_ROOT/CONTAINER/NPU_DEVICE/PROBE_ROOT and --task-root as appropriate. They do
 not install dependencies or replace a production SGLang installation.
 
-Keep this feature experimental pending complete-model quality/serving tests.
+Keep this feature experimental: full-model tests below do not establish
+numerical equivalence or low-latency offload.
 The C=2048 regressions and native-vs-LRU miss differences are material limits.
 
 
@@ -276,38 +277,44 @@ hashes and device occupancy logs with the aggregate report.
 
 Tuned full-checkpoint results, code d9786495 (48-block device gather)
 ------------------------------------------------------------------
+Accepted final run: lim-b48-clean-c4096-ep16. Every complete workload has
+one excluded warmup and three measured rounds. A post-run audit covers all
+three performance workloads, the 32-example quality diagnostic and the two
+isolated B1 checks. All five intervals have zero foreign NPU observations.
+
 input/output/concurrency    TPOT ms       TTFT s       output token/s
-8192/128/1              118.269        3.375             6.958
-32768/512/1              126.854       13.508             6.536
-8192/128/4              124.141       13.147            17.726
-Relative to original LIM, measured TPOT decreased by 7.55%, 6.55%, and 7.74%
-for these three workloads. Relative to the same-policy reference at 8K/128,
-TPOT decreased by 58.71% at concurrency 1 and 53.99% at concurrency 4.
-Relative to no offload, tuned TPOT remains 2.47x, 2.63x, and 2.50x. Thus
-the small kernel tuning has a measured benefit, but low-degradation H2D
-hiding has NOT been achieved by the complete offload bridge.
+8192/128/1                  118.561       3.373          6.945
+32768/512/1                 127.185      13.499          6.523
+8192/128/4                  124.008      13.145         17.718
+Relative to original LIM, measured TPOT decreased by 7.32%, 6.31%, and 7.84%.
+Relative to the same-policy reference at 8K/128, TPOT decreased by
+58.61% at concurrency 1 and 54.04% at concurrency 4. Relative to
+no offload, tuned TPOT remains 2.48x, 2.64x, and 2.50x. Thus this kernel
+tuning has a measured benefit, but low-degradation H2D hiding has NOT been
+achieved by the complete offload bridge.
 
-Tuned session HBM: median chip sampled peak 50392.5 MiB vs baseline
-57068.0 MiB (11.70% lower). The worst-device sampled peak is 51849 MiB
-vs baseline 57229 MiB (9.40% lower). These are whole-device observations
-including the fixed model/configuration overhead, not just resident KV.
-An archive audit found four foreign-process samples in the original tuned
-32K/512 and 8K/concurrency-4 windows. Those tuned performance/peak results
-are contaminated and must not be used as final isolated measurements;
-they are retained for audit and superseded by guarded reruns. Earlier
-baseline/reference/original-LIM measurement windows had no foreign samples.
+Accepted tuned HBM: median chip sampled peak 50392.5 MiB vs baseline
+57068.0 MiB (11.70% lower). Worst-device sampled peak is 51477 MiB
+vs baseline 57229 MiB (10.05% lower). These are whole-device
+observations including fixed model/configuration overhead. Accepted tuned
+samples cover the guarded timing/quality intervals; baseline samples cover
+service-ready through quality completion. Both exclude profiles. Sampling
+frequency differs (fast ownership scans for the rerun, 10-second waits for
+older sessions), so these are observed peaks, not exact allocator watermarks.
 
-Tuned custom task score: 29/32, with zero truncations; baseline 29/32,
-same-policy reference 28/32, original LIM 30/32. Only 7/32 complete tuned
-and reference token sequences were identical. Maximum logprob difference
-on their common generated prefixes was 0.4407. Two isolated B1 rechecks
-still had differing generated sequences, with maximum common-prefix
-logprob difference 0.3106. Thus batch sensitivity explains only part of the
-differences. No accuracy-lossless or numerical-equivalence claim is made.
-These sampled-token comparisons are NOT full-distribution KL measurements.
-The same short 8K needle repeatability checks passed 8/8 for tuned code.
+The final custom task score is 28/32, with zero truncations; baseline 29/32,
+same-policy reference 28/32, original LIM 30/32. An earlier run of the same
+tuned code scored 29/32; concurrent greedy serving is not demonstrated to
+be batch invariant. Only 5/32 final tuned/reference complete token sequences
+were identical. Maximum logprob difference on common generated prefixes
+was 0.5766. The two isolated B1 rechecks still had differing generated
+sequences, with maximum common-prefix logprob difference 0.3106. Batch
+sensitivity explains only part of the differences. No accuracy-lossless or
+numerical-equivalence claim is made. These sampled-token comparisons are
+NOT full-distribution KL measurements. Short 8K needle repeats previously
+passed 8/8 on this same tuned code; they were not repeated in the final run.
 
-A second diagnostic-only profile of tuned code confirms 128 native LIM
+A separate diagnostic-only profile of tuned code confirms 128 native LIM
 invocations and 478 complete five-copy/SFA layer groups. All those copy
 and SFA kernels are on physical stream 187; none of the copies overlaps
 its consumer SFA. Median resident-to-selected gather fell from 283.11 us
@@ -315,9 +322,19 @@ in the original profile to 155.03 us; the tuned miss-fill copy median was
 121.06 us. Cumulative profile durations include profiler overhead and
 partially captured graph boundaries, so they are not normalized TPOT.
 
-Validation cleanup: the test model/container were stopped, no NPU processes
-remained, and host shared memory returned to approximately 1 GiB. Source
-and raw results remain in the task directory for reproduction.
+Archive audit correction: the first tuned session contained four foreign
+AFS NPU-process observations. Its 32K/512 B1 and 8K/128 B4 timings and
+whole-session peaks are INVALID for isolated claims. All three tuned timing
+workloads and quality were rerun under an ownership guard. Whole attempts,
+rather than slow individual rounds, would be rejected upon interference;
+all final attempts were accepted on their first try. The complete post-run
+scan audit also passed. Historical raw data and exclusion reasons remain
+in the evidence archive. Earlier baseline/reference/original-LIM windows
+were unaffected; the earlier tuned 8K/B1 and quality windows were unaffected.
+
+Validation cleanup: the test model/container and ownership guard were
+stopped, no NPU processes remained, and host shared memory returned to
+approximately 1 GiB. Source and raw results remain in the task directory.
 
 Remaining work for the original performance/accuracy objectives: eliminate
 selected-KV materialization with a compatible copy/SFA fused route or direct
@@ -327,7 +344,3 @@ and isolate the first numerical divergence under fixed batch/teacher-forced
 prefixes with captured TopK sets, selected payloads and SFA inputs. Full-model
 cache-hit-rate telemetry was not collected, so fixture hit rates must not be
 substituted for actual checkpoint hit rates.
-
-Audit correction: the original tuned 32K and concurrency-4 rows above are
-invalid due to competing AFS NPU jobs. The original tuned 8K/concurrency-1
-rows and quality interval were not affected. Guarded reruns follow below.
