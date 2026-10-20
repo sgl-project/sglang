@@ -277,13 +277,16 @@ def validate_deepseek_v41_encoder_only_prefill(server_args: ServerArgs) -> None:
             "transfer backends other than Mooncake",
             cfg.disaggregation_transfer_backend != "mooncake",
         ),
-        ("speculative decoding", cfg.speculative_algorithm is not None),
+        # Prefill has no lm_head; decode drafts from its own tail extend.
+        (
+            "speculative decoding on prefill",
+            not is_decode and cfg.speculative_algorithm is not None,
+        ),
         ("pipeline parallelism", cfg.pp_size != 1),
         (
             "context parallelism",
             cfg.enable_prefill_cp or cfg.attn_cp_size != 1 or cfg.dcp_size != 1,
         ),
-        ("DP attention on prefill", not is_decode and attn_dp_enabled_of(cfg)),
         (
             "prefill CUDA graphs",
             cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,

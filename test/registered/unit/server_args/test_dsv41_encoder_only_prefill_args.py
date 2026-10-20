@@ -53,6 +53,13 @@ class TestDsv41EncoderOnlyPrefillArgs(CustomTestCase):
         args = self.make_args("decode")
         validate_deepseek_v41_encoder_only_prefill(args)
         self.assertTrue(resolving_view(args).enable_decoder_swa_bounded_replay)
+        validate_deepseek_v41_encoder_only_prefill(
+            self.make_args("prefill", attn_dp_size=2, tp_size=2)
+        )
+        # Decode drafts from its own tail extend.
+        validate_deepseek_v41_encoder_only_prefill(
+            self.make_args("decode", speculative_algorithm="DSPARK")
+        )
 
     def test_decode_requires_decoder_replay(self):
         args = self.make_args("decode", enable_decoder_swa_bounded_replay=False)
@@ -61,10 +68,9 @@ class TestDsv41EncoderOnlyPrefillArgs(CustomTestCase):
 
     def test_rejects_unsupported_features(self):
         for role, fields, message in (
-            ("decode", {"speculative_algorithm": "DSPARK"}, "speculative"),
+            ("prefill", {"speculative_algorithm": "DSPARK"}, "speculative"),
             ("decode", {"disaggregation_decode_enable_radix_cache": True}, "radix"),
             ("prefill", {"disaggregation_transfer_backend": "nixl"}, "Mooncake"),
-            ("prefill", {"attn_dp_size": 2, "tp_size": 2}, "DP attention"),
         ):
             with self.subTest(role=role, **fields):
                 with self.assertRaisesRegex(ValueError, message):

@@ -1515,7 +1515,12 @@ def setup_state_kv_args(
                         ring_lens,
                         ring_item_lens,
                     )
-            if hasattr(token_to_kv_pool, "get_request_state_buf_infos"):
+            # An encoder-only split leaves no request-scoped state; see
+            # dsv41_encoder_prefix_len.
+            if (
+                hasattr(token_to_kv_pool, "get_request_state_buf_infos")
+                and not get_disagg().dsv41_encoder_only_prefill
+            ):
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_request_state_buf_infos()
                 )
@@ -1825,7 +1830,11 @@ def setup_state_kv_args(
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
-    if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
+    if (
+        2 not in ratios
+        or str(get_spec().speculative_algorithm).upper() != "DSPARK"
+        or get_disagg().dsv41_encoder_only_prefill
+    ):
         return None
 
     from sglang.srt.disaggregation.base.conn import StateType
@@ -1859,9 +1868,11 @@ def dsv41_encoder_prefix_len(prompt_len: int, window: int) -> int:
 
     Decode runs the final window through the full model on top of this prefix,
     reading its transferred encoder SWA, so the split matches collocated
-    decoder SWA bounded replay.
+    decoder SWA bounded replay. The prefix is even, so no ratio-2 compressor
+    holds a pending half-pair: no request-scoped state crosses, and the peers'
+    pair rings may differ in size (decode's grows with speculative decoding).
     """
-    return max(0, prompt_len - window)
+    return max(0, prompt_len - window) // 2 * 2
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

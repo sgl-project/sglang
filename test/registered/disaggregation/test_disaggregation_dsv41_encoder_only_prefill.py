@@ -23,8 +23,8 @@ register_cuda_ci(est_time=1200, stage="extra-b", runner_config="8-gpu-b300")
 
 DSV41_FLASH_MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 
-# Around the 128-token window: no transfer at all (<= 128), a one-token and an
-# odd prefix (pending ratio-2 pair), page-aligned prefixes, and a long prompt.
+# Around the 128-token window: no transfer at all (<= 129), the smallest prefix,
+# odd N - 128 (a 129-token tail), page-aligned prefixes, and a long prompt.
 PROMPT_LENS = [1, 127, 128, 129, 130, 131, 383, 384, 385, 4096]
 
 
