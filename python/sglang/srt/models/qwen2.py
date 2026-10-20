@@ -117,9 +117,12 @@ class Qwen2MLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            x = self.activation_quant(
-                gate_up, self.act_fn, self.down_proj, forward_batch
-            )
+            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+                x = self.activation_quant(
+                    gate_up, self.act_fn, self.down_proj, forward_batch
+                )
+            else:
+                x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 

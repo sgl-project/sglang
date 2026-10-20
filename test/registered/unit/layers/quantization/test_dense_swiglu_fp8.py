@@ -55,7 +55,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
         return mlp
 
     def test_mlp_parity_and_graph_replay(self):
-        """Real constructors must engage fusion, including on graph replay."""
+        """Cold first-decode dispatch and graph replay must match the unfused MLP."""
         from sglang.srt.models.llama import LlamaDecoderLayer
         from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 
@@ -66,6 +66,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                 mlp = self._make_mlp(model)
                 self.assertTrue(mlp.activation_quant.enabled)
                 self.assertIsNone(mlp.dual_gemm.mode)
+                self.assertIsNone(mlp.act_fn._forward_method)
                 for m in (1, 3, 32, 128):
                     with self.subTest(model=model, m=m):
                         x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
@@ -78,6 +79,25 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                         actual = mlp(x, batch)
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                         if m == 1:
+                            # Non-decode output must not depend on the fusion helper.
+                            with mock.patch.object(
+                                type(mlp.activation_quant),
+                                "__call__",
+                                side_effect=AssertionError(
+                                    "non-decode entered fusion dispatch"
+                                ),
+                            ):
+                                for mode in (None, *ForwardMode):
+                                    if mode == ForwardMode.DECODE:
+                                        continue
+                                    candidate = (
+                                        SimpleNamespace(forward_mode=mode)
+                                        if mode is not None
+                                        else None
+                                    )
+                                    torch.testing.assert_close(
+                                        mlp(x, candidate), expected, rtol=0, atol=0
+                                    )
                             # Isolate attention/communication, but exercise the actual
                             # decoder -> real MLP handoff. Dropping forward_batch must fail.
                             boundary = SimpleNamespace(
