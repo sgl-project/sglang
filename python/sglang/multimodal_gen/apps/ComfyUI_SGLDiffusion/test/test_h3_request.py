@@ -127,6 +127,25 @@ class _Response:
         return self._payload
 
 
+_TMP_FILES = []
+
+
+def _tmp_file(suffix):
+    """A temp file path that the autouse fixture below deletes afterwards."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        _TMP_FILES.append(fh.name)
+        return fh.name
+
+
+@pytest.fixture(autouse=True)
+def _remove_tmp_files():
+    yield
+    while _TMP_FILES:
+        path = _TMP_FILES.pop()
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def _run_node(**node_kwargs):
     """Drive the node through the real client and capture the POST payload."""
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:30010")
@@ -135,7 +154,7 @@ def _run_node(**node_kwargs):
     # file_path with os.path.exists before trusting it (see
     # SGLDiffusionServerAPI._localize_video_result), since on a remote
     # server that path belongs to a different filesystem.
-    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    out_path = _tmp_file(".mp4")
 
     def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
         captured.update(json or data or {})
@@ -153,10 +172,10 @@ def _run_node(**node_kwargs):
 
     def fake_get_image_path(image):
         # _image_material_uri reads this file's bytes and then deletes it.
-        fh = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
-        fh.close()
-        return fh.name
+        path = _tmp_file(".png")
+        with open(path, "wb") as fh:
+            fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        return path
 
     node = SGLDiffusionGenerateH3()
     with (
@@ -260,7 +279,7 @@ def test_extra_fields_win_over_generic_defaults():
     """A model's own field must not be shadowed by a same-named generic default."""
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:30010")
     captured = {}
-    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    out_path = _tmp_file(".mp4")
 
     def fake_post(url, json=None, headers=None, timeout=None, files=None, data=None):
         captured.update(json or data or {})

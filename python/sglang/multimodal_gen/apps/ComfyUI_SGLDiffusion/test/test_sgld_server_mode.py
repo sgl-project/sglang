@@ -220,6 +220,25 @@ class _Response:
 # --- Bug 9: hardcoded 300s timeout on image requests -----------------------
 
 
+_TMP_FILES = []
+
+
+def _tmp_file(suffix):
+    """A temp file path that the autouse fixture below deletes afterwards."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        _TMP_FILES.append(fh.name)
+        return fh.name
+
+
+@pytest.fixture(autouse=True)
+def _remove_tmp_files():
+    yield
+    while _TMP_FILES:
+        path = _TMP_FILES.pop()
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def test_image_timeout_is_configurable():
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234", image_timeout=900)
     captured = {}
@@ -237,10 +256,13 @@ def test_image_timeout_is_configurable():
 # --- Bug 10: batched image inputs were silently truncated to image[0] ------
 
 
-def test_get_image_path_rejects_batches_instead_of_dropping_them():
+def test_get_image_path_uses_first_image_of_a_batch_with_a_warning(caplog):
     batch = torch.zeros(3, 8, 8, 3)
-    with pytest.raises(ValueError, match="batch of 3 images"):
-        UTILS.get_image_path(batch)
+    with caplog.at_level("WARNING"):
+        path = UTILS.get_image_path(batch)
+    assert os.path.exists(path)
+    os.remove(path)
+    assert "batch of 3 images" in caplog.text
 
 
 def test_get_image_path_accepts_single_image():
@@ -324,9 +346,9 @@ def test_generic_video_node_reports_server_resolved_size_not_requested_size():
 
 def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+    local_image = _tmp_file(".png")
+    with open(local_image, "wb") as fh:
         fh.write(b"fake-png-bytes")
-        local_image = fh.name
 
     seen = {}
 
@@ -336,7 +358,7 @@ def test_generate_video_uploads_local_input_reference_instead_of_sending_path():
         seen["json"] = json
         return _Response({"id": "job-1"})
 
-    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    out_path = _tmp_file(".mp4")
 
     def fake_get(url, headers=None, timeout=None, **kwargs):
         return _Response({"id": "job-1", "status": "completed", "file_path": out_path})
@@ -366,7 +388,7 @@ def _capture_video_request(client, **kwargs):
         seen["json"] = json
         return _Response({"id": "job-1"})
 
-    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    out_path = _tmp_file(".mp4")
 
     def fake_get(url, headers=None, timeout=None, **kw):
         return _Response({"id": "job-1", "status": "completed", "file_path": out_path})
@@ -454,6 +476,44 @@ def test_generate_video_downloads_result_when_server_path_is_not_local():
         assert os.path.dirname(result["file_path"]) == out_dir
 
 
+@pytest.mark.parametrize("video_id", ["../escape", "a/b", "job.1", ""])
+def test_localize_video_result_rejects_unsafe_video_id(video_id):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+    status = {"status": "completed", "file_path": "/srv/out/x.mp4"}
+    with tempfile.TemporaryDirectory() as out_dir:
+        with mock.patch(f"{PKG}.core.server_api.requests.get") as get:
+            with pytest.raises(RuntimeError, match="unsafe id"):
+                client._localize_video_result(status, video_id, out_dir)
+        get.assert_not_called()
+        assert os.listdir(out_dir) == []
+
+
+def test_localize_video_result_whitelists_extension_and_cleans_up_on_error():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+
+    class _Broken(_Response):
+        def iter_content(self, chunk_size=None):
+            yield b"partial"
+            raise SERVER_API.requests.exceptions.ConnectionError("dropped")
+
+    status = {"status": "completed", "file_path": "/srv/out/job-1.sh"}
+    with tempfile.TemporaryDirectory() as out_dir:
+        with mock.patch(
+            f"{PKG}.core.server_api.requests.get", return_value=_Response({})
+        ):
+            result = client._localize_video_result(status, "job-1", out_dir)
+        assert result["file_path"] == os.path.join(
+            os.path.realpath(out_dir), "job-1.mp4"
+        )
+        os.remove(result["file_path"])
+        with mock.patch(
+            f"{PKG}.core.server_api.requests.get", return_value=_Broken({})
+        ):
+            with pytest.raises(SERVER_API.requests.exceptions.ConnectionError):
+                client._localize_video_result(status, "job-1", out_dir)
+        assert os.listdir(out_dir) == []
+
+
 class _HTTPErrorResponse(_Response):
     def raise_for_status(self):
         raise SERVER_API.requests.exceptions.HTTPError(
@@ -531,6 +591,19 @@ def test_h3_allows_local_video_reference_against_local_server():
         "/data/clip.mp4", "reference_video", "http://127.0.0.1:3000/v1"
     )
     assert uri == "file:///data/clip.mp4"
+
+
+def test_is_local_server_accepts_own_hostname_and_loopback():
+    is_local = NODES.SGLDiffusionGenerateH3._is_local_server
+    host = NODES.socket.gethostname()
+    assert is_local(f"http://{host}:3000/v1")
+    assert is_local("http://0.0.0.0:3000/v1")
+    assert is_local("http://127.0.0.2:3000/v1")
+    assert is_local("http://[::1]:3000/v1")
+    with mock.patch.object(
+        NODES.socket, "getaddrinfo", return_value=[(0, 0, 0, "", ("10.1.2.3", 0))]
+    ):
+        assert not is_local("http://gpu-box:3000/v1")
 
 
 def test_h3_passes_file_uri_through_for_any_server():

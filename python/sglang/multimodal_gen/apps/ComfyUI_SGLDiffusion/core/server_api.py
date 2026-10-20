@@ -6,10 +6,17 @@ Provides a low-level interface for interacting with SGLang Diffusion HTTP server
 import contextlib
 import json
 import os
+import re
 import time
 from typing import Any, Callable, Dict, Optional
 
 import requests
+
+# Server-supplied names used to build a local path for a downloaded video.
+_SAFE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]+")
+_VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv")
+_MAX_VIDEO_BYTES = 2 * 1024**3
+_DOWNLOAD_DEADLINE_S = 600
 
 
 class SGLDiffusionServerAPI:
@@ -449,20 +456,46 @@ class SGLDiffusionServerAPI:
             return status
         if not file_path and status.get("url"):
             return status
-        target_dir = output_path or os.getcwd()
+        if not isinstance(video_id, str) or not _SAFE_VIDEO_ID.fullmatch(video_id):
+            raise RuntimeError(f"Refusing to save video with unsafe id {video_id!r}")
+        ext = os.path.splitext(file_path or "")[1].lower() or ".mp4"
+        if ext not in _VIDEO_EXTENSIONS:
+            ext = ".mp4"
+        target_dir = os.path.realpath(output_path or os.getcwd())
         os.makedirs(target_dir, exist_ok=True)
-        ext = os.path.splitext(file_path or "")[1] or ".mp4"
-        local_path = os.path.join(target_dir, f"{video_id}{ext}")
+        local_path = os.path.realpath(os.path.join(target_dir, f"{video_id}{ext}"))
+        if os.path.commonpath([target_dir, local_path]) != target_dir:
+            raise RuntimeError(f"Refusing to save video outside {target_dir}")
+        deadline = time.monotonic() + _DOWNLOAD_DEADLINE_S
         response = requests.get(
             f"{self.base_url}/videos/{video_id}/content",
             headers=self.headers,
             timeout=300,
             stream=True,
         )
-        response.raise_for_status()
-        with open(local_path, "wb") as fh:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                fh.write(chunk)
+        try:
+            response.raise_for_status()
+            written = 0
+            with open(local_path, "wb") as fh:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    written += len(chunk)
+                    if written > _MAX_VIDEO_BYTES:
+                        raise RuntimeError(
+                            f"Video download exceeded {_MAX_VIDEO_BYTES} bytes"
+                        )
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"Video download exceeded {_DOWNLOAD_DEADLINE_S}s"
+                        )
+                    fh.write(chunk)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(local_path)
+            raise
+        finally:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()
         status = dict(status)
         status["file_path"] = local_path
         return status

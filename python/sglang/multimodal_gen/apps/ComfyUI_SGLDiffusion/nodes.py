@@ -4,7 +4,9 @@ Provides nodes for connecting to SGLang Diffusion server and generating images/v
 """
 
 import base64
+import ipaddress
 import os
+import socket
 import urllib.parse
 import uuid
 
@@ -719,8 +721,22 @@ class SGLDiffusionGenerateH3:
 
     @staticmethod
     def _is_local_server(base_url: str) -> bool:
-        host = urllib.parse.urlparse(base_url).hostname or ""
-        return host in ("localhost", "127.0.0.1", "::1")
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+        if not host:
+            return False
+        if host in ("localhost", "0.0.0.0", "::"):
+            return True
+        own = {socket.gethostname().lower(), socket.getfqdn().lower()}
+        if host in own:
+            return True
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except (OSError, UnicodeError):
+            return False
+        addrs = {info[4][0].split("%", 1)[0] for info in infos}
+        return bool(addrs) and all(
+            ipaddress.ip_address(addr).is_loopback for addr in addrs
+        )
 
     @classmethod
     def _remote_material_uri(cls, value: str, kind: str, base_url: str) -> str:
