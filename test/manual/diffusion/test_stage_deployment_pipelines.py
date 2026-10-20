@@ -2,10 +2,13 @@
 """Real encoder/denoiser/decoder deployments without per-field payload contracts."""
 
 import asyncio
+import base64
 import sys
+from io import BytesIO
 
 import pytest
 import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
@@ -28,14 +31,15 @@ class _StageCluster(DisaggCluster):
 
 
 @pytest.mark.parametrize(
-    "model,num_frames",
+    "model,num_frames,image_conditioning",
     [
-        ("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 5),
-        ("Tongyi-MAI/Z-Image-Turbo", 1),
-        ("Qwen/Qwen-Image", 1),
+        ("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", 5, False),
+        ("Tongyi-MAI/Z-Image-Turbo", 1, False),
+        ("Qwen/Qwen-Image", 1, False),
+        ("black-forest-labs/FLUX.2-klein-4B", 1, True),
     ],
 )
-def test_external_contracts_match_monolithic(model, num_frames):
+def test_external_contracts_match_monolithic(model, num_frames, image_conditioning):
     _require_gpus(3)
     contracts = [
         {"name": "InputValidationStage"},
@@ -58,6 +62,8 @@ def test_external_contracts_match_monolithic(model, num_frames):
         },
         {"name": "decoding_stage_postprocess"},
     ]
+    if image_conditioning:
+        contracts.insert(2, {"name": "ImageVAEEncodingStage", "components": ["vae"]})
     requests = [
         dict(
             prompt="A mountain landscape in daylight",
@@ -73,6 +79,13 @@ def test_external_contracts_match_monolithic(model, num_frames):
         )
         for index, width in enumerate((256, 320) if num_frames > 1 else (512, 640))
     ]
+    if image_conditioning:
+        image = BytesIO()
+        Image.new("RGB", (247, 239), (40, 90, 160)).save(image, format="PNG")
+        requests[0]["image_path"] = [
+            "data:image/png;base64,"
+            + base64.b64encode(image.getvalue()).decode("ascii")
+        ]
     prepared, expected = [], []
     with DiffGenerator.from_pretrained(
         model_path=model,
@@ -105,9 +118,13 @@ def test_external_contracts_match_monolithic(model, num_frames):
             expected.append(result.output.cpu())
 
     groups = {
-        "encoder": [0, 1],
-        "denoiser": [2, 3, "denoising_stage"],
-        "decoder": [5, "decoding_stage_postprocess"],
+        "encoder": [0, 1, 2] if image_conditioning else [0, 1],
+        "denoiser": [
+            "LatentPreparationStage",
+            "TimestepPreparationStage",
+            "denoising_stage",
+        ],
+        "decoder": ["decoding_stage", "decoding_stage_postprocess"],
     }
     with _StageCluster(
         model=model,
