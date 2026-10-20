@@ -377,8 +377,17 @@ class AITerImpl(AttentionImpl):
             if output is not None:
                 return output
 
-        # BF16 path
-        output = aiter.flash_attn_func(
+        if USE_AITER_GFX1250:
+            return self._forward_bf16_eager(query, key, value)
+        return self._forward_bf16(query, key, value)
+
+    def _forward_bf16(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return aiter.flash_attn_func(
             query,
             key,
             value,
@@ -388,7 +397,17 @@ class AITerImpl(AttentionImpl):
             return_lse=False,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
-        return output
+
+    # On gfx1250 flash_attn_func dispatches to a FlyDSL kernel whose Python JIT reads
+    # thread-local MLIR context state; Dynamo tracing into it fails at compile time.
+    @torch.compiler.disable
+    def _forward_bf16_eager(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._forward_bf16(query, key, value)
 
     @torch.compiler.disable
     def forward_varlen(

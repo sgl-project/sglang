@@ -21,11 +21,12 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
+    TWO_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
 
     def is_push(self) -> bool:
-        return self == AllReduceAlgo.ONE_SHOT_PUSH
+        return self in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH)
 
     @property
     def algo_name(self) -> str:
@@ -34,6 +35,7 @@ class AllReduceAlgo(enum.Enum):
 
 _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
+    AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
 }
@@ -226,6 +228,10 @@ def custom_all_reduce(
 ) -> torch.Tensor:
     module = get_all_reduce_module(input.dtype, comm.world_size)
     result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    # Already a torch.Tensor once tvm-ffi loads torch's DLPack exchange API;
+    # re-wrapping it is a pure round trip (~15 us per call on GB300).
+    if isinstance(result, torch.Tensor):
+        return result
     return torch.from_dlpack(result)
 
 

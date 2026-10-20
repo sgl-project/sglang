@@ -1629,7 +1629,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get(
+                "ignore",
+                config.get("modules_to_not_convert", config.get("exclude_modules", [])),
+            )
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
@@ -2004,7 +2007,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
-            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )
@@ -2313,26 +2316,65 @@ def _compute_gemm1_alphas(
     w13_weight_scale_2: torch.Tensor,
     w13_input_scale: torch.Tensor,
     is_gated: bool,
+    *,
+    up_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GEMM1 weight x input alphas for the gate (w1) and up (w3) halves of w13.
 
     w13 fuses the gate and up projections, which may carry separate NVFP4 weight
-    scales stored as [num_experts, 2] (col 0 = gate, col 1 = up). A 1-D (or
-    [num_experts, 1]) scale, and any non-gated layer, shares one scale across
-    both halves; the col-1 read is guarded so those cases stay in bounds.
+    scales stored as [num_experts, 2] in w13 row order: [gate, up] by default,
+    [up, gate] when up_first (the FlashInfer TRT-LLM loader layout).
+    A 1-D (or [num_experts, 1]) scale, and any non-gated layer, shares one scale
+    across both halves; the col-1 read is guarded so those cases stay in bounds.
 
     Returns (g1_alphas, g1_alphas_up), equal for a shared scale. Single-alpha
     backends use g1_alphas; the TRT-LLM path also uses g1_alphas_up.
     """
     if is_gated and w13_weight_scale_2.dim() == 2 and w13_weight_scale_2.shape[1] >= 2:
-        gate_scale = w13_weight_scale_2[:, 0]
-        up_scale = w13_weight_scale_2[:, 1]
+        gate_col, up_col = (1, 0) if up_first else (0, 1)
+        gate_scale = w13_weight_scale_2[:, gate_col]
+        up_scale = w13_weight_scale_2[:, up_col]
     else:
         gate_scale = w13_weight_scale_2.reshape(w13_weight_scale_2.shape[0])
         up_scale = gate_scale
     g1_alphas = (w13_input_scale * gate_scale).to(torch.float32)
     g1_alphas_up = (w13_input_scale * up_scale).to(torch.float32)
     return g1_alphas, g1_alphas_up
+
+
+def _compute_trtllm_gated_act_params(
+    *,
+    activation: Optional[str],
+    gemm1_alpha: Optional[float],
+    gemm1_clamp_limit: Optional[float],
+    swiglu_limit: Optional[float],
+    g1_alphas: torch.Tensor,
+    g1_alphas_up: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    params = {}
+    is_situ = activation == "situ"
+    clamp_limit = None if is_situ else (gemm1_clamp_limit or swiglu_limit)
+    if clamp_limit is not None:
+        # The kernel clamps both raw GEMM1 halves at this one value,
+        # so it is exact for the up half only when the gate/up scales match.
+        if not torch.equal(g1_alphas, g1_alphas_up):
+            logger.warning_once(
+                "NVFP4 MoE gate/up global scales differ; the TRT-LLM SwiGLU clamp "
+                "limit is exact for the gate half only. Accuracy may be affected."
+            )
+        params["gemm1_clamp_limit"] = (clamp_limit / g1_alphas).to(torch.float32)
+
+    if gemm1_alpha is not None:
+        params["gemm1_alpha"] = torch.full_like(
+            g1_alphas, gemm1_alpha, dtype=torch.float32
+        )
+        # Beta is added to the raw up half, so it is in up-alpha units.
+        params["gemm1_beta"] = (
+            torch.full_like(g1_alphas, gemm1_clamp_limit, dtype=torch.float32)
+            if is_situ
+            else (1.0 / g1_alphas_up).to(torch.float32)
+        )
+    return params
 
 
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
@@ -2420,6 +2462,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
+        """Align TRT-LLM weights, allowing model-specific storage layouts."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            align_fp4_moe_weights_for_flashinfer_trtllm,
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        align_fp4_moe_weights_for_flashinfer_trtllm(
+            layer,
+            hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                use_per_token_activation=self.quant_config.use_per_token_activation,
+                is_gated=layer.moe_runner_config.is_gated,
+            ),
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2429,6 +2486,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if self.enable_flashinfer_trtllm_moe:
+            alignment = (
+                64
+                if layer.moe_runner_config.is_gated
+                and self.use_flashinfer_trtllm_weight_layout
+                else 128
+            )
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, alignment
+            )
+            layer.moe_runner_config.intermediate_size_per_partition = (
+                intermediate_size_per_partition
+            )
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
@@ -2635,9 +2705,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         layer.mega_l1_weights = l1_pair
         layer.mega_l2_weights = l2_pair
-        layer.mega_l1_alphas = l1_alphas
-        layer.mega_l2_alphas = l2_alphas
-        layer.mega_l2_act_scales = l2_act_scales
+        # Parameters, so EPLB moves each expert's values with its weights.
+        for name, value in (
+            ("mega_l1_alphas", l1_alphas),
+            ("mega_l2_alphas", l2_alphas),
+            ("mega_l2_act_scales", l2_act_scales),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
         # Free the checkpoint layout.
         layer.w13_weight.data = l1_pair[0]
         layer.w13_weight_scale.data = l1_pair[1]
@@ -2758,9 +2834,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # Create shared parameters. g1_alphas / g1_alphas_up are the gate (w1)
         # and up (w3) GEMM1 scales (equal for shared-scale checkpoints).
         g1_alphas, g1_alphas_up = _compute_gemm1_alphas(
-            layer.w13_weight_scale_2,
-            w13_input_scale,
-            layer.moe_runner_config.is_gated,
+            w13_weight_scale_2=layer.w13_weight_scale_2,
+            w13_input_scale=w13_input_scale,
+            is_gated=layer.moe_runner_config.is_gated,
+            up_first=self.use_flashinfer_trtllm_weight_layout,
         )
         copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
         copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
@@ -2782,39 +2859,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
-            is_situ = runner_config.activation == "situ"
-            gemm1_clamp_limit = (
-                None
-                if is_situ
-                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
+            gated_act_params = _compute_trtllm_gated_act_params(
+                activation=runner_config.activation,
+                gemm1_alpha=runner_config.gemm1_alpha,
+                gemm1_clamp_limit=runner_config.gemm1_clamp_limit,
+                swiglu_limit=runner_config.swiglu_limit,
+                g1_alphas=layer.g1_alphas,
+                g1_alphas_up=layer.g1_alphas_up,
             )
-            if gemm1_clamp_limit is not None:
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_clamp_limit",
-                    (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
-                )
-
-            if runner_config.gemm1_alpha is not None:
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_alpha",
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_alpha,
-                        dtype=torch.float32,
-                    ),
-                )
-                gemm1_beta = (
-                    torch.full_like(
-                        layer.g1_alphas,
-                        runner_config.gemm1_clamp_limit,
-                        dtype=torch.float32,
-                    )
-                    if is_situ
-                    else (1.0 / layer.g1_alphas).to(torch.float32)
-                )
-                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
+            for name, value in gated_act_params.items():
+                copy_or_rebind_param(layer, name, value)
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
@@ -2885,19 +2939,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_fp4_moe_weights_for_flashinfer_trtllm,
-                trtllm_nvfp4_hidden_alignment,
-            )
-
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(
-                layer,
-                hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                    use_per_token_activation=self.quant_config.use_per_token_activation,
-                    is_gated=layer.moe_runner_config.is_gated,
-                ),
-            )
+            self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
@@ -3259,7 +3302,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
+            slot = getattr(layer, "_nvfp4_layout_slot", None)
+            pair_weight = slot[0].pair[slot[1]] if slot and slot[0].is_pair else None
             quant_info = FlashInferCutlassMoeQuantInfo(
+                pair_w2_weight=pair_weight,
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,

@@ -11,6 +11,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 import sglang.srt.layers.quantization.fp8_utils as fp8_utils
+import sglang.srt.model_loader.utils as model_loader_utils
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization import fp8 as fp8_quant
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
@@ -64,6 +65,37 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertFalse(fired_again)
         self.assertTrue(weight_scale.format_ue8m0)
         requant.assert_called_once_with(weight, weight_scale, BLOCK_SIZE)
+
+    def test_sm120_requants_grouped_moe_but_not_dense_weights(self):
+        """SM120's DeepGEMM grouped MoE GEMM faults on FP32 block scales that are
+        not powers of two; dense block-FP8 GEMMs there keep FP32 scales."""
+        dense = _make_params()
+        experts = _make_params()
+
+        with (
+            self._enabled_deepgemm_ue8m0(),
+            patch.object(model_loader_utils, "get_device_sm", return_value=120),
+            patch.object(fp8_utils, "requant_weight_ue8m0_inplace") as requant,
+        ):
+            dense_fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
+                *dense,
+                BLOCK_SIZE,
+                use_deepgemm_runner=True,
+                output_dtype=torch.bfloat16,
+                weight_shape=dense[0].shape,
+            )
+            experts_fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
+                *experts,
+                BLOCK_SIZE,
+                use_deepgemm_runner=True,
+                output_dtype=torch.bfloat16,
+                weight_shape=experts[0].shape,
+                grouped_moe=True,
+            )
+
+        self.assertFalse(dense_fired)
+        self.assertTrue(experts_fired)
+        requant.assert_called_once_with(*experts, BLOCK_SIZE)
 
     def test_helper_skips_non_bf16_output(self):
         weight, weight_scale = _make_params()
@@ -213,6 +245,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
                     use_deepgemm_runner=True,
                     output_dtype=torch.bfloat16,
                     weight_shape=layer.w13_weight.shape[-2:],
+                    grouped_moe=True,
                 ),
                 call(
                     layer.w2_weight,
@@ -221,6 +254,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
                     use_deepgemm_runner=True,
                     output_dtype=torch.bfloat16,
                     weight_shape=layer.w2_weight.shape[-2:],
+                    grouped_moe=True,
                 ),
             ],
         )

@@ -52,6 +52,7 @@ import unittest
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
     _extract_output_logprobs,
@@ -84,7 +85,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=3140, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=3340, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -300,6 +301,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
         cls.model = _MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = _base_args() + [
+            "--enable-metrics",
             "--enable-hierarchical-cache",
             "--hicache-ratio",
             "4",
@@ -364,6 +366,27 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             branches_per_group=branches,
             max_new_tokens=512,
             sampling_temperature=0,
+        )
+
+
+class TestUnifiedHybridHiCacheSlowLoadBitExact(TestUnifiedHybridHiCacheBitExact):
+    """A prefill CUDA graph must not replay over a host-to-device load that has not
+    landed; the delay makes the load lose that race every time."""
+
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES.override(50_000_000):
+            super().setUpClass()
+
+    def test_multiturn_decode_cache_hit_branching(self):
+        server_info = requests.get(self.base_url + "/server_info", timeout=30).json()
+        self.assertEqual(server_info["cuda_graph_config"]["prefill"]["backend"], "full")
+        graph_count = _prefill_graph_count(self.base_url)
+        super().test_multiturn_decode_cache_hit_branching()
+        self.assertGreater(
+            _prefill_graph_count(self.base_url),
+            graph_count,
+            "Delayed HiCache test did not replay the configured Full CUDA graph.",
         )
 
 
