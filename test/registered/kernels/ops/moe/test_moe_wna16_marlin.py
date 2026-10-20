@@ -6,9 +6,12 @@ import pytest
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
+from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+from sglang.kernels.ops.quantization.awq_marlin_repack import awq_marlin_repack
 from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
@@ -233,6 +236,61 @@ def generate_test_cases():
 
 
 TEST_CASES = generate_test_cases()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_moe_marlin_groupwise_zero_point_translation(dtype):
+    """Group-dependent affine offsets preserve an exactly zero weight matrix."""
+    device = torch.device("cuda")
+    experts, topk, n, k, group_size = 8, 8, 1536, 2048, 128
+    groups = k // group_size
+    group_ids = torch.arange(groups, dtype=torch.int64, device=device)
+    # All eight nibbles equal g; column permutations preserve these values.
+    packed_codes = (group_ids * 0x11111111).to(torch.int32)
+    awq = packed_codes.repeat_interleave(group_size)[:, None]
+    awq = awq.expand(k, n // 8).contiguous()
+    one_expert = awq_marlin_repack(awq, k, n, 4)
+    qweight = one_expert.unsqueeze(0).expand(experts, -1, -1).contiguous()
+    qzeros = packed_codes[None, :, None].expand(experts, groups, n // 8).contiguous()
+    scales = torch.ones((experts, groups, n), dtype=dtype, device=device)
+    a = torch.full((1, k), 0.125, dtype=dtype, device=device)
+    topk_ids = torch.arange(topk, dtype=torch.int32, device=device).unsqueeze(0)
+    topk_weights = torch.full((1, topk), 1 / topk, dtype=torch.float32, device=device)
+    sorted_ids, expert_ids, padded = moe_align_single_token(topk_ids, 8)
+    workspace = marlin_make_workspace(device, max_blocks_per_sm=4)
+    perm = torch.empty((experts, 0), dtype=torch.int32, device=device)
+    # Non-atomic GEMM must overwrite C, even when the result is zero.
+    c = torch.full((topk, n), float("nan"), dtype=dtype, device=device)
+
+    output = moe_wna16_marlin_gemm(
+        a=a,
+        c_or_none=c,
+        b_q_weight=qweight,
+        b_bias_or_none=None,
+        b_scales=scales,
+        global_scale_or_none=None,
+        b_zeros_or_none=qzeros,
+        g_idx_or_none=None,
+        perm_or_none=perm,
+        workspace=workspace,
+        sorted_token_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=padded,
+        topk_weights=topk_weights,
+        moe_block_size=8,
+        top_k=topk,
+        mul_topk_weights=False,
+        is_ep=False,
+        b_q_type=scalar_types.uint4,
+        size_m=1,
+        size_n=n,
+        size_k=k,
+        is_k_full=True,
+        use_atomic_add=False,
+        use_fp32_reduce=True,
+        is_zp_float=False,
+    )
+    torch.testing.assert_close(output, torch.zeros_like(output), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

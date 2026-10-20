@@ -1135,7 +1135,8 @@ __global__ void Marlin(
         }
 
       } else if constexpr (group_blocks >= thread_k_blocks) {
-        if (k % b_sh_wr_iters == 0) {
+        constexpr int g = group_blocks / thread_k_blocks;
+        if (k % b_sh_wr_iters == 0 && pipe % g == 0) {
           int4* sh_zp_stage =
               sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
 #pragma unroll
@@ -1177,7 +1178,8 @@ __global__ void Marlin(
 
       if constexpr (group_blocks != -1) {
         if constexpr (group_blocks >= thread_k_blocks) {
-          if (k % b_sh_wr_iters == 0) {
+          constexpr int g = group_blocks / thread_k_blocks;
+          if (k % b_sh_wr_iters == 0 && pipe % g == 0) {
             int4* sh_zp_stage =
                 sh_zp + zp_sh_stage * ((group_blocks / thread_k_blocks) * (pipe / (group_blocks / thread_k_blocks)));
             reinterpret_cast<int4*>(&frag_zpf[k % 2])[0] = sh_zp_stage[zp_sh_rd];
