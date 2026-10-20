@@ -97,7 +97,7 @@ def test_contracts_compile_and_tensor_tree_round_trip():
 def test_worker_retains_reusable_model_outputs(monkeypatch):
     for method in ("set_device", "reset_peak_memory_stats"):
         monkeypatch.setattr(torch.cuda, method, lambda *args: None)
-    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 1024**2)
     monkeypatch.setattr(
         torch.cuda, "Event", lambda: SimpleNamespace(record=lambda: None)
     )
@@ -116,10 +116,11 @@ def test_worker_retains_reusable_model_outputs(monkeypatch):
         worker=SimpleNamespace(pipeline=SimpleNamespace(forward=forward)),
         _is_multi_rank=lambda: False,
     )
-    first, *_ = worker._execute(Req(prompt="first"))
+    first, _, _, peak = worker._execute(Req(prompt="first"))
     second, *_ = worker._execute(Req(prompt="second"))
     torch.testing.assert_close(first["latents"], torch.ones(2))
     torch.testing.assert_close(second["latents"], torch.full((2,), 2.0))
+    assert peak == 1
 
 
 @pytest.mark.parametrize("deployed", [False, True])
