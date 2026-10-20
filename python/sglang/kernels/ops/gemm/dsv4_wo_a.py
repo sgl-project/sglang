@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.layernorm.mxfp8_epilogue import ue8m0_scale
+from sglang.kernels.ops.quantization.mxfp8_epilogue import ue8m0_scale
 
 
 @triton.jit
