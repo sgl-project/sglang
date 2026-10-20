@@ -21,6 +21,7 @@ use tonic::{Code, Status};
 use tracing::{debug, info, warn};
 use zeromq::{Socket, SocketRecv, SubSocket};
 
+use crate::lora::{LoraIndex, LoraStore};
 use crate::pb::kv_indexer_client::KvIndexerClient;
 use crate::pb::{
     ApplyExternalKvBatchRequest, ExternalKvAction, ExternalKvActionType, TierType, WorkerCacheSpec,
@@ -264,11 +265,12 @@ async fn supervise(config: BridgeConfig) -> Result<(), BridgeError> {
     // Reconnecting recovers the connection only: events published while
     // disconnected are lost.
     let mut delay = RECONNECT_MIN_DELAY;
+    let mut lora = LoraIndex::default();
     loop {
         match connect(&config).await {
             Ok((client, subscriber)) => {
                 delay = RECONNECT_MIN_DELAY;
-                match run_session(&config, client, subscriber).await {
+                match run_session(&config, client, subscriber, &mut lora).await {
                     Ok(()) => {
                         info!("bridge shut down cleanly");
                         return Ok(());
@@ -317,6 +319,7 @@ async fn run_session(
     config: &BridgeConfig,
     mut client: KvIndexerClient<Channel>,
     mut subscriber: SubSocket,
+    lora: &mut LoraIndex,
 ) -> Result<(), BridgeError> {
     // Tracked only to log a discontinuity. Nothing acts on it.
     let mut last_seq: Option<u64> = None;
@@ -349,7 +352,7 @@ async fn run_session(
         }
         last_seq = Some(seq);
 
-        forward_raw_batch(config, &mut client, seq, &payload).await?;
+        forward_raw_batch(config, &mut client, seq, &payload, lora).await?;
     }
 }
 fn parse_zmq_frames(frames: &[bytes::Bytes]) -> Result<(u64, &[u8]), BridgeError> {
@@ -376,8 +379,9 @@ async fn forward_raw_batch(
     client: &mut KvIndexerClient<Channel>,
     seq: u64,
     payload: &[u8],
+    lora: &mut LoraIndex,
 ) -> Result<(), BridgeError> {
-    let actions = match decode_event_batch(payload) {
+    let actions = match decode_event_batch_with_lora(payload, true, lora) {
         Ok(actions) => actions,
         Err(error) => {
             warn!(seq, %error, "skipping undecodable event batch");
@@ -557,13 +561,23 @@ fn encode_block_sizes(block_sizes: &[Option<u32>]) -> Vec<u32> {
         .collect()
 }
 
+#[cfg(test)]
 fn decode_event_batch(payload: &[u8]) -> Result<EventActions, BridgeError> {
     decode_event_batch_impl(payload, true)
 }
 
+#[cfg(test)]
 fn decode_event_batch_impl(
     payload: &[u8],
     log_event_errors: bool,
+) -> Result<EventActions, BridgeError> {
+    decode_event_batch_with_lora(payload, log_event_errors, &mut LoraIndex::default())
+}
+
+fn decode_event_batch_with_lora(
+    payload: &[u8],
+    log_event_errors: bool,
+    lora: &mut LoraIndex,
 ) -> Result<EventActions, BridgeError> {
     let mut cursor = Cursor::new(payload);
     let value = read_value(&mut cursor).map_err(|error| BridgeError::Decode(error.to_string()))?;
@@ -577,7 +591,7 @@ fn decode_event_batch_impl(
     let events = expect_array(&batch[1], "KVEventBatch.events")?;
     let mut actions = EventActions::default();
     for (event_index, event) in events.iter().enumerate() {
-        if let Err(error) = decode_event(event, &mut actions) {
+        if let Err(error) = decode_event(event, &mut actions, lora) {
             if log_event_errors {
                 warn!(
                     event_index,
@@ -590,10 +604,14 @@ fn decode_event_batch_impl(
     Ok(actions)
 }
 
-fn decode_event(event: &Value, actions: &mut EventActions) -> Result<(), BridgeError> {
+fn decode_event(
+    event: &Value,
+    actions: &mut EventActions,
+    lora: &mut LoraIndex,
+) -> Result<(), BridgeError> {
     // `KVCacheEvent` is a tagged map (`tag=True` without `array_like`).
     match event {
-        Value::Map(entries) => decode_event_map(entries, actions),
+        Value::Map(entries) => decode_event_map(entries, actions, lora),
         _ => Err(BridgeError::Decode("KV event must be a map".to_string())),
     }
 }
@@ -620,6 +638,7 @@ fn required_map_field<'a>(
 fn decode_event_map(
     entries: &[(Value, Value)],
     actions: &mut EventActions,
+    lora: &mut LoraIndex,
 ) -> Result<(), BridgeError> {
     let event_type = expect_str(required_map_field(entries, "type")?, "KV event type")?;
     let medium = |field: &str| -> Result<Option<&str>, BridgeError> {
@@ -647,22 +666,69 @@ fn decode_event_map(
                 Some(value) => decode_optional_hash(value, "BlockStored.parent_block_hash")?,
                 None => None,
             };
-            actions.report(
-                tier,
-                parent_block_hash,
-                decode_hashes(required_map_field(entries, "block_hashes")?)?,
-                mask,
-                block_size,
-            );
+            let hashes = decode_hashes(required_map_field(entries, "block_hashes")?)?;
+            let name = map_field(entries, "lora_name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            if let Some(name) = name {
+                let tokens = expect_array(required_map_field(entries, "token_ids")?, "token_ids")?;
+                let bigram = tokens.first().is_some_and(|t| matches!(t, Value::Array(_)));
+                let mut flattened = Vec::new();
+                for token in tokens {
+                    if bigram {
+                        let pair = expect_array(token, "bigram token")?;
+                        if pair.len() != 2 {
+                            return Err(BridgeError::Decode("bigram token must be a pair".into()));
+                        }
+                        for value in pair {
+                            flattened.push(decode_token(value)?);
+                        }
+                    } else {
+                        flattened.push(decode_token(token)?);
+                    }
+                }
+                let size = decode_block_size(required_map_field(entries, "block_size")?)?;
+                let stores = lora.store(LoraStore {
+                    hashes,
+                    parent: parent_block_hash,
+                    tokens: flattened,
+                    block_size: size as usize,
+                    bigram,
+                    name: name.to_string(),
+                    salt: map_field(entries, "cache_salt")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    tiers: 1 << (tier - 1),
+                    component_mask: mask,
+                });
+                for stored in stores {
+                    for i in 0..3 {
+                        if stored.tiers & (1 << i) != 0 {
+                            actions.report(
+                                i + 1,
+                                stored.parent,
+                                stored.hashes.clone(),
+                                stored.component_mask,
+                                stored.component_mask.map(|_| stored.block_size as u32),
+                            );
+                        }
+                    }
+                }
+            } else {
+                actions.report(tier, parent_block_hash, hashes, mask, block_size);
+            }
         }
         "BlockRemoved" => {
             let tier = medium_to_tier(medium("BlockRemoved.medium")?)?;
-            actions.revoke(
-                tier,
-                decode_hashes(required_map_field(entries, "block_hashes")?)?,
-            );
+            let hashes = decode_hashes(required_map_field(entries, "block_hashes")?)?;
+            for (hash, bits) in lora.remove(&hashes, 1 << (tier - 1)) {
+                if bits != 0 {
+                    actions.revoke(tier, vec![hash]);
+                }
+            }
         }
         "AllBlocksCleared" => {
+            lora.clear();
             actions.clear_all();
         }
         other => {
@@ -670,6 +736,13 @@ fn decode_event_map(
         }
     }
     Ok(())
+}
+
+fn decode_token(value: &Value) -> Result<u32, BridgeError> {
+    value
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| BridgeError::Decode("token ID must be u32".into()))
 }
 
 fn decode_hashes(value: &Value) -> Result<Vec<i64>, BridgeError> {
@@ -1038,6 +1111,53 @@ mod tests {
             ]),
             vec![rep(hbm(), &["1"]), rev(hbm(), &["5"])]
         );
+    }
+
+    #[test]
+    fn lora_bridge_tracks_external_ids_across_batches_and_tier_moves() {
+        let mut map = LoraIndex::default();
+        let lora = |id, medium| {
+            stored_with_extra(
+                &[id],
+                None,
+                medium,
+                vec![("lora_name", Value::String("adapter-a".into()))],
+            )
+        };
+        let first =
+            decode_event_batch_with_lora(&batch(vec![lora(100, "GPU")]), false, &mut map).unwrap();
+        let Action::Report { hashes, .. } = &first.actions[0] else {
+            panic!("store expected")
+        };
+        let key = hashes[0];
+        assert_ne!(key, 100);
+        decode_event_batch_with_lora(
+            &batch(vec![lora(200, "GPU"), lora(100, "CPU_PINNED")]),
+            false,
+            &mut map,
+        )
+        .unwrap();
+        let actions =
+            decode_event_batch_with_lora(&batch(vec![removed(&[100], "GPU")]), false, &mut map)
+                .unwrap();
+        assert!(
+            actions.actions.is_empty(),
+            "another load still owns the GPU prefix"
+        );
+        let actions = decode_event_batch_with_lora(
+            &batch(vec![removed(&[200], "GPU"), removed(&[100], "CPU_PINNED")]),
+            false,
+            &mut map,
+        )
+        .unwrap();
+        assert_eq!(
+            actions.actions,
+            vec![
+                rev(hbm(), &[&key.to_string()]),
+                rev(dram(), &[&key.to_string()])
+            ]
+        );
+        assert!(map.snapshot().is_empty());
     }
 
     /// Wrap events in a 3-element batch [ts, events, attn_dp_rank].

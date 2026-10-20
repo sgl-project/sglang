@@ -34,7 +34,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 if TYPE_CHECKING:
@@ -232,7 +232,7 @@ class DeepseekMHARocmForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if get_parallel().dcp_enabled:
+                if self.dcp_size > 1:
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,

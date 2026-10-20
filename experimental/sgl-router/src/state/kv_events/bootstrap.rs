@@ -47,6 +47,9 @@ pub use vet::{VetError, VettedSnapshot};
 
 /// Wire-format version. Bump on any incompatible change to [`PeerSnapshot`].
 pub const SNAPSHOT_FORMAT: u32 = 1;
+/// LoRA aliases are required to interpret removals; older replicas must refuse these snapshots.
+pub const LORA_SNAPSHOT_FORMAT: u32 = 2;
+pub const LORA_MAPPINGS_PARAM: &str = "include_lora";
 
 /// Path the producer serves snapshots on.
 pub const SNAPSHOT_PATH: &str = "/internal/kv_snapshot";
@@ -290,6 +293,9 @@ pub struct PeerSnapshot {
     pub cursors: Vec<(u32, i64)>,
     /// Tree nodes in dependency order; see [`SnapshotNode`].
     pub nodes: Vec<SnapshotNode>,
+    /// Per-worker opaque LoRA IDs needed to apply subsequent removals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lora_blocks: Vec<(u32, Vec<sgl_kv_indexer::lora::LoraBlock>)>,
     /// Ranks the producer is subscribed to but held no tree node for at export
     /// time: ranks it is still bootstrapping itself (their batches are held,
     /// not applied), and ranks whose applied stream left nothing standing.
@@ -361,6 +367,8 @@ mod test_support {
 
     pub(super) fn sample_snapshot() -> PeerSnapshot {
         PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 64,
             is_bigram: true,
@@ -406,6 +414,8 @@ mod tests {
     #[test]
     fn wire_cursor_is_addressed_by_identity_not_table_position() {
         let snap = PeerSnapshot {
+            lora_blocks: Vec::new(),
+
             format: SNAPSHOT_FORMAT,
             block_size: 4,
             is_bigram: false,

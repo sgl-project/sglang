@@ -8,8 +8,9 @@
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
 // fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
-// DP-Attention, DeepEP and MegaMoE are absent by design: they have never been
-// enabled on this model. EP is set equal to TP on every shape except MI355X.
+// DP-Attention, DeepEP and MegaMoE are absent by design. DeepEP and MegaMoE have
+// never been enabled on this model; DP-Attention runs in the MI355X agentic recipe
+// (cookbook §3.6). EP is set equal to TP on every shape except MI355X.
 
 export const config = {
   modelName: "DeepSeek-V4.1",
@@ -55,7 +56,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261006",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261013",
   },
 
   github: {
@@ -165,9 +166,9 @@ export const config = {
         title: "Decoder SWA Bounded Replay",
         control: "select",
         options: [
-          { id: "off", label: "Off (default)" },
-          { id: "on", label: "On (faster prefill)",
-            flags: ["--enable-decoder-swa-bounded-replay"] },
+          { id: "on", label: "Automatic (default)" },
+          { id: "off", label: "Off (full prefill)",
+            flags: ["--no-enable-decoder-swa-bounded-replay"] },
         ],
       },
     ],
@@ -233,7 +234,6 @@ export const config = {
         "--mem-fraction-static 0.8",
         "--attention-backend dsv4",
         "--moe-runner-backend flashinfer_mxfp4",
-        "--enable-decoder-swa-bounded-replay",
         // Decode CUDA graphs: the derived batch list does not fit here.
         "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
@@ -355,6 +355,8 @@ export const config = {
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
+        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -373,7 +375,6 @@ export const config = {
         // Decode CUDA graphs: the derived batch list does not fit here; a cap of 64
         // fits and keeps 64-request decode batches on the graph.
         "--cuda-graph-max-bs-decode 64",
-        "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-backend-prefill disabled",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
@@ -391,6 +392,8 @@ export const config = {
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
+        "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
+        "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -406,7 +409,6 @@ export const config = {
         "--fp8-gemm-backend aiter",
         "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 128",
-        "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-backend-prefill disabled",
         "--reasoning-parser auto",
         "--tool-call-parser auto",

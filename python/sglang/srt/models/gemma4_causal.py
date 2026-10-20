@@ -636,7 +636,7 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = None
 
         # Parallel MoE
-        self.enable_moe_block = getattr(config, "enable_moe_block", False)
+        self.enable_moe_block = self._enable_moe_block(config)
         if self.enable_moe_block:
             self.router = Gemma4Router(
                 config,
@@ -671,20 +671,37 @@ class Gemma4DecoderLayer(nn.Module):
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
+        attn, ffn = self.stage_facts(
+            config, layer_id, post_attention_layernorm=self.post_attention_layernorm
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (
-                declare_attn(
-                    output_transform=OutputTransform(self.post_attention_layernorm)
-                ),
-                self.input_layernorm,
-            ),
-            (
-                declare_ffn(
-                    sparse=self.enable_moe_block,
-                    next_layer_sparse=self.enable_moe_block,
-                    update=REPLACE_AT_EXIT,
-                ),
-                self.pre_feedforward_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.pre_feedforward_layernorm),
+        )
+
+    @staticmethod
+    def _enable_moe_block(config: PretrainedConfig) -> bool:
+        return getattr(config, "enable_moe_block", False)
+
+    @classmethod
+    def stage_facts(
+        cls,
+        config: PretrainedConfig,
+        layer_id: int,
+        *,
+        post_attention_layernorm=None,
+    ):
+        """The stages a Gemma 4 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). The attention's output norm is its output
+        transform."""
+        enable_moe_block = cls._enable_moe_block(config)
+        return (
+            declare_attn(output_transform=OutputTransform(post_attention_layernorm)),
+            declare_ffn(
+                sparse=enable_moe_block,
+                next_layer_sparse=enable_moe_block,
+                update=REPLACE_AT_EXIT,
             ),
         )
 
@@ -919,6 +936,7 @@ class Gemma4TextModel(PreTrainedModel):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Gemma4DecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

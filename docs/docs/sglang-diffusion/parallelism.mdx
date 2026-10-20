@@ -112,6 +112,28 @@ identical to the NCCL path.
 | `SGLANG_DIFFUSION_IPC_A2A` | `1` | set `0` to force NCCL |
 | `SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS` | `10000` | deadlock backstop for the peer wait; on expiry the transport retires on every rank and the request fails rather than returning incomplete data |
 | `SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS` | `16` | staging pairs kept alive; raise for many-resolution serving |
+| `SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS` | `-1` | head groups for the pipelined exchange below; `0` keeps the sequential exchange, `N >= 2` forces `N` groups |
+
+On a single host with peer-to-peer access, Ulysses attention also pipelines
+the exchange against attention, one head group at a time: while group g
+attends, group g + 1's q/k/v moves on the copy engine, and finished groups send
+their output back while later groups still attend. Every Ulysses path of
+`USPAttention` goes through it under FlashAttention or cuDNN SDPA, at any batch
+size and with GQA: dense attention, key masks and tail padding, and text tokens
+replicated on every rank (a prefix, a suffix, or a K/V-only prefix), which stay
+out of the exchange. MiniMax-H3's attention uses the same transport. Ring
+attention, uneven sequence shards (`seq_lens`) and the K/V-gather mode keep the
+sequential exchange. The automatic count is the largest of 7, 5, 4, 3 and 2
+that divides the heads per rank while each group's call still fills four waves
+of 128-row tiles, so short sequences such as a 1024² image keep the sequential
+exchange. Its buffers are one pool per dtype that every shape shares, grown to
+the largest (about 4 × rows per rank × heads × head_dim); a shape that would
+not fit on every rank keeps the sequential exchange. The first call of every
+shape runs both exchanges and keeps the pipeline only if they give the same
+bytes on every rank, so results never change; that check runs the sequential
+exchange on per-call buffers, so no staging for it stays allocated. A custom
+attention module reuses it through
+`ulysses_pipelined_attention(q, k, v, attend, groups, replicated=..., sequential=...)`.
 
 Independently of the transport, the default path already packs the three
 Q/K/V input exchanges into one destination-major collective. A handful of
