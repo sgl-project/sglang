@@ -165,6 +165,15 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _built_runner_backend(quant_method: FusedMoEMethodBase):
+    # The layer calls create_moe_runner before building its dispatcher, so the
+    # runner the quant method actually picked is known here. Methods that keep
+    # no runner of their own (including wrappers that build one on an inner
+    # scheme) return None and the dispatcher follows --moe-runner-backend.
+    runner = quant_method.runner
+    return None if runner is None else runner.runner_backend
+
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
@@ -183,7 +192,9 @@ def create_moe_dispatcher(
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
         # dispatcher stays a pure noop passthrough.
-        return StandardDispatcher(moe_runner_config)
+        return StandardDispatcher(
+            moe_runner_config, runner_backend=_built_runner_backend(quant_method)
+        )
     elif (
         a2a_backend.is_deepep()
         or a2a_backend.is_mooncake()
