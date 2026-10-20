@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     run_bench_one_batch,
 )
 
-register_xpu_ci(est_time=600, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=45, suite="stage-b-test-1-gpu-xpu")
 
 _CI_IO_ARGS = ["--input", "64", "--output", "4"]
 _FULL_IO_ARGS = ["--input", "128", "--output", "16"]
