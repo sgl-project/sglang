@@ -54,7 +54,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import LazyImport
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -369,38 +368,6 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
-
-    # Resolved on first call: CUDA builds without FlashInfer must still import
-    # this module.
-    _raw_bmm_fp8_batched = LazyImport("flashinfer", "bmm_fp8")
-
-    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
-    def _bmm_fp8_batched_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
-
-    def bmm_fp8(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
-        return out
 
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -932,19 +899,19 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
         )
     if backend.is_gfx95_dot_scaled():
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
         return dot_scaled_mxfp8_blockscaled_linear
     if backend.is_gfx95_mxfp8_native():
-        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
             mxfp8_native_blockscaled_linear,
         )
 
         return mxfp8_native_blockscaled_linear
     if backend.is_gfx95_mxfp8_aiter():
-        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import (
             aiter_mxfp8_blockscaled_linear,
         )
 
@@ -993,7 +960,7 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
         dot_scaled_mxfp8_blockscaled_linear,
     )
 
