@@ -11,7 +11,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InitLoadBackParams,
     InsertParams,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -33,6 +36,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_children,
     node_device_value,
     node_host_value,
+    node_key_length,
     node_parent,
     node_token_ids,
     write_backup,
@@ -325,6 +329,43 @@ class UnifiedRadixCacheFixtures:
         chain.reverse()
         return chain
 
+    def _hicache_chain(self, num_pages=3):
+        """A HiCache fixture holding ``_build_chain_pages(num_pages)``; skips when nodes merged."""
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, num_pages)
+        if len(chain) < num_pages:
+            self.skipTest("chain too short")
+        return cache, allocator, req_to_token_pool, chain
+
+    def _evict_to_host(self, cache, leaf, *, pin=None):
+        """Back ``leaf`` up and evict it to host; ``pin`` (its parent) is kept locked meanwhile."""
+        self._backup_node(cache, leaf)
+        lock = cache.inc_lock_ref(pin) if pin is not None else None
+        try:
+            cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        finally:
+            if lock is not None:
+                cache.dec_lock_ref(pin, lock.to_dec_params())
+
+    def _match_for_load_back(self, cache, req_to_token_pool, tokens):
+        """Match ``tokens`` for a fresh request and apply the match to it."""
+        req = self._make_req(req_to_token_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        return req, match
+
+    def _init_load_back(self, cache, req, **kwargs):
+        return cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+                **kwargs,
+            )
+        )
+
     def _release_ongoing_load_back_locks(self, cache):
         for node, lock_params, host_lock_params in list(
             cache.ongoing_load_back.values()
@@ -403,18 +444,8 @@ class UnifiedRadixCacheFixtures:
         exits before reaching N. Anchor=Y has only 1 page and walks into
         N's tombstone.
         """
-        if not self.cfg.has_swa:
-            self.skipTest("requires SWA")
-        if self.cfg.has_mamba:
-            self.skipTest("SWA-only path keeps the chain construction simple")
-        ps = self.cfg.page_size
-        sw = self.cfg.sliding_window_size
-        if ps >= sw:
-            self.skipTest("test scenario requires ps < sw")
-        window_pages = (sw + ps - 1) // ps
+        window_pages = self.cfg.sw_pages
         chain_pages = window_pages + 3
-        if chain_pages * ps > self.cfg.kv_size // 2:
-            self.skipTest("kv_size too small for the desired chain")
 
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(

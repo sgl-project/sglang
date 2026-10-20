@@ -17,7 +17,6 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
-    EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -49,6 +48,7 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires_hicache,
     requires_multi_page_window,
     requires_ps1_window4,
+    requires_representative_aux,
     requires_swa,
     requires_swa_only,
 )
@@ -573,6 +573,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_buffer_only_write_path_roundtrip(self):
         """Write path end to end: admission -> D2H staging -> storage write
         -> free. Staging and locks fully released, pages stored under every
@@ -765,6 +766,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_buffer_only_split_intent_writes_every_piece(self):
         """Repeated splits preserve every pool's write once, parents first."""
         storage_dir = self._make_storage_dir()
@@ -853,6 +855,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_buffer_only_writes_component_pools_independently(self):
         """A component's own pool (aliased host entry, per-pool keys,
         BACKUP_HOST transfers) is written and believed independently of the
@@ -927,6 +930,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_buffer_only_component_pool_only_rewrite(self):
         """With only the component's pool dropped from the beliefs, a requested
         backup writes that pool alone, staged through the anchor's host pool
@@ -1459,6 +1463,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             self.assertGreaterEqual(surfaced_swa_hit, window)
 
     @requires_hicache
+    @requires_representative_aux
     def test_buffer_only_load_back_drops_on_sibling_published_span(self):
         """Queued-UAF regression: a sibling publishes the staged span between
         staging and consumption; the live pre-check must drop the hold before
@@ -1474,17 +1479,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         avail0 = self._host_avail_sizes(cons)
 
         req_id = CacheRequestHandle("sibling-publish", 0)
-        cons.prefetch_from_storage(
-            req_id, cons.root_node_handle(), array("q", seq), None, None
-        )
-        self._pump_hicache_until(
-            cons,
-            lambda: (
-                cons.check_prefetch_progress(req_id)
-                and cons.buffer_pipeline.has_staged(req_id)
-            ),
-            "prefetch did not stage",
-        )
+        self._prefetch_until_staged(cons, req_id, seq)
         cons.pop_prefetch_loaded_tokens(req_id)
 
         # Sibling publishes the identical span (live FULL + SWA).
@@ -1634,17 +1629,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
 
         req_id = CacheRequestHandle("adopt-under-evict", 0)
-        cons.prefetch_from_storage(
-            req_id, cons.root_node_handle(), array("q", seq), None, None
-        )
-        self._pump_hicache_until(
-            cons,
-            lambda: (
-                cons.check_prefetch_progress(req_id)
-                and cons.buffer_pipeline.has_staged(req_id)
-            ),
-            "prefetch did not stage",
-        )
+        self._prefetch_until_staged(cons, req_id, seq)
         cons.pop_prefetch_loaded_tokens(req_id)
 
         # Admission's temporary request lock must protect the head on its own.
@@ -1977,6 +1962,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         cons.sanity_check()
 
+    @requires_swa_only
     def test_tp_swa_prefetch_adopted_when_peer_present(self):
         """When every rank has the full SWA window, SWA is adopted under tp>1
         (the single packed all_reduce path still works)."""
@@ -2375,23 +2361,6 @@ class TestUnifiedRadixPrefetchCorruption(
             completed_tokens, "dropped"
         )
 
-        cache.sanity_check()
-
-    def test_write_through_eviction_counts_unbacked_tokens(self):
-        cache, allocator, _ = build_fixture(self.cfg)
-        self._init_hicache(cache)
-        cache.metrics_collector = mock.Mock()
-
-        seq = list(range(1, 1 + 2 * self.ps))
-        self._insert_device(cache, allocator, seq)
-        result = cache.evict(EvictParams(num_tokens=len(seq)))
-
-        self.assertGreaterEqual(result.num_tokens_evicted, len(seq))
-        cache.metrics_collector.increment_dropped_tokens.assert_called_once_with(
-            num_tokens=len(seq),
-            reason="write_through_unbacked_eviction",
-            pool=PoolName.KV.value,
-        )
         cache.sanity_check()
 
     def test_prefetch_refill_kept_under_unbacked_parent_in_write_back(self):

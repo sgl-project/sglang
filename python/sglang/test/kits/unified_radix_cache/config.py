@@ -276,6 +276,74 @@ requires_full_mamba_ps1 = requires(
 )
 
 
+def _full_only(cfg):
+    return cfg.components == (ComponentType.FULL,)
+
+
+requires_aux = requires(
+    lambda cfg: cfg.has_swa or cfg.has_mamba, "requires an aux component"
+)
+
+
+requires_single_aux = requires(
+    lambda cfg: cfg.has_swa != cfg.has_mamba, "requires exactly one aux component"
+)
+
+
+def supports_swa_anchor_chain(cfg):
+    """SWA-only, page_size < window, and the 3-page-padded window chain fits half the pool."""
+    if not cfg.has_swa or cfg.has_mamba or cfg.page_size >= cfg.sliding_window_size:
+        return False
+    return (cfg.sw_pages + 3) * cfg.page_size <= cfg.kv_size // 2
+
+
+requires_swa_anchor_chain = requires(
+    supports_swa_anchor_chain, "requires the SWA anchor chain to fit the pool"
+)
+
+
+def supports_swa_lru_pinning(cfg):
+    """SWA-only, an 8-page node spans the cushion, and the 4 chain inserts plus a side branch fit the pool."""
+    if not cfg.has_swa or cfg.has_mamba:
+        return False
+    if 8 * cfg.page_size < cfg.sliding_window_size + cfg.page_size:
+        return False
+    return cfg.kv_size >= (4 * 8 + 5) * cfg.page_size
+
+
+requires_swa_lru_pinning = requires(
+    supports_swa_lru_pinning, "requires SWA-only with node size >= cushion"
+)
+
+
+# Representative subsets for tests that reach the same code on every config of a
+# dimension. Each keeps an explicit small set instead of the whole matrix.
+
+# Drops page_size 16/64/128 (page alignment is the same arithmetic as ps 4) and
+# every aux stack (the body never touches an aux component).
+requires_representative_full = requires(
+    lambda cfg: _full_only(cfg) and cfg.page_size in (1, 4),
+    "Full-only logic: FULL ps1 and FULL paged (ps4)",
+)
+
+
+# Drops page_size 16/64/128, SWA windows other than 4, Mamba ps64/128 (same
+# arithmetic and kernels as ps4) and Full+SWA+Mamba ps64; keeps one config per
+# aux kind and buffer mode, since lock/evict/insert hooks run per component.
+requires_representative_aux = requires(
+    lambda cfg: (
+        cfg.page_size in (1, 4)
+        and (
+            _full_only(cfg)
+            or (cfg.has_swa and not cfg.has_mamba and cfg.sliding_window_size == 4)
+            or (cfg.has_mamba and not cfg.has_swa)
+            or (cfg.has_swa and cfg.has_mamba and cfg.page_size == 1)
+        )
+    ),
+    "aux hooks: FULL ps1/ps4, SWA w4 ps1/ps4, Mamba ps1/ps4, SWA+Mamba ps1",
+)
+
+
 def config_attrs(suite, cfg):
     """Bind the test mixin ``suite`` to ``cfg``, hiding the tests whose requirements it fails."""
     attrs = {"cfg": cfg}

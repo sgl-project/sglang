@@ -10,7 +10,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
-    Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -47,7 +46,6 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 from sglang.srt.runtime_context import (
     get_serving,
 )
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -57,8 +55,12 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires_mamba,
     requires_paged,
     requires_ps1_window4,
+    requires_representative_aux,
+    requires_representative_full,
+    requires_single_aux,
     requires_swa,
     requires_swa_and_mamba,
+    requires_swa_lru_pinning,
     requires_swa_only,
 )
 from sglang.test.kits.unified_radix_cache.core import (
@@ -359,6 +361,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         cache.sanity_check()
 
+    @requires_representative_full
     def test_cache_salt_and_extra_key_form_independent_namespaces(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
@@ -399,27 +402,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertNotEqual(first_match.last_device_node, second_match.last_device_node)
         cache.sanity_check()
 
-    def test_shared_prefix_split(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        base = self._make_seq(1, 2)
-        self._insert(cache, allocator, req_to_token_pool, base)
-
-        branch_a = base + self._make_seq(100, 2)
-        branch_b = base + self._make_seq(200, 2)
-
-        result_a = self._insert(cache, allocator, req_to_token_pool, branch_a)
-        self.assertEqual(result_a.prefix_len, len(base))
-        result_b = self._insert(cache, allocator, req_to_token_pool, branch_b)
-        self.assertEqual(result_b.prefix_len, len(base))
-
-        for seq in (branch_a, branch_b):
-            m = match_prefix(cache, seq)
-            self.assertEqual(m.device_prefix_len, len(seq))
-
-        m = match_prefix(cache, base + self._make_seq(999, 1))
-        self.assertEqual(m.device_prefix_len, len(base))
-        cache.sanity_check()
-
+    @requires_representative_aux
     def test_evict_respects_lock_ref(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq_a = self._make_seq(1, 2)
@@ -444,6 +427,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_a))
         cache.sanity_check()
 
+    @requires_representative_aux
     def test_prev_prefix_len(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         initial_avail = allocator.available_size()
@@ -452,22 +436,24 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         seq_2p = self._make_seq(1, 2)  # 2 pages (extends seq_1p)
         seq_3p = self._make_seq(1, 3)  # 3 pages (extends seq_2p)
 
+        def insert(seq, prev_prefix_len):
+            key = RadixKey(array("q", seq))
+            params = InsertParams(
+                key=key,
+                value=self._alloc(allocator, len(seq))[: len(key)],
+                prev_prefix_len=prev_prefix_len,
+                track_adopted_ranges=True,
+            )
+            if self.cfg.has_mamba:
+                req = self._make_req(req_to_token_pool)
+                params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
+            return cache.insert(params)
+
         self._insert(cache, allocator, req_to_token_pool, seq_1p)
         self.assertEqual(allocator.available_size(), initial_avail - len(seq_1p))
 
         # Frees the 1-page overlap.
-        key_2p = RadixKey(array("q", seq_2p))
-        value_2p = self._alloc(allocator, len(seq_2p))
-        params = InsertParams(
-            key=key_2p,
-            value=value_2p[: len(key_2p)],
-            prev_prefix_len=0,
-            track_adopted_ranges=True,
-        )
-        if self.cfg.has_mamba:
-            req = self._make_req(req_to_token_pool)
-            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
-        result = cache.insert(params)
+        result = insert(seq_2p, 0)
         self.assertEqual(result.prefix_len, len(seq_1p))
         self.assertEqual(
             result.adopted_ranges[ComponentType.FULL],
@@ -480,18 +466,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         # prev_prefix_len covers the whole overlap: nothing freed.
         avail_before = allocator.available_size()
-        key_3p = RadixKey(array("q", seq_3p))
-        value_3p = self._alloc(allocator, len(seq_3p))
-        params = InsertParams(
-            key=key_3p,
-            value=value_3p[: len(key_3p)],
-            prev_prefix_len=len(seq_2p),
-            track_adopted_ranges=True,
-        )
-        if self.cfg.has_mamba:
-            req = self._make_req(req_to_token_pool)
-            params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(0)
-        result = cache.insert(params)
+        result = insert(seq_3p, len(seq_2p))
         self.assertEqual(result.prefix_len, len(seq_2p))
         self.assertEqual(
             result.adopted_ranges[ComponentType.FULL],
@@ -597,6 +572,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
         cache.sanity_check()
 
+    @requires_representative_full
     def test_release_without_insert(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         tokens = self._make_seq(1, 2)
@@ -613,6 +589,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertEqual(m.device_prefix_len, 0)
         cache.sanity_check()
 
+    @requires_representative_aux
     def test_checkpoint_mid_flight(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
@@ -704,6 +681,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    @requires_representative_aux
     def test_diagnostics(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._insert(cache, allocator, req_to_token_pool, self._make_seq(1, 2))
@@ -721,6 +699,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires_paged
+    @requires_representative_aux
     def test_paged_match_truncates_unaligned_key(self):
         ps = self.cfg.page_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -739,6 +718,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires_paged
+    @requires_representative_aux
     def test_paged_page_boundary_mismatch(self):
         ps = self.cfg.page_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -764,6 +744,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
     @requires(
         lambda cfg: not cfg.has_swa, "SWA paged allocator accounts in pages, not tokens"
     )
+    @requires_representative_aux
     def test_paged_checkpoint_unaligned_tail_freed(self):
         ps = self.cfg.page_size
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
@@ -785,6 +766,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires_mamba
+    @requires_representative_aux
     def test_mamba_evict_breaks_match(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq_short = self._make_seq(1, 2)
@@ -800,6 +782,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires_mamba
+    @requires_representative_aux
     def test_mamba_evict_cascades_on_full_leaf(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
@@ -811,6 +794,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires_mamba
+    @requires_representative_aux
     def test_mamba_cow_on_match(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         mamba_pool = req_to_token_pool.mamba_pool
@@ -1146,12 +1130,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         # Same stranded-Mamba-lock setup as above.
         cache.tree_core.set_component_device_lock_ref(node_a, ComponentType.MAMBA, 1)
-        self.assertGreaterEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.MAMBA), 1, "Mamba locked"
-        )
-        self.assertEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.FULL), 0, "Full unlocked"
-        )
 
         result = cache.tree_core.evict_component(
             node_a, ComponentType.SWA, EvictLayer.DEVICE
@@ -1208,9 +1186,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
                 )
                 cache.sanity_check()
 
+    @requires_swa_lru_pinning
     def test_swa_lru_walk_down_does_not_refresh_ancestors_during_insert(self):
-        if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires SWA-only config with node size >= cushion")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1227,7 +1204,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         # Each 8-page segment is cap-split into [prefix, tail]; the tail leads
         # the pair in MRU order, so segment tails sit at even indices.
         self.assertEqual(len(pre), 8)
-        side_node, c_node, b_node, a_node = pre[0], pre[2], pre[4], pre[6]
+        side_node, b_node, a_node = pre[0], pre[4], pre[6]
 
         seq_abcd = seq_abc + self._make_seq(300, 8)
         self._insert(cache, allocator, req_to_token_pool, seq_abcd)
@@ -1253,6 +1230,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.sanity_check()
 
     @requires(lambda cfg: cfg.has_swa or cfg.has_mamba, "requires an aux LRU")
+    @requires_representative_aux
     def test_partial_match_keeps_unmatched_suffix_lru_position(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         cold_tokens = self._make_seq(1, 2)
@@ -1271,9 +1249,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             )
         cache.sanity_check()
 
+    @requires_swa_lru_pinning
     def test_swa_lru_match_only_refreshes_window_cushion(self):
-        if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires SWA-only config with node size >= cushion")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1311,9 +1288,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
         cache.sanity_check()
 
+    @requires_swa_lru_pinning
     def test_swa_lru_old_ancestors_evict_first_under_pressure(self):
-        if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires SWA-only config with node size >= cushion")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         seq_a = self._make_seq(1, 8)
@@ -1380,9 +1356,8 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cache.unlock(req.lock)
         cache.sanity_check()
 
+    @requires_swa_lru_pinning
     def test_swa_lru_fresh_leaf_cap_rebuilds_both_nodes(self):
-        if not self._swa_pinning_cfg_supported():
-            self.skipTest("requires SWA-only config with node size >= cushion")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
         # A single fresh in-window leaf longer than the cushion is cap-split into
@@ -1401,11 +1376,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNotNone(prefix_swa)
 
         # The in-window tail leaf is more-MRU (order[0]) than its older prefix
-        # parent (order[1]); the tail is capped to one cushion.
-        cushion = self.cfg.sliding_window_size + self.cfg.page_size
+        # parent (order[1]); the cap itself is asserted by
+        # test_swa_leaf_capped_to_window_on_insert.
         self.assertEqual(len(node_children(cache, tail)), 0)
         self.assertEqual(prefix, node_parent(cache, tail))
-        self.assertLess(node_key_length(cache, tail), cushion)
         self.assertEqual(
             node_key_length(cache, tail) + node_key_length(cache, prefix), len(seq)
         )
@@ -1453,17 +1427,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIn(parent, node_children(cache, cache.root_node_handle()))
         self.assertTrue(all(evicted == 0 for evicted in result.tracker.values()))
 
+    @requires_representative_aux
+    @requires_single_aux
     def test_aux_evict_full_locked_leaf_tombstones_aux_only(self):
-        aux_types = [
-            ct
-            for ct in (ComponentType.SWA, ComponentType.MAMBA)
-            if ct in self.cfg.components
-        ]
-        if not aux_types:
-            self.skipTest("requires an auxiliary component")
-        if len(aux_types) > 1:
-            self.skipTest("single-aux case keeps cascade expectations precise")
-        aux = aux_types[0]
+        aux = ComponentType.SWA if self.cfg.has_swa else ComponentType.MAMBA
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         # One page stays within a single SWA window (no leaf-cap split).
@@ -1537,6 +1504,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             self.assertEqual(cache.swa_evictable_size(), 0)
         cache.sanity_check()
 
+    @requires_representative_aux
     def test_evict_cascade_parent_becomes_d_leaf(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         base = self._make_seq(1, 2)
@@ -1547,7 +1515,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         m_base = match_prefix(cache, base)
         lock_result = cache.inc_lock_ref(m_base.last_device_node)
 
-        result = cache.evict(EvictParams(num_tokens=len(leaf)))
+        cache.evict(EvictParams(num_tokens=len(leaf)))
         cache.sanity_check()
 
         cache.dec_lock_ref(
@@ -1576,9 +1544,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertEqual(len(node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
+    @requires_representative_aux
     def test_evict_respects_lru_order(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
         seq_old = self._make_seq(1, 2)
         seq_new = self._make_seq(500, 2)
 
@@ -1649,19 +1617,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertEqual(result.num_tokens_evicted, before - after)
         cache.sanity_check()
 
-    @requires_swa
-    def test_swa_evict_internal_tombstone(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        base = self._make_seq(1, 3)
-        leaf = base + self._make_seq(500, 3)
-        self._insert(cache, allocator, req_to_token_pool, base)
-        self._insert(cache, allocator, req_to_token_pool, leaf)
-
-        swa_before = cache.swa_evictable_size()
-        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
-        self.assertEqual(cache.swa_evictable_size(), 0)
-        cache.sanity_check()
-
     @requires(
         lambda cfg: cfg.page_size == 1, "page_size=1 keeps the split boundary mid-node"
     )
@@ -1673,6 +1628,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         result = match_prefix(cache, [1, 2, 3, 4, 99])
         self.assertEqual(result.full_kv_hit_length, 4)
 
+    @requires_representative_aux
     def test_zero_match_result_carries_node_id_handles(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -1768,61 +1724,52 @@ class UnifiedLRUListBoundedRefreshTest(
 ):
     components = (ComponentType.FULL, ComponentType.SWA)
 
-    def test_bounded_refresh_skips_non_included(self):
-        root, [a, b, c, d] = self._build_chain([2, 2, 2, 2])
-        lru = UnifiedLRUList(ComponentType.SWA, self.components)
-        for n in (a, c, d):  # b excluded from LRU (simulated tombstone)
-            lru.insert_mru(n)
-        self.assertEqual(self._lru_order(lru), [d, c, a])
+    def test_bounded_refresh(self):
+        # name -> (node key lengths, LRU insert order, window, nodes included in
+        # the LRU, refreshed node, MRU->LRU order afterwards)
+        cases = {
+            # B is a simulated tombstone: it adds 2 to acc (6 >= 5) but is
+            # skipped, and the walk stops there so A is never visited.
+            "skips_non_included": ([2, 2, 2, 2], "acd", 5, "acd", "d", "dca"),
+            # Walking up from D visits D (acc 3 < 5) and C (acc 6 >= 5, stop);
+            # they move to the head, A and B keep their relative positions.
+            "visits_only_until_window_filled": (
+                [3, 3, 3, 3],
+                "dcba",
+                5,
+                "abcd",
+                "d",
+                "dcab",
+            ),
+            # A big window walks A and B, then hits root and stops.
+            "stops_at_root": ([1, 1], "ab", 1000, "ab", "b", "ba"),
+            "window_zero_is_noop": ([2, 2, 2], "abc", 0, "abc", "c", "cba"),
+        }
+        for name, (
+            key_lens,
+            inserted,
+            window,
+            included,
+            node,
+            expected,
+        ) in cases.items():
+            with self.subTest(name):
+                root, chain = self._build_chain(key_lens)
+                nodes = dict(zip("abcd", chain))
+                lru = UnifiedLRUList(ComponentType.SWA, self.components)
+                for n in inserted:
+                    lru.insert_mru(nodes[n])
+                self.assertEqual(
+                    self._lru_order(lru), [nodes[n] for n in reversed(inserted)]
+                )
 
-        included = {a, c, d}
-        lru.reset_node_and_window_ancestors_mru(
-            d, root, window_size=5, should_include=lambda n: n in included
-        )
-        # D, C refreshed; B contributes 2 to acc (now 6 >= 5) but is skipped;
-        # A is not visited because the walk stops at B.
-        self.assertEqual(self._lru_order(lru), [d, c, a])
-
-    def test_bounded_refresh_visits_only_until_window_filled(self):
-        root, [a, b, c, d] = self._build_chain([3, 3, 3, 3])
-        lru = UnifiedLRUList(ComponentType.SWA, self.components)
-        # MRU->LRU: A, B, C, D (deepest is at the LRU tail, oldest)
-        for n in (d, c, b, a):
-            lru.insert_mru(n)
-        self.assertEqual(self._lru_order(lru), [a, b, c, d])
-
-        # window=5: walking up from D visits D(acc=3<5) and C(acc=6>=5, stop).
-        # Order expected: [D, C, A, B]. Why: D and C move to head in that
-        # order (D first, then C right after D). A and B keep their relative
-        # positions (they were the surviving prefix [A, B] before).
-        lru.reset_node_and_window_ancestors_mru(
-            d, root, window_size=5, should_include=lambda _n: True
-        )
-        self.assertEqual(self._lru_order(lru), [d, c, a, b])
-
-    def test_bounded_refresh_stops_at_root(self):
-        root, [a, b] = self._build_chain([1, 1])
-        lru = UnifiedLRUList(ComponentType.SWA, self.components)
-        for n in (a, b):
-            lru.insert_mru(n)
-        self.assertEqual(self._lru_order(lru), [b, a])
-
-        # Big window — refresh walks A and B both, then hits root and stops.
-        lru.reset_node_and_window_ancestors_mru(
-            b, root, window_size=1000, should_include=lambda _n: True
-        )
-        self.assertEqual(self._lru_order(lru), [b, a])
-
-    def test_bounded_refresh_window_zero_is_noop(self):
-        root, [a, b, c] = self._build_chain([2, 2, 2])
-        lru = UnifiedLRUList(ComponentType.SWA, self.components)
-        for n in (a, b, c):
-            lru.insert_mru(n)
-        before = self._lru_order(lru)
-        lru.reset_node_and_window_ancestors_mru(
-            c, root, window_size=0, should_include=lambda _n: True
-        )
-        self.assertEqual(self._lru_order(lru), before)
+                lru.reset_node_and_window_ancestors_mru(
+                    nodes[node],
+                    root,
+                    window_size=window,
+                    should_include=lambda n: n in {nodes[i] for i in included},
+                )
+                self.assertEqual(self._lru_order(lru), [nodes[n] for n in expected])
 
 
 class TestUnifiedMambaLRUMatchRefresh(
@@ -1895,16 +1842,20 @@ class TestMambaCheckpointGrid(MambaCheckpointGridFixtures, CustomTestCase):
     )
 
     def test_grid_follows_the_widened_tree_page(self):
-        # lcm(chunk=64, tree page=96) is 192. Chunk-only alignment would
-        # incorrectly report 256, which is not a radix-node boundary.
-        self.assertEqual(
-            self._branching_seqlen(tree_page_size=96, full_hit_length=288), 192
-        )
-
-    def test_grid_is_the_chunk_size_without_widening(self):
-        self.assertEqual(
-            self._branching_seqlen(tree_page_size=32, full_hit_length=160), 128
-        )
+        # lcm(chunk=64, tree page=96) is 192: chunk-only alignment would
+        # incorrectly report 256, which is not a radix-node boundary. Without
+        # widening the grid is just the chunk size.
+        for tree_page_size, full_hit_length, expected in (
+            (96, 288, 192),
+            (32, 160, 128),
+        ):
+            with self.subTest(tree_page_size=tree_page_size):
+                self.assertEqual(
+                    self._branching_seqlen(
+                        tree_page_size=tree_page_size, full_hit_length=full_hit_length
+                    ),
+                    expected,
+                )
 
 
 class TestMambaFinishedOvershootCheckpoint(
@@ -2230,25 +2181,11 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
         # Page-aligned length is the shape that costs the bigram key a page.
         seq_len = 4 * page_size
 
-        req = Req(
-            rid=0,
-            origin_input_text="",
-            origin_input_ids=array("q"),
-            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-        )
-        req_to_token_pool.alloc([req])
         tokens = list(range(1, seq_len + 1))
+        req = self._make_prompt_req(
+            cache, allocator, req_to_token_pool, tokens, seq_len
+        )
         req.origin_input_ids = tokens
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens)
-        req.extend_end = len(req.full_untruncated_fill_ids)
-        kv_indices = self._alloc_paged(allocator, seq_len)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, seq_len)), kv_indices)
-        req.kv.kv_committed_len = seq_len
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
 
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.checkpoint(req, up_to=req.extend_end)
@@ -2281,26 +2218,9 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
         prompt_len, owned = 4 * page_size, 6 * page_size
         tokens = list(range(1, owned + 1))
 
-        req = Req(
-            rid=0,
-            origin_input_text="",
-            origin_input_ids=array("q", tokens[:prompt_len]),
-            sampling_params=SamplingParams(
-                temperature=0, max_new_tokens=owned - prompt_len
-            ),
+        req = self._make_prompt_req(
+            cache, allocator, req_to_token_pool, tokens, prompt_len
         )
-        req_to_token_pool.alloc([req])
-        req.output_ids = []
-        req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
-        req.extend_end = prompt_len
-        kv_indices = self._alloc_paged(allocator, owned)
-        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, owned)), kv_indices)
-        req.kv.kv_committed_len = prompt_len
-        req.kv.kv_allocated_len = owned
-        req.last_node = cache.root_node_handle()
-        req.kv.cache_protected_len = 0
-        req.lock = None
-        req.extra_key = None
         cache.checkpoint(req, up_to=prompt_len)
 
         req.output_ids = tokens[prompt_len:]

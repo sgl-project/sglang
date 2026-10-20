@@ -14,9 +14,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
-    InitLoadBackParams,
     InsertParams,
-    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -45,6 +43,7 @@ from sglang.test.kits.unified_radix_cache.config import (
     requires_full_swa_ps1_window4,
     requires_hicache,
     requires_swa,
+    requires_swa_anchor_chain,
 )
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
@@ -310,12 +309,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         leaf = match_prefix(cache, tokens).last_device_node
         leaf_len = node_key_length(cache, leaf)
         parent = node_parent(cache, leaf)
-        self._backup_node(cache, leaf)
-        lock_result = cache.inc_lock_ref(parent)
-        try:
-            cache.evict(EvictParams(num_tokens=leaf_len))
-        finally:
-            cache.dec_lock_ref(parent, lock_result.to_dec_params())
+        self._evict_to_host(cache, leaf, pin=parent)
         evicted = cache.tree_core.evict_component(
             leaf, ComponentType.SWA, EvictLayer.HOST
         )
@@ -441,15 +435,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         leaf = match_prefix(cache, tokens).last_device_node
         parent = cache.tree_core.get_parent_node_id(leaf)
         self.assertIsNotNone(parent)
-        self._backup_node(cache, leaf)
-        lock_result = cache.inc_lock_ref(parent)
-        try:
-            cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
-        finally:
-            cache.dec_lock_ref(
-                parent,
-                lock_result.to_dec_params(),
-            )
+        self._evict_to_host(cache, leaf, pin=parent)
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
         self.assertTrue(cache.tree_core.is_backuped(leaf))
         evict_result = cache.tree_core.evict_component(
@@ -498,30 +484,16 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
     @requires_full_mamba_ps1
     def test_scheduler_hicache_full_mamba_init_load_back_appends_new_indices(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         tokens = self._match_tokens_for_chain(cache, chain)
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
-        req = self._make_req(req_to_token_pool)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        self._apply_match_to_req(req, match)
+        req, match = self._match_for_load_back(cache, req_to_token_pool, tokens)
 
-        loaded_len, new_node = cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=req.best_match_node,
-                host_hit_length=req.host_hit_length,
-                req=req,
-            )
-        )
+        loaded_len, new_node = self._init_load_back(cache, req)
 
         self.assertEqual(new_node, leaf)
         self.assertEqual(req.prefix_len + loaded_len, len(tokens))
@@ -541,29 +513,16 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         if aux is None:
             self.skipTest("requires exactly one aux component")
 
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         tokens = self._match_tokens_for_chain(cache, chain)
         leaf_full = node_device_value(cache, leaf, ComponentType.FULL).clone()
         self._backup_node(cache, leaf)
         self._set_aux_host_tombstone(cache, leaf, aux)
 
-        req = self._make_req(req_to_token_pool)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        self._apply_match_to_req(req, match)
+        req, match = self._match_for_load_back(cache, req_to_token_pool, tokens)
 
-        loaded_len, new_node = cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=req.best_match_node,
-                host_hit_length=req.host_hit_length,
-                req=req,
-            )
-        )
+        loaded_len, new_node = self._init_load_back(cache, req)
 
         self.assertEqual(new_node, leaf)
         new_indices = cache.path_device_indices(new_node)[req.prefix_len :]
@@ -579,34 +538,21 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
     @requires_full_mamba_ps1
     def test_scheduler_hicache_load_back_fallback_keeps_old_anchor(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         tokens = self._match_tokens_for_chain(cache, chain)
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
 
-        req = self._make_req(req_to_token_pool)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        self._apply_match_to_req(req, match)
+        req, match = self._match_for_load_back(cache, req_to_token_pool, tokens)
 
         # Simulate a request without its own mamba slot so load-back allocates one
         # (that allocation is what a called-off load-back must free + not publish).
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
-        loaded_len, new_node = cache.init_load_back(
-            InitLoadBackParams(
-                best_match_node=req.best_match_node,
-                host_hit_length=req.host_hit_length,
-                req=req,
-                # Pinning the resident ancestors leaves too little for the tail.
-                mem_quota=len(tokens) - 1,
-            )
+        # Pinning the resident ancestors leaves too little for the tail.
+        loaded_len, new_node = self._init_load_back(
+            cache, req, mem_quota=len(tokens) - 1
         )
 
         self.assertEqual(loaded_len, 0)
@@ -621,35 +567,20 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
     @requires_full_mamba_ps1
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_load_failure(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         tokens = self._match_tokens_for_chain(cache, chain)
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
 
-        req = self._make_req(req_to_token_pool)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        self._apply_match_to_req(req, match)
+        req, match = self._match_for_load_back(cache, req_to_token_pool, tokens)
 
         # Simulate a request without its own mamba slot so load-back allocates one.
         req.kv.mamba_pool_idx = None
         avail_before = req_to_token_pool.mamba_allocator.available_size()
         # H->D load fails after the mamba slot is pre-allocated -> must free it.
         with mock.patch.object(cache.cache_controller, "load", return_value=None):
-            loaded_len, _ = cache.init_load_back(
-                InitLoadBackParams(
-                    best_match_node=req.best_match_node,
-                    host_hit_length=req.host_hit_length,
-                    req=req,
-                    mem_quota=None,
-                )
-            )
+            loaded_len, _ = self._init_load_back(cache, req, mem_quota=None)
 
         self.assertEqual(loaded_len, 0)
         self.assertIsNone(req.kv.mamba_pool_idx)
@@ -658,107 +589,37 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         )
 
     @requires_full_mamba_ps1
-    def test_scheduler_hicache_load_back_rolls_back_mamba_on_capacity_failure(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-        tokens = self._match_tokens_for_chain(cache, chain)
+    def test_load_back_abort_mamba_slot(self):
+        """An aborted load-back returns the mamba slot it allocated for the
+        request and leaves a slot the request already owned alone."""
+        for owns_slot in (False, True):
+            with self.subTest(owns_slot=owns_slot):
+                cache, allocator, req_to_token_pool, chain = self._hicache_chain()
+                leaf = chain[-1]
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+                self._evict_to_host(cache, leaf)
+                self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+                self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.MAMBA))
 
-        req = self._make_req(req_to_token_pool)
-        match = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
-        )
-        self._apply_match_to_req(req, match)
+                # Without a slot of its own, load_back's CoW arm allocates one.
+                req = self._make_req(req_to_token_pool)
+                if not owns_slot:
+                    req_to_token_pool.mamba_allocator.free(
+                        req.kv.mamba_pool_idx.unsqueeze(0)
+                    )
+                    req.kv.mamba_pool_idx = None
+                preexisting_slot = req.kv.mamba_pool_idx
+                mamba_avail = req_to_token_pool.mamba_allocator.available_size()
 
-        # Simulate a request without its own mamba slot so load-back allocates one.
-        req.kv.mamba_pool_idx = None
-        avail_before = req_to_token_pool.mamba_allocator.available_size()
-        # No device room and eviction frees nothing -> load-back bails after the
-        # mamba pre-alloc, which must still be freed.
-        with (
-            mock.patch.object(
-                cache.token_to_kv_pool_allocator, "available_size", return_value=0
-            ),
-            mock.patch.object(
-                cache, "evict", return_value=mock.Mock(num_tokens_evicted=0)
-            ),
-        ):
-            loaded_len, _ = cache.init_load_back(
-                InitLoadBackParams(
-                    best_match_node=req.best_match_node,
-                    host_hit_length=req.host_hit_length,
-                    req=req,
-                    mem_quota=None,
+                # Impossible quota -> load_back aborts after building the transfers.
+                loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
+
+                self.assertFalse(loaded)
+                self.assertIs(req.kv.mamba_pool_idx, preexisting_slot)
+                self.assertEqual(
+                    req_to_token_pool.mamba_allocator.available_size(), mamba_avail
                 )
-            )
-
-        self.assertEqual(loaded_len, 0)
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), avail_before
-        )
-
-    @requires_full_mamba_ps1
-    def test_load_back_abort_frees_unpublished_mamba_slot(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
-        self.assertIsNotNone(node_host_value(cache, leaf, ComponentType.MAMBA))
-
-        # A request whose mamba slot was released: load_back's CoW arm allocates one.
-        req = self._make_req(req_to_token_pool)
-        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
-        req.kv.mamba_pool_idx = None
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        # Impossible quota -> load_back aborts after building the transfers.
-        loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
-
-        self.assertFalse(loaded)
-        # the aborted call must return its slot and not leave req pointing at it
-        self.assertIsNone(req.kv.mamba_pool_idx)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
-        )
-        self._release_ongoing_load_back_locks(cache)
-
-    @requires_full_mamba_ps1
-    def test_load_back_abort_keeps_preexisting_mamba_slot(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
-        leaf = chain[-1]
-
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
-        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
-
-        # The request already owns its slot: an aborted load-back must not free it.
-        req = self._make_req(req_to_token_pool)
-        preexisting_slot = req.kv.mamba_pool_idx
-        self.assertIsNotNone(preexisting_slot)
-        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
-
-        loaded = cache.load_back(leaf, mem_quota=-(10**9), req=req)
-
-        self.assertFalse(loaded)
-        self.assertIs(req.kv.mamba_pool_idx, preexisting_slot)
-        self.assertEqual(
-            req_to_token_pool.mamba_allocator.available_size(), mamba_avail
-        )
-        self._release_ongoing_load_back_locks(cache)
+                self._release_ongoing_load_back_locks(cache)
 
     @requires_full_mamba_ps1
     def test_load_back_success_publishes_fresh_mamba_slot(self):
@@ -888,10 +749,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
     @requires_full_mamba_ps1
     def test_prepare_load_back_mamba(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         comp = cache.components[ComponentType.MAMBA]
 
@@ -932,15 +790,11 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
 
     @requires_full_mamba_ps1
     def test_prepare_load_back_mamba_pool_exhausted(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         comp = cache.components[ComponentType.MAMBA]
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
 
         req = self._make_req(req_to_token_pool)
         req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
@@ -1141,6 +995,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             n_swa,
         )
 
+    @requires_swa_anchor_chain
     def test_hicache_swa_load_back_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
         ps = self.cfg.page_size

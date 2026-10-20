@@ -212,19 +212,6 @@ class UnifiedRadixCacheCoreFixtures(UnifiedRadixCacheFixtures):
     def _swa_lru_order(self, cache):
         return cache.tree_core.get_component_device_lru_node_ids(ComponentType.SWA)
 
-    def _swa_pinning_cfg_supported(self) -> bool:
-        if not self.cfg.has_swa or self.cfg.has_mamba:
-            return False
-        cushion = self.cfg.sliding_window_size + self.cfg.page_size
-        pages_per_node = 8
-        side_pages = 5
-        if pages_per_node * self.cfg.page_size < cushion:
-            return False
-        chain_inserts_pages = 4 * pages_per_node + side_pages
-        if self.cfg.kv_size < chain_inserts_pages * self.cfg.page_size:
-            return False
-        return True
-
 
 class UnifiedLRUListBoundedRefreshFixtures:
     def _make_node(self, key_len: int) -> UnifiedTreeNode:
@@ -387,6 +374,33 @@ class SWAWindowUnderBigramKeyFixtures:
         self.assertIsNotNone(swa_indices)
         allocator.full_to_swa_index_mapping[full_indices] = swa_indices
         return full_indices[:need_size]
+
+    def _make_prompt_req(self, cache, allocator, req_to_token_pool, tokens, prompt_len):
+        """A request on ``tokens[:prompt_len]`` with paged KV for all of ``tokens`` written."""
+        prompt = array("q", tokens[:prompt_len])
+        req = Req(
+            rid=0,
+            origin_input_text="",
+            origin_input_ids=prompt,
+            sampling_params=SamplingParams(
+                temperature=0, max_new_tokens=max(len(tokens) - prompt_len, 1)
+            ),
+        )
+        req_to_token_pool.alloc([req])
+        req.output_ids = []
+        req.full_untruncated_fill_ids = array("q", prompt)
+        req.extend_end = prompt_len
+        kv_indices = self._alloc_paged(allocator, len(tokens))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+        )
+        req.kv.kv_committed_len = prompt_len
+        req.kv.kv_allocated_len = len(tokens)
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock = None
+        req.extra_key = None
+        return req
 
 
 class UnifiedRadixCacheDecoderSwaBoundedReplayHoldBackFixtures:

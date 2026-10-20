@@ -800,130 +800,100 @@ class TestSegmentLockProtocol(SegmentLockProtocolFixtures, CustomTestCase):
         cache.dec_lock_ref(root, lock)
         cache.sanity_check()
 
-    def test_release_with_incorrect_root_boundary_fails_loud(self):
-        """An incorrect root boundary must fail at the acquired segment's edge."""
+    def test_misused_receipt_release_fails_loud(self):
+        """A receipt replayed wrongly dies at the first node instead of walking
+        a segment: an incorrect root boundary, another node (the rematch-clobbered
+        ``req.last_node`` class of bug), twice, after an early SWA release (F2
+        replay: used to run a second SWA walk that stole ancestors' locks), or
+        unanchored on root, where releasing would otherwise be a no-op."""
         sw = self.cfg.sliding_window_size
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 3 * sw)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = self._match_leaf(cache, seq)
-        lock = cache.inc_lock_ref(leaf)
-        self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
+        anchored = "lock receipt anchored on node"
 
-        self._assert_protocol_violation(
-            lambda: cache.dec_lock_ref(
+        def incorrect_root_boundary(cache, leaf, lock):
+            self.assertIsNotNone(lock.component_lock_uuids[ComponentType.SWA])
+            return lambda: cache.dec_lock_ref(
                 leaf,
                 DecLockRefParams(
                     node_id=leaf, component_lock_uuids={ComponentType.SWA: None}
                 ),
-            ),
-            "lock_ref=0",
-        )
+            )
 
-    def test_release_on_another_node_fails_loud(self):
-        """The receipt anchors the lock on the node it was taken on; replaying
-        it on a different node (the rematch-clobbered ``req.last_node`` class
-        of bug) must assert instead of walking that node's segment."""
-        sw = self.cfg.sliding_window_size
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 2 * sw)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = self._match_leaf(cache, seq)
-        parent = node_parent(cache, leaf)
-        self.assertFalse(cache.tree_core.is_root(parent))
-        lock = cache.inc_lock_ref(leaf)
-        self.assertEqual(lock.node_id, leaf)
+        def another_node(cache, leaf, lock):
+            parent = node_parent(cache, leaf)
+            self.assertFalse(cache.tree_core.is_root(parent))
+            self.assertEqual(lock.node_id, leaf)
+            return lambda: cache.dec_lock_ref(parent, lock.to_dec_params())
 
-        self._assert_protocol_violation(
-            lambda: cache.dec_lock_ref(parent, lock.to_dec_params()),
-            "lock receipt anchored on node",
-        )
+        def double_release(cache, leaf, lock):
+            cache.dec_lock_ref(leaf, lock.to_dec_params())
+            return lambda: cache.dec_lock_ref(leaf, lock.to_dec_params())
 
-    def test_unanchored_device_release_fails_loud(self):
+        def early_release(cache, leaf, lock):
+            cache.release_swa(TreeLock(leaf, lock.to_dec_params()))
+            return lambda: cache.dec_lock_ref(leaf, lock.to_dec_params())
+
+        def unanchored_root(cache, leaf, lock):
+            root = cache.root_node_handle()
+            return lambda: cache.tree_core.dec_lock_ref(root, DecLockRefParams())
+
+        cases = {
+            "incorrect_root_boundary": (3 * sw, incorrect_root_boundary, "lock_ref=0"),
+            "another_node": (2 * sw, another_node, anchored),
+            "double_release": (2 * sw, double_release, "lock_ref=0"),
+            "early_release_without_skip_swa": (2 * sw, early_release, "lock_ref=0"),
+            "unanchored_root": (2 * sw, unanchored_root, anchored),
+        }
+        for name, (num_pages, prepare, fragment) in cases.items():
+            with self.subTest(name):
+                cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+                seq = self._make_seq(1, num_pages)
+                self._insert(cache, allocator, req_to_token_pool, seq)
+                leaf = self._match_leaf(cache, seq)
+                lock = cache.inc_lock_ref(leaf)
+                self._assert_protocol_violation(prepare(cache, leaf, lock), fragment)
+
+    def test_unanchored_release_fails_loud(self):
         """#41261 replay: a receipt that lost its anchor must not walk the
         node's segment and drop locks other holders own."""
-        cache, allocator, leaf = self._leaf_with_lock_path()
-        lock = cache.inc_lock_ref(leaf).to_dec_params()
-        self._assert_unanchored_release_rejected(
-            cache,
-            allocator,
-            leaf,
-            lambda: cache.dec_lock_ref(leaf, replace(lock, node_id=None)),
-            lambda: cache.dec_lock_ref(leaf, lock),
-        )
 
-    def test_unanchored_host_release_fails_loud(self):
-        cache, allocator, leaf = self._leaf_with_lock_path(hicache=True)
-        self._backup_node(cache, leaf)
-        lock = cache.inc_host_lock_ref(leaf).to_dec_params()
-        self._assert_unanchored_release_rejected(
-            cache,
-            allocator,
-            leaf,
-            lambda: cache.dec_host_lock_ref(leaf, replace(lock, node_id=None)),
-            lambda: cache.dec_host_lock_ref(leaf, lock),
-        )
+        def inc(cache, leaf):
+            return cache.inc_lock_ref(leaf)
 
-    def test_unanchored_swa_only_release_fails_loud(self):
-        cache, allocator, leaf = self._leaf_with_lock_path()
-        lock = cache.inc_lock_ref(leaf).to_dec_params()
-        self._assert_unanchored_release_rejected(
-            cache,
-            allocator,
-            leaf,
-            lambda: cache.tree_core.dec_swa_lock_only(
-                leaf, replace(lock, node_id=None)
-            ),
-            lambda: cache.dec_lock_ref(leaf, lock),
-        )
+        def dec(cache, leaf, lock):
+            cache.dec_lock_ref(leaf, lock)
 
-    def test_unanchored_window_only_release_fails_loud(self):
-        cache, allocator, leaf = self._leaf_with_lock_path()
-        lock = cache.inc_lock_ref(leaf).to_dec_params()
-        self._assert_unanchored_release_rejected(
-            cache,
-            allocator,
-            leaf,
-            lambda: cache.tree_core.dec_window_lock_only(
-                leaf, ComponentType.SWA, replace(lock, node_id=None)
-            ),
-            lambda: cache.dec_lock_ref(leaf, lock),
-        )
+        def inc_host(cache, leaf):
+            return cache.inc_host_lock_ref(leaf)
 
-    def test_unanchored_root_release_fails_loud(self):
-        """Every acquire anchors its receipt, root included; an unanchored
-        receipt lost its anchor upstream even where releasing is a no-op."""
-        cache, _, _ = build_fixture(self.cfg)
-        root = cache.root_node_handle()
-        self._assert_protocol_violation(
-            lambda: cache.tree_core.dec_lock_ref(root, DecLockRefParams()),
-            "lock receipt anchored on node",
-        )
+        def dec_host(cache, leaf, lock):
+            cache.dec_host_lock_ref(leaf, lock)
 
-    def test_double_release_fails_loud(self):
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 2 * self.cfg.sliding_window_size)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = self._match_leaf(cache, seq)
-        lock = cache.inc_lock_ref(leaf)
-        cache.dec_lock_ref(leaf, lock.to_dec_params())
-        self._assert_protocol_violation(
-            lambda: cache.dec_lock_ref(leaf, lock.to_dec_params()), "lock_ref=0"
-        )
+        def dec_swa_only(cache, leaf, lock):
+            cache.tree_core.dec_swa_lock_only(leaf, lock)
 
-    def test_finish_after_early_release_without_skip_swa_fails_loud(self):
-        """F2 replay: retraction-after-early-release used to run a second SWA
-        walk that stole ancestors' locks; now it dies at the first node."""
-        sw = self.cfg.sliding_window_size
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        seq = self._make_seq(1, 2 * sw)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = self._match_leaf(cache, seq)
-        lock = cache.inc_lock_ref(leaf)
-        cache.release_swa(TreeLock(leaf, lock.to_dec_params()))
-        self._assert_protocol_violation(
-            lambda: cache.dec_lock_ref(leaf, lock.to_dec_params()), "lock_ref=0"
-        )
+        def dec_window_only(cache, leaf, lock):
+            cache.tree_core.dec_window_lock_only(leaf, ComponentType.SWA, lock)
+
+        # name -> (hicache, acquire, unanchored release, correct release)
+        cases = {
+            "device": (False, inc, dec, dec),
+            "host": (True, inc_host, dec_host, dec_host),
+            "swa_only": (False, inc, dec_swa_only, dec),
+            "window_only": (False, inc, dec_window_only, dec),
+        }
+        for name, (hicache, acquire, release, unlock) in cases.items():
+            with self.subTest(name):
+                cache, allocator, leaf = self._leaf_with_lock_path(hicache=hicache)
+                if hicache:
+                    self._backup_node(cache, leaf)
+                lock = acquire(cache, leaf).to_dec_params()
+                self._assert_unanchored_release_rejected(
+                    cache,
+                    allocator,
+                    leaf,
+                    lambda: release(cache, leaf, replace(lock, node_id=None)),
+                    lambda: unlock(cache, leaf, lock),
+                )
 
     def test_finish_after_early_release_with_skip_swa(self):
         """The correct F2 flow: unlock honors the early release."""
@@ -1010,14 +980,10 @@ class TestSegmentLockFuzz(SegmentLockFuzzFixtures, CustomTestCase):
         max_num_reqs=256,
     )
 
-    def test_fuzz_seed0(self):
-        self._run_seed(0)
-
-    def test_fuzz_seed1(self):
-        self._run_seed(1)
-
-    def test_fuzz_seed2(self):
-        self._run_seed(2)
+    def test_fuzz(self):
+        for seed in range(3):
+            with self.subTest(seed=seed):
+                self._run_seed(seed)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")

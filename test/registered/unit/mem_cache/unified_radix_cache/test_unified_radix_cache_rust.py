@@ -24,6 +24,31 @@ _SHARED_SUITES = (
 )
 
 
+# Classes that never build a TreeCore through the backend switch (mocks, pure
+# Python units, or a directly constructed Python core): a rerun repeats them.
+_PYTHON_ONLY_CLASSES = frozenset(
+    {
+        "TestAnchorLockOutcomePolicy",
+        "TestDisabledUnifiedRadixCache",
+        "TestPrefetchCommitOrdering",
+        "TestUnifiedRadixCacheActionRouting",
+        "TestUnifiedRadixComponentLedgerUnits",
+        "TestUnifiedRadixComponentRegistryOverride",
+        "TestUnifiedTreeCoreLoadBackPending",
+        "TestUnifiedTreeNodeGetPrefixHashValues",
+        "UnifiedLRUListBoundedRefreshTest",
+    }
+)
+
+
+def _rust_applicable(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from _rust_applicable(test)
+        elif type(test).__name__ not in _PYTHON_ONLY_CLASSES:
+            yield test
+
+
 class RustBackendSuite(unittest.TestSuite):
     """Scope the test backend to this suite without polluting discovery."""
 
@@ -39,7 +64,9 @@ class RustBackendSuite(unittest.TestSuite):
 def load_tests(loader, standard_tests, pattern):
     """Load every topic module under the Rust backend override."""
     return RustBackendSuite(
-        loader.loadTestsFromModule(module) for module in _SHARED_SUITES
+        test
+        for module in _SHARED_SUITES
+        for test in _rust_applicable(loader.loadTestsFromModule(module))
     )
 
 

@@ -29,12 +29,15 @@ from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
     define_config_test_classes,
     requires,
+    requires_aux,
     requires_full_mamba_ps1,
     requires_full_swa_ps1,
     requires_full_swa_ps1_window4,
     requires_hicache,
     requires_mamba,
+    requires_representative_aux,
     requires_swa,
+    requires_swa_anchor_chain,
     requires_swa_and_mamba,
     requires_swa_only,
 )
@@ -127,6 +130,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
         """Write-back eviction will keep freeing device KV when the host pool
         is exhausted and host eviction cannot free space to prevent OOM."""
@@ -156,6 +160,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_hicache_write_back_drop_respects_pins_then_frees_subtree(self):
         """The host-pressure drop fallback must decline while any node in the
         unbacked subtree is host-pinned, then reclaim the whole subtree --
@@ -262,16 +267,9 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertEqual(host_pool.available_size(), baseline_host)
         cache.sanity_check()
 
+    @requires_full_swa_ps1_window4
     def test_hicache_split_preserves_inflight_swa_host_pin(self):
         """A split SWA host segment stays pinned and releases without leaks."""
-        expected_cfg = CacheConfig(
-            page_size=1,
-            components=(ComponentType.FULL, ComponentType.SWA),
-            sliding_window_size=4,
-        )
-        if self.cfg != expected_cfg:
-            self.skipTest("single page-size-1 Full+SWA host-lock regression")
-
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
         swa_host_pool = cache.swa_kv_pool_host
@@ -308,6 +306,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_hicache_evict_device_leaf_aborts_demote_when_backup_fails(self):
         """The tree op defers a write-back victim's demote: it returns a BackupKV
         without freeing device, and _demote requires a completed backup, so a
@@ -364,6 +363,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_hicache_partial_match_splits_evicted_backed_up_node(self):
         """Partial matches on host-only nodes must keep the host prefix usable."""
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
@@ -442,6 +442,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_hicache_evict_drops_unlocked_node_when_backup_fails(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")
@@ -494,6 +495,8 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertTrue(cache.tree_core.is_host_evictable_leaf(split_leaf))
         cache.sanity_check()
 
+    @requires_aux
+    @requires_representative_aux
     def test_hicache_evict_to_host_updates_aux_lru(self):
         """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [
@@ -501,8 +504,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             for ct in (ComponentType.MAMBA, ComponentType.SWA)
             if ct in self.cfg.components
         ]
-        if not aux_types:
-            self.skipTest("requires at least one aux component")
 
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         seq = self._make_seq(1, 2)
@@ -707,6 +708,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
 
+    @requires_representative_aux
     def test_match_prefix_best_and_device_node_without_hicache(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         ps = self.cfg.page_size
@@ -761,14 +763,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )[0]
         self.assertEqual(xfer.nodes_to_load, [leaf])
 
+    @requires_hicache
+    @requires_representative_aux
     def test_evict_host_drains_freed_host_values_to_the_pools(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
         host_pool_attr = {
@@ -790,16 +790,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_full_mamba_ps1
     def test_hicache_mamba_host_best_match_keeps_device_anchor(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         parent = chain[-2]
         tokens = self._match_tokens_for_chain(cache, chain)
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
         result = match_prefix(cache, tokens)
@@ -845,16 +841,12 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
     @requires_full_swa_ps1
     def test_hicache_swa_host_best_match_keeps_device_anchor(self):
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         parent = chain[-2]
         tokens = self._match_tokens_for_chain(cache, chain)
 
-        self._backup_node(cache, leaf)
-        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self._evict_to_host(cache, leaf)
         self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
 
         result = match_prefix(cache, tokens)
@@ -867,10 +859,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertEqual(result.host_hit_length, node_key_length(cache, leaf))
         self.assertEqual(result.swa_host_hit_length, node_key_length(cache, leaf))
 
-        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
-        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
-        if len(chain) < 3:
-            self.skipTest("chain too short")
+        cache, allocator, req_to_token_pool, chain = self._hicache_chain()
         leaf = chain[-1]
         parent = chain[-2]
         tokens = self._match_tokens_for_chain(cache, chain)
@@ -998,6 +987,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
                 self.assertEqual(result.cache_protected_len, 7)
                 self.assertEqual(result.cache_actions, (FreeDeviceKV(indices=[]),))
 
+    @requires_swa_anchor_chain
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
         ps = self.cfg.page_size
@@ -1197,6 +1187,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         cache.sanity_check()
 
     @requires_hicache
+    @requires_representative_aux
     def test_hicache_write_back_leaf_backup(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
         self._init_hicache(cache, write_policy="write_back")

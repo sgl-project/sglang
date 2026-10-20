@@ -83,6 +83,13 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
             salted_hashes,
         )
 
+        # A branch off a split node carries the salt too.
+        self._insert(cache, allocator, seq, cache_salt="tenant-a")
+        self._stored_events(cache)
+        self._insert(cache, allocator, [1, 2, 5, 6], cache_salt="tenant-a")
+        (branch,) = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(branch.cache_salt, "tenant-a")
+
     def test_session_id_is_attributed_without_changing_block_hash(self):
         cache_a, allocator_a, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
         cache_a.take_events()
@@ -134,22 +141,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertEqual(session_b_tail[0].parent_block_hash, shared_parent)
         self.assertEqual(list(session_b_tail[0].token_ids), [7, 8])
         self.assertEqual(session_b_tail[0].session_id, "session-b")
-
-    def test_cache_salt_event_parentage_survives_node_split(self):
-        cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
-        cache.take_events()
-
-        self._insert(cache, allocator, [1, 2, 3, 4], cache_salt="tenant-a")
-        original = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(original), 1)
-        self.assertEqual(len(original[0].block_hashes), 2)
-
-        self._insert(cache, allocator, [1, 2, 5, 6], cache_salt="tenant-a")
-        branch = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(branch), 1)
-        self.assertEqual(branch[0].cache_salt, "tenant-a")
-        self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
-        self.assertEqual(list(branch[0].token_ids), [5, 6])
 
     def test_event_hashes_depend_on_cache_salt_but_not_extra_key(self):
         def stored_hashes(*, extra_key=None, cache_salt=None):
@@ -295,6 +286,11 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
         self.assertEqual(delayed[0].lora_name, "adapter-a")
         self.assertEqual(self._event_hashes(delayed), self._event_hashes(stored))
 
+        # A branch off a split node carries the name too.
+        self._insert(cache, allocator, [1, 2, 5, 6], extra_key="uuid-a")
+        (branch,) = self._stored_events(cache, StorageMedium.GPU)
+        self.assertEqual(branch.lora_name, "adapter-a")
+
     def test_lora_name_survives_until_queued_stores_are_taken(self):
         """A finished request's blocks still publish under its adapter when
         other requests register before the events are taken."""
@@ -310,21 +306,6 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
 
         stored = self._stored_events(cache, StorageMedium.GPU)
         self.assertEqual([e.lora_name for e in stored], ["adapter-a"])
-
-    def test_lora_event_parentage_survives_node_split(self):
-        lora_names, _reqs = make_lora_names(**{"uuid-a": "adapter-a"})
-        cache, allocator, _ = build_fixture(
-            self.cfg, enable_kv_cache_events=True, kv_event_lora_names=lora_names
-        )
-        cache.take_events()
-
-        self._insert(cache, allocator, [1, 2, 3, 4], extra_key="uuid-a")
-        original = self._stored_events(cache, StorageMedium.GPU)
-        self._insert(cache, allocator, [1, 2, 5, 6], extra_key="uuid-a")
-        branch = self._stored_events(cache, StorageMedium.GPU)
-        self.assertEqual(len(branch), 1)
-        self.assertEqual(branch[0].lora_name, "adapter-a")
-        self.assertEqual(branch[0].parent_block_hash, original[0].block_hashes[0])
 
     def test_kv_events_split_preserves_block_hash_parentage(self):
         cache, allocator, _ = build_fixture(self.cfg, enable_kv_cache_events=True)
