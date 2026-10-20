@@ -118,10 +118,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
 )
 from sglang.srt.layers.moe.topk import (
-    BypassedTopKOutput,
     TopK,
     TopKOutputFormat,
     fused_shared_expert_weight,
+    is_expert_remapping_enabled,
     is_routed_scaling_factor_fused_in_topk,
 )
 from sglang.srt.layers.moe.utils import (
@@ -1031,7 +1031,9 @@ class DeepseekV2MoE(nn.Module):
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
             and not getattr(self, "is_hash", False)
-            and not get_exec().moe.enable_eplb
+            and not is_expert_remapping_enabled()
+            and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
         )
 
     def forward(
@@ -1165,11 +1167,7 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             router_logits_partials = None
         if use_flashinfer_trtllm_bypass:
-            topk_output = BypassedTopKOutput(
-                hidden_states=hidden_states,
-                raw_router_logits=router_logits,
-                topk_config=self.topk.topk_config,
-            )
+            topk_output = self.topk.forward_cuda(hidden_states, router_logits)
         else:
             topk_kwargs = (
                 {"input_ids": input_ids_global}

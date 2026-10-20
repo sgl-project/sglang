@@ -505,6 +505,48 @@ class TestTopKRoutingInputs(CustomTestCase):
             output.topk_ids.tolist(), [[2, 0, 4], [0, 3, 4], [-1, -1, -1], [-1, -1, -1]]
         )
 
+    def test_deepseek_opaque_bypass_requires_identity_placement_and_native_policy(self):
+        from sglang.srt.models import deepseek_v2
+
+        moe = SimpleNamespace(
+            alt_stream=object(),
+            num_fused_shared_experts=0,
+            shared_experts=object(),
+            experts=SimpleNamespace(use_flashinfer_trtllm_moe=True),
+            _enable_a2a_moe=False,
+            _fuse_shared_experts_inside_sbo=False,
+            is_hash=False,
+            topk=self._router(output_format=TopKOutputFormat.BYPASSED),
+        )
+        with (
+            patch.object(deepseek_v2, "_enable_pcg_dsv2_dual_stream", True),
+            patch.object(
+                deepseek_v2, "is_in_tc_piecewise_cuda_graph", return_value=True
+            ),
+            patch.object(
+                deepseek_v2,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
+            ),
+            get_exec().moe.override(
+                enable_eplb=False,
+                init_expert_location="trivial",
+                ep_num_redundant_experts=0,
+                ep_dispatch_algorithm=None,
+            ),
+        ):
+            self.assertTrue(
+                deepseek_v2.DeepseekV2MoE._can_dual_stream_graph(moe, self.hidden)
+            )
+            with get_exec().moe.override(init_expert_location="reverse"):
+                self.assertFalse(
+                    deepseek_v2.DeepseekV2MoE._can_dual_stream_graph(moe, self.hidden)
+                )
+            moe.topk.topk_config.output_format = TopKOutputFormat.STANDARD
+            self.assertFalse(
+                deepseek_v2.DeepseekV2MoE._can_dual_stream_graph(moe, self.hidden)
+            )
+
     def test_empty_target_participates_in_lp_without_caller_layer_id(self):
         class Solver:
             def __init__(self):
