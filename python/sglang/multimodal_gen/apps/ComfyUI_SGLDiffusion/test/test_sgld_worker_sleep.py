@@ -207,6 +207,9 @@ def test_native_model_size_counts_weight_files(tmp_path):
     (weights / "config.json").write_bytes(b"{}")
     (weights / "model-00001.safetensors").write_bytes(b"weights")
     (weights / "model-00002.safetensors").write_bytes(b"more weights")
+    for sibling in ("text_encoder", "vae"):
+        (model_dir / sibling).mkdir()
+        (model_dir / sibling / "model.safetensors").write_bytes(b"not the dit")
 
     assert GENERATOR._native_model_size_bytes(str(model_dir)) == 19
 
@@ -394,6 +397,26 @@ def test_off_gpu_worker_reports_zero_and_detach_is_a_noop(monkeypatch):
     patcher.detach()
     assert sent == []
     assert not gen.worker_asleep
+
+
+def test_stale_patcher_after_rebuild_reports_zero_and_does_not_sleep():
+    owner = _FakeWorkerOwner()
+    old_token = object()
+    owner.generator = old_token
+    patcher = SGLDModelPatcher(
+        torch.nn.Module(),
+        torch.device("cpu"),
+        torch.device("cpu"),
+        size=100,
+        model_type="qwen_image",
+        worker=owner,
+        worker_token=old_token,
+    )
+    assert patcher.loaded_size() == 100
+    owner.generator = object()  # ensure_executor rebuilt the worker
+    assert patcher.loaded_size() == 0
+    patcher.detach()
+    assert owner.calls == []
 
 
 def test_loaded_size_prefers_measured_resident_bytes():

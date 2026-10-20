@@ -186,8 +186,15 @@ def native_model_type(model_dir: str) -> str:
 
 
 def _native_model_size_bytes(model_dir: str) -> int:
-    """Return the on-disk weight size used for ComfyUI VRAM accounting."""
+    """Return the on-disk weight size used for ComfyUI VRAM accounting.
+
+    Only the DiT (``transformer/``) is loaded by the worker; text encoders and
+    the VAE in sibling directories are not, so they are not counted.
+    """
     weight_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
+    transformer_dir = os.path.join(model_dir, "transformer")
+    if os.path.isdir(transformer_dir):
+        model_dir = transformer_dir
     return sum(
         os.path.getsize(os.path.join(root, name))
         for root, _, names in os.walk(model_dir)

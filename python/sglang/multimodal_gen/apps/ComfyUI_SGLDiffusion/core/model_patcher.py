@@ -93,6 +93,14 @@ class SGLDModelPatcher(ModelPatcher):
             return self.size
         return self.model_size_dict.get(self.model_type, 0)
 
+    def _is_stale(self):
+        """True when the worker was rebuilt after this patcher was made."""
+        if self.worker is None or self.worker_token is None:
+            return False
+        return self.worker_token is not getattr(
+            self.worker, "generator", self.worker_token
+        )
+
     def loaded_size(self):
         """VRAM ComfyUI can reclaim from this patcher.
 
@@ -100,8 +108,10 @@ class SGLDModelPatcher(ModelPatcher):
         it is always 0 and ComfyUI never considers this patcher worth
         unloading. The weights are resident in the worker unless it sleeps.
         """
+        # A patcher for a replaced worker owns nothing that detach() can free.
         if (
             self.worker is None
+            or self._is_stale()
             or getattr(self.worker, "worker_asleep", False)
             or not getattr(self.worker, "shares_comfy_gpu", True)
         ):
@@ -121,7 +131,9 @@ class SGLDModelPatcher(ModelPatcher):
         for the VAE or a text encoder) ends here. The worker is woken again
         by ``SGLDiffusionGenerator.ensure_executor`` on the next forward.
         """
-        if self.worker is not None:  # no-op unless the worker shares ComfyUI's GPU
+        # A stale patcher must not sleep the current worker, and has nothing
+        # resident (loaded_size() is 0), so there is nothing to free here.
+        if self.worker is not None and not self._is_stale():
             self.worker.sleep_worker(self.worker_token)
         return super().detach(unpatch_all)
 
