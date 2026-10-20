@@ -356,19 +356,12 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             "the unified KV layout with encoder SWA bounded replay",
             is_unified_kv_triton() and cfg.enable_encoder_swa_bounded_replay,
         ),
-        # the draft's block window assumes uniform verify blocks, and the PD
-        # transfer does not carry the draft ring of a ratio-1/2 model yet
+        # the draft's block window assumes uniform verify blocks
         (
             "the unified KV layout with compact ragged verify",
             is_unified_kv_triton()
             and cfg.speculative_algorithm is not None
             and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC,
-        ),
-        (
-            "the unified KV layout with DSpark under PD disaggregation",
-            is_unified_kv_triton()
-            and cfg.speculative_algorithm is not None
-            and cfg.disaggregation_mode != "null",
         ),
         (
             "the unified KV layout with HiCache",
@@ -397,7 +390,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -405,8 +398,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
-                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
+                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
