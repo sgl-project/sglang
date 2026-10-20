@@ -73,9 +73,8 @@ class MambaAttnBackendBase(AttentionBackend):
     # else — update_mamba_state_after_mtp_verify keys the fused branch on it.
     accept_lens_pool: Optional[torch.Tensor] = None
 
-    # Most sequences the prefill graph tables hold (larger batches replay the
-    # eager-metadata variant if captured, else no graph); set at init by backends
-    # whose supports_prefill_graph_extend holds.
+    # Most sequences the prefill graph tables hold; larger batches never replay them.
+    # Set at init by backends whose supports_prefill_graph_extend holds.
     prefill_graph_max_seqs: int
 
     def __init__(self, model_runner: ModelRunner):
@@ -129,9 +128,11 @@ class MambaAttnBackendBase(AttentionBackend):
         return False
 
     def prefill_graph_eager_metadata_fallback(self) -> bool:
+        """Whether buckets also capture an eager-metadata variant for larger batches."""
         return False
 
     def prefill_graph_bucket_max_seqs(self, num_tokens: int) -> Optional[int]:
+        """Most sequences one bucket's prefill graph tables hold (None: no bound)."""
         return None
 
     def init_prefill_graph_metadata(self, forward_batch: ForwardBatch):
