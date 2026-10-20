@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
 )
+from sglang.srt.disaggregation.utils import poll_and_all_reduce_prefill_pp_sections
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -83,6 +84,10 @@ class TestAllocationConfiguration(CustomTestCase):
             {"disaggregation_mode": "null"},
             {"disaggregation_transfer_backend": "nixl"},
             {"tp_size": 2},
+            # Rejected here, before the topology validators that would raise a
+            # bare assertion or divide by zero.
+            {"tp_size": 3, "attn_dp_size": 2},
+            {"attn_dp_size": 0},
             {"disaggregation_mode": "decode", "pp_size": 2},
             {"attn_cp_size": 2},
             {"dcp_size": 2},
@@ -647,9 +652,9 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Success)
 
-    def pp_parked_schedulers(self, senders, queued_senders=None):
-        """One scheduler per PP stage, each holding the same parked request and,
-        if given, the same request waiting in the bootstrap queue."""
+    def mock_pp_sync(self):
+        """Every stage's PP poll sync returns PP0's last payload; self.pp_syncs
+        records the syncing ranks."""
         polls_from_stage0 = []
         self.pp_syncs = []
 
@@ -673,6 +678,12 @@ class TestAllocationIntegration(CustomTestCase):
             ),
         )
 
+    def pp_parked_schedulers(self, senders, queued_senders=None, waiting=False):
+        """One scheduler per PP stage, each holding the same pending request,
+        parked or, if ``waiting``, in the waiting queue, and, if given, the same
+        request in the bootstrap queue."""
+        self.mock_pp_sync()
+
         def finalize(req):
             req.pending_bootstrap = False
             return True
@@ -680,11 +691,15 @@ class TestAllocationIntegration(CustomTestCase):
         schedulers = []
         for pp_rank, sender in enumerate(senders):
             req = SimpleNamespace(
-                rid="parked", disagg_kv_sender=sender, pending_bootstrap=True
+                rid="pending",
+                disagg_kv_sender=sender,
+                pending_bootstrap=True,
+                to_finish=None,
+                finished_reason=None,
             )
-            scheduler = self.inflight_scheduler([req])
+            scheduler = self.inflight_scheduler([] if waiting else [req])
             scheduler.pp_group = None
-            scheduler.waiting_queue = []
+            scheduler.waiting_queue = [req] if waiting else []
             scheduler.handle_bootstrap_failure = Mock()
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
             queue.queue = []
@@ -693,6 +708,9 @@ class TestAllocationIntegration(CustomTestCase):
                     SimpleNamespace(
                         rid="queued",
                         disagg_kv_sender=queued_senders[pp_rank],
+                        pending_bootstrap=True,
+                        to_finish=None,
+                        finished_reason=None,
                         prefill_attempt_count=0,
                         is_retracted=False,
                         metadata_buffer_index=0,
@@ -711,12 +729,15 @@ class TestAllocationIntegration(CustomTestCase):
 
     def pp_step(self, schedulers):
         """One PP loop iteration's bootstrap step, in PP rank order."""
+        syncs = []
         for scheduler in schedulers:
             self.pp_syncs.clear()
             SchedulerPPMixin.process_bootstrapped_queue(scheduler)
-            # A stage's send of a poll sync completes only once the next stage
-            # receives it in the same iteration; a second sync would deadlock.
-            self.assertLessEqual(len(self.pp_syncs), 1)
+            syncs.append(len(self.pp_syncs))
+        # A stage's send of a poll sync completes only once the next stage
+        # receives it in the same iteration, so every stage must sync as often
+        # as PP0, and at most once.
+        self.assertIn(syncs, ([0] * len(schedulers), [1] * len(schedulers)))
 
     def test_pp_stages_finalize_parked_prefill_on_consensus_only(self):
         """Finalizing re-checkpoints the radix cache, so a stage acting on its own
@@ -767,6 +788,63 @@ class TestAllocationIntegration(CustomTestCase):
             scheduler.handle_bootstrap_failure.assert_called_once_with(req)
             self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
             scheduler.send_kv_chunk.assert_not_called()
+
+    def test_pp_stage_local_bootstrap_failure_drops_waiting_prefill_everywhere(self):
+        """Under PP no stage-local poll may drop a waiting request, so without the
+        consensus one whose decode peer gave up is prefilled in full first."""
+        stages = self.pp_stages(2)
+        senders = [MooncakeKVSender(mgr, "prefill:8998", 1) for mgr in stages]
+        schedulers = self.pp_parked_schedulers(senders, waiting=True)
+        reqs = [scheduler.waiting_queue[0] for scheduler in schedulers]
+        senders[1].abort()
+        self.wait_until(lambda: stages[0].request_status.collect(1)[1] == KVPoll.Failed)
+        self.pp_step(schedulers)
+        for scheduler, req in zip(schedulers, reqs):
+            scheduler.handle_bootstrap_failure.assert_called_once_with(req)
+            self.assertEqual(scheduler.waiting_queue, [])
+
+    def test_pp_release_leaves_parked_prefill_to_consensus(self):
+        """The release poll is stage-local: failing a parked request there lets
+        the stages' parked sets diverge and the next consensus poll misalign."""
+        sender = self.sender()
+        sender.abort()
+        req = SimpleNamespace(
+            rid="parked", disagg_kv_sender=sender, pending_bootstrap=True
+        )
+        scheduler = self.inflight_scheduler([req])
+        scheduler.handle_bootstrap_failure = Mock()
+        scheduler.process_disagg_prefill_inflight_queue(rids_to_check=["parked"])
+        scheduler.handle_bootstrap_failure.assert_not_called()
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
+
+    def test_pp_consensus_fails_when_stages_order_requests_differently(self):
+        """Stages holding as many requests as PP0 per queue, or in total, but in
+        another order or split would otherwise apply PP0's polls to other
+        requests; each stage re-sorts its waiting queue on its own."""
+        a, b = (
+            SimpleNamespace(
+                bootstrap_room=room, poll_pp_consensus=lambda: KVPoll.Bootstrapping
+            )
+            for room in (1, 2)
+        )
+        self.mock_pp_sync()
+        groups = dict(
+            attn_cp_cpu_group=None,
+            attn_tp_cpu_group=None,
+            pp_group=None,
+            pp_size=2,
+            pp_poll_sync_work_list=[],
+        )
+        self.assertEqual(
+            poll_and_all_reduce_prefill_pp_sections([[a, b], []], pp_rank=0, **groups),
+            [[KVPoll.Bootstrapping] * 2, []],
+        )
+        for label, sections in (("reordered", [[b, a], []]), ("split", [[a], [b]])):
+            with self.subTest(label):
+                with self.assertRaisesRegex(AssertionError, "PP stages disagree"):
+                    poll_and_all_reduce_prefill_pp_sections(
+                        sections, pp_rank=1, **groups
+                    )
 
     def test_pp_chunked_prefill_ignores_stage_local_bootstrap_failure(self):
         """Releasing a chunked request on one stage's poll desynchronizes the PP

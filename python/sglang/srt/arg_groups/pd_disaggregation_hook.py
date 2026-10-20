@@ -12,11 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import (
-    attn_dp_enabled_of,
-    derive_attn_tp_size,
-    num_dp_ranks_of,
-)
+from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -211,13 +207,13 @@ def _validate_prefill_complete(server_args: ServerArgs) -> None:
         unsupported.append("attention context parallelism")
     if cfg.disaggregation_mode == "decode" and cfg.pp_size != 1:
         unsupported.append("decode pipeline parallelism")
-    attn_tp_size = derive_attn_tp_size(
-        tp_size=cfg.tp_size,
-        attn_cp_size=cfg.attn_cp_size,
-        attn_dp_size=cfg.attn_dp_size,
-    )
-    if attn_tp_size != 1:
-        unsupported.append("attention tensor parallelism greater than one")
+    # Compared as a product, not divided: the validators that reject
+    # non-positive or non-dividing widths run after this hook.
+    if cfg.tp_size != cfg.attn_dp_size * cfg.attn_cp_size:
+        unsupported.append(
+            "attention tensor parallelism other than one "
+            "(tp_size must equal attn_dp_size * attn_cp_size)"
+        )
     if cfg.enable_pdmux or cfg.decoupled_spec_role != "null":
         unsupported.append("PD multiplexing or decoupled speculation")
     if cfg.enable_pd_role_switch:
