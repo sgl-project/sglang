@@ -30,6 +30,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -550,10 +551,10 @@ class TestFactoryViews(unittest.TestCase):
             self.assertEqual(pool.k_buffer[0].dtype, torch.uint8)
 
     def test_rebind_emits_physical_full_and_build_derives_swa(self):
-        """End-to-end over the real factory: rebind_write_loc rebinds
-        out_cache_loc to FULL-side physical ids (phase 1), and the per-batch
-        build derives the SWA write loc pointwise from those values (phase 2)
-        -- both checked against the v2p tables over the VIRTUAL ids."""
+        """End-to-end over the real factory: a batch's own plan binds
+        out_cache_loc to FULL-side physical ids and derives the SWA write ids
+        from the virtual window -- both checked against the v2p tables over
+        the VIRTUAL ids."""
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
         from sglang.srt.runtime_context import get_parallel
 
@@ -584,11 +585,11 @@ class TestFactoryViews(unittest.TestCase):
                 device="cpu",
             )
             self.assertTrue(source.is_translating)
-            source.rebind_write_loc(fb)
+            source.bind_own_plan(fb)
             self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
             self.assertTrue(
                 torch.equal(
-                    source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+                    source.write_ids(fb, IdSpaceKind.SLIDING_WINDOW), expected_swa
                 )
             )
 

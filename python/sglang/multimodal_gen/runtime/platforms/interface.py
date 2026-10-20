@@ -130,8 +130,6 @@ class Platform:
     # compilation strategy.
     simple_compile_backend: str = "inductor"
 
-    supported_quantization: list[str] = []
-
     def init_backend(self) -> None:
         """One-time backend initialization, in each worker; raising aborts startup.
 
@@ -208,6 +206,12 @@ class Platform:
         if not cls.is_cuda_static():
             return False
         return torch.cuda.get_device_capability()[0] == 12
+
+    @classmethod
+    def is_gfx1151(cls) -> bool:
+        """True on the gfx1151 (Strix Halo) ROCm arch. Overridden on
+        RocmPlatform; every other platform is False."""
+        return False
 
     @classmethod
     def is_cuda_static(cls) -> bool:
@@ -297,6 +301,16 @@ class Platform:
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         torch.get_device_module(device).set_device(device)
+
+    @classmethod
+    def synchronize(cls) -> None:
+        """Synchronize pending device work for the current platform."""
+        torch.get_device_module().synchronize()
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Release cached device memory for the current platform."""
+        torch.get_device_module().empty_cache()
 
     @classmethod
     def get_attn_backend_cls_str(
@@ -405,13 +419,6 @@ class Platform:
         )
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        """
-        Check if the current platform supports async output.
-        """
-        raise NotImplementedError
-
-    @classmethod
     def inference_mode(cls):
         """A device-specific wrapper of `torch.inference_mode`.
 
@@ -446,16 +453,6 @@ class Platform:
         - By default all models are considered supported.
         """
         pass
-
-    @classmethod
-    def verify_quantization(cls, quant: str) -> None:
-        """
-        Verify whether the quantization is supported by the current platform.
-        """
-        if cls.supported_quantization and quant not in cls.supported_quantization:
-            raise ValueError(
-                f"{quant} quantization is currently not supported in {cls.device_name}."
-            )
 
     @classmethod
     def get_current_memory_usage(
@@ -530,8 +527,3 @@ class Platform:
     def tensor_on_device(self, t: torch.Tensor) -> bool:
         """Check if a tensor is on the current platform's device."""
         return t.is_cuda
-
-
-class UnspecifiedPlatform(Platform):
-    _enum = PlatformEnum.UNSPECIFIED
-    device_type = ""

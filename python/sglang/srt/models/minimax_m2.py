@@ -17,7 +17,7 @@
 
 import logging
 from contextlib import nullcontext
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -39,9 +39,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -53,7 +53,6 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    reduce_moe_output,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -90,14 +89,12 @@ from sglang.srt.runtime_context import (
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
 # Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    BumpAllocator,
     add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
     is_cpu,
     is_cuda,
-    is_non_idle_and_non_empty,
     is_npu,
     is_xpu,
     make_pp_layers,
@@ -604,7 +601,6 @@ class MiniMaxM2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        final_hidden_states = reduce_moe_output(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -632,103 +628,6 @@ class MiniMaxM2MoE(nn.Module):
         return final_hidden_states
 
     # TBO Operations for MiniMax MoE
-    def op_gate(self, state):
-        """Gate operation for TBO - compute router logits"""
-        if is_non_idle_and_non_empty(
-            state.forward_batch.forward_mode, state.hidden_states_mlp_input
-        ):  # router_logits: (num_tokens, num_experts)
-            state.router_logits, _ = self.gate(state.hidden_states_mlp_input)
-        else:
-            state.router_logits = None
-
-    def op_select_experts(self, state):
-        """Expert selection operation for TBO"""
-        router_logits = state.pop("router_logits")
-        hidden_states = state.hidden_states_mlp_input
-
-        if router_logits is not None:
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
-                )
-            )
-            with ctx:
-                state.topk_weights_local, state.topk_idx_local, _ = self.topk(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
-                )
-        else:
-            state.topk_idx_local = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            state.topk_weights_local = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
-
-    def op_dispatch_a(self, state):
-        """Dispatch A operation for TBO - start async dispatch"""
-        if self.ep_size > 1:
-            self.experts.deepep_dispatcher.dispatch_a(
-                hidden_states=state.pop("hidden_states_mlp_input"),
-                topk_idx=state.pop("topk_idx_local"),
-                topk_weights=state.pop("topk_weights_local"),
-                forward_batch=state.forward_batch,
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-
-    def op_dispatch_b(self, state):
-        """Dispatch B operation for TBO - complete async dispatch"""
-        if self.ep_size > 1:
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(
-                    self.layer_id
-                )
-            )
-            with ctx:
-                state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-
-    def op_experts(self, state):
-        """Expert computation for TBO"""
-        state.hidden_states_experts_output = self.experts.moe_impl(
-            dispatch_output=state.dispatch_output,
-        )
-
-    def op_combine_a(self, state):
-        """Combine A operation for TBO - start async combine"""
-        if self.ep_size > 1:
-            self.experts.deepep_dispatcher.combine_a(
-                hidden_states=state.pop("hidden_states_experts_output"),
-                topk_idx=state.dispatch_output.topk_idx,
-                topk_weights=state.dispatch_output.topk_weights,
-                forward_batch=state.forward_batch,
-                tbo_subbatch_index=state.get("tbo_subbatch_index"),
-            )
-            state.pop("dispatch_output")
-
-    def op_combine_b(self, state):
-        """Combine B operation for TBO - complete async combine"""
-        if self.ep_size > 1:
-            state.hidden_states_after_combine = (
-                self.experts.deepep_dispatcher.combine_b(
-                    tbo_subbatch_index=state.get("tbo_subbatch_index"),
-                )
-            )
-
-    def op_output(self, state):
-        """Output operation for TBO - final MLP output"""
-        final_hidden_states = state.pop("hidden_states_after_combine")
-        # MiniMax doesn't have shared experts like DeepSeek, so no need to add them
-        state.hidden_states_mlp_output = final_hidden_states
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -745,7 +644,6 @@ class MiniMaxM2Attention(nn.Module):
         self.hidden_size = config.hidden_size
 
         # Use attention TP rank/size for dp-attention support
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         # Get dimensions from config
@@ -791,8 +689,7 @@ class MiniMaxM2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -802,8 +699,7 @@ class MiniMaxM2Attention(nn.Module):
             bias=False,
             reduce_results=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -929,18 +825,6 @@ class MiniMaxM2Attention(nn.Module):
             )
         return self.forward_core(s)
 
-    def op_prepare(self, state):
-        state.attn_intermediate_state = self.forward_prepare(
-            positions=state.positions,
-            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
-            forward_batch=state.forward_batch,
-        )
-
-    def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
-        )
-
 
 class MiniMaxM2DecoderLayer(nn.Module):
     """MiniMax Decoder Layer implementation with MoE support."""
@@ -956,8 +840,8 @@ class MiniMaxM2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
 
-        # TBO support: All MiniMax layers are sparse (MoE)
-        self.is_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         self.self_attn = MiniMaxM2Attention(
             config=config,
@@ -980,24 +864,20 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
 
-        is_previous_layer_sparse = True
-        is_next_layer_sparse = True
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
-            previous=declare_ffn(
-                sparse=is_previous_layer_sparse, next_layer_sparse=self.is_layer_sparse
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        # TBO support: All MiniMax layers are sparse (MoE)
+        return (
+            declare_attn(),
+            declare_ffn(sparse=True, next_layer_sparse=True),
         )
 
     def forward(
@@ -1025,58 +905,12 @@ class MiniMaxM2DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
-        with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
-        hidden_states = ffn_exit.finish(hidden_states)
+        hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
 
     # TBO Operations for MiniMax Decoder Layer
-    def op_comm_prepare_attn(
-        self,
-        state,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        zero_allocator: BumpAllocator,
-        tbo_subbatch_index: Optional[int] = None,
-    ):
-        """Communication prepare for attention - TBO operation"""
-        state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
-        )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                zero_allocator=zero_allocator,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
-        )
-
-    def op_comm_prepare_mlp(self, state):
-        """Communication prepare for MLP - TBO operation"""
-        hidden_states = self.attn_boundary.finish(
-            state.pop("hidden_states_after_attn"), state.forward_batch
-        )
-        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
-            hidden_states, state.forward_batch
-        )
-
-    def op_comm_postprocess_layer(self, state):
-        """Communication postprocess for layer - TBO operation"""
-        hidden_states = self.ffn_boundary.finish_complete_output(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
-        )
-
-        output = dict(
-            positions=state.positions,
-            hidden_states=hidden_states,
-            forward_batch=state.forward_batch,
-            zero_allocator=state.zero_allocator,
-            tbo_subbatch_index=state.tbo_subbatch_index,
-        )
-        return output
 
 
 class MiniMaxM2Model(nn.Module):
@@ -1114,6 +948,7 @@ class MiniMaxM2Model(nn.Module):
             config.num_hidden_layers,
             layer_fn,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(MiniMaxM2DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

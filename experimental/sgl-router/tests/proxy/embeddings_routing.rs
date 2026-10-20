@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenAI `/v1/embeddings`: the engine's schema, with text input forwarded as router tokens.
+//! OpenAI `/v1/embeddings` and SGLang's `/v1/classify`: the engine's schema, with
+//! text input forwarded as router tokens.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -49,6 +50,27 @@ async fn embeddings_forward_text_as_input_ids() {
     send(&app, json!({"model": MODEL, "input": ["hi", "yo"]})).await;
     let expected = json!({"model": MODEL, "input": [prompt_ids("hi"), prompt_ids("yo")]});
     assert_eq!(engine.captured_json().await, expected);
+}
+
+#[tokio::test]
+async fn classify_forwards_token_ids_for_one_prompt_only() {
+    let engine = MockWorker::start(vec![]).await;
+    let app = radix_router(&[(&engine, WorkerMode::Plain)], HashTree::new());
+    // `ClassifyRequest` takes no batch of token-ID lists.
+    for (input, forwarded) in [
+        (json!("hi"), json!(prompt_ids("hi"))),
+        (json!(["hi", "yo"]), json!(["hi", "yo"])),
+    ] {
+        let request = Request::post("/v1/classify")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"model": MODEL, "input": input}).to_string(),
+            ))
+            .unwrap();
+        let res = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(engine.captured_json().await["input"], forwarded);
+    }
 }
 
 #[tokio::test]
