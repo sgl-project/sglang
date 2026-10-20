@@ -40,6 +40,18 @@ class ParallelExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute stages while respecting their declared parallelism type."""
+        if server_args.stage_deployment:
+            original_run_stage = run_stage
+
+            def run_stage(stage, current):
+                result = original_run_stage(stage, current)
+                if isinstance(result, OutputBatch):
+                    if result.error:
+                        raise RuntimeError(result.error)
+                    current.extra["_deployment_result"] = result
+                    return current
+                return result
+
         if server_args.enable_cfg_parallel:
             rank = get_classifier_free_guidance_rank()
         else:

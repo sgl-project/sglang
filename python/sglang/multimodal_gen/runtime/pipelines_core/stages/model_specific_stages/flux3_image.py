@@ -558,7 +558,7 @@ class Flux3ImageTextEncodeStage(PipelineStage):
             batch.extra["flux3_text"] = encoded[
                 index * branches : (index + 1) * branches
             ]
-            if not batch.image_path:
+            if not batch.image_path and not server_args.stage_deployment:
                 batch.extra.update(flux3_condition=None, flux3_crop=None)
         return batches
 
@@ -884,7 +884,7 @@ class Flux3ImageDecodeStage(PipelineStage):
         ]
 
     @torch.no_grad()
-    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         with (
             self.use_declared_component(
                 component_name="vae",
@@ -894,11 +894,10 @@ class Flux3ImageDecodeStage(PipelineStage):
             use_vae_fast_path(self.vae, batch.quality != "exact"),
         ):
             with torch.inference_mode():
-                image = crop_output(
-                    vae_decode(self.vae, batch.latents, batch.latent_ids, batched=True),
-                    batch.extra["flux3_crop"],
+                batch.output = vae_decode(
+                    self.vae, batch.latents, batch.latent_ids, batched=True
                 )
-        return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
+        return batch
 
     @torch.no_grad()
     def run_grouped_requests(self, batches, server_args):
@@ -923,15 +922,26 @@ class Flux3ImageDecodeStage(PipelineStage):
                     [req.num_outputs_per_prompt for _, req in group]
                 )
                 for (index, req), images in zip(group, decoded_groups):
-                    outputs[index] = OutputBatch(
-                        output=list(
-                            self._to_display(
-                                crop_output(images, req.extra["flux3_crop"])
-                            )
-                        ),
-                        metrics=req.metrics,
-                    )
+                    req.output = images
+                    outputs[index] = req
         return outputs
+
+
+class Flux3ImagePostprocessStage(PipelineStage):
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DECODER
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        return OutputBatch(
+            output=self._to_display(
+                crop_output(batch.output, batch.extra["flux3_crop"])
+            ),
+            metrics=batch.metrics,
+        )
+
+    def run_grouped_requests(self, batches, server_args):
+        return [self.forward(batch, server_args) for batch in batches]
 
     @staticmethod
     def _to_display(image: Tensor) -> Tensor:

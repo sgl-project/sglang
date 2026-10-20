@@ -608,6 +608,9 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
+    stage_deployment: str | None = None
+    stage_role: str | None = None
+    stage_endpoint: str | None = None
     disagg_timeout: int = 3600
     disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"

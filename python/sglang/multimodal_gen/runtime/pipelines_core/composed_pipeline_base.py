@@ -14,6 +14,11 @@ from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 import torch
 from tqdm import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+    Deployment,
+    ExecutionPlan,
+    StageSpec,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -89,6 +94,7 @@ class ComposedPipelineBase(ABC):
     _extra_config_module_map: dict[str, str] = {}
     # Exact module keys; unspecified components retain the default loader dispatch.
     component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
+    stage_specs: ClassVar[tuple[StageSpec, ...]] = ()
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -116,6 +122,13 @@ class ComposedPipelineBase(ABC):
         use. The pipeline should be stateless and not hold any batch state.
         """
         self.server_args = server_args
+        self.deployment_plan = (
+            ExecutionPlan.compile(
+                Deployment.load(server_args.stage_deployment), self.stage_specs
+            )
+            if server_args.stage_deployment
+            else None
+        )
         self._disagg_role = server_args.disagg_role
         self.validate_disagg_role(self._disagg_role)
 
@@ -138,6 +151,11 @@ class ComposedPipelineBase(ABC):
             base_required_config_modules = COMFYUI_REQUIRED_MODULES
         self._unfiltered_required_config_modules = tuple(base_required_config_modules)
         self._required_config_modules = list(self._unfiltered_required_config_modules)
+        if self.deployment_plan is not None:
+            required = self.deployment_plan.roles[server_args.stage_role].components
+            self._required_config_modules = [
+                name for name in self._required_config_modules if name in required
+            ]
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -189,6 +207,12 @@ class ComposedPipelineBase(ABC):
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
+        if self.deployment_plan is not None:
+            expected = self.deployment_plan.roles[self.server_args.stage_role].stages
+            if tuple(self._stage_name_mapping) != expected:
+                raise ValueError(
+                    f"Instantiated stages {tuple(self._stage_name_mapping)} do not match placement {expected}"
+                )
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -706,6 +730,11 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
+        if self.deployment_plan is not None:
+            return (
+                stage_name
+                in self.deployment_plan.roles[self.server_args.stage_role].stages
+            )
         if self._disagg_role.includes_stage(role_affinity):
             return True
 

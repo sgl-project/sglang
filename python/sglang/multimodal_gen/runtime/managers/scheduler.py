@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import asyncio
 import dataclasses
 import pickle
 import threading
@@ -15,6 +16,10 @@ from typing import Any, Callable, Iterator, List
 import msgspec
 import zmq
 
+from sglang.multimodal_gen.runtime.disaggregation.deployment.runtime import (
+    DeploymentWorker,
+    broadcast_request,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
@@ -1399,6 +1404,15 @@ class Scheduler(
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
+        if self.server_args.stage_role:
+            if self.gpu_id == 0:
+                asyncio.run(DeploymentWorker(self).run())
+            else:
+                while self._broadcast_to_all_ranks(None) is not None:
+                    req = broadcast_request(self, None)
+                    self.worker.pipeline.forward(req, self.server_args)
+            return
+
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_event_loop()

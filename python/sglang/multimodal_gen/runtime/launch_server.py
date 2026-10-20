@@ -8,6 +8,14 @@ import time
 
 import uvicorn
 
+from sglang.multimodal_gen.registry import get_model_info, get_pipeline_class
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+    Deployment,
+    ExecutionPlan,
+)
+from sglang.multimodal_gen.runtime.disaggregation.deployment.runtime import (
+    DeploymentServer,
+)
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
 )
@@ -797,6 +805,10 @@ def dispatch_launch(server_args: ServerArgs):
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
 
+    if server_args.stage_deployment:
+        launch_stage_deployment(server_args)
+        return
+
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:
         launch_server(server_args)
@@ -806,6 +818,48 @@ def dispatch_launch(server_args: ServerArgs):
         launch_disagg_role(server_args)
     else:
         raise ValueError(f"Unknown disagg_role: {role}")
+
+
+def launch_stage_deployment(server_args: ServerArgs):
+    if server_args.disagg_role != RoleType.MONOLITHIC or server_args.dp_size != 1:
+        raise ValueError(
+            "Stage deployment uses named role replicas, not --disagg-role or --dp-size"
+        )
+    pipeline_cls = (
+        get_pipeline_class(server_args.pipeline_class_name)
+        if server_args.pipeline_class_name
+        else get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        ).pipeline_cls
+    )
+    plan = ExecutionPlan.compile(
+        Deployment.load(server_args.stage_deployment), pipeline_cls.stage_specs
+    )
+    if server_args.stage_role:
+        role = plan.roles[server_args.stage_role]
+        if server_args.stage_endpoint not in role.endpoints:
+            raise ValueError(
+                "--stage-endpoint must identify a worker listed for --stage-role"
+            )
+        server_args.warmup_mode = "off"
+        processes = launch_server(server_args, launch_http_server=False)
+        try:
+            for process in processes:
+                process.join()
+        finally:
+            shutdown_scheduler_processes(None, processes, request_shutdown=False)
+        return
+    configure_logger(server_args)
+    server = DeploymentServer(
+        plan, server_args.disagg_timeout, server_args.disagg_max_slots_per_instance
+    )
+    server.start(server_args.scheduler_endpoint_for(0))
+    try:
+        launch_http_server_only(server_args)
+    finally:
+        server.stop()
 
 
 if __name__ == "__main__":
