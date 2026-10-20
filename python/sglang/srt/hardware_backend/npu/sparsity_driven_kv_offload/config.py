@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
     get_dsa_index_topk,
+    get_dsa_indexer_layer_ids,
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
@@ -83,6 +84,8 @@ def get_sparsity_driven_kv_offload_cell_size(
     use_mla_backend: bool,
     num_layers: int,
     element_size: int,
+    start_layer: int = 0,
+    is_draft_worker: bool = False,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
@@ -93,4 +96,18 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
-    return index_head_dim * num_layers * element_size
+    from sglang.srt.mem_cache.kv_cache_configurator import (
+        _should_elide_dsa_index_k,
+    )
+
+    if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
+        owner_layer_ids = get_dsa_indexer_layer_ids(
+            model_config.hf_config,
+            start_layer,
+            start_layer + num_layers,
+        )
+        # Match the allocator's dense fallback for a PP range without owners.
+        num_indexer_layers = len(owner_layer_ids) or num_layers
+    else:
+        num_indexer_layers = num_layers
+    return index_head_dim * num_indexer_layers * element_size

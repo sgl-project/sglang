@@ -444,6 +444,17 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     return max(layer_id - 1, 0) % freq != 0
 
 
+def get_dsa_indexer_layer_ids(
+    config: PretrainedConfig, start_layer: int, end_layer: int
+) -> tuple[int, ...]:
+    """Return model layer IDs in this rank's range that own DSA index-K rows."""
+    return tuple(
+        layer_id
+        for layer_id in range(start_layer, end_layer)
+        if not dsa_layer_skips_topk(config, layer_id)
+    )
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
