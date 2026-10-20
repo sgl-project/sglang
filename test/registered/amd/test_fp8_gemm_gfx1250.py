@@ -5,8 +5,8 @@ caps BLOCK_SIZE_K at 64 because FP8 ``tl.dot`` miscompiles above that on this
 target. Guards: ragged M and small N still match a dequantized reference,
 ``gfx1250_fp8_scaled_mm_supported`` rejects the shapes the K loop cannot cover,
 an all-zero activation row quantizes to exact zeros, and ``Fp8LinearMethod``
-both reaches the tile for an online-quantized checkpoint and stays off it when
-the kill switch is set.
+both reaches the tile for an online-quantized checkpoint, lays its weights out
+row-major, and stays off the tile when the kill switch is set.
 """
 
 import unittest
@@ -118,6 +118,13 @@ class TestFp8LinearMethodDispatchGfx1250(CustomTestCase):
         self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
         self.assertEqual(tuple(layer.weight.shape), (K, N))
         self.assertEqual(layer.weight_scale.numel(), N)
+        # Row-major, not the transposed view this would otherwise be. The
+        # tile's configs are tuned for this layout and it is worth 1.05-1.33x,
+        # so a refactor that drops the transpose is a silent regression.
+        self.assertTrue(
+            layer.weight.is_contiguous(),
+            f"weight must be row-major [K, N]; strides {layer.weight.stride()}",
+        )
 
         x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
         out = method.apply(layer, x)

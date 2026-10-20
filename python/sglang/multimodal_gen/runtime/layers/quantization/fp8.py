@@ -395,8 +395,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
 
-                # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
+                # Update the layer with the new values. The gfx1250 tile wants
+                # [K, N] contiguous along N rather than the usual transposed
+                # view of a [N, K] weight; at these shapes that is worth
+                # 1.05-1.33x, paid once here as a transpose at load.
+                qweight_kn = qweight.t()
+                if self.use_gfx1250_triton_fp8:
+                    qweight_kn = qweight_kn.contiguous()
+                layer.weight = Parameter(qweight_kn, requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
 

@@ -90,18 +90,18 @@ def _fp8_scaled_mm_kernel(
 def _select_config(M: int, N: int) -> _Config:
     """Tile chosen by an offline sweep over the FLUX.2 720p linear shapes.
 
-    The sweep covered BLOCK_M/N in {64,128,256}, BLOCK_K in {32,64},
-    num_warps in {4,8} and num_stages in {2,3,4,5} at M in {512, 3600, 4112},
-    N in {6144, 36864, 55296} and K in {6144, 15360, 18432, 24576}, gated on
-    agreeing with a dequantized reference. A 256x256x64 tile with 4 warps won
-    every shape that fills 96 CUs (1150-1255 TFLOPS); the narrower tiles win
-    only below that, where the top configs are within ~3% of each other.
+    Tuned for a **row-major** ``[K, N]`` B (see the note on `b` in
+    :func:`gfx1250_fp8_scaled_mm`); a column-major B is correct but prefers a
+    different, slower tile. The sweep covered BLOCK_M/N in {64,128,256},
+    BLOCK_K in {32,64}, num_warps in {4,8} and num_stages in {3,4} at M in
+    {512, 3600, 4112}, N in {6144, 36864, 55296} and K in
+    {6144, 15360, 18432, 24576}, gated on agreeing with a dequantized
+    reference. A 128-row tile won every shape; N decides the warp count and,
+    below 1024 rows, the tile width.
     """
-    if M >= 1024:
-        return (256, 256, _BLOCK_K, 4, 3)
-    if M >= 256:
-        return (256, 256, _BLOCK_K, 4, 3) if N >= 16384 else (128, 256, _BLOCK_K, 4, 3)
-    return (64, 256, _BLOCK_K, 4, 3)
+    if M >= 256 or N >= 16384:
+        return (128, 256, _BLOCK_K, 8 if N >= 16384 else 4, 4)
+    return (128, 128, _BLOCK_K, 4, 4)
 
 
 def gfx1250_fp8_scaled_mm_supported(M: int, N: int, K: int) -> bool:
@@ -126,8 +126,11 @@ def gfx1250_fp8_scaled_mm(
 
     Args:
         a: ``[M, K]`` ``float8_e4m3fn`` activations, row-major.
-        b: ``[K, N]`` ``float8_e4m3fn`` weights (typically the transposed view
-            of a ``[N, K]`` contiguous weight).
+        b: ``[K, N]`` ``float8_e4m3fn`` weights. Pass these **row-major**, i.e.
+            contiguous along N. The usual transposed view of a ``[N, K]``
+            weight is correct but 1.05-1.33x slower on this target, because a
+            BLOCK_N slice of one k-row then reads N single bytes strided by K
+            instead of BLOCK_N contiguous ones.
         a_scale: ``M`` per-token scales, any shape with ``M`` elements.
         b_scale: ``N`` per-channel scales, any shape with ``N`` elements.
         out_dtype: output dtype.
