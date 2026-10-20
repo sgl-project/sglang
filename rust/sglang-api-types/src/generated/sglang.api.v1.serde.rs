@@ -1647,12 +1647,7 @@ impl ::serde::Serialize for GenerateRequest {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "custom_labels", v)?;
         }
         if let Some(v) = &self.images_config {
-            ::serde::ser::SerializeMap::serialize_entry(
-                &mut map,
-                "images_config",
-                &::serde_json::from_str::<::serde_json::Value>(v)
-                    .unwrap_or(::serde_json::Value::Null),
-            )?;
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "images_config", v)?;
         }
         if let Some(v) = &self.return_prompt_token_ids {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "return_prompt_token_ids", v)?;
@@ -1965,10 +1960,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             if f_images_config.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("images_config"));
                             }
-                            f_images_config = Some(
-                                map.next_value::<Option<::serde_json::Value>>()?
-                                    .map(|v| v.to_string()),
-                            );
+                            f_images_config = Some(map.next_value::<Option<ImagesConfig>>()?);
                         }
                         "return_prompt_token_ids" => {
                             if f_return_prompt_token_ids.is_some() {
@@ -2045,6 +2037,64 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     routed_experts_start_len: f_routed_experts_start_len.flatten(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ImagesConfig {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.image_mode {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_mode", v)?;
+        }
+        if let Some(v) = &self.prefix {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prefix", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ImagesConfig {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ImagesConfig;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ImagesConfig")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_image_mode = None;
+                let mut f_prefix = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "image_mode" => {
+                            if f_image_mode.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_mode"));
+                            }
+                            f_image_mode =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "prefix" => {
+                            if f_prefix.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("prefix"));
+                            }
+                            f_prefix =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ImagesConfig {
+                    image_mode: f_image_mode.flatten(),
+                    prefix: f_prefix.flatten(),
                 })
             }
         }
@@ -2562,8 +2612,12 @@ impl ::serde::Serialize for GenerateMetaInfo {
         if let Some(v) = &self.weight_version {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "weight_version", v)?;
         }
-        if let Some(v) = &self.weight_versions {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "weight_versions", v)?;
+        if !self.weight_versions.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "weight_versions",
+                &self.weight_versions,
+            )?;
         }
         ::serde::ser::SerializeMap::end(map)
     }
@@ -2736,8 +2790,10 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                             if f_weight_versions.is_some() {
                                 return Err(::serde::de::Error::duplicate_field("weight_versions"));
                             }
-                            f_weight_versions =
-                                Some(map.next_value::<Option<WeightVersionSpans>>()?);
+                            f_weight_versions = Some(
+                                map.next_value::<Option<Vec<WeightVersionSpan>>>()?
+                                    .unwrap_or_default(),
+                            );
                         }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
@@ -2761,7 +2817,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateMetaInfo {
                     reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
                     output_token_logprobs_length: f_output_token_logprobs_length.flatten(),
                     weight_version: f_weight_version.flatten(),
-                    weight_versions: f_weight_versions.flatten(),
+                    weight_versions: f_weight_versions.unwrap_or_default(),
                 })
             }
         }
@@ -2827,23 +2883,6 @@ impl<'de> ::serde::Deserialize<'de> for WeightVersionSpan {
             }
         }
         deserializer.deserialize_map(V)
-    }
-}
-
-impl ::serde::Serialize for WeightVersionSpans {
-    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_seq(self.items.iter())
-    }
-}
-
-impl<'de> ::serde::Deserialize<'de> for WeightVersionSpans {
-    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(WeightVersionSpans {
-            items:
-                <::prost::alloc::vec::Vec<WeightVersionSpan> as ::serde::Deserialize>::deserialize(
-                    deserializer,
-                )?,
-        })
     }
 }
 

@@ -82,11 +82,18 @@ message GenerateRequest {
   optional string session_id = 33;
   OptionalStringOrList custom_logit_processor = 34;
   CustomLabels custom_labels = 35;
-  optional string images_config = 36 [(sglang.json.v1.field_json).raw_json = true];
+  ImagesConfig images_config = 36;
   optional bool return_prompt_token_ids = 37;
   optional int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
   OptionalStringList modalities = 40;
+}
+
+// Per-request Unlimited-OCR options. The processor owns mode validation and
+// defaults: an absent image_mode uses "gundam", an absent prefix adds no tokens.
+message ImagesConfig {
+  optional string image_mode = 1;
+  optional string prefix = 2;
 }
 
 // Preserve an explicitly empty label map, distinct from an absent map.
@@ -202,18 +209,14 @@ message GenerateMetaInfo {
   // Python reports the cumulative count even for incremental logprob frames.
   optional uint64 output_token_logprobs_length = 15;
   optional string weight_version = 16;
-  WeightVersionSpans weight_versions = 17;
+  // Omitted until terminal output; reported spans are always nonempty.
+  repeated WeightVersionSpan weight_versions = 17;
 }
 
 message WeightVersionSpan {
   string version = 1;
   int64 start = 2;
   int64 end = 3;
-}
-
-message WeightVersionSpans {
-  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
-  repeated WeightVersionSpan items = 1;
 }
 
 message GenerateResponse {

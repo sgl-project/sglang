@@ -419,8 +419,8 @@ pub struct GenerateRequest {
     pub custom_logit_processor: ::core::option::Option<OptionalStringOrList>,
     #[prost(message, optional, tag = "35")]
     pub custom_labels: ::core::option::Option<CustomLabels>,
-    #[prost(string, optional, tag = "36")]
-    pub images_config: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "36")]
+    pub images_config: ::core::option::Option<ImagesConfig>,
     #[prost(bool, optional, tag = "37")]
     pub return_prompt_token_ids: ::core::option::Option<bool>,
     #[prost(int64, optional, tag = "38")]
@@ -429,6 +429,15 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
+}
+/// Per-request Unlimited-OCR options. The processor owns mode validation and
+/// defaults: an absent image_mode uses "gundam", an absent prefix adds no tokens.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ImagesConfig {
+    #[prost(string, optional, tag = "1")]
+    pub image_mode: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub prefix: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Preserve an explicitly empty label map, distinct from an absent map.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -584,8 +593,9 @@ pub struct GenerateMetaInfo {
     pub output_token_logprobs_length: ::core::option::Option<u64>,
     #[prost(string, optional, tag = "16")]
     pub weight_version: ::core::option::Option<::prost::alloc::string::String>,
-    #[prost(message, optional, tag = "17")]
-    pub weight_versions: ::core::option::Option<WeightVersionSpans>,
+    /// Omitted until terminal output; reported spans are always nonempty.
+    #[prost(message, repeated, tag = "17")]
+    pub weight_versions: ::prost::alloc::vec::Vec<WeightVersionSpan>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WeightVersionSpan {
@@ -595,11 +605,6 @@ pub struct WeightVersionSpan {
     pub start: i64,
     #[prost(int64, tag = "3")]
     pub end: i64,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct WeightVersionSpans {
-    #[prost(message, repeated, tag = "1")]
-    pub items: ::prost::alloc::vec::Vec<WeightVersionSpan>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {
