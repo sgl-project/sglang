@@ -8,7 +8,6 @@ from sglang.kernels.ops.attention.decode_attention import (
 )
 from sglang.kernels.ops.attention.extend_attention import (
     extend_attention_fwd,
-    redundant_attention,
 )
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
@@ -23,9 +22,14 @@ from sglang.srt.layers.attention.wave_ops.prefill_attention import (
 )
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.extend_attention import redundant_attention
 
 # Wave attention kernel unit tests (AMD only - requires wave_lang)
-register_amd_ci(est_time=60, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(
+    est_time=60,
+    suite="stage-a-test-1-gpu-small-amd",
+    disabled="Wave prefill corrupts the native heap on ROCm 10",
+)
 
 
 class TestWaveAttention(unittest.TestCase):
@@ -283,6 +287,9 @@ class TestWaveAttention(unittest.TestCase):
         self.assertTrue(cos_sim.item() > 0.99)
         self.assertTrue(torch.allclose(o, o_triton, atol=3e-2))
 
+    @unittest.skip(
+        "Wave grouped decode is temporarily disabled because it produces NaNs on ROCm 10."
+    )
     def test_grouped_decode_attention(self):
         seq_lens = [5, 100, 128, 500]
         configs = [

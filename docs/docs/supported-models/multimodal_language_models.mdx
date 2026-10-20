@@ -409,18 +409,20 @@ sglang serve \
 
 ### Performance Optimization
 
-For multimodal models, you can use the `--keep-mm-feature-on-device` flag to optimize for latency at the cost of increased GPU memory usage:
+For multimodal models, you can use `--mm-feature-transport=cuda_ipc` to optimize for latency at the cost of increased GPU memory usage:
 
 - **Default behavior**: Multimodal feature tensors are moved to CPU after processing to save GPU memory
-- **With `--keep-mm-feature-on-device`**: Feature tensors remain on GPU, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
+- **With `--mm-feature-transport=cuda_ipc`**: Feature tensors stay in a bounded GPU pool shared over CUDA IPC, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
 
-Use this flag when you have sufficient GPU memory and want to minimize latency for multimodal inference.
+Use this option when you have sufficient GPU memory and want to minimize latency for multimodal inference.
 
 ### Multimodal Inputs Limitation
 
 - **Use `--mm-process-config '&#123;"image":&#123;"max_pixels":1048576&#125;,"video":&#123;"fps":3,"max_pixels":602112,"max_frames":60&#125;&#125;'`**: To set `image`, `video`, and `audio` input limits.
 
 This can reduce GPU memory usage, improve inference speed, and help to avoid OOM, but may impact model performance, thus set a proper value based on your specific use case. The config entries are passed as `images_kwargs`, `videos_kwargs`, and `audio_kwargs` to the HuggingFace processor, so each modality's settings are kept separate and do not collide. Refer to the HuggingFace documentation for your model's processor to understand the available parameters.
+
+For GLM-V models, the per-request `video_url` fields `fps`, `max_frames`, `max_tokens_per_frame`, and `max_image_tokens` can only tighten the deployment's video budget. Larger `fps`, `max_frames`, and `max_image_tokens` values are clamped to the deployment setting, and a `max_tokens_per_frame` that would exceed the video token budget is ignored. Raise the limits with `--mm-process-config` instead.
 
 ### Bidirectional Attention in Multimodal Model Serving
 **Note for serving the Gemma-3 multimodal model**:

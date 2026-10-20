@@ -10,7 +10,7 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
-from sglang.kernels.ops.attention.utils import get_num_page_per_block_flashmla
+from sglang.kernels.ops.attention.kv_indices import get_num_page_per_block_flashmla
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -327,7 +327,6 @@ class TestTRTLLMMLA(CustomTestCase):
     def setUpClass(cls):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         set_global_server_args_for_scheduler(server_args)
 
     @classmethod

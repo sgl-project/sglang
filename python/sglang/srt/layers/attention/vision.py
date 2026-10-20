@@ -40,6 +40,7 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -50,9 +51,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 if _is_cuda:
-    from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
-
     from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module.
+    cudnn_batch_prefill_with_kv_cache = LazyImport(
+        "flashinfer.prefill", "cudnn_batch_prefill_with_kv_cache"
+    )
 
     def flash_attn_func(*args, ver: int = 3, **kwargs):
         if ver == 4:
@@ -83,6 +88,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.distributed import utils as dist_utils
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -454,10 +460,6 @@ class VisionTritonAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        use_data_parallel = (
-            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
-        )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -528,10 +530,6 @@ class VisionFlash3Attention(nn.Module):
         if not (_is_cuda or _is_musa):
             raise Exception("VisionFlash3Attention is only available for cuda or musa")
         super().__init__()
-        use_data_parallel = (
-            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
-        )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
 
     def forward(
         self,
@@ -614,6 +612,11 @@ class VisionFlash4Attention(nn.Module):
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; models without
+            # a runner keep passing tensors even when the graph env var is set.
+            cu_seqlens_gpu = cu_seqlens[0]
+            max_seqlen = cu_seqlens[1]
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
@@ -1102,6 +1105,7 @@ class VisionAttention(nn.Module):
         ] = None,
         use_data_parallel: bool = False,
         use_dp_attention_reduce: bool = False,
+        allow_tp_reduce_mismatch: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
         workspace_buffer: Optional[torch.Tensor] = None,
         use_sink: bool = False,
@@ -1197,8 +1201,7 @@ class VisionAttention(nn.Module):
                 total_num_kv_heads=num_dummy_heads + num_kv_heads,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="replicated" if use_data_parallel else "attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
             )
         else:
@@ -1207,17 +1210,26 @@ class VisionAttention(nn.Module):
                 output_size=3 * self.dummy_dim,
                 bias=qkv_bias,
                 quant_config=quant_config,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group="replicated" if use_data_parallel else "attn_tp",
                 prefix=add_prefix("qkv_proj", prefix),
+            )
+        # TODO: this layer shards over attention TP but reduces over the full TP
+        # group; reduce over the attention-TP group so attention DP and attention
+        # CP narrower than TP can run it.
+        if not allow_tp_reduce_mismatch:
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=self.tp_size,
+                reduces_over_attn_tp=use_dp_attention_reduce,
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
             )
         self.proj = RowParallelLinear(
             input_size=self.dummy_dim,
             output_size=embed_dim,
             bias=proj_bias,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
+            parallel_group="replicated" if use_data_parallel else "attn_tp",
             prefix=add_prefix("proj", prefix),
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
@@ -1272,7 +1284,7 @@ class VisionAttention(nn.Module):
 
         Platform defaults:
         - CUDA (Hopper SM90): "fa3"
-        - CUDA (Blackwell SM100): "fa4"
+        - CUDA (Blackwell SM100/SM103): "fa4"
         - CUDA (other): "triton_attn"
         - Ascend NPU: "ascend_attn"
         - Other platforms: device-specific optimized backend or "sdpa"
@@ -1290,10 +1302,10 @@ class VisionAttention(nn.Module):
         elif passed_backend is not None:
             backend = passed_backend
         elif is_cuda():
-            major, minor = get_device_capability()
+            major, _ = get_device_capability()
             if major == 9:
                 backend = "fa3"
-            elif major == 10 and minor != 3:
+            elif major == 10:
                 backend = "fa4"
             else:
                 backend = "triton_attn"

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # MiniMax H3 visual VAE: 3D causal CNN encoder + ViT3D decoder (inference-only bundle).
 import math
-import os
 from typing import List, Union
 
 import numpy as np
@@ -14,6 +13,8 @@ from diffusers.models import ModelMixin
 from diffusers.utils import logging
 from PIL import Image
 
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
@@ -30,38 +31,6 @@ from .vae_cnn import EncoderFCN3D
 from .vae_vit import ViT3DDecoder
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
-
-def _resolve_temporal_cat_dtype():
-    raw = (
-        os.environ.get("MINIMAX_H3_VAE_DECODER_TEMPORAL_CAT_DTYPE", "").strip().lower()
-    )
-    if raw in ("", "0", "false", "no", "off", "none", "keep", "default"):
-        return None
-    mapping = {
-        "fp16": torch.float16,
-        "float16": torch.float16,
-        "half": torch.float16,
-        "bf16": torch.bfloat16,
-        "bfloat16": torch.bfloat16,
-        "fp32": torch.float32,
-        "float32": torch.float32,
-    }
-    if raw not in mapping:
-        raise ValueError(
-            "MINIMAX_H3_VAE_DECODER_TEMPORAL_CAT_DTYPE must be one of "
-            "fp16|bf16|fp32|keep, got %r" % raw
-        )
-    return mapping[raw]
-
-
-def _resolve_temporal_stream_cat():
-    raw = (
-        os.environ.get("MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT", "1")
-        .strip()
-        .lower()
-    )
-    return raw not in ("0", "false", "no", "off", "disable", "disabled")
 
 
 def get_tile_parallel_state():
@@ -206,6 +175,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             "pixel_norm_type": self.pixel_norm_type,
             "transform": self.transform,
             "transform_rev": self.transform_rev,
+            "transform_rev_inplace": self.transform_rev_inplace,
             "use_3d_conv": self.use_3d_conv,
         }
         if hasattr(self, "processor"):
@@ -662,7 +632,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return int(total_frames), int(pad_frames), int(total_frames - pad_frames)
 
     def _decode_temporal_streaming(
-        self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+        self, z, z_head, z_tail, num_chunks, pad_tokens, on_frames
     ):
         total_frames, pad_frames, output_frames = (
             self._decode_temporal_output_frame_plan(
@@ -702,6 +672,8 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                     part[:, :, :copy_frames, :, :]
                 )
                 write_pos += copy_frames
+                if on_frames is not None:
+                    on_frames(dec[:, :, write_pos - copy_frames : write_pos])
             dropped_frames += part_frames - copy_frames
 
         for i in range(num_chunks):
@@ -717,8 +689,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
             clip_dec = self._adaptive_decode(clip_z)
             decoded_count += 1
-            if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
-                clip_dec = clip_dec.to(temporal_cat_dtype)
             if clip_dec.device != z.device:
                 clip_dec = clip_dec.to(z.device)
 
@@ -776,7 +746,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         return dec
 
-    def decode_temporal(self, z):
+    def decode_temporal(self, z, on_frames=None):
         chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
 
         isolated_token_num = 0
@@ -813,10 +783,9 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
             pad_z = z[:, :, -1:, :, :].expand(-1, -1, pad_tokens, -1, -1)
             z = torch.cat([z, pad_z], dim=2)
 
-        temporal_cat_dtype = _resolve_temporal_cat_dtype()
-        if not self.training and _resolve_temporal_stream_cat():
+        if not self.training and envs.MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT:
             return self._decode_temporal_streaming(
-                z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype
+                z, z_head, z_tail, num_chunks, pad_tokens, on_frames
             )
 
         decoded_tasks = []
@@ -832,8 +801,6 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 clip_z = torch.cat([clip_z, z_tail], dim=2)
 
             clip_dec = self._adaptive_decode(clip_z)
-            if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
-                clip_dec = clip_dec.to(temporal_cat_dtype)
 
             decoded_tasks.append((i, clip_dec))
 
@@ -887,16 +854,23 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         if pad_frames > 0:
             dec = dec[:, :, :-pad_frames, :, :]
 
+        if on_frames is not None:
+            on_frames(dec)
         return dec
 
-    def decode_base(self, z, frame_num=None, process_image=False):
+    def decode_base(self, z, frame_num=None, process_image=False, on_frames=None):
+        """``on_frames`` receives every output frame once, in order, as soon as it is final."""
+        if on_frames is not None and (
+            process_image or not self.use_3d_conv or frame_num is not None
+        ):
+            raise ValueError("on_frames needs an untrimmed temporal video decode")
         if process_image or not self.use_3d_conv:
             if not self.use_3d_conv and z.ndim == 5:
                 z = z.squeeze(2)
 
             recon = self._adaptive_decode(z)
         else:
-            recon = self.decode_temporal(z)
+            recon = self.decode_temporal(z, on_frames=on_frames)
 
         if self.use_3d_conv:
             if frame_num is not None:
@@ -1230,11 +1204,13 @@ class AutoencoderKLLegacy(AutoencoderKL):
 
         self.transform = get_normalize_transform(pixel_norm_type)
         self.transform_rev = get_denormalize_transform(pixel_norm_type)
+        self.transform_rev_inplace = get_denormalize_transform(
+            pixel_norm_type, inplace=True
+        )
 
         self.use_3d_conv = use_3d_conv
         self.causal_encoder = causal_encoder
         self.causal_decoder = causal_decoder
-        self.slidedec = self.causal_encoder and not self.causal_decoder
 
         # some registered parameters for simplicity
         self.vae_ratio = int(np.cumprod(space_down)[-1])
@@ -1281,6 +1257,7 @@ class AutoencoderKLLegacy(AutoencoderKL):
         self.decoder = ViT3DDecoder(**vit_kwargs)
 
     @torch.no_grad()
+    @cached_vae_encode
     def encode(self, x):
         return self.quant_conv(self.encoder(x))
 

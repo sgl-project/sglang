@@ -1,7 +1,7 @@
 """Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs torch.
 
 Run on SM90+ (Hopper or later):
-    python test/registered/jit/benchmark/bench_dsv3_fused_a_gemm.py
+    python test/registered/kernels/benchmark/gemm/bench_dsv3_fused_a_gemm.py
 """
 
 import torch

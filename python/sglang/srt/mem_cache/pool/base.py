@@ -8,7 +8,7 @@ import abc
 import logging
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -18,6 +18,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+    from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
 
 logger = logging.getLogger(__name__)
 
@@ -30,33 +32,72 @@ class KVWriteLoc:
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
-      KERNEL-FACING on every pool: physical by allocation on non-unified
-      pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
-      the unified pool.
+      PHYSICAL on every pool: by allocation on non-unified pools, the
+      iteration's plan's write ids on the unified pool (``KVLocPlan.bind``).
     - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise); under the unified pool the translator derives it from the
-      same rebound loc (``sliding_window_write_loc_for``).
-    - ``full_loc``: OPTIONAL full-attention-sub-pool location. Since the
-      construction-time rebind it is the SAME id space as ``loc``, so pools
-      fall back to ``loc`` when it is ``None`` -- only triton's captured path
-      still passes its capture-stable
-      ``ForwardMetadata.out_cache_loc_full_physical`` buffer here (a
-      same-space alias slated for collapse).
+      otherwise): the same plan's write ids in the sliding-window sub-pool
+      (``KVIndexTranslator.write_ids``).
+    - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
+      space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
     loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
+
+    ``physical`` marks the locs as physical token ids: the write ids a plan
+    bound to the batch, or ids produced separately and marked so. A unified
+    pool's write door refuses a loc not marked physical; other pools do not
+    check.
     """
 
     loc: torch.Tensor
     swa_loc: Optional[torch.Tensor] = None
     full_loc: Optional[torch.Tensor] = None
+    physical: bool = False
+
+    @classmethod
+    def for_batch(
+        cls,
+        forward_batch,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> KVWriteLoc:
+        """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
+        physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
+        the same mark, so it must come from the same plan (as
+        ``KVIndexTranslator.write_ids`` does); a loc produced separately states
+        its own mark with ``KVWriteLoc(loc, physical=...)``."""
+        return cls(
+            forward_batch.out_cache_loc,
+            swa_loc,
+            full_loc,
+            physical=forward_batch.out_cache_loc_is_physical,
+        )
+
+    @classmethod
+    def for_layer(
+        cls,
+        forward_batch,
+        layer,
+        *,
+        swa_loc: Optional[torch.Tensor] = None,
+        full_loc: Optional[torch.Tensor] = None,
+    ) -> KVWriteLoc:
+        """``layer``'s write loc: the batch's, or for a cross-attention layer
+        ``encoder_out_cache_loc``, which nothing translates and so is never
+        marked physical."""
+        if layer.is_cross_attention:
+            return cls(forward_batch.encoder_out_cache_loc, swa_loc, full_loc)
+        return cls.for_batch(forward_batch, swa_loc=swa_loc, full_loc=full_loc)
 
     def __post_init__(self):
         # swa_loc / full_loc are resolved once at metadata-init from the full
         # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
         # layer, so slice these pre-resolved locs to match (same per-token order).
+        # A multi-step draft step's slice is NOT a prefix of the all-steps loc;
+        # its backend derives per-step locs and never relies on this.
         if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
@@ -68,6 +109,11 @@ def unwrap_write_loc(loc_info):
     if isinstance(loc_info, KVWriteLoc):
         return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
     return loc_info, None, None
+
+
+def write_loc_is_physical(loc_info) -> bool:
+    """Whether ``loc_info`` is a ``KVWriteLoc`` marked physical; a bare loc is not."""
+    return isinstance(loc_info, KVWriteLoc) and loc_info.physical
 
 
 class KvBufferDesc:
@@ -127,10 +173,6 @@ class KVCache(abc.ABC):
     ):
         self.size = size
         self.page_size = page_size
-        # Row-blocks one page holds in this pool's kernel-facing id space; >1
-        # only for the unified pool's per-layer views, and then a write loc must
-        # have been translated into that space first.
-        self.kernel_page_blocks = 1
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
@@ -157,6 +199,25 @@ class KVCache(abc.ABC):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        """Persistent buffers for migrated host consumers; see device_pool_info.py.
+
+        Unmigrated formats retain their existing construction entry points.
+        Consumers must not use exceptions or empty descriptions to pick a path.
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no device pool provider")
+
+    def host_pool_decls(self):
+        """Host pools HiCache keeps for the buffers this device pool (and its
+        sub-pools) owns: the KV pool itself, plus dependent pools such as sparse
+        index keys in subclasses. Not a description of the whole model: buffers
+        owned elsewhere (e.g. Mamba state in req_to_token_pool) are declared by
+        their owner or assembled by the existing strategy paths."""
+        # pool_host imports this module. Resolve the declaration types lazily.
+        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
+
+        return (make_kv_pool_decl(self),)
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
@@ -190,6 +251,21 @@ class KVCache(abc.ABC):
         k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
         return k_buffer.shape, v_buffer.shape
 
+    # Unified pools set this: their write doors take physical ids only.
+    requires_physical_write_loc = False
+
+    def _check_physical_write_loc(self, loc_info, where: str) -> None:
+        # A flag read, no device sync: cheap enough to run on every write-door
+        # call. Fused writers that scatter through `get_kv_buffer`, and a
+        # replayed cuda graph, do not pass through here.
+        if self.requires_physical_write_loc and not write_loc_is_physical(loc_info):
+            raise ValueError(
+                f"{where}: write loc is not marked physical. Hand the pool "
+                "KVWriteLoc.for_batch(forward_batch) for a batch bound to a "
+                "plan (KVLocPlan.bind), or KVWriteLoc(loc, physical=True) for "
+                "ids translated separately."
+            )
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -211,6 +287,15 @@ class KVCache(abc.ABC):
         cache_v: torch.Tensor,
     ) -> None:
         raise NotImplementedError()
+
+    # Optional translation from controller IDs to this pool's buffer indices.
+    # L2TransferEngine resolves it on the transfer stream; move gates prevent
+    # relocation until the transfer is acknowledged.
+    host_transfer_translate: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+    # Token capacity for host sizing; `size` may count rows in per-layer views.
+    host_capacity_tokens: Optional[int] = None
+    # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
+    host_capacity_bytes: Optional[int] = None
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
@@ -257,6 +342,13 @@ class BaseSWAKVPool(KVCache):
     # Set when SWA KV is a per-request ring of this many tokens (addressed by
     # req_pool_idx) rather than a paged token pool; SWA is then not budgeted per token.
     swa_req_ring_size: Optional[int] = None
+    # Set when the target keeps SWA KV in per-request window rows (DeepSeek-V4.1
+    # encoder replay) instead of a paged pool; there is no full -> swa mapping.
+    request_window: Optional[RequestWindow] = None
+    # Independent draft SWA buffers can consume full-token IDs directly instead
+    # of the target SWA allocator's physical IDs. HiCache must preserve that
+    # index ownership even though both buffers implement sliding attention.
+    swa_uses_full_indices: bool = False
 
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:

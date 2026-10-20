@@ -6,9 +6,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
-    ModelDeploymentConfig,
-)
 
 
 @dataclass
@@ -44,6 +41,9 @@ class Pi05PipelineConfig(PipelineConfig):
     image_size: tuple[int, int] = (224, 224)
     image_normalization_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     image_normalization_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+
+    # Experimental eager completion-boundary execution; scheduler opt-in.
+    enable_segmented_actions: bool = False
 
     enable_global_prefix_cache: bool = False
     enable_prefix_cuda_graph: bool = True
@@ -123,10 +123,15 @@ class Pi05PipelineConfig(PipelineConfig):
     def check_pipeline_config(self) -> None:
         super().check_pipeline_config()
         self._validate_cuda_graph_config()
+        if self.enable_segmented_actions and self.offload_action_expert_after_denoise:
+            raise ValueError(
+                "Segmented actions do not support per-request action offload"
+            )
 
     def prefix_cuda_graph_available(self) -> bool:
         return bool(
-            self.enable_prefix_cuda_graph
+            not self.enable_segmented_actions
+            and self.enable_prefix_cuda_graph
             and self.prefix_cuda_graph_max_entries > 0
             and not any(
                 (
@@ -143,7 +148,8 @@ class Pi05PipelineConfig(PipelineConfig):
 
     def action_cuda_graph_available(self) -> bool:
         return bool(
-            self.enable_action_cuda_graph
+            not self.enable_segmented_actions
+            and self.enable_action_cuda_graph
             and self.action_cuda_graph_max_entries > 0
             and not self.offload_action_expert_after_denoise
         )
@@ -162,5 +168,20 @@ class Pi05PipelineConfig(PipelineConfig):
             self.action_horizon * self.action_dim * self.default_num_inference_steps
         )
 
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig()
+
+def register():
+    from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Pi05SamplingParams,
+        pipeline_config_cls=Pi05PipelineConfig,
+        hf_model_paths=[
+            "lerobot/pi05_base",
+            "lerobot/pi05_libero_base",
+        ],
+        model_detectors=[
+            lambda hf_id: "pi05" in hf_id.lower(),
+            lambda hf_id: "pi0.5" in hf_id.lower(),
+        ],
+    )

@@ -13,9 +13,9 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
     <tr>
       <th>Quantization scheme</th>
       <th>Layer type</th>
-      <th>A2 Supported</th>
-      <th>A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2 Series Supported</th>
+      <th>A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
       <th>Diffusion models</th>
     </tr>
   </thead>
@@ -133,9 +133,9 @@ SGLang supports **mix-bits** quantization (independently defines and loads each 
     <tr>
       <th>Quantization scheme</th>
       <th>Layer type</th>
-      <th>A2 Supported</th>
-      <th>A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2 Series Supported</th>
+      <th>A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -169,9 +169,9 @@ GPTQ on Ascend support
     <tr>
       <th>Quantization scheme</th>
       <th>Layer type</th>
-      <th>A2 Supported</th>
-      <th>A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2 Series Supported</th>
+      <th>A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -212,9 +212,9 @@ GPTQ on Ascend support
     <tr>
       <th>Quantization scheme</th>
       <th>Layer type</th>
-      <th>A2 Supported</th>
-      <th>A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2 Series Supported</th>
+      <th>A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -255,9 +255,9 @@ Compressed-tensors (LLM Compressor) on Ascend support:
     <tr>
       <th>Quantization scheme</th>
       <th>Layer type</th>
-      <th>A2 Supported</th>
-      <th>A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2 Series Supported</th>
+      <th>A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -298,9 +298,9 @@ Compressed-tensors (LLM Compressor) on Ascend support:
     <tr>
       <th>Quantization type</th>
       <th>Layer type</th>
-      <th>A2 Supported</th>
-      <th>A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2 Series Supported</th>
+      <th>A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
     </tr>
   </thead>
   <tbody>
@@ -351,7 +351,7 @@ python3 -m sglang.launch_server \
 
 **MXFP8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
-LLM dense W8A8 MXFP8 Linear support on Ascend was added in [PR #22352](https://github.com/sgl-project/sglang/pull/22352). Requires Ascend 950 Products or newer (`npu_dynamic_mx_quant` is not available on A2 / A3).
+LLM dense W8A8 MXFP8 Linear support on Ascend was added in [PR #22352](https://github.com/sgl-project/sglang/pull/22352). Requires Ascend 950PR/DT Series or newer (`npu_dynamic_mx_quant` is not available on A2/A3 Series).
 
 - Online MXFP8 quantization (BF16/FP16 weights → MXFP8 at load time):
 
@@ -381,7 +381,7 @@ python3 -m sglang.launch_server \
 
 **MXFP8 for LLM MoE models (e.g. Qwen3-30B-A3B / Qwen3.5 MoE):**
 
-LLM MoE W8A8 MXFP8 (FusedMoE) support builds on the dense MXFP8 path. Requires Ascend A5 series or newer — the fused MoE MX kernels (`npu_grouped_matmul_swiglu_quant_v2`, `npu_dynamic_mx_quant`) are A5-only.
+LLM MoE W8A8 MXFP8 (FusedMoE) support builds on the dense MXFP8 path. Requires Ascend 950PR/DT Series or newer — the fused MoE MX kernels (`npu_grouped_matmul_swiglu_quant_v2`, `npu_dynamic_mx_quant`) are only available on the 950PR/DT Series.
 
 - Online MXFP8 quantization (BF16/FP16 expert weights → MXFP8 at load time):
 
@@ -410,11 +410,11 @@ python3 -m sglang.launch_server \
 > - Offline path: `ModelSlimMXFP8MoEScheme` (one instance per weight group) loads `float8_e4m3fn` expert weights + uint8 (e8m0, exponent + 127) block scales. The scale is reshaped `[E, N, K/32] → [E, N, K/64, 2]` (contiguous pairing, matching `npu_dynamic_mx_quant`) then transposed.
 > - Forward: `AscendTPDispatcher` runs `npu_moe_init_routing_v2(quant_mode=3)`, which fuses the per-token MX activation quant into routing (e4m3 payload + e8m0 block scale, reshaped to the pair-split layout). `AscendRunnerCore` then runs gmm1 `npu_grouped_matmul_swiglu_quant_v2` (cumulative `group_list`; fuses gate/up + swiglu + requant, so no separate activation step) → gmm2 `npu_grouped_matmul` (count `group_list`). The UE8M0 (`float8_e8m0fnu`) scale dtypes are passed explicitly; the e4m3 `x`/`weight` dtypes are left implicit.
 > - **Router gate**: msmodelslim may also quantize `mlp.gate` (`W8A8_MXFP8`). The gate is a `ReplicatedLinear`, so its quantization must be **description-driven**: for the offline `modelslim` path the gate is passed the quant config and dequantized correctly; the online path keeps it in BF16. Loading a quantized gate as BF16 without its block scale scrambles routing and produces garbage output.
-> - Where the activation quant happens depends on the dispatcher. On `ascend_tp` it is fused into routing as described above. DeepEP has no MXFP8 dispatch dtype, so it keeps dispatching BF16 and gmm1 quantizes the hidden states itself via `npu_dynamic_mx_quant` before the fused kernel — the two paths reach the same gmm1 input. Only the `ascend_tp` path has been validated end-to-end on Ascend A5.
+> - Where the activation quant happens depends on the dispatcher. On `ascend_tp` it is fused into routing as described above. DeepEP has no MXFP8 dispatch dtype, so it keeps dispatching BF16 and gmm1 quantizes the hidden states itself via `npu_dynamic_mx_quant` before the fused kernel — the two paths reach the same gmm1 input. Only the `ascend_tp` path has been validated end-to-end on the Ascend 950PR/DT Series.
 
 **MXFP4 W4A8 for LLM dense models (e.g., Qwen3 / Qwen3.5):**
 
-LLM dense W4A8 (MXFP4 4-bit weights + MXFP8 8-bit activations) Linear support was added in [PR #23650](https://github.com/sgl-project/sglang/pull/23650). Requires Ascend 950 Products or newer.
+LLM dense W4A8 (MXFP4 4-bit weights + MXFP8 8-bit activations) Linear support was added in [PR #23650](https://github.com/sgl-project/sglang/pull/23650). Requires Ascend 950PR/DT Series or newer.
 
 - Online W4A8 quantization (BF16/FP16 weights → MXFP4 at load time):
 
@@ -436,7 +436,7 @@ python3 -m sglang.launch_server \
 
 **ModelSlim W4A8 MXFP4 for LLM MoE models:**
 
-SGLang auto-detects offline ModelSlim `W4A8_MXFP` MoE checkpoints from `quant_model_description.json`; do not pass `--quantization`. This path requires Ascend A5 or newer.
+SGLang auto-detects offline ModelSlim `W4A8_MXFP` MoE checkpoints from `quant_model_description.json`; do not pass `--quantization`. This path requires Ascend 950PR/DT Series or newer.
 
 ```bash Command
 MODEL_PATH=/path/to/w4a8-mxfp4-moe-model
@@ -453,7 +453,7 @@ python3 -m sglang.launch_server \
 
 **MXFP4 W4A4 for LLM dense models (e.g. Qwen3 / Qwen3.5):**
 
-LLM dense W4A4 (MXFP4 4-bit weights + 4-bit activations) Linear support was added in [PR #23795](https://github.com/sgl-project/sglang/pull/23795). Requires Ascend A5 series (Ascend 950) or newer — the dual-level online path uses the `DualLevelQuantBatchMatmul` op, which A2/A3 lack. On the Ascend NPU backend `--quantization mxfp4` selects this W4A4 path (on GPU the same flag selects the upstream OCP MXFP4 MoE config instead).
+LLM dense W4A4 (MXFP4 4-bit weights + 4-bit activations) Linear support was added in [PR #23795](https://github.com/sgl-project/sglang/pull/23795). Requires Ascend 950PR/DT Series or newer — the dual-level online path uses the `DualLevelQuantBatchMatmul` op, which A2/A3 Series lack. On the Ascend NPU backend `--quantization mxfp4` selects this W4A4 path (on GPU the same flag selects the upstream OCP MXFP4 MoE config instead).
 
 - Online W4A4 quantization (BF16/FP16 weights → dual-level MXFP4 at load time):
 
@@ -472,11 +472,11 @@ python3 -m sglang.launch_server \
 > - **Online** (`NPUDualLevelMXFP4LinearMethod`) uses **dual-level** MXFP4: both weights and activations are quantized with a fine FP8 (E4M3) L0 block scale plus a coarser L1 scale via `npu_dynamic_dual_level_mx_quant`, and the matmul runs via `npu_dual_level_quant_matmul` (weight in FRACTAL_NZ). Dual-level captures per-block dynamic range far better than a single UE8M0 (power-of-2) scale, which is what made an earlier single-level RTN online path degenerate (greedy decoding could loop without emitting EOS).
 > - **Offline** (`ModelSlimMXFP4Scheme` → `NPUSingleLevelMXFP4OfflineLinearMethod`) is **single-level**: msmodelslim's `W4A4_MXFP4` checkpoint ships single-level UE8M0 block scales (block_size = 32), so the matmul runs via `npu_quant_matmul(..., x1_dtype=x2_dtype=torch_npu.float4_e2m1fn_x2, group_sizes=[1, 1, 32])`. The online and offline paths therefore use different matmul kernels — they no longer share the matmul path.
 > - As with W4A8, the packed-FP4 dtype passed to the NPU ops (`dst_type` / `x2_dtype`) must be resolved from `torch_npu.float4_e2m1fn_x2` (an int enum), not the `torch.float4_e2m1fn_x2` dtype object, which recent op-plugin builds reject.
-> - Validated end-to-end on Ascend A5 hardware.
+> - Validated end-to-end on Ascend 950PR/DT Series hardware.
 
 **ModelSlim W4A4 MXFP4 for LLM MoE models:**
 
-SGLang auto-detects offline ModelSlim `W4A4_MXFP4` MoE checkpoints from `quant_model_description.json`; do not pass `--quantization`. This path requires Ascend 950 products or newer.
+SGLang auto-detects offline ModelSlim `W4A4_MXFP4` MoE checkpoints from `quant_model_description.json`; do not pass `--quantization`. This path requires Ascend 950PR/DT Series or newer.
 
 ```bash Command
 MODEL_PATH=/path/to/w4a4-mxfp4-moe-model
@@ -493,9 +493,9 @@ python3 -m sglang.launch_server \
 
 ## Diffusion Model Quantization on Ascend NPU
 
-SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires Ascend 950 Products; the ModelSlim W8A8/W4A4 schemes work on A2/A3.
+SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires Ascend 950PR/DT Series; the ModelSlim W8A8/W4A4 schemes work on A2/A3 Series.
 
-**Requirements for MXFP8:** CANN ≥ 8.0.RC3, Ascend 950 Products
+**Requirements for MXFP8:** CANN ≥ 8.0.RC3, Ascend 950PR/DT Series
 
 <table>
   <thead>
@@ -504,8 +504,8 @@ SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion mo
       <th><code>quant_type</code> in JSON</th>
       <th>Scheme class</th>
       <th>Mode</th>
-      <th>A2/A3 Supported</th>
-      <th>Ascend 950 Products Supported</th>
+      <th>A2/A3 Series Supported</th>
+      <th>950PR/DT Series Supported</th>
       <th>Trigger</th>
     </tr>
   </thead>
