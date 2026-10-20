@@ -49,11 +49,9 @@ export const config = {
     { id: "multi-2", label: "Multi-Nodes" },
   ],
 
-  // AgentX 1P1D recipe: InferenceX PR #3664, commit df5e433239d7.
-  // The strategy presets use c16 / c48 / c256. Pro uses its MTP head;
-  // Pro Official is the InferenceX checkpoint. Acceptance simulation is omitted.
-  // Pro Official kernel/routing updates follow the optimized AgentX recipe;
-  // see section 3.7 for the c1 / c512 overrides.
+  // MI355X 1P1D strategy presets use c16 / c48 / c256.
+  // Pro uses its MTP head; Pro Official uses DSpark.
+  // See section 3.7 for the Pro Official c1 / c512 overrides.
   overlayDims: [
     { id: "pdMode", title: "PD role", default: "prefill",
       showWhen: (s) => s.hw === "mi355x" && s.quant === "fp4"
@@ -73,7 +71,7 @@ export const config = {
     const official = sel.variant === "pro-official";
     const gamma = sel.strategy === "low-latency" ? 6 : 3;
     const tp = dp || !prefill ? 8 : 4;
-    const image = "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001";
+    const image = "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019";
     const router = [
       ...(official && dp ? ["env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests"] : []),
       "python3 -m sglang_router.launch_router",
@@ -93,7 +91,7 @@ export const config = {
       router: { port: 8000, command: router } };
     if (role === "router") return { ...common,
       commands: { python: router, docker: `docker run --network host --rm ${image} ${router}` } };
-    // Emit overrides only. Defaults checked against the pinned image:
+    // Emit overrides only. Baseline defaults originally checked against
     // SGLang 3b2ad1c6ae, MORI 879983bdbd8c. ROCm model setup enables the
     // Aiter indexer; MegaMoE MTPR defaults to 8192 and static heap is implicit.
     // This Aiter MegaMoEV2 uses mori_shmem_create_tensor, not the CCO allocator.
@@ -340,8 +338,8 @@ sgl-eval run mmmu_pro \\
     gb300: "lmsysorg/sglang:latest",
     // AMD daily-updated lmsysorg/sglang-rocm images. Bump the dated tag when you
     // re-verify on a newer build.
-    mi300x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi30x-20261007",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.21-rocm720-mi35x-20261007",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261016",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261016",
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -2386,7 +2384,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2409,7 +2407,7 @@ sgl-eval run mmmu_pro \\
       // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2436,7 +2434,7 @@ sgl-eval run mmmu_pro \\
       // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -3035,6 +3033,7 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3064,6 +3063,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3096,6 +3096,7 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3131,6 +3132,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3157,6 +3159,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3191,6 +3194,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3227,6 +3231,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3267,6 +3272,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3303,6 +3309,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3341,6 +3348,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3375,6 +3383,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3415,6 +3424,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3453,6 +3463,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3488,6 +3499,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3528,6 +3540,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3566,6 +3579,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3600,6 +3614,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3640,6 +3655,7 @@ sgl-eval run mmmu_pro \\
         "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
         "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
+        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",

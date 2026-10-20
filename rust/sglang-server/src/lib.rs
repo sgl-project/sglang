@@ -38,7 +38,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
-use crate::utils::startup::{grpc_listen_addr, listen_addr, value_error};
+use crate::utils::startup::{advertise_listener_ports, grpc_listen_addr, listen_addr, value_error};
 use crate::utils::{logging, runtime, shm::ShmSegment};
 
 /// One drained request handed to Python by [`Server::recv_requests`]: the
@@ -304,6 +304,7 @@ impl Server {
             .map_err(|e| value_error("bad listen address", e))?;
         let grpc_addr = grpc_listen_addr(&server_args, port_offset)
             .map_err(|e| value_error("bad gRPC listen address", e))?;
+        let server_args = advertise_listener_ports(server_args, http_addr, grpc_addr);
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
