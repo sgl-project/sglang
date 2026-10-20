@@ -141,6 +141,76 @@ sglang serve --model-path Wan-AI/Wan2.1-T2V-14B-Diffusers \
 
 > ZMQ handles startup order gracefully — instances and head can start in any order.
 
+## FLUX.3 split encoding
+
+FLUX.3 Image supports both the three-role topology above and four independently
+deployable worker pools:
+
+```text
+HTTP head -> prompt_encoder -> image_encoder -> denoiser -> decoder -> HTTP head
+```
+
+The prompt encoder loads only the text encoder. The image encoder loads only
+the VAE for reference-image encoding; the decoder has its own VAE instance.
+The denoiser loads only the DiT and creates noise from the request seed locally.
+T2I follows the same route, but the image encoder skips VAE computation.
+Stages within one request run sequentially; different requests can occupy
+different worker pools concurrently. This is not a latency optimization for a
+single request: separation adds transfers and allows independent placement and
+scaling.
+
+Use the same FLUX.3 package, variant, and numerical settings on every process.
+Each host currently needs a complete package on disk, even though a worker
+loads only its own components into memory. Follow the
+[FLUX.3 cookbook](/cookbook/diffusion/FLUX/FLUX.3) for model access and licensing.
+Install the transfer dependencies described below on every worker.
+
+For a Linux NVIDIA deployment with four GPUs, start the workers in one shell:
+
+```bash
+MODEL_PATH=black-forest-labs/flux-3-image-klein
+for spec in 'prompt_encoder 0 19000' 'image_encoder 1 19010' \
+            'denoiser 2 19020' 'decoder 3 19030'; do
+  read -r ROLE GPU WORK_PORT <<< "$spec"
+  CUDA_VISIBLE_DEVICES="$GPU" sglang serve --model-path "$MODEL_PATH" \
+    --num-gpus 1 --disagg-role "$ROLE" \
+    --disagg-server-addr tcp://127.0.0.1:18000 \
+    --disagg-p2p-hostname 127.0.0.1 \
+    --scheduler-port "$WORK_PORT" --master-port "$((WORK_PORT + 50))" &
+done
+```
+
+Then start the GPU-less head in another shell:
+
+```bash
+sglang serve --model-path black-forest-labs/flux-3-image-klein \
+  --disagg-role server --host 127.0.0.1 --port 30000 --scheduler-port 18000 \
+  --prompt-encoder-urls tcp://127.0.0.1:19000 \
+  --image-encoder-urls tcp://127.0.0.1:19010 \
+  --denoiser-urls tcp://127.0.0.1:19020 \
+  --decoder-urls tcp://127.0.0.1:19030
+```
+
+The existing image API is unchanged: use `/v1/images/generations` for T2I and
+multipart `/v1/images/edits` for references. Omit `size` on edits to keep the
+reference dimensions, including the model's padding/crop behavior. The head
+inlines locally uploaded reference files before dispatch, so GPU workers do
+not need access to the head's upload directory. URL inputs must remain
+reachable from the image encoder.
+
+Specify both `--prompt-encoder-urls` and `--image-encoder-urls`, instead of
+`--encoder-urls`. Each accepts semicolon-separated worker endpoints, with the
+same dispatch policy as the existing pools. Alternatively, use the existing
+`encoder` role and `--encoder-urls` to colocate both encoders in one worker.
+
+Across machines, replace loopback addresses with routable IPs. Advertise each
+worker's IP with `--disagg-p2p-hostname`, and use that exact work endpoint in
+the head's URL list. The head also listens on scheduler port +4 for prompt
+encoder results and +5 for image encoder results; +1/+2/+3 retain their
+existing meanings. Keep worker work/control ports (+1), internal scheduler
+ports, and distributed master ports distinct. Run the internal transport on a
+trusted private network, not a public interface.
+
 ## Multiple Instances per Role
 
 Use semicolons in `--*-urls` to register multiple instances:

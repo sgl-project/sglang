@@ -703,9 +703,7 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
-        if self._disagg_role == RoleType.MONOLITHIC:
-            return True
-        if role_affinity == self._disagg_role:
+        if self._disagg_role.includes_stage(role_affinity):
             return True
 
         logger.info(
