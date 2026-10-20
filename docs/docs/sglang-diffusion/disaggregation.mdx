@@ -190,6 +190,8 @@ registration and completion contract.
 - TP/SP settings apply within each worker group. Transfers currently carry
   complete declared tensors; arbitrary sharded tensor layouts across groups
   need an explicit gather/reshard stage or colocation.
+- For numerical comparisons, match the parallelism of every stage, including
+  the VAE decode group, rather than only the denoiser's TP/SP settings.
 - Placement must produce an acyclic role graph. Stateful loops and
   encode-while-decode streaming must stay within a compatible role; splitting a
   loop into independently retried operations is not supported.

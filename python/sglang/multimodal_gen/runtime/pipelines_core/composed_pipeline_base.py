@@ -510,6 +510,10 @@ class ComposedPipelineBase(ABC):
                         self._disagg_role == RoleType.MONOLITHIC
                         or module_role is None
                         or module_role == self._disagg_role
+                    ) and (
+                        self.deployment_plan is None
+                        or "transformer_2"
+                        in self.deployment_plan.roles[server_args.stage_role].components
                     ):
                         self.required_config_modules.append("transformer_2")
                     else:
@@ -542,7 +546,7 @@ class ComposedPipelineBase(ABC):
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
-        if self._disagg_role != RoleType.MONOLITHIC:
+        if self._disagg_role != RoleType.MONOLITHIC or self.deployment_plan is not None:
             self._init_skipped_component_configs(model_index, server_args)
 
         declared_modules = model_index

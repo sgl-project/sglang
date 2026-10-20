@@ -59,7 +59,11 @@ class ExecutionPlan:
     ) -> "ExecutionPlan":
         stages = deployment.stages or defaults
         names = [stage.name for stage in stages]
-        if not names or len(names) != len(set(names)):
+        if (
+            not names
+            or any(not name for name in names)
+            or len(names) != len(set(names))
+        ):
             raise ValueError("Stage contracts must have unique, nonempty names")
         specs = {stage.name: stage for stage in stages}
         owner = {}
@@ -101,6 +105,10 @@ class ExecutionPlan:
             if not dependencies <= selected:
                 raise ValueError(
                     f"Stage {stage.name} has missing dependencies: {dependencies - selected}"
+                )
+            if not dependencies <= set(names[:index]):
+                raise ValueError(
+                    f"Stage {stage.name} has a forward dependency; order stage contracts topologically"
                 )
             for other in stage.colocate_with:
                 if owner.get(other) != owner[stage.name]:

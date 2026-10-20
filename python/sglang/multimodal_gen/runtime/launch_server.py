@@ -10,12 +10,12 @@ import time
 import uvicorn
 
 from sglang.multimodal_gen.registry import get_model_info, get_pipeline_class
+from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
+    DeploymentServer,
+)
 from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
     Deployment,
     ExecutionPlan,
-)
-from sglang.multimodal_gen.runtime.disaggregation.deployment.runtime import (
-    DeploymentServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,

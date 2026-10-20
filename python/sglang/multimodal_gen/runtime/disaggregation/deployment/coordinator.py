@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage-group workers and an asynchronous, tensor-free graph coordinator."""
+"""Asynchronous dependency scheduling without routing tensors through the head."""
 
 import asyncio
 import base64
-import concurrent.futures
 import pickle
 import threading
 import time
@@ -11,261 +10,13 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
-import torch
-import torch.distributed as dist
 import zmq
 import zmq.asyncio
-from torch.utils._pytree import tree_flatten, tree_leaves, tree_map, tree_unflatten
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
-    fork_request,
-    read_field,
-    write_field,
-)
-from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import (
-    TensorTransport,
-    rpc,
-)
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    resolve_sampling_params_cls,
-)
+from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import fork_request
+from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import rpc
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
-
-
-def run_partition(scheduler, req):
-    error = None
-    try:
-        result = scheduler.worker.pipeline.forward(req, scheduler.server_args)
-        if isinstance(result, OutputBatch):
-            if result.error:
-                raise RuntimeError(result.error)
-            req.extra["_deployment_result"] = result
-    except Exception as exc:
-        error = str(exc)
-    if scheduler._is_multi_rank():
-        group = get_world_group()
-        errors = [None] * len(group.ranks)
-        dist.all_gather_object(errors, error, group=group.cpu_group)
-        error = next((item for item in errors if item), None)
-    return error
-
-
-def broadcast_request(scheduler, req):
-    group = get_world_group()
-    if req is not None:
-        state = dict(vars(req))
-        state["extra"] = dict(req.extra)
-        if "_deployment_result" in state["extra"]:
-            state["extra"]["_deployment_result"] = vars(
-                state["extra"]["_deployment_result"]
-            )
-        leaves, spec = tree_flatten(state)
-        tensors = [(i, x) for i, x in enumerate(leaves) if isinstance(x, torch.Tensor)]
-        metadata = [(i, tuple(t.shape), t.dtype) for i, t in tensors]
-        leaves = [None if isinstance(x, torch.Tensor) else x for x in leaves]
-        scheduler._broadcast_to_all_ranks((leaves, spec, metadata))
-    else:
-        leaves, spec, metadata = scheduler._broadcast_to_all_ranks(None)
-        tensors = [
-            (
-                i,
-                torch.empty(
-                    shape, dtype=dtype, device=f"cuda:{scheduler.worker.local_rank}"
-                ),
-            )
-            for i, shape, dtype in metadata
-        ]
-    for index, tensor in tensors:
-        if tensor.device.type != "cuda":
-            tensor = tensor.to(f"cuda:{scheduler.worker.local_rank}")
-        dist.broadcast(tensor, src=group.ranks[0], group=group.device_group)
-        leaves[index] = tensor
-    restored = object.__new__(Req)
-    vars(restored).update(tree_unflatten(leaves, spec))
-    if "_deployment_result" in restored.extra:
-        restored.extra["_deployment_result"] = OutputBatch(
-            **restored.extra["_deployment_result"]
-        )
-    return restored
-
-
-def _field_size(value):
-    return sum(
-        (leaf.numel() * leaf.element_size() + 511) // 512 * 512
-        for leaf in tree_leaves(value)
-        if isinstance(leaf, torch.Tensor)
-    )
-
-
-class DeploymentWorker:
-    """One placement group; computation is serialized, transfers remain serviceable."""
-
-    def __init__(self, scheduler):
-        self.scheduler = scheduler
-        self.args = scheduler.server_args
-        self.pipeline = scheduler.worker.pipeline
-        self.sampling_params_cls = resolve_sampling_params_cls(self.args)
-        self.plan = self.pipeline.deployment_plan
-        self.role = self.plan.roles[self.args.stage_role]
-        self.device = torch.device(f"cuda:{scheduler.worker.local_rank}")
-        self.results = {}
-        self.expired = {}
-        self.lock = threading.Lock()
-        self.compute = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self.transfers = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        self.transport = None
-        self.context = None
-
-    def _execute(self, req):
-        torch.cuda.set_device(self.device)
-        if self.scheduler._is_multi_rank():
-            self.scheduler._broadcast_to_all_ranks("deployment_compute")
-            req = broadcast_request(self.scheduler, req)
-        error = run_partition(self.scheduler, req)
-        if error:
-            raise RuntimeError(error)
-        values = {path: read_field(req, path) for path in self.role.outputs}
-        ready = torch.cuda.Event()
-        ready.record()
-        return values, ready, req.metrics
-
-    async def _execute_message(self, message):
-        ticket = message["ticket"]
-        with self.lock:
-            if len(self.results) >= self.args.disagg_max_slots_per_instance:
-                raise RuntimeError("Stage worker result capacity exhausted")
-        incoming = message["request"]
-        if isinstance(incoming, dict):
-            params = self.sampling_params_cls()
-            req = Req(sampling_params=params, **incoming)
-            params._explicit_fields = set(incoming)
-            params._adjust(self.args)
-            params._validate()
-            req.validate()
-        else:
-            req = fork_request(incoming)
-            if type(req.sampling_params) is SamplingParams:
-                params = self.sampling_params_cls()
-                params._merge_with_user_params(req.sampling_params)
-                params._explicit_fields = vars(req.sampling_params).get(
-                    "_explicit_fields", set()
-                )
-                params._adjust(self.args)
-                params._validate()
-                req.sampling_params = params
-                req.validate()
-        for source in message["sources"]:
-            fields = source["fields"]
-            values = await self.transport.receive(
-                self.context,
-                source["endpoint"],
-                source["ticket"],
-                fields,
-                sum(source["sizes"][path] for path in fields),
-                self.args.disagg_timeout,
-            )
-            for path, value in values.items():
-                write_field(req, path, value)
-        if "_deployment_output_fields" in req.extra:
-            req.extra["_deployment_result"] = OutputBatch(
-                **req.extra.pop("_deployment_output_fields")
-            )
-        loop = asyncio.get_running_loop()
-        values, ready, metrics = await loop.run_in_executor(
-            self.compute, self._execute, req
-        )
-        with self.lock:
-            if ticket in self.expired:
-                raise RuntimeError("Request cancelled before stage completion")
-            self.results[ticket] = (time.monotonic(), values, ready)
-        return {
-            "ticket": ticket,
-            "sizes": {path: _field_size(value) for path, value in values.items()},
-            "metrics": metrics,
-        }
-
-    def _push(self, message):
-        torch.cuda.set_device(self.device)
-        with self.lock:
-            _, values, ready = self.results[message["ticket"]]
-            selected = {path: values[path] for path in message["fields"]}
-        torch.cuda.current_stream().wait_event(ready)
-        if message.get("cpu"):
-            return {
-                "values": tree_map(
-                    lambda x: x.cpu() if isinstance(x, torch.Tensor) else x, selected
-                )
-            }
-        return self.transport.push(selected, message["target"])
-
-    async def _handle(self, socket, envelope, message):
-        try:
-            method = message["method"]
-            if method == "execute":
-                reply = await self._execute_message(message)
-            elif method == "push":
-                reply = await asyncio.get_running_loop().run_in_executor(
-                    self.transfers, self._push, message
-                )
-            elif method == "release":
-                with self.lock:
-                    self.results.pop(message["ticket"], None)
-                    self.expired[message["ticket"]] = time.monotonic()
-                reply = {}
-            elif method == "ping":
-                reply = {"role": self.role.name, "stages": self.role.stages}
-            else:
-                raise ValueError(f"Unknown deployment worker method: {method}")
-        except Exception as exc:
-            reply = {"error": str(exc)}
-        await socket.send_multipart([*envelope, pickle.dumps(reply)])
-
-    async def run(self):
-        torch.cuda.set_device(self.device)
-        self.transport = TensorTransport(
-            self.device,
-            self.args.disagg_p2p_hostname,
-            self.args.disagg_transfer_pool_size,
-            self.args.disagg_ib_device,
-        )
-        self.context = zmq.asyncio.Context()
-        socket = self.context.socket(zmq.ROUTER)
-        socket.setsockopt(zmq.LINGER, 0)
-        socket.bind(self.args.stage_endpoint)
-        tasks = set()
-        try:
-            while self.scheduler._running:
-                cutoff = time.monotonic() - self.args.disagg_timeout
-                with self.lock:
-                    self.results = {
-                        key: value
-                        for key, value in self.results.items()
-                        if value[0] > cutoff
-                    }
-                    self.expired = {
-                        key: value
-                        for key, value in self.expired.items()
-                        if value > cutoff
-                    }
-                try:
-                    frames = await asyncio.wait_for(socket.recv_multipart(), 1)
-                except TimeoutError:
-                    continue
-                task = asyncio.create_task(
-                    self._handle(socket, frames[:-1], pickle.loads(frames[-1]))
-                )
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-        finally:
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self.compute.shutdown(wait=True)
-            self.transfers.shutdown(wait=True)
-            self.transport.close()
-            socket.close()
-            self.context.term()
 
 
 class DeploymentServer:
@@ -379,6 +130,10 @@ class DeploymentServer:
                 ],
                 "lease": assignments,
                 "metrics": [task.result().get("metrics") for task in tasks.values()],
+                "peak_memory_mb": max(
+                    (task.result().get("peak_memory_mb", 0) for task in tasks.values()),
+                    default=0,
+                ),
             }
         except BaseException:
             for task in tasks.values():
@@ -472,6 +227,7 @@ class DeploymentServer:
                                 metrics.denoising_stages.update(item.denoising_stages)
                                 metrics.steps.extend(item.steps)
                         response.metrics = metrics
+                        response.peak_memory_mb = result["peak_memory_mb"]
                         metrics.total_duration_ms = (time.monotonic() - started) * 1000
                     finally:
                         await self.release(result["lease"])

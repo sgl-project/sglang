@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterator, List
 import msgspec
 import zmq
 
-from sglang.multimodal_gen.runtime.disaggregation.deployment.runtime import (
+from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
     DeploymentWorker,
     broadcast_request,
     run_partition,

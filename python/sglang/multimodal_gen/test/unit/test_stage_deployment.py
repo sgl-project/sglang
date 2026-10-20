@@ -12,6 +12,9 @@ import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.disaggregation.deployment import client
+from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
+    DeploymentServer,
+)
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
     pack_fields,
     unpack_fields,
@@ -21,9 +24,6 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
     ExecutionPlan,
     RoleSpec,
     StageSpec,
-)
-from sglang.multimodal_gen.runtime.disaggregation.deployment.runtime import (
-    DeploymentServer,
 )
 
 
