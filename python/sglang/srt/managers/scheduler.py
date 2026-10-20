@@ -5144,9 +5144,34 @@ class Scheduler(
                 )
 
     def _poll_elastic_ep_recovery(self) -> None:
-        from sglang.srt.elastic_ep.elastic_ep import poll_recovery_control_plane
+        from sglang.srt.elastic_ep.elastic_ep import (
+            ElasticEPStateManager,
+            poll_recovery_control_plane,
+        )
 
-        poll_recovery_control_plane()
+        if not poll_recovery_control_plane() or get_parallel().tp_rank != 0:
+            return
+        state = ElasticEPStateManager.instance()
+        if state is None:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            ElasticScaleUpdateReq(
+                success=state.recovery_succeeded is not False,
+                terminal=state.recovery_succeeded is not None,
+                effective_ep_size=state.effective_ep_size,
+                operation_id=state.recovery_operation_id,
+                recovery_update=True,
+                recovery_phase=state.recovery_phase,
+                recovery_topology_generation=state.recovery_topology_generation,
+                recovery_rank_offset=state.recovery_rank_offset,
+                recovery_failed_allocation_incarnation=(
+                    state.recovery_failed_allocation_incarnation
+                ),
+                error=state.recovery_error,
+            )
+        )
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
