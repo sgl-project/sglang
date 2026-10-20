@@ -7,13 +7,13 @@ export const config = {
 
   variants: [
     { id: "397b", label: "397B", subtitle: "MoE" },
-    { id: "122b", label: "122B" },
+    { id: "122b", label: "122B", subtitle: "MoE" },
     { id: "35b",  label: "35B-A3B",  subtitle: "MoE" },
     { id: "9b",       label: "9B",       subtitle: "dense" },
   ],
 
   quantizations: [
-    { id: "bf16",  label: "Original" },
+    { id: "bf16",  label: "BF16" },
     { id: "fp8",   label: "FP8" },
   ],
 

@@ -36,13 +36,13 @@ Select Docker in the deployment panel to generate the container command.
 
 </Accordion>
 
-Choose your hardware, model size, and checkpoint format. The 9B recipe uses one GPU, 35B-A3B uses two, and 122B and 397B use eight. BF16 397B requires H200 in this matrix; its FP8 checkpoint is also available on H100. Select **Original** for the original checkpoint or **FP8** for an FP8 checkpoint. All commands use Hugging Face repository IDs and default to port **30000**.
+Choose your hardware, model size, and checkpoint format. The 9B recipe uses one GPU, 35B-A3B uses two, and 122B and 397B use eight. BF16 397B requires H200 in this matrix; its FP8 checkpoint is also available on H100. Select **BF16** for a BF16 checkpoint or **FP8** for an FP8 checkpoint. All commands use Hugging Face repository IDs and default to port **30000**.
 
 <Deployment config={config} />
 
 ## 1. Model introduction
 
-Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingface.co/ornith-ai). The 9B, 35B-A3B, and 397B checkpoints use Qwen3.5 architectures. The table lists the checkpoints covered by this recipe.
+Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingface.co/ornith-ai). The 9B, 35B-A3B, 122B, and 397B checkpoints use Qwen3.5 architectures. The table lists the checkpoints covered by this recipe.
 
 <table style={{width: "100%", borderCollapse: "collapse"}}>
   <thead>
@@ -70,8 +70,8 @@ Ornith-1.5 is an agentic model family published by [Ornith AI](https://huggingfa
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/ornith-ai/Ornith-1.5-122B">Ornith-1.5-122B</a></td>
-      <td style={{padding: "9px 12px"}}>Original</td>
-      <td style={{padding: "9px 12px"}}>8× H100</td>
+      <td style={{padding: "9px 12px"}}>BF16</td>
+      <td style={{padding: "9px 12px"}}>MoE; 8× H100</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px"}}><a href="https://huggingface.co/ornith-ai/Ornith-1.5-397B">Ornith-1.5-397B</a></td>
