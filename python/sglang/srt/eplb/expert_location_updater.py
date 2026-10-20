@@ -184,21 +184,14 @@ def create_temp_buffers(sample_tensors):
 
 
 class P2PDesc(msgspec.Struct):
-    """One send or receive of a plan; becomes a `P2POp` when executed."""
-
     op: Callable
     tensor: torch.Tensor
     peer: int
 
 
 class LayerUpdatePlan(msgspec.Struct):
-    """The copies and P2P ops that move one layer to its new placement."""
-
-    # (src expert location in the weights, dst expert location in the buffers)
     weight2buffer_copy_infos: List[Tuple[int, int]]
-    # (logical_expert_id, ops); each entry holds only sends or only receives
     p2p_op_infos: List[Tuple[int, List[P2PDesc]]]
-    # (src expert location in the buffers, dst expert location in the weights)
     buffer2weight_copy_infos: List[Tuple[int, int]]
     num_physical_experts: int
     num_local_physical_experts: int

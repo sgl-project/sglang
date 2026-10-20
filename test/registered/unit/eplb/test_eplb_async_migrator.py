@@ -1,5 +1,3 @@
-"""Expert migration tests: the planner issues no device op, the synchronous updater keeps its order, and two gloo ranks on CPU migrate one layer at a time."""
-
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -107,7 +105,6 @@ def _run_rank(rank, master_port, writer):
 
             for layer_id in job.layer_ids:
                 migrator.issue_layer(job, layer_id)
-                # Forward passes would run here; the weights must still be old.
                 for expected, actual in zip(
                     _weights_for(_OLD_MAPS[layer_id], rank),
                     weights_of_layer[layer_id],
@@ -152,8 +149,6 @@ def _single_rank_weights(physical_to_logical_map):
 
 class TestExpertLocationUpdaterPlan(CustomTestCase):
     def test_plan_issues_no_device_op(self):
-        """Plans are built on a worker thread while staging buffers may still be
-        read by an install, so planning must not copy anything."""
         old = [0, 1, 2, 0]
         new = [1, 0, 2, 1]
         weights = _single_rank_weights(old)

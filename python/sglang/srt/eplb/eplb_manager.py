@@ -200,7 +200,6 @@ class EPLBManager:
         logger.info(msg)
 
     def _rebalance_async(self):
-        """Rebalance without stalling forward passes; one yield per pass."""
         logger.info("[EPLBManager] rebalance start (async)")
         passes = 0
 

@@ -61,11 +61,8 @@ def _compute_elastic_expert_layout(
 
 
 class EplbPlacement(msgspec.Struct):
-    """The maps an EPLB run produces, on whatever device the algorithm used."""
-
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
-    # (layers, num_logical_experts) for this rank, or None without static dispatch
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
 
 
@@ -191,7 +188,6 @@ class ExpertLocationMetadata:
         use_flat_topology: bool = False,
         moe_ep_rank: Optional[int] = None,
     ) -> Optional[EplbPlacement]:
-        """Run the EPLB algorithm on `logical_count` where it lives."""
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:

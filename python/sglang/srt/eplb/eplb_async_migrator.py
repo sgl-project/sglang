@@ -11,8 +11,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Expert migration on a side stream, installed one layer per forward pass."""
-
 from __future__ import annotations
 
 import logging
@@ -72,7 +70,6 @@ class AsyncExpertMigrator:
         self._warm_up()
 
     def _warm_up(self):
-        """Create the communicator's connections now, not inside a rebalance."""
         world_size = torch.distributed.get_world_size(self._group)
         rank = torch.distributed.get_rank(self._group)
         with self._device_module.stream(self._stream):
@@ -141,7 +138,6 @@ class AsyncExpertMigrator:
         )
 
     def poll_placement(self, job: AsyncRebalanceJob) -> bool:
-        """Advance the placement phase without blocking; True once plans exist."""
         if job.thread is None:
             if not job.count_event.query():
                 return False
@@ -197,7 +193,6 @@ class AsyncExpertMigrator:
         return job.new_metadata
 
     def issue_layer(self, job: AsyncRebalanceJob, layer_id: int):
-        """Enqueue one layer's staging copies and P2P ops on the side stream."""
         plan = job.plans[layer_id]
         weights = job.routed_experts_weights_of_layer[layer_id]
         transfer_event = self._device_module.Event()
@@ -210,7 +205,6 @@ class AsyncExpertMigrator:
         job.layers_issued += 1
 
     def install_layer(self, job: AsyncRebalanceJob, layer_id: int):
-        """Make the compute stream adopt one layer's staged experts and maps."""
         plan = job.plans[layer_id]
         weights = job.routed_experts_weights_of_layer[layer_id]
         assert job.new_metadata is not None and job.transfer_event is not None
@@ -222,7 +216,6 @@ class AsyncExpertMigrator:
         job.layers_installed += 1
 
     def cancel(self, job: Optional[AsyncRebalanceJob]):
-        """Drain in-flight work so a reset leaves the staging buffers idle."""
         if job is not None and job.thread is not None and job.thread.is_alive():
             job.thread.join()
         self._device_module.synchronize()
