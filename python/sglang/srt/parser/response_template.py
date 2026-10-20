@@ -16,10 +16,13 @@
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 from collections.abc import Callable, Sequence
 from typing import Any
+
+import msgspec
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -53,9 +56,47 @@ GRAMMAR_AFTER_REASONING = "after_reasoning"
 GRAMMAR_FROM_START = "from_start"
 
 
+class _ServingTemplates(msgspec.Struct, frozen=True):
+    """A validated template and the variants the serving detectors parse with."""
+
+    source: ResponseTemplate
+    streaming: ResponseTemplate
+    reasoning_only: ResponseTemplate | None
+    tool_extraction: ResponseTemplate | None
+
+
 def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
-    """Validate the template and reject semantic fields serving cannot route."""
+    """Validate the template and every variant the serving detectors build."""
+    return _derive_serving_templates(template).source
+
+
+def _derive_serving_templates(template: dict) -> _ServingTemplates:
+    # Detectors are built several times per request; derive each template once.
+    return _derive_serving_templates_from_json(json.dumps(template))
+
+
+@functools.lru_cache(maxsize=8)
+def _derive_serving_templates_from_json(template_json: str) -> _ServingTemplates:
+    template = json.loads(template_json)
     loaded = load_response_template(template)
+    _check_serving_fields(loaded)
+    return _ServingTemplates(
+        source=loaded,
+        streaming=_streaming_template(template),
+        reasoning_only=(
+            _reasoning_only_template(template)
+            if _THINKING_FIELD in loaded.fields
+            else None
+        ),
+        tool_extraction=(
+            _tool_extraction_template(template)
+            if _TOOL_FIELD in loaded.fields
+            else None
+        ),
+    )
+
+
+def _check_serving_fields(loaded: ResponseTemplate) -> None:
     fields = set(loaded.fields)
     unsupported = (fields - _SUPPORTED_RESPONSE_TEMPLATE_FIELDS) | (
         set(loaded.defaults) - {"role"}
@@ -79,7 +120,12 @@ def validate_response_template_for_serving(template: dict) -> ResponseTemplate:
                 f"response_template field {name!r} uses semantics that cannot "
                 "be streamed by the OpenAI serving adapter"
             )
-    return loaded
+    tool_field = loaded.fields.get(_TOOL_FIELD)
+    if tool_field is not None and tool_field.open_re is None:
+        raise ValueError(
+            f"response_template field {_TOOL_FIELD!r} needs 'open' or "
+            "'open_pattern' so tool calls can be told apart from other text"
+        )
 
 
 def resolve_response_template(
@@ -104,15 +150,15 @@ def configure_response_template_request(request: Any) -> None:
     request.chat_template_kwargs = template_kwargs
 
 
-def _load_serving_template(
+def _load_serving_templates(
     tokenizer: Any | None, template: dict | None, fallback: dict | None
-) -> tuple[dict, ResponseTemplate]:
+) -> tuple[dict, _ServingTemplates]:
     """Use the explicit template, then checkpoint metadata, then the detector's
     built-in fallback."""
     template = resolve_response_template(tokenizer, template) or fallback
     if template is None:
         raise ValueError("response_template is required")
-    return template, validate_response_template_for_serving(template)
+    return template, _derive_serving_templates(template)
 
 
 def _streaming_template(template: dict[str, Any]) -> ResponseTemplate:
@@ -371,7 +417,7 @@ class ResponseTemplateReasoningDetector:
         grammar_start: str | None = None,
         **_kwargs,
     ):
-        template, loaded = _load_serving_template(
+        template, templates = _load_serving_templates(
             tokenizer, response_template, self.response_template
         )
         self.response_template = template
@@ -379,7 +425,7 @@ class ResponseTemplateReasoningDetector:
         self.think_excluded_tokens = None
         self._force_nonempty_content = force_nonempty_content
         self._open_reasoning = ""
-        thinking = loaded.fields.get(_THINKING_FIELD)
+        thinking = templates.source.fields.get(_THINKING_FIELD)
         self.think_start_token = (
             thinking.open_literals[0]
             if thinking and thinking.open_literals
@@ -395,9 +441,9 @@ class ResponseTemplateReasoningDetector:
             grammar_start = GRAMMAR_FROM_START
         self._grammar_start = grammar_start
         if grammar_start == GRAMMAR_AFTER_REASONING:
-            self._template = _reasoning_only_template(template)
+            self._template = templates.reasoning_only
         else:
-            self._template = _streaming_template(template)
+            self._template = templates.streaming
         self._prefix = prefix
         self._adapter = self._new_adapter()
 
@@ -468,16 +514,18 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
         prefix: str = "",
     ):
         super().__init__()
-        template, loaded = _load_serving_template(
+        template, templates = _load_serving_templates(
             tokenizer, response_template, self.response_template
         )
         self.response_template = template
-        if _TOOL_FIELD not in loaded.fields:
+        if templates.tool_extraction is None:
             raise ValueError(f"response_template has no {_TOOL_FIELD!r} field")
-        self._template = _tool_extraction_template(template)
+        self._template = templates.tool_extraction
         self._prefix = prefix
         self._adapter = ResponseTemplateStreamAdapter(self._template, prefix=prefix)
-        self.tool_close_literals = loaded.fields[_TOOL_FIELD].close_literals or []
+        self.tool_close_literals = (
+            templates.source.fields[_TOOL_FIELD].close_literals or []
+        )
         if self.tool_close_literals:
             self.eot_token = self.tool_close_literals[0]
         self.incomplete_tool_call_indices: set[int] = set()

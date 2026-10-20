@@ -1122,6 +1122,30 @@ class TestResolveAutoParsers(CustomTestCase):
         self.assertIsNone(_declared(args, "reasoning_parser"))
         self.assertIsNone(_declared(args, "tool_call_parser"))
 
+    def test_response_template_with_undelimited_tool_field_is_ignored(self):
+        """A tool field without an opener leaves no text outside the calls, so
+        the tool parser could never be constructed; auto must not select it."""
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "tool_calls": {
+                    "content": "json",
+                    "transform": {"type": "function", "function": "{content}"},
+                },
+            },
+        }
+
+        with _patch_hf_transformers_utils(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertIsNone(_declared(args, "reasoning_parser"))
+        self.assertIsNone(_declared(args, "tool_call_parser"))
+
     def test_resolves_reasoning_parser_only(self):
         args = self._make_server_args(reasoning_parser="auto", tool_call_parser=None)
         tokenizer = _DummyTokenizer([], chat_template=self.qwen3_template)
