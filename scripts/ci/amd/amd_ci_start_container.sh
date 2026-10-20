@@ -4,10 +4,11 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
-  # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
+# List release tags on origin instead of fetching them: `git fetch --tags` also
+# pulls every branch head (~1,800 refs, ~30 s per job) just to read one tag name.
+if TAGS=$(git ls-remote --tags --refs origin 'v*.*.*'); then
+  # Use the shared helper's ordering so stable/post releases sort above rc tags.
+  VERSION_FROM_TAG=$(printf '%s\n' "$TAGS" | sed 's#.*refs/tags/##' | python3 -c 'import sys; sys.path.insert(0, "scripts/release"); from get_version_tag import parse_version_tuple; t = sys.stdin.read().split(); print(max(t, key=parse_version_tuple) if t else "")' || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
     SGLANG_VERSION="$VERSION_FROM_TAG"
     echo "Using SGLang version from git tags: $SGLANG_VERSION"
@@ -15,7 +16,7 @@ if git fetch --tags origin; then
     echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
   fi
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to list tags from origin; using default $SGLANG_VERSION" >&2
 fi
 
 
