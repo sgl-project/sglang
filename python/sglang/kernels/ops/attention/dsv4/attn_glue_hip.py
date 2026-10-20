@@ -227,21 +227,26 @@ def _expand_same_length_kernel(
     req_pool_ptr,
     seq_lens_out_ptr,
     req_pool_out_ptr,
+    positions_out_ptr,
+    window_lens_out_ptr,
     num_tokens,
     qo_len,
     offset,
+    window,
     BLOCK: tl.constexpr,
+    WITH_POSITIONS: tl.constexpr,
 ):
     t = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     m = t < num_tokens
     r = t // qo_len
     seq_len = tl.load(seq_lens_ptr + r, mask=m, other=0)
-    tl.store(
-        seq_lens_out_ptr + t,
-        seq_len + (offset - qo_len + 1) + t % qo_len,
-        mask=m,
-    )
+    lens = seq_len + (offset - qo_len + 1) + t % qo_len
+    tl.store(seq_lens_out_ptr + t, lens, mask=m)
     tl.store(req_pool_out_ptr + t, tl.load(req_pool_ptr + r, mask=m, other=0), mask=m)
+    if WITH_POSITIONS:
+        lens32 = lens.to(tl.int32)
+        tl.store(positions_out_ptr + t, lens32 - 1, mask=m)
+        tl.store(window_lens_out_ptr + t, tl.minimum(lens32, window), mask=m)
 
 
 def expand_same_length(
@@ -249,17 +254,25 @@ def expand_same_length(
     req_pool_indices: torch.Tensor,
     qo_len: int,
     offset: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    window: Optional[int] = None,
+) -> Tuple[torch.Tensor, ...]:
     """Every request's qo_len rows, one launch: row t of request r sees
     seq_lens[r] + offset - qo_len + 1 + t % qo_len keys (its causal length, in
-    seq_lens' dtype) and reads req_pool_indices[r]."""
+    seq_lens' dtype) and reads req_pool_indices[r]. With ``window``, also each
+    row's int32 position (length - 1) and its length clamped to the window."""
     bs = seq_lens.shape[0]
     assert req_pool_indices.shape[0] == bs and seq_lens.is_contiguous()
     num_tokens = bs * qo_len
-    seq_lens_out = torch.empty(num_tokens, dtype=seq_lens.dtype, device=seq_lens.device)
+    device = seq_lens.device
+    seq_lens_out = torch.empty(num_tokens, dtype=seq_lens.dtype, device=device)
     req_pool_out = torch.empty(
         num_tokens, dtype=req_pool_indices.dtype, device=req_pool_indices.device
     )
+    with_positions = window is not None
+    positions = window_lens = seq_lens_out
+    if with_positions:
+        positions = torch.empty(num_tokens, dtype=torch.int32, device=device)
+        window_lens = torch.empty(num_tokens, dtype=torch.int32, device=device)
     if num_tokens:
         block = 256
         _expand_same_length_kernel[(triton.cdiv(num_tokens, block),)](
@@ -267,11 +280,17 @@ def expand_same_length(
             req_pool_indices.contiguous(),
             seq_lens_out,
             req_pool_out,
+            positions,
+            window_lens,
             num_tokens,
             qo_len,
             offset,
+            window if with_positions else 0,
             BLOCK=block,
+            WITH_POSITIONS=with_positions,
         )
+    if with_positions:
+        return seq_lens_out, req_pool_out, positions, window_lens
     return seq_lens_out, req_pool_out
 
 

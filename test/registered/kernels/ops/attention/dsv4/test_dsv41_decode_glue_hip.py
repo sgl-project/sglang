@@ -350,6 +350,27 @@ def test_expand_same_length_matches_torch(seq_dtype, req_dtype):
         assert torch.equal(lens, ref_lens) and torch.equal(req_rep, ref_req)
 
 
+def test_expand_same_length_positions_and_window_lens():
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import expand_same_length
+
+    _seed(12)
+    for seq_dtype in (torch.int32, torch.int64):
+        seq_lens = torch.tensor([1, 2, 127, 128, 129, 70000], device=DEVICE).to(
+            seq_dtype
+        )
+        req = torch.arange(6, dtype=torch.int32, device=DEVICE)
+        lens, req_rep, positions, window_lens = expand_same_length(
+            seq_lens, req, 5, offset=5, window=128
+        )
+        ref_lens, ref_req = expand_same_length(seq_lens, req, 5, offset=5)
+        assert torch.equal(lens, ref_lens) and torch.equal(req_rep, ref_req)
+        # make_core_attn_metadata's chain: int32 lengths, minus one, clamped
+        ref32 = ref_lens.to(torch.int32)
+        assert positions.dtype is window_lens.dtype is torch.int32
+        assert torch.equal(positions, ref32 - 1)
+        assert torch.equal(window_lens, torch.clamp(ref32, max=128))
+
+
 @pytest.mark.parametrize("ratios", [(1,), (2,), (1, 2)], ids=["c1", "c2", "c1c2"])
 def test_sparse_buffers_fill_low_ratio_raw_indices(ratios):
     from sglang.kernels.ops.attention.dsv4.attn_glue_hip import sparse_buffers

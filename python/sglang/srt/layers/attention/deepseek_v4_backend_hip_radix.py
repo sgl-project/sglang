@@ -1476,13 +1476,14 @@ class DeepseekV4HipRadixBackend(
         assert out_cache_loc.shape[0] >= num_tokens, (
             f"{out_cache_loc.shape=} holds fewer than {num_tokens=} block slots"
         )
-        seq_lens_casual, req_pool_indices_repeated = (
+        seq_lens_casual, req_pool_indices_repeated, positions, _ = (
             self.expand_extend_with_same_length(
                 bs=batch_size,
                 qo_len=block_size,
                 seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
                 seq_lens_offset=block_size,
+                window=SWA_WINDOW,
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -1496,6 +1497,7 @@ class DeepseekV4HipRadixBackend(
             is_prefill=True,
             dspark_block_size=block_size,
             num_groups=batch_size,
+            positions=positions,
         )
         return DSV4Metadata(
             core_attn_metadata,
@@ -1524,9 +1526,9 @@ class DeepseekV4HipRadixBackend(
             )
         extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
 
-        seq_lens_casual, req_pool_indices_repeated = (
+        seq_lens_casual, req_pool_indices_repeated, positions, window_lens = (
             self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices
+                bs, num_draft_tokens, seq_lens, req_pool_indices, window=SWA_WINDOW
             )
         )
         need_compress = self.need_compress
@@ -1538,6 +1540,8 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             num_groups=bs,
+            positions=positions,
+            window_lens=window_lens,
         )
         # extend_seq_lens is uniform here (seq_lens already carries the draft
         # block, so the minimum above cannot trim it), hence an exact token count.
@@ -3529,12 +3533,14 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens_offset: int = 0,
+        window: Optional[int] = None,
     ):
         """Each request's qo_len rows, one launch: their causal lengths (of
-        seq_lens + seq_lens_offset) and request slots."""
+        seq_lens + seq_lens_offset) and request slots; with ``window``, also
+        their int32 positions and lengths clamped to it."""
         assert seq_lens.shape[0] == bs
         return expand_same_length(
-            seq_lens, req_pool_indices, qo_len, offset=seq_lens_offset
+            seq_lens, req_pool_indices, qo_len, offset=seq_lens_offset, window=window
         )
 
     def make_core_attn_metadata(
@@ -3550,10 +3556,14 @@ class DeepseekV4HipRadixBackend(
         dspark_block_size: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
+        positions: Optional[torch.Tensor] = None,
+        window_lens: Optional[torch.Tensor] = None,
     ) -> DSV4AttnMetadata:
-        """swa_replay_start floors every row's window at that absolute position."""
+        """swa_replay_start floors every row's window at that absolute position.
+        ``positions`` / ``window_lens``: the rows' int32 positions and lengths
+        clamped to SWA_WINDOW, as ``expand_same_length`` built them."""
         seq_lens_casual = seq_lens_casual.to(torch.int32)
-        raw_positions = seq_lens_casual - 1
+        raw_positions = seq_lens_casual - 1 if positions is None else positions
 
         request_layout = None
         window = self.token_to_kv_pool.request_window
@@ -3605,7 +3615,11 @@ class DeepseekV4HipRadixBackend(
                 page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
                 swa_replay_start=swa_replay_start,
             )
-            swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+            swa_topk_lengths = (
+                torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+                if window_lens is None
+                else window_lens
+            )
             if swa_replay_start is not None:
                 # Slots below the floor are -1; the valid count shrinks to match.
                 floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
