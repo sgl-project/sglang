@@ -1482,6 +1482,14 @@ class Envs:
     # Q35RT: runtime switches of the Qwen3.5 2.2 tree, names kept; all off by default.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
+    # Verify input staging, bit-identical: reuse last round's mamba track indices while their
+    # inputs are unchanged, and skip the replay-time input_ids / positions copies that the
+    # same-stream pre-planned load_batch already made.
+    SGLANG_Q35MF_MKH_N3B = EnvBool(False)
+    # The post-verify graphs' per-round input load as one small_field_copy launch that also
+    # reads the injected acceptance length from its pinned host slot (bit-identical); needs
+    # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
+    SGLANG_Q35MF_MKH_N3C = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

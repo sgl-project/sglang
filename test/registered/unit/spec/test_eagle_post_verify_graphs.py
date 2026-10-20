@@ -357,6 +357,37 @@ class TestPostVerifyGraphs(CustomTestCase):
         self.assertEqual(drawn, before)
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
 
+    def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
+        """With SGLANG_Q35MF_MKH_N3C a round's inputs and its forced length go to
+        one copy plan; without it, or when the plan refuses the layout, the
+        per-dtype copies stage the same values."""
+        inputs = {
+            "draft_tokens": torch.arange(14),
+            "seq_lens": torch.tensor([17, 40]),
+            "temperatures": torch.rand(2, 1),
+        }
+        sim_len = torch.tensor([3])
+        for plan_mode in ("off", "accepts", "refuses"):
+            calls = []
+
+            def plan(dsts, srcs, accepts=plan_mode == "accepts"):
+                calls.append(len(dsts))
+                for dst, src in zip(dsts, srcs) if accepts else ():
+                    dst.copy_(src)
+                return accepts
+
+            staged = {name: torch.zeros_like(src) for name, src in inputs.items()}
+            staged["sim_accept_len"] = torch.zeros(1, dtype=torch.int64)
+            slot = SimpleNamespace(
+                staged=staged, load_plan=None if plan_mode == "off" else plan
+            )
+            eagle_post_verify_graphs._PostVerifyGraphs._load(slot, inputs, sim_len)
+            with self.subTest(plan=plan_mode):
+                self.assertEqual(calls, [] if plan_mode == "off" else [4])
+                for name, src in inputs.items():
+                    self.assertTrue(torch.equal(staged[name], src), name)
+                self.assertEqual(int(staged["sim_accept_len"]), 3)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestPostVerifyGraphsMatchEager(CustomTestCase):
@@ -429,6 +460,11 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
 
     def test_forced_acceptance(self):
         self._check(sim_acc_len=4.8)
+
+    def test_forced_acceptance_with_one_launch_load(self):
+        # SGLANG_Q35MF_MKH_N3C: inputs and the pinned forced length in one launch
+        with patch.object(eagle_post_verify_graphs, "_ONE_LAUNCH_LOAD", True):
+            self._check(sim_acc_len=4.8)
 
 
 if __name__ == "__main__":
