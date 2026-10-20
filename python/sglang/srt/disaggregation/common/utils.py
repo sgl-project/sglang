@@ -44,13 +44,13 @@ def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     return header + b"".join(buffers)
 
 
-def unpack_list_of_buffers(
-    buf: bytes, *, max_buffers: Optional[int] = None
-) -> List[bytes]:
+def _unpack_buffer_lengths(
+    buf: bytes, max_buffers: Optional[int]
+) -> Tuple[Tuple[int, ...], int]:
     if max_buffers is not None and max_buffers < 0:
         raise ValueError("max_buffers must be non-negative")
     if buf == b"":
-        return []
+        return (), 0
     if len(buf) < 4:
         raise ValueError("buffer-list header is truncated")
 
@@ -65,9 +65,15 @@ def unpack_list_of_buffers(
     payload_size = sum(lens)
     if header_size + payload_size != len(buf):
         raise ValueError("buffer-list payload size does not match its declared lengths")
+    return lens, header_size
+
+
+def unpack_list_of_buffers(
+    buf: bytes, *, max_buffers: Optional[int] = None
+) -> List[bytes]:
+    lens, offset = _unpack_buffer_lengths(buf, max_buffers)
 
     out = []
-    offset = header_size
     for length in lens:
         out.append(buf[offset : offset + length])
         offset += length
@@ -82,15 +88,20 @@ def unpack_int_lists(
     buf: bytes, fmt: str, *, max_lists: Optional[int] = None
 ) -> List[List[int]]:
     width = struct.calcsize(fmt)
-    buffers = unpack_list_of_buffers(buf, max_buffers=max_lists)
-    for item in buffers:
-        if len(item) % width != 0:
+    lens, offset = _unpack_buffer_lengths(buf, max_lists)
+    for length in lens:
+        if length % width != 0:
             raise ValueError(
-                f"integer-list payload length {len(item)} is not divisible by {width}"
+                f"integer-list payload length {length} is not divisible by {width}"
             )
-    return [
-        list(struct.unpack(f"<{len(item) // width}{fmt}", item)) for item in buffers
-    ]
+
+    out = []
+    for length in lens:
+        out.append(
+            list(struct.unpack_from(f"<{length // width}{fmt}", buf, offset=offset))
+        )
+        offset += length
+    return out
 
 
 class FastQueue:
