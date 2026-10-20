@@ -226,9 +226,7 @@ class ResponseTemplateStreamAdapter:
         self._prefix_end = 0
         self._finalized = False
         tool_field = template.fields.get(_TOOL_FIELD)
-        self._tool_has_closer = (
-            tool_field is not None and tool_field.close_re is not None
-        )
+        self._tool_close_re = None if tool_field is None else tool_field.close_re
         self._pending_reasoning = ""
         self._pending_tool_streamed = False
         self._grammar_start = grammar_start
@@ -391,10 +389,16 @@ class ResponseTemplateStreamAdapter:
     def _is_unusable_tool_end(self, event: dict) -> bool:
         """Whether a tool region ended malformed, or at end of stream without its
         closer because the call was cut off."""
-        return event["type"] == "region_malformed" or (
+        if event["type"] == "region_malformed":
+            return True
+        text = self._parser.input_text
+        # End-of-stream finalization and a matched zero-width closer such as `\Z`
+        # emit the same close event, so check whether the closer matches there.
+        return (
             event["type"] == "region_close"
-            and self._tool_has_closer
-            and event["start"] == len(self._parser.input_text)
+            and self._tool_close_re is not None
+            and event["start"] == len(text)
+            and self._tool_close_re.match(text, len(text)) is None
         )
 
 

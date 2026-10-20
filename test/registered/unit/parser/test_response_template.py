@@ -1007,6 +1007,37 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(text, "hello<end>")
         self.assertEqual(_call_values(calls), [("get_weather", {"location": "Paris"})])
 
+    def test_end_of_input_closer_completes_the_call(self):
+        """A closer that matches only at end of input, such as `\\Z`, closes the
+        last call instead of marking it cut off."""
+        template = copy.deepcopy(XML_TOOL_TEMPLATE)
+        del template["fields"]["tool_calls"]["close"]
+        template["fields"]["tool_calls"]["close_pattern"] = r"\Z"
+        text = "hello<call:get_weather><arg:location>Paris</arg>"
+
+        def new_parser():
+            return FunctionCallParser(
+                tools=[_tool()],
+                tool_call_parser="response_template",
+                tokenizer=SimpleNamespace(response_template=template),
+            )
+
+        normal_text, calls = new_parser().parse_non_stream(text)
+        self.assertEqual(normal_text, "hello")
+        self.assertEqual(_call_values(calls), [("get_weather", {"location": "Paris"})])
+
+        streaming = new_parser()
+        streamed = [streaming.parse_stream_chunk(char) for char in text]
+        streamed.append(streaming.parse_stream_end())
+        calls = [call for _, chunk_calls in streamed for call in chunk_calls]
+        self.assertEqual("".join(chunk_text for chunk_text, _ in streamed), "hello")
+        self.assertEqual("".join(call.name or "" for call in calls), "get_weather")
+        self.assertEqual(
+            json.loads("".join(call.parameters for call in calls)),
+            {"location": "Paris"},
+        )
+        self.assertEqual(streaming.detector.incomplete_tool_call_indices, set())
+
     def test_streamed_call_without_closer_stays_incomplete(self):
         for template, first_call, cut_call in (
             (
