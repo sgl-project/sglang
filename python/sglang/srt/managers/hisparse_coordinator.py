@@ -1399,6 +1399,111 @@ class HiSparseCoordinator:
         else:
             self.request_finished(req)
 
+    def retract_req_state_preserving(self, req: Req) -> None:
+        """Retract a request while keeping its host-pool recovery state.
+
+        HiSparse already maintains a host copy of every committed token via
+        staging/eager backup, so a memory-pressure retraction must not bulk-copy
+        the device KV to CPU, and must not drop the request's
+        ``req_to_host_pool`` row (that row IS the backup). Only the device side
+        is released here:
+
+        - the request's device buffer indices go back to the hisparse allocator
+        - the full->device mapping entries for its logical slots are cleared
+        - the logical (full-space) slots return to the logical allocator so
+          other requests can use them
+
+        The host row and its allocated length stay untouched, keyed by the
+        unchanged ``req_pool_idx`` row, so the request can be resumed later by
+        re-allocating logical slots and swap-in from host on demand.
+        """
+        # release resources only after the execution of a potential overlapped batch
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+
+        allocated_len = req.kv.kv_allocated_len
+        req_pool_idx = req.kv.req_pool_idx
+
+        # release device buffer indices (same ownership union request_finished
+        # computes; over-allocation slots carry stale -1/0 entries that are
+        # filtered out below)
+        current_cap = int(self.req_device_buffer_size[req_pool_idx])
+        if current_cap > 0:
+            side_buf_hi = self.req_to_device_buffer[req_pool_idx, :current_cap]
+            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
+            if all_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+
+        allocated_locs = self.req_to_token_pool.req_to_token[
+            req_pool_idx, :allocated_len
+        ]
+        # NOTE: the logical (full-space) slots themselves are released by the
+        # caller's release_kv_cache -> free_segment path; free_hisparse here
+        # would double-free them. We only clear the full->device mapping so
+        # stale resident entries cannot outlive the request's slot ownership.
+        self.token_to_kv_pool_allocator.free_hisparse_mapping_only(allocated_locs)
+
+        # clear device-side req info (host row is deliberately kept)
+        self.req_device_buffer_tokens[:, req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req_pool_idx, :] = -1
+        self.req_to_device_buffer[req_pool_idx, :] = 0
+        self.req_device_buffer_size[req_pool_idx] = 0
+        self.lru_slots[:, req_pool_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req_pool_idx] = False
+
+        # Mark for the resume path: no retransfer from prefill is needed; the
+        # host pool already holds every committed token.
+        req.hisparse_retraction_pending = True
+
+    def discard_retracted_request(self, req: Req) -> None:
+        """Drop a state-preserving-retracted request entirely (abort/flush).
+
+        Frees the retained host-pool row and the kept req_to_token row that
+        retraction preserved, so an aborted retracted request leaks nothing.
+        """
+        if not getattr(req, "hisparse_retraction_pending", False):
+            return
+        assert req.kv.req_pool_idx is not None
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool,
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
+        )
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        req.hisparse_retraction_pending = False
+        # Release the kept req_to_token row.
+        if req.kv.req_pool_idx is not None:
+            self.req_to_token_pool.free(req)
+
+    def resume_after_retraction(self, req: Req) -> None:
+        """Re-admit a state-preserving-retracted request.
+
+        The retained ``req_to_host_pool`` row is indexed by token position, so
+        it stays valid across the logical-slot reallocation done by
+        ``_pre_alloc``. A fresh device buffer is allocated and marked all-miss
+        so the swap-in kernel reloads top-k tokens from host on demand.
+        """
+        assert getattr(req, "hisparse_retraction_pending", False)
+        self.alloc_device_buffer(req)
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
+        if host_len <= self.device_buffer_size:
+            self._preload_to_device_buffer(req)
+        else:
+            # Every slot a miss -> swap-in from host as needed
+            self.req_device_buffer_tokens[
+                :, req.kv.req_pool_idx, : self.device_buffer_size
+            ] = -1
+        # The retained host row already covers every token up to
+        # kv_allocated_len (the fill length), so the first decode step after
+        # resume has nothing new to back up -- same as admit_request_direct.
+        self._skip_first_backup[req.kv.req_pool_idx] = True
+        req.hisparse_retraction_pending = False
+        req.hisparse_staging = False
+
     def request_finished(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
