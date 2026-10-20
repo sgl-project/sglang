@@ -81,7 +81,7 @@ def _fill_block_table(req_to_token, req_pool_indices, seq_lens, page_size, *, v2
 
 def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size):
     """The static-pool route: the stripped flashmla kernel, token//ps verbatim."""
-    from sglang.kernels.ops.kvcache.kv_indices import (
+    from sglang.kernels.ops.attention.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )
