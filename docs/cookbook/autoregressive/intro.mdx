@@ -8,6 +8,12 @@ metatags:
 
 <CardGroup cols={3}>
   <Card
+    title="Reflection"
+    mode="card"
+    href="/cookbook/autoregressive/Reflection/Beam-1_0"
+    img="/cards/logos/reflection.png"
+  />
+  <Card
     title="IQuestLab"
     mode="card"
     href="/cookbook/autoregressive/IQuestLab/IQuest-Q1"

@@ -37,6 +37,7 @@ COPY experimental/sgl-router/Cargo.toml experimental/sgl-router/Cargo.lock ./
 COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # sglang-processor is a path dependency that inherits from the rust/ workspace manifest.
 COPY rust/Cargo.toml /work/rust/Cargo.toml
+COPY rust/sglang-api-types /work/rust/sglang-api-types
 COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
 # Stub a minimal src tree so cargo can see the workspace targets, then
 # prepare the chef recipe.
@@ -71,6 +72,7 @@ COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # The recipe omits path dependencies outside this workspace, so cook against a
 # stub of sglang-processor; its real sources arrive with the router's below.
 COPY rust/Cargo.toml /work/rust/Cargo.toml
+COPY rust/sglang-api-types /work/rust/sglang-api-types
 COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
 RUN mkdir -p /work/rust/sglang-processor/src && touch /work/rust/sglang-processor/src/lib.rs
 

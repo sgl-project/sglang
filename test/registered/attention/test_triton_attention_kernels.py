@@ -15,14 +15,16 @@ from sglang.kernels.ops.attention.extend_attention import (
     build_unified_kv_indices,
     extend_attention_fwd,
     extend_attention_fwd_unified,
-    redundant_attention,
 )
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kernels.extend_attention import redundant_attention
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
@@ -863,6 +865,108 @@ class TestTritonAttention(CustomTestCase):
         for S in seq_lens:
             for B, H_Q, H_KV, D, D_V in configs:
                 self._test_grouped_decode_attention_once(B, S, H_Q, H_KV, D, D_V)
+
+    def test_decode_attention_uneven_batch_graph_replay(self):
+        """One captured decode graph replayed over uniform, padded and ragged batches.
+
+        TritonAttnBackend refreshes num_kv_splits and the uneven_batch flag in place
+        before each replay, and the captured stage-1 kernels read the flag at run time,
+        so every replay must see its own flag and match an eager run without rotation.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        bs, pool, D, max_kv_splits = 8, 8192, 128, 8
+        rounds = [
+            ([600] * bs, 0),
+            ([600, 610, 620, 630, 640, 1, 1, 1], 1),  # CUDA-graph padding rows
+            ([600] * bs, 0),
+            ([1000] + [64] * (bs - 1), 1),
+            ([700] * bs, 0),
+        ]
+        for H_Q, H_KV in ((8, 8), (16, 2)):
+            backend = TritonAttnBackend.__new__(TritonAttnBackend)
+            backend.num_head, backend.num_kv_head = H_Q, H_KV
+            backend.max_kv_splits = max_kv_splits
+            backend.device_core_count = torch.cuda.get_device_properties(
+                device
+            ).multi_processor_count
+            backend.static_kv_splits = False
+            backend.enable_deterministic = False
+            backend.split_tile_size = None
+            backend.cuda_graph_num_kv_splits = torch.zeros(
+                bs, dtype=torch.int32, device=device
+            )
+            backend.cuda_graph_uneven_batch = torch.zeros(
+                1, dtype=torch.int32, device=device
+            )
+            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (
+                None,
+                None,
+                None,
+                lens,
+            )
+
+            seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
+            kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            kv_indices = torch.zeros(pool, dtype=torch.int64, device=device)
+            q = torch.randn(bs, H_Q, D, dtype=dtype, device=device)
+            k_buffer = torch.randn(pool, H_KV, D, dtype=dtype, device=device)
+            v_buffer = torch.randn(pool, H_KV, D, dtype=dtype, device=device)
+            o = torch.empty(bs, H_Q, D, dtype=dtype, device=device)
+            attn_logits = torch.empty(
+                bs, H_Q, max_kv_splits, D, dtype=torch.float32, device=device
+            )
+            attn_lse = torch.empty(
+                bs, H_Q, max_kv_splits, dtype=torch.float32, device=device
+            )
+
+            def update(lens):
+                seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+                kv_indptr[1:] = torch.cumsum(seq_lens, 0)
+                kv_indices[: sum(lens)] = torch.randperm(pool, device=device)[
+                    : sum(lens)
+                ]
+                backend._apply_cuda_graph_metadata(
+                    None, bs, None, seq_lens, ForwardMode.DECODE, None
+                )
+
+            def decode(out, uneven_batch):
+                decode_attention_fwd(
+                    q,
+                    k_buffer,
+                    v_buffer,
+                    out,
+                    kv_indptr,
+                    kv_indices,
+                    attn_logits,
+                    attn_lse,
+                    backend.cuda_graph_num_kv_splits,
+                    max_kv_splits,
+                    D**-0.5,
+                    1.0,
+                    1.0,
+                    enable_lean=False,
+                    uneven_batch=uneven_batch,
+                )
+
+            update(rounds[1][0])
+            decode(o, backend.cuda_graph_uneven_batch)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                decode(o, backend.cuda_graph_uneven_batch)
+            flag_ptr = backend.cuda_graph_uneven_batch.data_ptr()
+            for lens, uneven in rounds:
+                with self.subTest(H_Q=H_Q, H_KV=H_KV, lens=lens):
+                    update(lens)
+                    graph.replay()
+                    ref = torch.empty_like(o)
+                    decode(ref, None)
+                    self.assertEqual(
+                        backend.cuda_graph_uneven_batch.data_ptr(), flag_ptr
+                    )
+                    self.assertEqual(backend.cuda_graph_uneven_batch.item(), uneven)
+                    self.assertTrue(torch.equal(o, ref))
 
     def test_decode_attention_large_batch_int64_offset(self):
         """Regression for int32 Mid_O offset overflow (PR #28788).

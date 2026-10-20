@@ -11,11 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
+use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
     CoreCall, CoreError, CoreEvent, CoreOutput, HealthStatus, recv_indexed,
 };
 #[cfg(test)]
 use crate::message::ids::Rid;
+#[cfg(test)]
+use crate::message::request::GenerationPolicy;
 use crate::message::request::{GenerateRequest, into_requests};
 use crate::message::wire::merge_preferred_sampling;
 use crate::utils::{
@@ -26,7 +29,7 @@ use axum::{
     Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -176,6 +179,7 @@ async fn health_generate(
 /// message, instead of axum's default 422.
 async fn generate(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
     let mut body = match body {
@@ -187,6 +191,11 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
+    if state.server_args.enable_request_header_overrides
+        && let Err(error) = apply_header_overrides(&mut body, &headers)
+    {
+        return native_error(StatusCode::BAD_REQUEST, &error, false);
+    }
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
@@ -204,7 +213,7 @@ async fn generate(
     let stream = body.stream.unwrap_or(false);
     // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
     // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (payloads, is_batch) = match into_requests(body) {
+    let (payloads, is_batch) = match into_requests(body, &state.generation_policy) {
         Ok(v) => v,
         // Request normalization only returns validation failures.
         Err(e) => {
@@ -564,6 +573,7 @@ mod tests {
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
         });
 
@@ -602,6 +612,7 @@ mod tests {
                     metadata: crate::api_server::core::CoreMetadata::default(),
                 },
             ),
+            generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
         });
@@ -641,6 +652,7 @@ mod tests {
         let state = Arc::new(AppState {
             core,
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
         });
 

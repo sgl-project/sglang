@@ -56,6 +56,8 @@ struct Inner {
 pub struct CircuitBreaker {
     inner: Mutex<Inner>,
     config: CircuitBreakerConfig,
+    /// A disabled breaker ignores failures, so it never opens.
+    enabled: bool,
 }
 
 impl CircuitBreaker {
@@ -71,11 +73,21 @@ impl CircuitBreaker {
                 probe_generation: 0,
             }),
             config,
+            enabled: true,
         }
     }
 
-    pub fn config(&self) -> &CircuitBreakerConfig {
-        &self.config
+    /// The breaker of every worker under `--disable-circuit-breaker`.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::new()
+        }
+    }
+
+    /// `None` for a [`disabled`](Self::disabled) breaker.
+    pub fn config(&self) -> Option<&CircuitBreakerConfig> {
+        self.enabled.then_some(&self.config)
     }
 
     /// Non-mutating predicate: would [`allow`] return `true` if called
@@ -162,6 +174,9 @@ impl CircuitBreaker {
     }
 
     pub fn record_failure(&self) {
+        if !self.enabled {
+            return;
+        }
         let mut g = self.inner.lock().unwrap();
         match g.state {
             State::Closed | State::HalfOpen { .. } => {

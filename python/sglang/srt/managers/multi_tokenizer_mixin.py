@@ -65,9 +65,8 @@ from sglang.srt.managers.load_snapshot import (
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
-from sglang.srt.runtime_context import (
-    get_disagg,
-)
+from sglang.srt.observability.trace import process_tracing_init
+from sglang.srt.runtime_context import get_disagg, get_observability
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -602,6 +601,13 @@ class MultiTokenizerRouter:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        # Requests are unpickled here; TraceReqContext needs an OTel provider.
+        if get_observability().enable_trace:
+            process_tracing_init(
+                get_observability().otlp_traces_endpoint,
+                get_observability().otlp_service_name,
+                trace_modules=get_observability().trace_modules,
+            )
         self.server_args = server_args
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)

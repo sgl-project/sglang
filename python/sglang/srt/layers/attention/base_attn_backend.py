@@ -171,6 +171,9 @@ class AttentionBackend(ABC):
 
     # True when prefill graph metadata can use ForwardBatch.max_seq_len_override.
     supports_prefill_cuda_graph_max_context_size: bool = False
+    # Replayed context limit when the user sets none; None when nothing the backend
+    # captures depends on the context length.
+    prefill_cuda_graph_default_max_seq_len: Optional[int] = None
     dllm_attention = None
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
@@ -244,6 +247,11 @@ class AttentionBackend(ABC):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
+
+    def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
+        """Rows this rank runs from a late-layer row switch on (DeepSeek-V4.1
+        decoder SWA bounded replay); None for backends without one."""
+        return None
 
     def on_after_cuda_graph_warmup(self):
         """Hook between cuda graph warmup pass and the actual capture.

@@ -29,7 +29,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{WireProtocol, WorkerRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -124,14 +124,15 @@ async fn pd_decode_stream_expires_after_prefill_completes() {
             ..Default::default()
         })
         .unwrap();
+    let spec = WorkerSpec {
+        id: WorkerId("d1".into()),
+        url: decode.url.clone(),
+        mode: WorkerMode::Decode,
+        model_ids: vec![ModelId("tiny".into())],
+        ..Default::default()
+    };
     registry
-        .add(WorkerSpec {
-            id: WorkerId("d1".into()),
-            url: decode.url.clone(),
-            mode: WorkerMode::Decode,
-            model_ids: vec![ModelId("tiny".into())],
-            ..Default::default()
-        })
+        .add_with_cb(spec, Some(Default::default()), WireProtocol::default())
         .unwrap();
     let prefill_worker = registry.get(&WorkerId("p1".into())).unwrap();
     let decode_worker = registry.get(&WorkerId("d1".into())).unwrap();

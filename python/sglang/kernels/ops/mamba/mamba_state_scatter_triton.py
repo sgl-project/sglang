@@ -422,7 +422,7 @@ def fused_conv_window_scatter_with_mask(
     ``[layers, cache, dim, K-1]``.
     """
     total_requests = step_indices_raw.shape[0]
-    if total_requests == 0:
+    if total_requests == 0 or dst.numel() == 0:
         return
 
     if not (dst.is_cuda or dst.is_xpu) or dst.device != src.device:
@@ -614,7 +614,11 @@ def _conv_multi_eligible(pairs) -> bool:
             return False
         if src.shape[0] != layers or src.shape[3:] != dst.shape[2:]:
             return False
-        if not dst.is_contiguous():
+        # The descriptor carries layer/slot strides. Only the trailing
+        # feature block is flat-copied, including for unified pool views.
+        if (dst.shape[3] != 1 and dst.stride(3) != 1) or (
+            dst.shape[2] != 1 and dst.stride(2) != dst.shape[3]
+        ):
             return False
         if src.shape[1:3] != pairs[0][1].shape[1:3]:
             return False
@@ -640,7 +644,10 @@ def fused_conv_window_scatter_multi(
 
     BLOCK_SIZE = 1024
     key = tuple(
-        (dst.data_ptr(), src.data_ptr()) + tuple(src.stride()) + tuple(dst.shape)
+        (dst.data_ptr(), src.data_ptr())
+        + tuple(src.stride())
+        + tuple(dst.stride())
+        + tuple(dst.shape)
         for dst, src in pairs
     )
     cached = _conv_multi_meta_cache.get(key)
@@ -723,7 +730,13 @@ def scatter_mamba_states_after_mtp_verify(
                 src_indices_raw,
             )
 
-    pairs = list(zip(mamba_caches.conv, mamba_caches.intermediate_conv_window))
+    pairs = [
+        (conv, window)
+        for conv, window in zip(
+            mamba_caches.conv, mamba_caches.intermediate_conv_window
+        )
+        if conv.numel() > 0
+    ]
     if not pairs:
         return
     if mamba_track_indices is not None:

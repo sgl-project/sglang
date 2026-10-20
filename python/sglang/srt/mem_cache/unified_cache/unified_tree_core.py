@@ -1398,18 +1398,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
-        components = self.components
-        if self.is_write_back:
-            swa = self.components_by_type.get(ComponentType.SWA)
-            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in components
+            for component in self.components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
+        if self.is_write_back:
+            return False
         if state.is_new_leaf:
             leaf_end = state.total_prefix_length + len(state.target_node.key)
             return (
