@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.eval_accuracy_kit import _run_sgl_eval
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1770, stage="weekly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2070, stage="weekly", runner_config="4-gpu-b200")
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -170,8 +171,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8A2ABase:
             other_args=[
                 "--quantization",
                 "mxfp8",
-                "--enable-dp-attention",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
                 "--tp-size",
                 "4",
@@ -251,11 +251,12 @@ class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
 
 class FlashinferTrtllmGenMoeBackendNVFP4Base:
     backend = None
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
     extra_env = {}
+    gsm8k_threshold = 0.89
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "nvidia/Qwen3-30B-A3B-NVFP4"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -290,7 +291,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.89)
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
 
 
 class TestFlashinferTrtllmGenMoeBackendFP8(
@@ -303,6 +304,29 @@ class TestFlashinferTrtllmGenMoeBackendNVFP4(
     FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
 ):
     backend = "flashinfer_trtllm"
+
+
+class TestFlashinferTrtllmGenMoeBackendNvFp4UntiedGateUp(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    """nvidia/Qwen3-30B-A3B-NVFP4 with each expert's gate and up global scales
+    re-split to differ but the same dequantized weights; accuracy must match."""
+
+    model = "mmangkad/Qwen3-30B-A3B-NVFP4-untied-gate-up"
+    backend = "flashinfer_trtllm"
+
+    def test_gsm8k(self):
+        _run_sgl_eval(
+            self,
+            eval_name="gsm8k",
+            score_threshold=0.9,
+            num_examples=200,
+            num_threads=128,
+            chat_template_kwargs={"enable_thinking": False},
+            max_tokens=2048,
+            temperature=0.7,
+            top_p=0.8,
+        )
 
 
 class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
@@ -334,6 +358,17 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
 ):
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    """Non-gated ReLU2 experts with per-token NVFP4 activations."""
+
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
+    backend = "flashinfer_trtllm"
+    gsm8k_threshold = 0.93
 
 
 if __name__ == "__main__":

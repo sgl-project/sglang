@@ -29,6 +29,7 @@ import jinja2.ext
 import jinja2.nodes
 import jinja2.sandbox
 
+from sglang.srt.arg_groups.muse_spark_hook import muse_spark_chat_template_default
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 
 logger = logging.getLogger(__name__)
@@ -526,11 +527,16 @@ def _is_gigachat35(ctx):
     return ctx.has_text("<｜GCML｜tool_calls>")
 
 
+def _is_iquest_q1(ctx):
+    return ctx.has_text("<|iquest_assistant|>")
+
+
 # ---------------------------------------------------------------------------
 # Reasoning parser rules
 # ---------------------------------------------------------------------------
 
 REASONING_PARSER_RULES = (
+    DetectionRule(name="iquest_q1", value="iquest_q1", predicate=_is_iquest_q1),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
@@ -576,6 +582,7 @@ REASONING_PARSER_RULES = (
 # ---------------------------------------------------------------------------
 
 TOOL_CALL_PARSER_RULES = (
+    DetectionRule(name="iquest_q1", value="iquest_q1", predicate=_is_iquest_q1),
     DetectionRule(name="gigachat35", value="gigachat35", predicate=_is_gigachat35),
     DetectionRule(name="k2_horizon", value="k2_horizon", predicate=_is_k2_v3),
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
@@ -711,6 +718,17 @@ def detect_tool_call_parser(
     return match_rules(ctx, TOOL_CALL_PARSER_RULES, "tool-call parser")
 
 
+def is_glm53_template(template: Optional[str]) -> bool:
+    """True if ``template`` is a GLM-5.3 family chat template."""
+    if not template:
+        return False
+    return _is_glm53(
+        TemplateDetectionContext(
+            template=template, reasoning_config=None, force_reasoning=False, vocab=set()
+        )
+    )
+
+
 def detect_inline_system_support(chat_template: Optional[str]) -> bool:
     """True if mid-conversation ``role: "system"`` renders inline; False if the
     template raises or silently drops it (then merge into the leading block).
@@ -777,6 +795,48 @@ def _log_undetected_parser(attr: str, label: str) -> None:
     )
 
 
+def _declare_python_template_parsers(server_args, template, needs) -> None:
+    """Resolve the ``auto`` parsers to the ones a Python chat template declares."""
+    detected = {attr: getattr(template, attr) for attr in needs}
+    for attr, value in detected.items():
+        logger.info(
+            f"Auto-detected --{attr.replace('_', '-')} as '{value}' from "
+            f"Python chat template '{template.name}'"
+        )
+    declare_resolution(server_args, "template-detection", **detected)
+
+
+def _checkpoint_python_chat_template(server_args, template):
+    """The Python chat template replacing the checkpoint's ``template``, if any.
+
+    Mirrors TemplateManager's selection when ``--chat-template`` is not set.
+    """
+    from sglang.srt.parser.python_chat_template import (
+        may_replace_jinja_template,
+        resolve_python_chat_template,
+    )
+
+    if not may_replace_jinja_template(template):
+        return None
+
+    cfg = resolving_view(server_args)
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=getattr(cfg, "revision", None),
+            model_config_parser=getattr(cfg, "model_config_parser", "auto"),
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to load model config to resolve a Python chat template: %s", e
+        )
+        return None
+    return resolve_python_chat_template(config, template)
+
+
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
     """The parsers the model architecture implies, for the fields still on auto."""
     from sglang.srt.entrypoints.openai.chat_encoding import is_deepseek_v41_arch
@@ -795,6 +855,8 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
 
     if "KimiK3" in arch or model_type == "kimi_k3":
         reasoning_parser, tool_call_parser = "kimi_k3", "kimi_k3"
+    elif arch == "IQuestQ1ForCausalLM":
+        reasoning_parser, tool_call_parser = "iquest_q1", "iquest_q1"
     elif arch in (
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -830,9 +892,39 @@ def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str,
     return resolved
 
 
+def _architecture_parser_defaults(server_args) -> Dict[str, str]:
+    """Parser defaults implied by an architecture when the caller omitted them."""
+    cfg = resolving_view(server_args)
+    missing = tuple(
+        attr
+        for attr in ("reasoning_parser", "tool_call_parser")
+        if getattr(cfg, attr) is None
+    )
+    if not missing:
+        return {}
+
+    model_config = getattr(server_args, "_model_config", None)
+    if model_config is None:
+        return {}
+    config = model_config.hf_config
+    architectures = getattr(config, "architectures", None) or []
+    arch = architectures[0] if architectures else ""
+    if arch != "MuseSparkForConditionalGeneration":
+        return {}
+
+    defaults = {attr: "muse" for attr in missing}
+    for attr, value in defaults.items():
+        logger.info(
+            "Defaulting --%s to '%s' for model architecture '%s'",
+            attr.replace("_", "-"),
+            value,
+            arch,
+        )
+    return defaults
+
+
 def resolve_auto_parsers(server_args) -> None:
-    """Resolve ``--reasoning-parser=auto`` / ``--tool-call-parser=auto`` from the
-    chat template, before anything publishes ``server_args``.
+    """Resolve architecture defaults and explicit ``auto`` parser requests.
 
     Performs a lightweight tokenizer load, so it runs once in engine init. The
     decision goes to this instance's declaration stash, so every holder of it
@@ -840,6 +932,22 @@ def resolve_auto_parsers(server_args) -> None:
     workers it is serialized for -- and each publishes bags projected from it.
     The fields stay what the operator passed.
     """
+    architecture_defaults = _architecture_parser_defaults(server_args)
+    if architecture_defaults:
+        declare_resolution(
+            server_args,
+            "architecture-parser-defaults",
+            **architecture_defaults,
+        )
+
+    chat_template_default = muse_spark_chat_template_default(server_args)
+    if chat_template_default is not None:
+        declare_resolution(
+            server_args,
+            "architecture-chat-template-default",
+            chat_template=chat_template_default,
+        )
+
     cfg = resolving_view(server_args)
     needs = tuple(
         attr
@@ -849,9 +957,19 @@ def resolve_auto_parsers(server_args) -> None:
     if not needs:
         return
 
+    chat_template_arg = getattr(cfg, "chat_template", None)
+    if isinstance(chat_template_arg, str):
+        from sglang.srt.parser.python_chat_template import get_python_chat_template
+
+        # A built-in Python chat template declares its parsers, so neither the
+        # tokenizer nor a Jinja source needs loading.
+        python_template = get_python_chat_template(chat_template_arg)
+        if python_template is not None:
+            _declare_python_template_parsers(server_args, python_template, needs)
+            return
+
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    chat_template_arg = getattr(cfg, "chat_template", None)
     try:
         explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
     except Exception as e:
@@ -873,6 +991,14 @@ def resolve_auto_parsers(server_args) -> None:
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
         template = getattr(tokenizer, "chat_template", None)
+
+    # A Python chat template replacing the checkpoint's renders this model's
+    # prompts, so its declared parsers decide; the Jinja source is not consulted.
+    if chat_template_arg is None:
+        python_template = _checkpoint_python_chat_template(server_args, template)
+        if python_template is not None:
+            _declare_python_template_parsers(server_args, python_template, needs)
+            return
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(

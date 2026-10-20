@@ -11,7 +11,6 @@ from collections import defaultdict
 from unittest import mock
 
 import torch
-from test_unified_radix_cache_unittest import CacheConfig, UnifiedRadixCacheSuite
 
 from sglang.srt.mem_cache.unified_cache.cache_action import MambaEvictExcessPathStates
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -23,6 +22,10 @@ from sglang.srt.mem_cache.unified_cache.components.mamba import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedLRUList, UnifiedTreeNode
 from sglang.srt.server_args import ServerArgs
+from sglang.test.kits.unified_radix_cache.config import (
+    CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -89,12 +92,6 @@ def _build_unified_chain(cap, length=3):
 
 
 class TestMambaPathStateCap(unittest.TestCase):
-    def test_server_arg_defaults_to_unlimited(self):
-        self.assertEqual(
-            ServerArgs(model_path="dummy").mamba_max_states_per_path,
-            -1,
-        )
-
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)
@@ -179,18 +176,10 @@ class TestMambaPathStateCap(unittest.TestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "mamba pool fixtures need CUDA")
-class TestMambaPathCapWriteThroughOrdering(CustomTestCase):
-    """CI-active write-through/path-cap ordering regressions (the unified radix
-    cache unittest module is temporarily gated off on trunk)."""
+class TestMambaPathCapWriteThroughOrdering(UnifiedRadixCacheFixtures, CustomTestCase):
+    """Write-through backup ordering regressions under the Mamba path-state cap."""
 
     cfg = CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
-    _rid = 0
-    # Borrow the fixture helpers without inheriting the full gated suite.
-    _make_req = UnifiedRadixCacheSuite._make_req
-    _alloc = UnifiedRadixCacheSuite._alloc
-    _insert = UnifiedRadixCacheSuite._insert
-    _init_hicache = UnifiedRadixCacheSuite._init_hicache
-    _build_hicache_fixture = UnifiedRadixCacheSuite._build_hicache_fixture
 
     def test_write_through_backup_survives_mamba_path_cap(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()

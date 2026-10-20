@@ -33,8 +33,6 @@ class TestFakeKVSender(unittest.TestCase):
             mgr=self.mgr if mgr is None else mgr,
             bootstrap_addr="fake_addr:1234",
             bootstrap_room=42,
-            dest_tp_ranks=[0],
-            pp_rank=0,
         )
 
     def _expire_deadline(self, sender: FakeKVSender, by: float = 1.0) -> None:

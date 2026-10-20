@@ -1405,6 +1405,10 @@ class LayerwiseOffloadManager:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
+            # Prepared-kernel caches retain their weight tensors. A streamed
+            # parameter must opt out or every prefetched layer remains alive
+            # after its post-hook releases it.
+            setattr(tensor, "_sglang_layerwise_offloaded", True)
             self._has_dtensor_weights = self._has_dtensor_weights or isinstance(
                 tensor, DTensor
             )
@@ -1486,7 +1490,7 @@ class LayerwiseOffloadManager:
     def _initialize_host_stores(
         self, layer_groups: Dict, layer_hosting: Dict[int, str]
     ) -> Iterator[torch.UntypedStorage]:
-        """Yield each pinned allocation before copying weights to transfer its lease."""
+        """Yield each pinned allocation to transfer its lease."""
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
@@ -1580,21 +1584,23 @@ class LayerwiseOffloadManager:
 
                 total_numel = current_offset
 
-                # create concatenated CPU buffer (in pinned memory)
-                if pin_this_layer:
-                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
-                else:
-                    cpu_buffer = torch.empty(total_numel, dtype=dtype)
+                cpu_buffer, populated = self._prepare_host_buffer(
+                    contiguous_weights,
+                    aligned_offsets,
+                    total_numel,
+                    dtype,
+                    pin_this_layer,
+                )
                 if pin_this_layer:
                     yield cpu_buffer.untyped_storage()
 
-                # offload weights to the buffer
                 for name, weight, local_weight in contiguous_weights:
                     current_offset = aligned_offsets[name]
                     numel = local_weight.numel()
-                    cpu_buffer[current_offset : current_offset + numel].copy_(
-                        local_weight.flatten()
-                    )
+                    if not populated:
+                        cpu_buffer[current_offset : current_offset + numel].copy_(
+                            local_weight.flatten()
+                        )
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "offset": current_offset,
@@ -1611,6 +1617,45 @@ class LayerwiseOffloadManager:
                     current_offset += numel
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
+
+    @staticmethod
+    def _prepare_host_buffer(
+        weights: List[Tuple[str, torch.Tensor, torch.Tensor]],
+        offsets: Dict[str, int],
+        total_numel: int,
+        dtype: torch.dtype,
+        pin: bool,
+    ) -> Tuple[torch.Tensor, bool]:
+        """Return a host buffer and whether CPU weights already populate it."""
+        nbytes = total_numel * dtype.itemsize
+        if (
+            pin
+            and nbytes >= _REGISTER_MIN_BYTES
+            and all(local.device.type == "cpu" for _, _, local in weights)
+        ):
+            storage = _shared_storage(nbytes)
+            if storage is not None:
+                buffer = torch.empty(0, dtype=dtype).set_(
+                    storage, 0, (total_numel,), (1,)
+                )
+                # CPU copies populate pages in parallel before registration;
+                # GPU copies must keep their pinned destination to avoid staging
+                for name, _, local in weights:
+                    offset = offsets[name]
+                    buffer[offset : offset + local.numel()].copy_(local.flatten())
+                if _pin_in_place(buffer):
+                    return buffer, True
+                # retain the originals until registration succeeds so fallback
+                # does not hold an extra full-size populated allocation
+                del buffer, storage
+
+        buffer = (
+            _pinned_empty(total_numel, dtype=dtype)
+            if pin
+            else torch.empty(total_numel, dtype=dtype)
+        )
+        # the caller must attach the pin lease before a fallible pinned copy
+        return buffer, False
 
     def _finalize_initialization(self) -> None:
         # prefetch the head of the stream for warm-up. Under `forward` residency
@@ -2669,6 +2714,9 @@ class LayerwiseOffloadManager:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
+                successor = getattr(self.model, "layerwise_prefetch_successor", None)
+                if successor is not None:
+                    successor(self, i)
 
             return hook
 
@@ -2716,6 +2764,9 @@ class LayerwiseOffloadableModuleMixin:
     # transfer per request and is worth it only when device memory is the
     # binding constraint, so it follows --performance-mode memory.
     park_non_layer_weights_between_uses: bool = False
+    # Pin those host copies. Default off: page-locked RAM cannot be reclaimed
+    # (H3 12GB decode is tight). Models that restore on the request tail opt in.
+    pin_parked_non_layer_weights: bool = False
 
     def _managed_layer_parameter_names(self) -> set:
         """Managed parameter names, including ``*.base_layer.weight`` aliases."""
@@ -2726,7 +2777,7 @@ class LayerwiseOffloadableModuleMixin:
                     names.update(offload_param_name_aliases(name))
         return names
 
-    def park_non_layer_weights(self) -> None:
+    def park_non_layer_weights(self, *, force: bool = False) -> None:
         """Move the parameters no manager streams back to the host.
 
         A layerwise component holds its non-layer parameters on the device for
@@ -2740,8 +2791,10 @@ class LayerwiseOffloadableModuleMixin:
         Buffers are left where they are. Layerwise offload keeps them resident
         on purpose, because a shared buffer such as a RoPE cache is referenced
         by many layers.
+
+        ``force=True`` parks even when headroom looks large (e.g. after release_all).
         """
-        if not self.park_non_layer_weights_between_uses:
+        if not force and not self.park_non_layer_weights_between_uses:
             return
         if current_platform.is_mps():
             # MPS parks its own non-layer weights, scoped to subphases
@@ -2753,7 +2806,7 @@ class LayerwiseOffloadableModuleMixin:
             if name not in managed and parameter.device.type != "cpu"
         ]
         holds = sum(p.numel() * p.element_size() for _, p in resident)
-        if holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
+        if not force and holds <= self._device_headroom_bytes() * PARK_SIGNIFICANCE:
             # There is room. Give back any host copies rather than hold them.
             # Restore any parameters still bound to placeholders first so we
             # do not leave weights as (1,) tensors after clearing the copies.
@@ -2765,8 +2818,34 @@ class LayerwiseOffloadableModuleMixin:
         with torch.inference_mode(False), torch.no_grad():
             for name, parameter in resident:
                 if name not in parked:
-                    parked[name] = parameter.detach().to("cpu", copy=True)
+                    parked[name] = self._host_park_copy(parameter)
                 parameter.data = self._park_placeholder(parameter)
+
+    def _should_pin_parked_weights(self) -> bool:
+        if (
+            not self.pin_parked_non_layer_weights
+            or current_platform.is_mps()
+            or not torch.cuda.is_available()
+        ):
+            return False
+        return any(
+            manager.pin_cpu_memory for manager in self.layerwise_offload_managers
+        )
+
+    def _host_park_copy(self, parameter: torch.Tensor) -> torch.Tensor:
+        host = parameter.detach().to("cpu", copy=True)
+        if not self._should_pin_parked_weights():
+            return host
+        if host.is_pinned:
+            return host
+        try:
+            return host.pin_memory()
+        except RuntimeError as exc:
+            logger.warning(
+                "Could not pin parked non-layer weights (%s); restore stays synchronous",
+                exc,
+            )
+            return host
 
     def _device_headroom_bytes(self) -> int:
         """What an allocation could get without the allocator growing its pool.
@@ -2803,17 +2882,28 @@ class LayerwiseOffloadableModuleMixin:
             return
         device = current_platform.get_local_torch_device()
         parameters = dict(self.named_parameters())
+        if all(
+            (parameter := parameters.get(name)) is not None
+            and parameter.device == device
+            and parameter.shape == host_tensor.shape
+            for name, host_tensor in parked.items()
+        ):
+            return
+        issued_async = False
         with torch.inference_mode(False), torch.no_grad():
             for name, host_tensor in parked.items():
                 parameter = parameters.get(name)
                 if parameter is None:
                     continue
-                # The parked copy is pageable, so this transfer stages through
-                # the driver's own pinned buffer and is synchronous whatever is
-                # asked for. Pinning it instead would make the copy async, at
-                # the price of host memory the kernel can never reclaim -- the
-                # wrong trade on the hosts this path exists for.
-                parameter.data = host_tensor.to(device)
+                # Pinned host copies DMA directly. Pageable copies still stage
+                # through the driver's bounce buffer and stay synchronous.
+                if host_tensor.is_pinned:
+                    parameter.data = host_tensor.to(device, non_blocking=True)
+                    issued_async = True
+                else:
+                    parameter.data = host_tensor.to(device)
+        if issued_async and torch.cuda.is_available():
+            torch.cuda.current_stream(device).synchronize()
 
     def _capture_mps_cpu_non_layer_weights(self) -> None:
         managed_names = {
@@ -3081,11 +3171,34 @@ class LayerwiseOffloadableModuleMixin:
             policies,
         )
 
+    def should_prefetch_layerwise_manager(
+        self, manager: LayerwiseOffloadManager
+    ) -> bool:
+        """Whether ``prepare_for_next_req`` should stream this manager's head."""
+        return manager.enabled
+
     def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
+            if not self.should_prefetch_layerwise_manager(manager):
+                continue
             manager.prepare_for_next_req(non_blocking=True)
+
+    def prefetch_layerwise_attr(
+        self, layers_attr: str, layer_idx: int, *, non_blocking: bool = True
+    ) -> None:
+        """Prefetch one layer of the named manager, if that stack is active."""
+        managers = self.layerwise_offload_managers
+        if not managers:
+            return
+        for manager in managers:
+            if not manager.enabled or manager.layers_attr_str != layers_attr:
+                continue
+            if not self.should_prefetch_layerwise_manager(manager):
+                return
+            manager.prefetch_layer(layer_idx, non_blocking=non_blocking)
+            return
 
     def disable_offload(self) -> None:
         """Disable layerwise offload: load all layers to GPU and remove hooks.
@@ -3586,99 +3699,3 @@ def configure_layerwise_offload_modules(
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
     return configured_component_names
-
-
-class LayerwiseUsageTracker:
-    """Temporary per-layer call counters for one calibration request.
-
-    Managers cannot provide this information when layerwise offload has not
-    been configured yet or was disabled by a resident placement. Observe the
-    declared layer groups directly and remove every hook before returning, so
-    ordinary serving requests pay no counter or hook-dispatch cost.
-    """
-
-    def __init__(
-        self,
-        modules: Mapping[str, object],
-        *,
-        stage_name_provider: Callable[[], str | None] | None = None,
-    ) -> None:
-        self._handles: list[Any] = []
-        self._counts: dict[str, dict[str, list[int]]] = {}
-        self._counts_by_stage: dict[str, dict[str, dict[str, list[int]]]] = {}
-        self._stage_name_provider = stage_name_provider
-        for component_name, module in modules.items():
-            if not isinstance(module, LayerwiseOffloadableModuleMixin):
-                continue
-            named_modules = dict(module.named_modules())
-            component_counts: dict[str, list[int]] = {}
-            for layer_name in module.layer_names:
-                layers = named_modules.get(layer_name)
-                if not isinstance(layers, (torch.nn.ModuleList, torch.nn.Sequential)):
-                    continue
-                counts = [0] * len(layers)
-                if not counts:
-                    continue
-                component_counts[layer_name] = counts
-                for layer_index, layer in enumerate(layers):
-
-                    def record_use(
-                        _module,
-                        _inputs,
-                        *,
-                        target_counts=counts,
-                        target_index=layer_index,
-                        target_component_name=component_name,
-                        target_layer_name=layer_name,
-                        target_layer_count=len(layers),
-                    ) -> None:
-                        target_counts[target_index] += 1
-                        if self._stage_name_provider is None:
-                            return
-                        stage_name = self._stage_name_provider()
-                        if stage_name is None:
-                            return
-                        stage_counts = self._counts_by_stage.setdefault(stage_name, {})
-                        component_stage_counts = stage_counts.setdefault(
-                            target_component_name, {}
-                        )
-                        layer_stage_counts = component_stage_counts.setdefault(
-                            target_layer_name, [0] * target_layer_count
-                        )
-                        layer_stage_counts[target_index] += 1
-
-                    self._handles.append(layer.register_forward_pre_hook(record_use))
-            if component_counts:
-                self._counts[component_name] = component_counts
-
-    def finish(self) -> dict[str, dict[str, tuple[int, ...]]]:
-        counts, _ = self.finish_with_stages()
-        return counts
-
-    def finish_with_stages(
-        self,
-    ) -> tuple[
-        dict[str, dict[str, tuple[int, ...]]],
-        dict[str, dict[str, dict[str, tuple[int, ...]]]],
-    ]:
-        for handle in self._handles:
-            handle.remove()
-        self._handles.clear()
-        counts = {
-            component_name: {
-                layer_name: tuple(counts)
-                for layer_name, counts in component_counts.items()
-            }
-            for component_name, component_counts in self._counts.items()
-        }
-        counts_by_stage = {
-            stage_name: {
-                component_name: {
-                    layer_name: tuple(counts)
-                    for layer_name, counts in component_counts.items()
-                }
-                for component_name, component_counts in stage_counts.items()
-            }
-            for stage_name, stage_counts in self._counts_by_stage.items()
-        }
-        return counts, counts_by_stage
