@@ -517,9 +517,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
             send=recovery_sent.append,
             fan_out=4,
         )
-        manager.update_active_ranks(
-            ActiveRanksOutput(status=[True, True, False, True])
-        )
+        manager.update_active_ranks(ActiveRanksOutput(status=[True, True, False, True]))
 
         task = asyncio.create_task(
             manager.observe_elastic_ep_membership(
