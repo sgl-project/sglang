@@ -727,22 +727,31 @@ class InternVLChatModel(nn.Module):
                 ("gate_up_proj", "gate_proj", 0),
                 ("gate_up_proj", "up_proj", 1),
             ]
-        elif "GptOssForCausalLM" in self.config.llm_config.architectures:
+        elif self.config.llm_config.architectures[0] == "GptOssForCausalLM":
             # GPT-OSS has its own bf16/mxfp4/quark loader; the loop below
             # only sees the vision model and projector weights.
             stacked_params_mapping = []
             other_weights = []
+            language_weights = []
+            # Split eagerly so the vision/projector weights are complete no
+            # matter how much of its iterator the language loader consumes.
+            for name, loaded_weight in weights:
+                if name.startswith("language_model."):
+                    language_weights.append(
+                        (name[len("language_model.") :], loaded_weight)
+                    )
+                else:
+                    other_weights.append(
+                        (name, _own_if_runai_streamed(loaded_weight))
+                    )
 
-            def language_model_weights():
-                for name, loaded_weight in weights:
-                    if name.startswith("language_model."):
-                        yield name[len("language_model.") :], loaded_weight
-                    else:
-                        other_weights.append(
-                            (name, _own_if_runai_streamed(loaded_weight))
-                        )
-
-            self.language_model.load_weights(language_model_weights())
+            language_iter = iter(language_weights)
+            self.language_model.load_weights(language_iter)
+            if next(language_iter, None) is not None:
+                raise RuntimeError(
+                    "GptOssForCausalLM.load_weights did not consume all "
+                    "language model weights"
+                )
             weights = other_weights
 
         params_dict = dict(self.named_parameters())
