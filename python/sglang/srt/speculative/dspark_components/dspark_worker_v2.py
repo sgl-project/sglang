@@ -270,6 +270,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
         )
         self.num_folded_verify_ids_steps = 0
+        self.num_relayed_in_graph_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
         )
@@ -379,6 +380,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
                 defer_context_kv=self._defer_context_kv_eligible(
                     static_epilogue_supported
+                ),
+                post_fold=(
+                    static_epilogue_supported
+                    and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
@@ -1117,6 +1122,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 chain_stride=self.verify_num_draft_tokens,
             )
 
+        relay = self._future_relay_in_graph(
+            run_compact=run_compact, folded_accept=folded_accept
+        )
+        if relay is not None:
+            relay.published_seq_lens = accept.new_seq_lens
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -1174,6 +1184,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=accept.bonus,
             new_seq_lens=accept.new_seq_lens,
         )
+        if relay is not None:
+            relay.published_bonus = next_draft_input.bonus_tokens
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
@@ -1189,6 +1201,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
         )
+
+    def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):
+        """The FutureMap relay this step's static graph already scattered into
+        (SGLANG_OPT_DSV41_DSPARK_POST_FOLD), or None for the host scatter."""
+        epilogue = self._verify_executor.verify_epilogue
+        if epilogue is None or run_compact or not folded_accept:
+            return None
+        relay = epilogue.future_relay
+        if relay is None or not relay.adopted:
+            return None
+        self.num_relayed_in_graph_steps += 1
+        if self.num_relayed_in_graph_steps == 1:
+            logger.info("Seq lens and bonus relayed by the verify graph (first step).")
+        return relay
 
     def _block_accept_lens(self, *, accept, folded_accept: bool, bs: int):
         in_graph = (

@@ -172,5 +172,80 @@ class TestInGraphBlockAcceptLens(unittest.TestCase):
         self.assertTrue(torch.equal(block, expected.to(torch.int32)))
 
 
+class TestPostFoldRelay(unittest.TestCase):
+    """SGLANG_OPT_DSV41_DSPARK_POST_FOLD: the static verify graph scatters new seq
+    lens and bonus into slot-indexed buffers the FutureMap adopts; the host skips
+    its scatter only for the exact tensors the worker marks as relayed."""
+
+    def tearDown(self):
+        from sglang.srt.managers import overlap_utils
+
+        overlap_utils._offered_relay = None
+
+    def test_graph_scatter_feeds_the_adopted_future_map(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            DsparkVerifyEpilogue,
+        )
+
+        pool_size = 10
+        epi = DsparkVerifyEpilogue(
+            max_bs=4,
+            verify_num_draft_tokens=6,
+            device="cpu",
+            tp_sync=type("S", (), {"sync": lambda self, site, t: None})(),
+            commit_ctx=SimpleNamespace(
+                resolve_req_to_token=lambda: torch.zeros(pool_size, 8)
+            ),
+            post_fold=True,
+        )
+        # A warmup scatter builds and offers the relay; the FutureMap adopts it
+        # (which resets it to -1 in CI) before any live step scatters.
+        epi._scatter_future_relay(torch.tensor([0, 0, 0, 0]), 4)
+        relay = epi.future_relay
+        self.assertIs(overlap_utils._offered_relay, relay)
+
+        fm = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        fm.needs_confidence_relay = False
+        fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
+        fm._adopt_relay(relay)
+        self.assertTrue(relay.adopted)
+
+        epi.new_seq_lens_buf.copy_(torch.tensor([50, 60, 7, 7]))
+        epi.bonus_buf.copy_(torch.tensor([500, 600, 9, 9]))
+        # Two live rows; the padded rows index the dummy slot 0.
+        epi._scatter_future_relay(torch.tensor([3, 7, 0, 0]), 4)
+        self.assertEqual(fm.new_seq_lens_buf[[3, 7]].tolist(), [50, 60])
+        self.assertEqual(fm.output_tokens_buf[[3, 7]].tolist(), [500, 600])
+
+        # The worker-marked tensor skips the host scatter, once.
+        marked = torch.tensor([-1, -1])
+        relay.published_seq_lens = marked
+        fm.publish(torch.tensor([3, 7]), marked)
+        self.assertEqual(fm.new_seq_lens_buf[[3, 7]].tolist(), [50, 60])
+        self.assertIsNone(relay.published_seq_lens)
+        # Any other tensor (an eager accept) still scatters.
+        fm.publish(torch.tensor([3, 7]), torch.tensor([51, 61]))
+        self.assertEqual(fm.new_seq_lens_buf[[3, 7]].tolist(), [51, 61])
+
+        fm._maybe_init_forward_bufs = lambda payload: None
+        fm._maybe_init_dsa_topk_indices_buf = lambda payload: None
+        fm.need_topk = fm.need_hidden_states = False
+        fm.draft_probs_buf = fm.dsa_topk_indices_buf = None
+        marked_bonus = torch.tensor([-1, -1])
+        relay.published_bonus = marked_bonus
+        fm.stash(
+            torch.tensor([3, 7]), overlap_utils.RelayPayload(bonus_tokens=marked_bonus)
+        )
+        self.assertEqual(fm.output_tokens_buf[[3, 7]].tolist(), [500, 600])
+        fm.stash(
+            torch.tensor([3, 7]),
+            overlap_utils.RelayPayload(bonus_tokens=torch.tensor([501, 601])),
+        )
+        self.assertEqual(fm.output_tokens_buf[[3, 7]].tolist(), [501, 601])
+
+
 if __name__ == "__main__":
     unittest.main()

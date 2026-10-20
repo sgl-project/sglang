@@ -576,6 +576,9 @@ class Envs:
     # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
     # and joins at the first draft KV store, overlapping the embedding.
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)
+    # DSpark static verify: the verify graph scatters new seq lens and the bonus into
+    # the FutureMap's slots; the host skips those scatters for folded accepts.
+    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing

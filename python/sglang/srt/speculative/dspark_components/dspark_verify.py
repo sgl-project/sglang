@@ -33,6 +33,10 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.overlap_utils import (
+    FutureRelayBuffers,
+    offer_future_relay_buffers,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -555,8 +559,13 @@ class DsparkVerifyEpilogue:
         accept_tail_min_bs: int = 1,
         accept_tail_max_bs: int = 0,
         defer_context_kv: bool = False,
+        post_fold: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
+        # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
+        # and the bonus into the FutureMap's slots; built at the first warmup.
+        self._post_fold = bool(post_fold)
+        self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs stage the draft-KV commit into
         # this, built at the first warmup; the next draft forward writes it.
         self._defer_context_kv = bool(defer_context_kv)
@@ -720,6 +729,8 @@ class DsparkVerifyEpilogue:
         self._commit_engram_history(
             candidates, forward_batch, self.commit_lens_buf[:bs], verify_lens
         )
+        if self._post_fold:
+            self._scatter_future_relay(forward_batch.req_pool_indices, bs)
         if not folds:
             return
         cache_loc = forward_batch.out_cache_loc
@@ -864,6 +875,24 @@ class DsparkVerifyEpilogue:
         )
         if torch.cuda.is_current_stream_capturing():
             self.folds_engram_commit = True
+
+    def _scatter_future_relay(self, req_pool_indices: torch.Tensor, bs: int) -> None:
+        """Unconditional: a step that takes another accept publishes and stashes on
+        the host afterwards. Padded rows index slot 0, every pool's dummy row."""
+        if self.commit_ctx is None:
+            return
+        if self.future_relay is None:
+            assert not (
+                torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            ), "the future relay is built at a warmup, before capture"
+            self.future_relay = FutureRelayBuffers(
+                req_pool_size=self.commit_ctx.resolve_req_to_token().shape[0],
+                device=req_pool_indices.device,
+            )
+            offer_future_relay_buffers(self.future_relay)
+        rows = req_pool_indices[:bs].to(torch.int64)
+        self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
+        self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
 
     def read_accept(self, bs: int) -> AcceptOuts:
         return AcceptOuts(
