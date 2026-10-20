@@ -130,12 +130,15 @@ class _DynamoCompatibleContribution:
 
 
 class _DynamoCompatibleDeclaredSum:
-    __slots__ = ("group",)
+    __slots__ = ("group", "complete_sum")
 
-    def __init__(self, group):
+    def __init__(self, group, complete_sum=None):
         self.group = group
+        self.complete_sum = complete_sum
 
     def complete(self, value):
+        if self.complete_sum is not None:
+            return self.complete_sum(value)
         from sglang.srt.layers.layer_boundary.layout import _sum_group
 
         return _sum_group(self.group).all_reduce(value)
@@ -158,14 +161,17 @@ class _DynamoCompatibleExitDecision:
 
 
 class _DynamoCompatibleUnreducedOutput:
-    __slots__ = ("partial", "group", "reduce_to_dp_local")
+    __slots__ = ("partial", "group", "reduce_to_dp_local", "complete_sum")
 
-    def __init__(self, partial, group=None, reduce_to_dp_local=None):
+    def __init__(self, partial, group=None, reduce_to_dp_local=None, complete_sum=None):
         self.partial = partial
         self.group = group
         self.reduce_to_dp_local = reduce_to_dp_local
+        self.complete_sum = complete_sum
 
     def complete(self):
+        if self.complete_sum is not None:
+            return self.complete_sum(self.partial)
         if self.reduce_to_dp_local is not None:
             return self.reduce_to_dp_local(self.partial)
         return self.group.all_reduce(self.partial)
@@ -622,7 +628,7 @@ def register_fake_ops(tp_size: int):
     def _(data, dim):
         return torch.cat([data] * tp_size, dim=dim)
 
-    @torch.library.register_fake(f"sgl_kernel::fused_experts_cpu")
+    @register_cpu_compile_fake("fused_experts_cpu")
     def _(
         hidden_states,
         w1,
@@ -2141,7 +2147,8 @@ class CPUGraphRunner:
             self.decode_dynamic_graphs[False] = self._compile_decode_dynamic_graph(
                 skip_cross_attention=False
             )
-        self._rewarm_decode_dynamic_graphs()
+        if self.capture_num_tokens:
+            self._rewarm_decode_dynamic_graphs()
         self._reset_mamba_cache_if_needed()
 
     def capture_prefill(self) -> None:

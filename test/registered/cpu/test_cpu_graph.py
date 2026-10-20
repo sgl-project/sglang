@@ -503,6 +503,36 @@ class TestCPUGraph(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(forward_batch))
 
+    def test_encoder_decoder_without_prefill_skips_decode_rewarm(self):
+        runner = CPUGraphRunner.__new__(CPUGraphRunner)
+        runner.is_generation = True
+        runner.enable_dynamic_graph = True
+        runner.enable_torch_compile = True
+        runner.is_encoder_decoder = True
+        runner.capture_num_tokens = []
+        runner.decode_dynamic_graphs = {}
+        runner.model_runner = SimpleNamespace(req_to_token_pool=SimpleNamespace())
+
+        with (
+            patch.object(
+                runner,
+                "_compile_decode_dynamic_graph",
+                side_effect=lambda skip_cross_attention: skip_cross_attention,
+            ) as compile_graph,
+            patch.object(runner, "_rewarm_decode_dynamic_graphs") as rewarm,
+        ):
+            runner._compile_decode_dynamic_graphs()
+
+        self.assertEqual(compile_graph.call_count, 2)
+        self.assertEqual(
+            [call.kwargs for call in compile_graph.call_args_list],
+            [
+                {"skip_cross_attention": True},
+                {"skip_cross_attention": False},
+            ],
+        )
+        rewarm.assert_not_called()
+
     def test_dynamic_prefill_graph_is_selected_for_uncaptured_tokens(self):
         runner = _make_cpu_graph_runner()
         runner.prefill_dynamic_graph = object()
