@@ -7,7 +7,7 @@ mod abort;
 pub mod grpc;
 pub mod sse;
 
-use abort::AbortOnDrop;
+pub use abort::AbortOnDrop;
 
 use crate::health::circuit_breaker::CircuitBreaker;
 use crate::server::error::ApiError;
@@ -211,6 +211,19 @@ impl Proxy {
             WireProtocol::Http1 => &self.default_client,
             WireProtocol::H2c => &self.h2c_client,
         }
+    }
+
+    pub fn abort_on_drop(
+        &self,
+        worker_url: &str,
+        protocol: WireProtocol,
+        headers: &HeaderMap,
+        rid: Option<&str>,
+    ) -> AbortOnDrop {
+        Url::parse(worker_url).map_or_else(
+            |_| AbortOnDrop::default(),
+            |worker| AbortOnDrop::new(self.client_for(protocol), &worker, headers, rid),
+        )
     }
 
     /// The client for side-channel admin traffic (e.g. `/flush_cache`), which

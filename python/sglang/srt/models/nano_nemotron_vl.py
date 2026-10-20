@@ -447,6 +447,9 @@ class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
             else None
         )
 
+    def prepare_for_forward(self, forward_batch: ForwardBatch) -> None:
+        self.language_model.prepare_for_forward(forward_batch)
+
     @property
     def lm_head(self):
         return self.language_model.lm_head

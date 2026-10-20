@@ -29,7 +29,6 @@ from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
-    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.dsv4.wo_a import MAX_M as _FUSED_WO_A_MAX_TOKENS
 from sglang.kernels.ops.attention.dsv4.wo_a import fused_rope_wo_a_bf16
@@ -38,6 +37,9 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
     wo_a_bf16_gemv,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
+)
+from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -90,7 +92,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
     should_skip_post_experts_all_reduce,
     uses_per_rank_fused_shared_slots,
 )
@@ -171,6 +173,11 @@ from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
     forward_layer_fused_boundary,
+)
+from sglang.srt.models.deepseek_v4_replay_tail import (
+    DecoderReplayTail,
+    bcg_tail_kv_store,
+    in_replay_tail_graph,
 )
 from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
 from sglang.srt.models.utils import WeightsMapper
@@ -820,7 +827,17 @@ def deepseek_v4_low_ratio_sources(layer, x, q_lora, positions) -> None:
     )
 
 
-bcg_deepseek_v4_low_ratio_sources = eager_on_graph(True)(deepseek_v4_low_ratio_sources)
+def _low_ratio_sources_capture_stub(layer, x, q_lora, positions) -> None:
+    # A decoder tail graph's capture pass hands the break activations its
+    # segments never computed; the indexer would select candidate blocks from
+    # them and index pages past the live context. Its replay runs the body.
+    if not in_replay_tail_graph():
+        deepseek_v4_low_ratio_sources(layer, x, q_lora, positions)
+
+
+bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
+    deepseek_v4_low_ratio_sources, capture_stub=_low_ratio_sources_capture_stub
+)
 
 
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1019,7 +1036,7 @@ class MqaAttentionBase(nn.Module):
             parallel_group="attn_tp",
         )
 
-        from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
+        from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 
         rope_theta, rope_scaling = get_rope_config(config)
         self.rope_scaling = dict(rope_scaling) if rope_scaling else None
@@ -1329,7 +1346,7 @@ class MQALayer(MqaAttentionBase):
         )
         self.mega_cos_sin_cache = None
         if self.use_mega_attention:
-            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            from sglang.kernels.ops.attention.dsv4.rope import (
                 precompute_cos_sin_table,
             )
 
@@ -1539,7 +1556,7 @@ class MQALayer(MqaAttentionBase):
                 is_batch_invariant_mode_enabled()
                 or get_exec().deterministic.enable_deterministic_inference
             ):
-                from sglang.kernels.ops.layernorm.mxfp8_epilogue import rmsnorm_mxfp8
+                from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import rmsnorm_mxfp8
 
                 y, quant, scale = rmsnorm_mxfp8(
                     q, self.q_norm.weight, self.q_norm.variance_epsilon
@@ -2029,7 +2046,7 @@ class MQALayer(MqaAttentionBase):
         use_cp = is_cp_active(forward_batch)
         kv: Optional[torch.Tensor]
 
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -2305,6 +2322,10 @@ class MQALayer(MqaAttentionBase):
                     positions=global_positions,
                 )
                 kv = None
+            elif in_replay_tail_graph():
+                assert not fuse_q_rope
+                bcg_tail_kv_store(self, x_linear, positions, qkv_a)
+                kv = None
             else:
                 self._compute_kv_to_cache(
                     x_linear,
@@ -2324,7 +2345,10 @@ class MQALayer(MqaAttentionBase):
             if (
                 forward_batch.forward_mode.is_extend()
                 and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                and (
+                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
+                    or in_replay_tail_graph()
+                )
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -2434,7 +2458,7 @@ class MQALayer(MqaAttentionBase):
                 )
             )
         )
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
         )
@@ -3273,7 +3297,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        from sglang.kernels.ops.layernorm.mhc import hc_combine
+        from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
         # y is the post-norm activation fed into the MoE. Allocate it in the
         # symmetric memory pool so the downstream all-reduce uses the low-latency
@@ -3284,7 +3308,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
-            y = hc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
+            y = mhc_combine(x_flat, pre.squeeze(1), self.hc_mult, dtype)
         return y, post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
@@ -3532,6 +3556,8 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
+    # Class-level default for instances built without running __init__.
+    decoder_replay_tail: Optional[DecoderReplayTail] = None
 
     def __init__(
         self,
@@ -3698,6 +3724,7 @@ class DeepseekV4Model(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         )
+        self.decoder_replay_tail = DecoderReplayTail.maybe_create(self)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -3831,6 +3858,15 @@ class DeepseekV4Model(nn.Module):
                 ),
                 in_graph=tail_in_graph,
             )
+        use_tail_graph, tail_graph_dp_rows = False, None
+        if self.decoder_replay_tail is not None:
+            use_tail_graph, tail_graph_dp_rows = self.decoder_replay_tail.plan(
+                tail,
+                forward_batch=forward_batch,
+                num_tokens=input_ids.shape[0],
+                tail_in_graph=tail_in_graph,
+                late_dp_counts=late_dp_counts,
+            )
         tail_sentinel = positions.new_zeros((1,)) if tail_in_graph else None
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -3845,7 +3881,10 @@ class DeepseekV4Model(nn.Module):
             if _is_cuda:
                 layer = self.layers[i]
                 if (
-                    (tail is not None and i == self.late_layer_start)
+                    (
+                        (tail is not None or use_tail_graph)
+                        and i == self.late_layer_start
+                    )
                     or layer.engram is not None
                     or (capture_dspark and i in self.dspark_layers_to_capture)
                 ):
@@ -3877,6 +3916,31 @@ class DeepseekV4Model(nn.Module):
                     # against the persistent index buffers.
                     tail_sentinel = bcg_deepseek_v4_enter_late_layer_tail(tail_sentinel)
                     saved_full = attn_backend.prefill_graph_late_layer_saved
+                    if (
+                        self.decoder_replay_tail is not None
+                        and self.decoder_replay_tail.breaks_out_of_prefill_graph(
+                            tail, num_tokens=input_ids.shape[0]
+                        )
+                    ):
+                        residual, pre, aux = (
+                            self.decoder_replay_tail.run_in_prefill_graph(
+                                state=state,
+                                positions=positions,
+                                input_ids=input_ids,
+                                input_ids_global=input_ids_global,
+                                capture_dspark=capture_dspark,
+                                block_rows=tail.token_indices.shape[0],
+                                source_kv_layer_id=(
+                                    self.late_layer_start
+                                    if self.tail_writes_source_kv
+                                    else None
+                                ),
+                            )
+                        )
+                        dspark_aux_hidden_states.extend(aux)
+                        residual_batch.clear(forward_batch)
+                        bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
+                        return residual, pre, tail
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
@@ -3890,6 +3954,33 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+                if use_tail_graph:
+                    residual, pre, aux = self.decoder_replay_tail.run(
+                        state=state,
+                        positions=positions,
+                        input_ids=input_ids,
+                        input_ids_global=input_ids_global,
+                        forward_batch=forward_batch,
+                        capture_dspark=capture_dspark,
+                        dp_rows=tail_graph_dp_rows,
+                    )
+                    dspark_aux_hidden_states.extend(aux)
+                    residual_batch.clear(forward_batch)
+                    attn_backend.exit_late_layer_tail(saved_full, forward_batch)
+                    return residual, pre, tail
+            if use_tail_graph and tail is None and i == self.late_layer_start:
+                residual, pre, aux = self.decoder_replay_tail.run_idle(
+                    state=state,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
+                    capture_dspark=capture_dspark,
+                    dp_rows=tail_graph_dp_rows,
+                )
+                dspark_aux_hidden_states.extend(aux)
+                residual_batch.clear(forward_batch)
+                return residual, pre, None
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
@@ -4275,9 +4366,9 @@ class DeepseekV4Model(nn.Module):
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import hc_combine
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            hidden_states = hc_combine(
+            hidden_states = mhc_combine(
                 pre_hc_head.float(), last_pre, self.hc_mult, hidden_states.dtype
             )
         else:
@@ -4336,7 +4427,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # batched/contiguous-load rope kernels (faster on gfx95; .
         # Module-level toggles default OFF; flipped True here for DSV4
         if _is_hip:
-            from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
+            from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
             from sglang.srt.layers.quantization.fp8_utils import (
                 set_dense_mxscale,
                 set_force_ck_w8a8,
@@ -4358,7 +4449,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.vision = None
         if (
             config.model_type == "deepseek_v41"
@@ -4574,11 +4666,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        return hf_config.n_shared_experts or 0
 
     def prepare_language_model_inputs(
         self,
