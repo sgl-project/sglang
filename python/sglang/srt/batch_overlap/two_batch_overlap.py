@@ -1137,13 +1137,22 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
 
 
 def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
-    value_a = output_a[name]
-    value_b = output_b[name]
+    return _model_forward_tbo_merge_values(
+        output_a[name],
+        output_b[name],
+        output_a["forward_batch"],
+        output_b["forward_batch"],
+        original_len,
+    )
+
+
+def _model_forward_tbo_merge_values(value_a, value_b, batch_a, batch_b, original_len):
+    """Write each child's rows back to its range of the parent batch."""
     assert (value_a is None) == (value_b is None)
     if value_a is None:
         return None
-    s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-    s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+    s0, t0 = batch_a.tbo_parent_token_range
+    s1, t1 = batch_b.tbo_parent_token_range
     res = torch.zeros(
         (original_len, *value_a.shape[1:]),
         dtype=value_a.dtype,
