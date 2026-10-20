@@ -21,7 +21,12 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=180, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=180,
+    stage="extra-b",
+    # Direct GPU transfers require an RDMA-capable runner, even for TP=1.
+    runner_config="4-gpu-h100",
+)
 
 _MODEL_PATH = "yujiepan/kimi-linear-tiny-random"
 
