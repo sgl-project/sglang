@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import (
     eagle_post_verify_graphs,
+    eagle_utils,
     eagle_worker_common,
     eagle_worker_v2,
     spec_utils,
@@ -32,7 +33,7 @@ from sglang.srt.speculative.eagle_post_verify_graphs import (
     EaglePostVerifyGraphs,
     simulated_acc_len_generator,
 )
-from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_utils import compact_verify_max_top_k, eagle_sample
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -356,6 +357,69 @@ class TestPostVerifyGraphs(CustomTestCase):
         before = [4 + int(torch.multinomial(probs, num_samples=1)) for _ in range(32)]
         self.assertEqual(drawn, before)
         self.assertTrue(torch.equal(torch.get_rng_state(), state))
+
+    def test_compact_top_k_sampling_takes_only_batches_of_finite_top_k(self):
+        """With SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING a verify samples on the
+        top-k support when every request has a finite top-k within the compact
+        limit, in the post-verify graphs (keyed apart from the dense branch, whose
+        sampling differs) and the eager verify alike; without it nothing changes."""
+
+        def batch(*top_ks):
+            reqs = [
+                SimpleNamespace(sampling_params=SimpleNamespace(top_k=k))
+                for k in top_ks
+            ]
+            return SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY, reqs=reqs)
+
+        def verify_kwargs(verify_batch):
+            worker = _worker(switch=True)
+            with patch.object(eagle_worker_v2, "run_eagle_verify") as run:
+                worker.verify(batch=verify_batch)
+            kwargs = run.call_args.kwargs
+            return kwargs["uno_target_max_top_k"], kwargs["sparse_bonus_argmax"]
+
+        limit = SimpleNamespace(_SPARSE_TOP_K_LIMIT=128)
+        with patch.dict("sys.modules", {"sglang.srt.speculative.uno_utils": limit}):
+            with patch.object(eagle_utils, "_COMPACT_VERIFY_SAMPLING", True):
+                self.assertEqual(compact_verify_max_top_k(batch(20, 64)), 64)
+                for dense in ((20, 1 << 30), (20, 1), (129,), ()):
+                    with self.subTest(top_ks=dense):
+                        self.assertIsNone(compact_verify_max_top_k(batch(*dense)))
+                self.assertEqual(verify_kwargs(batch(20)), (20, True))
+            self.assertIsNone(compact_verify_max_top_k(batch(20, 64)))
+            self.assertEqual(verify_kwargs(batch(20)), (None, False))
+
+        graphs = EaglePostVerifyGraphs(
+            target_worker=_target_worker(),
+            simulated_acc_len_rng=simulated_acc_len_generator(0),
+        )
+        verify_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=torch.zeros(1),
+            sampling_info=SimpleNamespace(
+                acc_additive_penalties=None,
+                acc_scaling_penalties=None,
+                logit_bias=None,
+                sampling_seed=None,
+                need_min_p_sampling=False,
+                has_watermark_candidates=False,
+                is_all_greedy=False,
+                need_top_k_sampling=True,
+                need_top_p_sampling=False,
+            ),
+            mamba_track_indices=None,
+            has_grammar=False,
+            hisparse_coordinator=None,
+        )
+        verify_input = SimpleNamespace(
+            topk=1, draft_probs=None, draft_token_num=7, max_tree_depth=7
+        )
+        logits = SimpleNamespace(next_token_logits=torch.zeros((7, 8)))
+        keys = {
+            graphs._key(verify_batch, verify_input, logits, True, max_top_k)
+            for max_top_k in (20, None)
+        }
+        self.assertEqual(len(keys), 2)
 
     def test_one_launch_load_stages_what_the_per_dtype_copies_stage(self):
         """With SGLANG_Q35MF_MKH_N3C a round's inputs and its forced length go to

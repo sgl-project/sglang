@@ -1490,6 +1490,12 @@ class Envs:
     # reads the injected acceptance length from its pinned host slot (bit-identical); needs
     # SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.
     SGLANG_Q35MF_MKH_N3C = EnvBool(False)
+    # A topk-1 chain against TRT-LLM MHA, which masks the draft window itself, is built
+    # with build_chain_tree instead of a full-context tree mask.
+    SGLANG_Q35MF_EDGE_CHAIN_TREE = EnvBool(False)
+    # A verify whose requests all sample with a finite top-k within the compact limit
+    # samples on that support (eagle_sample's compact branch), graphed or eager.
+    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)

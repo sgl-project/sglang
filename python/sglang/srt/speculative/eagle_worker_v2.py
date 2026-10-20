@@ -95,6 +95,7 @@ from sglang.srt.speculative.eagle_post_verify_graphs import (
 )
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
+    compact_verify_max_top_k,
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
@@ -1955,6 +1956,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+        # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
+        # every request allows it, in the post-verify graphs and the eager verify
+        max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -1969,6 +1973,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            uno_target_max_top_k=max_top_k,
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
+            sparse_bonus_argmax=max_top_k is not None,
         )

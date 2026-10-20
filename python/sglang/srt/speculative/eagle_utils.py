@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -50,6 +51,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_COMPACT_VERIFY_SAMPLING = envs.SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING.get()
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +522,20 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
+    """The support for eagle_sample's compact top-k branch under
+    SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING, or None for the dense branch: every
+    request must sample with a finite top-k within the compact limit."""
+    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+        return None
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    top_ks = [req.sampling_params.top_k for req in batch.reqs]
+    if not top_ks or any(k <= 1 or k > _SPARSE_TOP_K_LIMIT for k in top_ks):
+        return None
+    return max(top_ks)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -531,13 +547,16 @@ def eagle_sample(
     watermark_full_mask: bool = True,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
+    sparse_bonus_argmax: bool = False,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information). simulated_acc_len: the injected
     acceptance length already drawn on the host, as a device int64 [1], so a CUDA
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
-    it from here otherwise (the global CPU RNG when None).
+    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
+    injected acceptance's bonus is the target argmax on the compact top-k branch
+    too, as on the dense one.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -831,7 +850,7 @@ def eagle_sample(
                 )
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
-            if target_predict is None:
+            if target_predict is None or sparse_bonus_argmax:
                 target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
                     bs, verify_input.draft_token_num
                 )

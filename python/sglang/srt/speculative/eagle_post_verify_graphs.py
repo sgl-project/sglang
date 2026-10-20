@@ -58,19 +58,23 @@ class EaglePostVerifyGraphs:
         verify_input: Any,
         logits_output: Any,
         can_run_cuda_graph: bool,
+        max_top_k: Optional[int] = None,
     ) -> Optional[tuple]:
         """(predict, accept_lens, accept_index, new_seq_lens, bonus_tokens,
         draft-extend inputs) from the post-verify graphs, or None when SGLang's
-        sampling and commit run eagerly."""
+        sampling and commit run eagerly. max_top_k: the compact top-k branch's
+        support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
-        key = self._key(batch, verify_input, logits_output, can_run_cuda_graph)
+        key = self._key(
+            batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
+        )
         if key is None:
             return None
         return self._graphs.run(
             key=key,
             inputs=_post_verify_inputs(batch, verify_input),
             make_slot=lambda staged: self._make_slot(
-                staged, batch, verify_input, logits_output
+                staged, batch, verify_input, logits_output, max_top_k
             ),
             sim_max_len=verify_input.max_tree_depth,
         )
@@ -86,6 +90,7 @@ class EaglePostVerifyGraphs:
         verify_input: Any,
         logits_output: Any,
         can_run_cuda_graph: bool,
+        max_top_k: Optional[int] = None,
     ) -> Optional[tuple]:
         from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
 
@@ -111,6 +116,7 @@ class EaglePostVerifyGraphs:
             bool(info.is_all_greedy),
             bool(info.need_top_k_sampling),
             bool(info.need_top_p_sampling),
+            max_top_k,
             SIMULATE_ACC_LEN > 0,
             batch.mamba_track_indices is not None,
             verify_input.draft_token_num,
@@ -125,6 +131,7 @@ class EaglePostVerifyGraphs:
         batch: ScheduleBatch,
         verify_input: Any,
         logits_output: Any,
+        max_top_k: Optional[int] = None,
     ) -> SimpleNamespace:
         from sglang.srt.runtime_context import mamba_track_grid
 
@@ -136,6 +143,7 @@ class EaglePostVerifyGraphs:
             is_all_greedy=bool(info.is_all_greedy),
             need_top_k=bool(info.need_top_k_sampling),
             need_top_p=bool(info.need_top_p_sampling),
+            max_top_k=max_top_k,
             logits=logits_output.next_token_logits,
             staged=staged,
             device=batch.device,
@@ -237,7 +245,9 @@ def _sample(slot: SimpleNamespace) -> tuple:
         verify_view,
         batch_view,
         SimpleNamespace(next_token_logits=slot.logits),
+        uno_target_max_top_k=slot.max_top_k,
         simulated_acc_len=staged.get("sim_accept_len"),
+        sparse_bonus_argmax=slot.max_top_k is not None,
     )
 
 
