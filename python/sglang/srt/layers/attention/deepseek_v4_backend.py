@@ -125,7 +125,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_flags,
     get_parallel,
     get_platform,
     get_spec,
@@ -4213,42 +4212,6 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
-    def _log_shared_compressed_kv(
-        self,
-        event: str,
-        layer_id: int,
-        compress_ratio: int,
-        reason: str,
-        *,
-        source_layer: Optional[int] = None,
-        compressed_tokens: Optional[int] = None,
-        swa_tokens: Optional[int] = None,
-    ) -> None:
-        if not logger.isEnabledFor(logging.INFO):
-            return
-        phase = (
-            "capture_warmup" if get_flags().dp.capturing_prefill_graph else "runtime"
-        )
-        key = (phase, event, compress_ratio, reason)
-        emitted = getattr(self, "_shared_compressed_kv_log_emitted", None)
-        if emitted is None:
-            emitted = self._shared_compressed_kv_log_emitted = set()
-        if key in emitted:
-            return
-        emitted.add(key)
-        logger.info(
-            "DSV41_SHARED_KV event=%s phase=%s layer_id=%s source_layer=%s "
-            "ratio=%s compressed_tokens=%s swa_tokens=%s reason=%s",
-            event,
-            phase,
-            layer_id,
-            source_layer,
-            compress_ratio,
-            compressed_tokens,
-            swa_tokens,
-            reason,
-        )
-
     def _forward_prefill_sparse(
         self,
         q: torch.Tensor,
@@ -4288,13 +4251,6 @@ class DeepseekV4AttnBackend(
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
-            self._log_shared_compressed_kv(
-                "BYPASS",
-                layer_id,
-                compress_ratio,
-                "swa_only",
-                swa_tokens=cache.swa_token_ids.shape[0],
-            )
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
@@ -4334,36 +4290,6 @@ class DeepseekV4AttnBackend(
                 )
                 if source_key is not None:
                     gather.dequantized_source = source_key
-                    reason = (
-                        "source_refresh"
-                        if layer_id == source_key[0]
-                        else "source_or_workspace_changed"
-                    )
-                else:
-                    reason = (
-                        "cp_inactive"
-                        if compress_ratio in (1, 2)
-                        else "unsupported_ratio"
-                    )
-                self._log_shared_compressed_kv(
-                    "DEQUANT" if reuse_compressed else "BYPASS",
-                    layer_id,
-                    compress_ratio,
-                    reason,
-                    source_layer=source_key[0] if source_key is not None else None,
-                    compressed_tokens=n_compressed,
-                    swa_tokens=cache.swa_token_ids.shape[0],
-                )
-            else:
-                self._log_shared_compressed_kv(
-                    "HIT",
-                    layer_id,
-                    compress_ratio,
-                    "shared_source",
-                    source_layer=source_key[0],
-                    compressed_tokens=n_compressed,
-                    swa_tokens=cache.swa_token_ids.shape[0],
-                )
         dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
@@ -4469,7 +4395,6 @@ class DeepseekV4AttnBackend(
             sparse_mla_q8kv8_prefill_fwd,
         )
 
-        self._log_shared_compressed_kv("BYPASS", layer_id, compress_ratio, "q8kv8_path")
         q_flat = q.squeeze(1)
         if q_flat.ndim != 3:
             raise ValueError(
