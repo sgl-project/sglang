@@ -28,6 +28,7 @@ from transformers import AutoTokenizer
 os.environ["SGLANG_DEFAULT_THINKING"] = "false"
 os.environ["SGLANG_DSV4_REASONING_EFFORT"] = ""
 os.environ["SGLANG_DSV41_REASONING_EFFORT"] = ""
+os.environ["SGLANG_INKLING_DEFAULT_REASONING_EFFORT"] = ""
 
 from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -99,6 +100,7 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
         if server.chat_encoding_spec == "dsv41"
         else None
     )
+    server._spec_adapter = server._build_spec_adapter()
     server._tokenizer_auto_adds_specials = len(tokenizer.encode("")) > 0
     server._prompt_text_round_trip_is_lossy = server._probe_prompt_text_round_trip()
     server._chat_template_cache = OrderedDict()
@@ -163,8 +165,14 @@ def generate(fixture_path):
         except Exception as error:
             case["error"] = f"{type(error).__name__}: {error}"
             continue
+        # Inkling renders ids with tml-renderers' own tokenizer, not the recorded one.
+        prompt = (
+            tok.decode(ids)
+            if server.chat_encoding_spec == "inkling"
+            else "".join(tok.texts)
+        )
         case.update(
-            prompt="".join(tok.texts),
+            prompt=prompt,
             token_count=len(ids),
             token_sha256=hashlib.sha256(
                 b"".join(i.to_bytes(4, "little") for i in ids)

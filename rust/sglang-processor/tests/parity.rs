@@ -6,10 +6,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 use sglang_processor::dynamo_renderer::RenderedPrompt;
-use sglang_processor::dynamo_tokenizers::Tokenizer;
+use sglang_processor::dynamo_tokenizers::{FastTokenizer, Tokenizer};
 use sglang_processor::{
     ChatFormatter, ChatFormatterOptions, load_tokenizer, resolve_tokenizer_file,
     select_chat_formatter,
@@ -23,6 +24,7 @@ fn fixtures_match_sglang() {
         std::env::remove_var("SGLANG_DEFAULT_THINKING");
         std::env::remove_var("SGLANG_DSV4_REASONING_EFFORT");
         std::env::remove_var("SGLANG_DSV41_REASONING_EFFORT");
+        std::env::remove_var("SGLANG_INKLING_DEFAULT_REASONING_EFFORT");
     }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/parity");
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -70,7 +72,7 @@ fn check(fixture: &Value) {
 
 fn check_case(
     formatter: &ChatFormatter,
-    tokenizer: Option<&Tokenizer>,
+    tokenizer: Option<&Tokenizers>,
     bos: &Value,
     case: &Value,
 ) -> Result<(), String> {
@@ -125,22 +127,36 @@ fn formatter(model: &str, fixture: &Value) -> ChatFormatter {
     formatter.unwrap_or_else(|| panic!("{model}: {error:?}"))
 }
 
+/// The checkpoint's tokenizer, and one that encodes segmented prompts.
+struct Tokenizers {
+    plain: Tokenizer,
+    segmented: Tokenizer,
+}
+
 /// The pinned tokenizer when it is in the HF cache; otherwise say token ids are skipped.
-fn cached_tokenizer(model: &str, revision: &str) -> Option<Tokenizer> {
+fn cached_tokenizer(model: &str, revision: &str) -> Option<Tokenizers> {
     let Some(file) = resolve_tokenizer_file(model, Some(revision)) else {
         eprintln!("{model}@{revision} is not in the HF cache: token ids not checked");
         return None;
     };
-    Some(load_tokenizer(Some(&file), None, true).unwrap())
+    let plain = load_tokenizer(Some(&file), None, true).unwrap();
+    // Hugging Face's backend has no segmented encoding; fastokens reads the same tokenizer.json.
+    let segmented = if file.ends_with(".json") {
+        Tokenizer::from(Arc::new(FastTokenizer::from_file(&file).unwrap()))
+    } else {
+        plain.clone()
+    };
+    Some(Tokenizers { plain, segmented })
 }
 
 /// `serving_chat._append_assistant_prefix_to_prompt_ids`: the continuation is
-/// encoded on its own, minus a leading BOS. Segmented prompts (Kimi K3) allow
-/// special tokens only where the checkpoint's encoder does.
-fn encode(tokenizer: &Tokenizer, prompt: &RenderedPrompt, prefix: &str, bos: &Value) -> Vec<u32> {
-    let ids = |text: &str| tokenizer.encode(text).unwrap().token_ids().to_vec();
+/// encoded on its own, minus a leading BOS. Segmented prompts (Kimi K3, Inkling)
+/// allow special tokens only where the checkpoint's encoder does.
+fn encode(tokenizers: &Tokenizers, prompt: &RenderedPrompt, prefix: &str, bos: &Value) -> Vec<u32> {
+    let ids = |text: &str| tokenizers.plain.encode(text).unwrap().token_ids().to_vec();
     let mut out = match prompt.encode_segments() {
-        Some(segments) => tokenizer
+        Some(segments) => tokenizers
+            .segmented
             .encode_segments(&segments)
             .unwrap()
             .token_ids()

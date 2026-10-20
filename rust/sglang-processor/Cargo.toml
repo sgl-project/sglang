@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 default = ["parser", "render", "tokenizer"]
 parser = ["dep:dynamo-parsers", "dep:dynamo-protocols", "dep:regex", "dep:uuid"]
-render = ["dep:dynamo-protocols", "dep:dynamo-renderer", "dep:minijinja"]
+render = ["dep:dynamo-protocols", "dep:dynamo-renderer", "dep:minijinja", "dep:ryu"]
 tokenizer = ["dep:dynamo-tokenizers"]
 # OpenAI endpoints served through `/generate`.
 openai = ["dep:regex", "dep:uuid"]
@@ -28,6 +28,7 @@ dynamo-protocols = { version = "7.0.0", optional = true }
 dynamo-renderer = { version = "7.1.1", optional = true }
 hf-hub = { version = "0.4", default-features = false }
 regex = { version = "1", optional = true }
+ryu = { version = "1", optional = true }
 uuid = { workspace = true, optional = true }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = true }
 

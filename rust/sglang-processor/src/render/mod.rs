@@ -24,8 +24,8 @@ pub use self::loader::load_chat_formatter;
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
-    render_deepseek_v4, render_deepseek_v41, render_glm53, render_kimi_k3, render_qwen38,
-    takes_content_parts,
+    render_deepseek_v4, render_deepseek_v41, render_glm53, render_inkling, render_kimi_k3,
+    render_qwen38, takes_content_parts,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
@@ -64,6 +64,8 @@ pub enum ChatFormatter {
         /// SGLang hands the template content parts lists rather than strings.
         content_parts: bool,
     },
+    /// Inkling as SGLang renders it through tml-renderers' TMLv0 renderer.
+    Inkling,
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -109,22 +111,8 @@ impl ChatFormatter {
                     })
             }
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
-                // Typed messages serialize straight to JSON, skipping minijinja.
-                let messages = match request.typed_messages() {
-                    Some(messages) => serde_json::to_value(messages),
-                    None => serde_json::to_value(request.messages()),
-                }
-                .map_err(|error| TemplateError::Renderer {
-                    message: format!("failed to serialize messages: {error}"),
-                })?;
-                let mut body = serde_json::json!({
-                    "tools": request.tools(),
-                    "reasoning_effort": request.reasoning_effort(),
-                    "chat_template_kwargs": request.chat_template_args(),
-                    "continue_final_message": !request.should_add_generation_prompt(),
-                });
-                body["messages"] = messages;
-                let (prompt, prefix) = self.render_request(body, &HashMap::new())?;
+                let (prompt, prefix) =
+                    self.render_request(request_body(request)?, &HashMap::new())?;
                 let prompt = prompt.into_text();
                 // SGLang tokenizes the prefix on its own and drops its leading BOS.
                 let prefix = prefix.strip_prefix(tokens::BOS).unwrap_or(&prefix);
@@ -136,6 +124,17 @@ impl ChatFormatter {
                     RenderedSegment::new(prefix, true),
                 ]))
             }
+            ChatFormatter::Inkling => {
+                let mut body = request_body(request)?;
+                body["tool_choice"] =
+                    serde_json::to_value(request.tool_choice()).map_err(|error| {
+                        TemplateError::Renderer {
+                            message: format!("failed to serialize tool_choice: {error}"),
+                        }
+                    })?;
+                self.render_request(body, &HashMap::new())
+                    .map(|(prompt, _)| prompt)
+            }
             ChatFormatter::Legacy(formatter) => formatter.render(request).map(RenderedPrompt::text),
         }
     }
@@ -144,8 +143,8 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3 and Qwen3.8 render
-    /// this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, Qwen3.8 and Inkling
+    /// render this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
@@ -166,6 +165,7 @@ impl ChatFormatter {
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
+            ChatFormatter::Inkling => render_inkling(request, default_kwargs),
             _ => Err("this formatter renders through render_prompt".into()),
         }
         .map_err(|message| TemplateError::Renderer { message })
@@ -183,7 +183,8 @@ impl ChatFormatter {
             | ChatFormatter::DeepSeekV41
             | ChatFormatter::Glm53(_)
             | ChatFormatter::KimiK3
-            | ChatFormatter::Qwen38 { .. } => None,
+            | ChatFormatter::Qwen38 { .. }
+            | ChatFormatter::Inkling => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -217,6 +218,9 @@ impl ChatFormatter {
             ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
+            ChatFormatter::Inkling => ThinkingTemplates::always()
+                .for_request(tools_enabled)
+                .apply(args, named_tool_choice),
             ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41 => {
                 let enabled = deepseek_v4_thinking(
                     &serde_json::json!({ "chat_template_kwargs": args }),
@@ -231,6 +235,26 @@ impl ChatFormatter {
             ChatFormatter::Legacy(_) => None,
         }
     }
+}
+
+/// The SGLang request body a typed request stands for.
+fn request_body(request: &dyn OAIChatLikeRequest) -> Result<Value, TemplateError> {
+    // Typed messages serialize straight to JSON, skipping minijinja.
+    let messages = match request.typed_messages() {
+        Some(messages) => serde_json::to_value(messages),
+        None => serde_json::to_value(request.messages()),
+    }
+    .map_err(|error| TemplateError::Renderer {
+        message: format!("failed to serialize messages: {error}"),
+    })?;
+    let mut body = serde_json::json!({
+        "tools": request.tools(),
+        "reasoning_effort": request.reasoning_effort(),
+        "chat_template_kwargs": request.chat_template_args(),
+        "continue_final_message": !request.should_add_generation_prompt(),
+    });
+    body["messages"] = messages;
+    Ok(body)
 }
 
 fn render_oai(
