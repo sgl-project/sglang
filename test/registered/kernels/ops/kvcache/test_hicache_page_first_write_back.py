@@ -60,6 +60,17 @@ def _token_indices_for_pages(
 
 
 def _pinned_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     from sglang.srt.mem_cache.pool_host.common import (
         ALLOC_MEMORY_FUNCS,
         alloc_with_pin_memory,
@@ -81,6 +92,17 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
 
 
 def _registered_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     return host_pool_cls(
         host_to_device_ratio=2.0,
         host_size=0,
@@ -125,7 +147,15 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         enable_memory_saver=False,
     )
     host_pool = _pinned_host_pool(
-        MHATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
+        MHATokenToKVPoolHost,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
+        layout="page_first",
     )
     assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
@@ -589,7 +619,13 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         )
         host_pool = _registered_host_pool(
             MHATokenToKVPoolHost,
-            device_pool=device_pool,
+            buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            write_back_staging=device_pool.hicache_write_back_staging,
             layout="page_first",
         )
         host_refs = [host_pool.k_data_refs[0], host_pool.v_data_refs[0]]

@@ -6,17 +6,11 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import (
-    CapabilityRequirement,
-    FormatSignature,
-    KernelBackend,
-    KernelSpec,
-)
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
 
-_CUDA = frozenset({CapabilityRequirement.CUDA})
 
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
 # never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
@@ -27,11 +21,7 @@ register_kernel(
         op="mamba.causal_conv1d_fwd",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_fwd",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True, description="causal depthwise conv1d forward (prefill)"
-        ),
-        description="Causal conv1d forward (sglang.kernels.jit).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -39,11 +29,7 @@ register_kernel(
         op="mamba.causal_conv1d_update",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.mamba.causal_conv1d:causal_conv1d_update",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True, description="causal depthwise conv1d update (decode)"
-        ),
-        description="Causal conv1d update (sglang.kernels.jit).",
+        capabilities=CUDA_ONLY,
     )
 )
 
@@ -122,7 +108,7 @@ register_kernel(
         op="mamba.fused_qwen4_short_conv_state",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_short_conv_state",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -130,7 +116,7 @@ register_kernel(
         op="mamba.fused_qwen4_verify_conv",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_verify_conv",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -138,7 +124,7 @@ register_kernel(
         op="mamba.fused_lfm_short_conv_prefill",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_prefill",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -146,7 +132,7 @@ register_kernel(
         op="mamba.fused_lfm_short_conv_decode",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.lfm_short_conv:fused_lfm_short_conv_decode",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
     )
 )
 
@@ -155,9 +141,16 @@ register_kernel(
         op="mamba.fill_track_conv_indices",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.sconv_tracking:fill_track_conv_indices",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            in_place=True, description="short-convolution checkpoint-window indices"
-        ),
+        capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.kda_prefill_track:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
     Flux3PrimsTsMethodMixin,
+    flux3_prims_ts_supports_lora,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_memory_usage_of_component,
@@ -53,6 +54,8 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
     def _reject_lora_on_packed_weights(self) -> None:
         super()._reject_lora_on_packed_weights()
+        if flux3_prims_ts_supports_lora():
+            return
         for layer in self.get_module("transformer").modules():
             if (
                 isinstance(layer, LinearBase)
@@ -60,7 +63,8 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 and layer.quant_method.prims_ts_role is not None
             ):
                 raise ValueError(
-                    "Dynamic LoRA cannot wrap PrimsTS-prepared FLUX.3 weights. "
+                    "Dynamic LoRA cannot wrap PrimsTS-prepared FLUX.3 weights: the "
+                    "installed FlashInfer cannot add a LoRA delta to PrimsTS GEMMs. "
                     "Start with --lora-path to load the generic quantized layout."
                 )
 
@@ -86,11 +90,13 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
         device = get_local_torch_device()
         cpu = torch.device("cpu")
         quant_config = resolve_flux3_image_package_quant_config(package)
-        enable_prims_ts = server_args.lora_path is None
+        enable_prims_ts = (
+            server_args.lora_path is None or flux3_prims_ts_supports_lora()
+        )
         if not enable_prims_ts and quant_config is not None:
             logger.info(
-                "FLUX.3 PrimsTS is disabled because dynamic LoRA requires "
-                "the generic quantized linear layout."
+                "FLUX.3 PrimsTS is disabled because the installed FlashInfer "
+                "cannot add a dynamic LoRA delta in its GEMM epilogue."
             )
         dit = load_flux3_image_dit(
             str(package.weights),
