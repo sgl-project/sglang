@@ -52,6 +52,12 @@ def _scheduler_for_typed_config():
             "default_priority_value",
             5,
         ),
+        ({}, "limit_mm_data_per_request", []),
+        (
+            {"limit_mm_data_per_request": {"video": 1, "image": 2}},
+            "limit_mm_data_per_request",
+            [("video", 1), ("image", 2)],
+        ),
     ],
     ids=[
         "native-grpc",
@@ -59,6 +65,8 @@ def _scheduler_for_typed_config():
         "deprecated-legacy-smg",
         "priority-off",
         "priority-on",
+        "mm-limits-unset",
+        "mm-limits-keep-order",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):

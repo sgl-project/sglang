@@ -3,7 +3,7 @@
 //! (model info, model list, server info, flush cache, weights check, tokenize,
 //! detokenize, health probe).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -39,7 +39,7 @@ pub(crate) struct CoreConfig {
     pub(crate) response_activity: ActivityCounter,
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
-    pub(crate) mm_limits: BTreeMap<String, usize>,
+    pub(crate) mm_limits: Vec<(String, usize)>,
     pub(crate) metadata: CoreMetadata,
 }
 
@@ -107,7 +107,7 @@ struct CoreInner {
     response_activity: ActivityCounter,
     startup_ready: AtomicBool,
     is_disaggregation: bool,
-    mm_limits: BTreeMap<String, usize>,
+    mm_limits: Vec<(String, usize)>,
     metadata: CoreMetadata,
     generations: Generations,
 }
@@ -1018,7 +1018,7 @@ mod tests {
             Default::default(),
             false,
             false,
-            BTreeMap::new(),
+            Vec::new(),
         )
     }
 
@@ -1029,7 +1029,7 @@ mod tests {
         response_activity: ActivityCounter,
         startup_ready: bool,
         is_disaggregation: bool,
-        mm_limits: BTreeMap<String, usize>,
+        mm_limits: Vec<(String, usize)>,
     ) -> CoreHandle {
         CoreHandle::new(
             intake_tx,
@@ -1072,7 +1072,7 @@ mod tests {
                 response_activity: Default::default(),
                 startup_ready: false,
                 is_disaggregation: false,
-                mm_limits: BTreeMap::new(),
+                mm_limits: Vec::new(),
                 metadata: CoreMetadata {
                     served_model_name: "served-model".into(),
                     max_context_length: 1_u64 << 32,
@@ -1324,7 +1324,7 @@ mod tests {
             Default::default(),
             false,
             false,
-            BTreeMap::from([("image".to_owned(), 1)]),
+            vec![("image".to_owned(), 1)],
         );
         let request = GenerateRequest {
             mm: Some(Box::new(MmData {
@@ -1358,7 +1358,7 @@ mod tests {
             activity.clone(),
             true,
             false,
-            BTreeMap::new(),
+            Vec::new(),
         );
         let probe_handle = handle.clone();
         let probe =
@@ -1392,7 +1392,7 @@ mod tests {
             Default::default(),
             true,
             true,
-            BTreeMap::new(),
+            Vec::new(),
         );
 
         let probe_task =
@@ -1454,7 +1454,7 @@ mod tests {
             Default::default(),
             false,
             true,
-            BTreeMap::new(),
+            Vec::new(),
         );
         let warm_up = tokio::spawn(async move { handle.warm_up(true).await });
 

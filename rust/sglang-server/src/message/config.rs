@@ -159,8 +159,10 @@ pub struct ServerArgs {
     /// Native-generation launch policy normally applied by Python ingress.
     pub lora_ids: BTreeMap<String, String>,
     pub enable_strict_thinking: bool,
-    /// Per-modality media-count limits from `--limit-mm-data-per-request`.
-    pub limit_mm_data_per_request: BTreeMap<String, usize>,
+    /// Per-modality media-count limits from `--limit-mm-data-per-request`, in
+    /// configured order: Python checks them in that order and reports the first
+    /// one exceeded. Empty means no per-modality limit.
+    pub limit_mm_data_per_request: Vec<(String, usize)>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -278,7 +280,7 @@ impl ServerArgs {
         preferred_sampling_params: Option<PreferredSamplingParams>,
         lora_ids: BTreeMap<String, String>,
         enable_strict_thinking: bool,
-        limit_mm_data_per_request: BTreeMap<String, usize>,
+        limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
@@ -376,7 +378,7 @@ impl Default for ServerArgs {
             preferred_sampling_params: None,
             lora_ids: BTreeMap::new(),
             enable_strict_thinking: false,
-            limit_mm_data_per_request: BTreeMap::new(),
+            limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
