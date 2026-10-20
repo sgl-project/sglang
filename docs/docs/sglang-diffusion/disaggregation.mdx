@@ -107,6 +107,12 @@ Stage workers skip standalone warmup because their inputs come from upstream
 stages. Send representative requests through the coordinator before measuring
 steady-state performance; warm up each input mode and worker replica you use.
 
+Zero-tolerance comparisons also require matching attention backends, precision,
+and VAE memory format. Automatic VAE memory format can depend on the worker's
+local GPU count. Set `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D` consistently to `true`
+or `false` for the baseline and all workers when comparing outputs. Identical
+transferred latents alone do not guarantee identical decoded pixels.
+
 ### Declaring stage boundaries
 
 Native pipelines can expose `stage_specs` using `StageSpec`, or deployments can
