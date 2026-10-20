@@ -2418,7 +2418,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         keep its keys, so the SWA window split has to leave it whole."""
         self._skip_unsupported_hicache_test()
         storage_dir = self._make_storage_dir()
-        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(storage_dir)
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
         seq = self._buffer_swa_seq()
         self._insert(cache, allocator, req_to_token_pool, seq)
         leaf = cache.match_prefix(
