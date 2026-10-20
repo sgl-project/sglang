@@ -4119,7 +4119,7 @@ class DeepseekV4AttnBackend(
                 )
 
                 return swapab_attention(
-                    q[..., :16, :],
+                    q[..., : layer.tp_q_head_num, :],
                     swa_k_cache,
                     swa_page_indices,
                     swa_topk_lengths,
