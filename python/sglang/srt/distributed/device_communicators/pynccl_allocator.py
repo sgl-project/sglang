@@ -4,6 +4,7 @@ import os
 import tempfile
 import traceback
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 
@@ -234,6 +235,19 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     return _mem_pool
 
 
+# The context whose segments are being registered with NCCL right now. The
+# registration has no timeout of its own, so the scheduler watchdog reads this
+# to name a stall inside it.
+_registering_context: Optional["SymmetricMemoryContext"] = None
+
+
+def describe_registration_in_progress() -> Optional[str]:
+    ctx = _registering_context
+    if ctx is None:
+        return None
+    return f"comm={ctx._comm_ptr} group={ctx.group_coordinator.unique_name}"
+
+
 class SymmetricMemoryContext:
     """
     Context manager for using symmetric memory with pynccl.
@@ -319,9 +333,15 @@ class SymmetricMemoryContext:
         3. Thread-safe access to the segment registry
         """
 
+        global _registering_context
+
+        _registering_context = self
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        result = _register_func(self._comm_ptr)
+        try:
+            result = _register_func(self._comm_ptr)
+        finally:
+            _registering_context = None
         assert result == 0, (
             f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
         )

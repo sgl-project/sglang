@@ -334,14 +334,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.captured_req_width,
             gathered_buffer_required=self.require_gathered_buffer,
         )
-        if self.dllm_uses_input_embeds:
-            max_requests = min(
-                self.dllm_config.max_running_requests, max(self.capture_bs)
-            )
-            self.capture_bs = sorted(
-                {bs for bs in self.capture_bs if bs <= max_requests} | {max_requests}
-            )
-            self.compile_bs = [bs for bs in self.compile_bs if bs <= max_requests]
         self.max_bs = max(self.capture_bs)
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
@@ -1115,6 +1107,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
+        with self.model_context():
+            self._capture()
+
+    def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1266,15 +1262,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Graph-recordable metadata-prep hook. The unified memory pool
-                # records ZERO translate nodes here: all its read/write translates
-                # run eagerly in `init_forward_metadata_out_graph` (replay-prep), so
-                # the captured graph reads already-physical locs. Base no-op for triton.
+                # Backends may gather live pool mappings into their static
+                # metadata here; these nodes run before any model KV reads.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
                 self._record_in_graph_metadata_prep_done()
-
-                # No invalidate_loc_cache() here: the unified pool translates its
-                # locs in `init_forward_metadata_out_graph`, so no cache to invalidate.
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
@@ -1606,7 +1597,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._resolve_shared_read_ends(
             self._replay_attn_backend(), forward_batch.forward_mode
         )
-        with timer_ctx, self.backend.replay_session():
+        with self.model_context(), timer_ctx, self.backend.replay_session():
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
