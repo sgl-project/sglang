@@ -125,6 +125,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.model_executor.runner_utils.forked_metadata_prep import (
+    join_in_graph_metadata_prep,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -4009,6 +4012,7 @@ class DeepseekV4AttnBackend(
         """Idle never trusts its metadata, which may be stale or unset: it writes
         the request window's idle layout, or translates the zero-padded
         out_cache_loc to the dummy slot."""
+        join_in_graph_metadata_prep()
         if self.pre_kv_store_hook is not None:
             self.pre_kv_store_hook()
         out_cache_loc = forward_batch.out_cache_loc

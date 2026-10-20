@@ -101,6 +101,10 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
+from sglang.srt.model_executor.runner_utils.forked_metadata_prep import (
+    fork_in_graph_metadata_prep,
+    join_in_graph_metadata_prep,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_capture_stream,
 )
@@ -235,6 +239,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
     _draft_metadata_glue = False
     _target_metadata_glue = False
+    _metadata_prep_fork: Optional[tuple] = None
+    _metadata_prep_fork_resolved = False
 
     def __init__(
         self,
@@ -250,6 +256,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        # SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: (stream, event) the draft graph's
+        # in-graph metadata prep is forked onto; resolved at the first capture.
+        self._metadata_prep_fork: Optional[tuple] = None
+        self._metadata_prep_fork_resolved = False
 
         # --- core state ------------------------------------------------
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
@@ -537,6 +547,51 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
         return max_num_tokens
+
+    def _forks_draft_metadata_prep(self) -> bool:
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
+
+        return (
+            envs.SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK.get()
+            # The unified-KV store location is not a join point.
+            and not is_unified_kv_triton()
+            and self.model_runner.spec_algorithm.is_dspark()
+            and self.model_runner.is_draft_worker
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            # Its KV store-location reads are where the forked prep joins.
+            and isinstance(self.attn_backend, DeepseekV4AttnBackend)
+            and self.device_module is torch.cuda
+            and not get_exec().graph.debug_cuda_graph
+            and not self.enable_torch_compile
+            and not get_parallel().attn_dp_enabled
+            and not self.enable_two_batch_overlap
+            and not self.enable_pdmux
+            and self.model_runner.lora_manager is None
+        )
+
+    def _run_in_graph_metadata_prep(self, attn_backend, forward_batch) -> None:
+        def prep():
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+            self._record_in_graph_metadata_prep_done()
+
+        if not self._metadata_prep_fork_resolved:
+            self._metadata_prep_fork_resolved = True
+            if self._forks_draft_metadata_prep():
+                self._metadata_prep_fork = (torch.cuda.Stream(), torch.cuda.Event())
+                logger.info(
+                    "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: draft in-graph "
+                    "metadata prep forked onto a side stream."
+                )
+        if self._metadata_prep_fork is None:
+            prep()
+            return
+        stream, done = self._metadata_prep_fork
+        fork_in_graph_metadata_prep(stream=stream, done=done, prep=prep)
 
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
@@ -1297,8 +1352,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         capture_hook(self, forward_batch)
                     # Backends may gather live pool mappings into their static
                     # metadata here; these nodes run before any model KV reads.
-                    attn_backend.init_forward_metadata_in_graph(forward_batch)
-                    self._record_in_graph_metadata_prep_done()
+                    self._run_in_graph_metadata_prep(attn_backend, forward_batch)
 
                     forward_batch.dp_local_start_pos = (
                         forward_batch.dp_local_num_tokens
@@ -1348,6 +1402,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         forward_batch,
                         **kwargs,
                     )
+                    if join_in_graph_metadata_prep():
+                        raise RuntimeError(
+                            "The draft forward never joined its forked metadata prep; "
+                            "unset SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK."
+                        )
                     for capture_hook in self.model_runner.capture_tail_hooks:
                         capture_hook(self, out, forward_batch, num_tokens)
                     return out
