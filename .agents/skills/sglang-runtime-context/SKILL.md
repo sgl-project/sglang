@@ -228,7 +228,7 @@ slack (`>= len(...) - 1`) or compared key names instead of value sources.
 **There is no `.config` hop.** `ParallelContext._read` answers every name in
 one order: a scoped override, then a permanent stamp, then the published
 `parallel` bag leaf. `publish` stamps ranks from the launcher; distributed init
-stamps group handles and corrects derived widths. Configured widths such as
+stamps group handles and validates their widths. Configured widths such as
 `tp_size`, `pp_size`, `attn_cp_size`, `dcp_size` and `moe_dp_size`, and config-only
 leaves such as `nccl_port`, `dp_size`, `ep_size` and `dwdp_size`, fall back to the
 published bag. Reading a config leaf before publish raises a `ValueError`
@@ -248,9 +248,9 @@ configured widths — checked at every assignment to `_TP` / `_PP` / `_ATTN_CP` 
   coordinators keep their construction width. Those are different names, not two
   answers to one name.
 
-DCP keeps its own pair: `get_parallel().attn_dcp_size` / `.dcp_enabled` answer from
-configured derivations before distributed init and permanent stamps afterwards,
-while `dcp_size` is what the launch requested.
+DCP keeps its own pair: `get_parallel().attn_dcp_size` / `.dcp_enabled` are derived
+from the published configuration unless explicitly overridden; `dcp_size` is
+what the launch requested.
 
 A process-global seed field-read of one of these sizes
 (`get_server_args().tp_size`, or an alias of it) is a read-ratchet failure. A
@@ -262,10 +262,10 @@ parallel quotients are not live reads at all — `attn_tp_size`, `attn_dp_size`,
 `attn_dcp_size`, `moe_ep_size`, `moe_tp_size`, `dcp_enabled` are a function of the
 configured leaves, computed once at publish into bag leaves, and answered
 override → stamp → published leaf. So `dcp_enabled` means "the launch configured
-DCP" (`dcp_size > 1`), not "a DCP group is installed here"; in a scheduler the
-stamp makes the two identical, in a process that publishes without dist init they
-differ. `test_a_topology_is_stated_by_naming_the_width` and its neighbours in
-`test_runtime_context.py` pin this; they replaced
+DCP" (`dcp_size > 1`), not "a DCP group is installed here". Normal distributed
+initialization builds the groups to match the configured widths; it does not
+restamp these DCP leaves. `test_a_topology_is_stated_by_naming_the_width` and its
+neighbours in `test_runtime_context.py` pin this; they replaced
 `test_attn_dcp_defaults_when_group_is_uninitialized`. One consequence for tests:
 overriding a leaf no longer moves its quotient — state a topology by publishing a
 config, or by naming the width. After init,
@@ -320,9 +320,9 @@ this).
   follows a post-publish override. Two questions are *not* that, and have their
   own spelling: the width of the MoE communicator you are about to collectively
   operate on is `get_moe_cp_size()` (the `_MOE_DP = _ATTN_CP` alias makes it
-  differ), and the effective DCP topology is `get_parallel().attn_dcp_size` /
-  `.dcp_enabled`, which answer from configured derivations before dist init
-  and permanent stamps afterwards.
+  differ), and DCP's derived width and enablement are
+  `get_parallel().attn_dcp_size` / `.dcp_enabled` (published configuration
+  unless explicitly overridden).
 - **this runner's resolved value** → the runner
   (`prefill_attention_backend_str`, `kv_cache_dtype_str`,
   `draft_attention_backend`, `num_fused_shared_experts` on the model).
