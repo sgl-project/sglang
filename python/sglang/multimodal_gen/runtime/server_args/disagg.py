@@ -61,19 +61,6 @@ class DisaggServerArgsMixin:
     def derive_pool_work_endpoint(self) -> str:
         return format_tcp_endpoint("0.0.0.0", self.scheduler_port, "pool_work_endpoint")
 
-    def derive_pool_control_endpoint(self) -> str:
-        return format_tcp_endpoint(
-            "0.0.0.0", self.scheduler_port + 1, "pool_control_endpoint"
-        )
-
-    def derive_pool_control_advertised_endpoint(self) -> str:
-        host = self.host or self.disagg_p2p_hostname or "127.0.0.1"
-        if host == "0.0.0.0":
-            host = self.disagg_p2p_hostname or "127.0.0.1"
-        return format_tcp_endpoint(
-            host, self.scheduler_port + 1, "pool_control_advertised_endpoint"
-        )
-
     @classmethod
     def add_disagg_cli_args(cls, parser: FlexibleArgumentParser) -> None:
         role_default = (
