@@ -2745,7 +2745,7 @@ class DeepseekV4AttnBackend(
             )
         )
 
-    def _prepare_prefill_shared_reads(
+    def _snapshot_prefill_shared_reads(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> SharedReadEnds:
         # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
