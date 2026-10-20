@@ -435,6 +435,15 @@ class GraniteMoeModel(nn.Module):
 
 
 class GraniteMoeForCausalLM(nn.Module):
+    # The fused linears and the checkpoint modules they load from. A quant config
+    # that targets q_proj/k_proj/v_proj separately (e.g. compressed-tensors with
+    # its own scheme for attention) can only be matched to qkv_proj through this.
+    # input_linear is GraniteMoeShared's shared-expert gate+up, stored fused.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "input_linear": ["input_linear"],
+    }
+
     # Legacy and current HF expert / router names with otherwise shared layout
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_suffix={
