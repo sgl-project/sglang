@@ -56,6 +56,8 @@ def _make_num_token_non_padded(
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
     draft_tokens: torch.Tensor
+    # [bs, gamma, vocab] for the sampling accept; None for a greedy draft or a
+    # folded proposal of a batch that does not sample.
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
@@ -180,7 +182,7 @@ class DraftNoise(msgspec.Struct, frozen=True):
 
 
 def step_logits_width(markov_head: BaseDSparkMarkovHead, base_width: int) -> int:
-    # Kept step logits are gathered whole over a sharded vocab.
+    # The whole vocab over a sharded one, as the megakernel's step logits span it.
     return base_width if markov_head.vocab_shard is None else markov_head.vocab_size
 
 
@@ -216,11 +218,7 @@ def _draft_step(
     sharded = (
         {}
         if shard is None
-        else dict(
-            vocab_start=shard.start,
-            gather=shard.gather.gather_stacked,
-            gather_logits=shard.gather,
-        )
+        else dict(vocab_start=shard.start, gather=shard.gather.gather_stacked)
     )
     tokens = MarkovSampleStep.execute(
         base_logits=base_logits,
@@ -250,12 +248,13 @@ def draft_markov_block(
     logits_out: Optional[torch.Tensor] = None,
     greedy_draft: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Returns the drafted tokens and the [bs, gamma, vocab] step logits,
-    written to ``logits_out`` or allocated here; a greedy draft keeps none."""
-    bs, gamma = base_logits.shape[:2]
+    """Returns the drafted tokens and the step logits over ``base_logits``' columns
+    (a sharded vocab's shard: see ``gather_step_logits``), written to
+    ``logits_out`` or allocated here; a greedy draft keeps none."""
+    gamma = base_logits.shape[1]
     if not greedy_draft and logits_out is None:
         logits_out = torch.empty(
-            (bs, gamma, step_logits_width(markov_head, base_logits.shape[-1])),
+            base_logits.shape,
             dtype=markov_head.step_logits_dtype(base_logits.dtype),
             device=base_logits.device,
         )
@@ -280,6 +279,24 @@ def draft_markov_block(
         return torch.stack(draft_tokens, dim=1), None
     noise.offset.add_(1)
     return torch.stack(draft_tokens, dim=1), logits_out
+
+
+def gather_step_logits(
+    markov_head: BaseDSparkMarkovHead, step_logits: torch.Tensor
+) -> torch.Tensor:
+    """[bs, gamma, vocab] from the ranks' step logits shards, side by side; a
+    collective over a sharded vocab, so every rank calls it alike."""
+    shard = markov_head.vocab_shard
+    if shard is None:
+        return step_logits
+    bs, gamma, width = step_logits.shape
+    rows = bs * gamma
+    stacked = shard.gather.gather_stacked(step_logits.reshape(rows, width))
+    by_rank = stacked.view(-1, rows, width).transpose(0, 1)
+    world, vocab = by_rank.shape[1], markov_head.vocab_size
+    if vocab == world * width:
+        return by_rank.reshape(bs, gamma, vocab)
+    return by_rank.reshape(rows, -1)[:, :vocab].reshape(bs, gamma, vocab)
 
 
 def sample_draft_block(
@@ -310,7 +327,9 @@ def sample_draft_block(
     return DraftBlockResult(
         draft_tokens=draft_tokens,
         corrected_logits=(
-            None if greedy_draft else expect(_DRAFT_STEP_LOGITS, step_logits)
+            None
+            if greedy_draft
+            else expect(_DRAFT_STEP_LOGITS, gather_step_logits(markov_head, step_logits))
         ),
         greedy_mask=params.greedy_mask,
         temperatures=params.temperatures,
@@ -405,10 +424,15 @@ class DraftBlockProposer:
             and fwd.can_run_graph
         ):
             folded = True
+            # Only the sampling accept reads them: a batch that does not sample
+            # leaves a sharded vocab's in place.
+            samples = not (sampling_info is None or sampling_info.is_all_greedy)
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
                 corrected_logits=(
-                    None if self._greedy_draft else draft_sampler.step_logits[:bs]
+                    draft_sampler.corrected_logits(bs)
+                    if samples and not self._greedy_draft
+                    else None
                 ),
                 greedy_mask=draft_sampler.params.greedy_mask[:bs],
                 temperatures=draft_sampler.params.temperatures[:bs],

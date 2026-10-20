@@ -230,57 +230,67 @@ class TestMarkovSampleStep(CustomTestCase):
         for rank in range(3):
             self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
-    def test_kept_sharded_logits_match_full_vocab(self):
-        # Kept logits are gathered whole and every rank picks from them: the
-        # same tokens and the same logits as the full vocab, both backends.
-        g = torch.Generator(device=DEVICE).manual_seed(2)
-        rows, shard = 32, 5000
-        vocab = 2 * shard - 7
-        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE)
-        bias = torch.randn(rows, vocab, generator=g, device=DEVICE)
-        temps = torch.rand(rows, generator=g, device=DEVICE)
-        temps[:8] = 0.0
+    def test_shards_keeping_their_logits_match_full_vocab(self):
+        # Each shard keeps its own logits and picks through candidates: the full
+        # vocab's tokens and logits, so the logits can cross ranks once a block.
+        g = torch.Generator(device=DEVICE).manual_seed(5)
+        rows, shard, rank = 20, 3000, 256
+        vocab = 3 * shard - 40
+        w1 = torch.randint(-2, 3, (512, rank), generator=g, device=DEVICE)
+        w2 = torch.randint(-2, 3, (vocab, rank), generator=g, device=DEVICE)
+        w1, w2 = w1.to(torch.bfloat16), w2.to(torch.bfloat16)
+        prev = torch.randint(0, 512, (rows,), generator=g, device=DEVICE)
+        bias = MarkovBiasGemv(prev_tokens=prev, w1=w1, w2=w2).materialize()
+        base = torch.randn(rows, 3 * shard, generator=g, device=DEVICE) * 16
+        temps = torch.rand(rows, generator=g, device=DEVICE) + 0.2
+        temps[::3] = 0.0
+        kwargs = dict(temps=temps, step_dtype=torch.float32)
         full_logits = torch.empty(rows, vocab, device=DEVICE)
         full = _call(
             MarkovSampleStep.triton,
             base=base[:, :vocab].contiguous(),
             bias=bias,
-            temps=temps,
-            step_dtype=torch.float32,
             logits_out=full_logits,
+            **kwargs,
         )
+        # the bias as a tensor, and left for the fused launch to compute
+        shard_bias = [
+            lambda start: bias[:, start : start + shard].contiguous(),
+            lambda start: MarkovBiasGemv(
+                prev_tokens=prev, w1=w1, w2=w2[start : start + shard]
+            ),
+        ]
         for impl in (MarkovSampleStep.triton, MarkovSampleStep.torch):
-            locals_ = {}
+            for bias_of in shard_bias:
+                partials = {}
 
-            def run(rank, gather_logits):
-                start = rank * shard
-                logits_out = torch.empty(rows, vocab, device=DEVICE)
-                tokens = _call(
-                    impl,
-                    base=base[:, start : start + shard].contiguous(),
-                    bias=bias[:, start : start + shard].contiguous(),
-                    temps=temps,
-                    step_dtype=torch.float32,
-                    vocab_start=start,
-                    gather=lambda _: self.fail("candidates gathered"),
-                    gather_logits=gather_logits,
-                    logits_out=logits_out,
-                )
-                return tokens, logits_out
+                def run(rank, gather):
+                    start = rank * shard
+                    logits_out = torch.empty(rows, shard, device=DEVICE)
+                    tokens = _call(
+                        impl,
+                        base=base[:, start : start + shard].contiguous(),
+                        bias=bias_of(start),
+                        vocab_start=start,
+                        gather=gather,
+                        logits_out=logits_out,
+                        **kwargs,
+                    )
+                    return tokens, logits_out
 
-            for rank in range(3):
-                run(
-                    rank,
-                    lambda local, rank=rank: locals_.setdefault(
-                        rank, local.clone()
-                    ).repeat(1, 3),
-                )
-            stacked = torch.cat([locals_[rank] for rank in range(3)], dim=1)
-            for rank in range(3):
-                tokens, logits_out = run(rank, lambda _: stacked)
-                self.assertTrue(torch.equal(tokens, full))
-                self.assertTrue(torch.equal(logits_out, full_logits))
-
+                for rank in range(3):
+                    run(rank, lambda part, rank=rank: partials.setdefault(rank, part))
+                if impl is MarkovSampleStep.triton:
+                    # the custom all-gather takes only 16-byte multiples
+                    self.assertEqual(partials[0][0].nbytes % 16, 0)
+                stacked = torch.cat([partials[rank] for rank in range(3)])
+                kept = []
+                for rank in range(3):
+                    tokens, logits_out = run(rank, lambda _: stacked)
+                    self.assertTrue(torch.equal(tokens, full))
+                    kept.append(logits_out)
+                kept = torch.cat(kept, dim=1)[:, :vocab]
+                self.assertTrue(torch.equal(kept, full_logits))
 
     def test_bias_gemv_matches_its_materialized_bias(self):
         # Integer weights keep the GEMV exact in any summation order, so the
@@ -324,7 +334,7 @@ class TestMarkovSampleStep(CustomTestCase):
                     **kwargs,
                 )
                 self.assertTrue(torch.equal(fused, greedy))
-            # Kept logits: the fused launch stores them and the gathered pick samples.
+            # Kept logits: the fused launch stores them and samples the rows.
             kept = []
             for b in (bias, gemv):
                 logits_out = torch.empty(rows, padded, device=DEVICE)
@@ -332,8 +342,6 @@ class TestMarkovSampleStep(CustomTestCase):
                     MarkovSampleStep.triton,
                     bias=b,
                     vocab_start=start,
-                    gather=lambda _: self.fail("candidates gathered"),
-                    gather_logits=lambda local: local,
                     logits_out=logits_out,
                     **kwargs,
                 )

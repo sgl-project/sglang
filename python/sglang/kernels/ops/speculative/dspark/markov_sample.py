@@ -78,7 +78,6 @@ def _markov_sample_partial_kernel(
     ROUND: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     STORE: tl.constexpr,
-    SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
 ):
@@ -92,24 +91,23 @@ def _markov_sample_partial_kernel(
     value = _round_to_step_dtype(value, ROUND)
     if STORE:
         tl.store(L + row * LS + i, value.to(L.dtype.element_ty), in_shard)
-    if SELECT:
-        _select_block(
-            value,
-            T,
-            OFFSET,
-            P,
-            row,
-            part,
-            i,
-            valid,
-            PARTS,
-            KEY,
-            STEP,
-            VOCAB_START,
-            BLOCK,
-            SAMPLE,
-            PHILOX_ROUNDS,
-        )
+    _select_block(
+        value,
+        T,
+        OFFSET,
+        P,
+        row,
+        part,
+        i,
+        valid,
+        PARTS,
+        KEY,
+        STEP,
+        VOCAB_START,
+        BLOCK,
+        SAMPLE,
+        PHILOX_ROUNDS,
+    )
 
 
 @triton.jit
@@ -217,7 +215,6 @@ def _markov_bias_partial_kernel(
     BLOCK_R: tl.constexpr,
     ROUND: tl.constexpr,
     STORE: tl.constexpr,
-    SELECT: tl.constexpr,
     SAMPLE: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
 ):
@@ -243,40 +240,40 @@ def _markov_bias_partial_kernel(
     value = _round_to_step_dtype(value, ROUND)
     if STORE:
         tl.store(L + row[:, None] * LS + i[None, :], value.to(L.dtype.element_ty), keep)
-    if SELECT:
-        key = value
-        if SAMPLE:
-            temperature = tl.load(T + row, has_row, 0.0)
-            sampled = temperature != 0.0
-            # a block of greedy rows draws no noise
-            if tl.max(sampled.to(tl.int32), 0) > 0:
-                # _select_block's noise: word k of a Philox call goes to token 4 q + k.
-                quad = (part * BLOCK_V + VOCAB_START) // 4 + tl.arange(0, BLOCK_V // 4)
-                lane = tl.zeros([BLOCK_M, BLOCK_V // 4], tl.int64)
-                p0, p1, p2, p3 = tl.philox(
-                    KEY,
-                    (lane + quad[None, :]).to(tl.uint32),
-                    (lane + row[:, None]).to(tl.uint32),
-                    (lane + STEP).to(tl.uint32),
-                    ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
-                    PHILOX_ROUNDS,
-                )
-                bits = tl.interleave(tl.interleave(p0, p2), tl.interleave(p1, p3))
-                uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
-                exp_noise = -libdevice.log1p(-uniform)
-                safe = tl.where(sampled, temperature, 1.0)
-                noised = value / safe[:, None] - tl.log(exp_noise)
-                key = tl.where(sampled[:, None], noised, value)
-        live = has_row[:, None] & valid[None, :]
-        nan = live & (key != key)
-        has_nan = tl.max(nan.to(tl.int32), 1) > 0
-        maximum = tl.max(tl.where(live & ~nan, key, -float("inf")), 1)
-        wins = tl.where(has_nan[:, None], nan, live & (key == maximum[:, None]))
-        idx = tl.min(tl.where(wins, i[None, :] + VOCAB_START, _NO_INDEX), 1)
-        maximum = tl.where(has_nan, float("nan"), maximum)
-        out = P + (row * PARTS + part) * 2
-        tl.store(out, maximum, has_row)
-        tl.store(out + 1, idx.to(tl.float32, bitcast=True), has_row)
+    key = value
+    if SAMPLE:
+        temperature = tl.load(T + row, has_row, 0.0)
+        sampled = temperature != 0.0
+        # a block of greedy rows draws no noise
+        if tl.max(sampled.to(tl.int32), 0) > 0:
+            # _select_block's noise: word k of a Philox call goes to token 4 q + k.
+            quad = (part * BLOCK_V + VOCAB_START) // 4 + tl.arange(0, BLOCK_V // 4)
+            lane = tl.zeros([BLOCK_M, BLOCK_V // 4], tl.int64)
+            p0, p1, p2, p3 = tl.philox(
+                KEY,
+                (lane + quad[None, :]).to(tl.uint32),
+                (lane + row[:, None]).to(tl.uint32),
+                (lane + STEP).to(tl.uint32),
+                ((lane + tl.load(OFFSET)) & 0xFFFFFFFF).to(tl.uint32),
+                PHILOX_ROUNDS,
+            )
+            bits = tl.interleave(tl.interleave(p0, p2), tl.interleave(p1, p3))
+            uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
+            exp_noise = -libdevice.log1p(-uniform)
+            safe = tl.where(sampled, temperature, 1.0)
+            noised = value / safe[:, None] - tl.log(exp_noise)
+            key = tl.where(sampled[:, None], noised, value)
+    live = has_row[:, None] & valid[None, :]
+    nan = live & (key != key)
+    has_nan = tl.max(nan.to(tl.int32), 1) > 0
+    maximum = tl.max(tl.where(live & ~nan, key, -float("inf")), 1)
+    wins = tl.where(has_nan[:, None], nan, live & (key == maximum[:, None]))
+    idx = tl.min(tl.where(wins, i[None, :] + VOCAB_START, _NO_INDEX), 1)
+    maximum = tl.where(has_nan, float("nan"), maximum)
+    out = P + (row * PARTS + part) * 2
+    tl.store(out, maximum, has_row)
+    tl.store(out + 1, idx.to(tl.float32, bitcast=True), has_row)
+
 
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
     # (high, low) 32-bit words of a * b; b splits in halves so int64 never overflows.
@@ -312,7 +309,6 @@ def _launch_partial(
     step_dtype,
     has_sampled_rows,
     vocab_start=0,
-    select=True,
 ):
     # Returns the [rows, parts * 2] (value, index bits) candidates of each block.
     if isinstance(bias, MarkovBiasGemv):
@@ -328,7 +324,6 @@ def _launch_partial(
             step_dtype=step_dtype,
             has_sampled_rows=has_sampled_rows,
             vocab_start=vocab_start,
-            select=select,
         )
     rows, padded = base_logits.shape
     # The padded width fixes the transport shape on every rank; WIDTH masks padding.
@@ -357,7 +352,6 @@ def _launch_partial(
         _ROUND_CODE[step_dtype],
         bias is not None,
         store is not None,
-        select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
         num_warps=4,
@@ -378,7 +372,6 @@ def _launch_bias_partial(
     step_dtype,
     has_sampled_rows,
     vocab_start,
-    select,
 ):
     rows, padded = base_logits.shape
     w1, w2 = bias.w1, bias.w2
@@ -416,7 +409,6 @@ def _launch_bias_partial(
         _GEMV_BLOCK_R,
         _ROUND_CODE[step_dtype],
         store is not None,
-        select,
         has_sampled_rows is not False,
         _PHILOX_ROUNDS,
         num_warps=4,
@@ -426,9 +418,9 @@ def _launch_bias_partial(
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``; a ``MarkovBiasGemv`` is computed in
-    the launch that adds it. Sharded, ``gather`` exchanges per-block candidates,
-    or ``gather_logits`` the kept ``logits_out`` whole. ``has_sampled_rows=False``
-    argmaxes every row."""
+    the launch that adds it. ``logits_out`` keeps the step logits of the shard.
+    Sharded, ``gather`` exchanges per-block candidates, so every rank picks the
+    full vocab's token. ``has_sampled_rows=False`` argmaxes every row."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
@@ -444,8 +436,6 @@ class MarkovSampleStep:
         offset,
         step_dtype,
         vocab_start,
-        gather,
-        gather_logits,
         logits_out,
     ):
         assert base_logits.ndim == 2 and base_logits.stride(1) == 1
@@ -463,11 +453,7 @@ class MarkovSampleStep:
         assert vocab_start % 4 == 0, vocab_start
         if logits_out is not None:
             assert logits_out.dtype == step_dtype and logits_out.stride(1) == 1
-            if gather is None:
-                assert logits_out.shape == base_logits.shape
-            else:
-                assert gather_logits is not None
-                assert logits_out.shape[0] == base_logits.shape[0]
+            assert logits_out.shape == base_logits.shape
 
     @classmethod
     def triton(
@@ -482,7 +468,6 @@ class MarkovSampleStep:
         step_dtype: torch.dtype,
         vocab_start: int = 0,
         gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
@@ -493,8 +478,6 @@ class MarkovSampleStep:
             offset,
             step_dtype,
             vocab_start,
-            gather,
-            gather_logits,
             logits_out,
         )
         rows, width = bias.shape
@@ -507,22 +490,14 @@ class MarkovSampleStep:
             step_dtype=step_dtype,
             has_sampled_rows=has_sampled_rows,
         )
-        if gather is not None and logits_out is not None:
-            local = torch.empty(
-                base_logits.shape, device=base_logits.device, dtype=step_dtype
-            )
-            launch(base_logits, bias, width=width, store=local, select=False)
-            full = gather_logits(local)[:, : logits_out.shape[1]]
-            gathered = launch(full, None, width=full.shape[1], store=logits_out)
-        else:
-            partial = launch(
-                base_logits,
-                bias,
-                width=width,
-                store=logits_out,
-                vocab_start=vocab_start,
-            )
-            gathered = partial if gather is None else gather(partial)
+        partial = launch(
+            base_logits,
+            bias,
+            width=width,
+            store=logits_out,
+            vocab_start=vocab_start,
+        )
+        gathered = partial if gather is None else gather(partial)
         parts = gathered.shape[1] // 2
         world = gathered.shape[0] // rows
         result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
@@ -550,7 +525,6 @@ class MarkovSampleStep:
         step_dtype: torch.dtype,
         vocab_start: int = 0,
         gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        gather_logits: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         logits_out: Optional[torch.Tensor] = None,
         has_sampled_rows: Optional[bool] = None,
     ) -> torch.Tensor:
@@ -563,8 +537,6 @@ class MarkovSampleStep:
             offset,
             step_dtype,
             vocab_start,
-            gather,
-            gather_logits,
             logits_out,
         )
         if isinstance(bias, MarkovBiasGemv):
@@ -573,19 +545,6 @@ class MarkovSampleStep:
         value = base_logits.to(torch.float32, copy=True)
         value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
-        if gather is not None and logits_out is not None:
-            full = gather_logits(value.to(step_dtype))[:, : logits_out.shape[1]]
-            return cls.torch(
-                base_logits=full,
-                bias=torch.zeros_like(full),
-                temperatures=temperatures,
-                key=key,
-                offset=offset,
-                step=step,
-                step_dtype=step_dtype,
-                logits_out=logits_out,
-                has_sampled_rows=has_sampled_rows,
-            )
         padded = base_logits.shape[1]
         device = base_logits.device
         if logits_out is not None:
