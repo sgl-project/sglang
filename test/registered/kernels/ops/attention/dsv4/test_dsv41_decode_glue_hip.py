@@ -326,6 +326,57 @@ def test_low_ratio_compression_metadata(loc_dtype, ratios):
             assert torch.equal(out[f"c{r}_topk_lengths_clamp1"], ref_clamp1)
 
 
+@pytest.mark.parametrize(
+    "seq_dtype", [torch.int32, torch.int64], ids=["seq32", "seq64"]
+)
+@pytest.mark.parametrize(
+    "req_dtype", [torch.int32, torch.int64], ids=["req32", "req64"]
+)
+def test_expand_same_length_matches_torch(seq_dtype, req_dtype):
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import expand_same_length
+
+    _seed(11)
+    for bs, qo_len, offset in ((1, 1, 0), (3, 5, 5), (48, 6, 0)):
+        seq_lens = torch.randint(qo_len, 100000, (bs,), device=DEVICE).to(seq_dtype)
+        req = torch.randint(0, 4096, (bs,), device=DEVICE).to(req_dtype)
+        # the torch chain it replaces, the draft block's offset added first
+        arange = dict(dtype=torch.int32, device=DEVICE)
+        ref_lens = (
+            (seq_lens + offset)[:, None] + torch.arange(-qo_len + 1, 1, **arange)
+        ).flatten()
+        ref_req = req[torch.arange(bs, **arange).repeat_interleave(qo_len)]
+        lens, req_rep = expand_same_length(seq_lens, req, qo_len, offset=offset)
+        assert lens.dtype is ref_lens.dtype and req_rep.dtype is ref_req.dtype
+        assert torch.equal(lens, ref_lens) and torch.equal(req_rep, ref_req)
+
+
+@pytest.mark.parametrize("ratios", [(1,), (2,), (1, 2)], ids=["c1", "c2", "c1c2"])
+def test_sparse_buffers_fill_low_ratio_raw_indices(ratios):
+    from sglang.kernels.ops.attention.dsv4.attn_glue_hip import sparse_buffers
+
+    _seed(13)
+    topk, rows = 512, 7
+    lens = {
+        r: torch.randint(0, 3 * topk, (rows,), dtype=torch.int32, device=DEVICE)
+        for r in ratios
+    }
+    out = sparse_buffers(
+        c4_topk_lengths_clamp1=None,
+        c4_topk_lengths_raw=None,
+        c1_topk_lengths_clamp1=lens.get(1),
+        c2_topk_lengths_clamp1=lens.get(2),
+        index_topk=topk,
+        page_index_align=64,
+    )
+    empty = torch.full((rows, topk), -1, dtype=torch.int32, device=DEVICE)
+    for r in ratios:
+        assert torch.equal(out[f"c{r}_sparse_topk_lengths"], lens[r].clamp(max=topk))
+        # a row's raw indices past its top-k are read as -1 (no key)
+        assert torch.equal(out[f"c{r}_sparse_raw_indices"], empty)
+        assert torch.equal(out[f"c{r}_sparse_page_indices"], empty)
+    assert not any(k.startswith("c4_") for k in out)
+
+
 def test_page_table_from_req_to_token_matches_torch():
     from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
         page_table_from_req_to_token,
