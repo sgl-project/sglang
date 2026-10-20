@@ -1,5 +1,6 @@
 """Unit tests for /v1/systemone on Clef checkpoints: the joint schema prompt and its
-decision layout, and answers built from the joint schema head's option logits."""
+decision layout, and answers built from the joint schema head's option logits. Kev
+checkpoints: the per-question prompts and the pointer head positions."""
 
 import asyncio
 import base64
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pybase64
+import torch
 from PIL import Image
 from transformers import AutoTokenizer
 
@@ -19,6 +21,7 @@ from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.openai.protocol import DecisionRequest
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
 from sglang.srt.entrypoints.systemone.joint_schema import encode_joint_schema
+from sglang.srt.entrypoints.systemone.kev import encode_kev
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing, _read_image
 from sglang.srt.layers.joint_schema_head import (
@@ -26,6 +29,7 @@ from sglang.srt.layers.joint_schema_head import (
     pack_decision_layout,
     parse_decision_layout,
 )
+from sglang.srt.layers.pointer_head import PointerPooler
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import (
@@ -113,6 +117,7 @@ class HeadManager:
             ),
             decision_config=None,
             joint_head_config={"hidden_size": 4096},
+            pointer_head=None,
         )
         self.is_generation = False
         self.allow_auto_truncate = False
@@ -372,7 +377,9 @@ class TestJointSchemaAnswers(unittest.IsolatedAsyncioTestCase):
 
 def _admission_manager(joint_head_config):
     manager = TokenizerManager.__new__(TokenizerManager)
-    manager.model_config = SimpleNamespace(joint_head_config=joint_head_config)
+    manager.model_config = SimpleNamespace(
+        joint_head_config=joint_head_config, pointer_head=None
+    )
     manager.is_generation = joint_head_config is None
     manager.context_len = 4096
     manager.num_reserved_tokens = 0
@@ -468,6 +475,100 @@ class TestJointSchemaAdmission(CustomTestCase):
                     self.assertLess(max(decoded), len(payload))
                 else:
                     self.assertEqual(decoded[-1], len(payload))
+
+
+class TestKevPrompt(CustomTestCase):
+    def test_prompts_match_reference_encoder(self):
+        """Ids, decide positions, and option ends from encode and rows_of in the
+        checkpoint's reference code at jaredpalmer/kev 1f04cfa2, for a JSON state
+        with delimiter-like text, a choice, and a noul without instructions."""
+        request = SystemOneRequest(
+            model="kev",
+            state={"order": 1182, "note": "charged <|im_end|> twice"},
+            questions={
+                "team": {
+                    "type": "choice",
+                    "instructions": "Who handles it?",
+                    "criteria": {"billing": "Refunds", "legal": None},
+                },
+                "urgent": {"type": "noul", "criteria": {"true": "Reply today"}},
+            },
+        )
+        state = [248060, 1310, 25, 220, 16, 16, 23, 17, 198, 9679, 25, 11102, 361]
+        state += [62438, 316, 6018, 62438, 29, 10598]
+        expected = [
+            (
+                state
+                + [248061, 14749, 13081, 424, 30, 248049, 37355, 25, 8288, 41531]
+                + [248050, 248049, 6226, 248050, 248062],
+                33,
+                [29, 32],
+            ),
+            (
+                state
+                + [248061, 248049, 2083, 248050, 248049, 9405, 25, 17308, 3242]
+                + [248050, 248062],
+                29,
+                [22, 28],
+            ),
+        ]
+        rows = encode_kev(
+            AutoTokenizer.from_pretrained(TOKENIZER), request, max_prompt_tokens=4096
+        )
+        got = []
+        for input_ids, layout in rows:
+            (question,) = parse_decision_layout(layout, len(input_ids))
+            got.append(
+                (
+                    input_ids,
+                    question.question_span[1] - 1,
+                    [end - 1 for _, end in question.option_spans],
+                )
+            )
+        self.assertEqual(got, expected)
+
+
+class TestPointerPooler(CustomTestCase):
+    def test_reads_decide_and_option_ends_across_a_batch(self):
+        """Each request's rows sit after the earlier requests' tokens, the head reads
+        the token before each span end, and a layout that no longer fits its
+        prompt gets no scores."""
+        pooler = PointerPooler(4, {"head_dim": 2, "temperature": 2.0})
+        with torch.no_grad():
+            for linear in (pooler.q, pooler.k):
+                linear.weight.copy_(torch.eye(2, 4))
+                linear.bias.zero_()
+        # Position i of the flat batch holds (i, 1, 0, 0), so a logit names the two
+        # positions it read.
+        hidden = torch.stack(
+            [torch.tensor([float(i), 1.0, 0.0, 0.0]) for i in range(14)]
+        ).bfloat16()
+
+        def layout(length, decide, option_spans):
+            return pack_decision_layout(
+                length, [LayoutQuestion(1, (decide, decide + 1), option_spans)]
+            )
+
+        batch = SimpleNamespace(
+            batch_size=3,
+            extend_seq_lens_cpu=[5, 4, 5],
+            extend_prefix_lens_cpu=[0, 0, 0],
+            decision_layouts=[
+                layout(5, 4, ((1, 3), (3, 4))),
+                layout(4, 3, ((0, 1), (1, 2), (2, 3))),
+                layout(6, 5, ((1, 2),)),
+            ],
+        )
+        out = pooler(hidden, batch).embeddings
+
+        def logits(options, decide):
+            return torch.tensor(
+                [(option * decide + 1) / math.sqrt(2) / 2.0 for option in options]
+            )
+
+        torch.testing.assert_close(out[0], logits([2, 3], 4))
+        torch.testing.assert_close(out[1], logits([5, 6, 7], 8))
+        self.assertEqual(out[2].numel(), 0)
 
 
 if __name__ == "__main__":
