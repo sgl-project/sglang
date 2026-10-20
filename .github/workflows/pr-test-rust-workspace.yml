@@ -121,17 +121,19 @@ jobs:
               compat_header=manifest.parent / "torch_compat.h",
               python_module="sglang.srt.mem_cache.rust_tree_core.mem_cache",
           )
-          subprocess.run(
-              [
-                  "cargo",
-                  "test",
-                  "--manifest-path",
-                  str(manifest),
-                  "--locked",
-                  "--no-default-features",
-              ],
-              cwd=root / "rust",
-              env=build.environment,
-              check=True,
-          )
+          for features in ([], ["--features", "torch"]):
+              subprocess.run(
+                  [
+                      "cargo",
+                      "test",
+                      "--manifest-path",
+                      str(manifest),
+                      "--locked",
+                      "--no-default-features",
+                      *features,
+                  ],
+                  cwd=root / "rust",
+                  env=build.environment,
+                  check=True,
+              )
           EOF
