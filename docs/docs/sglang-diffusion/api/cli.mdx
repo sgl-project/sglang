@@ -134,7 +134,9 @@ Declarative stage deployment currently targets Linux/NVIDIA with Mooncake and re
 - `--disagg-transfer-pool-size {BYTES}`: transfer buffer per worker (default: 268435456 bytes). Include space for incoming tensors, outgoing tensors, and preallocated receive slots.
 
 See [Disaggregated serving](/docs/sglang-diffusion/disaggregation)
-for stage contracts, deployment commands, and operational limits. Full-generation
+for single/multi-machine examples, TP/SP, and replicas, and the
+[stage deployment reference](/docs/sglang-diffusion/disaggregation/stage-contracts)
+for contracts and operational limits. Full-generation
 deployments retain the existing generation and editing APIs.
 
 ### Sampling and output

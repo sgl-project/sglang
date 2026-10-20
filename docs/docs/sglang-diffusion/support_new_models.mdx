@@ -361,7 +361,7 @@ Use a custom single-purpose stage only when the reference pipeline has one step
 that cannot be represented cleanly by a hook or native-stage subclass. Keep the
 custom stage narrow and reuse native stages before and after it.
 
-For [declarative disaggregation](/docs/sglang-diffusion/disaggregation#declaring-stage-boundaries),
+For [declarative disaggregation](/docs/sglang-diffusion/disaggregation/stage-contracts#declaring-stage-boundaries),
 expose `stage_specs` with stable stage names, complete input/output fields, and
 the components each stage needs. Register stage factories so unselected stages
 are not constructed, and make custom loaders honor the selected component set.
