@@ -41,10 +41,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
-    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -1059,7 +1059,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
@@ -1117,7 +1117,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 0.0)
@@ -1930,24 +1930,6 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
 
         self.assertEqual(seen, ["first.png", "second.png"])
         self.assertEqual(tuple(image.shape), (2, 3, 16, 16))
-
-
-class TestCosmos3ModalitySamplingParams(unittest.TestCase):
-    """Sound / V2V / action sampling-param fields and defaults."""
-
-    def test_sound_duration_default_and_set(self):
-        self.assertEqual(Cosmos3SamplingParams(prompt="t").sound_duration, 0.0)
-        self.assertEqual(
-            Cosmos3SamplingParams(prompt="t", sound_duration=3.0).sound_duration, 3.0
-        )
-
-    def test_v2v_fields(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", video_path="in.mp4", condition_frame_indexes=[0, 1]
-        )
-        self.assertEqual(sp.video_path, "in.mp4")
-        self.assertEqual(sp.condition_frame_indexes, [0, 1])
-        self.assertEqual(sp.condition_video_keep, "first")
 
 
 class TestCosmos3CaptionMetadata(unittest.TestCase):

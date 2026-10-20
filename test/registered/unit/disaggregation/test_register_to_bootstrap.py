@@ -26,6 +26,59 @@ class TestRegisterToBootstrap(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
+    def test_sender_dp_rank_registration(self):
+        from sglang.srt.disaggregation.base.conn import KVPoll
+        from sglang.srt.disaggregation.common.conn import CommonKVSender
+
+        for force_query in (False, True):
+            for dp_rank in (0, 1):
+                with self.subTest(force_query=force_query, dp_rank=dp_rank):
+                    mgr = MagicMock(
+                        is_dummy_cp_rank=False,
+                        attn_dp_rank=dp_rank,
+                        deferred_bootstrap=None,
+                    )
+                    sender = MagicMock(spec=CommonKVSender)
+                    sender._register_prefill_dp_rank = (
+                        CommonKVSender._register_prefill_dp_rank.__get__(sender)
+                    )
+                    with (
+                        patch(
+                            "sglang.srt.disaggregation.common.conn.requests.post"
+                        ) as mock_post,
+                        get_context().override_server_args(
+                            dp_size=4, load_balance_method="follow_bootstrap_room"
+                        ),
+                        envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.override(
+                            force_query
+                        ),
+                    ):
+                        mock_post.return_value.status_code = 200
+                        CommonKVSender.__init__(
+                            sender,
+                            mgr=mgr,
+                            bootstrap_addr="127.0.0.1:8765",
+                            bootstrap_room=4,
+                        )
+
+                    self.assertEqual(
+                        mock_post.call_args_list,
+                        [
+                            call(
+                                "http://127.0.0.1:8765/register_dp_rank",
+                                json={"bootstrap_room": 4, "dp_rank": dp_rank},
+                                timeout=5,
+                            )
+                        ]
+                        if force_query
+                        else [],
+                    )
+                    conflict = not force_query and dp_rank != 0
+                    self.assertEqual(mgr.record_failure.call_count, int(conflict))
+                    mgr.update_status.assert_called_with(
+                        4, KVPoll.Failed if conflict else KVPoll.Bootstrapping
+                    )
+
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_succeeds_on_first_attempt(self, mock_put, mock_time):
@@ -178,6 +231,8 @@ class TestRegisterToBootstrap(CustomTestCase):
             "rank_port",
             "page_size",
             "kv_cache_dtype",
+            # Decode pulls from every shard-group rank when this is set.
+            "enable_kv_cache_sharding",
             # Self-registered HTTP API port used to derive the PD retract
             # rebootstrap /generate URL on the decode side.
             "prefill_http_port",
@@ -185,6 +240,24 @@ class TestRegisterToBootstrap(CustomTestCase):
         for field in required_fields:
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_cp_tp_group_sharing_registers_cp_rank_as_tp_rank(
+        self, mock_put, mock_time
+    ):
+        # A sharing prefill CP rank holds every KV head and its own
+        # linear-attention shard: decode pairs with it as a CP-1 TP rank.
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+        mgr = self._make_manager()
+        mgr.attn_cp_size, mgr.attn_cp_rank = 4, 2
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertEqual([payload[k] for k in ("attn_tp_size", "attn_tp_rank")], [4, 2])
+        self.assertEqual([payload[k] for k in ("attn_cp_size", "attn_cp_rank")], [1, 0])
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")

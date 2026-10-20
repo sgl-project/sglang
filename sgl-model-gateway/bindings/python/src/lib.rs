@@ -412,6 +412,7 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
+    decode_dispatch_limit: Option<usize>,
     connection_mode: core::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -637,6 +638,7 @@ impl Router {
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .maybe_decode_dispatch_limit(self.decode_dispatch_limit)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -733,6 +735,7 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
+        decode_dispatch_limit = None,
         model_path = None,
         tokenizer_path = None,
         chat_template = None,
@@ -825,6 +828,7 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
+        decode_dispatch_limit: Option<usize>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         chat_template: Option<String>,
@@ -930,6 +934,7 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            decode_dispatch_limit,
             connection_mode,
             model_path,
             tokenizer_path,

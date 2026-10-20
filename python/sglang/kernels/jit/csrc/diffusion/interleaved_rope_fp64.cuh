@@ -91,27 +91,27 @@ struct InterleavedRopeFP64Kernel {
       tvm::ffi::TensorView q,
       tvm::ffi::TensorView k,
       tvm::ffi::TensorView cos,
-      tvm::ffi::TensorView sin,
-      int64_t batch_size,
-      int64_t seq_len,
-      int64_t num_heads,
-      int64_t head_dim) {
+      tvm::ffi::TensorView sin) {
     using namespace host;
     using Pair = device::AlignedVector<T, 2>;
 
-    auto N = SymbolicSize{"activation_elements"};
-    auto R = SymbolicSize{"table_elements"};
+    auto B = SymbolicSize{"batch"};
+    auto S = SymbolicSize{"sequence"};
+    auto H = SymbolicSize{"heads"};
+    auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({N}).with_dtype<T>().with_device(device).verify(q_out).verify(k_out).verify(q).verify(k);
-    TensorMatcher({R}).with_dtype<double>().with_device(device).verify(cos).verify(sin);
+    TensorMatcher({B, S, H, D}).with_dtype<T>().with_device(device).verify(q_out).verify(k_out).verify(q).verify(k);
+    TensorMatcher({1, S, 1, D}).with_dtype<double>().with_device(device).verify(cos).verify(sin);
+
+    const int64_t batch_size = B.unwrap();
+    const int64_t seq_len = S.unwrap();
+    const int64_t num_heads = H.unwrap();
+    const int64_t head_dim = D.unwrap();
 
     CHECK_HOST(batch_size > 0 && seq_len > 0 && num_heads > 0 && head_dim > 0)
         << "interleaved_rope_fp64 dimensions must be positive";
     CHECK_HOST(head_dim % 2 == 0) << "interleaved_rope_fp64 head_dim must be even";
-    CHECK_HOST(N.unwrap() == batch_size * seq_len * num_heads * head_dim)
-        << "interleaved_rope_fp64 activation shape does not match dimensions";
-    CHECK_HOST(R.unwrap() == seq_len * head_dim) << "interleaved_rope_fp64 table shape does not match dimensions";
     CHECK_HOST(
         q_out.data_ptr() != k_out.data_ptr() && q_out.data_ptr() != q.data_ptr() && q_out.data_ptr() != k.data_ptr() &&
         k_out.data_ptr() != q.data_ptr() && k_out.data_ptr() != k.data_ptr())
@@ -123,7 +123,7 @@ struct InterleavedRopeFP64Kernel {
         reinterpret_cast<uintptr_t>(k.data_ptr()) % alignof(Pair) == 0)
         << "interleaved_rope_fp64 activations must be aligned to rotation pairs";
 
-    const int64_t num_pairs = N.unwrap() / 2;
+    const int64_t num_pairs = q.numel() / 2;
     const int64_t pairs_per_head = head_dim / 2;
     const auto blocks =
         static_cast<uint32_t>(std::min<int64_t>(div_ceil(num_pairs, static_cast<int64_t>(kBlockSize)), kMaxGrid));

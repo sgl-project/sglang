@@ -207,6 +207,9 @@ class TestDcpCachedPrefixSend(CustomTestCase):
         mgr.transfer_queues = [None]
         mgr._register_staging_memory = Mock()
         mgr.request_status = {}
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr._staging_outstanding = {}
         mgr.is_dummy_cp_rank = False
         mgr.enable_all_cp_ranks_for_transfer = False
         mgr.decode_kv_args_table = {
@@ -241,13 +244,13 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 }
                 mgr.add_transfer_request = Mock()
                 with get_context().override_server_args(dp_size=1):
-                    sender = NixlKVSender(mgr, "unused", 1, [0], 0)
+                    sender = NixlKVSender(mgr, "unused", 1)
                 sender.init((total - prefix + page_size - 1) // page_size, 3)
                 req = SimpleNamespace(
                     rid="cached-prefix",
                     kv=SimpleNamespace(req_pool_idx=0),
                     origin_input_ids=[0] * total,
-                    extend_range=SimpleNamespace(end=total),
+                    extend_end=total,
                     start_send_idx=prefix,
                     disagg_decode_prefix_len=prefix,
                     disagg_kv_sender=sender,

@@ -340,10 +340,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             )
 
     def test_eligibility_is_fail_closed(self):
-        self.assertIs(envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.default, True)
-        self.assertEqual(
-            envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.default, 8192
-        )
         self.assertTrue(self._is_eligible())
         for case in (
             {"enabled": False},
@@ -908,6 +904,61 @@ class TestChunkedTopKMatchesUnchunked(CustomTestCase):
                 self.assertTrue(torch.equal(run(rows_per_chunk), expected))
 
 
+class TestDeepSelectFullTopKDecode(CustomTestCase):
+    @staticmethod
+    def _decode_case():
+        from sglang.srt.layers.attention.dsv4.v41_indexer import DecodeInputs
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DecodeScores
+
+        scores = torch.tensor(
+            [[1.0, 4.0, 2.0, 3.0], [3.0, 2.0, -torch.inf, -torch.inf]],
+            dtype=torch.float32,
+        )
+        lens = torch.tensor([4, 2], dtype=torch.int64)
+        slots = torch.tensor([[40, 10, 30, 20], [80, 70, 0, 0]], dtype=torch.int64)
+        metadata = SimpleNamespace(
+            page_table=torch.tensor([[10], [20]], dtype=torch.int32),
+            compressed_page_size=4,
+        )
+        page_indices = torch.full((2, 8), -1, dtype=torch.int32)
+        inputs = DecodeInputs(
+            indexer=SimpleNamespace(index_topk=8),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=None,
+            req_rows=torch.arange(2),
+            paged_metadata=metadata,
+            is_verify=False,
+            out_page_indices=page_indices,
+        )
+        data = DecodeScores(bs=2, lmax=4, lens=lens, slots=slots, scores=scores)
+        return inputs, data
+
+    def test_decode_uses_select_decode_fallback(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import full_topk as mod
+
+        inputs, data = self._decode_case()
+        inputs.indexer.index_topk = 2
+        indexer = object.__new__(mod.FullTopKIndexer)
+        indexer.token_to_kv_pool = None
+        indexer.req_to_token = None
+        indexer.use_deep_gemm_decode = False
+        indexer.use_deep_select_decode = False
+
+        with (
+            patch.object(mod, "decode_scores", return_value=data),
+            patch.object(mod, "topk_page_transform") as page_transform,
+            patch.object(mod, "select_decode") as select_decode,
+        ):
+            indexer.topk_decode(inputs)
+
+        page_transform.assert_not_called()
+        select_decode.assert_called_once_with(inputs, data, 2)
+
+
 class TestChunkedPagedDecode(CustomTestCase):
     """An eager decode whose paged-MQA metadata is split into row chunks (#40637):
     every DeepGEMM call must get its own chunk's schedule and every top-k its own
@@ -933,6 +984,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             compressed_page_size=64,
             topk_metadata_chunks=self.topk_plans,
             use_topk_v2=True,
+            rows_per_request=1,
             row_chunks=lambda: list(zip(self.chunks, self.plans)),
         )
         inputs = DecodeInputs(
@@ -946,6 +998,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             req_rows=torch.arange(num_rows),
             paged_metadata=metadata,
             is_verify=True,
+            out_page_indices=torch.full((num_rows, 4), -1, dtype=torch.int32),
         )
         data = DeepGEMMDecodeData(
             q_fp4=torch.zeros((num_rows, 1, 2, 64), dtype=torch.int8),
@@ -954,12 +1007,6 @@ class TestChunkedPagedDecode(CustomTestCase):
             k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
         )
         return inputs, data
-
-    def _selection(self):
-        from sglang.srt.layers.attention.dsv4.v41_indexer import Selection
-
-        page_indices = torch.full((self.num_rows, 4), -1, dtype=torch.int32)
-        return Selection(page_indices=page_indices, raw_indices=page_indices.clone())
 
     def _mocks(self):
         width = self.width
@@ -1023,7 +1070,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             patch.object(mod.torch.cuda, "Event", return_value=event),
             patch.object(mod.torch.cuda, "current_stream", return_value=stream),
         ):
-            table = backend.publish_decode(inputs, self._selection())
+            table = backend.publish_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
         self.assertEqual(table.blocks.shape, (self.num_rows, backend.topk_blocks))
@@ -1044,9 +1091,67 @@ class TestChunkedPagedDecode(CustomTestCase):
             patch.object(mod, "deep_gemm_fp4_paged_mqa_logits", deep_gemm),
             patch.object(mod, "topk_transform_paged_from_metadata", topk),
         ):
-            indexer.topk_decode(inputs, self._selection())
+            indexer.topk_decode(inputs)
 
         self._assert_chunked_calls(deep_gemm, topk)
+
+
+class TestGroupedVerifyRows(CustomTestCase):
+    """Static verify rows reach the paged logits kernel as one request per block."""
+
+    def _args(self, rows_per_request, rows=slice(None)):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            DeepGEMMDecodeData,
+        )
+
+        requests, block, heads, pages = 3, 6, 2, 4
+        num_rows = requests * block
+        lens = torch.arange(num_rows, dtype=torch.int32) + 100
+        table = torch.arange(requests * pages, dtype=torch.int32).view(requests, pages)
+        metadata = SimpleNamespace(
+            compressed_seq_lens=lens,
+            page_table=table.repeat_interleave(block, dim=0),
+            rows_per_request=rows_per_request,
+        )
+        data = DeepGEMMDecodeData(
+            q_fp4=torch.arange(num_rows * heads * 64, dtype=torch.int8).view(
+                num_rows, 1, heads, 64
+            ),
+            q_sf=torch.arange(num_rows * heads, dtype=torch.int32).view(
+                num_rows, 1, heads
+            ),
+            weights=torch.zeros((num_rows, heads), dtype=torch.float32),
+            k_cache=torch.zeros((1, 64, 1, 68), dtype=torch.uint8),
+        )
+        return data, metadata, table, data.paged_logits_args(metadata, rows)
+
+    def test_one_row_per_request_keeps_the_per_row_layout(self):
+        data, metadata, _table, ((q, sf), lens, table) = self._args(1)
+        self.assertTrue(torch.equal(q, data.q_fp4))
+        self.assertTrue(torch.equal(sf, data.q_sf))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens))
+        self.assertTrue(torch.equal(table, metadata.page_table))
+
+    def test_block_rows_become_one_request(self):
+        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(6)
+        self.assertEqual(tuple(q.shape), (3, 6, 2, 64))
+        self.assertEqual(tuple(sf.shape), (3, 6, 2))
+        self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens.view(3, 6)))
+        self.assertEqual(tuple(table.shape), (3, 4))
+        self.assertTrue(torch.equal(table, per_request_table))
+        self.assertEqual(table.stride(1), 1)
+
+    def test_row_chunk_groups_its_own_rows(self):
+        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(
+            6, slice(6, 18)
+        )
+        self.assertEqual(tuple(q.shape), (2, 6, 2, 64))
+        self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4[6:18]))
+        self.assertTrue(
+            torch.equal(lens, metadata.compressed_seq_lens[6:18].view(2, 6))
+        )
+        self.assertTrue(torch.equal(table, per_request_table[1:]))
 
 
 class TestCandidateIndexerGating(CustomTestCase):

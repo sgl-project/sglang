@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-scoped prefix KV and graph replay regression tests; no checkpoint needed."""
 
+import json
 from copy import deepcopy
 
 import pytest
@@ -35,9 +36,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
@@ -46,7 +51,10 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
     ensure_distributed_env_defaults,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="requires NVIDIA CUDA fusions",
+)
 
 
 @pytest.fixture(scope="module")
@@ -192,11 +200,47 @@ def test_bf16_qk_norm_matches_reference(model):
         torch.testing.assert_close(norm(x), reference(x), atol=0, rtol=0)
 
 
+def _save_lora_and_add_delta(reference, path, adapter_format):
+    """Save a rank-2 LoRA in a published checkpoint layout and add its delta to reference."""
+    scale, metadata = 1.0, None
+    if adapter_format == "diffusers_metadata_alpha":
+        # diffusers keeps alpha only in this JSON blob; alpha 4 over rank 2 doubles B @ A.
+        scale = 2.0
+        packed = {"transformer.r": 2, "transformer.lora_alpha": 4}
+        metadata = {"lora_adapter_metadata": json.dumps(packed)}
+    fused = adapter_format == "comfyui_fused_gate_up"
+    prefix = "diffusion_model." if fused else "transformer."
+    weights = {}
+    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
+        layer = reference.get_submodule(name)
+        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"{prefix}{name}.lora_A.weight"] = a.cpu()
+        weights[f"{prefix}{name}.lora_B.weight"] = b.cpu()
+        layer.weight.add_(scale * (b @ a))
+    if fused:
+        # ComfyUI's native checkpoint fuses the SwiGLU inputs row-wise as [gate; up].
+        mlp = reference.transformer_blocks[1].img_mlp
+        a = torch.randn(2, mlp.gate_layer.weight.shape[1], device="cuda") * 0.2
+        b = torch.randn(2 * mlp.gate_layer.weight.shape[0], 2, device="cuda") * 0.2
+        weights[f"{prefix}transformer_blocks.1.img_mlp.gate_up.lora_A.weight"] = a.cpu()
+        weights[f"{prefix}transformer_blocks.1.img_mlp.gate_up.lora_B.weight"] = b.cpu()
+        gate, up = b.chunk(2, dim=0)
+        mlp.gate_layer.weight.add_(gate @ a)
+        mlp.proj.weight.add_(up @ a)
+    save_file(weights, str(path), metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    "adapter_format",
+    ["diffusers", "diffusers_metadata_alpha", "comfyui_fused_gate_up"],
+)
 @pytest.mark.parametrize("merge_mode", ["dynamic", "merge"])
 @torch.no_grad()
-def test_diffusers_lora_matches_weight_delta_and_restores_base(
-    model, tmp_path, monkeypatch, merge_mode
+def test_published_lora_layouts_match_weight_delta_and_restore_base(
+    model, tmp_path, monkeypatch, merge_mode, adapter_format
 ):
+    """Fused gate_up rows and metadata-only alpha must reach the layers, not be dropped."""
     # Reuse loaded native components, then exercise the real adapter loader.
     monkeypatch.setattr(ComposedPipelineBase, "__init__", lambda self: None)
     pipeline = object.__new__(QwenImage21Pipeline)
@@ -214,16 +258,8 @@ def test_diffusers_lora_matches_weight_delta_and_restores_base(
         loaded.load_state_dict(model.state_dict())
     pipeline.modules = {"transformer": actual_model}
     pipeline.__init__()
-    weights = {}
-    for name in ("transformer_blocks.0.attn.to_q", "transformer_blocks.0.img_mlp.out"):
-        layer = reference.get_submodule(name)
-        a = torch.randn(2, layer.weight.shape[1], device="cuda") * 0.2
-        b = torch.randn(layer.weight.shape[0], 2, device="cuda") * 0.2
-        weights[f"transformer.{name}.lora_A.weight"] = a.cpu()
-        weights[f"transformer.{name}.lora_B.weight"] = b.cpu()
-        layer.weight.add_(b @ a)
     adapter = tmp_path / "adapter.safetensors"
-    save_file(weights, str(adapter))
+    _save_lora_and_add_delta(reference, adapter, adapter_format)
     kwargs = dict(inputs(5, False), prefix_caches=None)
     with set_forward_context(None, None):
         baseline = actual_model(**kwargs)
@@ -283,7 +319,9 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
         ):
             model(**first)
             stage._bcg_run(runner, first, model)
-        assert len(runner.entries) == 1
+        # warmup captures every text bucket for a single cached prefix
+        captured = len(stage._bcg_text_buckets()) if sample_count == 1 else 1
+        assert len(runner.entries) == captured
         with (
             torch.no_grad(),
             set_forward_context(
@@ -295,7 +333,7 @@ def test_graph_replay_uses_new_request_prefix(model, edit, sample_count):
             model(**second)
             expected = model(**second)
             actual = stage._bcg_run(runner, second, model)
-        assert len(runner.entries) == 1
+        assert len(runner.entries) == captured
         torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
     finally:
         runner.reset()
@@ -486,6 +524,73 @@ def test_cuda_qk_rope_pack_matches_eager_prefill_and_cached_steps(
             kwargs["hidden_states"].add_(0.1)
             expected = actual_model(**kwargs)
             torch.testing.assert_close(runner(**kwargs), expected, atol=0, rtol=0)
+    finally:
+        runner.reset()
+
+
+def prompt_inputs_hd128(seed, text_tokens):
+    kwargs = inputs_hd128(seed, False)
+    kwargs["encoder_hidden_states"] = torch.randn(
+        1, text_tokens, 16, device="cuda", dtype=torch.bfloat16
+    )
+    kwargs["layouts"] = [
+        build_layout([False] * text_tokens, [(1, 4, 4)], (16, 56, 56), "cuda")
+    ]
+    return kwargs
+
+
+@pytest.mark.parametrize("kv_pack", ["cuda", "triton", "eager"])
+@torch.no_grad()
+def test_padded_prefix_replays_one_graph_across_prompt_lengths(
+    bf16_model_hd128, monkeypatch, kv_pack
+):
+    # each K/V packing path must skip the pad rows so the replay matches the
+    # unpadded eager forward bit for bit
+    disabled = BitExactFusionGate("reference")
+    disabled.disable()
+    if kv_pack != "cuda":
+        monkeypatch.setattr(model_module, "_KV_PACK_CUDA_FUSION", disabled)
+    if kv_pack == "eager":
+        monkeypatch.setattr(model_module, "_KV_ROPE_FUSION", disabled)
+    monkeypatch.setattr(
+        DenoisingStage, "_bcg_text_buckets", staticmethod(lambda: (8, 16))
+    )
+    model = bf16_model_hd128
+    stage = object.__new__(QwenImage21DenoisingStage)
+    runner = DiffusionBreakableCudaGraphRunner(model, torch.device("cuda"))
+    replays = []
+    replay = runner.replay
+    monkeypatch.setattr(
+        runner,
+        "replay",
+        lambda entry, kwargs: replays.append(entry) or replay(entry, kwargs),
+    )
+    try:
+        warmup = prompt_inputs_hd128(3, 4)
+        with set_forward_context(
+            None,
+            None,
+            Req(sampling_params=QwenImage21SamplingParams(), is_warmup=True),
+        ):
+            model(**warmup)
+            stage._bcg_run(runner, warmup, model)
+        assert len(runner.entries) == 2
+        replays.clear()
+        lengths = (2, 7, 8, 13, 16)
+        for seed, text_tokens in enumerate(lengths, start=20):
+            kwargs = prompt_inputs_hd128(seed, text_tokens)
+            with set_forward_context(
+                None, None, Req(sampling_params=QwenImage21SamplingParams())
+            ):
+                model(**kwargs)
+                kwargs["timestep"].fill_(300.0)
+                expected = model(**kwargs)
+                padded = stage._bcg_pad_prompt_kwargs(kwargs, current_model=model)
+                torch.testing.assert_close(model(**padded), expected, atol=0, rtol=0)
+                actual = stage._bcg_run(runner, kwargs, model)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        assert len(replays) == len(lengths)
+        assert len(runner.entries) == 2
     finally:
         runner.reset()
 

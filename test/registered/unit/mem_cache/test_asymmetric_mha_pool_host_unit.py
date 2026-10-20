@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
+from sglang.srt.platforms.interface import PlatformCapabilities
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,9 +20,11 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     host = AsymmetricMHATokenToKVPoolHost.__new__(AsymmetricMHATokenToKVPoolHost)
+    host._transfer_device = torch.device("cpu")
     host.layout = layout
     host.page_size = 2
     host.layer_num = 3
+    host.target_layer_num = 3
     host.head_num = 2
     host.head_dim = 4
     host.v_head_dim = 6
@@ -62,35 +65,98 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
     v_buffer = [
         torch.empty(size, host.head_num, host.v_head_dim) for _ in range(host.layer_num)
     ]
-    return SimpleNamespace(
+    host.device_k_buffers = tuple(k_buffer)
+    host.device_v_buffers = tuple(v_buffer)
+    host.device_k_data_ptrs = torch.tensor(
+        [x.data_ptr() for x in k_buffer], dtype=torch.uint64
+    )
+    host.device_v_data_ptrs = torch.tensor(
+        [x.data_ptr() for x in v_buffer], dtype=torch.uint64
+    )
+    host.device_pool = SimpleNamespace(
+        layer_num=host.layer_num,
+        layer_shard_enabled=False,
         k_buffer=k_buffer,
         v_buffer=v_buffer,
-        k_data_ptrs=torch.tensor([x.data_ptr() for x in k_buffer], dtype=torch.uint64),
-        v_data_ptrs=torch.tensor([x.data_ptr() for x in v_buffer], dtype=torch.uint64),
+        k_data_ptrs=host.device_k_data_ptrs,
+        v_data_ptrs=host.device_v_data_ptrs,
     )
+    return host.device_pool
 
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
     def test_factory_selects_asymmetric_pool_for_mismatched_kv_dims(self):
-        symmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=4)
-        asymmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=6)
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        def info(v_head_dim):
+            return (
+                MHATokenToKVPool(
+                    size=8,
+                    page_size=2,
+                    dtype=torch.float16,
+                    head_num=1,
+                    head_dim=4,
+                    v_head_dim=v_head_dim,
+                    layer_num=1,
+                    device="cpu",
+                    enable_memory_saver=False,
+                )
+                .get_device_pool_infos()[0]
+                .buffer_info
+            )
+
+        symmetric_pool = info(4)
+        asymmetric_pool = info(6)
 
         self.assertIs(get_mha_host_pool_cls(symmetric_pool), MHATokenToKVPoolHost)
         self.assertIs(
             get_mha_host_pool_cls(asymmetric_pool), AsymmetricMHATokenToKVPoolHost
         )
 
+    def test_builds_over_a_real_device_pool(self):
+        # The asymmetric pool has per-side row widths and no `token_stride_size`,
+        # so building it must not need one for its packed device rows.
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        device = MHATokenToKVPool(
+            size=15,
+            page_size=2,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            v_head_dim=6,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        host = AsymmetricMHATokenToKVPoolHost(
+            buffer_info=device.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=2,
+            layout="page_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+            device_capacity_tokens=device.size
+            if device.host_capacity_tokens is None
+            else device.host_capacity_tokens,
+            start_layer=device.start_layer,
+            end_layer=device.end_layer,
+            write_back_staging=device.hicache_write_back_staging,
+        )
+        self.assertTrue(host.device_rows_packed)
+
     def test_staged_write_back_jit_uses_separate_kv_buffers(self):
         host = _make_host("page_first")
         host.page_num = 4
         host.v_head_dim = 8
-        host.device_pool = SimpleNamespace(
-            device="cuda",
+        buffer_info = SimpleNamespace(
+            device=torch.device("cuda"),
             head_num=host.head_num,
             head_dim=host.head_dim,
             v_head_dim=host.v_head_dim,
-            store_dtype=host.dtype,
-            hicache_write_back_staging=None,
+            dtype=host.dtype,
         )
         cpu_empty = torch.empty
 
@@ -100,9 +166,12 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         with (
             mock.patch("sglang.srt.mem_cache.pool_host.mha._is_cuda", True),
             mock.patch("sglang.srt.mem_cache.pool_host.mha._is_hip", False),
-            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_npu", False),
-            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_xpu", False),
-            mock.patch("sglang.srt.mem_cache.pool_host.mha._is_mps", False),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.mha.current_platform",
+                SimpleNamespace(
+                    capabilities=PlatformCapabilities(hicache_device_kernels=True)
+                ),
+            ),
             mock.patch(
                 "sglang.srt.mem_cache.pool_host.mha.can_use_write_back_jit_kernel",
                 return_value=True,
@@ -112,7 +181,7 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
                 side_effect=_cpu_empty,
             ),
         ):
-            host._init_write_back_staging_buffers()
+            host._init_write_back_staging_buffers(buffer_info, None)
 
         self.assertTrue(host.can_use_write_back_jit)
         self.assertEqual(host.staging_page_capacity, 4)
