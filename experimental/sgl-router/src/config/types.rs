@@ -32,6 +32,8 @@ pub struct ProxyConfig {
     pub max_backoff_ms: u64,
     /// PD: requests per prefill DP rank sent to decode before their first token.
     pub decode_dispatch_limit: Option<NonZeroU32>,
+    /// PD: return decode's response only once prefill completes.
+    pub stream_after_prefill: bool,
 }
 
 impl ProxyConfig {
@@ -64,6 +66,7 @@ impl Default for ProxyConfig {
             initial_backoff_ms: 50,
             max_backoff_ms: 2000,
             decode_dispatch_limit: None,
+            stream_after_prefill: false,
         }
     }
 }

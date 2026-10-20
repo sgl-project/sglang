@@ -86,7 +86,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
+    resolve_shared_experts_config,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -285,11 +285,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-    # Decide the shared-experts-fusion question here, once per runner, before any
-    # layer exists: this is the only place a model class is instantiated, and it
-    # is the last point that still knows both the checkpoint's quantization and
-    # (through the build scope) whether this runner is a draft.
-    install_shared_experts_fusion_decision(
+    shared_experts = resolve_shared_experts_config(
         model_class, model_config.hf_config, quant_config
     )
     kwargs = {
@@ -305,8 +301,10 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    model = model_class(**kwargs)
-    check_stage_producers(model)
+    with get_model().override(shared_experts=shared_experts):
+        model = model_class(**kwargs)
+        check_stage_producers(model)
+    model.shared_experts_config = shared_experts
     return model
 
 

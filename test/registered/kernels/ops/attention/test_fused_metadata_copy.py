@@ -153,7 +153,7 @@ def test_fused_metadata_copy_dtype_validation():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.kernels.ops.attention.fused_metadata_copy import (
+    from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
         fused_metadata_copy_cuda,
     )
 
@@ -272,7 +272,7 @@ def test_fused_metadata_copy(bs, has_real_page_table, has_flashmla):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.kernels.ops.attention.fused_metadata_copy import (
+    from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
         fused_metadata_copy_cuda,
     )
 
@@ -473,7 +473,7 @@ def test_fused_metadata_copy_multi_dtype_validation():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.kernels.ops.attention.fused_metadata_copy import (
+    from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
         fused_metadata_copy_multi_cuda,
     )
 
@@ -581,7 +581,7 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
-    from sglang.kernels.ops.attention.fused_metadata_copy import (
+    from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
         fused_metadata_copy_multi_cuda,
     )
 
