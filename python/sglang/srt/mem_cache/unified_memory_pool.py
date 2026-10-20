@@ -57,11 +57,13 @@ from sglang.srt.mem_cache.layout.token_major import (
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
-    KvBufferDesc,
-    KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+)
+from sglang.srt.mem_cache.pool.base import (
+    KvBufferDesc,
+    KVWriteLoc,
     unwrap_write_loc,
     write_loc_is_physical,
 )

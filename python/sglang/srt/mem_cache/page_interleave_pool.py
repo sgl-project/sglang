@@ -68,12 +68,12 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     RadixAttention,
-    unwrap_write_loc,
 )
 from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
 )
+from sglang.srt.mem_cache.pool.base import unwrap_write_loc
 from sglang.srt.mem_cache.utils import get_mla_kv_buffer_triton
 from sglang.srt.utils import ceil_div, get_bool_env_var
 

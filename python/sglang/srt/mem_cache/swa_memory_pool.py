@@ -4,12 +4,14 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
-    KVCache,
     MHATokenToKVPool,
     MLATokenToKVPool,
+)
+from sglang.srt.mem_cache.pool.base import (
+    BaseSWAKVPool,
+    KVCache,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool

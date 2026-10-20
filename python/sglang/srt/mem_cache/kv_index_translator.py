@@ -81,7 +81,6 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
 from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv_loc_plan import (
     IdSpace,
@@ -90,6 +89,7 @@ from sglang.srt.mem_cache.kv_loc_plan import (
     pad_with_sink,
     window_read_extent,
 )
+from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu

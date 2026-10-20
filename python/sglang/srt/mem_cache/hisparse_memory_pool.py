@@ -10,11 +10,8 @@ from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
     translate_padded_hisparse_locations,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.memory_pool import (
-    DSATokenToKVPool,
-    MHATokenToKVPool,
-    unwrap_write_loc,
-)
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pool.base import unwrap_write_loc
 from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)

@@ -19,10 +19,9 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     draft_state_layer_ids,
     draft_swa_layer_ids,
 )
-from sglang.srt.mem_cache.memory_pool import (
+from sglang.srt.mem_cache.memory_pool import MambaPool, MHATokenToKVPool
+from sglang.srt.mem_cache.pool.base import (
     KVWriteLoc,
-    MambaPool,
-    MHATokenToKVPool,
     unwrap_write_loc,
     write_loc_is_physical,
 )

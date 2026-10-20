@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -14,6 +13,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_bytes,
     host_memory_budget_scope,

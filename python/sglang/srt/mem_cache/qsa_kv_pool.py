@@ -15,7 +15,8 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
+from sglang.srt.mem_cache.pool.base import GB
 
 logger = logging.getLogger(__name__)
 

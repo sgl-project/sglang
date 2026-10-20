@@ -17,7 +17,7 @@ from sglang.srt.layers.dcp import (
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,

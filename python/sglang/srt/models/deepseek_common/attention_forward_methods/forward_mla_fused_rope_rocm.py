@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,

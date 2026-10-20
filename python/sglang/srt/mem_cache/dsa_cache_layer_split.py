@@ -44,6 +44,8 @@ from sglang.srt.mem_cache.memory_pool import (
     RadixAttention,
     get_tensor_size_bytes,
     maybe_detect_oob,
+)
+from sglang.srt.mem_cache.pool.base import (
     unwrap_write_loc,
 )
 from sglang.srt.runtime_context import get_parallel

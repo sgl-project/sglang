@@ -29,7 +29,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     align_entry_bytes,
     align_part_offset,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.pool.base import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
     UnifiedDraftMambaPool,

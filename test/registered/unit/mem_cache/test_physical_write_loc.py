@@ -32,11 +32,8 @@ import torch
 
 from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import (
-    KVWriteLoc,
-    MHATokenToKVPool,
-    write_loc_is_physical,
-)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool.base import KVWriteLoc, write_loc_is_physical
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,

@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict
 
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
