@@ -900,7 +900,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             simulate_bonus_sampling_info = sampling_info
             sampling_info = None
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT): #这里就只是执行draft模型的token验证
+        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT): #这里就是dspark并行生成草稿token的代码
             proposal = self._proposer.propose(
                 batch=batch,
                 draft_input=draft_input,
@@ -912,11 +912,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
-        draft_tokens = draft_block.draft_tokens #验证后的token
+        draft_tokens = draft_block.draft_tokens #验证后的token 大小（B,draft_token_num=5）
         if coordination_plan is not None:
             coordination_plan.apply(batch, "target", rank, local_only=target_local_only)
 
-        confidence = proposal.confidence #获取置信度输出, draft模型预测的置信度，用这个来做第一遍筛选。
+        confidence = proposal.confidence #获取置信度输出, 大小（B,draft_token_num=5）draft模型预测的置信度，用这个来做第一遍筛选。
         if confidence is None:
             confidence = self._verify_planner.compute_confidence_tensor(
                 draft_hidden=proposal.draft_hidden,
@@ -928,6 +928,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         00993641
         resolve_verify_token_budget函数：这里面会调用compute_budget_sync用condfience和SPS计算筛选的token
         例如 bs=3, 那最低的验证token_num=3, 假设根据confidence和SPS-table计算需要再额外再多分配6行位置。那最终验证的token_num=9
+        
+        confidence 决定“哪些token更有希望”，SPS 决定“多验证这些草稿要付出多少时间”，两者一起决定总共验证多少个。
         """
         verify_token_budget = self._verify_planner.resolve_verify_token_budget(
             draft_input=draft_input,
@@ -937,6 +939,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ) #
 
         """
+        00993641
         SparkVerifyPlanner.schedule_layout函数：
         这里会调用 ScheduleVerifyLensTopk.execute，把计算得到额外6个名额按照surival的值，优先分配给更可能连续接受的位置，比如bs=3， 分配是【3,1,2】，再加上每个请求原本的1个anchor, 对应num_token=[4,2,3]
         它把每请求的验证长度和本轮需要的执行容量，封装一下 layout 交给后端
