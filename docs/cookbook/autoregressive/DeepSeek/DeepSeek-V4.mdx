@@ -954,7 +954,7 @@ docker run \
     python3 -m sglang.launch_server <role args below>
 ```
 
-Use this image for the **MI355X Pro Official FP4 multi-node** workers and router, including the additional concurrency points below. The Deployment and Playground Docker outputs select it for all three Pro Official PD roles. It supports the documented `SGLANG_DSV4_DENSE_MXSCALE` and `SGLANG_ROUTER_P2C_LOAD_METRIC` settings. The original **Pro** FP4 multi-node recipe retains `lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001`. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
+Use this image for the **MI355X Pro / Pro Official FP4 multi-node** workers and router, including the additional concurrency points below. The Deployment and Playground Docker outputs select it for all three PD roles. It supports the documented `SGLANG_DSV4_DENSE_MXSCALE` and `SGLANG_ROUTER_P2C_LOAD_METRIC` settings. `--network host` replaces the single-node `-p` mapping because the two roles run on different hosts.
 
 For the **MI355X Pro / Pro Official FP4** presets, **High-Throughput** sets `MORI_IO_QP_MAX_SEND_WR=32767` and `MORI_IO_QP_MAX_CQE=32768` on both MORI roles. Low-Latency and Balanced use the transport's default queue sizes. The send-queue backoff timeout uses MORI's default of 5 seconds.
 

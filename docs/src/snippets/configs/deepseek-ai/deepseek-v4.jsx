@@ -71,9 +71,7 @@ export const config = {
     const official = sel.variant === "pro-official";
     const gamma = sel.strategy === "low-latency" ? 6 : 3;
     const tp = dp || !prefill ? 8 : 4;
-    const image = official
-      ? "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019"
-      : "lmsysorg/sglang-rocm:v0.5.21-rocm724-mi35x-20261001";
+    const image = "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019";
     const router = [
       ...(official && dp ? ["env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests"] : []),
       "python3 -m sglang_router.launch_router",
@@ -93,7 +91,7 @@ export const config = {
       router: { port: 8000, command: router } };
     if (role === "router") return { ...common,
       commands: { python: router, docker: `docker run --network host --rm ${image} ${router}` } };
-    // Emit overrides only. Baseline defaults checked against the Pro image:
+    // Emit overrides only. Baseline defaults originally checked against
     // SGLang 3b2ad1c6ae, MORI 879983bdbd8c. ROCm model setup enables the
     // Aiter indexer; MegaMoE MTPR defaults to 8192 and static heap is implicit.
     // This Aiter MegaMoEV2 uses mori_shmem_create_tensor, not the CCO allocator.
