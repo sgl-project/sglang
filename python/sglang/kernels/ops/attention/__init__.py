@@ -74,6 +74,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.fused_lightning_indexer_manage",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.attention.npu_lim:fused_lightning_indexer_manage",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.TRITON,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),

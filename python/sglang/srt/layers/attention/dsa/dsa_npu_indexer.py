@@ -284,8 +284,9 @@ class DSANPUIndexerMixin:
                         device=k.device,
                     )
                 else:
-                    actual_seq_lengths_q = torch.tensor(
-                        [1 + i * 1 for i in range(bs)],
+                    actual_seq_lengths_q = torch.arange(
+                        1,
+                        bs + 1,
                         dtype=torch.int32,
                         device=k.device,
                     )
@@ -324,6 +325,30 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
+
+            backend = get_attn_backend()
+            manager = getattr(backend, "sparse_kv_manager", None)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and manager is not None
+                and manager.lim_adapter is not None
+            ):
+                if use_quant_indexer:
+                    raise ValueError(
+                        "LIM/reference decode does not support quantized index keys."
+                    )
+                plan = manager.lim_adapter.select(
+                    manager,
+                    query=q.view(-1, self.n_heads, self.head_dim),
+                    weights=weights,
+                    key=past_key_states,
+                    block_table=block_table,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                    reference_indexer=torch_npu.npu_lightning_indexer,
+                )
+                backend.forward_metadata.sparse_kv_lim_plan = plan
+                return plan.source_ids
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(

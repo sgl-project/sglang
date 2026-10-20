@@ -251,6 +251,59 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # Logical-page KV sharding reserves a fixed double-buffered assembly
         # scratch next to the pool; charge it before token sizing.
         self._fixed_overhead_bytes = compute_page_shard_scratch_bytes(kvc)
+        if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparse_kv_budget,
+                get_sparsity_driven_kv_offload_sparse_context_len,
+                is_sparsity_driven_kv_offload_enabled,
+            )
+            from sglang.srt.mem_cache.allocation_sizing import (
+                get_req_to_token_extra_context_len,
+            )
+
+            if is_sparsity_driven_kv_offload_enabled(
+                model_config=kvc.model_config, use_mla_backend=kvc.use_mla_backend
+            ):
+                # The variable-sized native pool contains only indexer KV. The
+                # separate sparse manager is allocated later by AscendAttnBackend
+                # and must be charged before that indexer pool fills HBM.
+                disagg = get_disagg()
+                extra_rows = (
+                    disagg.disaggregation_decode_extra_slots or 0
+                    if disagg.disaggregation_mode == "decode"
+                    or disagg.enable_pd_role_switch
+                    else 0
+                )
+                budget = get_sparse_kv_budget(
+                    request_rows=get_schedule().max_running_requests + extra_rows + 1,
+                    context_len=kvc.model_config.context_len
+                    + get_req_to_token_extra_context_len(),
+                    num_layers=num_layers,
+                    top_k=get_sparsity_driven_kv_offload_sparse_context_len(
+                        model_config=kvc.model_config
+                    ),
+                    kv_bytes_per_token=(
+                        kvc.model_config.kv_lora_rank
+                        + kvc.model_config.qk_rope_head_dim
+                    )
+                    * torch._utils._element_size(kvc.kv_cache_dtype),
+                )
+                reservation = budget.managed_hbm_bytes
+                if (
+                    envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() == 0
+                    and envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() > 0
+                ):
+                    # Final admission capacity may be smaller than the configured
+                    # maximum; auto-sizing can then use more of the byte budget.
+                    reservation = (
+                        envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2
+                    )
+                self._fixed_overhead_bytes += reservation
+                if envs.SGLANG_NPU_SPARSE_KV_INDEXER.get() == "lim":
+                    # One FP32 dequant-scale workspace shared across indexer
+                    # layers, with a row for every physical indexer token.
+                    self._cell_size += 4
+                    self._fixed_overhead_bytes += 4 * get_schedule().page_size
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.

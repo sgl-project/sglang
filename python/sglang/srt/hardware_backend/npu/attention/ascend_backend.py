@@ -51,6 +51,9 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
+        LIMSelection,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -85,6 +88,9 @@ def _reshape_kv_for_fia_nz(
 
 @dataclass
 class ForwardMetadata:
+    # Current anchor plan, also consumed by following IndexShare layers. The
+    # tensors are owned by the sparse manager and updated inside graph replay.
+    sparse_kv_lim_plan: Optional[LIMSelection] = None
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
 

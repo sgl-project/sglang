@@ -1,0 +1,137 @@
+Experimental Ascend LIM sparse KV offload
+========================================
+
+Purpose and configuration
+-------------------------
+Integrate the external FusedLightningIndexerManage (LIM) operator into the
+SGLang DSA NPU decode path. Full compact attention KV remains in registered
+host DRAM; each request/layer retains C tokens of main KV in HBM. Full indexer
+keys remain in HBM. K is the selected TopK count, fixed at 2048; C is the
+resident capacity and does not increase TopK.
+
+The default remains legacy. Experimental modes are explicit:
+  SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
+  SGLANG_NPU_SPARSE_KV_INDEXER=li_reference|lim
+  SGLANG_NPU_SPARSE_KV_CACHE_SIZE=4096
+  SGLANG_NPU_LIM_LIBRARY=/absolute/path/to/native/operator.so
+
+Alternatively set CACHE_SIZE=0 and SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB to derive C.
+This per-rank manager budget covers persistent resident KV, slot maps, policy
+and selected/adapter workspaces. Model weights, full indexer KV, allocator
+fragmentation, graph pools and kernel temporaries require separate headroom.
+The native dummy key-scale workspace is reserved separately in pool sizing.
+
+Current adapter limits: BF16 indexer/main KV, Q1, K=2048, page=128, PP=1,
+DCP disabled, speculative decoding disabled; C is a multiple of 128 in
+[2048,32640], and source capacity is at most 2**21. C8 is unsupported here.
+The native operator must already be installed; this change does not build it.
+
+Selection semantics and accuracy status
+--------------------------------------
+For an offloaded request (page-aligned prefix >= C), select K from the stable
+prefix and attend all currently visible tail tokens as well. The Q1 adapter
+has at most one visible 128-token tail page. Short requests use the non-offload
+route. IndexShare consumers reuse the anchor plan with their own layer KV.
+
+This differs from the original full-sequence TopK policy. Equal results against
+the same-policy LI reference do not establish model-quality parity against
+full-sequence TopK. Changing C should change cache residency, not selection;
+misses are fetched rather than dropped. Incorrect cache routing would still
+be a correctness bug, hence the bitwise KV checks.
+
+Covered on real NPU: TopK set parity on fixed fixtures with wide score margins,
+bitwise selected KV parity, SFA output tolerance rtol=0.01/atol=0.002, cold fill,
+short requests, request allocation/reset/reuse, indexer entry, new-token D2H,
+IndexShare payloads, graph capture/replay, and post-timing payload checks.
+Dynamic graph coverage crosses seq_len 8193 -> 8321, forces the newly visible
+page into TopK, then exercises mixed padding and request reuse. Invalid source
+IDs are masked explicitly because the native invalid-row path can retain stale
+outputs during graph replay.
+
+Not validated: complete model generations/logprobs/KL/perplexity/task accuracy,
+tensor-parallel communication, speculative decode, C8, or SHMEM runtime.
+The approximately 168 GB GLM-5.2-w4a8 checkpoint was not loaded. Fixed dimensions
+match its relevant configuration: index H=32/D=128, K=2048, CKV=512, KPE=64,
+and local attention QH=8; this is not a model end-to-end benchmark.
+
+151 measurements, 2026-10-20
+----------------------------
+Measured SGLang source base: 806e7423af8c2ab3dd364f1501b5d3f69e1d83d5.
+This branch is ported onto the newer official main; these numbers retain their
+original measurement provenance and are not advertised as a new-main rerun.
+Branch base: 4b83f215f498bc0371587bfae4a9470f24e77737 (2026-10-20).
+Ascend A3 physical device 7, CANN 9.1, torch 2.10.0+cpu with torch_npu
+2.10.0.post6. Native library SHA256:
+5fabea4cb210d04e8c72c1e01f2b3fdc2866ab9bc2f35f56f07c5a775596be0a
+
+Reference: ordinary native LI + cache management + materialize/refill + SFA.
+LIM: native fused LI/manage + native plan consumption + SFA.
+Both use BF16, the same prefix/tail selection policy, and real registered DRAM.
+Timing includes each layer's new-token D2H, selection, KV copies/refill, tail and
+SFA. It excludes projections, model weights, scheduler, sampling and TP traffic.
+Both paths reuse indexing in four-layer IndexShare cases.
+
+Each captured graph contains eight BA pairs (16 decode steps); 50 replays per
+round, seven rounds in alternating mode order. Report all-round medians without
+outlier removal. Units are microseconds per batch decode step, not per token.
+L is the prefix length. Tail=128 for L=8192 and 1 otherwise. All-hit is a
+constructed control; scattered hotsets expose native/reference policy differences.
+
+B   L       C     layers  hit% ref/LIM     ref us   LIM us   latency change
+1   32768   2048  1       93.75/93.75      528.43   611.63   +15.74%
+1   32768   2048  1       50.00/50.00      528.02   726.86   +37.66%
+4   32768   2048  1       93.75/93.75      771.72   894.44   +15.90%
+4   8192    2048  1       50.00/50.00     1008.40  1033.37    +2.48%
+4   32768   4096  1      100.00/81.29     1349.17  1233.86    -8.55%
+1   32768   4096  4      100.00/98.29     2628.33  1532.41   -41.70%
+4   32768   4096  1      100.00/100.00    1345.67   711.39   -47.14%
+1   32768   4096  4      100.00/100.00    2591.79  1445.07   -44.24%
+4   131072  4096  1      100.00/100.00    1504.33   884.76   -41.19%
+
+All nine passed correctness checks. Across 83 full process-table samples, no
+foreign process was observed on the target device; the host was still shared.
+Earlier contended measurements are excluded. Full raw evidence remains in the
+local task's analysis/lim_benefit_151_20261020 directory, outside this code commit.
+
+Real persistent tensor-storage audit: B=1, two request rows including padding,
+source capacity 32896, four layers, C=4096. Resident main KV: 36 MiB; total
+manager plus separately reserved key-scale: 47.48 MiB; a separately allocated
+full main-KV buffer of the same dimensions: 289.12 MiB. The reduction is 83.58%
+against full main KV alone, not process/model peak HBM. Four audited C/layer
+configurations matched the allocation budget after separating key-scale bytes.
+
+The production shm allocator returned ret=-4 on this machine. Benchmarks
+explicitly replace only the host-registration boundary with an ACL registered-
+host helper, identically for both modes. Production has no automatic fallback.
+This does not validate the target SHMEM backend or vLLM MemFabric/GVA costs.
+
+Current native copy dependency is LIM -> host misses into resident -> selected
+gather -> visible tail -> SFA, ordered on the current NPU stream. Copy-SFA's
+internal transfer/attention pipeline is not integrated, so these gains do not
+prove H2D is hidden. Graph replay also excludes Python forward interpretation;
+do not attribute the measured difference to Python interpreter time alone.
+
+Validation and reproduction
+---------------------------
+After porting onto this main, all 14 CPU boundary tests passed again. The 18
+changed Python files pass repository Ruff rules, Ruff format, and isort checks.
+The original three CPU state-contract checks and NPU measurements above retain
+their measured-base provenance; complete-model accuracy remains unverified.
+
+CPU-only boundary tests:
+  python test/manual/npu/test_sparse_kv_offload_cache.py
+Installed SGLang CPU state contracts:
+  python -m pytest test/registered/unit/hardware_backend/test_npu_lim_state.py -q
+
+NPU fixed-input runner: benchmark/hisparse/bench_lim_framework.py
+Dynamic graph check: benchmark/hisparse/check_lim_graph_transitions.py
+151 container runner: benchmark/hisparse/run_lim_151.sh
+151 monitored A/B matrix: benchmark/hisparse/run_lim_benefit_151.py
+
+The 151 runners require staged source, the existing container/native library,
+and the external registered-host helper. Inspect their defaults or override
+TASK_ROOT/CONTAINER/NPU_DEVICE/PROBE_ROOT and --task-root as appropriate. They do
+not install dependencies or replace a production SGLang installation.
+
+Keep this feature experimental pending complete-model quality/serving tests.
+The C=2048 regressions and native-vs-LRU miss differences are material limits.

@@ -10,6 +10,7 @@ import torch_npu
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
+    unidex_copy_inplace,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -76,19 +77,16 @@ def forward_sparsity_driven_kv_offload(
             forward_batch.forward_mode.is_draft_extend_v2()
             or forward_batch.forward_mode.is_target_verify()
         ):
-            actual_seq_qlen = (
-                torch.arange(
-                    backend.speculative_num_draft_tokens,
-                    backend.speculative_num_draft_tokens + q.shape[0],
-                    backend.speculative_num_draft_tokens,
-                    dtype=torch.int32,
-                )
-                .to(q.device)
-                .to(torch.int32)
+            actual_seq_qlen = torch.arange(
+                backend.speculative_num_draft_tokens,
+                backend.speculative_num_draft_tokens + q.shape[0],
+                backend.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=q_nope.device,
             )
         else:
-            actual_seq_qlen = (
-                torch.arange(1, q.shape[0] + 1).to(q.device).to(torch.int32)
+            actual_seq_qlen = torch.arange(
+                1, q.shape[0] + 1, device=q_nope.device, dtype=torch.int32
             )
     else:
         actual_seq_qlen = backend.forward_metadata.actual_seq_lengths_q
@@ -161,30 +159,55 @@ def forward_sparsity_driven_kv_offload(
         # device-cache hits and host misses are copied into this buffer, the
         # device cache is refilled from it, and sparse attention consumes it
         # directly.
-        selected_kv_buffer = torch.zeros(
-            (
-                batch_size,
-                selected_kv_length,
-                num_kv_heads,
-                nope_head_dim + rope_head_dim,
-            ),
-            dtype=k.dtype,
-            device=backend.device,
-        )
-        sparse_kv_manager.materialize_selected_kv(
-            layer, forward_batch, topk_indices, selected_kv_buffer, stream
-        )
+        selected_kv_buffer = sparse_kv_manager.selected_kv_buffer[:batch_size]
+        selected_kv_buffer.zero_()
+        adapter = sparse_kv_manager.lim_adapter
+        if adapter is not None and adapter.is_native:
+            plan = backend.forward_metadata.sparse_kv_lim_plan
+            if plan is None:
+                raise RuntimeError(
+                    "LIM attention has no anchor plan; an indexer must precede IndexShare layers."
+                )
+            adapter.materialize(
+                sparse_kv_manager,
+                plan,
+                layer.layer_id - sparse_kv_manager.start_layer,
+                selected_kv_buffer,
+                stream,
+                copy=unidex_copy_inplace,
+            )
+        else:
+            sparse_kv_manager.materialize_selected_kv(
+                layer, forward_batch, topk_2d, selected_kv_buffer, stream
+            )
 
-        _wait_stream_event(stream, sparse_kv_manager.hit_done)
         _wait_stream_event(stream, sparse_kv_manager.miss_done)
+        if adapter is not None:
+            plan = backend.forward_metadata.sparse_kv_lim_plan
+            if plan is None:
+                raise RuntimeError(
+                    "Experimental prefix/tail attention requires an indexer plan."
+                )
+            selected_kv_buffer, topk_2d = adapter.append_tail(
+                sparse_kv_manager,
+                plan,
+                layer.layer_id - sparse_kv_manager.start_layer,
+                selected_kv_buffer,
+                copy=unidex_copy_inplace,
+            )
+            selected_kv_length = adapter.width
 
         selected_k_nope, selected_k_rope = selected_kv_buffer.split(
             [nope_head_dim, rope_head_dim], dim=-1
         )
 
-        topk_valid = topk_2d >= 0
+        topk_valid = (topk_2d >= 0) & (topk_2d < sparse_kv_manager.max_context_len)
         if forward_batch.seq_lens is not None:
-            valid_rows = (forward_batch.seq_lens[:batch_size] > 0).view(batch_size, 1)
+            valid_rows = (
+                (forward_batch.seq_lens[:batch_size] > 0)
+                & (forward_batch.req_pool_indices[:batch_size] > 0)
+                & (forward_batch.req_pool_indices[:batch_size] < sparse_kv_manager.size)
+            ).view(batch_size, 1)
             topk_valid = topk_valid & valid_rows
 
         actual_seq_lengths_kv = (
@@ -276,7 +299,6 @@ def forward_sparsity_driven_kv_offload(
         )
 
         _wait_stream_event(stream, sparse_kv_manager.refill_done)
-        _wait_stream_event(stream, sparse_kv_manager.slot_map_done)
 
         attn_out = ret[0] if isinstance(ret, tuple) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(
