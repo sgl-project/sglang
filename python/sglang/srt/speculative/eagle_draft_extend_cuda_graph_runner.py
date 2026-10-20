@@ -295,6 +295,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
+        # the batch sizes whose graphs run the draft megakernel's draft_extend
+        self.megakernel = self.eagle_worker.megakernel
+        self.megakernel_served = (
+            frozenset()
+            if self.megakernel is None
+            else self.megakernel.bind_extend_graphs(self)
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -454,6 +461,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_info.dsa_seed_topk_capture = self.buffers.dsa_seed_topk_capture[
                 :num_tokens
             ]
+        served = bs in self.megakernel_served
 
         def run_once():
             self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -467,6 +475,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            if served:
+                return self.megakernel.run_draft_extend(
+                    runner=self, forward_batch=forward_batch
+                )
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
@@ -681,7 +693,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             self._publish_read_done(in_graph=False)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
+            # None when the megakernel's draft_extend kept the logits
+            next_token_logits=(
+                None
+                if out.next_token_logits is None
+                else out.next_token_logits[:raw_bs]
+            ),
             # CUDA graph replay reuses its captured output storage. These states
             # survive into the next draft step, so detach them from that buffer.
             hidden_states=out.hidden_states[:raw_bs].clone(),

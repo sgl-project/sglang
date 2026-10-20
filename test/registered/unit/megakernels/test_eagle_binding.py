@@ -1,12 +1,14 @@
-"""CPU contract of the EAGLE binding: a covered step's view is the running forward's
-own attention metadata and pools, read from a hybrid GDN backend; the pools are
-sealed at their first read and checked after capture; every struct carries data
-only; the tolerated lists name real members."""
+"""CPU contracts of the EAGLE binding and of SGLang's side of the EAGLE entries: a
+covered step's view is the running forward's own metadata and pools, sealed at their
+first read and checked after capture; the structs carry data only and the tolerated
+lists name real members; offered entries run only at the batch sizes every rank
+serves, an unservable setup is refused, and without an offer SGLang's path runs."""
 
+import contextlib
 import typing
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import torch
@@ -19,6 +21,8 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.megakernels import eagle_binding as eb
 from sglang.srt.megakernels import runtime
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
+from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -78,6 +82,7 @@ def _trtllm(pool):
         forward_metadata=metadata,
         token_to_kv_pool=pool,
         data_type=torch.bfloat16,
+        use_sliding_window_kv_pool=False,
     )
 
 
@@ -105,6 +110,87 @@ def _hybrid():
 def _view(binding, backend):
     with patch.object(eb, "get_attn_backend", return_value=backend):
         return binding.forward_view()
+
+
+def _model(**entries):
+    """A model whose built megakernel offers these entries."""
+    model = torch.nn.Module()
+    model.__dict__["_megakernel"] = SimpleNamespace(widths=(), **entries)
+    return model
+
+
+def _megakernel(**entries):
+    """SGLang's side of a draft offering these entries."""
+    return EagleMegakernel(
+        draft_worker=SimpleNamespace(
+            draft_runner=SimpleNamespace(
+                model=_model(**entries),
+                model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
+            )
+        ),
+    )
+
+
+def _init(
+    *,
+    draft=None,
+    enabled=True,
+    topk=1,
+    num_steps=2,
+    rejection_sampling=False,
+    dp_attention=False,
+    target_backend=None,
+    draft_backend=None,
+):
+    """init_eagle_megakernel, with --enable-nvidia-megakernel unless enabled is False,
+    for a draft worker whose model's megakernel offers these entries; by default its
+    target runs GDN and trtllm_mha under a hybrid backend and its draft trtllm_mha."""
+    if draft_backend is None:
+        draft_backend = _trtllm(KvPool())
+    draft_worker = SimpleNamespace(
+        topk=topk,
+        target_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                attn_backend=_hybrid() if target_backend is None else target_backend
+            ),
+        ),
+        draft_runner=SimpleNamespace(
+            model=_model(**(draft or {})),
+            model_config=None,
+            attn_backend=draft_backend,
+        ),
+        # DraftBackendFactory builds no multi-step backend for one step
+        draft_attn_backend=(
+            SimpleNamespace(attn_backends=(draft_backend,)) if num_steps > 1 else None
+        ),
+        draft_extend_attn_backend=None,
+    )
+    spec = SimpleNamespace(speculative_use_rejection_sampling=rejection_sampling)
+    parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
+    with (
+        patch.object(eagle_megakernel, "megakernel_enabled", return_value=enabled),
+        patch.object(eagle_megakernel, "get_spec", return_value=spec),
+        patch.object(eagle_megakernel, "get_parallel", return_value=parallel),
+    ):
+        return eagle_megakernel.init_eagle_megakernel(draft_worker=draft_worker)
+
+
+def _ranks(other=None):
+    """megakernel_agree's gather as rank 0 of two ranks; other maps this rank's value
+    to rank 1's, by default the same."""
+    return patch.object(
+        runtime,
+        "_gather_tp",
+        side_effect=lambda value, group=None: [
+            value,
+            value if other is None else other(value),
+        ],
+    )
+
+
+def _batch(*rids):
+    reqs = [SimpleNamespace(rid=rid) for rid in rids]
+    return SimpleNamespace(reqs=reqs, seq_lens=torch.zeros(len(rids)))
 
 
 def _leaves(hint):
@@ -170,6 +256,172 @@ class TestEagleBinding(CustomTestCase):
             for field, hint in typing.get_type_hints(cls).items():
                 for leaf in _leaves(hint):
                     self.assertIn(leaf, allowed, f"{cls.__name__}.{field}")
+
+
+class TestEagleEntries(CustomTestCase):
+    def test_without_the_flag_or_an_offered_entry_sglang_keeps_its_own_path(self):
+        self.assertIsNone(_init())
+        self.assertIsNone(_init(draft={"draft_loop": print}, enabled=False))
+        self.assertIsInstance(_init(draft={"draft_loop": print}), EagleMegakernel)
+        runner = SimpleNamespace(capture_bs=[1, 2])
+        self.assertEqual(_megakernel().bind_draft_graphs(runner), frozenset())
+
+    def test_every_unservable_setup_is_refused_before_any_capture(self):
+        """The entries hand over a multi-step topk-1 chain's trtllm_mha and GDN
+        metadata for this rank's own batch; any other setup is refused at startup,
+        with all its reasons."""
+        offer = {"draft_loop": print}
+        sliding = _hybrid()
+        sliding.full_attn_backend.use_sliding_window_kv_pool = True
+        with self.assertRaises(ValueError) as refused:
+            _init(
+                draft=offer,
+                topk=2,
+                rejection_sampling=True,
+                dp_attention=True,
+                target_backend=sliding,
+                draft_backend=SimpleNamespace(),
+            )
+        for reason in (
+            "chain draft (topk 1)",
+            "rejection sampling",
+            "DP attention",
+            "sliding-window pool",
+            "the draft must run trtllm_mha, not SimpleNamespace",
+        ):
+            self.assertIn(reason, str(refused.exception))
+        with self.assertRaisesRegex(ValueError, "hybrid .* not TRTLLMHAAttnBackend"):
+            _init(draft=offer, target_backend=_trtllm(KvPool()))
+        with self.assertRaisesRegex(ValueError, "multi-step draft"):
+            _init(draft={"draft_extend": print}, num_steps=1)
+
+    def test_the_draft_worker_takes_its_megakernel_once_both_backends_exist(self):
+        """The draft's graph runners read the worker's megakernel when they capture,
+        and its init reads both of the draft's attention backends:
+        init_attention_backends sets it once both exist."""
+        order = MagicMock()
+        worker = eagle_worker_v2.EagleDraftWorker.__new__(
+            eagle_worker_v2.EagleDraftWorker
+        )
+        worker.__dict__.update(
+            draft_owns_attention=False,
+            draft_worker=order.draft_worker,
+            init_attention_backend=order.init_attention_backend,
+        )
+        # the PP and MoE contexts read process groups and runtime flags a CPU test lacks
+        with (
+            patch.object(eagle_worker_v2, "draft_pp_context", contextlib.nullcontext),
+            patch.object(
+                eagle_worker_v2,
+                "speculative_moe_backend_context",
+                contextlib.nullcontext,
+            ),
+            patch.object(
+                eagle_worker_v2,
+                "speculative_moe_a2a_backend_context",
+                contextlib.nullcontext,
+            ),
+            patch.object(
+                eagle_megakernel, "init_eagle_megakernel", order.init_eagle_megakernel
+            ),
+        ):
+            worker.init_attention_backends()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.draft_worker.init_attention_backends(),
+                call.init_attention_backend(),
+                call.init_eagle_megakernel(draft_worker=worker),
+            ],
+        )
+        self.assertIs(worker.megakernel, order.init_eagle_megakernel.return_value)
+
+    def test_each_factory_runs_once_and_serves_only_what_every_rank_serves(self):
+        """A rank on SGLang's code at a batch size would wait in collectives the
+        entry's step skips, so a size not every rank serves must be refused."""
+        calls = []
+
+        def factory(**buffers):
+            calls.append(buffers)
+            return lambda bs: print if bs <= 2 else None
+
+        mk = _megakernel(draft_loop=factory, draft_extend=factory)
+        draft_runner = SimpleNamespace(
+            max_bs=4, speculative_num_steps=3, device="cpu", capture_bs=[1, 2, 4]
+        )
+        extend_runner = SimpleNamespace(
+            max_bs=4, captured_req_width=7, device="cpu", capture_bs=[1, 2, 4]
+        )
+        with _ranks():
+            self.assertEqual(mk.bind_draft_graphs(draft_runner), {1, 2})
+            self.assertEqual(mk.bind_extend_graphs(extend_runner), {1, 2})
+        loop, extend = calls
+        self.assertEqual(loop["draft_tokens"].shape, (4, 3))
+        self.assertEqual((loop["num_steps"], loop["max_bs"]), (3, 4))
+        self.assertEqual((extend["tokens_per_request"], extend["max_bs"]), (7, 4))
+        self.assertEqual(extend["hidden"].shape, (4, 4))
+        with (
+            _ranks(lambda sizes: sizes[:1]),
+            self.assertRaisesRegex(RuntimeError, "draft_loop batch sizes differ"),
+        ):
+            mk.bind_draft_graphs(draft_runner)
+
+    def test_a_draft_round_reuses_a_served_extend_only_for_the_input_it_made(self):
+        """The megakernel may reuse what its draft extend left behind only when that
+        extend produced this round's input: not after another extend, not for other
+        requests (a PD decode instance's first round), and only once. The extend's
+        tokens are SGLang's own copy, which the next replay leaves alone."""
+        rounds, outs = [], {}
+
+        def draft_extend(**buffers):
+            outs.update(buffers)
+            return lambda bs: print if bs == 1 else None
+
+        mk = _megakernel(
+            draft_loop=lambda **_: lambda bs: print if bs == 1 else None,
+            draft_extend=draft_extend,
+            begin_draft_round=rounds.append,
+        )
+        draft_runner = SimpleNamespace(
+            max_bs=2, speculative_num_steps=3, device="cpu", capture_bs=[1, 2]
+        )
+        extend_runner = SimpleNamespace(
+            max_bs=2, captured_req_width=4, device="cpu", capture_bs=[1, 2]
+        )
+        with _ranks():
+            mk.bind_draft_graphs(draft_runner)
+            mk.bind_extend_graphs(extend_runner)
+        draft_input = SimpleNamespace(
+            topk_index=torch.zeros((1, 1), dtype=torch.int64),
+            hidden_states=torch.zeros((1, 4)),
+        )
+
+        def served_extend(*rids):
+            mk.note_draft_extend()
+            extend_runner.bs = extend_runner.raw_bs = len(rids)
+            return mk.extend_tokens(runner=extend_runner, batch=_batch(*rids))
+
+        def begin(*rids):
+            mk.begin_draft_round(
+                runner=draft_runner, batch=_batch(*rids), draft_input=draft_input
+            )
+            return rounds[-1].from_served_extend
+
+        outs["topk_index"][0] = 5  # what the extend's replay wrote
+        _, topk_index = served_extend("a")
+        outs["topk_index"].zero_()  # the next replay rewrites it
+        self.assertEqual(topk_index.tolist(), [[5]])
+        self.assertTrue(begin("a"))
+        self.assertFalse(begin("a"))
+        served_extend("a")
+        mk.note_draft_extend()  # an extend the megakernel did not serve
+        self.assertFalse(begin("a"))
+        served_extend("a")
+        self.assertFalse(begin("b"))
+        calls = len(rounds)
+        begin("a", "b")
+        self.assertEqual(len(rounds), calls)  # batch size 2 is not served
+        self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
 
 
 if __name__ == "__main__":

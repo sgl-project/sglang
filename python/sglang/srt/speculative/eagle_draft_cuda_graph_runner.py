@@ -277,6 +277,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
+        # the batch sizes whose graphs run the draft megakernel's draft_loop
+        self.megakernel = eagle_worker.megakernel
+        self.megakernel_served = (
+            frozenset()
+            if self.megakernel is None
+            else self.megakernel.bind_draft_graphs(self)
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -486,6 +493,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
+        served = num_seqs in self.megakernel_served
 
         def run_once():
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -498,6 +506,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
+            if served:
+                # leaves positions as they are, so nothing is subtracted after it
+                return self.megakernel.run_draft_loop(
+                    runner=self, forward_batch=forward_batch
+                )
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
