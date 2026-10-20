@@ -803,6 +803,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "pp_size": self.pp_size,
             },
         }
+        # Keys embed the pp/tp rank here and one scheduler cannot list every rank's
+        # objects, so these stay unsupported until the layout enumerates ranks.
         if self.pp_size != 1 or not self.is_mla_backend:
             layout.update(
                 enabled=False,
