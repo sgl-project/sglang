@@ -6,16 +6,17 @@ use crate::config::Config;
 use crate::discovery::ModelId;
 
 use crate::policies::buckets::BucketSelector;
-use crate::policies::prefix_provider::RadixTreePrefixProvider;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
-use crate::state::kv_events::{BlockSizeOracle, KvEventIndex, KvIndexMetrics};
+use crate::state::kv_events::{
+    BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
+};
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadRegistry;
 use crate::tokenizer::TokenizerRegistry;
-use crate::workers::WorkerRegistry;
+use crate::workers::{DecodeGate, WorkerRegistry};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -38,6 +39,16 @@ pub enum ChatRouting {
     Reorg(HashMap<ModelId, BucketResolver>),
 }
 
+impl ChatRouting {
+    /// Whether the built routing reads request tokens; `legacy` holds the legacy policies.
+    pub fn needs_request_tokens(&self, legacy: &PolicyRegistry) -> bool {
+        match self {
+            Self::Legacy => legacy.needs_request_tokens(),
+            Self::Reorg(resolvers) => resolvers.values().any(BucketResolver::needs_request_tokens),
+        }
+    }
+}
+
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -51,6 +62,7 @@ pub struct AppContext {
     /// Per-worker active-load bookkeeping shared by the proxy, policies,
     /// timeout janitor, and metrics.
     pub router_inflight_load: Arc<RouterInflightLoadRegistry>,
+    pub decode_gate: DecodeGate,
     /// Lightweight Prometheus-format metrics registry served via
     /// `/metrics`. Shared with the edge middleware (requests_total /
     /// responses_total), the chat handler (worker_requests_total), the
@@ -60,6 +72,8 @@ pub struct AppContext {
     pub engine_reported_load: Arc<EngineReportedLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
     pub radix_tree_prefix_provider: Option<RadixTreePrefixProvider>,
+    /// Local KV tree for `--dp-aware` rank selection, under any policy.
+    pub dp_rank_prefix_provider: Option<RadixTreePrefixProvider>,
     pub block_size_oracle: Arc<BlockSizeOracle>,
     /// Read-only handles `/metrics` pulls the KV storage-tier series from on
     /// scrape. `None` when this router maintains no local tree (external
@@ -116,6 +130,7 @@ impl AppContext {
         // it here for policies that emit their own counters.
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
+        let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
         Self {
             config,
             tokenizers,
@@ -125,9 +140,11 @@ impl AppContext {
             bucket_selector,
             chat_routing: ChatRouting::Legacy,
             router_inflight_load,
+            decode_gate,
             metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
+            dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
             kv_index: None,
@@ -135,6 +152,15 @@ impl AppContext {
             inflight_http: InflightHttp::new(),
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
+    }
+
+    /// Readiness conditions 3 and 4, via
+    /// [`BootstrapTracker::admit_ready`](crate::state::kv_events::BootstrapTracker::admit_ready).
+    /// Always true when this router holds no KV index.
+    pub fn kv_bootstrap_admit_ready(&self) -> bool {
+        self.kv_index
+            .as_ref()
+            .is_none_or(|idx| idx.bootstrap().admit_ready())
     }
 
     /// Report bootstrap as finished, unless the pod has already begun draining.
@@ -188,12 +214,16 @@ impl AppContext {
                 observability: Default::default(),
                 model: crate::config::ModelConfig {
                     id: "stub-model".into(),
-                    tokenizer_path: "stub".into(),
+                    tokenizer_path: Some("stub".into()),
                     disable_input_ids_forwarding: false,
                     tokenizer: Default::default(),
                     policy: crate::config::PolicyKind::RoundRobin,
                     decode_policy: Default::default(),
+                    dp_aware: false,
+                    dp_rank_policy: Default::default(),
                     bucket_config: None,
+                    reorg_buckets: None,
+                    reorg_admission: Default::default(),
                     circuit_breaker: None,
                     cache_aware: None,
                     sticky: None,
@@ -218,9 +248,11 @@ impl AppContext {
             bucket_selector: Arc::new(BucketSelector::new(None)),
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
+            decode_gate: DecodeGate::new(None),
             metrics: MetricsRegistry::new(),
             prefix_index: None,
             radix_tree_prefix_provider: None,
+            dp_rank_prefix_provider: None,
             block_size_oracle: BlockSizeOracle::new(),
             kv_metrics: None,
             kv_index: None,

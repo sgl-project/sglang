@@ -1744,7 +1744,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         try:
             parallel = get_parallel()
-            info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
+            info["attn_dp_enabled"] = self._dp_attn.is_dp_attention_enabled()
             info["attn_tp_rank"] = parallel.attn_tp_rank
             info["attn_tp_size"] = parallel.attn_tp_size
             info["attn_dp_rank"] = parallel.attn_dp_rank

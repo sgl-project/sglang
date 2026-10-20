@@ -7,6 +7,9 @@
 /python/sglang/kernels @DarkSharpness @HaiShaw @BBuf @celve @HydraQYH @yuan-luo
 /python/sglang/kernels/ops/diffusion @yingluosanqian @BBuf @mickqian @triple-mu @niehen6174
 /python/sglang/kernels/ops/attention/fla @yizhang2077 @hebiao064 @yuan-luo
+/python/sglang/kernels/ops/attention/linear @yizhang2077 @hebiao064 @yuan-luo
+/python/sglang/kernels/ops/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
+/python/sglang/kernels/jit/csrc/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers/quantization/ @HaiShaw @BowenBao @OrangeRedeng @TallMessiWu
@@ -74,8 +77,11 @@
 /python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
-/rust/sglang-radix-tree @Jialin @hzh0425 @xiezhq-hermann @ispobock @alphabetc1
-/rust/sglang-renderer @sagearc
+/rust/sglang-grpc @alexnails @ishandhanani
+/rust/sglang-mm @sherlockwu @merrymercy
+/rust/sglang-processor @sagearc @sherlockwu
+/rust/sglang-radix-tree @Jialin @alphabetc1
+/rust/sglang-server @rainj-me @merrymercy
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
@@ -102,6 +108,7 @@
 /python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/speculative/frozen_kv_mtp_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl @pyc96
 /python/sglang/kernels/ops/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/kernels/ops/embeddings/ngram_embedding.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/kernels/jit/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator

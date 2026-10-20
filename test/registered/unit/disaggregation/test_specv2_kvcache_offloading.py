@@ -39,7 +39,7 @@ def _make_mock_req(
     req_pool_idx: int,
     kv_committed_len: int,
     kv_allocated_len: int,
-    prefix_indices_len: int = 0,
+    prefix_len: int = 0,
     rid: int = 0,
     origin_len: int = 0,
 ):
@@ -54,7 +54,7 @@ def _make_mock_req(
         kv_committed_len=kv_committed_len,
         kv_allocated_len=kv_allocated_len,
     )
-    req.prefix_indices = list(range(prefix_indices_len))
+    req.prefix_len = prefix_len
     req.owned_kv_len = lambda: req.kv.kv_committed_len
     return req
 
@@ -202,13 +202,15 @@ class TestReleaseFinishedReq(unittest.TestCase):
             req_pool_idx=0,
             kv_committed_len=20,
             kv_allocated_len=20,
-            prefix_indices_len=5,
+            prefix_len=5,
         )
         req.kv.cache_protected_len = 5
+        lock = req.lock
 
         manager._release_finished_req(req)
 
-        manager.tree_cache.unpin.assert_called_once_with(req)
+        manager.tree_cache.unlock.assert_called_once_with(lock)
+        self.assertIsNone(req.lock)
         self.assertTrue(torch.equal(freed[0], torch.arange(5, 20, dtype=torch.int64)))
 
     def test_release_finished_req_frees_prefill_and_pops_state(self):
