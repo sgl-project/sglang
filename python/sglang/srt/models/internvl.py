@@ -741,9 +741,7 @@ class InternVLChatModel(nn.Module):
                         (name[len("language_model.") :], loaded_weight)
                     )
                 else:
-                    other_weights.append(
-                        (name, _own_if_runai_streamed(loaded_weight))
-                    )
+                    other_weights.append((name, _own_if_runai_streamed(loaded_weight)))
 
             language_iter = iter(language_weights)
             self.language_model.load_weights(language_iter)
