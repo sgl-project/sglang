@@ -13,6 +13,7 @@ from sglang.srt.batch_overlap.operations import (
     execute_overlapped_operations,
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.layer_boundary import (
     Layout,
@@ -338,6 +339,22 @@ def compute_split_indices_for_cuda_graph_replay(
 # -------------------------------- Preparation ---------------------------------------
 
 
+def _verify_input_blocks_split(batch) -> bool:
+    """split_spec_info only knows EagleVerifyInput. Spec-v2 workers turn the
+    scheduled DECODE batch into TARGET_VERIFY after the scheduler picked a split,
+    and an idle DP rank joins that step as IDLE (or TARGET_VERIFY) carrying the
+    same kind of verify input. When that input cannot be split (e.g. DSpark's
+    DFlashVerifyInput), every rank of the step must run it without TBO so the
+    MoE collectives still pair up."""
+    spec_info = batch.spec_info
+    return (
+        (batch.forward_mode.is_target_verify() or batch.forward_mode.is_idle())
+        and spec_info is not None
+        and spec_info.is_verify_input()
+        and not hasattr(spec_info, "retrieve_index")
+    )
+
+
 class TboCudaGraphRunnerPlugin:
     def __init__(self):
         self._tbo_children_num_token_non_padded = torch.zeros(
@@ -345,7 +362,7 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        if not is_tbo_enabled() or _verify_input_blocks_split(batch):
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -403,6 +420,7 @@ class TboDPAttentionPreparer:
 
         deepep_mode = get_deepep_mode()
         enable_a2a_moe = not get_moe_a2a_backend().is_none()
+        ll_supports_extend = get_moe_a2a_backend().low_latency_supports_extend()
         enable_two_batch_overlap = is_tbo_enabled()
 
         self.enable_two_batch_overlap = enable_two_batch_overlap
@@ -442,8 +460,18 @@ class TboDPAttentionPreparer:
                     and not local_batch.forward_mode.is_target_verify()
                 )
                 and enable_a2a_moe
+                and not ll_supports_extend
                 and (resolved_deepep_mode.is_low_latency())
             )
+            if (
+                local_can_run_tbo
+                and local_batch.forward_mode.is_extend()
+                and not local_batch.forward_mode.is_target_verify()
+                and num_tokens < envs.SGLANG_TBO_MIN_EXTEND_TOKENS.get()
+            ):
+                # Halving a short prefill doubles its kernel launches and buys no
+                # overlap; one such rank keeps the whole step unsplit.
+                local_can_run_tbo = False
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -507,6 +535,9 @@ class TboForwardBatchPreparer:
     @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
         if batch.tbo_split_seq_index is None or is_draft_worker:
+            return
+        if _verify_input_blocks_split(batch):
+            batch.tbo_split_seq_index = None
             return
 
         tbo_children_num_token_non_padded = (
@@ -1185,7 +1216,11 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         return self._inners[0].expert_mask_gpu
 
     def _execute(self, name, tbo_subbatch_index: Optional[int] = None, **kwargs):
-        return getattr(self._inners[tbo_subbatch_index or 0], name)(**kwargs)
+        inner = self._inners[tbo_subbatch_index or 0]
+        # Tells the dispatcher whether this call belongs to a TBO micro-batch, so
+        # TBO-only settings stay off the ordinary forwards of a TBO-enabled server.
+        inner.tbo_subbatch_active = tbo_subbatch_index is not None
+        return getattr(inner, name)(**kwargs)
 
     def dispatch(self, **kwargs) -> DispatchOutput:
         return self._execute("dispatch", **kwargs)

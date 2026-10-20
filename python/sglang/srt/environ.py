@@ -501,6 +501,8 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Prefill batches with fewer tokens on any DP rank run without TBO.
+    SGLANG_TBO_MIN_EXTEND_TOKENS = EnvInt(0)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
@@ -896,6 +898,9 @@ class Envs:
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
+    # Native EPv2 with TBO caps the dispatch/combine grid to leave CUs to the sibling
+    # micro-batch; false keeps MORI's own launch geometry.
+    SGLANG_MORI_EPV2_TBO_GRID_CAP = EnvBool(True)
 
     # ===================================================================
     # AMD, ROCm, and AITER

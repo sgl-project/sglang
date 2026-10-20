@@ -258,7 +258,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
+        # A draft worker never runs TBO (no TBO attention backend, no split), so its
+        # graphs must not wait for can_run_tbo: DSpark's draft steps otherwise never
+        # replay a graph and fall back to eager.
+        self.enable_two_batch_overlap = (
+            get_exec().overlap.enable_two_batch_overlap
+            and not model_runner.is_draft_worker
+        )
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
@@ -1254,7 +1260,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            if self.enable_two_batch_overlap:
+                self.tbo_plugin.capture_one_batch_size(
+                    forward_batch, num_tokens=num_tokens
+                )
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
