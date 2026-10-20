@@ -149,7 +149,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.scale_residual_norm_scale_shift_nvfp4",
-        KernelBackend.JIT,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.norm_scale_shift_jit:try_fused_scale_residual_norm_scale_shift_nvfp4",
         _CUDA,
     ),
@@ -173,13 +173,13 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.layernorm_modulate",
-        KernelBackend.TRITON,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_layernorm_modulate",
         _CUDA,
     ),
     (
         "diffusion.qk_head_layernorm",
-        KernelBackend.TRITON,
+        KernelBackend.KDA,
         "sglang.kernels.kda_kernels.layernorm_modulate_triton:fused_qk_head_layernorm",
         _CUDA,
     ),

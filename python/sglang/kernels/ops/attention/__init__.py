@@ -75,7 +75,7 @@ del _mod, _fn
 register_kernel(
     KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
-        backend=KernelBackend.TRITON,
+        backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 1), max_sm=(12, 1))}
@@ -123,7 +123,7 @@ def qwen38_qsa_sm121_varlen(
             "unsupported SM121 QSA call: expected BF16 D=256, 12:1 GQA, "
             "TP1 24Q/2KV or TP2 12Q/1KV, bs<=128, and selected KV<=2055"
         )
-    return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.TRITON)(
+    return get_kernel("attention.kda_qwen38_qsa_sm121", KernelBackend.KDA)(
         q,
         k,
         v,
