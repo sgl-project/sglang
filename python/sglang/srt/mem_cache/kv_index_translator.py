@@ -67,7 +67,7 @@ from typing import Dict, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.kv_indices import (
+from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
