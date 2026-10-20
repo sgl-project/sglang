@@ -74,7 +74,10 @@ class _DSV41FlashLinkerServer:
                 json.dumps({"enable_group_semantics": True}),
                 *cls.extra_args,
             ],
-            env=cls.mooncake.server_env(),
+            env={
+                **cls.mooncake.server_env(),
+                "SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS": "0",
+            },
         )
         cls.addClassCleanup(terminate_and_kill_process_tree, cls.process)
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
