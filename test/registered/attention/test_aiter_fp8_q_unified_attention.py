@@ -170,7 +170,6 @@ class TestAiterFP8QUnifiedAttention(CustomTestCase):
                     req_pool_indices=req_pool_indices,
                     seq_lens=seq_lens,
                     seq_lens_sum=int(seq_lens.sum().item()),
-                    encoder_lens=None,
                     forward_mode=ForwardMode.DECODE,
                     spec_info=None,
                     seq_lens_cpu=seq_lens.cpu(),
