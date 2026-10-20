@@ -1808,6 +1808,9 @@ class Envs:
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
     SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(False)
+    # DSpark static verify: run the target verify runner's metadata prep through the
+    # metadata glue graph where its backend declares the prep host-free.
+    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

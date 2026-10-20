@@ -1351,6 +1351,22 @@ class DeepseekV4AttnBackend(
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
         return pin_tensor.to(self.device, non_blocking=True)
 
+    def glue_target_verify_metadata(self) -> str:
+        # The static target verify prep reads the runner's slots and own buffers only;
+        # host lengths, online c128 MTP, trtllm, a request window and CP are unaudited.
+        for bad, why in (
+            (self.is_draft_runner, "a draft runner"),
+            (self.needs_cpu_seq_lens, "host sequence lengths"),
+            (self.trtllm_attn, "trtllm-gen attention"),
+            (self.online_c128_mtp.enabled(), "online c128 MTP"),
+            (read_ragged_verify_mode() is not RaggedVerifyMode.STATIC, "ragged verify"),
+            (self.token_to_kv_pool.request_window is not None, "a request window"),
+            (get_parallel().attn_cp_size != 1, "context parallelism"),
+        ):
+            if bad:
+                return why
+        return ""
+
     def glue_draft_metadata(self) -> str:
         # On FlashMLA without online c128 MTP, a request window or context
         # parallelism, the DSpark draft block prep launches only device work whose
