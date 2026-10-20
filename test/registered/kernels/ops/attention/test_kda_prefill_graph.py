@@ -91,6 +91,9 @@ def _batch(extend_lens, prefix_lens, track=None):
     starts = [sum(extend_lens[:i]) for i in range(bs)]
     batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
+        # Nothing here relabels a decode batch as a 1-token extend, so the
+        # logical mode is just the forward mode.
+        logical_forward_mode=ForwardMode.EXTEND,
         batch_size=bs,
         _original_batch_size=None,
         req_pool_indices=torch.arange(bs, device=dev),
