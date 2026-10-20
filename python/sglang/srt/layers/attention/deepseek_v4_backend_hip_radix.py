@@ -622,7 +622,9 @@ class DSV4AttnMetadata:
                 compute_page_indices=True,
             )
             self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
-        self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+        # its builders already pad it; F.pad copies even with nothing to pad
+        if self.swa_page_indices.shape[-1] % PAGE_INDEX_ALIGNED_SIZE:
+            self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if unified_swa_pages:
             if self.unified is None:
