@@ -29,6 +29,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -403,6 +405,52 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
                     layout.qo_indptr_device, expected.qo_indptr_device
                 )
                 torch.testing.assert_close(layout.verify_lens, expected.verify_lens)
+
+
+class TestSkipPrefilledInputs(CustomTestCase):
+    """SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: a pre-planned verify replay skips
+    re-copying input_ids / positions only when they are the very tensors the plan-time
+    load copied; any other source, even with equal values, is copied."""
+
+    def _runner(self):
+        r = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        r.buffers = SimpleNamespace(
+            input_ids=torch.full((8,), -1, dtype=torch.int64),
+            positions=torch.full((8,), -1, dtype=torch.int64),
+        )
+        r.raw_num_token = 3
+        r._prefilled_inputs = None
+        r.num_prefilled_input_skips = 0
+        return r
+
+    def _batch(self):
+        return SimpleNamespace(
+            input_ids=torch.arange(10, 13), positions=torch.arange(3) + 100
+        )
+
+    def _copied(self, r):
+        return r.buffers.input_ids[:3].tolist(), r.buffers.positions[:3].tolist()
+
+    def test_copies_without_a_plan_time_fill(self):
+        r = self._runner()
+        r._copy_replay_inputs(self._batch())
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+    def test_skips_only_the_plan_time_tensors_and_only_once(self):
+        r, fb = self._runner(), self._batch()
+        r._prefilled_inputs = (fb.input_ids, fb.positions)
+        r._copy_replay_inputs(fb)
+        # Untouched: the plan-time load owns these rows.
+        self.assertEqual(self._copied(r), ([-1] * 3, [-1] * 3))
+        # The record is consumed: the next replay copies again.
+        r._copy_replay_inputs(fb)
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
+
+    def test_equal_values_from_other_tensors_are_copied(self):
+        r, other = self._runner(), self._batch()
+        r._prefilled_inputs = (other.input_ids, other.positions)
+        r._copy_replay_inputs(self._batch())
+        self.assertEqual(self._copied(r), ([10, 11, 12], [100, 101, 102]))
 
 
 if __name__ == "__main__":

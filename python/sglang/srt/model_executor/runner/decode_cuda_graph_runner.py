@@ -260,6 +260,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _metadata_prep_fork: Optional[tuple] = None
     _metadata_prep_fork_resolved = False
     _early_verify_metadata = None
+    _skips_prefilled_inputs = False
+    _prefilled_inputs: Optional[tuple] = None
+    num_prefilled_input_skips = 0
 
     def __init__(
         self,
@@ -275,6 +278,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # In-graph metadata prep: shared buffers -> in-graph private data
         self.in_graph_metadata_prep_done: Optional[torch.cuda.Event] = None
+        # SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: the (input_ids, positions)
+        # tensors the plan-time load already copied into this runner's buffers.
+        self._prefilled_inputs: Optional[tuple] = None
+        self.num_prefilled_input_skips = 0
         # SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK: (stream, event) the draft graph's
         # in-graph metadata prep is forked onto; resolved at the first capture.
         self._metadata_prep_fork: Optional[tuple] = None
@@ -551,6 +558,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and self._glues_target_verify_metadata()
         )
         self._draft_glue_logged = 0
+        self._skips_prefilled_inputs = self._resolve_skips_prefilled_inputs()
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._metadata_glue = MetadataGlueGraph(self.device)
             atexit.register(self._log_draft_glue, " at shutdown")
@@ -1545,8 +1553,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
             self._set_dp_real_num_tokens(self.raw_num_token)
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self._copy_replay_inputs(forward_batch)
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1629,6 +1636,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_slots=STAGED_SLOTS if early_staged else frozenset(),
         )
+        if self._skips_prefilled_inputs:
+            self._prefilled_inputs = (forward_batch.input_ids, forward_batch.positions)
 
         if (
             not is_ragged
@@ -1834,6 +1843,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             early.discard()
             return False
         return early.take(key=key, forward_batch=forward_batch)
+
+    def _copy_replay_inputs(self, forward_batch: ForwardBatch) -> None:
+        prefilled = self._prefilled_inputs
+        self._prefilled_inputs = None
+        # The plan-time load (or the early stage it took) filled these from the very
+        # same tensors.
+        if prefilled is None or forward_batch.input_ids is not prefilled[0]:
+            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+        if prefilled is None or forward_batch.positions is not prefilled[1]:
+            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+        if prefilled is not None:
+            self._note_prefilled_input_skip()
+
+    def _note_prefilled_input_skip(self) -> None:
+        self.num_prefilled_input_skips += 1
+        if self.num_prefilled_input_skips == 1:
+            logger.info(
+                "Pre-planned verify replay skipped its input_ids / positions "
+                "re-copy (first step)."
+            )
+
+    def _resolve_skips_prefilled_inputs(self) -> bool:
+        """The DSpark target verify runner, whose verify batches are pre-planned by
+        prepare_for_verify and then replayed from the same tensors."""
+        return (
+            envs.SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS.get()
+            and not self.model_runner.is_draft_worker
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and self.model_runner.spec_algorithm.is_dspark()
+        )
 
     def _glues_target_verify_metadata(self) -> bool:
         """Whether this DSpark target verify runner's metadata prep runs through the
