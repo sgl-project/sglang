@@ -35,8 +35,8 @@ async def rpc(context, endpoint, message, timeout):
     try:
         await socket.send(pickle.dumps(message))
         reply = pickle.loads(await asyncio.wait_for(socket.recv(), timeout))
-        if reply.get("error"):
-            raise RuntimeError(reply["error"])
+        if "error" in reply:
+            raise RuntimeError(reply["error"] or "Remote deployment request failed")
         return reply
     finally:
         socket.close()

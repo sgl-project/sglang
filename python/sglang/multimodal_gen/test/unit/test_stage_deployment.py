@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
     DeploymentWorker,
+    run_partition,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     SlotHandle,
@@ -365,7 +366,23 @@ def test_coordinator_parallel_join_and_cleanup():
     asyncio.run(run())
 
 
-def test_client_failure_cancels_outstanding_rpc(monkeypatch):
+def test_empty_partition_error_is_not_success(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
+
+    def fail(*args):
+        raise RuntimeError("")
+
+    scheduler = SimpleNamespace(
+        worker=SimpleNamespace(pipeline=SimpleNamespace(forward=fail)),
+        server_args=None,
+        _is_multi_rank=lambda: False,
+    )
+    assert run_partition(scheduler, Req()) == "RuntimeError"
+
+
+@pytest.mark.parametrize("error", ["invalid encoder input", ""])
+def test_client_failure_cancels_outstanding_rpc(monkeypatch, error):
     closed = []
 
     class NoGpuTransport:
@@ -392,14 +409,16 @@ def test_client_failure_cancels_outstanding_rpc(monkeypatch):
                     if not first:
                         continue
                     first = False
-                    reply = {"error": "invalid encoder input"}
+                    reply = {"error": error}
                 else:
                     reply = {}
                 await socket.send_multipart([*frames[:-1], pickle.dumps(reply)])
 
         task = asyncio.create_task(peer())
         try:
-            with pytest.raises(RuntimeError, match="invalid encoder input"):
+            with pytest.raises(
+                RuntimeError, match=error or "Remote deployment request failed"
+            ):
                 async with client.EncodingClient(f"tcp://127.0.0.1:{port}") as encoder:
                     await asyncio.gather(encoder.encode({}), encoder.encode({}))
             assert closed

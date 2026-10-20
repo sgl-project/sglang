@@ -46,7 +46,7 @@ def run_partition(scheduler, req):
                 raise RuntimeError(result.error)
             req.extra["_deployment_result"] = result
     except Exception as exc:
-        error = str(exc)
+        error = str(exc) or type(exc).__name__
     peak = torch.cuda.max_memory_reserved() / (1024**2)
     if scheduler._is_multi_rank():
         group = get_world_group()
