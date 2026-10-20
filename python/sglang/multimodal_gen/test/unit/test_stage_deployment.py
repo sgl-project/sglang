@@ -378,7 +378,7 @@ def test_empty_partition_error_is_not_success(monkeypatch):
         server_args=None,
         _is_multi_rank=lambda: False,
     )
-    assert run_partition(scheduler, Req()) == "RuntimeError"
+    assert run_partition(scheduler, SimpleNamespace(extra={})) == "RuntimeError"
 
 
 @pytest.mark.parametrize("error", ["invalid encoder input", ""])
