@@ -386,8 +386,8 @@ class WarpShuffleEpilogueArrayPerTokenScale {
   static constexpr int kOutputAlignment = ElementsPerVector;
 
   static_assert(
-      TileM == 128 && TileN == 32 && TileK == 512,
-      "The warp-shuffle epilogue is specialized for config320's 128x32x512 tile.");
+      TileM == 128 && TileN == 32 && (TileK == 256 || TileK == 512),
+      "The warp-shuffle epilogue requires a 128x32 C tile and K tile 256 or 512.");
   static_assert(cute::is_same_v<ElementAccumulator, float>, "The warp-shuffle epilogue requires FP32 accumulators.");
   static_assert(
       cute::is_same_v<ElementCompute, float>, "The warp-shuffle epilogue requires FP32 scale multiplication.");

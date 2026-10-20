@@ -269,7 +269,8 @@ struct cutlass_3x_w4a8_group_gemm {
       std::is_same_v<KernelSchedule, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>);
   static_assert(
       !UseWarpShuffleGemm2Epilogue ||
-      (cute::size<0>(TileShape{}) == 128 && cute::size<1>(TileShape{}) == 32 && cute::size<2>(TileShape{}) == 512));
+      (cute::size<0>(TileShape{}) == 128 && cute::size<1>(TileShape{}) == 32 &&
+       (cute::size<2>(TileShape{}) == 256 || cute::size<2>(TileShape{}) == 512)));
   static_assert(!UseWarpShuffleGemm2Epilogue || cute::size(ClusterShape{}) == 1);
   static_assert(!UsePreMmaE8M0Scale || std::is_same_v<QuantTypeB, cutlass::float_e2m1_t>);
   static_assert(!UsePreMmaE8M0Scale || GroupSize == 32);

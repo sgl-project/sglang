@@ -129,6 +129,23 @@ struct SM90_PRECOMPUTED_MXFP4_WARP_SHUFFLE_PACKED_GEMM2 {
       false>;
 };
 
+// Experimental K256 counterpart of config334. Keep the 128x32 C fragment
+// and BF16 packed-store mapping unchanged; compare directly against config350.
+struct SM90_PRECOMPUTED_MXFP4_K256_PACKED_GEMM2 {
+  using TileShape = cute::Shape<cute::Int<128>, cute::Int<32>, cute::Int<256>>;
+  using ClusterShape = cute::Shape<cute::Int<1>, cute::Int<1>, cute::Int<1>>;
+  using Cutlass3xW4A8Gemm = cutlass_3x_w4a8_group_gemm<
+      TileShape,
+      ClusterShape,
+      cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong,
+      sgl_kernel::w4a8_detail::WarpShufflePackedStoreGemm2Epilogue,
+      typename QuantTraits<WType::MXFP4>::Element,
+      QuantTraits<WType::MXFP4>::GroupSize,
+      false,
+      true,
+      false>;
+};
+
 template <typename Config>
 inline void invoke_gemm(
     torch::Tensor& d_tensors,
@@ -566,6 +583,19 @@ void dispatch_mxfp4a8_fused_moe_mm_sm90(
       "fused MXFP4A8 per-row scale must contain one value per activation row");
   TORCH_CHECK(topk > 0, "topk must be positive");
 
+  // Experimental short-K tactics: use only the fused pre-MMA E8M0 path.
+  // Device-only grouped problem shapes skip the mainloop's host-shape checks,
+  // so validate the uniform tensor dimensions before launching these tactics.
+  if ((swg_config >= 350 && swg_config <= 356) || swg_config == 358) {
+    TORCH_CHECK(
+        a_tensors.dim() == 2 && a_tensors.size(1) == 256,
+        "K=256 fused MXFP4A8 candidate requires 2D activation [R, 256]");
+    TORCH_CHECK(
+        b_tensors.dim() == 3 && b_tensors.size(2) == 128 &&
+            b_tensors.size(1) > 0 && b_tensors.size(1) % 128 == 0,
+        "K=256 fused MXFP4A8 candidate requires weight [E, N, 128], N divisible by 128");
+  }
+
   switch (swg_config) {
     case 100:
       INVOKE_GEMM_WITH_CONFIG_AS((SM90_SWG_MXFP4<8>));
@@ -591,12 +621,38 @@ void dispatch_mxfp4a8_fused_moe_mm_sm90(
     case 334:
       INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4_WARP_SHUFFLE_PACKED_GEMM2));
       return;
+    // Template axes are [output channels, routed tokens, reduction K].
+    // Cluster=1 avoids changing cluster work-map/multicast semantics.
+    case 350:  // Ntoken32, K256, global expert-major work map.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4<128, 32, 256, 1, 1, false>));
+      return;
+    case 351:  // Ntoken64: primary M8192 candidate.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4<128, 64, 256, 1, 1, false>));
+      return;
+    case 352:  // Same tile as 351, change only work ownership/order.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4<128, 64, 256, 1, 1, true>));
+      return;
+    case 353:  // Same token/K tile as 351, halve output-channel tile.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4<64, 64, 256, 1, 1, false>));
+      return;
+    case 354:  // FlashInfer-like tile, deliberately keep cluster=1.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4<64, 128, 256, 1, 1, false>));
+      return;
+    case 355:  // Same output/token tile as 351, use two K128 iterations.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4<128, 64, 128, 1, 1, false>));
+      return;
+    case 356:  // Existing SWG implementation, token tile 32 instead of 16.
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_SWG_MXFP4<32>));
+      return;
+    case 358:
+      INVOKE_GEMM_WITH_CONFIG_AS((SM90_PRECOMPUTED_MXFP4_K256_PACKED_GEMM2));
+      return;
     default:
       TORCH_CHECK(
           false,
           "Unsupported fused MXFP4A8 config=",
           swg_config,
-          "; expected one of 100, 101, 204, 205, 313, 320, 322, 334");
+          "; expected one of 100, 101, 204, 205, 313, 320, 322, 334, 350-356, 358");
   }
 }
 
