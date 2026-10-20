@@ -3,14 +3,11 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
-
-_SMALLM_MOE_ON = os.environ.get("SGLANG_ROCM_SMALLM_MOE", "1") != "0"
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -24,6 +21,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
+
+_SMALLM_MOE_ON = envs.SGLANG_ROCM_SMALLM_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -414,7 +413,7 @@ def _pre_permute_deepep_to_aiter(
     quant_type = quant_info.quant_type
 
     if is_mori:
-        from sglang.kernels.ops.moe.rocm_moe_utils import upscale, upscale_mxfp4
+        from sglang.kernels.ops.quantization.rocm_upscale import upscale, upscale_mxfp4
 
         a1_scale = dispatch_output.hidden_states_scale
         num_local_tokens = dispatch_output.num_recv_tokens_per_expert
