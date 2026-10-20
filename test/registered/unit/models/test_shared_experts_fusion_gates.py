@@ -444,7 +444,19 @@ class TestGlm5NextGate(_FusionGateCase):
 
     def test_quark_mxfp4_is_admitted(self):
         config = self._config(num_hidden_layers=45)
-        self.assertIsNone(self._reason_on_gfx950(config=config, quant=self._quark()))
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
+                self.assertIsNone(
+                    self._reason_on_gfx950(
+                        tp_size=tp_size, config=config, quant=self._quark()
+                    )
+                )
+
+    def test_quark_mxfp4_at_tp2_is_rejected(self):
+        self.assertIn(
+            "HIP Quark shared experts fusion is validated only for TP4 and TP8",
+            self._reason_on_gfx950(tp_size=2, quant=_quant("quark")),
+        )
 
     def test_quark_target_layer_experts_must_share_one_mxfp4_spec(self):
         config = self._config(num_hidden_layers=45)
@@ -468,7 +480,7 @@ class TestGlm5NextGate(_FusionGateCase):
             with self.subTest(name):
                 self.assertIn(
                     "same Quark MXFP4 layout",
-                    self._reason_on_gfx950(config=config, quant=quant),
+                    self._reason_on_gfx950(tp_size=4, config=config, quant=quant),
                 )
 
     def test_ep_and_a2a_topologies_are_rejected(self):

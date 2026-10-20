@@ -1421,6 +1421,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "clamped SiLU G1U1 activation."
                 )
             if quant_config is not None and quant_config.get_name() == "quark":
+                if parallel.tp_size == 2:
+                    return "HIP Quark shared experts fusion is validated only for TP4 and TP8."
                 return cls._quark_mxfp4_shared_fusion_disable_reason(
                     text_config, quant_config
                 )
