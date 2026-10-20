@@ -12,6 +12,11 @@ from torch.utils._pytree import (
     treespec_loads,
 )
 
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
+    dtype_to_str,
+    str_to_dtype,
+)
+
 
 def read_field(req, path):
     parts = path.split(".")
@@ -55,21 +60,35 @@ def fork_request(req):
 
 def pack_fields(values):
     leaves, spec = tree_flatten(values)
-    tensors, metadata = {}, []
+    tensors, metadata, empty = {}, [], {}
     for index, leaf in enumerate(leaves):
         if isinstance(leaf, torch.Tensor):
-            tensors[str(index)] = leaf
+            if leaf.numel():
+                tensors[str(index)] = leaf
+            else:
+                empty[str(index)] = (list(leaf.shape), dtype_to_str(leaf.dtype))
             metadata.append(None)
         else:
             metadata.append(leaf)
     # required fields must never silently disappear on a transport boundary
-    scalar = {"spec": treespec_dumps(spec), "leaves": metadata}
+    scalar = {
+        "spec": treespec_dumps(spec),
+        "leaves": metadata,
+        "tensors": list(tensors),
+        "empty": empty,
+    }
     json.dumps(scalar, allow_nan=False)
     return tensors, scalar
 
 
-def unpack_fields(tensors, scalar):
+def unpack_fields(tensors, scalar, device="cpu"):
+    if set(tensors) != set(scalar["tensors"]):
+        raise ValueError("Received tensor fields do not match the payload contract")
     leaves = list(scalar["leaves"])
     for index, tensor in tensors.items():
         leaves[int(index)] = tensor
+    for index, (shape, dtype) in scalar["empty"].items():
+        leaves[int(index)] = torch.empty(
+            shape, dtype=str_to_dtype(dtype), device=device
+        )
     return tree_unflatten(leaves, treespec_loads(scalar["spec"]))

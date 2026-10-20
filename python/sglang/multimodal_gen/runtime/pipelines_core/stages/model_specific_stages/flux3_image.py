@@ -48,12 +48,15 @@ from sglang.multimodal_gen.runtime.pipelines.flux3_image_package import (
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     normalize_output_seeds,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding import (
     ConditionEncodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.postprocess import (
+    PostprocessStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -927,21 +930,9 @@ class Flux3ImageDecodeStage(PipelineStage):
         return outputs
 
 
-class Flux3ImagePostprocessStage(PipelineStage):
-    @property
-    def role_affinity(self) -> RoleType:
-        return RoleType.DECODER
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        return OutputBatch(
-            output=self._to_display(
-                crop_output(batch.output, batch.extra["flux3_crop"])
-            ),
-            metrics=batch.metrics,
-        )
-
-    def run_grouped_requests(self, batches, server_args):
-        return [self.forward(batch, server_args) for batch in batches]
+class Flux3ImagePostprocessStage(PostprocessStage):
+    def process(self, batch, server_args):
+        return self._to_display(crop_output(batch.output, batch.extra["flux3_crop"]))
 
     @staticmethod
     def _to_display(image: Tensor) -> Tensor:

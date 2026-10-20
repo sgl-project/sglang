@@ -65,6 +65,12 @@ class DisaggServerArgsMixin:
     @classmethod
     def add_disagg_cli_args(cls, parser: FlexibleArgumentParser) -> None:
         parser.add_argument(
+            "--stage-node",
+            type=str,
+            default=None,
+            help="Launch every stage worker assigned to this node in --stage-deployment.",
+        )
+        parser.add_argument(
             "--stage-deployment",
             type=str,
             default=None,

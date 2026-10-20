@@ -62,6 +62,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.postprocess import (
+    PostprocessStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -95,6 +98,7 @@ class ComposedPipelineBase(ABC):
     # Exact module keys; unspecified components retain the default loader dispatch.
     component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
     stage_specs: ClassVar[tuple[StageSpec, ...]] = ()
+    deployment_plan: ExecutionPlan | None = None
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -937,12 +941,16 @@ class ComposedPipelineBase(ABC):
                 vae=self.get_module(vae_key),
                 pipeline=self,
                 component_name=vae_key,
+                separate_postprocess=True,
             )
 
-        return self.add_stage_factory(
+        self.add_stage_factory(
             RoleType.DECODER,
             create_stage,
             stage_name,
+        )
+        return self.add_stage_factory(
+            RoleType.DECODER, PostprocessStage, stage_name + "_postprocess"
         )
 
     def add_standard_t2i_stages(

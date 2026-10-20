@@ -14,12 +14,12 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
     pack_fields,
     unpack_fields,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport import (
+    engine as transfer_engines,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferTensorBuffer,
     tensor_payload_size,
-)
-from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
-    create_transfer_engine,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.manager import (
     DiffusionTransferManager,
@@ -45,11 +45,17 @@ async def rpc(context, endpoint, message, timeout):
 class TensorTransport:
     def __init__(self, device, hostname, pool_size, ib_device=None):
         self.device = torch.device(device)
-        engine = create_transfer_engine(hostname, self.device.index or 0, ib_device)
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
+        engine = transfer_engines.create_transfer_engine(
+            hostname, self.device.index or 0, ib_device
+        )
         buffer = TransferTensorBuffer(pool_size, device=str(self.device))
         self.manager = DiffusionTransferManager(engine, buffer)
 
     def push(self, values, target):
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         tensors, scalar = pack_fields(values)
         key = target["key"]
         size = tensor_payload_size(tensors)
@@ -97,12 +103,14 @@ class TensorTransport:
                 timeout,
             )
             acknowledged = True
+            if self.device.type == "cuda":
+                torch.cuda.set_device(self.device)
             tensors, event = self.manager.load_tensors_async(
                 key, reply["manifest"], self.device
             )
             if event is not None:
                 event.synchronize()
-            return unpack_fields(tensors, reply["scalar"])
+            return unpack_fields(tensors, reply["scalar"], self.device)
         finally:
             if acknowledged:
                 self.manager.free_receive_slot(key)

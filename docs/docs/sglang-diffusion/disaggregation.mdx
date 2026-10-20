@@ -1,12 +1,205 @@
 ---
-title: "Disaggregated Diffusion Pipeline"
+title: "Disaggregated serving"
 metatags:
-    description: "Split SGLang Diffusion pipelines into independent encoder, denoiser, and decoder services for disaggregated serving."
+    description: "Place pipeline stage groups on independent worker pools, or use encoder, denoiser, and decoder deployment presets."
 ---
 
-Split a monolithic text-to-video/image pipeline into independent **Encoder**, **Denoiser**, and **Decoder** roles, each running on its own GPU(s). A central **DiffusionServer** routes requests through the pipeline.
+A pipeline defines computation; a deployment assigns that computation to workers.
+A **stage** is an operation in the pipeline. A **role** groups stages that run
+together in one worker. A role can have multiple replicas, and multiple roles can
+share a machine or GPU when their combined memory requirements fit.
 
-## Quick Start
+You can use the existing encoder/denoiser/decoder presets, or an experimental
+stage deployment for pipelines with declared stage contracts. Disaggregation
+allows independent placement and scaling; it does not inherently reduce
+single-request latency.
+
+## Declarative stage deployment
+
+This path currently targets Linux with NVIDIA GPUs and Mooncake. FLUX.3 Image
+provides built-in contracts. Other native pipelines can provide contracts without
+adding model names or role names to a whitelist. A working monolithic pipeline
+alone is not sufficient: its stage boundaries must describe transferable state.
+
+Save the following as `deployment.json`:
+
+```json
+{
+  "roles": {
+    "prompt": {
+      "stages": ["flux3_text_encode"],
+      "endpoints": ["tcp://127.0.0.1:19000"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 0}
+    },
+    "reference": {
+      "stages": ["flux3_condition_encode"],
+      "endpoints": ["tcp://127.0.0.1:19010"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 0}
+    },
+    "generate": {
+      "stages": ["flux3_denoise"],
+      "endpoints": ["tcp://127.0.0.1:19020"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 1}
+    },
+    "output": {
+      "stages": ["flux3_decode", "flux3_postprocess"],
+      "endpoints": ["tcp://127.0.0.1:19030"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 0}
+    }
+  }
+}
+```
+
+Use the same model package, variant, numerical settings, and deployment file
+on every host. Authenticate for gated models before starting. The example shares
+GPU 0 between three worker processes; each loads its own required components and
+transfer pool. This is process colocation, not shared weight storage.
+
+Start the workers assigned to this node with one command:
+
+```bash
+MODEL_PATH=black-forest-labs/flux-3-image-klein
+sglang serve --model-path "$MODEL_PATH" \
+  --stage-deployment deployment.json --stage-node node1
+```
+
+Start the coordinator and the existing generation API in another terminal:
+
+```bash
+sglang serve --model-path black-forest-labs/flux-3-image-klein \
+  --stage-deployment deployment.json \
+  --host 127.0.0.1 --port 30000 --scheduler-port 18000
+```
+
+For an individually managed worker, replace `--stage-node` with:
+
+```bash
+sglang serve --model-path black-forest-labs/flux-3-image-klein \
+  --stage-deployment deployment.json --stage-role generate \
+  --stage-endpoint tcp://127.0.0.1:19020 \
+  --num-gpus 1 --base-gpu-id 1 --scheduler-port 19120 --master-port 19220
+```
+
+The per-role `server_args` apply when using `--stage-node`; an individually
+launched worker uses its own CLI arguments. Worker scheduler, master, and stage
+ports must be distinct. For multiple machines, use routable private addresses,
+assign roles to the appropriate `node`, and set `--disagg-p2p-hostname` on each
+node. Node launch starts local processes; it does not provision machines or SSH
+into other hosts.
+
+The prompt and reference branches execute independently, then the denoiser waits
+for both. T2I reference encoding is a no-op. Within one role, stages keep their
+pipeline order and communicate through the local request context, without a
+network hop. Cross-role edges transfer only the declared fields their consumers
+need. Independent requests can use different replicas of a role.
+
+### Encoding for training
+
+For encoder-only serving, use a deployment containing just the `prompt` and
+`reference` roles above and set its top-level outputs:
+
+```json
+"outputs": ["extra.flux3_text", "extra.flux3_condition"]
+```
+
+The coordinator returns tensor descriptors, not embeddings serialized through
+the HTTP generation API. An asynchronous trainer client receives the named
+tensors directly into a registered transfer pool on its GPU:
+
+```python
+import asyncio
+
+from sglang.multimodal_gen.runtime.disaggregation.deployment.client import EncodingClient
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+
+async def main():
+    async with EncodingClient(
+        "tcp://127.0.0.1:18000",
+        device="cuda:0",
+        hostname="127.0.0.1",
+    ) as client:
+        requests = [
+            Req(prompt="A mountain landscape", image_path=None),
+            Req(prompt="A watercolor landscape", image_path=None),
+        ]
+        results = await asyncio.gather(*(client.encode(req) for req in requests))
+        embeddings = results[0]["extra.flux3_text"]
+
+asyncio.run(main())
+```
+
+For remote media, provide a URL accessible to the encoder or an inline data URL.
+A trainer-local filename is not automatically available to another machine.
+Set the client's `hostname` to its routable private IP for cross-machine GPU
+transfers. Returned tensors own their storage; temporary receive slots are
+released after the transfer and local copy finish. There is no denoise or decode
+work in an encoder-only deployment.
+
+### Declaring stage boundaries
+
+Native pipelines can expose `stage_specs` using `StageSpec`, or deployments can
+provide the same contracts in their top-level `stages` array:
+
+```python
+StageSpec(
+    "vae_encode",
+    inputs=("image_path",),
+    outputs=("extra.image_latents",),
+    components=("vae",),
+    after=(),
+)
+```
+
+`inputs` and `outputs` name request fields, `extra.<key>` fields, or
+`result.<field>` outputs. The planner binds reads to their latest preceding
+writer. By default a stage also depends on its predecessor; `after=()` removes
+that control dependency, while data dependencies still apply. Use
+`colocate_with` for stages sharing non-transferable runtime state. Keep generator,
+scheduler, module, and CUDA-event objects local; tensors and JSON-safe metadata
+cross deployment boundaries. Required fields that cannot be serialized fail
+explicitly rather than being silently omitted.
+
+Stage factories must allow selecting stages before component loading, and
+custom loaders must honor the selected role's component set. The shared loader
+does this for componentized pipelines; FLUX.3 also honors it in its custom loader.
+Do not assume that old role-based module-name heuristics describe a custom stage.
+
+Model transforms belong in postprocessing stages. Media saving and HTTP response
+formatting remain at the output boundary. The standard decoding helper and
+FLUX.3 expose postprocessing separately; a specialized decoder that performs
+additional work internally needs its own accurate contract before that boundary
+can be split. Kernel implementations remain in stages/models, independent of
+placement. The existing transfer-engine factory is the integration point for
+custom communication implementations; both endpoints must obey the same buffer
+registration and completion contract.
+
+### Operational limits
+
+- Use trusted private networking. Internal worker/coordinator RPC uses Python
+  serialization and must not be exposed to untrusted clients.
+- Size `--disagg-transfer-pool-size` for simultaneous receives and sends. Result
+  leases and coordinator admission are bounded by
+  `--disagg-max-slots-per-instance`; receive pools are separate from model memory.
+- A result is retained through fan-out until consumers finish or its lease
+  expires. Unacknowledged transfers quarantine receive slots instead of reusing
+  addresses that a remote sender might still write. Restart an exhausted worker
+  after resolving the transport failure.
+- TP/SP settings apply within each worker group. Transfers currently carry
+  complete declared tensors; arbitrary sharded tensor layouts across groups
+  need an explicit gather/reshard stage or colocation.
+- Placement must produce an acyclic role graph. Stateful loops and
+  encode-while-decode streaming must stay within a compatible role; splitting a
+  loop into independently retried operations is not supported.
+- This is not a durable job queue and does not automatically replay failed
+  inference or perform cross-node resource scheduling.
+
+## Preset role deployment
+
+### Quick start
 
 Disaggregation is controlled by a single flag: `--disagg-role`. Each component is launched independently, just like LLM PD disaggregation.
 

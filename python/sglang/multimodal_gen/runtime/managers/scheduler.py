@@ -19,6 +19,7 @@ import zmq
 from sglang.multimodal_gen.runtime.disaggregation.deployment.runtime import (
     DeploymentWorker,
     broadcast_request,
+    run_partition,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
@@ -1410,7 +1411,7 @@ class Scheduler(
             else:
                 while self._broadcast_to_all_ranks(None) is not None:
                     req = broadcast_request(self, None)
-                    self.worker.pipeline.forward(req, self.server_args)
+                    run_partition(self, req)
             return
 
         # Pool mode: all roles use the pool event loop

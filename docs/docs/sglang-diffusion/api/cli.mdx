@@ -120,6 +120,12 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 ### Disaggregated serving
 
+- `--stage-deployment {JSON_PATH}`: stage contracts and named role placement. Without a worker selector, launches the coordinator and existing generation API.
+- `--stage-node {NAME}`: launch all worker processes assigned to this node, using their declared server arguments.
+- `--stage-role {NAME}` and `--stage-endpoint {TCP_ENDPOINT}`: launch one named worker using its own CLI arguments instead of the node launcher.
+
+Declarative stage deployment currently targets Linux/NVIDIA with Mooncake and has built-in FLUX.3 Image contracts. Other native pipelines need explicit stage/component contracts. Do not combine it with the preset `--disagg-role` mode.
+
 - `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
 - `--disagg-server-addr {TCP_ENDPOINT}`: head scheduler endpoint used by workers for registration and result routing.
 - `--encoder-urls {ENDPOINTS}`: combined encoder pool on the head. For split encoding, replace it with both `--prompt-encoder-urls` and `--image-encoder-urls`; do not mix the two topologies.

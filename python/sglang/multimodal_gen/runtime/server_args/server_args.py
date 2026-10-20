@@ -611,6 +611,7 @@ class ServerArgs(DisaggServerArgsMixin):
     stage_deployment: str | None = None
     stage_role: str | None = None
     stage_endpoint: str | None = None
+    stage_node: str | None = None
     disagg_timeout: int = 3600
     disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"

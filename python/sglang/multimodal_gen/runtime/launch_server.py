@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import copy
 import dataclasses
 import multiprocessing as mp
 import os
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.managers.worker_bootstrap import (
     ServerArgsPayload,
     bootstrap_http_server_process,
     bootstrap_scheduler_process,
+    bootstrap_stage_role,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import (
     configure_metrics,
@@ -179,7 +181,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         reader, writer = worker_context.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
         spec = SchedulerProcessSpec(
-            local_rank=i,
+            local_rank=server_args.base_gpu_id + i if server_args.stage_role else i,
             rank=rank,
             server_args=server_args_payload,
             pipe_writer=writer,
@@ -837,6 +839,69 @@ def launch_stage_deployment(server_args: ServerArgs):
     plan = ExecutionPlan.compile(
         Deployment.load(server_args.stage_deployment), pipeline_cls.stage_specs
     )
+    if server_args.stage_node:
+        if server_args.stage_role:
+            raise ValueError("Use --stage-node or --stage-role, not both")
+        deployment = Deployment.load(server_args.stage_deployment)
+        context = mp.get_context("spawn")
+        processes = []
+        reserved = set()
+        try:
+            for name, role in deployment.roles.items():
+                if role.node != server_args.stage_node:
+                    continue
+                forbidden = {
+                    key
+                    for key in role.server_args
+                    if key.startswith("_")
+                    or key
+                    in {
+                        "model_path",
+                        "pipeline_config",
+                        "stage_deployment",
+                        "stage_node",
+                        "stage_role",
+                        "stage_endpoint",
+                        "disagg_role",
+                    }
+                }
+                if forbidden:
+                    raise ValueError(f"Role {name} cannot override {sorted(forbidden)}")
+                for index, endpoint in enumerate(role.endpoints):
+                    overrides = dict(role.server_args)
+                    for port in ("scheduler_port", "master_port"):
+                        overrides[port] = _find_available_port(avoid=reserved)
+                        reserved.add(overrides[port])
+                    overrides["base_gpu_id"] = int(
+                        overrides.get("base_gpu_id", server_args.base_gpu_id)
+                    ) + index * int(overrides.get("num_gpus", server_args.num_gpus))
+                    args = dataclasses.replace(
+                        copy.deepcopy(server_args),
+                        **overrides,
+                        stage_node=None,
+                        stage_role=name,
+                        stage_endpoint=endpoint,
+                        _explicit_arg_names=server_args._explicit_arg_names
+                        | overrides.keys(),
+                    )
+                    process = context.Process(
+                        target=bootstrap_stage_role,
+                        args=(ServerArgsPayload.capture(args),),
+                        name=f"diffusion-{name}-{index}",
+                    )
+                    process.start()
+                    processes.append(process)
+            if not processes:
+                raise ValueError(
+                    f"No workers assigned to node {server_args.stage_node}"
+                )
+            while all(process.is_alive() for process in processes):
+                time.sleep(0.2)
+            raise RuntimeError(
+                "A stage worker exited; stopping the node's remaining workers"
+            )
+        finally:
+            shutdown_scheduler_processes(None, processes, request_shutdown=False)
     if server_args.stage_role:
         role = plan.roles[server_args.stage_role]
         if server_args.stage_endpoint not in role.endpoints:

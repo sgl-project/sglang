@@ -28,6 +28,25 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+
+
+def run_partition(scheduler, req):
+    error = None
+    try:
+        result = scheduler.worker.pipeline.forward(req, scheduler.server_args)
+        if isinstance(result, OutputBatch):
+            if result.error:
+                raise RuntimeError(result.error)
+            req.extra["_deployment_result"] = result
+    except Exception as exc:
+        error = str(exc)
+    if scheduler._is_multi_rank():
+        group = get_world_group()
+        errors = [None] * len(group.ranks)
+        dist.all_gather_object(errors, error, group=group.cpu_group)
+        error = next((item for item in errors if item), None)
+    return error
 
 
 def broadcast_request(scheduler, req):
@@ -90,15 +109,19 @@ class DeploymentWorker:
         if self.scheduler._is_multi_rank():
             self.scheduler._broadcast_to_all_ranks("deployment_compute")
             req = broadcast_request(self.scheduler, req)
-        result = self.pipeline.forward(req, self.args)
-        if isinstance(result, OutputBatch):
-            if result.error:
-                raise RuntimeError(result.error)
-            req.extra["_deployment_result"] = result
-        return {path: read_field(req, path) for path in self.role.outputs}
+        error = run_partition(self.scheduler, req)
+        if error:
+            raise RuntimeError(error)
+        values = {path: read_field(req, path) for path in self.role.outputs}
+        ready = torch.cuda.Event()
+        ready.record()
+        return values, ready, req.metrics
 
     async def _execute_message(self, message):
         ticket = message["ticket"]
+        with self.lock:
+            if len(self.results) >= self.args.disagg_max_slots_per_instance:
+                raise RuntimeError("Stage worker result capacity exhausted")
         req = fork_request(message["request"])
         for source in message["sources"]:
             fields = source["fields"]
@@ -117,21 +140,25 @@ class DeploymentWorker:
                 **req.extra.pop("_deployment_output_fields")
             )
         loop = asyncio.get_running_loop()
-        values = await loop.run_in_executor(self.compute, self._execute, req)
+        values, ready, metrics = await loop.run_in_executor(
+            self.compute, self._execute, req
+        )
         with self.lock:
             if ticket in self.expired:
                 raise RuntimeError("Request cancelled before stage completion")
-            self.results[ticket] = (time.monotonic(), values)
+            self.results[ticket] = (time.monotonic(), values, ready)
         return {
             "ticket": ticket,
             "sizes": {path: _field_size(value) for path, value in values.items()},
+            "metrics": metrics,
         }
 
     def _push(self, message):
         torch.cuda.set_device(self.device)
         with self.lock:
-            values = self.results[message["ticket"]][1]
+            _, values, ready = self.results[message["ticket"]]
             selected = {path: values[path] for path in message["fields"]}
+        torch.cuda.current_stream().wait_event(ready)
         if message.get("cpu"):
             return {
                 "values": tree_map(
@@ -177,21 +204,21 @@ class DeploymentWorker:
         tasks = set()
         try:
             while self.scheduler._running:
+                cutoff = time.monotonic() - self.args.disagg_timeout
+                with self.lock:
+                    self.results = {
+                        key: value
+                        for key, value in self.results.items()
+                        if value[0] > cutoff
+                    }
+                    self.expired = {
+                        key: value
+                        for key, value in self.expired.items()
+                        if value > cutoff
+                    }
                 try:
                     frames = await asyncio.wait_for(socket.recv_multipart(), 1)
                 except TimeoutError:
-                    cutoff = time.monotonic() - self.args.disagg_timeout
-                    with self.lock:
-                        self.results = {
-                            key: value
-                            for key, value in self.results.items()
-                            if value[0] > cutoff
-                        }
-                        self.expired = {
-                            key: value
-                            for key, value in self.expired.items()
-                            if value > cutoff
-                        }
                     continue
                 task = asyncio.create_task(
                     self._handle(socket, frames[:-1], pickle.loads(frames[-1]))
@@ -220,6 +247,7 @@ class DeploymentServer:
         self.context = None
         self.counters = defaultdict(int)
         self.slots = {}
+        self.leases = {}
 
     async def execute(self, request, outputs=None, roles=None):
         if isinstance(request, Req) and request.image_path:
@@ -316,6 +344,7 @@ class DeploymentServer:
                     if name in desired.values()
                 ],
                 "lease": assignments,
+                "metrics": [task.result().get("metrics") for task in tasks.values()],
             }
         except BaseException:
             for task in tasks.values():
@@ -345,12 +374,23 @@ class DeploymentServer:
                 if message["method"] == "ping":
                     response = {"status": "ok"}
                 elif message["method"] == "encode":
-                    async with admission:
+                    await admission.acquire()
+                    try:
                         response = await self.execute(
                             message["request"], message["outputs"]
                         )
+                        lease_id = uuid.uuid4().hex
+                        self.leases[lease_id] = (
+                            response["lease"],
+                            time.monotonic(),
+                            admission,
+                        )
+                        response["lease"] = lease_id
+                    except BaseException:
+                        admission.release()
+                        raise
                 elif message["method"] == "release":
-                    await self.release(message["lease"])
+                    await self.release_lease(message["lease"])
                     response = {}
                 else:
                     raise ValueError("Unknown deployment server method")
@@ -361,13 +401,15 @@ class DeploymentServer:
                         "Deployment serving expects one generation request"
                     )
                 async with admission:
-                    if any(
-                        not path.startswith("result.") for path in self.plan.outputs
-                    ):
+                    outputs = [
+                        path for path in self.plan.outputs if path.startswith("result.")
+                    ]
+                    if not outputs:
                         raise ValueError(
                             "This deployment returns encoder tensors; use EncodingClient"
                         )
-                    result = await self.execute(requests[0])
+                    started = time.monotonic()
+                    result = await self.execute(requests[0], outputs)
                     try:
                         fields = {}
                         for source in result["sources"]:
@@ -389,6 +431,14 @@ class DeploymentServer:
                                 for path, value in fields.items()
                             }
                         )
+                        metrics = RequestMetrics(requests[0].request_id)
+                        for item in result["metrics"]:
+                            if item is not None:
+                                metrics.stages.update(item.stages)
+                                metrics.denoising_stages.update(item.denoising_stages)
+                                metrics.steps.extend(item.steps)
+                        response.metrics = metrics
+                        metrics.total_duration_ms = (time.monotonic() - started) * 1000
                     finally:
                         await self.release(result["lease"])
         except Exception as exc:
@@ -409,6 +459,13 @@ class DeploymentServer:
         self.ready.set()
         try:
             while not self.stopped.is_set():
+                expired = [
+                    key
+                    for key, (_, started, _) in self.leases.items()
+                    if time.monotonic() - started > self.timeout
+                ]
+                for key in expired:
+                    await self.release_lease(key)
                 try:
                     frames = await asyncio.wait_for(socket.recv_multipart(), 0.2)
                 except TimeoutError:
@@ -424,8 +481,20 @@ class DeploymentServer:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                *(self.release_lease(key) for key in list(self.leases))
+            )
             socket.close()
             self.context.term()
+
+    async def release_lease(self, key):
+        lease = self.leases.pop(key, None)
+        if lease is not None:
+            assignments, _, admission = lease
+            try:
+                await self.release(assignments)
+            finally:
+                admission.release()
 
     def start(self, endpoint):
         self.thread = threading.Thread(

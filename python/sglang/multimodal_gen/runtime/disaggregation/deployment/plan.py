@@ -20,12 +20,14 @@ class StageSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 class RoleSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     stages: tuple[str, ...]
     endpoints: tuple[str, ...]
+    node: str = "local"
+    server_args: dict = {}
 
 
 class Deployment(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     roles: dict[str, RoleSpec]
     stages: tuple[StageSpec, ...] = ()
-    outputs: tuple[str, ...] = ("result.output",)
+    outputs: tuple[str, ...] | None = None
 
     @classmethod
     def load(cls, path: str) -> "Deployment":
@@ -123,6 +125,15 @@ class ExecutionPlan:
             for path, producer in bindings[stage].items():
                 source = owner[producer]
                 if source != role:
+                    last_writer = next(
+                        name
+                        for name in reversed(names)
+                        if owner.get(name) == source and path in specs[name].outputs
+                    )
+                    if last_writer != producer:
+                        raise ValueError(
+                            f"Stage {stage} needs an overwritten version of {path}; split role {source}"
+                        )
                     previous = role_inputs[role].setdefault(path, source)
                     if previous != source:
                         raise ValueError(
@@ -130,7 +141,14 @@ class ExecutionPlan:
                         )
                     role_outputs[source].add(path)
         outputs = {}
-        for path in deployment.outputs:
+        output_paths = (
+            deployment.outputs
+            if deployment.outputs is not None
+            else tuple(path for path in producers if path.startswith("result."))
+        )
+        if not output_paths:
+            raise ValueError("Declare at least one terminal output for this deployment")
+        for path in output_paths:
             if path not in producers:
                 raise ValueError(f"No selected stage produces output {path}")
             source = owner[producers[path]]
