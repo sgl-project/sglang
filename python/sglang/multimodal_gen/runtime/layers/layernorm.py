@@ -105,6 +105,8 @@ class RMSNorm(CustomOp):
     Refer to https://arxiv.org/abs/1910.07467
     """
 
+    _quant_linear: Optional[nn.Module] = None
+
     def __init__(
         self,
         hidden_size: int,
@@ -112,12 +114,14 @@ class RMSNorm(CustomOp):
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
+        preserve_residual_rounding: bool = False,
     ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.cast_x_before_out_mul = cast_x_before_out_mul
+        self.preserve_residual_rounding = preserve_residual_rounding
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
@@ -125,6 +129,14 @@ class RMSNorm(CustomOp):
             self._forward_method = self.forward_native
         elif USE_AITER:
             self._forward_method = self.forward_aiter
+
+    @property
+    def eps(self) -> float:
+        return self.variance_epsilon
+
+    def fuse_input_quant(self, linear: nn.Module) -> None:
+        # The consuming projection must not become a child of the norm.
+        self.__dict__["_quant_linear"] = linear
 
     def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
         return rms_norm_fn(
@@ -187,6 +199,11 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.preserve_residual_rounding:
+            if residual is not None:
+                x = residual = residual + x
+            out = F.rms_norm(x, (self.hidden_size,), self.weight, self.variance_epsilon)
+            return out if residual is None else (out, residual)
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = x.dtype
@@ -252,10 +269,40 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
+            if (
+                getattr(
+                    getattr(self._quant_linear, "quant_method", None),
+                    "accepts_int8_input",
+                    False,
+                )
+                and self.variance_size_override is None
+                and not self.cast_x_before_out_mul
+            ):
+                from sglang.srt.hardware_backend.npu.layernorm import (
+                    try_add_rmsnorm_int8,
+                )
+
+                quantized = try_add_rmsnorm_int8(
+                    x, residual, self.weight, self.variance_epsilon
+                )
+                if quantized is not None:
+                    return quantized
+            if self.preserve_residual_rounding:
+                # Preserve the model's low-precision residual addition.
+                residual = residual + x
+                return self.forward_npu(residual), residual
             out, _, residual_out = torch_npu.npu_add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )
             return out, residual_out
+        if self.preserve_residual_rounding and (
+            x.dtype not in (torch.float16, torch.bfloat16)
+            or self.weight.dtype != x.dtype
+            or self.weight.device != x.device
+            or x.numel() == 0
+            or not hasattr(torch.ops.npu, "npu_rms_norm")
+        ):
+            return self.forward_native(x)
         return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_hip(

@@ -48,6 +48,13 @@ Use the [command builder](#1-quick-start) above.
 
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
+For online INT8 quantization on Ascend, load the original FP16/BF16 checkpoint
+and add `--quantization w8a8_int`. On A14B models this selects both
+transformers; `--transformer-quantization w8a8_int` selects only the primary
+transformer. See [Online W8A8 INT8](/docs/sglang-diffusion/quantization#online-w8a8-int8-on-ascend)
+for prerequisites, ignored layers, and the validation status. The benchmarks
+below do not measure this online W8A8 configuration.
+
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)

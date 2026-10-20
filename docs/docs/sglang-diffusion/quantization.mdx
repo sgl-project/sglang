@@ -1245,12 +1245,62 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```mxfp4_npu``` linear with online quantization (`--quantization mxfp4_npu`)
     - [x]  ```w8a8_int``` linear with online quantization on Ascend (`--quantization w8a8_int`)
 
-For an unquantized diffusion transformer on Ascend, `--quantization
-w8a8_int` converts supported linear weights after loading. Activations are
-dynamically quantized per token, while layer outputs are restored to the
-transformer's original FP16/BF16 dtype. Use
-`--quantization-ignored-layers PATTERN...` to retain accuracy-sensitive layers
-in their checkpoint precision.
+## Online W8A8 INT8 on Ascend
+
+Use `--quantization w8a8_int` with an original FP16/BF16 diffusion checkpoint
+on Ascend NPU. Follow the
+[NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+and install compatible CANN, PyTorch, and torch_npu versions before running.
+The backend requires `npu_dynamic_quant` and `npu_quant_matmul`.
+
+Weights are quantized per output channel after loading, and activations are
+dynamically quantized per token. Linear outputs retain the input FP16/BF16
+dtype. This online method does not require calibration or a ModelSlim
+`quant_model_description.json`; use the existing ModelSlim loading path for
+pre-quantized checkpoints.
+
+For Wan 2.2 T2V-A14B, the following example uses eight Ascend NPUs with TP2
+and SP4:
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --num-gpus 8 \
+  --tp-size 2 \
+  --sp-degree 4 \
+  --attention-backend laser_attn \
+  --quantization w8a8_int \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+The same online linear path is used by Wan 2.2 I2V-A14B and TI2V-5B. Use the
+[Wan 2.2 cookbook](/cookbook/diffusion/Wan/Wan2.2) for their model and input
+settings. Wan keeps its GELU activation. MiniMax-H3 uses the same linear
+backend and optionally fuses SwiGLU or residual RMSNorm with activation
+quantization when the installed NPU operators support them; otherwise it
+uses separate activation, normalization, and quantization operations.
+
+On Wan 2.2 A14B, global `--quantization w8a8_int` applies to both
+`transformer` and `transformer_2`. To select only the primary transformer,
+replace the global flag with `--transformer-quantization w8a8_int`.
+You can also select both components explicitly:
+
+```bash
+--component-quantizations.transformer w8a8_int \
+--component-quantizations.transformer_2 w8a8_int
+```
+
+Use `--quantization-ignored-layers blocks.0` to keep block 0 of each selected
+transformer in checkpoint precision; with the global quantization flag,
+this component-local prefix is applied to both A14B transformers. To exclude
+layers from just one explicitly selected component, use
+`--component-quantization-ignored-layers.transformer blocks.0` together with
+`--transformer-quantization w8a8_int`.
+
+Target-NPU correctness and generation quality for this online W8A8 path
+remain pending validation. Existing BF16 cookbook benchmarks do not measure
+this configuration.
 
 ## MXFP8 Quantization
 

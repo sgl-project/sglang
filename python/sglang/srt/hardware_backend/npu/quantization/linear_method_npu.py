@@ -1,5 +1,4 @@
 import logging
-from functools import lru_cache
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -129,24 +128,6 @@ class _INT8Activation(NamedTuple):
     source_dtype: torch.dtype
 
 
-@lru_cache(maxsize=None)
-def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) -> bool:
-    try:
-        op = torch.ops.npu.npu_dequant_swiglu_quant
-        probe = torch.zeros((1, width), device=device, dtype=dtype)
-        data, scale = op(probe, quant_mode=1, activate_left=True)
-        return (
-            data.dtype == torch.int8
-            and data.shape == (1, width // 2)
-            and scale.dtype == torch.float32
-            and scale.shape == (1,)
-        )
-    except torch.OutOfMemoryError:
-        raise
-    except (AttributeError, NotImplementedError, RuntimeError):
-        return False
-
-
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     accepts_int8_input = True
 
@@ -160,21 +141,12 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         self.online_weights = online_weights
 
     def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
-        if (
-            x.device.type != "npu"
-            or x.dtype not in (torch.float16, torch.bfloat16)
-            or x.ndim != 2
-            or x.shape[0] == 0
-            or x.shape[1] == 0
-            or x.shape[1] % 2
-            or not x.is_contiguous()
-        ):
+        from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluQuant
+
+        result = NPUSwigluQuant.try_apply(x)
+        if result is None:
             return None
-        if not _supports_swiglu_int8(x.device, x.dtype, x.shape[1]):
-            return None
-        data, scale = torch.ops.npu.npu_dequant_swiglu_quant(
-            x, quant_mode=1, activate_left=True
-        )
+        data, scale = result
         return _INT8Activation(data, scale, x.dtype)
 
     def process_weights_after_loading(self, layer: torch.nn.Module):

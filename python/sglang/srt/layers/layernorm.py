@@ -448,28 +448,6 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
     return False
 
 
-@lru_cache(maxsize=None)
-def _supports_add_rmsnorm_int8(device: torch.device, dtype: torch.dtype, width: int):
-    try:
-        x = torch.zeros((1, width), device=device, dtype=dtype)
-        weight = torch.ones(width, device=device, dtype=dtype)
-        data, _, residual, scale, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
-            x, x, weight, epsilon=1e-6
-        )
-        return (
-            data.dtype == torch.int8
-            and data.shape == x.shape
-            and residual.dtype == dtype
-            and residual.shape == x.shape
-            and scale.dtype == torch.float32
-            and scale.shape == (1,)
-        )
-    except torch.OutOfMemoryError:
-        raise
-    except (AttributeError, NotImplementedError, RuntimeError):
-        return False
-
-
 class RMSNorm(BaseFusedOp):
     # The projection that consumes this norm's output; see fuse_input_quant().
     _quant_linear: Optional[nn.Module] = None
@@ -670,32 +648,11 @@ class RMSNorm(BaseFusedOp):
             or self.cast_x_before_out_mul
             or self.fp32_residual
             or self.override_orig_dtype is not None
-            or x.device.type != "npu"
-            or x.dtype not in (torch.float16, torch.bfloat16)
-            or x.ndim != 2
-            or x.numel() == 0
-            or residual.shape != x.shape
-            or residual.dtype != x.dtype
-            or residual.device != x.device
-            or self.weight is None
-            or self.weight.shape != (x.shape[-1],)
-            or self.weight.dtype != x.dtype
-            or self.weight.device != x.device
         ):
             return None
-        if not _supports_add_rmsnorm_int8(x.device, x.dtype, x.shape[-1]):
-            return None
-        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            _INT8Activation,
-        )
+        from sglang.srt.hardware_backend.npu.layernorm import try_add_rmsnorm_int8
 
-        eps = self.variance_epsilon
-        if eps is None:
-            eps = torch.finfo(x.dtype).eps
-        data, _, residual_out, scales, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
-            x, residual, self.weight, epsilon=eps
-        )
-        return _INT8Activation(data, scales, x.dtype), residual_out
+        return try_add_rmsnorm_int8(x, residual, self.weight, self.variance_epsilon)
 
     def forward_npu(
         self,

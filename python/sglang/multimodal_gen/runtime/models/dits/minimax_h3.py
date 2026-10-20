@@ -75,14 +75,12 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
-)
-from sglang.multimodal_gen.runtime.layers.minimax_h3_npu import (
-    MiniMaxH3RMSNorm,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -381,11 +379,15 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
+def _norm(
+    size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE
+) -> nn.RMSNorm | RMSNorm:
     # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
     # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
     # reduction, matching that accumulation semantic.
-    return MiniMaxH3RMSNorm(size, eps=eps, dtype=dtype)
+    if current_platform.is_npu():
+        return RMSNorm(size, eps=eps, preserve_residual_rounding=True).to(dtype=dtype)
+    return nn.RMSNorm(size, eps=eps, dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -395,7 +397,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm,
+    norm: nn.RMSNorm | RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -506,8 +508,8 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: nn.RMSNorm | RMSNorm,
+    k_norm: nn.RMSNorm | RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
@@ -1573,7 +1575,8 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cube_sparse_capable=False,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
-        self.norm2.fuse_input_quant(self.mlp.fc1)
+        if isinstance(self.norm2, RMSNorm):
+            self.norm2.fuse_input_quant(self.mlp.fc1)
 
     def forward(
         self,
@@ -1590,7 +1593,11 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        h, x = self.norm2(h, x)
+        if isinstance(self.norm2, RMSNorm):
+            h, x = self.norm2(h, x)
+        else:
+            x = x + h
+            h = self.norm2(x)
         return x + self.mlp(h)
 
 
