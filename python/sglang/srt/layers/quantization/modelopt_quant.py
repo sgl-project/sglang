@@ -2007,7 +2007,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
-            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )
@@ -2447,6 +2447,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if self.enable_flashinfer_trtllm_moe:
+            alignment = (
+                64
+                if layer.moe_runner_config.is_gated
+                and self.use_flashinfer_trtllm_weight_layout
+                else 128
+            )
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, alignment
+            )
+            layer.moe_runner_config.intermediate_size_per_partition = (
+                intermediate_size_per_partition
+            )
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
