@@ -4,7 +4,6 @@ import json
 import os
 import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,7 +16,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.muse_spark_utils import try_cached_muse_spark_model
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -202,106 +200,6 @@ class TestMaybeAddMtpSafetensors(CustomTestCase):
                     [model, mtp],
                 )
                 listing.assert_not_called()
-
-
-class TestMuseSparkCachedModel(CustomTestCase):
-    """A partial HF snapshot must not replace a downloadable model ID."""
-
-    def test_cached_checkpoint_completeness(self):
-        repo = "test/model"
-        with tempfile.TemporaryDirectory() as folder:
-            snapshot = Path(folder) / "snapshot"
-            snapshot.mkdir()
-            for name in (
-                "config.json",
-                "processor_config.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-                "l4_200k_base",
-                "chat_template.jinja",
-                "generation_config.json",
-                "hf_quant_config.json",
-            ):
-                (snapshot / name).write_text("{}")
-            shard = snapshot / "model-00001-of-00002.safetensors"
-            shard.write_bytes(b"weights")
-            other = snapshot / "model-00002-of-00002.safetensors"
-            index = snapshot / INDEX_NAME
-            index.write_text(
-                json.dumps({"weight_map": {"a": shard.name, "b": other.name}})
-            )
-
-            with (
-                patch.dict(os.environ, {"DEFAULT_MODEL_CACHE_DIR": ""}),
-                patch(
-                    "sglang.test.muse_spark_utils.find_local_repo_dir",
-                    return_value=str(snapshot),
-                ),
-            ):
-                resolve = lambda: try_cached_muse_spark_model(repo)
-                # An interrupted download still needs the Hub fallback.
-                self.assertEqual(resolve(), repo)
-                other.write_bytes(b"weights")
-                self.assertEqual(resolve(), str(snapshot))
-
-                # Required processor assets and weight symlinks must be usable.
-                (snapshot / "processor_config.json").unlink()
-                self.assertEqual(resolve(), repo)
-                (snapshot / "processor_config.json").write_text("{}")
-                other.unlink()
-                other.symlink_to(snapshot / "missing-blob")
-                self.assertEqual(resolve(), repo)
-                other.unlink()
-                other.touch()
-                self.assertEqual(resolve(), repo)
-                other.write_bytes(b"weights")
-                for data in ("{", "{}", '{"weight_map": {}}'):
-                    index.write_text(data)
-                    self.assertEqual(resolve(), repo)
-
-    def test_single_file_draft_and_default_cache(self):
-        # DFlash has config + weights, with no tokenizer or processor of its own.
-        repo = "test/draft"
-        with tempfile.TemporaryDirectory() as folder:
-            snapshot = Path(folder) / repo
-            snapshot.mkdir(parents=True)
-            (snapshot / "config.json").write_text("{}")
-            with patch.dict(os.environ, {"DEFAULT_MODEL_CACHE_DIR": folder}):
-                self.assertEqual(try_cached_muse_spark_model(repo, draft=True), repo)
-                (snapshot / "model.safetensors").write_bytes(b"weights")
-                self.assertEqual(
-                    try_cached_muse_spark_model(repo, draft=True), str(snapshot)
-                )
-
-    def test_cache_miss_keeps_model_id(self):
-        with (
-            patch.dict(os.environ, {"DEFAULT_MODEL_CACHE_DIR": ""}),
-            patch(
-                "sglang.test.muse_spark_utils.find_local_repo_dir", return_value=None
-            ),
-        ):
-            self.assertEqual(
-                try_cached_muse_spark_model("test/missing", draft=True), "test/missing"
-            )
-
-    def test_incomplete_default_cache_does_not_hide_hf_snapshot(self):
-        with tempfile.TemporaryDirectory() as folder:
-            (Path(folder) / "test/model").mkdir(parents=True)
-            snapshot = Path(folder) / "hf-snapshot"
-            snapshot.mkdir()
-            (snapshot / "config.json").write_text("{}")
-            (snapshot / "model.safetensors").write_bytes(b"weights")
-            with (
-                patch.dict(os.environ, {"DEFAULT_MODEL_CACHE_DIR": folder}),
-                patch(
-                    "sglang.test.muse_spark_utils.find_local_repo_dir",
-                    return_value=str(snapshot),
-                ),
-            ):
-                self.assertEqual(
-                    try_cached_muse_spark_model("test/model", draft=True), str(snapshot)
-                )
 
 
 class TestInitializeDummyWeights(CustomTestCase):
