@@ -1999,6 +1999,7 @@ class UnifiedRadixCache(BasePrefixCache):
         prefix_keys: Optional[list[str]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        kv_hints=None,
     ) -> int:
         """Probe L3 with the request namespace."""
         if (
@@ -2022,6 +2023,7 @@ class UnifiedRadixCache(BasePrefixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            kv_hints=kv_hints,
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
@@ -2044,6 +2046,7 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        kv_hints=None,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2172,6 +2175,7 @@ class UnifiedRadixCache(BasePrefixCache):
             matched_prefix_tokens,
             aux_xfers or None,
             assume_stored=assume_stored,
+            kv_hints=kv_hints,
         )
         operation = submission.operation
         if operation is None:

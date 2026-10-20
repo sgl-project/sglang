@@ -3323,6 +3323,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):
