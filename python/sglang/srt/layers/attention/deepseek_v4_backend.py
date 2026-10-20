@@ -1190,7 +1190,6 @@ class DeepseekV4AttnBackend(
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
-    extend_dummy_seqs_capped_by_req_pool: bool = True
     folds_encoder_swa_replay: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False

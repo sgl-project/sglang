@@ -113,8 +113,6 @@ def _quant_q_fp8(q: torch.Tensor, q_scale: Optional[float]) -> torch.Tensor:
 
 
 class MiniMaxSparseAttnBackend(AttentionBackend):
-    extend_dummy_seqs_capped_by_req_pool: bool = True
-
     def __init__(self, runner: ModelRunner):
         assert isinstance(runner.token_to_kv_pool, MiniMaxSparseKVPool)
         self.is_npu = is_npu()
@@ -1873,9 +1871,6 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
-        self.extend_dummy_seqs_capped_by_req_pool = getattr(
-            dense_backend, "extend_dummy_seqs_capped_by_req_pool", False
-        ) or getattr(sparse_backend, "extend_dummy_seqs_capped_by_req_pool", False)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # delegate so the dense (FlashInfer) backend keeps its own eager init.

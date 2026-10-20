@@ -426,13 +426,11 @@ def maybe_flashinfer_autotune_extend(
     if mr.is_draft_worker and not can_run_dummy_draft_extend(mr.spec_algorithm):
         return
 
+    # Backends may size per-seq extend metadata to the req pool;
+    # a real extend batch never exceeds it, so neither does the dummy.
     batch_size, per_req = _extend_dummy_shape(
         num_tokens=num_tokens,
-        max_seqs=(
-            mr.req_to_token_pool.size
-            if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool
-            else None
-        ),
+        max_seqs=mr.req_to_token_pool.size,
         max_tokens_per_req=mr.req_to_token_pool.max_context_len,
         token_alignment=get_parallel().attn_tp_size,
     )
@@ -501,17 +499,14 @@ def maybe_flashinfer_autotune_extend(
 def _extend_dummy_shape(
     *,
     num_tokens: int,
-    max_seqs: Optional[int],
+    max_seqs: int,
     max_tokens_per_req: int,
     token_alignment: int,
 ) -> tuple[int, int]:
-    if max_seqs is not None:
-        num_tokens = min(num_tokens, max_seqs * max_tokens_per_req)
+    num_tokens = min(num_tokens, max_seqs * max_tokens_per_req)
     # Real batches are padded to a multiple of attn_tp_size;
     # Kimi-K3 SP-MoE skips its MoE reduce-scatter for unaligned rows.
     num_tokens = max(num_tokens // token_alignment, 1) * token_alignment
-    if max_seqs is None:
-        return num_tokens, 1
     pow2_tokens = 1 << (num_tokens.bit_length() - 1)
     for target in (num_tokens, pow2_tokens):
         if target % token_alignment:
