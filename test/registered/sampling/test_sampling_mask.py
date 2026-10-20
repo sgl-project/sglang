@@ -158,11 +158,8 @@ class TestSamplingMaskCapture(CustomTestCase):
                 )
 
     def test_min_p_capture_preserves_original_top_p_nucleus(self):
-        """Token 3 must survive top-p before top-k and min-p filtering.
-
-        Its preceding mass is 0.80 in the original distribution, below 0.82.
-        Renormalizing top-k first raises that mass to 0.80 / 0.85 and drops it.
-        """
+        """Token 3 must survive joint filtering: its original preceding mass
+        is 0.80 < 0.82, while its top-k-normalized mass exceeds 0.82."""
         backends = ("pytorch",) if is_hip() else ("pytorch", "flashinfer")
         for backend in backends:
             with self.subTest(backend=backend):

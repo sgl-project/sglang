@@ -745,11 +745,7 @@ def _apply_joint_top_k_top_p(
     top_k_renorm_prob,
     top_p_renorm_prob,
 ) -> torch.Tensor:
-    """Match the normal sampler's joint top-k/top-p distribution.
-
-    Top-p must inspect the original distribution. Applying top-k first would
-    renormalize its support and change the cumulative-mass boundary.
-    """
+    """Apply top-p to the original distribution before top-k renormalization."""
     if sampling_info.need_top_p_sampling:
         probs = top_p_renorm_prob(
             probs,

@@ -1196,9 +1196,8 @@ def build_speculative_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                # topk_probs has already been renormalized over the top-k
-                # support. Scale top-p by that support's original probability
-                # mass so the cutoff still refers to the full distribution.
+                # Divide top-p by the original top-k mass so the compact distribution
+                # preserves the full-distribution nucleus.
                 topk_mass = torch.exp(
                     torch.logsumexp(topk_logits, dim=-1)
                     - torch.logsumexp(scaled_logits, dim=-1)

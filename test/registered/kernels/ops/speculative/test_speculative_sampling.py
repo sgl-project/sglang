@@ -249,12 +249,8 @@ def joint_top_k_top_p_case():
 
 
 def test_eagle_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
-    """EAGLE must retain token 3, whose preceding original mass is only 0.80.
-
-    Applying top-k first instead raises that mass to 0.80 / 0.85 > top_p.
-    Exercise the FlashInfer kernels used by eagle_sample on CUDA, or Triton
-    on HIP, rather than the sgl_kernel renormalizers.
-    """
+    """Production renormalizers must retain token 3: its original preceding
+    mass is 0.80 < top_p, while its top-k-normalized mass exceeds top_p."""
     original_probs, sampling_info, expected_probs = joint_top_k_top_p_case
     filtered_probs = _apply_joint_top_k_top_p(
         original_probs,
@@ -270,11 +266,8 @@ def test_eagle_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
 def test_speculative_target_preserves_original_top_p_nucleus(
     joint_top_k_top_p_case, use_sparse_topk
 ):
-    """DFlash/DSpark/UNO targets must retain token 3 in dense and sparse modes.
-
-    Its preceding original mass is 0.80 < top_p; renormalizing top-k first
-    would instead compare 0.80 / 0.85 against top_p and wrongly remove it.
-    """
+    """Dense and sparse targets must retain token 3 using its original
+    preceding mass of 0.80, not its top-k-normalized mass of 0.80 / 0.85."""
     original_probs, sampling_info, expected_probs = joint_top_k_top_p_case
     filtered_probs = build_speculative_verify_target_probs(
         next_token_logits=original_probs.log(),
@@ -290,11 +283,8 @@ def test_speculative_target_preserves_original_top_p_nucleus(
 
 @pytest.mark.skipif(torch.version.cuda is None, reason="UNO compact path requires CUDA")
 def test_uno_compact_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
-    """UNO compact support must include token 3 using its original top-p mass.
-
-    Renormalizing its top-k support first raises the preceding mass from
-    0.80 to 0.80 / 0.85 > top_p and would incorrectly remove that token.
-    """
+    """Compact support must retain token 3 using its original preceding
+    mass of 0.80, not its top-k-normalized mass of 0.80 / 0.85."""
     original_probs, sampling_info, expected_probs = joint_top_k_top_p_case
     support_ids, support_probs = _build_sparse_target_support_tensors(
         next_token_logits=original_probs.log(),
