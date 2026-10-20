@@ -772,6 +772,15 @@ class _MoriEPDispatcherImplBase:
         self._manual_recv_cap = envs.SGLANG_MORI_MOE_MAX_INPUT_TOKENS.get()
         self._recv_cap_pow2_buckets = False
 
+    @property
+    def _in_tbo_subbatch(self) -> bool:
+        from sglang.srt.model_executor.forward_context import (
+            get_forward_context,
+            has_forward_context,
+        )
+
+        return has_forward_context() and get_forward_context().is_micro_batch
+
     @staticmethod
     def _snapshot_sender_rows() -> tuple[int, ...] | None:
         """Copy CPU scheduler metadata; non-int rows would need a device sync."""
@@ -799,7 +808,8 @@ class _MoriEPDispatcherImplBase:
             self._recv_cap = min(self._manual_recv_cap, self._get_physical_recv_rows())
         elif (
             self._trim_recv
-            and not self._tbo_enabled
+            # The DP token counts describe the whole batch, not a micro-batch.
+            and not self._in_tbo_subbatch
             and self._is_recv_layout_verified()
         ):
             bound = mori_recv_bound(self._num_tokens, self._dispatch_sender_rows)
@@ -1626,6 +1636,16 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
         # halves back to back.
         return self.enable_sdma
 
+    def _use_comm_stream(self) -> bool:
+        # Only a TBO micro-batch has a sibling to overlap with; other forwards of
+        # a TBO-enabled server run the transfer on the compute stream.
+        return self._comm_stream is not None and self._in_tbo_subbatch
+
+    def _capture_event_if_async(self):
+        if not self._use_comm_stream():
+            return None
+        return super()._capture_event_if_async()
+
     def _dispatch_transport(
         self, hidden_states, topk_weights, topk_ids, scale, ready_event
     ):
@@ -1646,7 +1666,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 hidden_states, topk_weights, scale, topk_ids, return_routing=True
             )
             self.mori_op.dispatch_recv()
-        elif self._comm_stream is None:
+        elif not self._use_comm_stream():
             result = self.mori_op.dispatch(
                 hidden_states, topk_weights, scale, topk_ids, **kwargs
             )
@@ -1672,7 +1692,7 @@ class _MoriEPv2DispatcherImplNormal(_MoriEPv2DispatcherImplBase):
                 hidden_states, None, self._recv_topk_ids, routing=self._routing
             )
             self.mori_op.combine_recv()
-        elif self._comm_stream is None:
+        elif not self._use_comm_stream():
             out, _ = self.mori_op.combine(
                 hidden_states, None, self._recv_topk_ids, routing=self._routing
             )

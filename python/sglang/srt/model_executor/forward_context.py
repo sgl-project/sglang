@@ -46,6 +46,8 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # This call runs one micro-batch of a larger batch (a TBO child).
+    is_micro_batch: bool = False
 
 
 _current: Optional[ForwardContext] = None

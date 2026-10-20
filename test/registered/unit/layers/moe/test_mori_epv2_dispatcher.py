@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.token_dispatcher import moriep
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPDispatcher
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import get_flags, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -112,13 +112,14 @@ class _MoriEPv2TestCase(CustomTestCase):
             item.stop()
         reset_context()
 
-    def _make_dispatcher(self, deepep_mode):
+    def _make_dispatcher(self, deepep_mode, async_finish=False):
         dispatcher = MoriEPDispatcher(
             group=None,
             router_topk=_TOPK,
             hidden_size=_HIDDEN,
             params_dtype=torch.bfloat16,
             deepep_mode=deepep_mode,
+            async_finish=async_finish,
         )
         dispatcher._get_impl()._mori_op = _FakeOp(self.log)
         return dispatcher
@@ -169,6 +170,91 @@ class TestMoriEPv2Transport(_MoriEPv2TestCase):
                 os.environ["MORI_ENABLE_SDMA"] = "1" if sdma else "0"
                 impl = self._make_dispatcher(deepep_mode)._get_impl()
                 self.assertEqual(impl._is_recv_layout_verified(), verified)
+
+
+class TestMoriEPv2TboPerCall(_MoriEPv2TestCase):
+    """--enable-two-batch-overlap must only change the calls that belong to a TBO
+    micro-batch; decode, verify and unsplit prefill forwards of the same server
+    keep the ordinary transfer settings."""
+
+    def _make_tbo_dispatcher(self):
+        stream = object()
+        with (
+            get_flags().moe.override(tbo_enabled=True),
+            patch.object(
+                moriep.CommStreamPool, "get_stream_from_pool", return_value=stream
+            ),
+        ):
+            dispatcher = self._make_dispatcher(DeepEPMode.NORMAL, async_finish=True)
+        self.assertIs(dispatcher._get_impl()._comm_stream, stream)
+        return dispatcher
+
+    def test_tbo_child_marked_only_while_its_stage_runs(self):
+        """A TBO child's stage sees itself marked; once the stage returns the mark
+        is gone, so later forwards are ordinary even where no DP metadata is
+        republished (no DP attention)."""
+        from sglang.srt.batch_overlap.operations import _StageExecutor
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            get_forward_context,
+            has_forward_context,
+        )
+
+        seen = []
+
+        def probe(state, **inputs):
+            seen.append(get_forward_context().is_micro_batch)
+            return inputs
+
+        child = SimpleNamespace(
+            global_dp_buffer_len=None,
+            tbo_padded_len=None,
+            global_num_tokens_cpu=None,
+            dp_padding_mode=SimpleNamespace(is_max_len=lambda: False),
+            moe_num_token_non_padded=None,
+        )
+        # Like execute_overlapped_operations, hand the child its own context.
+        executor = _StageExecutor(
+            "a",
+            [[SimpleNamespace(debug_name="probe", fn=probe)]],
+            inputs={"forward_batch": child},
+            child_ctx=ForwardContext(attn_backend=None),
+            micro_batch=True,
+        )
+        executor.next()
+        self.assertEqual(seen, [True])
+        self.assertFalse(has_forward_context())
+
+        # An unsplit forward (execute_operations) runs no micro-batch.
+        _StageExecutor(
+            "primary",
+            [[SimpleNamespace(debug_name="probe", fn=probe)]],
+            inputs={"forward_batch": child},
+            child_ctx=ForwardContext(attn_backend=None),
+        ).next()
+        self.assertEqual(seen[-1], False)
+
+    def test_comm_stream_only_for_micro_batches(self):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        dispatcher = self._make_tbo_dispatcher()
+        with forward_context(ForwardContext(attn_backend=None, is_micro_batch=True)):
+            self.assertTrue(dispatcher._get_impl()._use_comm_stream())
+
+        # An ordinary forward runs the transfer on the compute stream: no event,
+        # no comm-stream hop.
+        impl = dispatcher._get_impl()
+        self.assertFalse(impl._use_comm_stream())
+        self.assertIsNone(impl._capture_event_if_async())
+        hidden, topk_output = self._inputs()
+        dispatched = dispatcher.dispatch(hidden, topk_output)
+        dispatcher.combine(
+            (dispatched.hidden_states, dispatched.topk_ids, dispatched.topk_weights)
+        )
+        self.assertEqual(self.log, ["dispatch", "combine"])
 
 
 if __name__ == "__main__":
