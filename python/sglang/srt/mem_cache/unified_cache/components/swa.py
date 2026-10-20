@@ -88,7 +88,9 @@ class SWAComponent(TreeComponent):
 
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
-        self.sliding_window_size = params.sliding_window_size
+        # This is the tree's required history, including widened draft reads;
+        # it does not change the model's attention window.
+        self.sliding_window_size = params.swa_retain_window
         self.gates_prefix_match = params.swa_gates_prefix_match
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
