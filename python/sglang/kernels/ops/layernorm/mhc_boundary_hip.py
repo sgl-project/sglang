@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
+from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
     rmsnorm_fake_quant_row,

@@ -400,7 +400,7 @@ def _combine(
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
-    from sglang.kernels.ops.layernorm.mhc import hc_combine
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
     cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
@@ -444,7 +444,7 @@ def _combine(
         from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
         return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
-    return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
+    return norm(mhc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
 # ---------------------------------------------------------------------------
