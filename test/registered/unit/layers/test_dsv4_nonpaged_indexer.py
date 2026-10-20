@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.indexer import (
     FP8_DTYPE,
     C4IndexerBackendMixin,
+    group_verify_rows,
     topk_transform_pytorch_vectorized,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -1152,6 +1153,81 @@ class TestGroupedVerifyRows(CustomTestCase):
             torch.equal(lens, metadata.compressed_seq_lens[6:18].view(2, 6))
         )
         self.assertTrue(torch.equal(table, per_request_table[1:]))
+
+
+class TestC4GroupedVerifyRows(CustomTestCase):
+    """The C4 indexer's static verify rows reach DeepGEMM as one request per group."""
+
+    requests, n, heads, pages = 3, 4, 2, 5
+
+    def _inputs(self):
+        rows = self.requests * self.n
+        table = torch.arange(self.requests * self.pages, dtype=torch.int32).view(
+            self.requests, self.pages
+        )
+        return (
+            torch.arange(rows * self.heads * 128, dtype=torch.int32).view(
+                rows, 1, self.heads, 128
+            ),
+            (torch.arange(rows, dtype=torch.int32) + 100).unsqueeze(-1),
+            table.repeat_interleave(self.n, dim=0),
+            table,
+        )
+
+    def test_one_row_per_request_passes_through(self):
+        q, lens, rows_table, _ = self._inputs()
+        out_q, out_lens, out_table = group_verify_rows(q, lens, rows_table, 1)
+        self.assertIs(out_q, q)
+        self.assertIs(out_lens, lens)
+        self.assertIs(out_table, rows_table)
+
+    def test_fp8_rows_become_one_request(self):
+        q, lens, rows_table, table = self._inputs()
+        out_q, out_lens, out_table = group_verify_rows(q, lens, rows_table, self.n)
+        self.assertEqual(tuple(out_q.shape), (self.requests, self.n, self.heads, 128))
+        self.assertTrue(torch.equal(out_q.reshape(q.shape), q))
+        self.assertTrue(torch.equal(out_lens, lens.view(self.requests, self.n)))
+        self.assertTrue(torch.equal(out_table, table))
+        self.assertEqual(out_table.stride(1), 1)
+
+    def test_fp4_pair_and_row_chunk(self):
+        q, lens, rows_table, table = self._inputs()
+        sf = torch.arange(q.shape[0] * self.heads, dtype=torch.int32).view(
+            -1, 1, self.heads
+        )
+        rows = slice(self.n, 3 * self.n)
+        (out_q, out_sf), out_lens, out_table = group_verify_rows(
+            (q[rows], sf[rows]), lens[rows], rows_table[rows], self.n
+        )
+        self.assertEqual(tuple(out_q.shape), (2, self.n, self.heads, 128))
+        self.assertEqual(tuple(out_sf.shape), (2, self.n, self.heads))
+        self.assertTrue(torch.equal(out_sf.reshape(-1, 1, self.heads), sf[rows]))
+        self.assertTrue(torch.equal(out_lens, lens[rows].view(2, self.n)))
+        self.assertTrue(torch.equal(out_table, table[1:]))
+
+    def test_gate(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            C4_GROUPED_VERIFY_MIN_REQUESTS,
+            DeepseekV4AttnBackend,
+        )
+        from sglang.srt.runtime_context import override_platform
+
+        gate = DeepseekV4AttnBackend._c4_indexer_groups_verify_rows
+        bs = C4_GROUPED_VERIFY_MIN_REQUESTS
+        with (
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
+            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
+        ):
+            with override_platform(is_sm100=True):
+                self.assertTrue(gate(None, bs))
+                self.assertFalse(gate(None, bs - 1))
+                with envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(True):
+                    self.assertFalse(gate(None, bs))
+                with envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True):
+                    self.assertFalse(gate(None, bs))
+            with override_platform(is_sm100=False):
+                self.assertFalse(gate(None, bs))
 
 
 class TestCandidateIndexerGating(CustomTestCase):

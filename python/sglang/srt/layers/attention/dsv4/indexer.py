@@ -516,6 +516,24 @@ def topk_transform_paged_from_metadata(
         )
 
 
+def group_verify_rows(
+    q, lens: torch.Tensor, table: torch.Tensor, rows_per_request: int
+):
+    """``(q, lens, table)`` for the paged logits kernel with ``rows_per_request``
+    consecutive rows per request scored as one next_n query, so the kernel reads
+    a request's index keys once rather than once per row: ``q`` (or each tensor
+    of an FP4 ``(values, scales)`` pair) viewed ``[requests, n, ...]``, the
+    per-row lengths ``[requests, n]``, and one page-table row per request."""
+    n = rows_per_request
+    if n == 1:
+        return q, lens, table
+    if isinstance(q, tuple):
+        q = tuple(t.view(-1, n, *t.shape[2:]) for t in q)
+    else:
+        q = q.view(-1, n, *q.shape[2:])
+    return q, lens.view(-1, n), table[::n]
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -1085,13 +1103,18 @@ class C4IndexerBackendMixin:
                 metadata: torch.Tensor,
                 topk_plan: Optional[torch.Tensor] = None,
             ) -> None:
-                row_q = (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows]
+                row_q, lens, table = group_verify_rows(
+                    (q[0][rows], q[1][rows]) if isinstance(q, tuple) else q[rows],
+                    _c4sl[rows],
+                    page_table[rows],
+                    indexer_metadata.rows_per_request,
+                )
                 logits = fn(
                     row_q,
                     c4_indexer_kv_cache,
                     weights[rows],
-                    _c4sl[rows],
-                    page_table[rows],
+                    lens,
+                    table,
                     metadata,
                     indexer_metadata.max_compressed_seq_len,
                     False,
