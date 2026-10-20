@@ -162,8 +162,16 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
     # Most requests one replay of that captured metadata can carry (None: no
-    # bound). Fixed at init: the dp-attention replay vote checks it too.
+    # bound). Fixed at init: the dp-attention replay vote checks it too, unless
+    # prefill_cuda_graph_eager_metadata_fallback captures an eager-metadata variant
+    # per bucket that takes the batches past it.
     prefill_cuda_graph_max_batch_size: Optional[int] = None
+    prefill_cuda_graph_eager_metadata_fallback: bool = False
+
+    def prefill_cuda_graph_bucket_max_batch_size(
+        self, num_tokens: int
+    ) -> Optional[int]:
+        return self.prefill_cuda_graph_max_batch_size
 
     # Backends may keep MIXED prefill eager under DP attention when replaying
     # the EXTEND graph is a known serving-performance regression.

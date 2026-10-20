@@ -520,6 +520,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner._backend_vote_prefill_cuda_graph = None
         runner._is_full_backend = False
         runner._captured_attn_metadata_max_bs = 2
+        runner._captured_attn_metadata_fallback = False
         runner.prefer_eager_mixed_prefill = False
         runner.prefill_backend_name = Backend.BREAKABLE
         runner.has_mha_companion_layers = False

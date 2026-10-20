@@ -44,7 +44,7 @@ import logging
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -171,6 +171,9 @@ def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int
     collectives when a dense FFN runs with moe_dense_tp_size=1.
     """
     return sorted({get_cuda_graph_max_batch_size(n) for n in capture_tokens})
+
+
+_EAGER_METADATA_VARIANT = "eager_metadata"
 
 
 def _chunked_prefix_variant(num_chunks: int) -> str:
@@ -304,6 +307,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
+    _captured_attn_metadata_bucket_max_bs: Optional[Callable[[int], Optional[int]]] = (
+        None
+    )
+    _captured_attn_metadata_fallback: bool = False
+    _buckets_without_captured_attn_metadata: frozenset = frozenset()
     dllm_attention = None
 
     @property
@@ -666,6 +674,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.attn_backend.prefill_cuda_graph_max_batch_size
             if self.use_captured_attn_metadata
             else None
+        )
+        self._captured_attn_metadata_bucket_max_bs = (
+            model_runner.attn_backend.prefill_cuda_graph_bucket_max_batch_size
+            if self.use_captured_attn_metadata
+            else None
+        )
+        self._captured_attn_metadata_fallback = (
+            self.use_captured_attn_metadata
+            and model_runner.attn_backend.prefill_cuda_graph_eager_metadata_fallback
         )
         self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
@@ -1073,9 +1090,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             and self._select_prefix_capture_chunks(max_prefix_len) is None
         )
 
+    def _captured_attn_metadata_fits(self, batch_size: int, num_tokens: int) -> bool:
+        max_bs = self._captured_attn_metadata_bucket_max_bs(num_tokens)
+        return max_bs is None or batch_size <= max_bs
+
     def _shape_key(self, num_tokens: int, forward_batch: ForwardBatch) -> ShapeKey:
         variant = None
-        if self._capture_chunked_prefix:
+        if self._captured_attn_metadata_fallback and (
+            num_tokens in self._buckets_without_captured_attn_metadata
+            or not self._captured_attn_metadata_fits(
+                forward_batch.batch_size, num_tokens
+            )
+        ):
+            variant = _EAGER_METADATA_VARIANT
+        elif self._capture_chunked_prefix:
             prefix_lens = forward_batch.extend_prefix_lens_cpu
             local_max_prefix_len = (
                 max(prefix_lens, default=0) if prefix_lens is not None else 0
@@ -1234,7 +1262,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            if not self.use_captured_attn_metadata:
+            if (
+                not self.use_captured_attn_metadata
+                or shape_key.variant_label == _EAGER_METADATA_VARIANT
+            ):
                 attn_backend.init_forward_metadata(forward_batch)
                 return
             metadata = (
@@ -1283,7 +1314,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.input_ids = static_forward_batch.input_ids
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
-        if not self.use_captured_attn_metadata:
+        if (
+            not self.use_captured_attn_metadata
+            or shape_key.variant_label == _EAGER_METADATA_VARIANT
+        ):
             attn_backend.init_forward_metadata(forward_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch, num_qo_tokens=shape_key.size
@@ -1339,7 +1373,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if self._is_full_backend and batch_size > self._capture_req_slots:
             return False
         if (
-            self._captured_attn_metadata_max_bs is not None
+            not self._captured_attn_metadata_fallback
+            and self._captured_attn_metadata_max_bs is not None
             and batch_size > self._captured_attn_metadata_max_bs
         ):
             return False
@@ -1710,6 +1745,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
             self.capture_one_shape(num_tokens)
+            if self._captured_attn_metadata_fallback:
+                self.capture_one_shape(num_tokens, eager_metadata_variant=True)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(
@@ -1717,12 +1754,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self,
+        size: int,
+        *,
+        prefix_num_chunks: int = 0,
+        eager_metadata_variant: bool = False,
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        if (
+            not eager_metadata_variant
+            and self._captured_attn_metadata_fallback
+            and not self._captured_attn_metadata_fits(
+                forward_batch.batch_size, num_tokens
+            )
+        ):
+            self._buckets_without_captured_attn_metadata = (
+                self._buckets_without_captured_attn_metadata | {num_tokens}
+            )
+            return
         # Recapture can follow decode replay, which may change model-owned storage.
         prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
         if prepare is not None:
@@ -1750,7 +1804,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             variant_label=(
                 _chunked_prefix_variant(prefix_num_chunks)
                 if prefix_num_chunks
-                else None
+                else (_EAGER_METADATA_VARIANT if eager_metadata_variant else None)
             ),
         )
         if prefix_num_chunks:
@@ -2316,8 +2370,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_num_tokens = len(static_forward_batch.input_ids)
             raw_num_tokens = self.raw_num_tokens
             shape_key = self._shape_key(static_num_tokens, forward_batch)
-            # The only variants this runner records are chunked-prefix ones.
-            if shape_key.variant_label is not None:
+            if shape_key in self._prefix_capture_batches:
                 self._prepare_chunked_prefix_replay(shape_key, forward_batch)
             # Replay prep, including the optional chunked-prefix gather above,
             # has finished every scheduler-shared read.

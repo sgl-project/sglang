@@ -5,6 +5,8 @@ from __future__ import annotations
 from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
@@ -115,23 +117,19 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             else None
         )
         result = self._recurrent_kda(
-            q=q.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
-            g=g[:, : q.shape[1]].contiguous(),
-            beta=beta[:, : q.shape[1]].contiguous(),
-            A_log=A_log.reshape(-1).float().contiguous(),
-            # FlashInfer's grouped-CTA recurrent kernel (extends with a cached prefix)
-            # indexes dt_bias as a flat [H*K] tensor and asserts a unit leading stride.
-            dt_bias=dt_bias.reshape(-1).float().contiguous(),
-            initial_state=ssm_states,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            use_gate_in_kernel=True,
-            lower_bound=lower_bound,
+            **_prefill_inputs(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                ssm_states=ssm_states,
+                lower_bound=lower_bound,
+            ),
             cu_seqlens=query_start_loc,
             ssm_state_indices=cache_indices.to(torch.int32),
-            beta_is_logit=True,
             state_checkpoints=checkpoints,
             checkpoint_cu_starts=(
                 state_checkpoint_cu_starts if needs_checkpoint else None
@@ -148,3 +146,202 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             kwargs["track_state"][track_ssm_h_batch_src] = checkpoints.float()
         output = result[0]
         return (output, None) if return_intermediate_states else output
+
+    def extend_in_graph(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float,
+        graph_state: FlashInferKDAPrefillGraphState,
+        cu_seqlens: torch.Tensor,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        inputs = _prefill_inputs(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            lower_bound=lower_bound,
+        )
+        checkpoints = None
+        checkpoint_kwargs = {}
+        if graph_state.checkpoint_every_n_tokens:
+            checkpoints = ssm_states.new_empty(
+                (graph_state.max_seqs, *ssm_states.shape[1:])
+            )
+            checkpoint_kwargs = dict(
+                state_checkpoints=checkpoints,
+                checkpoint_cu_starts=graph_state.checkpoint_cu_starts,
+                checkpoint_every_n_tokens=graph_state.checkpoint_every_n_tokens,
+                checkpoint_state_indices=graph_state.checkpoint_state_indices,
+            )
+        wrapper = graph_state.wrapper(layer_id=layer_id, cu_seqlens=cu_seqlens)
+        result = wrapper.run(
+            **inputs,
+            output=torch.empty_like(inputs["q"]),
+            ssm_state_indices=graph_state.state_indices,
+            **checkpoint_kwargs,
+        )
+        graph_state.scratch.adopt(wrapper)
+        return result[0], checkpoints
+
+
+def _prefill_inputs(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_states: torch.Tensor,
+    lower_bound: float,
+) -> dict:
+    return dict(
+        q=q.contiguous(),
+        k=k.contiguous(),
+        v=v.contiguous(),
+        g=g[:, : q.shape[1]].contiguous(),
+        beta=beta[:, : q.shape[1]].contiguous(),
+        A_log=A_log.reshape(-1).float().contiguous(),
+        # FlashInfer's grouped-CTA recurrent kernel (extends with a cached prefix)
+        # indexes dt_bias as a flat [H*K] tensor and asserts a unit leading stride.
+        dt_bias=dt_bias.reshape(-1).float().contiguous(),
+        initial_state=ssm_states,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=lower_bound,
+        beta_is_logit=True,
+    )
+
+
+# kda_chunked_bt16's BT: how far FlashInfer's last tile reads past the batch.
+FLASHINFER_KDA_PREFILL_TILE_TOKENS = 16
+
+
+class FlashInferKDAPrefillGraphScratch(msgspec.Struct):
+    buffer: Optional[torch.Tensor] = None
+
+    # Workaround: shares FlashInfer's private planner scratch (calls run serially on
+    # one stream). Drop once flashinfer-ai/flashinfer#5069 lands.
+    def share(self, wrapper) -> None:
+        if self.buffer is not None:
+            _planner_workspace(wrapper).__dict__["_cute_dsl_workspace"] = self.buffer
+
+    def adopt(self, wrapper) -> None:
+        workspace = _planner_workspace(wrapper)._cute_dsl_workspace
+        if workspace is not None and (
+            self.buffer is None or workspace.numel() > self.buffer.numel()
+        ):
+            self.buffer = workspace
+
+
+def _planner_workspace(wrapper):
+    return wrapper._impl.workspace
+
+
+class FlashInferKDAPrefillGraphState(msgspec.Struct, frozen=True):
+    max_seqs: int
+    checkpoint_every_n_tokens: int
+    state_indices: torch.Tensor
+    checkpoint_cu_starts: Optional[torch.Tensor]
+    checkpoint_state_indices: Optional[torch.Tensor]
+    host_checkpoint_cu_starts: Optional[np.ndarray]
+    host_checkpoint_state_indices: Optional[np.ndarray]
+    scratch: FlashInferKDAPrefillGraphScratch
+    wrappers: dict = msgspec.field(default_factory=dict)
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        num_tokens: int,
+        max_seqs: int,
+        checkpoint_every_n_tokens: int,
+        device: torch.device,
+        scratch: Optional[FlashInferKDAPrefillGraphScratch] = None,
+    ) -> FlashInferKDAPrefillGraphState:
+        cu_starts = indices = host_cu_starts = host_indices = None
+        if checkpoint_every_n_tokens:
+            max_checkpoints = num_tokens // checkpoint_every_n_tokens + 1
+            cu_starts = torch.zeros(max_seqs + 1, dtype=torch.int64, device=device)
+            indices = torch.full(
+                (max_checkpoints,), -1, dtype=torch.int32, device=device
+            )
+            host_cu_starts = np.zeros(max_seqs + 1, dtype=np.int64)
+            host_indices = np.full(max_checkpoints, -1, dtype=np.int32)
+        return cls(
+            max_seqs=max_seqs,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_indices=torch.zeros(max_seqs, dtype=torch.int32, device=device),
+            checkpoint_cu_starts=cu_starts,
+            checkpoint_state_indices=indices,
+            host_checkpoint_cu_starts=host_cu_starts,
+            host_checkpoint_state_indices=host_indices,
+            scratch=FlashInferKDAPrefillGraphScratch() if scratch is None else scratch,
+        )
+
+    def fill(
+        self,
+        *,
+        extend_seq_lens: list[int],
+        cache_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        checkpoint_rows: list[tuple[int, int]],
+    ) -> None:
+        self.state_indices.copy_(cache_indices.clamp(min=0))
+        if self.checkpoint_every_n_tokens:
+            self._fill_checkpoint_tables(
+                extend_seq_lens=extend_seq_lens, checkpoint_rows=checkpoint_rows
+            )
+        for wrapper in self.wrappers.values():
+            wrapper.plan(cu_seqlens)
+
+    def _fill_checkpoint_tables(
+        self,
+        *,
+        extend_seq_lens: list[int],
+        checkpoint_rows: list[tuple[int, int]],
+    ) -> None:
+        n = self.checkpoint_every_n_tokens
+        bs = len(extend_seq_lens)
+        starts = self.host_checkpoint_cu_starts
+        starts[0] = 0
+        np.cumsum(
+            np.asarray(extend_seq_lens, dtype=np.int64) // n, out=starts[1 : bs + 1]
+        )
+        starts[bs + 1 :] = starts[bs]
+        indices = self.host_checkpoint_state_indices
+        indices.fill(-1)
+        for row, completed_chunks in checkpoint_rows:
+            indices[starts[row] + completed_chunks - 1] = row
+        self.checkpoint_cu_starts.copy_(
+            torch.from_numpy(starts).pin_memory(), non_blocking=True
+        )
+        self.checkpoint_state_indices.copy_(
+            torch.from_numpy(indices).pin_memory(), non_blocking=True
+        )
+
+    def wrapper(self, *, layer_id: int, cu_seqlens: torch.Tensor):
+        wrapper = self.wrappers.get(layer_id)
+        if wrapper is None:
+            from flashinfer.kda import RecurrentKDAPrefillWrapper
+
+            wrapper = RecurrentKDAPrefillWrapper(cu_seqlens.device)
+            self.scratch.share(wrapper)
+            wrapper.plan(cu_seqlens)
+            self.wrappers[layer_id] = wrapper
+        return wrapper

@@ -15,9 +15,14 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
     kda_extend_in_graph,
+    prefill_graph_max_seqs,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (
     build_fused_accept_indices,
+)
+from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+    FlashInferKDAPrefillGraphScratch,
+    FlashInferKDAPrefillKernel,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -51,6 +56,13 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_cache_chunk_size,
 )
+
+
+def _flashinfer_prefill_graph_max_seqs(*, num_heads: int, device) -> int:
+    # Mirrors kda_chunked_bt16._occupancy_pick_route: past it FlashInfer leaves the
+    # two-CTA decomp route for the slower plain engine.
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    return max(1, sm_count // (2 * num_heads))
 
 
 def _validate_flashinfer_kda_prefill(
@@ -513,6 +525,20 @@ class KDAAttnBackend(MambaAttnBackendBase):
         self.kernel_dispatcher = KDAKernelDispatcher(
             decode_backend, prefill_backend, verify_backend
         )
+        self._flashinfer_prefill_graph = isinstance(
+            self.kernel_dispatcher.extend_kernel, FlashInferKDAPrefillKernel
+        )
+        self.flashinfer_prefill_graph_scratch = FlashInferKDAPrefillGraphScratch()
+        if self._flashinfer_prefill_graph:
+            self.prefill_graph_max_seqs = min(
+                self.prefill_graph_max_seqs,
+                _flashinfer_prefill_graph_max_seqs(
+                    num_heads=model_runner.req_to_token_pool.mamba_pool.mamba_cache.temporal.shape[
+                        -3
+                    ],
+                    device=self.device,
+                ),
+            )
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,
@@ -624,10 +650,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def supports_prefill_graph_extend(self) -> bool:
         return (
             not envs.SGLANG_DISABLE_KDA_PREFILL_GRAPH_EXTEND.get()
-            # Only the Triton chain guards padded rows (-1 state slots, chunks past T).
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonKDAKernel)
+            # Only the Triton chain (-1 state slots, chunks past T) and the FlashInfer
+            # graph state (padding slot 0, zeroed tail rows) guard padded rows.
+            and isinstance(
+                self.kernel_dispatcher.extend_kernel,
+                (TritonKDAKernel, FlashInferKDAPrefillKernel),
+            )
             # Fused-accept staging (flashinfer verify) writes per extend.
             and self.accept_lens_pool is None
+        )
+
+    def prefill_graph_eager_metadata_fallback(self) -> bool:
+        return self._flashinfer_prefill_graph
+
+    def prefill_graph_bucket_max_seqs(self, num_tokens: int) -> int:
+        return prefill_graph_max_seqs(
+            num_tokens=num_tokens,
+            max_seqs_cap=self.prefill_graph_max_seqs,
+            flashinfer=self._flashinfer_prefill_graph,
         )
 
     def prefill_graph_extend_active(self) -> bool:
@@ -645,6 +685,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             track=get_exec().mamba.enable_mamba_extra_buffer,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
+            flashinfer_chunk_size=(
+                self.mamba_chunk_size if self._flashinfer_prefill_graph else None
+            ),
+            flashinfer_scratch=self.flashinfer_prefill_graph_scratch,
         )
         self._fill_prefill_graph_metadata(
             meta=meta, forward_batch=forward_batch, cache_indices=cache_indices
