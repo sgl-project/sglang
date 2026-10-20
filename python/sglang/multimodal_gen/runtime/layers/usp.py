@@ -54,7 +54,7 @@ def uncached_a2a_staging():
 
 # Accelerators whose device module exposes is_current_stream_capturing() and can
 # run the packed-QKV relayout kernel. "cuda" also covers ROCm, where is_cuda is True.
-_A2A_DEVICE_TYPES = ("cuda", "xpu", "cpu")
+_A2A_DEVICE_TYPES = ("cuda", "xpu")
 
 
 def drop_a2a_staging_buffers() -> None:
@@ -90,15 +90,20 @@ def _a2a_staging_buffer(
         _UNCACHED_STAGING
         or torch.is_grad_enabled()
         or torch.compiler.is_compiling()
-        or device.type not in _A2A_DEVICE_TYPES
-        or torch.get_device_module(device).is_current_stream_capturing()
+        or (device.type != "cpu" and device.type not in _A2A_DEVICE_TYPES)
     ):
         return torch.empty(shape, dtype=dtype, device=device)
-
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.get_device_module(device).current_device()
-    key = (role, dtype, device_index)
+    if device.type == "cpu":
+        # CPU has no accelerator stream capture or device index.
+        device_index = 0
+    else:
+        device_module = torch.get_device_module(device)
+        if device_module.is_current_stream_capturing():
+            return torch.empty(shape, dtype=dtype, device=device)
+        device_index = device.index
+        if device_index is None:
+            device_index = device_module.current_device()
+    key = (role, dtype, device.type, device_index)
     required_numel = math.prod(shape)
     buffer = _A2A_STAGING_BUFFERS.get(key)
     if buffer is None or buffer.numel() < required_numel:
@@ -491,7 +496,7 @@ def _can_use_packed_qkv_a2a_4d(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, world_size: int
 ) -> bool:
     return (
-        q.device.type in _A2A_DEVICE_TYPES
+        (q.device.type == "cpu" or q.device.type in _A2A_DEVICE_TYPES)
         and q.ndim == 4
         and q.shape == k.shape == v.shape
         and q.dtype == k.dtype == v.dtype

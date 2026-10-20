@@ -82,13 +82,44 @@ class TestDiffusionCPUParallel(CustomTestCase):
                 finally:
                     kill_process_tree(process.pid)
 
-            if timed_out:
-                self.fail(f"Diffusion generation timed out after {GENERATE_TIMEOUT}s.")
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            log_tail = log_text[-16000:]
 
-            self.assertEqual(returncode, 0)
-            self.assertTrue(output_file.is_file())
+            if timed_out:
+                self.fail(
+                    f"Diffusion generation timed out after {GENERATE_TIMEOUT}s.\n"
+                    f"Command: {' '.join(command)}\n"
+                    f"Generation log:\n{log_tail}"
+                )
+
+            self.assertEqual(
+                returncode,
+                0,
+                msg=(
+                    f"Diffusion generation failed with return code {returncode}.\n"
+                    f"Command: {' '.join(command)}\n"
+                    f"Generation log:\n{log_tail}"
+                ),
+            )
+
+            self.assertTrue(
+                output_file.is_file(),
+                msg=(
+                    f"Expected output video not found: {output_file}\n"
+                    f"Actual generated files: {[str(p) for p in output_dir.rglob('*')]}\n"
+                    f"Command: {' '.join(command)}\n"
+                    f"Generation log:\n{log_tail}"
+                ),
+            )
+
             self.assertGreater(
-                output_file.stat().st_size, 0, "Generated video is empty"
+                output_file.stat().st_size,
+                0,
+                msg=(
+                    f"Generated video is empty: {output_file}\n"
+                    f"Command: {' '.join(command)}\n"
+                    f"Generation log:\n{log_tail}"
+                ),
             )
 
     def test_cpu_tp_only(self):
