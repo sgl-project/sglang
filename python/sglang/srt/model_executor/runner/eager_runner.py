@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -259,7 +260,11 @@ class EagerRunner(BaseRunner):
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
-        with ctx, pdmux_ctx:
+        with (
+            ctx,
+            pdmux_ctx,
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -341,7 +346,10 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
+        with (
+            device_timer_ctx(model_runner.device_timer, category),
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             if cp_active and (
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
@@ -448,7 +456,10 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        with device_timer_ctx(model_runner.device_timer, "idle"):
+        with (
+            device_timer_ctx(model_runner.device_timer, "idle"),
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

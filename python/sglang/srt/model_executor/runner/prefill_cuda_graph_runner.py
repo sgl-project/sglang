@@ -819,7 +819,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 full_graph=self._is_full_backend, raw_num_tokens=raw_num_tokens
             ),
             forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=forward_batch,
             ),
             set_tc_piecewise_forward_context(
                 forward_batch,
@@ -953,7 +954,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             set_forward_batch(fb),
             prefill_graph_scope(full_graph=self._is_full_backend),
             forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ForwardContext(attn_backend=self.model_runner.attn_backend),
+                forward_batch=fb,
             ),
             set_tc_piecewise_forward_context(
                 fb,
@@ -1234,7 +1236,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         and stash the returned per-bucket metadata object; otherwise fall
         back to the generic eager init that BCG/TC_PIECEWISE use today."""
         attn_backend = self.model_runner.attn_backend
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
+        ):
             if not self.use_captured_attn_metadata:
                 attn_backend.init_forward_metadata(forward_batch)
                 return
