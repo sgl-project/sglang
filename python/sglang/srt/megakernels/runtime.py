@@ -92,6 +92,7 @@ def install_megakernel(
     model._derived_weight_cache_error = (
         f"Online weight updates are not supported with {FLAG} ({spec.name})"
     )
+    _install_preparation_bridge(model=model, built=built, binding=binding)
     built_s = time.perf_counter() - start
     used_mib = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
     if not built.widths:
@@ -248,14 +249,18 @@ class _Dispatch:
         @functools.wraps(self.original)
         def forward(input_ids, positions, forward_batch, *args, **kwargs):
             step = self.built.plan(input_ids, forward_batch, *args, **kwargs)
-            if torch.cuda.is_current_stream_capturing():
+            capturing = torch.cuda.is_current_stream_capturing()
+            if capturing:
                 self.captured[int(forward_batch.batch_size)] = step
             if step is None:
                 return self.original(
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
+            view = self.binding.forward_view(forward_batch)
+            if capturing:
+                self.binding.seal_capture_view(forward_batch, view)
             return self.built.forward(
-                msgspec.structs.replace(step, view=self.binding.forward_view()),
+                msgspec.structs.replace(step, view=view),
                 self.original,
                 input_ids,
                 positions,
@@ -265,6 +270,26 @@ class _Dispatch:
             )
 
         return forward
+
+
+def _install_preparation_bridge(
+    *, model: torch.nn.Module, built: BuiltMegakernel, binding: MegakernelBinding
+) -> None:
+    """Chain a built object's optional post-pool preparation into the model hook."""
+    prepare = getattr(built, "prepare_before_cuda_graph_capture", None)
+    if prepare is None:
+        return
+    original_prepare = getattr(model, "prepare_before_cuda_graph_capture", None)
+
+    def prepare_before_cuda_graph_capture(model_runner: Any) -> None:
+        if original_prepare is not None:
+            original_prepare(model_runner)
+        prepare(binding.preparation_view(model_runner))
+
+    # An nn.Module callback belongs to this instance, not its module/state tree.
+    model.__dict__["prepare_before_cuda_graph_capture"] = (
+        prepare_before_cuda_graph_capture
+    )
 
 
 class _CaptureCheck:

@@ -111,7 +111,11 @@ class BuiltMegakernel(Protocol):
 
     SGLang's runtime state reaches a build as BuildContext.binding and a covered
     step as Step.view (megakernels/binding.py, which also lists what else may be
-    called, written or read).
+    called, written or read). A built object may additionally define
+    ``prepare_before_cuda_graph_capture(view)``. SGLang calls it after its model
+    preparation, once the attention backends and pools exist, and passes a typed
+    preparation view rather than its model runner. The callback may run again when
+    CUDA graphs are recaptured and must therefore be idempotent.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested

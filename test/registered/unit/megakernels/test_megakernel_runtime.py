@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
 from msgspec.structs import replace
@@ -17,7 +17,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _fakes import ANY_TP, ARCH, ISA, SPEC, Lm, batch, server_args  # noqa: E402
+from _fakes import (  # noqa: E402
+    ANY_TP,
+    ARCH,
+    ISA,
+    SPEC,
+    FakeBuilt,
+    Lm,
+    batch,
+    server_args,
+)
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
@@ -29,10 +38,11 @@ def install(
     tokens=2,
     hooks=None,
     is_draft=False,
+    model=None,
 ):
     """install_megakernel on an Lm as rank 0 of the published server; gathered maps
     a gathered value to what the other ranks report, default the same as this rank."""
-    lm, hooks = Lm(), [] if hooks is None else hooks
+    lm, hooks = (Lm() if model is None else model), [] if hooks is None else hooks
     gpu = SimpleNamespace(multi_processor_count=160)
     with (
         patch.object(runtime, "device_isa", return_value=ISA),
@@ -69,6 +79,9 @@ class TestMegakernelRuntime(CustomTestCase):
         )
         view_patch.start()
         self.addCleanup(view_patch.stop)
+        capture_view_patch = patch.object(MegakernelBinding, "seal_capture_view")
+        capture_view_patch.start()
+        self.addCleanup(capture_view_patch.stop)
 
     def _install_spec(self, spec, **kw):
         with patch.object(runtime, "find_spec", return_value=(spec, "")):
@@ -84,6 +97,124 @@ class TestMegakernelRuntime(CustomTestCase):
             self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard")
         # only a covered step runs the megakernel, with the running forward's view
         self.assertEqual((built.steps, built.views), ([4], ["view"]))
+        MegakernelBinding.seal_capture_view.assert_not_called()
+
+    def test_dispatch_passes_and_seals_the_current_capture_view(self):
+        lm = install(tokens=1)
+        forward_batch = batch(4)
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            lm(forward_batch.input_ids, None, forward_batch)
+        MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
+        MegakernelBinding.seal_capture_view.assert_called_once_with(
+            forward_batch, "view"
+        )
+
+    def test_optional_preparation_runs_after_the_model_hook_and_repeats(self):
+        events = []
+        prepared_view = object()
+
+        # Use the ordinary fake object, adding only the optional callback under test.
+        def build(model, hf_config, context):
+            model.context = context
+            built = FakeBuilt(context.widths)
+
+            def prepare(view):
+                events.append(("plugin", view))
+
+            built.prepare_before_cuda_graph_capture = prepare
+            return built
+
+        model = Lm()
+        original = Mock(side_effect=lambda runner: events.append(("model", runner)))
+        model.__dict__["prepare_before_cuda_graph_capture"] = original
+        spec = replace(SPEC, build=build)
+        with patch.object(
+            MegakernelBinding, "preparation_view", return_value=prepared_view
+        ) as make_view:
+            lm = self._install_spec(spec, model=model)
+            runner = object()
+            lm.prepare_before_cuda_graph_capture(runner)
+            lm.prepare_before_cuda_graph_capture(runner)
+        self.assertEqual(
+            events,
+            [
+                ("model", runner),
+                ("plugin", prepared_view),
+                ("model", runner),
+                ("plugin", prepared_view),
+            ],
+        )
+        self.assertEqual(original.call_args_list, [call(runner), call(runner)])
+        self.assertEqual(make_view.call_args_list, [call(runner), call(runner)])
+
+    def test_absent_preparation_callback_leaves_the_model_hook_untouched(self):
+        model = Lm()
+        original = Mock()
+        model.__dict__["prepare_before_cuda_graph_capture"] = original
+        lm = install(model=model)
+        self.assertIs(lm.__dict__["prepare_before_cuda_graph_capture"], original)
+
+        hookless = install()
+        self.assertNotIn("prepare_before_cuda_graph_capture", hookless.__dict__)
+
+    def test_preparation_failures_propagate_in_order(self):
+        def prepared_spec(plugin):
+            def build(model, hf_config, context):
+                model.context = context
+                built = FakeBuilt(context.widths)
+                built.prepare_before_cuda_graph_capture = plugin
+                return built
+
+            return replace(SPEC, build=build)
+
+        model = Lm()
+        model.__dict__["prepare_before_cuda_graph_capture"] = Mock(
+            side_effect=RuntimeError("model failed")
+        )
+        plugin = Mock()
+        lm = self._install_spec(prepared_spec(plugin), model=model)
+        with (
+            patch.object(MegakernelBinding, "preparation_view") as make_view,
+            self.assertRaisesRegex(RuntimeError, "model failed"),
+        ):
+            lm.prepare_before_cuda_graph_capture(object())
+        make_view.assert_not_called()
+        plugin.assert_not_called()
+
+        model = Lm()
+        plugin = Mock()
+        with patch.object(
+            MegakernelBinding,
+            "preparation_view",
+            side_effect=RuntimeError("view failed"),
+        ):
+            lm = self._install_spec(prepared_spec(plugin), model=model)
+            with self.assertRaisesRegex(RuntimeError, "view failed"):
+                lm.prepare_before_cuda_graph_capture(object())
+        plugin.assert_not_called()
+
+        model = Lm()
+        plugin = Mock(side_effect=RuntimeError("plugin failed"))
+        with patch.object(MegakernelBinding, "preparation_view", return_value=object()):
+            lm = self._install_spec(prepared_spec(plugin), model=model)
+            with self.assertRaisesRegex(RuntimeError, "plugin failed"):
+                lm.prepare_before_cuda_graph_capture(object())
+
+    def test_zero_width_build_still_gets_the_preparation_bridge(self):
+        plugin = Mock()
+        zero = SimpleNamespace(
+            widths=(),
+            draft_sampler=print,
+            summary=lambda: "draft sampler",
+            prepare_before_cuda_graph_capture=plugin,
+        )
+        spec = replace(SPEC, max_rows=0, build=lambda model, hf, ctx: zero)
+        with patch.object(
+            MegakernelBinding, "preparation_view", return_value="prepared"
+        ):
+            lm = self._install_spec(spec, is_draft=True)
+            lm.prepare_before_cuda_graph_capture("runner")
+        plugin.assert_called_once_with("prepared")
 
     def test_a_target_without_a_usable_spec_is_refused_and_a_draft_keeps_its_forward(
         self,
