@@ -15,8 +15,9 @@ from sglang.srt.speculative.dflash_utils import (
     build_speculative_verify_target_probs,
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -344,6 +345,48 @@ def softmax_temp(
 
 
 @triton.jit
+def _softmax_temp_kernel(
+    logits_ptr,
+    temp_ptr,
+    out_ptr,
+    vocab,
+    rows_per_request,
+    logits_row_stride,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    temp = tl.load(temp_ptr + row // rows_per_request).to(tl.float32)
+    base = logits_ptr + row.to(tl.int64) * logits_row_stride
+    out_base = out_ptr + row.to(tl.int64) * vocab
+
+    row_max = -float("inf")
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        row_max = tl.maximum(row_max, tl.max(x, axis=0))
+
+    sum_exp = 0.0
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        e = tl.exp(x - row_max)
+        e = tl.where(vmask, e, 0.0)
+        sum_exp += tl.sum(e, axis=0)
+
+    for v0 in range(0, vocab, BLOCK_V):
+        offs = v0 + tl.arange(0, BLOCK_V)
+        vmask = offs < vocab
+        x = tl.load(base + offs, mask=vmask, other=-float("inf")).to(tl.float32)
+        x = x / temp
+        e = tl.exp(x - row_max)
+        tl.store(out_base + offs, e / sum_exp, mask=vmask)
+
+
+@triton.jit
 def _softmax_temp_chunk_stats_kernel(
     logits_ptr,
     temp_ptr,
@@ -415,19 +458,13 @@ def _softmax_temp_normalize_kernel(
         tl.store(out_base + offs, tl.exp(x - row_max) * inv_sum, mask=vmask)
 
 
-def softmax_temp_triton(
-    *,
+def _softmax_temp_split_vocab(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
+    out: torch.Tensor,
     rows_per_request: int,
-) -> torch.Tensor:
+) -> None:
     num_rows, vocab = logits.shape[0], logits.shape[-1]
-    bs = num_rows // rows_per_request
-    assert bs * rows_per_request == num_rows, (
-        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
-    )
-    temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
-    out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
     BLOCK_V = 2048
     CHUNK = 4 * BLOCK_V
     n_chunks = triton.cdiv(vocab, CHUNK)
@@ -458,6 +495,35 @@ def softmax_temp_triton(
         CHUNK=CHUNK,
         BLOCK_V=BLOCK_V,
         N_CHUNKS_P2=triton.next_power_of_2(n_chunks),
+    )
+
+
+def softmax_temp_triton(
+    *,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    rows_per_request: int,
+) -> torch.Tensor:
+    num_rows, vocab = logits.shape[0], logits.shape[-1]
+    bs = num_rows // rows_per_request
+    assert bs * rows_per_request == num_rows, (
+        f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
+    )
+    temperatures = temperatures.reshape(bs).to(torch.float32).contiguous()
+    out = torch.empty((num_rows, vocab), dtype=torch.float32, device=logits.device)
+    if _is_hip:
+        # One CTA per row leaves most CUs idle at decode batch sizes.
+        _softmax_temp_split_vocab(logits, temperatures, out, rows_per_request)
+        return out
+    BLOCK_V = 4096
+    _softmax_temp_kernel[(num_rows,)](
+        logits,
+        temperatures,
+        out,
+        vocab,
+        rows_per_request,
+        logits.stride(0),
+        BLOCK_V=BLOCK_V,
     )
     return out
 
