@@ -248,7 +248,9 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
 
         if self.expert_selection_fn == "sigmoid":
-            custom_routing_function = cohere2_sigmoid_topk
+            custom_routing_function = (
+                None if self.norm_topk_prob else cohere2_sigmoid_topk
+            )
             scoring_func = "sigmoid"
             routing_method_type = (
                 RoutingMethodType.SigmoidRenorm

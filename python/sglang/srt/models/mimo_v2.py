@@ -71,7 +71,11 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputFormat,
     is_expert_remapping_enabled,
 )
-from sglang.srt.layers.moe.utils import is_deepep_class_backend, sum_post_experts_output
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    is_deepep_class_backend,
+    sum_post_experts_output,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
@@ -440,6 +444,11 @@ class MiMoV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        routing_method_type = (
+            RoutingMethodType.DeepSeekV3
+            if self.gate.e_score_correction_bias is not None and config.norm_topk_prob
+            else None
+        )
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
@@ -450,6 +459,7 @@ class MiMoV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
+            routing_method_type=routing_method_type,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -470,7 +480,10 @@ class MiMoV2MoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         uses_mxfp4_runner = isinstance(
             self.experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod
