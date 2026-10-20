@@ -25,8 +25,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.kvcr.device_layout import KVCRLayout
 from sglang.srt.mem_cache.storage.kvcr.endpoints import rank_endpoint
-from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout
 from sglang.srt.mem_cache.storage.kvcr.runtime import KVCRRuntime
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,

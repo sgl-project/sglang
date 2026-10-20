@@ -293,7 +293,7 @@ class TestKVCRDirectLinker(CustomTestCase):
 
     def test_offload_snapshots_before_preparation_and_holds_physical_keys(self):
         """Pending producers must not force row reads or permit reused indices/keys."""
-        from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout
+        from sglang.srt.mem_cache.storage.kvcr.device_layout import KVCRLayout
 
         base = self.group.entries[0]
         indexer = copy(base)
@@ -471,7 +471,7 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertTrue(self.runtime.closed)
 
     def test_lookup_checks_all_and_trailing_boundaries_for_physical_pools(self):
-        from sglang.srt.mem_cache.storage.kvcr.layout import KVCRLayout
+        from sglang.srt.mem_cache.storage.kvcr.device_layout import KVCRLayout
 
         base = self.group.entries[0]
         # DeepSeek-V4's logical KV component has no physical pool named KV.
