@@ -384,6 +384,9 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+    if _is_xpu:
+        # XPU's torch._scaled_mm backend supports rowwise scaling.
+        return True
     return False
 
 
@@ -787,6 +790,35 @@ def torch_w8a8_block_fp8_linear(
         output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
     return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def prepare_xpu_block_scale_for_scaled_mm(
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    linear_fn: Callable,
+) -> torch.Tensor:
+    """Materialize the XPU block scale layout consumed by scaled_mm once."""
+    # Keep logical [N-blocks, K-blocks] shape, but use
+    # transpose-contiguous storage. For [1, 128], scaled_mm transposes
+    # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
+    # This avoids a per-forward contiguous/copy in either path.
+    if (
+        linear_fn is not torch_w8a8_block_fp8_linear
+        or not isinstance(block_size, (list, tuple))
+        or tuple(block_size) not in ((1, 128), (128, 128))
+        or weight_scale.ndim != 2
+        or weight_scale.t().is_contiguous()
+    ):
+        return weight_scale
+
+    reordered = torch.empty_strided(
+        weight_scale.shape,
+        (1, weight_scale.shape[0]),
+        dtype=weight_scale.dtype,
+        device=weight_scale.device,
+    )
+    reordered.copy_(weight_scale)
+    return reordered
 
 
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
@@ -2023,6 +2055,8 @@ def requant_block_scale_ue8m0_for_deepgemm(
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
+    *,
+    grouped_moe: bool = False,
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
@@ -2041,6 +2075,7 @@ def requant_block_scale_ue8m0_for_deepgemm(
             weight_block_size=weight_block_size,
             output_dtype=output_dtype,
             weight_shape=weight_shape,
+            grouped_moe=grouped_moe,
         )
     ):
         return False
@@ -2331,7 +2366,9 @@ def _apply_fallback_scaled_mm(
     )
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
-    x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
+    # A single scale has no row dimension to trim, regardless of its shape.
+    if x_scale.numel() > 1:
+        x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
 
     output = output * x_scale * weight_scale.t()
     if bias is not None:
@@ -2555,12 +2592,22 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
+    rowwise_scale_layout_supported = not _is_xpu or (
+        x_scale.ndim == 2
+        and x_scale.shape[1] == 1
+        and x_scale.is_contiguous()
+        and weight_scale.ndim == 2
+        and weight_scale.shape[1] == 1
+        and weight_scale.t().is_contiguous()
+    )
     if (
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        and (
+            (USE_ROWWISE_TORCH_SCALED_MM and rowwise_scale_layout_supported)
+            or _use_aiter
+        )
     ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
