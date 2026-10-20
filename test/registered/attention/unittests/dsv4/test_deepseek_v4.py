@@ -522,6 +522,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        backend.is_dsv41 = False
+        backend.hisparse_coordinator = None
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )
@@ -566,6 +568,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             with self.subTest(num_qo_tokens=num_qo_tokens):
                 backend = object.__new__(DeepseekV4AttnBackend)
                 backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+                backend.is_dsv41 = False
+                backend.hisparse_coordinator = None
                 backend.forward_metadata = DSV4Metadata(
                     self._make_core_metadata(0), indexer_metadata=None
                 )
@@ -597,6 +601,33 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 # Dense reaches the same boundary using metadata init's snapshot.
                 self.assertIs(shared_read_ends, SharedReadEnds.PRE_REPLAY)
 
+    def test_prefill_snapshot_skips_layers_reading_live_tables(self):
+        from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _LARGE_INDEXER_QUERY_THRESHOLD,
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        for is_dsv41, hisparse_coordinator in ((True, None), (False, object())):
+            with self.subTest(is_dsv41=is_dsv41, hisparse=hisparse_coordinator):
+                backend = object.__new__(DeepseekV4AttnBackend)
+                backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+                backend.is_dsv41 = is_dsv41
+                backend.hisparse_coordinator = hisparse_coordinator
+                backend.forward_metadata = DSV4Metadata(
+                    self._make_core_metadata(0), indexer_metadata=None
+                )
+                backend._build_sparse_prefill_chunk_cache = mock.Mock()
+
+                shared_read_ends = backend.resolve_prefill_shared_read_ends(
+                    batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD + 1
+                )
+
+                self.assertIs(shared_read_ends, SharedReadEnds.UNKNOWN)
+                backend._build_sparse_prefill_chunk_cache.assert_not_called()
+
     def test_sparse_prefill_snapshot_propagates_build_failure(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -606,6 +637,8 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
         backend = object.__new__(DeepseekV4AttnBackend)
         backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        backend.is_dsv41 = False
+        backend.hisparse_coordinator = None
         backend.forward_metadata = DSV4Metadata(
             self._make_core_metadata(0), indexer_metadata=None
         )

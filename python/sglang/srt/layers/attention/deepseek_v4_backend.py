@@ -2755,6 +2755,10 @@ class DeepseekV4AttnBackend(
             return SharedReadEnds.UNKNOWN
         if is_cp_active(forward_batch):
             return SharedReadEnds.UNKNOWN
+        # The V4.1 low-ratio indexer reads req_to_token and HiSparse translates
+        # through full_to_hisparse in every layer, after any snapshot.
+        if self.is_dsv41 or self.hisparse_coordinator is not None:
+            return SharedReadEnds.UNKNOWN
 
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)

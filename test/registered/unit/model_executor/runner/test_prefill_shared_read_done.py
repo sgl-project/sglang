@@ -74,11 +74,8 @@ def test_disabled_when_flag_is_false():
     assert runner.shared_read_done_event is None
 
 
-@pytest.mark.parametrize(
-    "algorithm", (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK)
-)
-def test_dflash_family_target_prefill_publishes(algorithm):
-    runner = _model_runner(spec_algorithm=algorithm)
+def test_dflash_target_prefill_publishes():
+    runner = _model_runner(spec_algorithm=SpeculativeAlgorithm.DFLASH)
     runner.prefill_shared_read_stager = Mock(return_value=False)
     with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(True):
         _prepare_and_publish(runner, _batch())
@@ -97,6 +94,7 @@ def test_dflash_family_target_prefill_publishes(algorithm):
         SpeculativeAlgorithm.STANDALONE,
         SpeculativeAlgorithm.NGRAM,
         SpeculativeAlgorithm.UNO,
+        SpeculativeAlgorithm.DSPARK,
         CustomSpecAlgo("TEST_PREFILL", lambda _: object),
     ],
 )
@@ -166,11 +164,7 @@ class _TargetOnlyPrefillAlgo(CustomSpecAlgo):
 
 class TestPrefillReadDoneCapability(CustomTestCase):
     def test_builtin_allowlist_is_unchanged(self):
-        allowed = {
-            SpeculativeAlgorithm.NONE,
-            SpeculativeAlgorithm.DFLASH,
-            SpeculativeAlgorithm.DSPARK,
-        }
+        allowed = {SpeculativeAlgorithm.NONE, SpeculativeAlgorithm.DFLASH}
         for algorithm in SpeculativeAlgorithm:
             with self.subTest(algorithm=algorithm):
                 runner = _model_runner(spec_algorithm=algorithm)
