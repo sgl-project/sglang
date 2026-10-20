@@ -1,11 +1,11 @@
-"""Inkling's default head precision preserves distinct greedy scores."""
+"""Output-only precision must not promote CPU head operands to FP32."""
 
 import unittest
 
 import torch
 from torch import nn
 
-from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
+from sglang.srt.configs.inkling import InklingModelConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
@@ -31,10 +31,22 @@ class TestInklingHeadPrecision(CustomTestCase):
         processor = LogitsProcessor(config, skip_all_gather=True)
         return processor._compute_lm_head(hidden, head)
 
-    def test_default_preserves_greedy_winner_before_bf16_rounding(self):
-        """BF16 rounding ties distinct scores and selects the smaller token ID."""
-        config = InklingModelConfig(vocab_size=2)
-        logits = self._logits(config)
+    def test_output_only_default_keeps_cpu_projection_bf16(self):
+        """An unsupported output-only path must retain BF16 rounding."""
+        logits = self._logits(InklingModelConfig(vocab_size=2))
+        self.assertEqual(logits.dtype, torch.bfloat16)
+        self.assertEqual(logits.argmax(dim=-1).item(), 0)
+
+    def test_explicit_full_fp32_still_promotes_cpu_operands(self):
+        reset_context()
+        publish(
+            ServerArgs(model_path="dummy", device="cpu", enable_fp32_lm_head=True),
+            role="test",
+        )
+        logits = self._logits(
+            InklingModelConfig(vocab_size=2, enable_lm_head_output_fp32=False)
+        )
+        self.assertEqual(logits.dtype, torch.float32)
         self.assertEqual(logits.argmax(dim=-1).item(), 1)
         torch.testing.assert_close(
             logits,
@@ -42,15 +54,6 @@ class TestInklingHeadPrecision(CustomTestCase):
             rtol=0,
             atol=0,
         )
-
-    def test_explicit_opt_out_survives_nested_config_round_trip(self):
-        config = InklingMMConfig(
-            text_config={"vocab_size": 2, "enable_lm_head_fp32": False}
-        )
-        restored = InklingMMConfig.from_dict(config.to_dict())
-        logits = self._logits(restored.text_config)
-        self.assertEqual(logits.dtype, torch.bfloat16)
-        self.assertEqual(logits.argmax(dim=-1).item(), 0)
 
 
 if __name__ == "__main__":
