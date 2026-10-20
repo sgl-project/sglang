@@ -224,10 +224,10 @@ def _persistent_finalize_kwargs(*, layer: FusedMoE) -> dict[str, Any]:
 
     tensor = _num_valid_tokens_tensor()
     layer._flashinfer_megamoe_num_valid_tokens = tensor
-    # Explicit PERSISTENT: AUTO would prefer FlashInfer's CAKE reducer wherever it
-    # supports the problem.
+    # AUTO: FlashInfer's CAKE reducer where it supports the problem, else the
+    # persistent finalize that reads this tensor.
     return {
-        "finalize_mode": FinalizeMode.PERSISTENT,
+        "finalize_mode": FinalizeMode.AUTO,
         "num_valid_tokens_tensor": tensor,
     }
 

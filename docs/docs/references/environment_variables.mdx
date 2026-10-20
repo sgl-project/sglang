@@ -368,7 +368,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FlashInfer's persistent finalize kernel for the MegaMOE top-k reduce, so its cost scales with the runtime token count instead of the workspace capacity. Requires a FlashInfer release that includes <code>FinalizeMode</code>; has no effect when in-kernel FC2 reduce is selected.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Let FlashInfer use its persistent finalize kernel for the MegaMOE top-k reduce, so its cost scales with the runtime token count instead of the workspace capacity. FlashInfer still prefers its CAKE reducer where that supports the problem. Requires a FlashInfer release that includes <code>FinalizeMode</code>; has no effect when in-kernel FC2 reduce is selected.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"true"</code></td>
     </tr>
     <tr>

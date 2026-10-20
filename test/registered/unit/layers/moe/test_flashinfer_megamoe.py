@@ -404,8 +404,9 @@ def test_persistent_finalize_kwargs_share_one_tensor(monkeypatch):
     first = module._persistent_finalize_kwargs(layer=first_layer)
     second = module._persistent_finalize_kwargs(layer=second_layer)
 
-    # PERSISTENT, not AUTO: AUTO would pick FlashInfer's CAKE reducer where it can.
-    assert first["finalize_mode"] is _FakeFinalizeMode.PERSISTENT
+    # AUTO, not PERSISTENT: FlashInfer picks CAKE where it supports the problem
+    # and falls back to persistent because the tensor is set.
+    assert first["finalize_mode"] is _FakeFinalizeMode.AUTO
     tensor = first["num_valid_tokens_tensor"]
     assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (1,)
     assert second["num_valid_tokens_tensor"] is tensor
