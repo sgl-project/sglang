@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, Optional
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
+from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
 from sglang.srt.utils.hf_transformers.lilicorr_gguf import build_lilicorr_gguf_config
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
@@ -46,9 +47,7 @@ GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
 def read_gguf_architecture(gguf_path: str) -> Optional[str]:
     """The ``general.architecture`` string, or None if it cannot be read."""
     try:
-        from gguf import GGUFReader
-
-        reader = GGUFReader(gguf_path)
+        reader = get_gguf_reader(gguf_path)
         field = reader.fields.get("general.architecture")
         if field is None:
             return None
@@ -61,9 +60,7 @@ def read_gguf_architecture(gguf_path: str) -> Optional[str]:
 def _get_native_config_builder(gguf_path: str):
     arch = read_gguf_architecture(gguf_path)
     if arch == "dflash":
-        from gguf import GGUFReader
-
-        if "lilicorr.num_layers" not in GGUFReader(gguf_path).fields:
+        if "lilicorr.num_layers" not in get_gguf_reader(gguf_path).fields:
             return None
     return GGUF_NATIVE_CONFIG_BUILDERS.get(arch)
 
@@ -110,10 +107,9 @@ def build_gguf_generation_config(gguf_path: str):
     an end-of-*message* id must not -- stopping on that truncates the model
     mid-reasoning, before it answers.
     """
-    from gguf import GGUFReader
     from transformers import GenerationConfig
 
-    reader = GGUFReader(gguf_path)
+    reader = get_gguf_reader(gguf_path)
     meta = {key: field.contents() for key, field in reader.fields.items()}
 
     stop_ids = []
@@ -147,11 +143,10 @@ def build_gguf_tokenizer(gguf_path: str, **kwargs: Any):
     """
     import json
 
-    from gguf import GGUFReader
     from tokenizers import Tokenizer
     from transformers import PreTrainedTokenizerFast
 
-    reader = GGUFReader(gguf_path)
+    reader = get_gguf_reader(gguf_path)
     meta = {key: field.contents() for key, field in reader.fields.items()}
 
     tokens = list(meta["tokenizer.ggml.tokens"])

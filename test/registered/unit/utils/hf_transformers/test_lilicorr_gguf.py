@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import gguf
 import numpy as np
@@ -18,6 +19,7 @@ from sglang.srt.utils.hf_transformers.gguf_native import (
     build_gguf_config,
     has_native_gguf_support,
 )
+from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
 from sglang.srt.utils.hf_transformers.lilicorr_gguf import (
     build_lilicorr_gguf_config,
     lilicorr_gguf_weights,
@@ -80,6 +82,19 @@ def _write_checkpoint(path, blocks, scale, extra_tensor=None, prec_a4=False):
 
 
 class TestLiLiCorrGGUF(CustomTestCase):
+    def test_model_config_and_weights_parse_checkpoint_once(self):
+        """Repeated config probes must not reparse large tokenizer metadata."""
+        get_gguf_reader.cache_clear()
+        self.addCleanup(get_gguf_reader.cache_clear)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "draft.gguf"
+            _write_checkpoint(path, np.zeros((2, 72), dtype=np.uint8), 0.25)
+            with patch("gguf.GGUFReader", wraps=gguf.GGUFReader) as reader:
+                config = ModelConfig(model_path=str(path), is_draft_model=True)
+                weights = dict(lilicorr_gguf_weights(str(path), config.hf_config))
+            self.assertEqual(weights["fc.weight_scale_2"].item(), 0.25)
+            self.assertEqual(reader.call_count, 1)
+
     def test_native_detection_does_not_claim_plain_dflash(self):
         with tempfile.TemporaryDirectory() as temp:
             for index, (architecture, head_layers, supported) in enumerate(

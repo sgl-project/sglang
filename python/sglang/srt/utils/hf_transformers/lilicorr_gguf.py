@@ -22,6 +22,8 @@ import re
 
 from transformers import Qwen3Config
 
+from sglang.srt.utils.hf_transformers.gguf_reader import get_gguf_reader
+
 _BACKBONE_NAMES = {
     "ffn_down": "mlp.down_proj",
     "ffn_gate": "mlp.gate_proj",
@@ -84,9 +86,9 @@ def lilicorr_tensor_name(name: str, num_layers: int, num_head_layers: int) -> st
 
 
 def build_lilicorr_gguf_config(path: str) -> Qwen3Config:
-    from gguf import GGMLQuantizationType, GGUFReader
+    from gguf import GGMLQuantizationType
 
-    reader = GGUFReader(path)
+    reader = get_gguf_reader(path)
 
     def field(key):
         if key not in reader.fields:
@@ -222,9 +224,9 @@ def slot_bias_from_gguf(bias, block_size: int, topk: int):
 def lilicorr_gguf_weights(path: str, config):
     import numpy as np
     import torch
-    from gguf import GGMLQuantizationType, GGUFReader
+    from gguf import GGMLQuantizationType
 
-    reader = GGUFReader(path)
+    reader = get_gguf_reader(path)
     head = config.dflash_config
     layers, head_layers = config.num_hidden_layers, head["lilicorr_num_layers"]
     tensors = {t.name: t for t in reader.tensors}
