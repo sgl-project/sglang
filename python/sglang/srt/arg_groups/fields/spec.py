@@ -254,33 +254,33 @@ class Spec(msgspec.Struct):
     # -------------------------------------------------------------------------
     speculative_ngram_min_bfs_breadth: A[
         int,
-        "Lower endpoint of the per-node BFS breadth schedule (positive and <= max breadth). Ignored by PROB matching.",
+        "The minimum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
     ] = 1
     speculative_ngram_max_bfs_breadth: A[
         int,
-        "Upper endpoint of the BFS breadth schedule; also limits per-node top-k in PROB matching.",
+        "The maximum breadth for BFS (Breadth-First Search) in ngram speculative decoding.",
     ] = 10
     speculative_ngram_match_type: A[
         Literal["BFS", "PROB"],
-        "CPU ngram trie expansion: BFS uses recency-ordered breadth-first search; PROB prioritizes observed token frequency.",
+        "The match type for cache tree.",
     ] = "BFS"
     speculative_ngram_max_trie_depth: A[
         int,
-        "Maximum CPU trie suffix/window length (>= 2). The verification tree is bounded by speculative-num-draft-tokens.",
+        "The max trie depth for ngram speculative decoding.",
     ] = 18
     speculative_ngram_capacity: A[
         int,
-        "CPU trie node capacity, including its root. Does not limit external SAM memory.",
+        "The cache capacity for ngram speculative decoding.",
     ] = 10 * 1000 * 1000
     speculative_ngram_external_corpus_path: A[
         Optional[str],
-        "Path to a UTF-8 JSONL file with one JSON string per nonblank line, pre-loaded into a CPU SAM at startup. Requires a positive external-sam-budget. Additional corpora can be added via POST /add_external_corpus.",
+        "Path to an external JSONL corpus to pre-load into SAM at startup. Additional corpora can be added at runtime via POST /add_external_corpus.",
     ] = None
     speculative_ngram_external_sam_budget: A[
         int,
-        "Non-root draft-node budget shared by external SAMs (0 to num-draft-tokens - 1). Each loaded SAM receives an equal floor-divided share; the remaining budget goes to the online trie.",
+        "Number of draft nodes reserved for the external SAM subtree in ngram speculative decoding.",
     ] = 0
     speculative_ngram_external_corpus_max_tokens: A[
         int,
-        "Positive token limit for all loaded external CPU corpora, including inter-document separator tokens. Exceeding the limit fails the load rather than truncating it.",
+        "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
