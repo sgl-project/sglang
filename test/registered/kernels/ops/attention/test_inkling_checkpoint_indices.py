@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.linear.inkling_sconv_backend import (
     InklingShortConvHybridAttnBackend,
 )
 from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
@@ -34,7 +35,13 @@ _BACKEND = "sglang.srt.layers.attention.linear.inkling_sconv_backend"
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestInklingCheckpointIndices(CustomTestCase):
     def make_backend(
-        self, *, lazy=False, static=False, slot_count=6, draft_token_num=None
+        self,
+        *,
+        lazy=False,
+        static=False,
+        slot_count=6,
+        draft_token_num=None,
+        fused=False,
     ):
         mamba = MambaSubPoolSpec(
             name="mamba",
@@ -89,7 +96,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
         backend.device = "cuda"
         backend.conv_state_len = 3
         backend._cache_indices_buf = None
-        backend._slot_gather_recordable = static
+        backend._slot_gather_recordable = (
+            req_pool.mamba_translate_is_fusable if fused else static
+        )
         config = SimpleNamespace(
             decode=SimpleNamespace(bs=[1, 2, 4], max_bs=4),
             prefill=SimpleNamespace(bs=[8]),
@@ -461,6 +470,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
         composite.buffers = buffers
         composite.captured_req_width = 4
         composite.draft_extend_attn_backend_list = [wrapper]
+        composite._out_cache_loc_virtual = None
+        composite._kv_loc_plan = None
+        composite._kv_loc_cols = None
         for step, tracking in enumerate((True, False, True)):
             with self.subTest(tracking=tracking, step=step):
                 ids = slots[-4:].roll(step).clone()
@@ -752,14 +764,14 @@ class TestInklingCheckpointIndices(CustomTestCase):
             )
             return eagle.EAGLEDraftExtendCudaGraphRunner(worker).buffers
 
-    def _make_draft_checkpoint_runner(self, multilayer, static, tracking):
+    def _make_draft_checkpoint_runner(self, multilayer, static, tracking, fused=False):
         from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
         )
 
         backend, allocator, pool, slots = self.make_backend(
-            lazy=True, static=static, slot_count=12, draft_token_num=4
+            lazy=True, static=static, slot_count=12, draft_token_num=4, fused=fused
         )
         backend.mamba_cache_chunk_size = 4
         req_pool = backend.req_to_token_pool
@@ -814,8 +826,92 @@ class TestInklingCheckpointIndices(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             device_timer=None,
             canary_manager=None,
+            # The KV side is not under test: a static pool's translator binds
+            # the captured batch to its own write ids.
+            kv_index_translator=KVIndexTranslator(
+                req_to_token=torch.zeros((1, 8), dtype=torch.int32, device="cuda"),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=object(),
+                page_size=1,
+                device="cuda",
+            ),
         )
         return runner, backend, allocator, pool, slots, buffers
+
+    def test_unified_fused_draft_checkpoint_replay(self):
+        for multilayer, staging in ((False, False), (True, False), (True, True)):
+            for tracking in (False, True):
+                with self.subTest(
+                    multilayer=multilayer, staging=staging, tracking=tracking
+                ):
+                    self._check_draft_checkpoint_replay(
+                        multilayer, False, tracking, staging=staging, fused=True
+                    )
+
+    def test_unified_captured_slots_follow_compaction_and_verify_commit(self):
+        backend, allocator, _, slots = self.make_backend(
+            lazy=True, slot_count=12, fused=True
+        )
+        pool = backend.req_to_token_pool
+        pool.req_index_to_mamba_index_mapping = torch.cat(
+            [slots.new_zeros(1), slots[1:5]]
+        ).to(torch.int32)
+        ids = torch.cat([slots[-2:], slots.new_tensor([-1, 0])])
+        original = ids.clone()
+        batch = self.batch(ids, mode=ForwardMode.TARGET_VERIFY)
+        batch.req_pool_indices.copy_(torch.tensor([1, 2, 3, 0], device="cuda"))
+        # The request buffer may have padding; its dummy slot must stay at zero.
+        # A negative checkpoint sentinel must also survive translation.
+        with patch.object(backend, "_refresh_sconv_metadata"):
+            backend.init_forward_metadata_in_graph(batch)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                backend.init_forward_metadata_in_graph(batch)
+        pointer = backend._cache_indices_buf.data_ptr()
+        track_pointer = backend._graph_track_indices.data_ptr()
+        table_pointer = pool.mamba_v2p_table.data_ptr()
+        before = backend._cache_indices.clone()
+        # Free live physical holes and move both active and checkpoint states.
+        for hole in (slots[:1], slots[5:6]):
+            allocator.free(hole.clone())
+            allocator._flush(urgent=True)
+            batch.req_pool_indices[:3].copy_(batch.req_pool_indices[:3].roll(1))
+            ids[:2].copy_(ids[:2].flip(0))
+            with patch.object(backend, "_prepare_slot_indices") as eager_prep:
+                backend.init_forward_metadata_out_graph(batch)
+                eager_prep.assert_not_called()
+            graph.replay()
+            active = backend._translate_mamba_indices(
+                pool.get_mamba_indices(batch.req_pool_indices)
+            )
+            torch.testing.assert_close(backend._cache_indices, active, rtol=0, atol=0)
+            torch.testing.assert_close(
+                backend.sconv_metadata.track_cache_indices,
+                backend._translate_mamba_indices(ids).long(),
+                rtol=0,
+                atol=0,
+            )
+            self.assertEqual(backend._cache_indices[-1].item(), 0)
+            self.assertEqual(backend.sconv_metadata.track_cache_indices[-2].item(), -1)
+            self.assertEqual(backend._cache_indices_buf.data_ptr(), pointer)
+            self.assertEqual(backend._graph_track_indices.data_ptr(), track_pointer)
+            self.assertEqual(pool.mamba_v2p_table.data_ptr(), table_pointer)
+            with (
+                patch.object(pool, "get_speculative_mamba2_params_all_layers"),
+                patch(_BACKEND + ".scatter_mamba_states_after_mtp_verify") as scatter,
+            ):
+                backend.commit_conv_state_after_mtp_verify(
+                    req_pool_indices=batch.req_pool_indices[:3],
+                    last_correct_step_indices=batch.req_pool_indices[:3],
+                    mamba_track_indices=ids[:3],
+                    mamba_steps_to_track=batch.req_pool_indices[:3],
+                )
+                torch.testing.assert_close(scatter.call_args.args[1], active[:3])
+                torch.testing.assert_close(
+                    scatter.call_args.args[3], backend._translate_mamba_indices(ids[:3])
+                )
+        self.assertFalse(torch.equal(before, backend._cache_indices))
+        torch.testing.assert_close(ids, original, rtol=0, atol=0)
 
     def test_static_staged_runner_checkpoint_replay(self):
         for tracking in (False, True):
@@ -823,7 +919,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 self._check_draft_checkpoint_replay(True, True, tracking, staging=True)
 
     def _check_draft_checkpoint_replay(
-        self, multilayer, static, tracking, staging=False
+        self, multilayer, static, tracking, staging=False, fused=False
     ):
         from sglang.srt.speculative import eagle_draft_extend_cuda_graph_runner as eagle
         from sglang.srt.speculative import (
@@ -832,7 +928,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
         runner, backend, allocator, pool, slots, buffers = (
-            self._make_draft_checkpoint_runner(multilayer, static, tracking)
+            self._make_draft_checkpoint_runner(
+                multilayer, static, tracking, fused=fused
+            )
         )
         hook_backend = backend
         if staging:
@@ -926,6 +1024,9 @@ class TestInklingCheckpointIndices(CustomTestCase):
                     input_ids=buffers.input_ids[: live * 4],
                     positions=buffers.positions[: live * 4],
                     out_cache_loc=buffers.out_cache_loc[: live * 4],
+                    out_cache_loc_virtual=None,
+                    kv_loc_plan=None,
+                    kv_loc_cols=None,
                     req_pool_indices=torch.arange(1, live + 1, device="cuda"),
                     seq_lens=torch.full((live,), 6, dtype=torch.int64, device="cuda"),
                     seq_lens_sum=6 * live,
@@ -973,7 +1074,13 @@ class TestInklingCheckpointIndices(CustomTestCase):
                         composite._stage_metadata = Mock()
                     composite.prepare(fresh)
                     runner.replay(
-                        4, composite.seq_lens_sum, composite._replay_spec_info, None
+                        4,
+                        composite.seq_lens_sum,
+                        composite._replay_spec_info,
+                        None,
+                        out_cache_loc_virtual=composite._out_cache_loc_virtual,
+                        kv_loc_plan=composite._kv_loc_plan,
+                        kv_loc_cols=composite._kv_loc_cols,
                     )
                 else:
                     runner.execute(fresh, torch.arange(live, device="cuda") * 4 + 1)

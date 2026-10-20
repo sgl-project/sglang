@@ -98,6 +98,11 @@ class HybridAttnBackend(AttentionBackend):
             forward_batch, num_qo_tokens=num_qo_tokens
         )
 
+    def get_fused_kv_write_buffers(self, layer, forward_batch):
+        return self._select_backend(
+            forward_batch.forward_mode
+        ).get_fused_kv_write_buffers(layer, forward_batch)
+
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix
@@ -109,6 +114,10 @@ class HybridAttnBackend(AttentionBackend):
     @property
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.prefill_backend.supports_prefill_cuda_graph_max_context_size
+
+    @property
+    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
+        return self.prefill_backend.prefill_cuda_graph_default_max_seq_len
 
     def prepare_full_cuda_graph_chunked_prefix(
         self,

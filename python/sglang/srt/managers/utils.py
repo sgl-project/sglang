@@ -24,8 +24,10 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -72,7 +74,7 @@ class GenerationBatchResult:
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -117,6 +119,11 @@ class GenerationBatchResult:
     # batch.out_cache_loc, so the slots have to travel on the result to survive
     # until the accepted path comes back over the relay.
     spec_verify_out_cache_loc: Optional[torch.Tensor] = None
+
+    # The plan the forward wrote its KV through, when the caller asked for it
+    # (`return_kv_loc_plan`): a speculative worker's own writes into the same
+    # slots take their ids from it.
+    kv_loc_plan: Optional[KVLocPlan] = None
 
     # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
     # Every stage holds the KV for its own layers, so every stage has to compact
@@ -384,7 +391,7 @@ class EmbeddingBatchResult:
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
-    copy_done: Optional[torch.cuda.Event] = None
+    copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
     can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")
