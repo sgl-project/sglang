@@ -1249,7 +1249,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             tool_call_id=Mock(),
         )
 
-    def test_only_a_selected_inkling_spec_requires_tml_renderers(self):
+    def test_only_a_selected_inkling_encoding_requires_tml_renderers(self):
         """Serving another model must not need tml-renderers, while selecting
         Inkling must still fail at construction when it is missing."""
         from sglang.srt.entrypoints.openai import chat_encoding_adapters
@@ -1258,9 +1258,9 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
         load_tml_renderers.cache_clear()
         self.addCleanup(load_tml_renderers.cache_clear)
 
-        def ctx(spec):
+        def ctx(encoding):
             return chat_encoding_adapters.ChatEncodingAdapterContext(
-                chat_encoding_spec=spec,
+                chat_encoding_spec=encoding,
                 tokenizer=None,
                 reasoning_parser="inkling",
                 tool_call_parser="inkling",
@@ -1271,10 +1271,12 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             )
 
         with patch.dict(sys.modules, {"tml_renderers": None}):
-            for spec in ("kimi_k3", "dsv4", "dsv41", "dsv32"):
-                with self.subTest(spec=spec):
+            for encoding in ("kimi_k3", "dsv4", "dsv41", "dsv32"):
+                with self.subTest(encoding=encoding):
                     self.assertIsNone(
-                        chat_encoding_adapters.build_chat_encoding_adapter(ctx(spec))
+                        chat_encoding_adapters.build_chat_encoding_adapter(
+                            ctx(encoding)
+                        )
                     )
             with self.assertRaises(ImportError):
                 chat_encoding_adapters.build_chat_encoding_adapter(ctx("inkling"))
