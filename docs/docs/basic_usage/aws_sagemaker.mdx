@@ -138,5 +138,11 @@ model.tar.gz
   drivers for CUDA 13 images. See the
   [ProductionVariant API reference](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ProductionVariant.html)
   for valid values.
+- `/ping` returns 503 until server warmup completes, during shutdown, and after a failed `/health` or
+  `/health_generate` probe until a later probe succeeds. If loading and warmup take longer than the
+  default startup health check window, raise `ContainerStartupHealthCheckTimeoutInSeconds`
+  (60 to 3600 seconds) on the
+  [ProductionVariant](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ProductionVariant.html)
+  or [InferenceComponentStartupParameters](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_InferenceComponentStartupParameters.html).
 - The endpoint exposes an OpenAI-compatible API, so the request body matches the SGLang server's
   `/v1/chat/completions` schema.
