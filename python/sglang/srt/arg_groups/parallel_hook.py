@@ -262,6 +262,14 @@ def handle_decode_context_parallelism(server_args: Any):
             "within one MNNVL domain. Use 'a2a' or 'ag_rs' elsewhere, or leave "
             "the flag unset to resolve it."
         )
+    if cfg.dcp_comm_backend == "a2a":
+        # Model-level testing found corrupted decode output with graph buffer
+        # registration enabled. Reuse the TP LM-head all-to-all safeguard;
+        # the precise registration/lifetime interaction is still under study.
+        _disable_nccl_graph_buffer_registration(
+            "graph-captured DCP a2a can produce corrupted decode output "
+            "with registered buffers"
+        )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
             raise ValueError("--dcp-replicate-q-proj requires --dcp-size > 1.")
