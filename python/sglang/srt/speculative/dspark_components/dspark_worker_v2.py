@@ -132,6 +132,10 @@ def _configure_target_hidden_projection(
 
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
+    _prepare_inputs_once = False
+    num_folded_verify_ids_steps = 0
+    num_relayed_in_graph_steps = 0
+    _verify_inputs_ready = None
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -257,6 +261,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
+        # Verify-window positions, cache locs and the draft anchor column in one launch.
+        self._prepare_inputs_once = envs.SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE.get()
+        self.num_folded_verify_ids_steps = 0
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
         )
@@ -815,6 +822,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
+        anchor_ids = (
+            self._proposer.draft_block_ids_view(bs=bs, device=prefix_lens.device)
+            if self._prepare_inputs_once
+            else None
+        )
         verify_window = alloc_verify_window(
             batch=batch,
             bs=bs,
@@ -827,6 +839,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if batch.seq_lens_cpu is not None
                 else draft_input.nxt_kv_lens_cpu
             ),
+            bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
+            anchor_ids=anchor_ids,
         )
 
         sampling_info = batch.sampling_info
@@ -854,6 +868,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
+                anchor_prepared=anchor_ids is not None,
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
@@ -881,9 +896,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
-        verify_ids_2d = torch.cat(
-            [draft_block_ids[:, :1], draft_tokens], dim=1
-        ).contiguous()
+        verify_ids_2d = proposal.verify_ids
+        if verify_ids_2d is None:
+            verify_ids_2d = torch.cat(
+                [draft_block_ids[:, :1], draft_tokens], dim=1
+            ).contiguous()
+        else:
+            self.num_folded_verify_ids_steps += 1
+            if self.num_folded_verify_ids_steps == 1:
+                logger.info("Verify ids read from the draft graph output (first step).")
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (

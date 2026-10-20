@@ -77,6 +77,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_raw: Optional[torch.Tensor] = None
     folded: bool = False
+    # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
+    # when the caller builds them.
+    verify_ids: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -417,6 +420,7 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
+        anchor_prepared: bool = False,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -433,10 +437,11 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            anchor_prepared=anchor_prepared,
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = None
+        confidence = confidence_raw = verify_ids = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -456,6 +461,8 @@ class DraftBlockProposer:
             if draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
+            if draft_sampler.verify_ids is not None:
+                verify_ids = draft_sampler.verify_ids[:bs]
         else:
             with self._base_logits_context():
                 base_logits, confidence_features = self.draft_model.compute_base_logits(
@@ -490,6 +497,7 @@ class DraftBlockProposer:
             confidence=confidence,
             confidence_raw=confidence_raw,
             folded=folded,
+            verify_ids=verify_ids,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
@@ -518,6 +526,19 @@ class DraftBlockProposer:
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
 
+    def draft_block_ids_view(self, *, bs: int, device) -> torch.Tensor:
+        """The ``[bs, query_token_num]`` draft input ids: mask tokens past column 0."""
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs or buf.device != torch.device(device):
+            buf = torch.full(
+                (bs, self.query_token_num),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            self._draft_block_ids_buf = buf
+        return buf[:bs]
+
     def _run_forward(
         self,
         *,
@@ -529,6 +550,7 @@ class DraftBlockProposer:
         embed_module,
         draft_sampler=None,
         sampling_info=None,
+        anchor_prepared: bool = False,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
@@ -536,18 +558,9 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        buf = self._draft_block_ids_buf
-        if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
-            buf = torch.full(
-                (bs, query_token_num),
-                int(self._mask_token_id),
-                dtype=torch.long,
-                device=device,
-            )
-            self._draft_block_ids_buf = buf
-        draft_block_ids = buf[:bs]
-
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
+        if not anchor_prepared:
+            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
