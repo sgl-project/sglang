@@ -67,7 +67,7 @@ if _is_npu:
         )
 
 if _is_hip:
-    from sglang.kernels.ops.attention.utils import (
+    from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
         fused_qk_rope_reshape_and_cache,
     )
 
@@ -434,6 +434,9 @@ class RotaryEmbedding(BaseFusedOp):
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
+            # rotary_embedding_cpu requires query and the cache to share a dtype;
+            # forward_cuda/forward_xpu already align them, forward_cpu did not.
+            self._match_cos_sin_cache_dtype(query)
             return torch.ops.sgl_kernel.rotary_embedding_cpu(
                 positions,
                 query,
