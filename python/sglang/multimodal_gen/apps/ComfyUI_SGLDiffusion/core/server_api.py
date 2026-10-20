@@ -4,11 +4,43 @@ Provides a low-level interface for interacting with SGLang Diffusion HTTP server
 """
 
 import os
+import re
 import shutil
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
+from urllib.parse import urlparse
 
 import requests
+
+MESH_FORMATS = ("glb", "obj", "ply", "usdz")
+MAX_MESH_BYTES = 2 << 30  # 2 GiB
+MESH_DOWNLOAD_DEADLINE_S = 600
+
+
+def _safe_job_id(job_id: Any) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(job_id or ""))
+    if not safe:
+        raise RuntimeError(f"Server returned an invalid job id: {job_id!r}")
+    return safe
+
+
+def _is_within(path: str, root: str) -> bool:
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def mesh_dest_path(output_dir: str, job: Dict[str, Any], fallback_format: str) -> str:
+    """Local path for a mesh job, built only from sanitized server values."""
+    fmt = str(job.get("format") or fallback_format).lower()
+    if fmt not in MESH_FORMATS:
+        raise RuntimeError(f"Server returned an unsupported mesh format: {fmt!r}")
+    dest = os.path.join(output_dir, f"sgld_{_safe_job_id(job.get('id'))}.{fmt}")
+    if not _is_within(dest, output_dir):
+        raise RuntimeError(f"Mesh path escapes the output directory: {dest}")
+    return dest
 
 
 class SGLDiffusionServerAPI:
@@ -439,29 +471,58 @@ class SGLDiffusionServerAPI:
             time.sleep(poll_interval)
         raise TimeoutError(f"Generation timed out after {max_wait_time} seconds")
 
-    def fetch_mesh(self, job: Dict[str, Any], dest_path: str) -> str:
+    def fetch_mesh(
+        self,
+        job: Dict[str, Any],
+        dest_path: str,
+        local_roots: Optional[Sequence[str]] = None,
+    ) -> str:
         """Put a completed mesh job's file at dest_path and return it.
 
-        The file is copied when the server shares this filesystem, otherwise it
-        is downloaded from the cloud url or the server's /content endpoint.
+        The server's file_path is only copied when it resolves inside one of
+        local_roots (the server's output dirs, shared with this host); any other
+        path the server names is ignored so it cannot make us read arbitrary
+        local files. Otherwise the file is downloaded from the cloud url (only
+        https or the server's own host, without the API key) or from the
+        server's /content endpoint.
         """
         os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
         local_path = job.get("file_path")
-        if local_path and os.path.isfile(local_path):
+        if (
+            local_path
+            and local_roots
+            and any(_is_within(local_path, root) for root in local_roots)
+            and os.path.isfile(local_path)
+        ):
             shutil.copyfile(local_path, dest_path)
             return dest_path
         if job.get("url"):
             url, headers = job["url"], {}
+            parsed = urlparse(url)
+            same_host = parsed.netloc == urlparse(self.base_url).netloc
+            if parsed.scheme not in ("http", "https") or not (
+                parsed.scheme == "https" or same_host
+            ):
+                raise RuntimeError(f"Refusing to download mesh from {url!r}")
         else:
-            url = f"{self.base_url}/meshes/{job['id']}/content"
+            url = f"{self.base_url}/meshes/{_safe_job_id(job.get('id'))}/content"
             headers = {"Authorization": self.headers["Authorization"]}
+        deadline = time.monotonic() + MESH_DOWNLOAD_DEADLINE_S
         try:
             with requests.get(url, headers=headers, stream=True, timeout=120) as r:
                 r.raise_for_status()
+                size = 0
                 with open(dest_path, "wb") as out:
                     for chunk in r.iter_content(chunk_size=1 << 20):
+                        size += len(chunk)
+                        if size > MAX_MESH_BYTES:
+                            raise RuntimeError("Mesh download exceeds 2 GiB")
+                        if time.monotonic() > deadline:
+                            raise RuntimeError("Mesh download timed out")
                         out.write(chunk)
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, RuntimeError) as e:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
             raise RuntimeError(f"Failed to download mesh: {str(e)}")
         return dest_path
 

@@ -10,6 +10,7 @@ import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+from .core.server_api import mesh_dest_path
 from .options import SGLDOptions
 
 
@@ -645,13 +646,15 @@ class SGLDiffusionGenerateMesh:
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
         )
+        roots = os.environ.get("SGLD_SERVER_OUTPUT_DIRS", "")
         mesh_path = sgld_client.fetch_mesh(
             job,
-            os.path.join(
-                folder_paths.get_output_directory(),
-                "mesh",
-                f"sgld_{job['id']}.{job.get('format') or output_format}",
+            mesh_dest_path(
+                os.path.join(folder_paths.get_output_directory(), "mesh"),
+                job,
+                output_format,
             ),
+            local_roots=[r for r in roots.split(os.pathsep) if r],
         )
         return (_as_file_3d(mesh_path), mesh_path)
 

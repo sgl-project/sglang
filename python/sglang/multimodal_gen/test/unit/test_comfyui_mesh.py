@@ -154,9 +154,49 @@ def test_fetch_mesh_copies_a_local_file_without_a_request(tmp_path):
     local.write_bytes(b"local-bytes")
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1")
     dest = client.fetch_mesh(
-        {"id": "m1", "file_path": str(local)}, str(tmp_path / "out" / "m.glb")
+        {"id": "m1", "file_path": str(local)},
+        str(tmp_path / "out" / "m.glb"),
+        local_roots=[str(tmp_path)],
     )
     assert open(dest, "rb").read() == b"local-bytes"
+
+
+def test_fetch_mesh_ignores_a_local_file_outside_the_server_roots(tmp_path):
+    local = tmp_path / "secret.glb"
+    local.write_bytes(b"secret")
+    server = _FakeMeshServer()
+    try:
+        dest = _client(server).fetch_mesh(
+            {"id": "m1", "file_path": str(local)},
+            str(tmp_path / "out" / "m.glb"),
+            local_roots=[str(tmp_path / "server_out")],
+        )
+    finally:
+        server.close()
+    assert open(dest, "rb").read() == GLB
+
+
+def test_fetch_mesh_refuses_a_plain_http_url_on_another_host(tmp_path):
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1")
+    with pytest.raises(RuntimeError, match="Refusing"):
+        client.fetch_mesh(
+            {"id": "m1", "url": "http://evil.example/m.glb"}, str(tmp_path / "m.glb")
+        )
+
+
+@pytest.mark.parametrize(
+    "job", [{"id": "../../x", "format": "glb"}, {"id": "m1", "format": "sh"}]
+)
+def test_mesh_dest_path_sanitizes_server_values(tmp_path, job):
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.server_api import (
+        mesh_dest_path,
+    )
+
+    if job["format"] == "sh":
+        with pytest.raises(RuntimeError, match="format"):
+            mesh_dest_path(str(tmp_path), job, "glb")
+    else:
+        assert mesh_dest_path(str(tmp_path), job, "glb") == str(tmp_path / "sgld_x.glb")
 
 
 def test_fetch_mesh_uses_the_cloud_url_without_the_api_key(tmp_path):
