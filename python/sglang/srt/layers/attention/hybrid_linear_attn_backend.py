@@ -166,6 +166,8 @@ class MambaAttnBackendBase(AttentionBackend):
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
+        logical_mode = forward_batch.logical_forward_mode
+
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
@@ -209,7 +211,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         replayssm_write_pos = None
         replayssm_force_flush = None
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if logical_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
             )
@@ -270,7 +272,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     new_vals[inv] = next_for_valid.to(write_pos_buf.dtype)
                     write_pos_buf[uniq_slots] = new_vals
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+        elif logical_mode.is_extend(include_draft_extend_v2=True):
             has_extend_meta = (
                 forward_batch.extend_start_loc is not None
                 and forward_batch.extend_seq_lens is not None
@@ -565,6 +567,7 @@ class MambaAttnBackendBase(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -1308,10 +1311,6 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
         elif not forward_batch.forward_mode.is_draft_extend_v2():
             self.linear_attn_backend.init_forward_metadata(forward_batch)
-        if static_forward_batch is not None:
-            self.prepare_prefill_shared_read_snapshot(
-                forward_batch, num_qo_tokens=static_forward_batch.positions.shape[0]
-            )
 
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         if layer_id in self.full_attn_layers:
@@ -1373,6 +1372,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
@@ -1383,6 +1383,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 num_tokens,
                 req_pool_indices,
                 seq_lens,
+                out_cache_loc,
                 encoder_lens,
                 forward_mode,
                 spec_info,
@@ -1469,13 +1470,21 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         is_linear_attn = not self._is_full_attn(layer, kwargs.get("layer_id"))
 
+        # For linear attention, dispatch on the logical mode to match the
+        # built metadata.
+        dispatch_mode = (
+            forward_batch.logical_forward_mode
+            if is_linear_attn
+            else forward_batch.forward_mode
+        )
+
         if forward_batch.forward_mode.is_idle():
             if is_linear_attn:
                 return mixed_qkv.new_empty(
                     mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim
                 )
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
-        elif forward_batch.forward_mode.is_decode():
+        elif dispatch_mode.is_decode():
             return self.forward_decode(
                 layer,
                 forward_batch,
@@ -1547,7 +1556,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # accept_lens == last_correct_step_indices + 1.
         mamba_pool = req_pool.mamba_pool
         if getattr(mamba_pool, "replayssm_is_kda", False):
-            from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+            from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
                 commit_kda_replayssm_after_verify,
             )
 

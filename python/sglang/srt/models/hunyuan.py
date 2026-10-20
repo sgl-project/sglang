@@ -161,6 +161,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size, config.num_experts, bias=False, quant_config=None

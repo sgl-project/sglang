@@ -4,8 +4,9 @@
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
 //! Mirrors SGLang reasoning controls and assistant continuations; DeepSeek-V4,
-//! V4.1, GLM-5.3 and Kimi-K3 render through `sglang_processor`. Forwarding remains guarded
-//! until parity has been verified for each request shape.
+//! V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 render through `sglang_processor`.
+//! Forwarding remains guarded until parity has been verified for each request
+//! shape.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,7 +42,7 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    /// DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3 render through `sglang_processor`.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 render through `sglang_processor`.
     processor: Option<ProcessorFormatter>,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
@@ -165,10 +166,16 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
-        // GLM-5.3 renders through `sglang_processor`, which knows it by its template.
+        // GLM-5.3 and Qwen3.8 render through `sglang_processor`, which knows them by
+        // their template.
         let processor = ProcessorFormatter::from_tokenizer_config(&cfg)
             .ok()
-            .filter(|formatter| matches!(formatter, ProcessorFormatter::Glm53(_)));
+            .filter(|formatter| {
+                matches!(
+                    formatter,
+                    ProcessorFormatter::Glm53(_) | ProcessorFormatter::Qwen38 { .. }
+                )
+            });
         let template: ChatTemplate =
             serde_json::from_value(cfg).context("parse tokenizer_config.json")?;
         if template.chat_template.is_none() {
@@ -254,8 +261,15 @@ impl ChatFormatter {
             .is_some_and(ProcessorFormatter::always_thinks)
     }
 
-    /// DeepSeek-V4, V4.1, GLM-5.3 and Kimi-K3 are fixture-verified against SGLang for every
-    /// text chat.
+    /// The template's reasoning toggle kwarg and default, which SGLang's OpenAI layer reads.
+    pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
+        self.processor
+            .as_ref()
+            .and_then(ProcessorFormatter::reasoning_toggle)
+    }
+
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3 and Qwen3.8 are fixture-verified against SGLang
+    /// for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
         match self.processor {
             Some(_) => super::ForwardingScope::AllText,
@@ -732,6 +746,27 @@ mod tests {
             "[gMASK]<sop>Reasoning Effort: max<|user|>AB"
         );
         let other = jinja(json!({ "chat_template": template.replace("Reasoning Effort", "R") }));
+        assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
+    }
+
+    /// Qwen3.8, known by its template, renders every text chat through `sglang_processor`:
+    /// text parts join with spaces and a later system turn fails, as in SGLang.
+    #[test]
+    fn qwen38_renders_through_the_processor() {
+        use crate::tokenizer::ForwardingScope;
+        let template = "{# <function= <parameter= preserve_thinking Reasoning effort is set to #}\
+            {% for m in messages %}{% if m.role == 'system' and not loop.first %}\
+            {{ raise_exception('System message must be at the beginning.') }}{% endif %}\
+            <|im_start|>{{ m.role }}|{{ m.content }}{% endfor %}";
+        let enc = jinja(json!({ "chat_template": template }));
+        assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
+        let parts = json!([{"type": "text", "text": "A"}, {"type": "text", "text": "B"}]);
+        let req = request(json!([{"role": "user", "content": parts}]));
+        assert_eq!(enc.render(&req).unwrap(), "<|im_start|>user|A B");
+        let mid_system =
+            json!([{"role": "user", "content": "A"}, {"role": "system", "content": "B"}]);
+        assert!(enc.render(&request(mid_system)).is_err());
+        let other = jinja(json!({ "chat_template": template.replace("preserve_thinking", "") }));
         assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
     }
 

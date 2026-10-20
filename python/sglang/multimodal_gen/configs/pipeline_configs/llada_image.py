@@ -3,7 +3,6 @@
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.llada_image import (
@@ -15,14 +14,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     SpatialImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.flux import _unpatchify_latents
-
-
-def flux2_vae_bn_stats(vae, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(like)
-    variance = vae.bn.running_var.view(1, -1, 1, 1)
-    std = torch.sqrt(variance + vae.config.arch_config.batch_norm_eps).to(like)
-    return mean, std
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    _unpatchify_latents,
+    flux2_vae_bn_stats,
+)
 
 
 @dataclass

@@ -28,8 +28,9 @@ import signal
 import sys
 import threading
 import zlib
+from functools import lru_cache
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import msgspec
 import psutil
@@ -38,6 +39,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -45,6 +47,7 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    ConfigureLoggingReq,
     ContinueGenerationReqInput,
     FreezeGCReq,
     PauseContinueBroadcastReq,
@@ -62,9 +65,9 @@ from sglang.srt.managers.load_snapshot import (
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.runtime_context import (
-    get_disagg,
-)
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.observability.trace import process_tracing_init
+from sglang.srt.runtime_context import get_disagg, get_observability
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -78,6 +81,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 
 logger = logging.getLogger(__name__)
+
+_cached_output_fields = lru_cache(maxsize=None)(msgspec.structs.fields)
 
 
 class SocketMapping:
@@ -151,6 +156,16 @@ def _extract_field_by_index(
 
     new_field = [field[index]]
     return wrap_as_pickle(new_field) if should_wrap_result else new_field
+
+
+def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int):
+    states = output.pooled_hidden_states
+    if states is None:
+        return None
+    # Stacked layout: one tensor holding a row per request.
+    if len(states) == 1 and len(output.rids) > 1:
+        return [states[0][i]]
+    return [states[i]]
 
 
 def _handle_output_by_index(output, i):
@@ -281,6 +296,12 @@ def _handle_output_by_index(output, i):
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i
+            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
+            pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
@@ -484,7 +505,7 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
             indices,
             check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
         )
-        for field in msgspec.structs.fields(output)
+        for field in _cached_output_fields(type(output))
         if field.name not in _NOT_SPLIT_FIELDS
     }
     return type(output)(
@@ -493,6 +514,48 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
         placeholder_tokens_val=None,
         **split_fields,
     )
+
+
+def _split_batch_by_key(
+    output: Any, keys: List[Any]
+) -> Optional[List[Tuple[Any, Any]]]:
+    indices_by_key: Dict[Any, List[int]] = {}
+    for index, key in enumerate(keys):
+        indices_by_key.setdefault(key, []).append(index)
+
+    # Build every sub-batch before any send, so a fallback never duplicates one.
+    try:
+        grouped = [
+            (key, _handle_output_by_indices(output, indices), indices)
+            for key, indices in indices_by_key.items()
+        ]
+    except _CannotSplitBatch:
+        return None
+
+    ipcs = output.http_worker_ipcs
+    for _, sub_output, indices in grouped:
+        sub_output.http_worker_ipcs = (
+            None if ipcs is None else [ipcs[index] for index in indices]
+        )
+    return [(key, sub_output) for key, sub_output, _ in grouped]
+
+
+def _send_output_to_tokenizer_workers(
+    output: Any, ipcs: List[Optional[str]], socket_mapping: SocketMapping
+) -> None:
+    grouped = (
+        _split_batch_by_key(output, ipcs)
+        if envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.get()
+        else None
+    )
+    if grouped is None:
+        for index, ipc_name in enumerate(ipcs):
+            single_output = _handle_output_by_index(output, index)
+            socket_mapping.send_output(ipc_name, single_output, is_tokenizer=True)
+        return
+
+    for ipc_name, grouped_output in grouped:
+        socket_mapping.send_output(ipc_name, grouped_output, is_tokenizer=True)
 
 
 class MultiHttpWorkerDetokenizerMixin:
@@ -516,11 +579,9 @@ class MultiHttpWorkerDetokenizerMixin:
                 # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
                 # forward either batched or single requests, so handle both shapes.
                 if isinstance(recv_obj, BaseBatchReq):
-                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                        new_output = _handle_output_by_index(output, i)
-                        self.socket_mapping.send_output(
-                            ipc_name, new_output, is_tokenizer=True
-                        )
+                    _send_output_to_tokenizer_workers(
+                        output, recv_obj.http_worker_ipcs, self.socket_mapping
+                    )
                 elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
                         recv_obj.http_worker_ipc, output, is_tokenizer=True
@@ -545,6 +606,13 @@ class MultiTokenizerRouter:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        # Requests are unpickled here; TraceReqContext needs an OTel provider.
+        if get_observability().enable_trace:
+            process_tracing_init(
+                get_observability().otlp_traces_endpoint,
+                get_observability().otlp_service_name,
+                trace_modules=get_observability().trace_modules,
+            )
         self.server_args = server_args
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
@@ -664,6 +732,8 @@ class MultiDetokenizerRouter:
     Each request is pinned to a worker by hashing its ``http_worker_ipc`` with
     ``zlib.crc32`` (deterministic across runs), so all outputs of the same rid
     always land on the same detokenizer and ``decode_status`` stays consistent.
+    With a single tokenizer worker no ``http_worker_ipc`` is stamped, and the
+    ``rid`` is hashed instead.
     """
 
     def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
@@ -681,65 +751,47 @@ class MultiDetokenizerRouter:
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
-    def _split_batch_by_target(self, recv_obj: BaseBatchReq):
-        ipcs = recv_obj.http_worker_ipcs
-        assert (
-            ipcs is not None
-            and len(ipcs) == len(recv_obj.rids)
-            and all(x is not None for x in ipcs)
-        ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
-
-        indices_by_target: Dict[str, List[int]] = {}
-        for index, ipc_key in enumerate(ipcs):
-            target = self._pick(ipc_key)
-            indices_by_target.setdefault(target, []).append(index)
-
-        try:
-            grouped = [
-                (
-                    target,
-                    _handle_output_by_indices(recv_obj, indices),
-                    indices,
-                )
-                for target, indices in indices_by_target.items()
-            ]
-        except _CannotSplitBatch:
-            return None
-
-        for _, output, indices in grouped:
-            output.http_worker_ipcs = [ipcs[index] for index in indices]
-        return grouped
+    def _pick_for(self, http_worker_ipc: Optional[str], rid: str) -> str:
+        return self._pick(rid if http_worker_ipc is None else http_worker_ipc)
 
     def _send_batch(self, recv_obj: BaseBatchReq) -> None:
-        grouped = self._split_batch_by_target(recv_obj)
+        ipcs = recv_obj.http_worker_ipcs
+        assert ipcs is not None and len(ipcs) == len(recv_obj.rids), (
+            f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
+        )
+        targets = [self._pick_for(ipc, rid) for ipc, rid in zip(ipcs, recv_obj.rids)]
+
+        grouped = _split_batch_by_key(recv_obj, targets)
         if grouped is None:
-            for index, ipc_key in enumerate(recv_obj.http_worker_ipcs):
+            for index, target in enumerate(targets):
                 one = _handle_output_by_index(recv_obj, index)
                 if one is recv_obj:
                     raise TypeError(f"Cannot split {type(recv_obj)}")
-                one.http_worker_ipcs = [ipc_key]
-                self._send(self._pick(ipc_key), one)
+                one.http_worker_ipcs = [ipcs[index]]
+                self._send(target, one)
             return
 
-        for target, output, _ in grouped:
+        for target, output in grouped:
             self._send(target, output)
 
     def event_loop(self):
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
 
-            # FreezeGCReq must freeze every detokenizer process.
-            if isinstance(recv_obj, FreezeGCReq):
+            # Control messages must reach every detokenizer process.
+            if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Single request: route like the batch items of the same rid.
             if isinstance(recv_obj, BaseReq):
-                assert recv_obj.http_worker_ipc is not None, (
-                    f"Single req {recv_obj.rid=} missing http_worker_ipc"
+                assert (
+                    recv_obj.http_worker_ipc is not None or recv_obj.rid is not None
+                ), f"Single req {type(recv_obj).__name__} has no routing key"
+                self._send(
+                    self._pick_for(recv_obj.http_worker_ipc, recv_obj.rid), recv_obj
                 )
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
                 continue
 
             # Batch request.
@@ -762,6 +814,8 @@ def run_multi_detokenizer_router_process(
     ipc_name_list: List[str],
     server_args: ServerArgs,
     port_args: PortArgs,
+    *,
+    enable_metrics: bool,
 ):
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
@@ -770,6 +824,8 @@ def run_multi_detokenizer_router_process(
 
     router = None
     try:
+        if enable_metrics:
+            start_cpu_monitor_thread("detokenizer_router")
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
