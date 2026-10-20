@@ -39,8 +39,10 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hip
+from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +123,16 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
+def is_dspark_spec() -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algorithm = get_spec().speculative_algorithm
+    return (
+        spec_algorithm is not None
+        and SpeculativeAlgorithm.from_string(spec_algorithm).is_dspark()
+    )
+
+
 def uses_draft_swa_ring() -> bool:
     """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
     state is tree-owned under encoder replay. The HIP backend still addresses the
@@ -128,9 +140,12 @@ def uses_draft_swa_ring() -> bool:
     return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
 
 
-def get_draft_swa_ring_size(sliding_window: int, max_draft_tokens: int) -> int:
-    # A draft block and a verify commit write past the committed window.
-    return sliding_window + max_draft_tokens
+def get_draft_swa_ring_size(
+    sliding_window: int, max_draft_tokens: int, page_size: int
+) -> int:
+    # A draft block and a verify commit write past the committed window; whole
+    # pages match the target request window's rows, so PD sends both as one list.
+    return ceil_div(sliding_window + max_draft_tokens, page_size) * page_size
 
 
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
@@ -1109,8 +1124,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self.request_window = None
         self.full_to_swa_index_mapping = None
-        # Per req slot, the first position the draft SWA ring holds KV for.
-        self.swa_req_ring_valid_from: Optional[torch.Tensor] = None
+        # Per req slot, the first position whose draft SWA rows this request
+        # wrote: the ring restarts at the cached prefix, and a PD decode receives
+        # the prefill's mark as request-row state.
+        self.swa_valid_from: Optional[torch.Tensor] = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
         # Under encoder replay the target keeps SWA in a per-request window. A
         # draft without its own ring still reads the target's full-to-SWA mapping,
@@ -1138,6 +1155,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             from sglang.srt.runtime_context import get_schedule
 
             chunk = get_schedule().chunked_prefill_size or 0
+            # A prefill graph pads its layouts to the captured bucket, which can
+            # exceed this rank's chunk (DP attention divides the chunk budget).
+            graph_config = get_exec().graph.cuda_graph_config
+            prefill_graph = graph_config.prefill if graph_config is not None else None
+            graph_rows = (
+                get_cuda_graph_max_batch_size(max(prefill_graph.bs))
+                if prefill_graph is not None
+                and prefill_graph.backend == Backend.BREAKABLE
+                and prefill_graph.bs
+                else 0
+            )
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
@@ -1147,6 +1175,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
                 + max(
                     chunk,
+                    graph_rows,
                     (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
                 ),
             )
@@ -1155,10 +1184,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             # while attending, so it addresses its ring directly with no workspace.
             self.unified_kv_pool = None
             self.swa_req_ring_size = get_draft_swa_ring_size(
-                self.sliding_window, online_mtp_max_draft_tokens or 0
-            )
-            self.swa_req_ring_valid_from = torch.zeros(
-                self.num_req_slots, dtype=torch.int64, device=device
+                self.sliding_window, online_mtp_max_draft_tokens or 0, swa_page_size
             )
             self.swa_kv_pool = self._make_kv_pool(
                 size=self.num_req_slots * self.swa_req_ring_size,
@@ -1216,6 +1242,23 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 kv_layout=self.kv_layout,
                 cls=kv_pool_cls,
             )
+
+        if (
+            is_draft_worker
+            and not _is_hip
+            and self.swa_kv_pool is not None
+            and is_dspark_spec()
+        ):
+            # Kept for the ring and for paged SWA alike, so both PD roles
+            # register it; it stays 0 unless the ring restarts or PD writes it.
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.swa_valid_from = torch.zeros(
+                    self.num_req_slots, dtype=torch.int64, device=device
+                )
 
         if self.request_window is not None:
             swa_storage = "request_window"
@@ -1277,10 +1320,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
 
-    def reset_swa_req_ring(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
-        """Restart the draft SWA ring of ``slots`` at ``valid_from``; the rows
-        before it belong to the slot's previous owner, not this request."""
-        self.swa_req_ring_valid_from[slots] = valid_from
+    def set_swa_valid_from(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
+        """The draft SWA rows of ``slots`` below ``valid_from`` are not this
+        request's: the slot's previous owner wrote them, or no one did."""
+        self.swa_valid_from[slots] = valid_from
+
+    def get_swa_valid_from_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """The draft SWA valid-from, which PD sends as request-row state."""
+        if self.swa_valid_from is None:
+            return [], [], []
+        mark = self.swa_valid_from
+        return [mark.data_ptr()], [mark.nbytes], [mark[0].nbytes]
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -1437,11 +1487,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self.swa_kv_pool is not None:
-            physical_pages_per_logical_page = (
-                self.swa_page_size // self.swa_kv_pool.page_size
-            )
-            for buf in self.swa_kv_pool.kv_buffer:
+        # Under encoder replay the target's SWA lives in the request window, whose
+        # pages pair with decode's paged SWA pages (RequestWindow.page_indices).
+        swa_pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        if swa_pool is not None:
+            physical_pages_per_logical_page = self.swa_page_size // swa_pool.page_size
+            for buf in swa_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -1633,6 +1688,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         assert is_valid_kv_layout_pair(self.kv_layout, layout)
         return layout
+
+    def pd_kv_layout(self) -> str:
+        """The main and compressed KV layouts, which PD peers must share."""
+        if self.uniform_fp8:
+            return KVLayout.UNIFORM_FP8.value
+        compressed = [
+            f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
+            for ratio in sorted(set(self.compression_ratios) - {0})
+        ]
+        return ",".join([self.kv_layout.value, *compressed])
 
     def _make_indexer_pool(
         self,

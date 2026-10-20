@@ -1032,9 +1032,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # HIP Triton conv1d, fused_qkv_split_gdn_prefill, fused_gdn_gating,
             # and 3D-Z rms_norm_gated already honor these strides.
             # Speculative extend/verify still unpacks.
+            # The strided views feed only prefill GDN; DP-relabeled decode rows
+            # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
                 _is_cuda or _is_hip
-            ) and forward_batch.forward_mode.is_extend_without_speculative()
+            ) and forward_batch.logical_forward_mode.is_extend_without_speculative()
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
                 if use_strided_prefill_z
