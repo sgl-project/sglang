@@ -1,10 +1,12 @@
-"""gfx1250 per-token/per-channel FP8 GEMM tile.
+"""gfx1250 per-token/per-channel FP8 GEMM tile, and the linear method that uses it.
 
 The tile indexes its operands modulo M and N instead of masking the loads, and
 caps BLOCK_SIZE_K at 64 because FP8 ``tl.dot`` miscompiles above that on this
 target. Guards: ragged M and small N still match a dequantized reference,
 ``gfx1250_fp8_scaled_mm_supported`` rejects the shapes the K loop cannot cover,
-and an all-zero activation row quantizes to exact zeros.
+an all-zero activation row quantizes to exact zeros, and ``Fp8LinearMethod``
+both reaches the tile for an online-quantized checkpoint and stays off it when
+the kill switch is set.
 """
 
 import unittest
@@ -16,6 +18,11 @@ from sglang.kernels.ops.gemm.fp8_gfx1250 import (
     gfx1250_fp8_scaled_mm_supported,
     per_token_quant_fp8_gfx1250,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+    Fp8Config,
+    Fp8LinearMethod,
+)
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_gfx1250_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -88,6 +95,45 @@ class TestFp8GemmGfx1250(CustomTestCase):
         roundtrip = q.float() * scale[:, None]
         rel = ((roundtrip - x.float()).abs().mean() / x.float().abs().mean()).item()
         self.assertLess(rel, 0.05)
+
+
+@unittest.skipUnless(is_gfx1250_supported(), "requires an AMD gfx1250 GPU")
+class TestFp8LinearMethodDispatchGfx1250(CustomTestCase):
+    """The seam this change moves: which GEMM an online-FP8 linear ends up on."""
+
+    def test_online_checkpoint_selects_the_tile_and_matches_bf16(self):
+        method = Fp8LinearMethod(Fp8Config())
+        self.assertTrue(method.use_gfx1250_triton_fp8)
+
+        M, N, K = 512, 6144, 6144
+        torch.manual_seed(0)
+        layer = torch.nn.Module()
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+        layer.weight = torch.nn.Parameter(w, requires_grad=False)
+        layer.input_scale = None
+        method.process_weights_after_loading(layer)
+
+        # The tile wants [K, N] fp8 weights with one scale per output channel;
+        # a per-tensor scale here would mean the dispatch picked another path.
+        self.assertEqual(layer.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(layer.weight.shape), (K, N))
+        self.assertEqual(layer.weight_scale.numel(), N)
+
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        out = method.apply(layer, x)
+        self.assertEqual(tuple(out.shape), (M, N))
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+        ref = x.float() @ w.float().t()
+        rel = ((out.float() - ref).abs().mean() / ref.abs().mean()).item()
+        self.assertLess(rel, 0.05, f"FP8 linear drifted from the BF16 result: {rel}")
+
+    def test_kill_switch_leaves_the_tile_unselected(self):
+        envs.SGLANG_DISABLE_GFX1250_FP8_GEMM.set(True)
+        try:
+            self.assertFalse(Fp8LinearMethod(Fp8Config()).use_gfx1250_triton_fp8)
+        finally:
+            envs.SGLANG_DISABLE_GFX1250_FP8_GEMM.clear()
 
 
 if __name__ == "__main__":
