@@ -114,10 +114,14 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
                 isinstance(quant_method, Fp8MoEMethod)
                 and (
                     runner_backend.is_cutlass()
+                    or runner_backend.is_flashinfer_trtllm()
                     or runner_backend.is_flashinfer_trtllm_routed()
                 )
                 or isinstance(quant_method, UnquantizedFusedMoEMethod)
-                and runner_backend.is_flashinfer_trtllm_routed()
+                and (
+                    runner_backend.is_flashinfer_trtllm()
+                    or runner_backend.is_flashinfer_trtllm_routed()
+                )
             )
         )
     )

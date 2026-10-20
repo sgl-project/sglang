@@ -179,21 +179,28 @@ class TestNvFp4MoeDispatch(CustomTestCase):
 
     def test_materialized_router_weights_reach_fp8_and_bf16_routed_kernels(self):
         """Materialized custom weights must not be sent to a logits router or normalized again."""
+        from sglang.srt.layers.moe import topk as topk_module
+        from sglang.srt.layers.moe.fused_moe_triton.layer import (
+            _fuses_routed_scaling_factor_in_topk,
+        )
         from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as kernels
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+        from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
         from sglang.srt.runtime_context import get_parallel
 
+        logits = torch.tensor([[0.0, 1.0, -2.0, 2.0]])
         ids = torch.tensor([[3, 1]], dtype=torch.int32)
-        weights = torch.tensor([[0.25, 0.5]])
+        routed_scale = 2.5
+        weights = torch.sigmoid(logits).gather(1, ids.long())
+        weights = weights / weights.sum(dim=-1, keepdim=True) * routed_scale
         hidden = torch.zeros((1, 4), dtype=torch.bfloat16)
-        dispatch = StandardDispatchOutput(
-            hidden, None, StandardTopKOutput(weights, ids, None)
-        )
         config = MoeRunnerConfig(
             top_k=2,
             activation="silu",
             num_local_experts=4,
             num_fused_shared_experts=0,
             intermediate_size_per_partition=128,
+            routed_scaling_factor=routed_scale,
         )
         expected = (ids.float() * weights).sum(dim=-1, keepdim=True).expand_as(hidden)
         fake_flashinfer = ModuleType("flashinfer.fused_moe")
@@ -271,14 +278,46 @@ class TestNvFp4MoeDispatch(CustomTestCase):
                 kernels, "trtllm_fp8_block_scale_routed_moe_out_wrapper", fp8_kernel
             ),
         ):
-            fp8_output = kernels.fused_experts_none_to_flashinfer_trtllm_fp8(
-                dispatch, quant_info, config
-            )
-            bf16_output = kernels.fused_experts_none_to_flashinfer_trtllm_bf16(
-                dispatch, bf16_info, config
-            )
-        torch.testing.assert_close(fp8_output.hidden_states, expected.to(hidden.dtype))
-        torch.testing.assert_close(bf16_output.hidden_states, expected.to(hidden.dtype))
+            for method_type, kernel, info in (
+                (
+                    Fp8MoEMethod,
+                    kernels.fused_experts_none_to_flashinfer_trtllm_fp8,
+                    quant_info,
+                ),
+                (
+                    UnquantizedFusedMoEMethod,
+                    kernels.fused_experts_none_to_flashinfer_trtllm_bf16,
+                    bf16_info,
+                ),
+            ):
+                with self.subTest(method=method_type.__name__):
+                    fold_scale = _fuses_routed_scaling_factor_in_topk(
+                        object.__new__(method_type), MoeRunnerBackend.FLASHINFER_TRTLLM
+                    )
+                    produced_weights, produced_ids = (
+                        topk_module.biased_grouped_topk_impl.__wrapped__(
+                            hidden,
+                            logits,
+                            torch.zeros(4),
+                            topk=2,
+                            renormalize=True,
+                            num_expert_group=1,
+                            topk_group=1,
+                            routed_scaling_factor=routed_scale,
+                            apply_routed_scaling_factor_on_output=fold_scale,
+                        )
+                    )
+                    dispatch = StandardDispatchOutput(
+                        hidden,
+                        None,
+                        StandardTopKOutput(
+                            produced_weights, produced_ids.to(torch.int32), None
+                        ),
+                    )
+                    output = kernel(dispatch, info, config)
+                    torch.testing.assert_close(
+                        output.hidden_states, expected.to(hidden.dtype)
+                    )
 
     def test_fp8_default_routing_policy_keeps_zero_enum(self):
         """The native softmax selector's zero value must not select grouped sigmoid routing."""
