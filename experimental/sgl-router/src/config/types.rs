@@ -655,7 +655,8 @@ pub struct AffinityConfig {
     /// Match prefill buckets on uncached tokens E instead of the input length. A
     /// request with a reusable prefix uses E's buckets, and spills to a worker
     /// with an idle DP rank when every rank in them has pending prefill; a
-    /// request without one uses every prefill worker.
+    /// request without one uses every prefill worker whose bucket admits its
+    /// context.
     pub route_by_uncached_tokens: bool,
 }
 

@@ -269,12 +269,32 @@ impl<'a> Selector<'a> {
             // Bucket, so build them only on the rung that actually reads them.
             let prefill_domains = || match (&idle_spill, uncached_tokens) {
                 (Some(domains), _) => domains.clone(),
-                (None, Some(extend)) => inputs.bucket_selector.prefill_domains_for_extend(
-                    inputs.workers,
-                    bucket_request,
-                    extend,
-                ),
-                (None, None) if cold => vec![CandidateDomain::global_prefill(inputs.workers)],
+                (None, Some(extend)) => {
+                    let domains = inputs.bucket_selector.prefill_domains_for_extend(
+                        inputs.workers,
+                        bucket_request,
+                        extend,
+                    );
+                    if domains.is_empty() {
+                        // No bucket admits E: fall back to input-length matching.
+                        inputs
+                            .bucket_selector
+                            .prefill_domains(inputs.workers, bucket_request)
+                    } else {
+                        domains
+                    }
+                }
+                // Cold: every worker whose bucket admits the request's context.
+                (None, None) if cold => {
+                    let mut admitted: Vec<Arc<Worker>> = inputs
+                        .bucket_selector
+                        .prefill_domains_for_any_extend(inputs.workers, bucket_request)
+                        .into_iter()
+                        .flat_map(|domain| domain.workers)
+                        .collect();
+                    admitted.dedup_by(|a, b| a.id == b.id);
+                    vec![CandidateDomain::global_prefill(&admitted)]
+                }
                 (None, None) => inputs
                     .bucket_selector
                     .prefill_domains(inputs.workers, bucket_request),
@@ -343,14 +363,14 @@ impl<'a> Selector<'a> {
     fn extend_bucket_workers(&self) -> Option<Vec<Arc<Worker>>> {
         let extend = self.uncached_tokens?;
         let inputs = self.inputs;
-        Some(
-            inputs
-                .bucket_selector
-                .prefill_domains_for_extend(inputs.workers, self.bucket_request, extend)
-                .into_iter()
-                .flat_map(|domain| domain.workers)
-                .collect(),
-        )
+        let members: Vec<Arc<Worker>> = inputs
+            .bucket_selector
+            .prefill_domains_for_extend(inputs.workers, self.bucket_request, extend)
+            .into_iter()
+            .flat_map(|domain| domain.workers)
+            .collect();
+        // No bucket admits E: the request falls back to input-length matching.
+        (!members.is_empty()).then_some(members)
     }
 
     /// When every DP rank in a warm request's buckets has pending prefill: the
@@ -1475,6 +1495,20 @@ mod tests {
         let signal = prefix_signal(&[(&long, 10)], 20);
         assert_eq!(
             route_both_ways(None, &workers, &loads, Some(&signal), &metrics),
+            ["long", "long"]
+        );
+        // Cold with a context cap: only the buckets that hold the prompt.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 3, 900_000, 1_000_000)]);
+        assert_eq!(
+            route_both_ways(Some(10_000), &workers, &loads, None, &metrics),
+            ["long", "long"]
+        );
+        // Warm, E = 5,000 is in `short`'s extend range, but `short`'s context cap
+        // rejects the prompt and `long` starts at 8,193: fall back to input length.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 0, 10, 1_000_000)]);
+        let signal = prefix_signal(&[(&long, 15)], 20);
+        assert_eq!(
+            route_both_ways(Some(10_000), &workers, &loads, Some(&signal), &metrics),
             ["long", "long"]
         );
     }
