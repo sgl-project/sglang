@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Optional
 
+import msgspec
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -59,8 +60,7 @@ def _compute_elastic_expert_layout(
     )
 
 
-@dataclass
-class EplbPlacement:
+class EplbPlacement(msgspec.Struct):
     """The maps an EPLB run produces, on whatever device the algorithm used."""
 
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)

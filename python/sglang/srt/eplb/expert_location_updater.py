@@ -13,10 +13,10 @@
 # ==============================================================================
 import logging
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import einops
+import msgspec
 import torch
 import torch.distributed
 from torch.distributed import P2POp
@@ -183,8 +183,7 @@ def create_temp_buffers(sample_tensors):
     return [torch.empty_like(tensor) for tensor in sample_tensors]
 
 
-@dataclass
-class P2PDesc:
+class P2PDesc(msgspec.Struct):
     """One send or receive of a plan; becomes a `P2POp` when executed."""
 
     op: Callable
@@ -192,8 +191,7 @@ class P2PDesc:
     peer: int
 
 
-@dataclass
-class LayerUpdatePlan:
+class LayerUpdatePlan(msgspec.Struct):
     """The copies and P2P ops that move one layer to its new placement."""
 
     # (src expert location in the weights, dst expert location in the buffers)

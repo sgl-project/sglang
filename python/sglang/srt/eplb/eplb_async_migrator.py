@@ -18,9 +18,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+import msgspec
 import torch
 import torch.distributed
 
@@ -38,8 +38,7 @@ from sglang.srt.runtime_context import get_device, get_parallel
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class AsyncRebalanceJob:
+class AsyncRebalanceJob(msgspec.Struct):
     layer_ids: List[int]
     old_metadata: ExpertLocationMetadata
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]]
@@ -51,7 +50,7 @@ class AsyncRebalanceJob:
     thread: Optional[threading.Thread] = None
     error: Optional[BaseException] = None
     placement: Optional[EplbPlacement] = None
-    plans: Dict[int, LayerUpdatePlan] = field(default_factory=dict)
+    plans: Dict[int, LayerUpdatePlan] = {}
     new_metadata: Optional[ExpertLocationMetadata] = None
     transfer_event: Optional[torch.Event] = None
     layers_issued: int = 0
