@@ -21,6 +21,10 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -47,8 +51,18 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
@@ -106,6 +120,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
+        if _is_xpu and not self._is_dummy:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
         self.dtype = buffer_info.dtype
         self.layout = layout
         self.kv_lora_rank = buffer_info.kv_lora_rank
@@ -667,6 +685,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ret = offload.kv_exchange_copy(meta, device)
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
     def load_to_device_per_layer(
         self,

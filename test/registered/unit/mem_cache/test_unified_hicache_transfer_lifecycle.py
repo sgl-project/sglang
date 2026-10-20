@@ -67,13 +67,17 @@ FULL, SWA = ComponentType.FULL, ComponentType.SWA
 
 
 def _python_inspector(params, components):
-    from unified_tree_core_inspector import UnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
+        UnifiedTreeCoreInspector,
+    )
 
     return UnifiedTreeCoreInspector(params, components)
 
 
 def _rust_inspector(params, _components):
-    from rust_unified_tree_core_inspector import RustUnifiedTreeCoreInspector
+    from sglang.test.kits.unified_radix_cache.rust_unified_tree_core_inspector import (
+        RustUnifiedTreeCoreInspector,
+    )
 
     return RustUnifiedTreeCoreInspector(params)
 
