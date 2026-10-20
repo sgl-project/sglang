@@ -361,6 +361,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
+                fused_accept_tail=envs.SGLANG_DSPARK_FUSED_ACCEPT_TAIL.get(),
+                accept_tail_min_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS.get(),
+                accept_tail_max_bs=envs.SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
