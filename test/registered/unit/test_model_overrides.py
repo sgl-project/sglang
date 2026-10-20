@@ -1686,24 +1686,124 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._leaf("swa_full_tokens_ratio"), 1.0)
         self.assertTrue(self._leaf("disable_hybrid_swa_memory"))
 
-    def test_gemma2_disables_hybrid_swa_memory(self):
-        sa = self._construct("Gemma2ForCausalLM", "llama")
-        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
-        self.assertIn(
-            ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
-            sa._resolved_overrides,
+    # The mini config's two layers: one sliding-window layer, one full layer.
+    _SWA_MIX = {
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 64,
+    }
+
+    def test_gemma_keeps_hybrid_swa_memory(self):
+        for architecture, backend in (
+            ("Gemma2ForCausalLM", "triton"),
+            ("Gemma2ForCausalLM", "fa3"),
+            ("Gemma3ForCausalLM", "triton"),
+            ("Gemma3ForConditionalGeneration", "triton"),
+        ):
+            with self.subTest(architecture=architecture, backend=backend):
+                sa = self._construct(
+                    architecture,
+                    "llama",
+                    config_extra=self._SWA_MIX,
+                    attention_backend=backend,
+                )
+                self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+                self.assertTrue(
+                    base_module.model_config_of(sa).is_layer_types_hybrid_swa
+                )
+
+    def test_gemma3_disables_hybrid_swa_memory_on_fa3(self):
+        for architecture in ("Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"):
+            for backends in (
+                {"attention_backend": "fa3"},
+                {
+                    "prefill_attention_backend": "triton",
+                    "decode_attention_backend": "fa3",
+                },
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, "llama", config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_gemma2_gemma3_overrides",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
+
+    def test_gemma3n_disables_hybrid_swa_memory(self):
+        from sglang.srt.arg_groups.model_overrides.gemma2_gemma3 import (
+            _gemma2_gemma3_overrides,
         )
-        self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
 
-    def test_olmo2_disables_hybrid_swa_memory(self):
+        for architecture in ("Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"):
+            with self.subTest(architecture=architecture):
+                self.assertEqual(
+                    _gemma2_gemma3_overrides(
+                        None, SimpleNamespace(architectures=[architecture])
+                    ),
+                    {"disable_hybrid_swa_memory": True},
+                )
+
+    def test_layer_types_hybrid_swa_memory_off_on_aiter(self):
+        for architecture in ("Gemma3ForCausalLM", "Cohere2ForCausalLM"):
+            for backends in (
+                {"attention_backend": "aiter"},
+                {
+                    "prefill_attention_backend": "aiter",
+                    "decode_attention_backend": "triton",
+                },
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, "llama", config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_layer_types_hybrid_swa_aiter",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
+
+    def test_listed_hybrid_swa_models_keep_their_pool_on_aiter(self):
+        sa = self._construct(
+            "Gemma4ForCausalLM",
+            "llama",
+            config_extra=self._SWA_MIX,
+            attention_backend="aiter",
+        )
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_olmo2_is_not_hybrid_swa(self):
         sa = self._construct("Olmo2ForCausalLM", "llama")
-        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
-        self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+        self.assertFalse(base_module.model_config_of(sa).is_hybrid_swa)
 
-    def test_exaone_conditional_on_sliding_window_pattern(self):
-        # With the pattern the branch also asserts an explicit backend.
+    def test_olmo3_keeps_hybrid_swa_memory(self):
+        sa = self._construct(
+            "Olmo3ForCausalLM", "olmo3", config_extra={"num_hidden_layers": 4}
+        )
+        model_config = base_module.model_config_of(sa)
+        self.assertEqual(model_config.hf_config.architectures, ["Olmo2ForCausalLM"])
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+        self.assertTrue(model_config.is_layer_types_hybrid_swa)
+
+    def test_exaone4_keeps_hybrid_swa_memory(self):
         sa = self._construct(
             "Exaone4ForCausalLM",
+            "llama",
+            config_extra={"sliding_window_pattern": "LLLG", **self._SWA_MIX},
+            attention_backend="fa3",
+        )
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_exaone_moe_disables_hybrid_swa_memory(self):
+        # With the pattern the branch also asserts an explicit backend.
+        sa = self._construct(
+            "ExaoneMoEForCausalLM",
             "llama",
             config_extra={"sliding_window_pattern": "LLLG"},
             attention_backend="fa3",
