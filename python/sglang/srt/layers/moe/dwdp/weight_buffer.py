@@ -47,9 +47,10 @@ class WeightBuffer:
         if backend is None:
             self._granularity = get_device_granularity(device_id)
             self._prop = make_device_allocation_prop(device_id, handle_types=None)
+            self.device = torch.device("cuda", device_id)
         else:
             self._granularity = backend.granularity
-            self._prop = backend.prop
+            self.device = backend.device
         self._pool_page_size = PagePool.DEFAULT_PAGE_SIZE_MULTIPLIER * self._granularity
         self._page_pool: Optional[PagePool] = None
         self._moe_layer_indices = sorted(layer_weight_specs.keys())
@@ -226,12 +227,6 @@ class WeightBuffer:
     @property
     def device_id(self) -> int:
         return self._device_id
-
-    @property
-    def device(self) -> torch.device:
-        if self.backend is not None:
-            return self.backend.device
-        return torch.device("cuda", self._device_id)
 
     def weight_names(self, layer_idx: int) -> List[str]:
         return list(self._layer_weight_specs[layer_idx].keys())

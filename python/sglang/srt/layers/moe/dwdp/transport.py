@@ -52,14 +52,11 @@ def _copy_local_weights_to_handles(
     device_id: int,
     backend=None,
 ) -> Tuple[Dict[Tuple[int, str], int], Dict[Tuple[int, str], int]]:
-    granularity = (
-        backend.granularity
-        if backend is not None
-        else get_device_granularity(device_id)
-    )
-    prop = (
-        backend.prop if backend is not None else make_device_allocation_prop(device_id)
-    )
+    if backend is None:
+        granularity = get_device_granularity(device_id)
+        prop = make_device_allocation_prop(device_id)
+    else:
+        granularity = backend.granularity
     handles: Dict[Tuple[int, str], int] = {}
     sizes: Dict[Tuple[int, str], int] = {}
 
@@ -136,9 +133,9 @@ class DWDPTransport:
                 sorted_keys, local_params, layer_weight_specs, layout, device_id
             )
         else:
+            backend.initialize(len(sorted_keys))
             error = None
             try:
-                backend.initialize(len(sorted_keys))
                 handles, sizes = _copy_local_weights_to_handles(
                     sorted_keys,
                     local_params,
@@ -176,16 +173,11 @@ class DWDPTransport:
     ) -> None:
         cpu_group = group.cpu_group
         backend = self.backend
-        granularity = (
-            backend.granularity
-            if backend is not None
-            else get_device_granularity(device_id)
-        )
-        prop = (
-            backend.prop
-            if backend is not None
-            else make_device_allocation_prop(device_id)
-        )
+        if backend is None:
+            granularity = get_device_granularity(device_id)
+            prop = make_device_allocation_prop(device_id)
+        else:
+            granularity = backend.granularity
 
         handle_list = [self._handle_set.get_handle(li, n) for li, n in sorted_keys]
         if backend is not None:
@@ -246,9 +238,16 @@ class DWDPTransport:
                 peer_phys_size = peer_page_end - peer_page_start
                 peer_data_offset = peer_start_bytes - peer_page_start
 
+                num_peer_experts = peer_end - peer_start
+                kwargs = dict(
+                    shape=(num_peer_experts,) + spec.full_shape[1:], dtype=spec.dtype
+                )
                 if backend is not None:
                     peer_ptr = backend.import_shard(
                         fabric_handle, peer_phys_size, peer_data_offset
+                    )
+                    peer_tensor = backend.tensor(
+                        peer_ptr, peer_end_bytes - peer_start_bytes, **kwargs
                     )
                 else:
                     peer_reservation = VmmReservation(
@@ -260,16 +259,6 @@ class DWDPTransport:
                     peer_reservation.map_existing(0, peer_phys_size, int(peer_handle))
                     self._peer_reservations.append(peer_reservation)
                     peer_ptr = peer_reservation.base + peer_data_offset
-
-                num_peer_experts = peer_end - peer_start
-                kwargs = dict(
-                    shape=(num_peer_experts,) + spec.full_shape[1:], dtype=spec.dtype
-                )
-                if backend is not None:
-                    peer_tensor = backend.tensor(
-                        peer_ptr, peer_end_bytes - peer_start_bytes, **kwargs
-                    )
-                else:
                     peer_tensor = tensor_from_pointer(
                         peer_ptr,
                         peer_end_bytes - peer_start_bytes,

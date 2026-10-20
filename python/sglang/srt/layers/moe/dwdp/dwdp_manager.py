@@ -42,9 +42,10 @@ class DwdpManager:
 
             self.device_id = torch.npu.current_device()
             self._backend = NPUBackend(self.device_id, get_parallel().tp_group)
+            self._device_module = torch.npu
         else:
             self.device_id = torch.cuda.current_device()
-        self._device_module = torch.npu if self._backend is not None else torch.cuda
+            self._device_module = torch.cuda
         self.layout: Optional[DwdpExpertLayout] = None
 
         self._weight_manager: Optional[DWDPWeightManager] = None
