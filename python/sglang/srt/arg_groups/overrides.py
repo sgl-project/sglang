@@ -306,6 +306,28 @@ def collect_model_override_declarations(
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
+@_register_for(
+    "MuseSparkForConditionalGeneration",
+)
+def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    overrides: Dict[str, Any] = {}
+    if cfg.enable_tf32_matmul is None:
+        overrides["enable_tf32_matmul"] = True
+        logger.info("Enable TF32 matmul by default for Muse Spark")
+    if cfg.kv_cache_dtype == "auto":
+        logger.info("Use fp8_e4m3 KV cache by default for Muse Spark")
+        overrides["kv_cache_dtype"] = "fp8_e4m3"
+    if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
+        # NaViT shards over the full TP group only, so attention TP narrower
+        # than TP needs the replicated (data-parallel) encoder.
+        logger.info(
+            "Enable the data-parallel mm encoder for Muse Spark under attention DP"
+        )
+        overrides["mm_enable_dp_encoder"] = True
+    return overrides
+
+
 @register_model_override_predicate(
     lambda arch: (
         "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
@@ -362,6 +384,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Qwen3_5ForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
+        "MiniCPMV4_7ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "NemotronH_Omni_Reasoning_V3",
@@ -390,6 +413,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
+        "MiniCPMV4_7ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "BailingMoeV3ForCausalLM",
         "BailingMoeV3VLForConditionalGeneration",
@@ -529,6 +553,7 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
@@ -541,15 +566,21 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    cuda_fp8_unsupported = {"tilelang"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
+    if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
+        return
+    if prefill_backend != "tilelang" or decode_backend != "tilelang":
         raise ValueError(
-            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
-            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
-            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
+            "raw and scaled FP8 KV layouts cannot be mixed."
         )
+    if dcp_size > 1:
+        raise ValueError("CUDA TileLang FP8 KV does not support --dcp-size > 1.")
+
+    import torch
+
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (8, 9):
+        raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
 
 def _check_tilelang_dsa_fp8_kv(
@@ -558,10 +589,11 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    dcp_size: int = 1,
 ) -> None:
     """Backward-compatible entry point for the TileLang DSA validation."""
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
     )
 
 
@@ -586,11 +618,6 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_prefill_backend"] = "intel_xpu"
         if view.dsa_decode_backend is None:
             declared["dsa_decode_backend"] = "intel_xpu"
-        # sgl-kernel topk ops (the default) are CUDA-only; fall back to the
-        # torch-native topk implementation on XPU, unless the user already
-        # picked a different backend explicitly (e.g. "flashinfer").
-        if view.dsa_topk_backend == "sgl-kernel":
-            declared["dsa_topk_backend"] = "torch"
         logger.warning(
             "Set DSA backends for XPU: prefill=%s, decode=%s, topk=%s.",
             declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
@@ -657,11 +684,21 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             declared["dsa_decode_backend"] = backend
         prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
         decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        if (
+            not get_platform().is_hip
+            and kv_cache_dtype == "fp8_e4m3"
+            and "tilelang" in (prefill, decode)
+        ):
+            raise ValueError("CUDA TileLang FP8 KV does not support HiSparse.")
         # The hisparse allow-list in hisparse_hook is platform- but not
         # dtype-aware, so an explicitly requested backend still has to clear the
         # shared backend/kv-cache-dtype rules before this arm returns early.
         _check_dsa_backend_constraints(
-            kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+            kv_cache_dtype,
+            prefill,
+            decode,
+            hip=get_platform().is_hip,
+            dcp_size=getattr(view, "dcp_size", 1) or 1,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -691,7 +728,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill, decode, hip=get_platform().is_hip
+        kv_cache_dtype,
+        prefill,
+        decode,
+        hip=get_platform().is_hip,
+        dcp_size=getattr(view, "dcp_size", 1) or 1,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
@@ -914,10 +955,26 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
 
-    Auto selects MNNVL on Blackwell and TRTLLM on single-node SM90.
+    MiMo defaults to CuTeDSL on Blackwell; other supported models use auto.
     """
-    hf_config = model_config_of(view).hf_config
+    model_config = model_config_of(view)
+    hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
+    is_mimo = model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+    if is_mimo:
+        import torch
+
+        from sglang.srt.layers.flashinfer_mnnvl_cutedsl import SUPPORTED_TP_SIZES
+
+        if not (
+            get_platform().is_sm100
+            and model_config.dtype == torch.bfloat16
+            and view.tp_size in SUPPORTED_TP_SIZES
+            and view.attn_cp_size == 1
+            and not view.encoder_only
+            and not view.enable_pdmux
+        ):
+            return {}
     # V4.1 TP4 uses the custom push plane for decode and fused MoE finalize.
     prefer_custom_dsv41 = (
         getattr(hf_config, "model_type", None) == "deepseek_v41"
@@ -929,7 +986,7 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     )
     if (
         view.flashinfer_allreduce_fusion_backend is None
-        and model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS
+        and (is_mimo or model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS)
         and not prefer_custom_dsv41
         and (get_platform().is_sm90 or get_platform().is_sm100)
         and view.tp_size > 1
@@ -937,10 +994,11 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
+        backend = "cutedsl" if is_mimo else "auto"
         logger.info(
-            f"Auto-enabling FlashInfer AllReduce Fusion on SM90/SM10X for {model_arch}"
+            "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )
-        return {"flashinfer_allreduce_fusion_backend": "auto"}
+        return {"flashinfer_allreduce_fusion_backend": backend}
     return {}
 
 
@@ -1231,6 +1289,11 @@ def _fa4_page_constraint(view: Any) -> dict:
         # page_size==1, so skip the 128 auto-force for it and keep the default.
         and (view.speculative_eagle_topk or 0) <= 1
     ):
+        if (
+            "DiffusionGemmaForBlockDiffusion"
+            in model_config_of(view).hf_config.architectures
+        ):
+            return {"page_size": 1}
         logger.warning(
             f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {view.page_size} to 128."
         )
@@ -1325,7 +1388,7 @@ def _dcp_comm_backend_default(view: Any) -> dict:
         nnodes=view.nnodes,
     ):
         backend = "fi_a2a"
-    elif platform.is_cuda or platform.is_hip:
+    elif platform.is_cuda or platform.is_hip or platform.is_xpu:
         backend = "a2a"
     else:
         backend = "ag_rs"
@@ -1391,22 +1454,30 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
+        use_megamoe_w4a16 = (
+            view.moe_a2a_backend == "flashinfer_megamoe"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
         if not get_platform().is_sm100:
             raise ValueError(
                 "--quantization nvfp4_online is supported only on "
                 "NVIDIA Blackwell SM100/SM103 GPUs."
             )
         if moe_runner_backend == "auto":
-            moe_runner_backend = "flashinfer_trtllm"
+            moe_runner_backend = (
+                "flashinfer_megamoe" if use_megamoe_w4a16 else "flashinfer_trtllm"
+            )
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
             "flashinfer_cutedsl",
-        ]:
+        ] and not (moe_runner_backend == "flashinfer_megamoe" and use_megamoe_w4a16):
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl; "
+                "flashinfer_megamoe requires --moe-a2a-backend flashinfer_megamoe "
+                "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
@@ -1446,11 +1517,11 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
-        and get_platform().is_sm120
+        and (get_platform().is_sm120 or get_platform().is_sm110)
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM120 for "
+            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
             "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
         )
     if moe_runner_backend != view.moe_runner_backend:
@@ -1562,9 +1633,22 @@ def _pipeline_parallel_overlap_disable(view: Any) -> dict:
 def _speculative_moe_runner_default(view: Any) -> dict:
     """Default the speculative (draft) MoE runner backend to the resolved
     target-model backend. Invoked at the head of the speculative-decoding
-    hook, after the MoE kernel chain has resolved."""
+    hook, after the MoE kernel chain has resolved.
+
+    flashinfer_megamoe routes by global expert id inside the mega kernel and
+    only supports the quantized MoE layers it prepared weights for. Draft
+    (MTP/NextN) layers are typically unquantized and run through a regular
+    runner, so inheriting it would mismatch the draft's runner and corrupt
+    expert-id dispatch. Default the draft to flashinfer_trtllm instead; users
+    with a quantized draft can set --speculative-moe-runner-backend explicitly.
+    (DeepGEMM megamoe is selected via the a2a backend and falls back per-layer
+    when its weights are not prepared, so it needs no override.)
+    """
     if view.speculative_moe_runner_backend is None:
-        return {"speculative_moe_runner_backend": view.moe_runner_backend}
+        default = view.moe_runner_backend
+        if default == "flashinfer_megamoe":
+            default = "flashinfer_trtllm"
+        return {"speculative_moe_runner_backend": default}
     return {}
 
 
@@ -1586,6 +1670,12 @@ def _dllm_attention_backend(view: Any) -> dict:
     from sglang.srt.dllm.algorithm import get_algorithm_cls
 
     algorithm_cls = get_algorithm_cls(view.dllm_algorithm)
+    if view.attention_backend in algorithm_cls.supported_attention_backends and all(
+        getattr(view, field, None)
+        in (None, *algorithm_cls.supported_attention_backends)
+        for field in ("prefill_attention_backend", "decode_attention_backend")
+    ):
+        return {}
     if backend := algorithm_cls.required_attention_backend:
         fields = (
             "attention_backend",
@@ -1699,11 +1789,14 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     False for any config the runtime won't post-capture-size, else it gets an
     under-reserved fraction."""
     cfg = resolving_view(server_args)
+    # Logical-page sharding always runs prefill eagerly. This predicate runs
+    # before the sharding hook disables prefill capture, so gate on the feature
+    # itself to retain eager activation headroom in the memory heuristic.
+    if cfg.enable_kv_cache_sharding:
+        return False
+
     mla_enabled = use_mla_backend(server_args)
     if not envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get():
-        return False
-    # Unified arenas are fully backed before capture and cannot resize afterward.
-    if cfg.enable_unified_memory:
         return False
     if cfg.device != "cuda":
         return False
@@ -1725,6 +1818,19 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
+    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
+    model_config = model_config_of(server_args)
+    if cfg.enable_unified_memory:
+        from sglang.srt.configs.hybrid_arch import mambaish_config
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if not model_config.is_hybrid_swa or mambaish_config(model_config) is not None:
+            return False
+        # The solver budgets these independent draft pools again after capture.
+        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
+            return False
+
     if (
         cfg.disaggregation_mode != "prefill"
         and cfg.cuda_graph_config.decode.backend == Backend.DISABLED
@@ -1745,33 +1851,11 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
 
     from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
 
-    hf_config = model_config_of(server_args).hf_config
+    hf_config = model_config.hf_config
     if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
         return False
 
     return True
-
-
-def cutedsl_moe_max_num_tokens(server_args: Any) -> int:
-    """Largest number of tokens a single forward routes through a CuteDSL
-    MoE layer on one (DP) rank. Single source of truth for both the
-    standard-allgather wrapper buffers and the FlashInfer A2A dispatcher
-    budget. Max over the prefill (max_prefill_tokens), piecewise-prefill
-    capture, and decode/verify bounds; num_tokens_per_req is
-    speculative_num_draft_tokens under speculative decoding, else 1.
-    """
-    cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm:
-        num_tokens_per_req = cfg.speculative_num_draft_tokens or 1
-    else:
-        num_tokens_per_req = 1
-    prefill_tokens = cfg.max_prefill_tokens
-    cg_config = cfg.cuda_graph_config
-    if cg_config is not None and cg_config.prefill.backend == Backend.TC_PIECEWISE:
-        prefill_tokens = max(prefill_tokens, cg_config.prefill.max_bs or 0)
-    decode_max_bs = (cg_config.decode.max_bs if cg_config is not None else 0) or 0
-    decode_tokens = decode_max_bs * num_tokens_per_req
-    return max(prefill_tokens, decode_tokens)
 
 
 def max_prefill_buffer_tokens(server_args: Any) -> int:
@@ -1793,6 +1877,17 @@ def max_prefill_buffer_tokens(server_args: Any) -> int:
     if isinstance(server_args, (ResolvedView, ResolvingConfig)):
         record = record_of(server_args)
     return prefill_buffer_ceiling_of(record, tokens)
+
+
+def flashinfer_a2a_max_dispatch_tokens_per_rank(prefill_buffer_tokens: int) -> int:
+    """Per-rank token capacity of the FlashInfer A2A workspace; the allocation
+    and the startup budget check must both read it from here."""
+    configured = envs.SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    if configured is not None:
+        return configured
+    # max_running_requests is unresolved at model construction; 4096 covers the
+    # per-DP-worker cap resolve_max_num_reqs applies, and _dummy_run.
+    return max(prefill_buffer_tokens, 4096)
 
 
 def mamba_cache_chunk_size(server_args: Any) -> int:

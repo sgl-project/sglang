@@ -44,10 +44,19 @@ class DsaGraphVariants:
 
 
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
-    from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        get_dsa_index_topk,
+        is_deepseek_dsa,
+    )
     from sglang.srt.utils import is_hip
 
     if is_hip() and is_deepseek_dsa(hf_config):
+        # KPool has no dense-skip path: both variants run the full indexer.
+        # Capture it once, keeping the regular DSA dense/sparse split intact.
+        if get_dsa_index_kpool(hf_config) > 1:
+            return None
+
         index_topk = get_dsa_index_topk(hf_config)
         logger.info(
             "[dense-decode] DSA dual-graph enabled: capturing "

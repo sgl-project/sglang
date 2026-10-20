@@ -32,13 +32,15 @@ use crate::policies::admission::{
     CandidateDomain, CandidateRange, DecisionReason,
 };
 use crate::policies::buckets::{BucketRequest, BucketSelector};
+use crate::policies::cache_aware::estimate_matched_prefix_tokens;
 use crate::policies::decode::{
     build_decode_policy, resolve_decode_with_capacity_fallback, DecodeSelectionContext,
 };
 use crate::policies::{
-    ExternalPrefixSignal, Policy, PrefillProposal, ProposalKind, SelectionContext,
+    Policy, PrefillProposal, PrefixLookupResult, ProposalKind, SelectionContext,
 };
 use crate::server::metrics::{CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason};
+use crate::state::kv_events::CacheNamespace;
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::workers::Worker;
 
@@ -55,8 +57,12 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub routing_key: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub request_input_tokens: u64,
+    /// The longest single prompt, which bucket limits bound; below
+    /// `request_input_tokens` only for a batch.
+    pub request_sequence_tokens: u64,
     pub request_tokens: Option<&'a [u32]>,
-    pub external_prefix: Option<&'a ExternalPrefixSignal>,
+    pub cache_namespace: &'a CacheNamespace,
+    pub external_prefix: Option<&'a PrefixLookupResult>,
     /// Required whenever `policy.uses_shared_prefill_admission()`; the
     /// per-domain rung panics without it. `Policy::needs_load_snapshot`
     /// defaults to `uses_shared_prefill_admission`, which is what keeps the
@@ -74,6 +80,8 @@ pub(crate) struct PrefillSelectionInputs<'a> {
     pub saturation_queue_floor: Option<u64>,
     /// `--min-load-choices`: sample size for the min-load capacity fallback.
     pub min_load_choices: usize,
+    /// `--route-by-uncached-tokens`.
+    pub route_by_uncached_tokens: bool,
 }
 
 /// The queue-gate blind warn is sampled: it fires on a per-request path, and
@@ -134,16 +142,50 @@ pub(crate) fn select_prefill_worker(
         // Prefill reserves no peak sequence room: the decode peer, not the
         // prefill worker, holds the KV for the tokens still to be generated.
         bucket_request: BucketRequest {
-            input_tokens: inputs.request_input_tokens,
+            input_tokens: inputs.request_sequence_tokens,
             expected_peak_sequence_tokens: None,
             ttft_slo_ms: inputs.ttft_slo_ms,
             tps_slo: inputs.tps_slo,
         },
         failure_reason: PolicySelectionFailureReason::ProposalEmpty,
         cache_gate_audit: None,
+        // E: the input beyond the longest prefix any prefill worker can reuse.
+        // None (cold) when nothing is reusable.
+        uncached_tokens: inputs
+            .route_by_uncached_tokens
+            .then(|| best_reusable_tokens(inputs))
+            .filter(|&reusable| reusable > 0)
+            .map(|reusable| inputs.request_sequence_tokens.saturating_sub(reusable)),
     };
     let selected = selector.run();
     selected.ok_or(selector.failure_reason)
+}
+
+/// Longest prefix, in tokens, that any of the request's prefill workers can reuse.
+fn best_reusable_tokens(inputs: &PrefillSelectionInputs<'_>) -> u64 {
+    let Some(signal) = inputs.external_prefix else {
+        return 0;
+    };
+    let sgl_kv_indexer::PrefixOutcome::Matched { matches, .. } = &signal.outcome else {
+        return 0;
+    };
+    matches
+        .iter()
+        .filter(|entry| {
+            inputs
+                .workers
+                .iter()
+                .any(|worker| worker.url == entry.address)
+        })
+        .map(|entry| {
+            estimate_matched_prefix_tokens(
+                inputs.request_sequence_tokens,
+                signal.query_blocks,
+                entry.matched_prefix_blocks,
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Carries the per-request bucket request and the failure reason across rungs.
@@ -160,6 +202,8 @@ struct Selector<'a> {
     /// resolution at all — no load snapshot, or no candidate proposal — which
     /// reads as a plain miss because nothing was gated out.
     cache_gate_audit: Option<(u64, u64, bool, u32)>,
+    /// `--route-by-uncached-tokens`: E for a request with a reusable prefix.
+    uncached_tokens: Option<u64>,
 }
 
 impl<'a> Selector<'a> {
@@ -177,8 +221,18 @@ impl<'a> Selector<'a> {
             && inputs.policy.is_bucket_affinity_policy()
             && session_affinity_mode != SessionAffinityMode::Bucket;
 
+        // By uncached tokens: a cold request uses every prefill worker, and a warm
+        // one whose buckets all queue while another worker idles spills there.
+        let cold = inputs.route_by_uncached_tokens && self.uncached_tokens.is_none();
+        let idle_spill = self.idle_spill_domains();
+        let uncached_tokens = self.uncached_tokens;
+
         // Cache-Aware resolves one bounded global candidate set and returns a final winner.
-        let cache_winner = self.cache_winner();
+        let cache_winner = if idle_spill.is_some() {
+            None
+        } else {
+            self.cache_winner()
+        };
         let cache_winner_hit = cache_winner.is_some();
 
         let global_affinity_probe = use_global_affinity_probe
@@ -213,10 +267,37 @@ impl<'a> Selector<'a> {
         let selected = cache_winner.or_else(|| {
             // Materializing the normal domains clones the member list of every
             // Bucket, so build them only on the rung that actually reads them.
-            let prefill_domains = || {
-                inputs
+            let prefill_domains = || match (&idle_spill, uncached_tokens) {
+                (Some(domains), _) => domains.clone(),
+                (None, Some(extend)) => {
+                    let domains = inputs.bucket_selector.prefill_domains_for_extend(
+                        inputs.workers,
+                        bucket_request,
+                        extend,
+                    );
+                    if domains.is_empty() {
+                        // No bucket admits E: fall back to input-length matching.
+                        inputs
+                            .bucket_selector
+                            .prefill_domains(inputs.workers, bucket_request)
+                    } else {
+                        domains
+                    }
+                }
+                // Cold: every worker whose bucket admits the request's context.
+                (None, None) if cold => {
+                    let mut admitted: Vec<Arc<Worker>> = inputs
+                        .bucket_selector
+                        .prefill_domains_for_any_extend(inputs.workers, bucket_request)
+                        .into_iter()
+                        .flat_map(|domain| domain.workers)
+                        .collect();
+                    admitted.dedup_by(|a, b| a.id == b.id);
+                    vec![CandidateDomain::global_prefill(&admitted)]
+                }
+                (None, None) => inputs
                     .bucket_selector
-                    .prefill_domains(inputs.workers, bucket_request)
+                    .prefill_domains(inputs.workers, bucket_request),
             };
             if inputs.policy_kind == PolicyKind::CacheAware {
                 // Cache miss or failure retries ordered domains with ordinary P2.
@@ -247,7 +328,11 @@ impl<'a> Selector<'a> {
         if inputs.policy_kind == PolicyKind::CacheAware && !cache_winner_hit && selected.is_some() {
             let (rejected, evaluated, fleet_all_queued, blocks) =
                 self.cache_gate_audit.unwrap_or((0, 0, false, 0));
-            let decision = cache_aware_fallback_decision(rejected, evaluated, fleet_all_queued);
+            let decision = if idle_spill.is_some() {
+                CacheAwareDecision::IdleSpill
+            } else {
+                cache_aware_fallback_decision(rejected, evaluated, fleet_all_queued)
+            };
             if matches!(decision, CacheAwareDecision::CacheWorkerQueued) {
                 // A real diversion: an unqueued destination existed and the
                 // gate gave up `blocks` of matched prefix to reach it. The
@@ -261,7 +346,61 @@ impl<'a> Selector<'a> {
                 .metrics
                 .record_cache_aware_decision(&inputs.model_id.0, decision);
         }
+        if let (true, Some(worker)) = (inputs.route_by_uncached_tokens, &selected) {
+            tracing::debug!(
+                model = %inputs.model_id,
+                input_tokens = bucket_request.input_tokens,
+                uncached_tokens = ?uncached_tokens,
+                route = if idle_spill.is_some() { "idle_spill" } else if cold { "cold" } else { "warm" },
+                selected = %worker.url,
+                "prefill route by uncached tokens",
+            );
+        }
         selected
+    }
+
+    /// Workers of the buckets holding E, when routing by uncached tokens.
+    fn extend_bucket_workers(&self) -> Option<Vec<Arc<Worker>>> {
+        let extend = self.uncached_tokens?;
+        let inputs = self.inputs;
+        let members: Vec<Arc<Worker>> = inputs
+            .bucket_selector
+            .prefill_domains_for_extend(inputs.workers, self.bucket_request, extend)
+            .into_iter()
+            .flat_map(|domain| domain.workers)
+            .collect();
+        // No bucket admits E: the request falls back to input-length matching.
+        (!members.is_empty()).then_some(members)
+    }
+
+    /// When every DP rank in a warm request's buckets has pending prefill: the
+    /// workers with an idle DP rank in the other buckets that admit it.
+    fn idle_spill_domains(&self) -> Option<Vec<CandidateDomain>> {
+        let targets = self.extend_bucket_workers()?;
+        let inputs = self.inputs;
+        let snapshot = inputs.load_snapshot?;
+        if targets.is_empty()
+            || !targets.iter().all(|worker| {
+                snapshot
+                    .fresh_min_rank_pending_for_url(&worker.url)
+                    .is_some_and(|n| n > 0)
+            })
+        {
+            return None;
+        }
+        let domains: Vec<CandidateDomain> = inputs
+            .bucket_selector
+            .prefill_domains_for_any_extend(inputs.workers, self.bucket_request)
+            .into_iter()
+            .filter_map(|mut domain| {
+                domain.workers.retain(|worker| {
+                    snapshot.fresh_min_rank_pending_for_url(&worker.url) == Some(0)
+                        && !targets.iter().any(|target| target.id == worker.id)
+                });
+                (!domain.workers.is_empty()).then_some(domain)
+            })
+            .collect();
+        (!domains.is_empty()).then_some(domains)
     }
 
     /// The per-request `SelectionContext` every rung starts from.
@@ -272,6 +411,7 @@ impl<'a> Selector<'a> {
             .with_candidate_range_id(candidate_range_id)
             .with_input_tokens(inputs.request_input_tokens)
             .with_request_tokens(inputs.request_tokens)
+            .with_cache_namespace(inputs.cache_namespace)
             .with_external_prefix(inputs.external_prefix)
     }
 
@@ -287,12 +427,22 @@ impl<'a> Selector<'a> {
             .base_context(global_range.id)
             .with_load_snapshot(snapshot)
             .with_prefill_cache_bucket(inputs.bucket_selector, bucket_request);
-        let PrefillProposal::CacheCandidates(proposal) = inputs
+        let PrefillProposal::CacheCandidates(mut proposal) = inputs
             .policy
             .propose_prefill(global_range.workers, &cache_ctx)?
         else {
             return None;
         };
+        if let Some(members) = self.extend_bucket_workers() {
+            proposal.candidates.retain(|candidate| {
+                members
+                    .iter()
+                    .any(|worker| worker.id == candidate.worker.id)
+            });
+            if proposal.candidates.is_empty() {
+                return None;
+            }
+        }
         let bounded_candidate_count = proposal.candidates.len();
         // The queue gate reads the engine-published load sample and fails open
         // per worker. When NO worker has a fresh sample the gate is inert
@@ -593,6 +743,8 @@ fn prefill_policy_reason(
 /// per-request facts.
 pub(crate) struct DecodeSelectionInputs<'a> {
     pub decode_policy_kind: DecodePolicyKind,
+    /// Disable for version-group probes so full groups do not count as admissible.
+    pub allow_capacity_fallback: bool,
     pub bucket_selector: &'a BucketSelector,
     /// Names the model in the log lines.
     pub model_id: &'a ModelId,
@@ -601,7 +753,12 @@ pub(crate) struct DecodeSelectionInputs<'a> {
     pub prefill_url: &'a str,
     pub decode_workers: &'a [Arc<Worker>],
     pub request_input_tokens: u64,
+    /// The longest single prompt, which bucket limits bound; below
+    /// `request_input_tokens` only for a batch.
+    pub request_sequence_tokens: u64,
     pub requested_max_output_tokens: Option<u64>,
+    /// Largest per-item input + output bound; unknown if any output budget is unset.
+    pub expected_peak_sequence_tokens: Option<u64>,
     pub ttft_slo_ms: Option<u64>,
     pub tps_slo: Option<f64>,
     /// Required: every rung resolves its proposal against the snapshot, so
@@ -627,17 +784,11 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         inputs.request_input_tokens,
         inputs.requested_max_output_tokens,
     );
-    // Only an explicit output budget justifies reserving peak sequence room;
-    // without one the projection degenerates to the input length and would
-    // bucket every request as if it decoded nothing.
-    let expected_peak_sequence_tokens = inputs
-        .requested_max_output_tokens
-        .map(|_| request_kv_tokens);
     let decode_domains = inputs.bucket_selector.decode_domains(
         inputs.decode_workers,
         BucketRequest {
-            input_tokens: inputs.request_input_tokens,
-            expected_peak_sequence_tokens,
+            input_tokens: inputs.request_sequence_tokens,
+            expected_peak_sequence_tokens: inputs.expected_peak_sequence_tokens,
             ttft_slo_ms: inputs.ttft_slo_ms,
             tps_slo: inputs.tps_slo,
         },
@@ -675,6 +826,9 @@ pub(crate) fn select_decode_peer(inputs: &DecodeSelectionInputs<'_>) -> Option<A
         .iter()
         .find_map(|domain| select_in_domain(domain, false))
         .or_else(|| {
+            if !inputs.allow_capacity_fallback {
+                return None;
+            }
             decode_domains
                 .iter()
                 .find_map(|domain| select_in_domain(domain, true))
@@ -700,12 +854,13 @@ mod tests {
     use crate::policies::buckets::BucketSelector;
     use crate::policies::cache_aware::CacheAwarePolicy;
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
-    use crate::policies::{ExternalPrefixSignal, Policy, ProposalKind, SelectionProposal};
+    use crate::policies::{Policy, PrefixLookupResult, ProposalKind, SelectionProposal};
     use crate::server::metrics::{
         CacheAwareDecision, MetricsRegistry, PolicySelectionFailureReason,
     };
     use crate::state::load_monitor::engine_reported_load::{
-        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
+        EngineReportedLoadSnapshot, EngineReportedLoadTable, EngineReportedSchedulingLoad,
+        LoadStat, NativeCacheRankLoad,
     };
     use crate::workers::Worker;
     use std::sync::Arc;
@@ -717,7 +872,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -778,8 +933,8 @@ mod tests {
     }
 
     /// An indexer hit placing `matched_prefix_blocks` on each named worker.
-    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> ExternalPrefixSignal {
-        ExternalPrefixSignal {
+    fn prefix_signal(matches: &[(&Arc<Worker>, u32)], query_blocks: usize) -> PrefixLookupResult {
+        PrefixLookupResult {
             outcome: sgl_kv_indexer::PrefixOutcome::Matched {
                 matches: matches
                     .iter()
@@ -792,6 +947,7 @@ mod tests {
                 best_prefix_blocks: matches.iter().map(|(_, blocks)| *blocks).max().unwrap_or(0),
             },
             query_blocks,
+            block_hashes: None,
         }
     }
 
@@ -826,13 +982,16 @@ mod tests {
             routing_key: None,
             session_id: None,
             request_input_tokens,
+            request_sequence_tokens: request_input_tokens,
             request_tokens: None,
+            cache_namespace: crate::state::kv_events::CacheNamespace::NONE,
             external_prefix: None,
             load_snapshot,
             workers,
             worker_queue_limit: None,
             saturation_queue_floor: None,
             min_load_choices: 2,
+            route_by_uncached_tokens: false,
             ttft_slo_ms: None,
             tps_slo: None,
             session_affinity_mode: SessionAffinityMode::Bucket,
@@ -848,12 +1007,15 @@ mod tests {
     ) -> DecodeSelectionInputs<'a> {
         DecodeSelectionInputs {
             decode_policy_kind: DecodePolicyKind::PowerOfTwo,
+            allow_capacity_fallback: true,
             bucket_selector,
             model_id,
             prefill_url: "http://prefill:30000",
             decode_workers,
             request_input_tokens,
+            request_sequence_tokens: request_input_tokens,
             requested_max_output_tokens: None,
+            expected_peak_sequence_tokens: None,
             ttft_slo_ms: None,
             tps_slo: None,
             load_snapshot,
@@ -1265,5 +1427,148 @@ mod tests {
             cache_aware_fallback_decision(2, 2, true),
             CacheAwareDecision::AllQueued
         ));
+    }
+
+    /// `short` takes up to 8192 uncached tokens, `long` the rest.
+    fn short_long_buckets(short_max_context: Option<u64>) -> BucketSelector {
+        let config: crate::config::BucketConfig = serde_json::from_value(serde_json::json!({
+            "buckets": [
+                {"id": "short", "stage": "prefill", "rank": 10, "worker_ids": ["short"],
+                 "max_extend_tokens": 8192, "max_context_tokens": short_max_context},
+                {"id": "long", "stage": "prefill", "rank": 20, "worker_ids": ["long"],
+                 "min_extend_tokens": 8193}
+            ]
+        }))
+        .unwrap();
+        BucketSelector::new(Some(config))
+    }
+
+    /// The worker picked for a 20,000-token prompt sampled twice (n = 2), with
+    /// and without `--route-by-uncached-tokens`.
+    fn route_both_ways(
+        short_max_context: Option<u64>,
+        workers: &[Arc<Worker>],
+        loads: &EngineReportedLoadSnapshot,
+        signal: Option<&PrefixLookupResult>,
+        metrics: &MetricsRegistry,
+    ) -> [String; 2] {
+        let policy = CacheAwarePolicy::new(AffinityConfig::default());
+        let buckets = short_long_buckets(short_max_context);
+        let model = ModelId("model".into());
+        [true, false].map(|route_by_uncached_tokens| {
+            let mut inputs = prefill_inputs(
+                &policy,
+                &buckets,
+                metrics,
+                &model,
+                workers,
+                Some(loads),
+                20_000,
+            );
+            inputs.request_input_tokens = 40_000;
+            inputs.policy_kind = PolicyKind::CacheAware;
+            inputs.external_prefix = signal;
+            inputs.route_by_uncached_tokens = route_by_uncached_tokens;
+            select_prefill_worker(&inputs).unwrap().id.0.clone()
+        })
+    }
+
+    #[test]
+    fn routes_prefill_buckets_by_uncached_tokens() {
+        let (short, long) = (worker("short"), worker("long"));
+        let workers = [Arc::clone(&short), Arc::clone(&long)];
+        let metrics = MetricsRegistry::new();
+        // Cold: the less loaded worker, whatever the input-length bucket.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 3, 900_000, 1_000_000)]);
+        assert_eq!(
+            route_both_ways(None, &workers, &loads, None, &metrics),
+            ["short", "long"]
+        );
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 0, 10, 1_000_000)]);
+        // Warm: 15 of 20 blocks reusable on `long` leave E = 5,000, `short`'s bucket.
+        let signal = prefix_signal(&[(&long, 15)], 20);
+        assert_eq!(
+            route_both_ways(None, &workers, &loads, Some(&signal), &metrics),
+            ["short", "long"]
+        );
+        // 10 of 20 blocks leave E = 10,000, `long`'s bucket: n scales the input, not E.
+        let signal = prefix_signal(&[(&long, 10)], 20);
+        assert_eq!(
+            route_both_ways(None, &workers, &loads, Some(&signal), &metrics),
+            ["long", "long"]
+        );
+        // Cold with a context cap: only the buckets that hold the prompt.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 3, 900_000, 1_000_000)]);
+        assert_eq!(
+            route_both_ways(Some(10_000), &workers, &loads, None, &metrics),
+            ["long", "long"]
+        );
+        // Warm, E = 5,000 is in `short`'s extend range, but `short`'s context cap
+        // rejects the prompt and `long` starts at 8,193: fall back to input length.
+        let loads = queued_snapshot(&[(&short, 0, 10, 1_000_000), (&long, 0, 10, 1_000_000)]);
+        let signal = prefix_signal(&[(&long, 15)], 20);
+        assert_eq!(
+            route_both_ways(Some(10_000), &workers, &loads, Some(&signal), &metrics),
+            ["long", "long"]
+        );
+    }
+
+    /// `(waiting requests, uncached tokens still to prefill)` on each DP rank.
+    type RankPending<'a> = &'a [(u64, u64)];
+
+    fn rank_snapshot(entries: &[(&Arc<Worker>, RankPending<'_>)]) -> EngineReportedLoadSnapshot {
+        let table = EngineReportedLoadTable::new();
+        let now = Instant::now();
+        for (worker, ranks) in entries {
+            for (dp_rank, &(waiting, uncached)) in (0..).zip(ranks.iter()) {
+                let load = LoadStat {
+                    num_running_reqs: 1,
+                    num_waiting_reqs: waiting,
+                    num_tokens: 10,
+                    max_total_num_tokens: 1_000_000,
+                    native_cache: Some(NativeCacheRankLoad {
+                        num_waiting_uncached_tokens: uncached,
+                        num_total_tokens: 10,
+                        max_running_requests: 64,
+                        total_prefill_uncached_tokens: 0,
+                        total_prefill_busy_us: 0,
+                    }),
+                };
+                table.set(&worker.url, dp_rank, load, now);
+            }
+        }
+        table.capture_snapshot(now)
+    }
+
+    #[test]
+    fn spills_to_a_worker_with_an_idle_dp_rank() {
+        let (short, long) = (worker("short"), worker("long"));
+        let workers = [Arc::clone(&short), Arc::clone(&long)];
+        let to_long = prefix_signal(&[(&long, 5)], 20); // E = 15,000: `long`'s bucket
+        let to_short = prefix_signal(&[(&short, 15)], 20); // E = 5,000: `short`'s bucket
+        let (busy, idle): (RankPending, RankPending) = (&[(2, 9)], &[(0, 0)]);
+        for (to, long_ranks, short_ranks, short_max_context, expected) in [
+            ("long", busy, &[(3, 9), (0, 0)][..], None, "short"),
+            ("long", busy, &[(3, 9), (1, 9)][..], None, "long"),
+            // Still prefilling a chunked prompt: nothing queued, but not idle.
+            ("long", busy, &[(3, 9), (0, 40_000)][..], None, "long"),
+            // `short`'s context limit does not admit the 20,000-token prompt.
+            ("long", busy, &[(3, 9), (0, 0)][..], Some(10_000), "long"),
+            // `short` spills only when every one of its ranks has pending work.
+            ("short", idle, &[(3, 9), (0, 0)][..], None, "short"),
+            ("short", idle, &[(3, 9), (1, 9)][..], None, "long"),
+        ] {
+            let metrics = MetricsRegistry::new();
+            let loads = rank_snapshot(&[(&long, long_ranks), (&short, short_ranks)]);
+            let signal = if to == "long" { &to_long } else { &to_short };
+            let [picked, _] =
+                route_both_ways(short_max_context, &workers, &loads, Some(signal), &metrics);
+            let spilled = metrics.render().contains("decision=\"idle_spill\"");
+            assert_eq!(
+                (picked.as_str(), spilled),
+                (expected, expected != to),
+                "long {long_ranks:?}, short {short_ranks:?}, short max context {short_max_context:?}"
+            );
+        }
     }
 }

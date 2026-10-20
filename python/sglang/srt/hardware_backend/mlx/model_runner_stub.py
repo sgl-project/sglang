@@ -210,7 +210,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // get_parallel().attn_dp_size
+            requested_per_worker = max(1, requested // get_parallel().attn_dp_size)
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self._explicit_aux_state_size_per_worker()
@@ -296,10 +296,6 @@ class MlxModelRunnerStub(ModelRunner):
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
-                # With the radix cache disabled no tree component exists to
-                # release auxiliary slots, so the pool owns their release
-                # (see MlxAuxiliaryStateReqToTokenPool docstring).
-                owns_auxiliary_state_release=get_memory().disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(

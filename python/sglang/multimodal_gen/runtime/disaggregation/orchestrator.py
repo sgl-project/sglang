@@ -190,6 +190,7 @@ class DiffusionServer:
         self._context = zmq.Context(io_threads=2)
         self._running = False
         self._ready = threading.Event()
+        self._startup_error: Exception | None = None
         self._thread: threading.Thread | None = None
 
         self._pending: dict[str, bytes] = {}  # request_id -> client ZMQ identity
@@ -258,6 +259,8 @@ class DiffusionServer:
     def start(self) -> None:
         if self._running:
             return
+        self._ready.clear()
+        self._startup_error = None
         self._running = True
         self._thread = threading.Thread(
             target=self._event_loop,
@@ -280,8 +283,14 @@ class DiffusionServer:
         )
 
     def wait_ready(self, timeout: float = 30.0) -> bool:
-        """Block until the event loop has bound all sockets, or *timeout* elapses."""
-        return self._ready.wait(timeout=timeout)
+        """Wait for bound sockets, propagating initialization errors to the caller."""
+        if not self._ready.wait(timeout=timeout):
+            return False
+        if self._startup_error is not None:
+            raise RuntimeError(
+                "DiffusionServer failed to bind sockets"
+            ) from self._startup_error
+        return True
 
     def stop(self) -> None:
         self._running = False
@@ -294,8 +303,24 @@ class DiffusionServer:
             )
 
     def _event_loop(self) -> None:
+        try:
+            self._run_event_loop()
+        except Exception as error:
+            self._startup_error = error
+            logger.exception("DiffusionServer socket initialization failed")
+        finally:
+            self._running = False
+            self._context.destroy(linger=0)
+            self._ready.set()
+
+    def _run_event_loop(self) -> None:
+        # Peers connect to the configured endpoints, so never move to another port.
         frontend, _ = get_zmq_socket(
-            self._context, zmq.ROUTER, self._frontend_endpoint, bind=True
+            self._context,
+            zmq.ROUTER,
+            self._frontend_endpoint,
+            bind=True,
+            same_port=True,
         )
 
         encoder_pushes: list[zmq.Socket] = []
@@ -321,13 +346,25 @@ class DiffusionServer:
             decoder_pushes.append(sock)
 
         encoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._encoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._encoder_result_endpoint,
+            bind=True,
+            same_port=True,
         )
         denoiser_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._denoiser_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._denoiser_result_endpoint,
+            bind=True,
+            same_port=True,
         )
         decoder_result_pull, _ = get_zmq_socket(
-            self._context, zmq.PULL, self._decoder_result_endpoint, bind=True
+            self._context,
+            zmq.PULL,
+            self._decoder_result_endpoint,
+            bind=True,
+            same_port=True,
         )
 
         poller = zmq.Poller()
@@ -387,7 +424,6 @@ class DiffusionServer:
         finally:
             for sock in all_sockets:
                 sock.close()
-            self._context.destroy(linger=0)
 
     def _handle_role_result(self, result_pull: zmq.Socket, role: RoleType) -> None:
         try:
@@ -865,8 +901,8 @@ class DiffusionServer:
             if idx is None:
                 break
             entry = self._denoiser_tta.popleft()
-            self._transfer_dispatch_to_denoiser(
-                entry.request_id, entry.transfer_state, idx
+            self._transfer_dispatch_to_receiver(
+                entry.request_id, entry.transfer_state, idx, RoleType.DENOISER
             )
 
     def _drain_decoder_tta(self) -> None:
@@ -877,8 +913,8 @@ class DiffusionServer:
             if idx is None:
                 break
             entry = self._decoder_tta.popleft()
-            self._transfer_dispatch_to_decoder(
-                entry.request_id, entry.transfer_state, idx
+            self._transfer_dispatch_to_receiver(
+                entry.request_id, entry.transfer_state, idx, RoleType.DECODER
             )
 
     def _extract_request_id(self, frames: list) -> str | None:
@@ -1161,36 +1197,57 @@ class DiffusionServer:
         )
         receiver_pushes[receiver_idx].send_multipart(encode_transfer_msg(alloc_msg))
 
-    def _transfer_dispatch_to_denoiser(
-        self, request_id: str, p2p: _TransferRequestState, denoiser_idx: int
+    def _transfer_dispatch_to_receiver(
+        self,
+        request_id: str,
+        p2p: _TransferRequestState,
+        receiver_idx: int,
+        role: RoleType,
     ) -> None:
-        self._denoiser_free_slots[denoiser_idx] -= 1
-        p2p.receiver_instance = denoiser_idx
+        if role == RoleType.DENOISER:
+            free_slots = self._denoiser_free_slots
+            peers = self._denoiser_peers
+            sender_pushes = self._encoder_pushes
+            receiver_pushes = self._denoiser_pushes
+            source_role = "encoder"
+            running_state = RequestState.DENOISING_RUNNING
+        elif role == RoleType.DECODER:
+            free_slots = self._decoder_free_slots
+            peers = self._decoder_peers
+            sender_pushes = self._denoiser_pushes
+            receiver_pushes = self._decoder_pushes
+            source_role = "denoiser"
+            running_state = RequestState.DECODER_RUNNING
+        else:
+            raise ValueError(f"Invalid transfer receiver role: {role}")
+
+        free_slots[receiver_idx] -= 1
+        p2p.receiver_instance = receiver_idx
 
         try:
             self._tracker.transition(
                 request_id,
-                RequestState.DENOISING_RUNNING,
-                denoiser_instance=denoiser_idx,
+                running_state,
+                **{f"{role.value}_instance": receiver_idx},
             )
         except ValueError:
             pass
 
-        peer_info = self._denoiser_peers.get(denoiser_idx, {})
+        peer_info = peers.get(receiver_idx, {})
         if not self._try_fast_path_push(
             request_id=request_id,
             p2p=p2p,
             receiver_peer_info=peer_info,
-            sender_pushes=self._encoder_pushes,
-            receiver_role_label="denoiser",
-            receiver_idx=denoiser_idx,
+            sender_pushes=sender_pushes,
+            receiver_role_label=role.value,
+            receiver_idx=receiver_idx,
         ):
             self._send_slow_path_alloc(
                 request_id=request_id,
                 p2p=p2p,
-                receiver_pushes=self._denoiser_pushes,
-                receiver_idx=denoiser_idx,
-                source_role="encoder",
+                receiver_pushes=receiver_pushes,
+                receiver_idx=receiver_idx,
+                source_role=source_role,
             )
 
     def _handle_transfer_allocated(self, msg: dict) -> None:
@@ -1377,38 +1434,6 @@ class DiffusionServer:
                 self._transfer_return_to_client_from_msg(request_id, msg)
 
             self._transfer_state.pop(request_id, None)
-
-    def _transfer_dispatch_to_decoder(
-        self, request_id: str, p2p: _TransferRequestState, decoder_idx: int
-    ) -> None:
-        self._decoder_free_slots[decoder_idx] -= 1
-        p2p.receiver_instance = decoder_idx
-
-        try:
-            self._tracker.transition(
-                request_id,
-                RequestState.DECODER_RUNNING,
-                decoder_instance=decoder_idx,
-            )
-        except ValueError:
-            pass
-
-        peer_info = self._decoder_peers.get(decoder_idx, {})
-        if not self._try_fast_path_push(
-            request_id=request_id,
-            p2p=p2p,
-            receiver_peer_info=peer_info,
-            sender_pushes=self._denoiser_pushes,
-            receiver_role_label="decoder",
-            receiver_idx=decoder_idx,
-        ):
-            self._send_slow_path_alloc(
-                request_id=request_id,
-                p2p=p2p,
-                receiver_pushes=self._decoder_pushes,
-                receiver_idx=decoder_idx,
-                source_role="denoiser",
-            )
 
     def _transfer_return_to_client_from_msg(self, request_id: str, msg: dict) -> None:
         with self._lock:

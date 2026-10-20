@@ -9,13 +9,8 @@ use thiserror::Error;
 
 pub const X_ROUTER_ERROR_CODE: HeaderName = HeaderName::from_static("x-router-error-code");
 
-/// Carries the worker's *own* HTTP status when the router had to synthesize a
-/// status of its own over a worker that did respond (today: a mid-body drop,
-/// where headers arrived but the body did not). Lets a gateway / operator
-/// recover what the engine actually said instead of seeing only the router's
-/// synthesized 502. Absent on every other response: a forwarded worker response
-/// already carries the worker's status in the status line, and a router-only
-/// condition (no workers, breaker open, ...) has no upstream status to report.
+/// Original worker status when a failed prefill or incomplete body becomes a router 502.
+/// Absent when no upstream response arrived or its status was forwarded unchanged.
 pub const X_ROUTER_UPSTREAM_STATUS: HeaderName =
     HeaderName::from_static("x-router-upstream-status");
 
@@ -54,6 +49,20 @@ impl ErrorClass {
             ErrorClass::Timeout => StatusCode::GATEWAY_TIMEOUT,
             ErrorClass::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+}
+
+/// The inverse of `into_grpc_status`, close to gRPC's HTTP status mapping.
+fn grpc_error_class(code: tonic::Code) -> ErrorClass {
+    use tonic::Code;
+    match code {
+        Code::InvalidArgument | Code::OutOfRange | Code::FailedPrecondition => {
+            ErrorClass::BadRequest
+        }
+        Code::NotFound => ErrorClass::NotFound,
+        Code::ResourceExhausted => ErrorClass::NoTarget,
+        Code::DeadlineExceeded => ErrorClass::Timeout,
+        _ => ErrorClass::Upstream,
     }
 }
 
@@ -102,6 +111,9 @@ pub enum ApiError {
     /// own body).
     #[error("upstream response body incomplete after status {status}")]
     UpstreamStatus { status: StatusCode },
+
+    #[error("prefill failed before KV transfer completed")]
+    PrefillFailed { status: Option<StatusCode> },
 
     /// Wall-clock timeout exceeded while waiting for the upstream worker's
     /// response (per-request `request_timeout`).
@@ -171,6 +183,10 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
+    /// A non-OK status from an engine's gRPC server, relayed to a gRPC client unchanged.
+    #[error("upstream gRPC status: {0}")]
+    UpstreamGrpc(tonic::Status),
+
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -187,7 +203,9 @@ impl ApiError {
             ApiError::SamplingContract { .. } => ErrorClass::BadRequest,
             ApiError::ModelNotFound(_) => ErrorClass::NotFound,
             ApiError::UpstreamUnreachable { .. } => ErrorClass::Upstream,
-            ApiError::UpstreamStatus { .. } => ErrorClass::Upstream,
+            ApiError::UpstreamStatus { .. } | ApiError::PrefillFailed { .. } => {
+                ErrorClass::Upstream
+            }
             ApiError::UpstreamTimeout { .. } => ErrorClass::Timeout,
             ApiError::NoHealthyWorkers { .. } => ErrorClass::NoTarget,
             ApiError::NoPrefillWorkersAvailable { .. } => ErrorClass::NoTarget,
@@ -196,6 +214,7 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => ErrorClass::NoTarget,
             ApiError::BreakerOpen { .. } => ErrorClass::NoTarget,
             ApiError::WorkerMisconfigured { .. } => ErrorClass::NoTarget,
+            ApiError::UpstreamGrpc(status) => grpc_error_class(status.code()),
             ApiError::Internal(_) => ErrorClass::Internal,
         }
     }
@@ -218,6 +237,7 @@ impl ApiError {
             // didn't. We surface a 502 but echo the worker's status in
             // `x-router-upstream-status` (see `into_response`).
             ApiError::UpstreamStatus { .. } => "upstream_body_incomplete",
+            ApiError::PrefillFailed { .. } => "prefill_failed",
             ApiError::UpstreamTimeout { .. } => "upstream_timeout",
             ApiError::NoHealthyWorkers { .. } => "no_healthy_workers",
             ApiError::NoPrefillWorkersAvailable { .. } => "no_prefill_workers_available",
@@ -226,19 +246,21 @@ impl ApiError {
             ApiError::PolicySelectionFailed { .. } => "policy_selection_failed",
             ApiError::BreakerOpen { .. } => "breaker_open",
             ApiError::WorkerMisconfigured { .. } => "worker_misconfigured",
+            ApiError::UpstreamGrpc(_) => "upstream_grpc_status",
             ApiError::Internal(_) => "internal_error",
         }
     }
 
     /// The worker's *own* status to echo in `x-router-upstream-status`, for the
     /// case where the router synthesized its own status over a worker that did
-    /// respond. Today only the mid-body-drop (`UpstreamStatus`) carries one. This
+    /// respond, including a failed prefill or an incomplete response body. This
     /// is an exhaustive, wildcard-free match (not an `if let` at the call site) so
     /// a future "synthesized over a responding worker" variant is forced to decide
     /// whether it echoes a status, rather than silently inheriting `None`.
     fn upstream_status(&self) -> Option<StatusCode> {
         match self {
             ApiError::UpstreamStatus { status } => Some(*status),
+            ApiError::PrefillFailed { status } => *status,
             ApiError::BadRequest(_)
             | ApiError::SamplingContract { .. }
             | ApiError::ModelNotFound(_)
@@ -251,6 +273,7 @@ impl ApiError {
             | ApiError::PolicySelectionFailed { .. }
             | ApiError::BreakerOpen { .. }
             | ApiError::WorkerMisconfigured { .. }
+            | ApiError::UpstreamGrpc(_)
             | ApiError::Internal(_) => None,
         }
     }
@@ -284,9 +307,49 @@ impl IntoResponse for ApiError {
             400..=499 => "invalid_request_error",
             _ => "server_error",
         };
-        // Pick a client-facing message that NEVER leaks worker URLs or raw
-        // source chains; full structured details are logged server-side.
-        let message = match &self {
+        let message = self.client_message();
+        let mut resp = (
+            status,
+            Json(ErrorEnvelope {
+                error: ErrorBody { typ, code, message },
+            }),
+        )
+            .into_response();
+        resp.headers_mut()
+            .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
+        // Preserve the worker's real status when we synthesized our own.
+        if let Some(upstream) = self.upstream_status() {
+            resp.headers_mut().insert(
+                X_ROUTER_UPSTREAM_STATUS,
+                HeaderValue::from(upstream.as_u16()),
+            );
+        }
+        resp
+    }
+}
+
+impl ApiError {
+    /// What a gRPC client receives: an engine's status unchanged, otherwise the
+    /// error's class as a gRPC code, with the HTTP path's message and error code.
+    pub fn into_grpc_status(self) -> tonic::Status {
+        use tonic::Code;
+        if let ApiError::UpstreamGrpc(status) = self {
+            return status;
+        }
+        let code = match self.class() {
+            ErrorClass::BadRequest => Code::InvalidArgument,
+            ErrorClass::NotFound => Code::NotFound,
+            ErrorClass::Upstream | ErrorClass::NoTarget => Code::Unavailable,
+            ErrorClass::Timeout => Code::DeadlineExceeded,
+            ErrorClass::Internal => Code::Internal,
+        };
+        router_grpc_status(code, self.error_code(), self.client_message())
+    }
+
+    /// The client-facing message; never leaks worker URLs or source chains,
+    /// which are logged here instead.
+    fn client_message(&self) -> String {
+        match self {
             ApiError::Internal(e) => {
                 // `{:#}` prints the anyhow chain (top error + sources) — `?e`
                 // would only show the outermost message.
@@ -311,6 +374,7 @@ impl IntoResponse for ApiError {
                 );
                 "upstream response was incomplete".to_string()
             }
+            ApiError::PrefillFailed { .. } => self.to_string(),
             ApiError::UpstreamTimeout { worker } => {
                 tracing::warn!(upstream = %worker, "upstream request timed out");
                 "upstream request timed out".to_string()
@@ -359,27 +423,24 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(_)
             | ApiError::ModelNotFound(_)
             | ApiError::SamplingContract { .. } => self.to_string(),
-        };
-        let mut resp = (
-            status,
-            Json(ErrorEnvelope {
-                error: ErrorBody { typ, code, message },
-            }),
-        )
-            .into_response();
-        resp.headers_mut()
-            .insert(X_ROUTER_ERROR_CODE, HeaderValue::from_static(code));
-        // Preserve the worker's real status when we synthesized our own (today,
-        // only the mid-body-drop case: the worker sent a status, then dropped the
-        // body, so we report a 502 but don't throw away what it said).
-        if let Some(upstream) = self.upstream_status() {
-            resp.headers_mut().insert(
-                X_ROUTER_UPSTREAM_STATUS,
-                HeaderValue::from(upstream.as_u16()),
-            );
+            ApiError::UpstreamGrpc(status) => status.message().to_string(),
         }
-        resp
     }
+}
+
+/// A status the router raises itself; `error_code` travels as `x-router-error-code`,
+/// as it does in the HTTP header.
+pub fn router_grpc_status(
+    code: tonic::Code,
+    error_code: &'static str,
+    message: impl Into<String>,
+) -> tonic::Status {
+    let mut status = tonic::Status::new(code, message);
+    status.metadata_mut().insert(
+        "x-router-error-code",
+        tonic::metadata::MetadataValue::from_static(error_code),
+    );
+    status
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 ---
 title: ERNIE-Image
+description: "Deploy ERNIE-Image and ERNIE-Image-Turbo with SGLang Diffusion."
 metatags:
     description: "Deploy ERNIE-Image and ERNIE-Image-Turbo with SGLang Diffusion."
 ---
@@ -8,7 +9,20 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "standard + Turbo", "single GPU"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/baidu/ernie-image.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [ERNIE-Image](https://huggingface.co/baidu/ERNIE-Image) is Baidu's text-to-image family with separate standard and Turbo checkpoints. The standard model is the quality-oriented path; Turbo is the lower-latency choice, and both load through SGLang's native `ErnieImagePipeline`.
 
@@ -18,16 +32,6 @@ This integration currently targets text-only image generation rather than image 
 | --- | --- | --- |
 | ERNIE-Image | `baidu/ERNIE-Image` | Regular text-to-image checkpoint |
 | ERNIE-Image-Turbo | `baidu/ERNIE-Image-Turbo` | Turbo text-to-image checkpoint |
-
-## 2. Installation
-
-Install SGLang with the diffusion dependencies:
-
-```bash Command
-pip install -e "python[diffusion]"
-```
-
-For full installation options, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
 
 ## 3. Serve the model
 
