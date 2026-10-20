@@ -343,6 +343,8 @@ def test_npu_qwen3_vl_batches_cross_request_image_misses(
     # Qwen3-VL-30B-A3B, the documented NPU deployment target, uses the MoE
     # wrapper while inheriting the same packed-image implementation.
     class Qwen3VLMoeForConditionalGeneration:
+        supports_batched_image_encoding = True
+
         def __init__(self):
             self.calls = []
 
@@ -437,9 +439,15 @@ def test_npu_batching_mode_guards(monkeypatch):
     monkeypatch.setattr(mm_schedule, "_is_xpu", False)
     monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "16384")
     monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
-    owner = type("Qwen3VLForConditionalGeneration", (), {})()
+    owner = type(
+        "Qwen3VLForConditionalGeneration",
+        (),
+        {"supports_batched_image_encoding": True},
+    )()
     encoder = SimpleNamespace(__self__=owner, __name__="get_image_feature")
     assert mm_schedule._can_batch_cross_request_image_misses(encoder)
+    unflagged_encoder = SimpleNamespace(__self__=object(), __name__="get_image_feature")
+    assert not mm_schedule._can_batch_cross_request_image_misses(unflagged_encoder)
     with monkeypatch.context() as m:
         m.delenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES")
         assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
@@ -472,6 +480,8 @@ def test_npu_qwen25_vl_batches_cross_request_image_misses(monkeypatch):
     mm_schedule.init_mm_embedding_cache(1 << 30)
 
     class Qwen2_5_VLForConditionalGeneration:
+        supports_batched_image_encoding = True
+
         def __init__(self):
             self.calls = []
 
@@ -533,6 +543,8 @@ def test_npu_kimi_vl_batches_cross_request_image_misses(monkeypatch):
     mm_schedule.init_mm_embedding_cache(1 << 30)
 
     class KimiVLForConditionalGeneration:
+        supports_batched_image_encoding = True
+
         def __init__(self):
             self.calls = []
 
@@ -594,6 +606,8 @@ def test_npu_glm4v_batches_cross_request_image_misses(monkeypatch):
     mm_schedule.init_mm_embedding_cache(1 << 30)
 
     class Glm4vForConditionalGeneration:
+        supports_batched_image_encoding = True
+
         def __init__(self):
             self.calls = []
 
@@ -708,7 +722,7 @@ def test_npu_minicpmo_batches_cross_request_image_misses(monkeypatch):
     one call for two requests' misses, outputs split back per request."""
 
     class MiniCPMO(_PackedImageFeatureMock):
-        pass
+        supports_batched_image_encoding = True
 
     _run_npu_cross_request_batch_case(monkeypatch, MiniCPMO())
 
@@ -718,7 +732,7 @@ def test_npu_phi4mm_batches_cross_request_image_misses(monkeypatch):
     contract: one call for two requests' misses, split back per request."""
 
     class Phi4MMForCausalLM(_PackedImageFeatureMock):
-        pass
+        supports_batched_image_encoding = True
 
     _run_npu_cross_request_batch_case(monkeypatch, Phi4MMForCausalLM())
 
@@ -728,7 +742,7 @@ def test_npu_janus_pro_batches_cross_request_image_misses(monkeypatch):
     get_image_feature contract: one call for two requests' misses."""
 
     class MultiModalityCausalLM(_PackedImageFeatureMock):
-        pass
+        supports_batched_image_encoding = True
 
     _run_npu_cross_request_batch_case(monkeypatch, MultiModalityCausalLM())
 

@@ -19,17 +19,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
-_NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS = {
-    "Qwen3VLForConditionalGeneration",
-    "Qwen3VLMoeForConditionalGeneration",
-    "Qwen2_5_VLForConditionalGeneration",
-    "Glm4vForConditionalGeneration",
-    "KimiVLForConditionalGeneration",
-    "MiniCPMO",
-    "Phi4MMForCausalLM",
-    "MultiModalityCausalLM",
-}
-
 embedding_cache: Optional[MultiModalStaticCache] = None
 host_offload_event: Optional[torch.cuda.Event] = None
 
@@ -253,7 +242,7 @@ def _can_batch_cross_request_image_misses(
     return (
         owner is not None
         and getattr(data_embedding_func, "__name__", None) == "get_image_feature"
-        and owner.__class__.__name__ in _NPU_CROSS_REQUEST_IMAGE_BATCH_MODELS
+        and getattr(owner, "supports_batched_image_encoding", False)
         and envs.SGLANG_NPU_VIT_MAX_BATCH_PATCHES.get() > 0
         and not envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
         and not getattr(owner, "use_data_parallel", False)

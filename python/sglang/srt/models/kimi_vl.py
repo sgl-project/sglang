@@ -121,6 +121,8 @@ def _language_model_config(config: KimiVLConfig):
 
 
 class KimiVLForConditionalGeneration(nn.Module):
+    supports_batched_image_encoding = True
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         if hf_config.encoder_only:
