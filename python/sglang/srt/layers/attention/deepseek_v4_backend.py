@@ -1200,6 +1200,8 @@ class DSV4Metadata:
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
     q_pad_buffer: Optional[torch.Tensor] = None
+    # Set once a CUDA graph captures q_pad_buffer; it may not grow after that.
+    q_pad_captured: bool = False
 
     # What the candidate-source layer published for the index-source layers after
     # it, in the implementation's own type; never copied from the host.
@@ -1572,6 +1574,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        rows_per_request: int = 1,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1609,6 +1612,7 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            rows_per_request=rows_per_request,
         )
 
     def init_forward_metadata_decode(
@@ -1999,7 +2003,7 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
+        tail_lens = async_h2d(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
             if is_cp_active(forward_batch)
@@ -2039,6 +2043,7 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_req_indices = torch.repeat_interleave(
                 forward_batch.req_pool_indices.to(torch.int64),
                 tail_lens.to(torch.int64),
+                output_size=sum(tail_lens_cpu),
             )
             positions = _tail_rows(
                 forward_batch.positions,
@@ -2407,16 +2412,25 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
+        rows_per_request = 1 if is_ragged else num_draft_tokens
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata,
+                    compress_ratio=1,
+                    rows_per_request=rows_per_request,
+                )
                 if 1 in low
                 else None
             ),
             c2_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata,
+                    compress_ratio=2,
+                    rows_per_request=rows_per_request,
+                )
                 if 2 in low
                 else None
             ),
@@ -4289,7 +4303,7 @@ class DeepseekV4AttnBackend(
                 )
 
                 return swapab_attention(
-                    q[..., :16, :],
+                    q[..., : layer.tp_q_head_num, :],
                     swa_k_cache,
                     swa_page_indices,
                     swa_topk_lengths,
