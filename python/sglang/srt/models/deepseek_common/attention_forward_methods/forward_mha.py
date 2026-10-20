@@ -4,8 +4,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache_paged_dsa,
+)
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -664,7 +666,7 @@ class DeepseekMHAForwardMixin:
         if _use_aiter_gfx95:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw
             # (kv_lora_rank + qk_rope_head_dim) layout, not the scaled 656-byte
-            # layout that dequantize_k_cache_paged expects (it asserts dim==656).
+            # layout that dequantize_k_cache_paged_dsa expects (it asserts dim==656).
             # Dequantize the raw layout via the pool's HIP-aware path instead —
             # the same routine _get_mla_kv_buffer uses for the BF16 MHA path.
             # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
@@ -687,7 +689,7 @@ class DeepseekMHAForwardMixin:
 
         kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
 
-        kv_latent_bf16 = dequantize_k_cache_paged(kv_cache_fp8, kv_indices)
+        kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 
         kv_a = kv_latent_bf16[:, :, : self.kv_lora_rank].squeeze(1).contiguous()
         k_pe = kv_latent_bf16[:, :, self.kv_lora_rank :]

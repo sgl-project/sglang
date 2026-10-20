@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2 import (
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     WanAnimate2TransformerBlock,
+    _InContextLayout,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multistep import (
     DPMSolverMultistepScheduler,
@@ -879,6 +880,45 @@ def test_resize_by_area_treats_the_request_size_as_a_pixel_area_budget(
     assert (out.shape[1], out.shape[0]) == expected_wh
     assert out.shape[0] * out.shape[1] <= 640 * 800
     assert out.shape[0] % 16 == 0 and out.shape[1] % 16 == 0
+
+
+def test_attention_slot_covers_both_grids_when_the_inputs_round_differently():
+    # The reference image and the driving video are each fitted to the budget at their own
+    # aspect ratio (_build_request_state calls resize_by_area once per input), so their
+    # 16-aligned canvases can differ by one step per side with the floor going either
+    # way. At 720x1280 a 1072x592 image lands on 1280x704 and a 538x304 video on 1264x720:
+    # the video grid is one latent row taller and one column narrower and holds more
+    # tokens per frame (79x45 = 3555 > 80x44 = 3520). The in-context layout must size its
+    # per-frame slot for both, or the reference K/V copy overflows.
+    budget = 720 * 1280
+    clip_len = 81
+    image, _ = resize_by_area(np.zeros((592, 1072, 3), np.uint8), budget, divisor=16)
+    video_frame, _ = resize_by_area(
+        np.zeros((304, 538, 3), np.uint8), budget, divisor=16
+    )
+    assert (image.shape[1], image.shape[0]) == (1280, 704)
+    assert (video_frame.shape[1], video_frame.shape[0]) == (1264, 720)
+
+    # Generation grid: the image canvas through the VAE (//8) and the (2, 2) patch (//2);
+    # reference-video grid: the same for the video canvas, one frame fewer (no
+    # reference-image frame), as build_clip_conditioning derives it from the VAE latent.
+    full_clip_grid = generation_token_grid(
+        clip_len, image.shape[0] // 8, image.shape[1] // 8
+    )
+    reference_video_grid = (
+        full_clip_grid[0] - 1,
+        video_frame.shape[0] // 8 // 2,
+        video_frame.shape[1] // 8 // 2,
+    )
+    assert full_clip_grid == (22, 44, 80)
+    assert reference_video_grid == (21, 45, 79)
+
+    layout = _InContextLayout(full_clip_grid, reference_video_grid, full_clip_grid)
+    assert layout.generation_video_tokens_per_frame == 3520
+    assert layout.reference_video_tokens_per_frame == 3555
+    assert layout.max_tokens_per_frame == 3555
+    assert layout.max_tokens_per_frame >= layout.generation_video_tokens_per_frame
+    assert layout.max_tokens_per_frame >= layout.reference_video_tokens_per_frame
 
 
 # build_clip_conditioning: per-clip tensors from the request state with stand-in encoders.
