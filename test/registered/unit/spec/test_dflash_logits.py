@@ -360,6 +360,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         ),
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
         _use_triton_accept_bonus=False,
+        _verify_argmax=lambda logits: torch.argmax(logits, dim=-1),
         block_size=2,
     )
 
@@ -380,6 +381,61 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert out_tokens.tolist() == [[7, 0]]
     assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+
+
+class _FakeTpSync:
+    """Stands in for a TP group whose rank 0 holds ``rank0``'s tensors."""
+
+    def __init__(self, rank0):
+        self.rank0 = list(rank0)
+        self.sites = []
+
+    def sync(self, site, values):
+        self.sites.append(site)
+        assert values.is_contiguous()
+        values.copy_(self.rank0.pop(0))
+        return values
+
+
+def test_selector_draft_is_broadcast_from_rank0():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    rank0_tokens = torch.tensor([[5, 6, 7]])
+    rank0_candidates = torch.tensor([[[5, 1], [6, 2], [7, 3]]])
+    rank0_q = torch.tensor([[[0.6, 0.4], [0.9, 0.1], [0.5, 0.5]]])
+    tp_sync = _FakeTpSync([rank0_tokens, rank0_candidates, rank0_q])
+    worker = SimpleNamespace(
+        _tp_sync=tp_sync,
+        _selector_sample=(
+            torch.tensor([[[5, 1], [6, 2], [7, 3]]]),
+            torch.tensor([[[0.3, 0.7], [0.9, 0.1], [0.5, 0.5]]]),
+        ),
+    )
+
+    draft_next = worker_mod.DFlashWorkerV2._broadcast_selector_draft(
+        worker, torch.tensor([[1, 6, 7]])
+    )
+
+    assert draft_next.tolist() == rank0_tokens.tolist()
+    candidate_ids, q_rows = worker._selector_sample
+    assert candidate_ids.tolist() == rank0_candidates.tolist()
+    torch.testing.assert_close(q_rows, rank0_q)
+    assert tp_sync.sites == [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR] * 3
+
+
+def test_greedy_selector_draft_broadcasts_tokens_only():
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    tp_sync = _FakeTpSync([torch.tensor([[4, 2]])])
+    worker = SimpleNamespace(_tp_sync=tp_sync, _selector_sample=None)
+
+    draft_next = worker_mod.DFlashWorkerV2._broadcast_selector_draft(
+        worker, torch.tensor([[4, 3]])
+    )
+
+    assert draft_next.tolist() == [[4, 2]]
+    assert worker._selector_sample is None
+    assert tp_sync.sites == [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR]
 
 
 def test_grouped_conv_supports_runtime_block_sizes():
