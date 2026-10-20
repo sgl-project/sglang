@@ -150,7 +150,6 @@ export const agentx = {
    "NATS_SERVER": "nats://$NATS_IP:4222"
   },
   {
-   "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
    "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
    "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
    "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT": "1",
@@ -2664,7 +2663,6 @@ export const agentx = {
        "cmd": "python3 -m sglang.launch_server",
        "env": {
         "NCCL_CUMEM_ENABLE": "1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
         "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT": "1",
         "SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS": "1",
@@ -3608,7 +3606,6 @@ export const agentx = {
          "--weight-loader-prefetch-checkpoints": null
         },
         "env": {
-         "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
          "SGLANG_OPT_USE_TOPK_V2": "1",
          "SGLANG_TIMEOUT_KEEP_ALIVE": "900",
          "TORCH_CUDA_ARCH_LIST": "10.0",
@@ -4732,7 +4729,6 @@ export const agentx = {
          "SGLANG_OPT_USE_TOPK_V2": "True",
          "SGLANG_RAGGED_VERIFY_MODE": "static",
          "TRITON_PTXAS_PATH": "/usr/local/cuda/bin/ptxas",
-         "SGLANG_ENABLE_UNIFIED_RADIX_TREE": null,
          "SGLANG_TIMEOUT_KEEP_ALIVE": null
         }
        },
@@ -5272,7 +5268,6 @@ export const agentx = {
        "cmd": "python3 -m sglang.launch_server",
        "env": {
         "NCCL_CUMEM_ENABLE": "1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
         "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT": "1",
         "SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS": "1",
@@ -5474,7 +5469,6 @@ export const agentx = {
          "kind": "sglang-router",
          "cmd": "python3 -m sglang_router.launch_router",
          "env": {
-          "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
           "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
           "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "8320",
           "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT": "1",
@@ -6209,7 +6203,6 @@ export const agentx = {
         "NATS_SERVER": "nats://$NATS_IP:4222",
         "SGLANG_DEFAULT_THINKING": "1",
         "SGLANG_DSV4_REASONING_EFFORT": "high",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
         "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT": "1",
         "SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS": "1",
         "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "1",
