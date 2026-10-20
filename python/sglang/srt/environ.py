@@ -901,6 +901,13 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # Kill switch for the gfx1250 Triton FP8 GEMM tile. On by default wherever
+    # online-quantized FP8 linears run on gfx1250, because hipBLASLt has no
+    # tuned kernel there. Setting this to 1 falls back to the library GEMM,
+    # which on gfx1250 is both slower than BF16 and, under torch.compile,
+    # fails to lower torch._scaled_mm -- so the supported way to turn FP8 off
+    # is to drop --quantization fp8, not this switch.
+    SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
