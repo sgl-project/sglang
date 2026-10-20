@@ -528,6 +528,7 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
@@ -541,7 +542,8 @@ class TreeComponent(ABC):
                     No tombstone — caller will delete the node.
 
         Freed indices are collected into *device_frees*/*host_frees* for the
-        Controller to drain, never freed inline.
+        Controller to drain, never freed inline. Additional cache work is
+        appended to *cache_actions* in the same operation.
 
         Returns (device_freed, host_freed) token counts."""
         ...
@@ -586,6 +588,7 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Return a device leaf, an internal backup request, or no selection.
 
@@ -596,7 +599,9 @@ class TreeComponent(ABC):
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
         )
-        return self._evict_device_next_node(tracker, device_frees, host_frees)
+        return self._evict_device_next_node(
+            tracker, device_frees, host_frees, cache_actions=cache_actions
+        )
 
     def evict_device_end(self) -> None:
         """Clear this component's device-eviction walk state."""
@@ -617,6 +622,7 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> NodeId | InternalStateBackup | None:
         """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
@@ -842,6 +848,7 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict from this component's host-side resources, collecting freed
         values into *device_frees*/*host_frees* for the Controller to drain.

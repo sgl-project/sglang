@@ -174,6 +174,7 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         cd = node.component_data[self.component_type]
@@ -220,6 +221,7 @@ class FullComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> Optional[NodeId]:
         ct = self.component_type
         lv = self._evict_device_last_node
@@ -251,6 +253,7 @@ class FullComponent(TreeComponent):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
@@ -264,7 +267,9 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
-            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+            self.tree_core._evict_host_leaf(
+                x, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
             if (
                 x.parent is not None
                 and x.parent in self.tree_core.evictable_host_leaves

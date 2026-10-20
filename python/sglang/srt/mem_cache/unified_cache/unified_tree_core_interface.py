@@ -23,7 +23,7 @@ class BaseEvictionResult(msgspec.Struct):
     """Base of the eviction step results: the component-keyed device/host
     values the step freed, for the Controller to drain right after the call
     returns, plus `tracker` -- the step's per-component evicted counts for the
-    Controller to accumulate."""
+    Controller to accumulate. Free the values, then drain cache actions."""
 
     device_frees: dict[ComponentType, list[torch.Tensor]] = msgspec.field(
         default_factory=lambda: defaultdict(list)
@@ -34,12 +34,15 @@ class BaseEvictionResult(msgspec.Struct):
     tracker: dict[ComponentType, int] = msgspec.field(
         default_factory=lambda: defaultdict(int)
     )
+    cache_actions: list[CacheAction | ComponentAction] = msgspec.field(
+        default_factory=list
+    )
 
     def __del__(self) -> None:
-        # Drop tripwire: every returned value must be drained before disposal.
-        assert not self.device_frees and not self.host_frees, (
-            "BaseEvictionResult dropped with undrained values"
-        )
+        # Drop tripwire: every returned resource must be drained before disposal.
+        assert (
+            not self.device_frees and not self.host_frees and not self.cache_actions
+        ), "BaseEvictionResult dropped with undrained resources"
 
 
 class EvictDeviceNextNodeResult(BaseEvictionResult):
@@ -548,9 +551,11 @@ class UnifiedTreeCoreInterface(ABC):
         tail_node_id: NodeId,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict shallow Mamba device checkpoints beyond the per-path cap on the
-        tail's root path, collecting freed values into the caller's dicts."""
+        tail's root path, collecting freed values and actions into the caller's
+        buffers. The caller frees values, then drains actions, even on error."""
         ...
 
     # ==== HiCache ====

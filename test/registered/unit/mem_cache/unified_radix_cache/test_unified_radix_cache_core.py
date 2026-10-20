@@ -37,6 +37,9 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
     EvictLayer,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    EvictDeviceLeafResult,
+)
 from sglang.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
     UnifiedLRUList,
@@ -2096,6 +2099,37 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache._apply_cache_action.assert_has_calls(
             [mock.call(first), mock.call(second)]
         )
+
+    def test_eviction_free_failure_still_drains_actions_in_order(self):
+        cache = object.__new__(UnifiedRadixCache)
+        first = UpdatePendingBackupOnNodeSplit(
+            ack_id=1, old_node_id=1, new_node_id=2, new_child_node_id=1
+        )
+        second = UpdatePendingBackupOnNodeSplit(
+            ack_id=2, old_node_id=3, new_node_id=4, new_child_node_id=3
+        )
+        result = EvictDeviceLeafResult()
+        result.cache_actions.extend([first, second])
+        error = RuntimeError("allocator free failed")
+        calls = []
+
+        def fail_free(device_frees, host_frees):
+            calls.append("free")
+            raise error
+
+        cache._free_values = mock.Mock(side_effect=fail_free)
+        cache._apply_cache_action = mock.Mock(side_effect=calls.append)
+        with self.assertRaises(RuntimeError) as raised:
+            cache._apply_eviction_result(result)
+
+        self.assertIs(raised.exception, error)
+        cache._free_values.assert_called_once_with(
+            result.device_frees, result.host_frees
+        )
+        self.assertEqual(calls, ["free", first, second])
+        self.assertFalse(result.cache_actions)
+        cache._apply_cache_actions(result.cache_actions)
+        self.assertEqual(cache._apply_cache_action.call_count, 2)
 
     def test_chained_replace_write_through_requires_list_order(self):
         # A pending node split twice in one walk emits two chained Replaces:

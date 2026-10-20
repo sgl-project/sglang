@@ -876,7 +876,7 @@ def test_stale_handle_operations_raise_key_error_without_poisoning_the_core():
             [live_root, stale_root], live_root, True
         ),
         "evict_excess_path_states": lambda: core.evict_excess_path_states(
-            stale_root, {}, {}
+            stale_root, {}, {}, []
         ),
         "inc_host_lock_ref": lambda: core.inc_host_lock_ref(stale_root),
         "dec_host_lock_ref": lambda: core.dec_host_lock_ref(
@@ -3334,14 +3334,20 @@ def test_python_component_returns_immutable_internal_backup_request(component):
         for ct in cache.tree_components
     }
     tracker, device_frees, host_frees = {component: 0}, {}, {}
+    cache_actions = []
     core.evict_device_start(component, num_tokens)
     try:
         request = cache.components[component].evict_device_next_node(
-            tracker, device_frees, host_frees
+            tracker, device_frees, host_frees, cache_actions
         )
         assert isinstance(request, InternalStateBackup)
         assert (request.node_id, request.num_tokens) == (victim, num_tokens)
-        assert not case.events and not device_frees and not host_frees
+        assert (
+            not case.events
+            and not device_frees
+            and not host_frees
+            and not cache_actions
+        )
         assert tracker == {component: 0}
         for ct, value in original.items():
             assert torch.equal(core.get_component_device_value(victim, ct), value)
@@ -3984,6 +3990,9 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     )
     leaf = inserted.last_device_node
 
+    action = core.build_backup_kv_action(leaf)
+    assert isinstance(action, BackupKV)
+    assert action.node_ids == [leaf]
     snapshot = core.snapshot_buffer_backup(leaf, pass_prefix_keys=True)
     assert snapshot.node_id == leaf
     assert snapshot.parent_is_root
@@ -4008,6 +4017,8 @@ def test_buffer_backup_snapshot_round_trips_and_detects_a_split():
     core.reset()
     assert core.snapshot_buffer_backup(leaf, pass_prefix_keys=True) is None
     assert core.validate_buffer_backup(leaf, len(snapshot.key)) is None
+    with pytest.raises(KeyError):
+        core.build_backup_kv_action(leaf)
 
 
 def test_buffer_backup_snapshot_preserves_bigram_keys():
@@ -4594,7 +4605,11 @@ def test_mamba_path_cap_evicts_excess_states_through_the_adapter():
         a for a in result.cache_actions if isinstance(a, MambaEvictExcessPathStates)
     ]
     device_frees, host_frees = defaultdict(list), defaultdict(list)
-    core.evict_excess_path_states(action.tail_node_id, device_frees, host_frees)
+    cache_actions = []
+    core.evict_excess_path_states(
+        action.tail_node_id, device_frees, host_frees, cache_actions
+    )
+    assert cache_actions == []
     # The two shallow states free; the tail's survives the soft cap.
     assert sorted(t.item() for t in device_frees[ComponentType.MAMBA]) == [7, 8]
     assert host_frees == {}

@@ -889,6 +889,7 @@ pub struct EvictDeviceNextNodeResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    cache_actions: Py<PyList>,
 }
 
 /// Leaf-eviction step result: the backup action for an unbacked
@@ -901,6 +902,7 @@ pub struct EvictDeviceLeafResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    cache_actions: Py<PyList>,
 }
 
 /// Drop-subtree result: whether the drop happened, this step's
@@ -911,6 +913,7 @@ pub struct DropSubtreeResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    cache_actions: Py<PyList>,
 }
 
 /// Demote result: this step's per-component evicted counts and the
@@ -920,6 +923,7 @@ pub struct DemoteResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    cache_actions: Py<PyList>,
 }
 
 /// Python-visible device->storage backup spec.
@@ -1001,6 +1005,7 @@ pub struct HostEvictionResultBinding {
     tracker: HashMap<u8, usize>,
     new_device_frees: Py<PyDict>,
     new_host_frees: Py<PyDict>,
+    cache_actions: Py<PyList>,
 }
 
 impl HostEvictionResultBinding {
@@ -1009,6 +1014,7 @@ impl HostEvictionResultBinding {
             tracker: tracker_to_py(result.tracker),
             new_device_frees: frees_to_py(py, result.device_frees)?,
             new_host_frees: frees_to_py(py, result.host_frees)?,
+            cache_actions: cache_actions_to_py(py, result.cache_actions)?,
         })
     }
 }
@@ -1017,8 +1023,8 @@ type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>, usize
 
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
-struct TreeCoreBinding<K: ChildKeyType> {
-    core: Mutex<UnifiedTreeCore<K>>,
+struct TreeCoreBinding<Core> {
+    core: Mutex<Core>,
     /// The core's construction device, kept outside the Mutex for pre-lock validation.
     device: Device,
     /// The core's page size, kept outside the Mutex for pre-lock validation.
@@ -1026,1753 +1032,1760 @@ struct TreeCoreBinding<K: ChildKeyType> {
 }
 
 // Send + Sync lets detach release the GIL around core calls.
-impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
-    /// Build a tree core for the given component types from the cache's
-    /// init params.
-    fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
-        let component_types = component_types
-            .into_iter()
-            .map(parse_component_type)
-            .collect::<PyResult<Vec<_>>>()?;
-        if component_types != [FULL]
-            && component_types != [FULL, SWA]
-            && component_types != [FULL, MAMBA]
-            && component_types != [FULL, SWA, MAMBA]
-        {
-            return Err(PyValueError::new_err(
-                "only the [Full], [Full, Swa], [Full, Mamba], and [Full, Swa, Mamba] component sets are supported",
-            ));
-        }
-        if component_types.contains(&SWA) && init_params.swa_sliding_window_size.is_none() {
-            return Err(PyValueError::new_err(
-                "the Swa component requires swa_sliding_window_size",
-            ));
-        }
-        if component_types.contains(&MAMBA) && init_params.mamba_cache_chunk_size.is_none() {
-            return Err(PyValueError::new_err(
-                "the Mamba component requires mamba_cache_chunk_size",
-            ));
-        }
-        if init_params.page_size == 0 {
-            return Err(PyValueError::new_err("page_size must be at least 1"));
-        }
-        let eviction_policy = init_params.eviction_policy.to_lowercase();
-        if !matches!(
-            eviction_policy.as_str(),
-            "lru" | "lfu" | "fifo" | "mru" | "filo" | "priority" | "slru" | "tlru"
-        ) {
-            return Err(PyValueError::new_err(format!(
-                "Unknown eviction policy: {eviction_policy}. Supported policies: \
-                 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru'."
-            )));
-        }
-        let params = init_params.to_cache_init_params()?;
-        let device = params.device;
-        let page_size = params.page_size;
-        Ok(TreeCoreBinding {
-            core: Mutex::new(UnifiedTreeCore::new(params, component_types)),
-            device,
-            page_size,
-        })
-    }
+macro_rules! tree_core_methods {
+    ($core:ident) => {
+        impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
+            /// Build a tree core for the given component types from the cache's
+            /// init params.
+            fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
+                let component_types = component_types
+                    .into_iter()
+                    .map(parse_component_type)
+                    .collect::<PyResult<Vec<_>>>()?;
+                let params = init_params.to_cache_init_params()?;
+                $core::<K>::validate_init_params(&params, &component_types)
+                    .map_err(PyValueError::new_err)?;
+                let device = params.device;
+                let page_size = params.page_size;
+                Ok(TreeCoreBinding {
+                    core: Mutex::new($core::new(params, component_types)),
+                    device,
+                    page_size,
+                })
+            }
 
-    /// Lock the core for one adapter call. A panic can leave a mutation half-applied,
-    /// so a poisoned core is never reused.
-    fn core(&self) -> std::sync::MutexGuard<'_, UnifiedTreeCore<K>> {
-        self.core.lock().unwrap_or_else(|_| {
-            panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
-        })
-    }
+            /// Lock the core for one adapter call. A panic can leave a mutation half-applied,
+            /// so a poisoned core is never reused.
+            fn core(&self) -> std::sync::MutexGuard<'_, $core<K>> {
+                self.core.lock().unwrap_or_else(|_| {
+                    panic!("Rust TreeCore mutex poisoned; refusing to reuse state after an earlier panic")
+                })
+            }
 
-    /// Reject an insert value whose dtype, device, or length cannot cover the key.
-    fn validate_insert_value(&self, value: &Tensor, key_atom_len: usize) -> PyResult<()> {
-        if value.kind() != Kind::Int64 {
-            return Err(PyValueError::new_err(format!(
-                "insert value must be an int64 tensor, got {:?}",
-                value.kind()
-            )));
-        }
-        if value.device() != self.device {
-            return Err(PyValueError::new_err(format!(
-                "insert value device {:?} does not match the tree core device {:?}",
-                value.device(),
-                self.device
-            )));
-        }
-        let aligned_key_len = key_atom_len / self.page_size * self.page_size;
-        let value_len = value.size().first().copied().unwrap_or(0);
-        if value_len < aligned_key_len as i64 {
-            return Err(PyValueError::new_err(format!(
-                "insert value length {value_len} is shorter than the aligned key length {aligned_key_len}"
-            )));
-        }
-        Ok(())
-    }
+            /// Reject an insert value whose dtype, device, or length cannot cover the key.
+            fn validate_insert_value(&self, value: &Tensor, key_atom_len: usize) -> PyResult<()> {
+                if value.kind() != Kind::Int64 {
+                    return Err(PyValueError::new_err(format!(
+                        "insert value must be an int64 tensor, got {:?}",
+                        value.kind()
+                    )));
+                }
+                if value.device() != self.device {
+                    return Err(PyValueError::new_err(format!(
+                        "insert value device {:?} does not match the tree core device {:?}",
+                        value.device(),
+                        self.device
+                    )));
+                }
+                let aligned_key_len = key_atom_len / self.page_size * self.page_size;
+                let value_len = value.size().first().copied().unwrap_or(0);
+                if value_len < aligned_key_len as i64 {
+                    return Err(PyValueError::new_err(format!(
+                        "insert value length {value_len} is shorter than the aligned key length {aligned_key_len}"
+                    )));
+                }
+                Ok(())
+            }
 
-    /// Drop the entire tree and reinitialize empty state.
-    fn reset(&self, py: Python<'_>) {
-        py.detach(|| self.core().reset());
-    }
+            /// Drop the entire tree and reinitialize empty state.
+            fn reset(&self, py: Python<'_>) {
+                py.detach(|| self.core().reset());
+            }
 
-    /// Match a key against the tree.
-    fn match_prefix(
-        &self,
-        py: Python<'_>,
-        params: &MatchParamsBinding,
-    ) -> PyResult<MatchResultBinding> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
-        let key = key.as_ref();
-        let params = MatchPrefixParams {
-            key,
-            namespace: KeyNamespaceRef::new(
-                params.extra_key.as_deref(),
-                params.cache_salt.as_deref(),
-            ),
-        };
-        let result = py.detach(|| self.core().match_prefix(&params));
-        MatchResultBinding::from_match_result(py, result)
-    }
+            /// Match a key against the tree.
+            fn match_prefix(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+            ) -> PyResult<MatchResultBinding> {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let key = key.as_ref();
+                let params = MatchPrefixParams {
+                    key,
+                    namespace: KeyNamespaceRef::new(
+                        params.extra_key.as_deref(),
+                        params.cache_salt.as_deref(),
+                    ),
+                };
+                let result = py.detach(|| self.core().match_prefix(&params));
+                MatchResultBinding::from_match_result(py, result)
+            }
 
-    /// Read-only FULL-device match, independent of auxiliary components.
-    fn match_full_device_prefix(
-        &self,
-        py: Python<'_>,
-        params: &MatchParamsBinding,
-    ) -> (usize, NodeId, usize) {
-        let key = K::key_from(Cow::Borrowed(&params.key));
-        let key = key.as_ref();
-        let namespace =
-            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
-        py.detach(|| self.core().match_full_device_prefix(key, namespace))
-    }
+            /// Read-only FULL-device match, independent of auxiliary components.
+            fn match_full_device_prefix(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+            ) -> (usize, NodeId, usize) {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let key = key.as_ref();
+                let namespace =
+                    KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+                py.detach(|| self.core().match_full_device_prefix(key, namespace))
+            }
 
-    fn swa_tombstone_ranges(
-        &self,
-        py: Python<'_>,
-        params: &MatchParamsBinding,
-        start: usize,
-        end: usize,
-    ) -> PyResult<Vec<(usize, usize)>> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
-        let namespace =
-            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
-        py.detach(|| {
-            self.core()
-                .swa_tombstone_ranges(key.as_ref(), namespace, start, end)
-        })
-        .map_err(PyAssertionError::new_err)
-    }
+            fn swa_tombstone_ranges(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+                start: usize,
+                end: usize,
+            ) -> PyResult<Vec<(usize, usize)>> {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let namespace =
+                    KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+                py.detach(|| {
+                    self.core()
+                        .swa_tombstone_ranges(key.as_ref(), namespace, start, end)
+                })
+                .map_err(PyAssertionError::new_err)
+            }
 
-    fn attach_swa_window(
-        &self,
-        py: Python<'_>,
-        params: &MatchParamsBinding,
-        window_start: usize,
-        window_end: usize,
-        swa_values: PyTensor,
-    ) -> PyResult<Py<PyList>> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
-        let namespace =
-            KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
-        let swa_values = swa_values.0;
-        let actions = py
-            .detach(move || {
-                self.core().attach_swa_window(
-                    key.as_ref(),
-                    namespace,
-                    window_start,
-                    window_end,
-                    &swa_values,
-                )
-            })
-            .map_err(PyAssertionError::new_err)?;
-        cache_actions_to_py(py, actions)
-    }
-
-    /// The empty match result anchored at the root.
-    fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
-        let result = py.detach(|| self.core().empty_match_result());
-        MatchResultBinding::from_match_result(py, result)
-    }
-
-    /// Insert device values into the tree per the provided key.
-    fn insert(
-        &self,
-        py: Python<'_>,
-        params: &InsertParamsBinding,
-    ) -> PyResult<InsertResultBinding> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
-        let key = key.as_ref();
-        let value: PyTensor = params.value.bind(py).extract()?;
-        // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
-        self.validate_insert_value(&value.0, key.atom_len())?;
-        let mamba_value = match &params.mamba_value {
-            Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
-            None => None,
-        };
-        let params = InsertParams {
-            rotation_base: params.rotation_base,
-            key,
-            namespace: KeyNamespaceRef::new(
-                params.extra_key.as_deref(),
-                params.cache_salt.as_deref(),
-            ),
-            session_id: params.session_id.as_deref(),
-            value: value.0,
-            mamba_value,
-            prev_prefix_len: params.prev_prefix_len,
-            swa_evicted_seqlen: params.swa_evicted_seqlen,
-            swa_branching_seqlen: params.swa_branching_seqlen,
-            inserted_len: params.inserted_len,
-            priority: params.priority,
-            track_adopted_ranges: params.track_adopted_ranges,
-        };
-        let result = py
-            .detach(move || self.core().try_insert(&params))
-            .map_err(tree_core_runtime_error)?;
-        InsertResultBinding::from_insert_result(py, result)
-    }
-
-    /// Start the resumable insert, running to its first barrier or completion.
-    fn begin_insert(
-        &self,
-        py: Python<'_>,
-        params: &InsertParamsBinding,
-    ) -> PyResult<InsertStepResultBinding> {
-        let key = K::key_from(Cow::Borrowed(&params.key));
-        let key = key.as_ref();
-        let value: PyTensor = params.value.bind(py).extract()?;
-        // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
-        self.validate_insert_value(&value.0, key.atom_len())?;
-        let mamba_value = match &params.mamba_value {
-            Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
-            None => None,
-        };
-        let params = InsertParams {
-            rotation_base: params.rotation_base,
-            key,
-            namespace: KeyNamespaceRef::new(
-                params.extra_key.as_deref(),
-                params.cache_salt.as_deref(),
-            ),
-            session_id: params.session_id.as_deref(),
-            value: value.0,
-            mamba_value,
-            prev_prefix_len: params.prev_prefix_len,
-            swa_evicted_seqlen: params.swa_evicted_seqlen,
-            swa_branching_seqlen: params.swa_branching_seqlen,
-            inserted_len: params.inserted_len,
-            priority: params.priority,
-            track_adopted_ranges: params.track_adopted_ranges,
-        };
-        let step = py
-            .detach(move || self.core().try_begin_insert(&params))
-            .map_err(tree_core_runtime_error)?;
-        InsertStepResultBinding::from_insert_step(py, step)
-    }
-
-    /// Continue the suspended insert after its step actions were applied.
-    fn resume_insert(&self, py: Python<'_>) -> PyResult<InsertStepResultBinding> {
-        let step = py
-            .detach(|| self.core().try_resume_insert())
-            .map_err(tree_core_runtime_error)?;
-        InsertStepResultBinding::from_insert_step(py, step)
-    }
-
-    /// Whether an insert walk is suspended at a barrier.
-    fn has_ongoing_insert(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().has_ongoing_insert())
-    }
-
-    /// Finish the insert (idempotent); returns still-pending actions to drain.
-    fn end_insert(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
-        let actions = py.detach(|| self.core().end_insert());
-        cache_actions_to_py(py, actions)
-    }
-
-    /// Bump the reference count on a node's component locks; the listed
-    /// components are left untaken and recorded in the receipt.
-    fn inc_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        skip_lock_components: Vec<u8>,
-    ) -> PyResult<IncLockRefResultBinding> {
-        let skip = component_set_from_py(&skip_lock_components)?;
-        let result = py
-            .detach(|| self.core().inc_lock_ref(node_id, skip))
-            .map_err(node_access_error)?;
-        Ok(IncLockRefResultBinding::from_result(result))
-    }
-
-    /// Pin only the FULL device values on a node's root path.
-    fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
-        py.detach(|| self.core().inc_full_pin(node_id))
-            .map_err(node_access_error)
-    }
-
-    /// Release a FULL-only root-path pin.
-    fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
-        py.detach(|| self.core().dec_full_pin(node_id))
-            .map_err(node_access_error)
-    }
-
-    /// Decrease the reference count on a node's component locks.
-    fn dec_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        params: &DecLockRefParamsBinding,
-        skip_swa: bool,
-    ) -> PyResult<()> {
-        let params = params.to_dec_lock_ref_params()?;
-        py.detach(|| self.core().dec_lock_ref(node_id, &params, skip_swa))
-            .map_err(node_access_error)?;
-        Ok(())
-    }
-
-    /// Release one window's lock, retaining other component locks.
-    fn dec_window_lock_only(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        params: &DecLockRefParamsBinding,
-    ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-        let component_type = parse_component_type(component_type)?;
-        let params = params.to_dec_lock_ref_params()?;
-        let (device_frees, host_frees) = py
-            .detach(|| {
-                let mut device_frees = HashMap::new();
-                let mut host_frees = HashMap::new();
-                self.core().dec_window_lock_only(
-                    node_id,
-                    component_type,
-                    &params,
-                    &mut device_frees,
-                    &mut host_frees,
-                )?;
-                Ok((device_frees, host_frees))
-            })
-            .map_err(node_access_error)?;
-        Ok((frees_to_py(py, device_frees)?, frees_to_py(py, host_frees)?))
-    }
-
-    /// Early-release the SWA portion of a request's tree lock; returns this
-    /// release's per-component (device_frees, host_frees).
-    fn dec_swa_lock_only(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        params: &DecLockRefParamsBinding,
-    ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
-        let params = params.to_dec_lock_ref_params()?;
-        let (device_frees, host_frees) = py
-            .detach(|| {
-                let mut device_frees = HashMap::new();
-                let mut host_frees = HashMap::new();
-                self.core().dec_swa_lock_only(
-                    node_id,
-                    &params,
-                    &mut device_frees,
-                    &mut host_frees,
-                )?;
-                Ok((device_frees, host_frees))
-            })
-            .map_err(node_access_error)?;
-        Ok((frees_to_py(py, device_frees)?, frees_to_py(py, host_frees)?))
-    }
-
-    /// Adjust the component's reclaimable device size.
-    fn adjust_component_size(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        delta: i64,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .adjust_component_size(node_id, component_type, delta)
-        })
-        .map_err(tree_core_runtime_error)
-    }
-
-    /// Collect paths under one tree lock.
-    fn collect_path_info(
-        &self,
-        py: Python<'_>,
-        end_node_ids: Vec<NodeId>,
-    ) -> PyResult<Vec<Vec<TreePathNodeInfoTuple>>> {
-        let paths = py
-            .detach(|| self.core().collect_path_info(&end_node_ids))
-            .map_err(tree_core_runtime_error)?;
-        Ok(paths
-            .into_iter()
-            .map(|path| {
-                path.into_iter()
-                    .map(|node| {
-                        (
-                            node.node_id,
-                            node.parent_id,
-                            node.path_start,
-                            node.path_end,
-                            node.full_value_len,
-                            node.num_children,
+            fn attach_swa_window(
+                &self,
+                py: Python<'_>,
+                params: &MatchParamsBinding,
+                window_start: usize,
+                window_end: usize,
+                swa_values: PyTensor,
+            ) -> PyResult<Py<PyList>> {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let namespace =
+                    KeyNamespaceRef::new(params.extra_key.as_deref(), params.cache_salt.as_deref());
+                let swa_values = swa_values.0;
+                let actions = py
+                    .detach(move || {
+                        self.core().attach_swa_window(
+                            key.as_ref(),
+                            namespace,
+                            window_start,
+                            window_end,
+                            &swa_values,
                         )
                     })
-                    .collect()
-            })
-            .collect())
-    }
+                    .map_err(PyAssertionError::new_err)?;
+                cache_actions_to_py(py, actions)
+            }
 
-    /// Store a component's device value on a node (the SWA rebuild write-back).
-    fn set_component_device_value(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        value: PyTensor,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        let value = value.0;
-        if value.kind() != Kind::Int64 {
-            return Err(PyValueError::new_err(format!(
-                "component device value must be an int64 tensor, got {:?}",
-                value.kind()
-            )));
-        }
-        if value.device() != self.device {
-            return Err(PyValueError::new_err(format!(
-                "component device value device {:?} does not match the tree core device {:?}",
-                value.device(),
-                self.device
-            )));
-        }
-        py.detach(|| {
-            self.core()
-                .set_component_device_value(node_id, component_type, value)
-        })
-        .map_err(node_access_error)?;
-        Ok(())
-    }
+            /// The empty match result anchored at the root.
+            fn empty_match_result(&self, py: Python<'_>) -> PyResult<MatchResultBinding> {
+                let result = py.detach(|| self.core().empty_match_result());
+                MatchResultBinding::from_match_result(py, result)
+            }
 
-    /// Logical key lengths for the nodes in a load-back transfer.
-    fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
-        py.detach(|| self.core().get_node_key_lengths(&node_ids))
-            .map_err(node_access_error)
-    }
 
-    /// A component's device value on a node, if set.
-    fn get_component_device_value(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<Option<Py<PyAny>>> {
-        let component_type = parse_component_type(component_type)?;
-        let value = py
-            .detach(|| {
-                self.core()
-                    .get_component_device_value(node_id, component_type)
-                    .map(|value| value.map(|tensor| tensor.shallow_clone()))
-            })
-            .map_err(node_access_error)?;
-        value.map(|value| tensor_to_py(py, value)).transpose()
-    }
-
-    // TODO(jialino): batch a full no-backup eviction round in Rust (one crossing
-    // instead of 2N+2); step-wise stays for the write-back interleave.
-    /// Begin a component's device-eviction walk for up to request_cnt tokens.
-    fn evict_device_start(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        request_cnt: usize,
-    ) -> PyResult<()> {
-        let ct = parse_component_type(component_type)?;
-        py.detach(|| self.core().evict_device_start(ct, request_cnt));
-        Ok(())
-    }
-
-    /// Advance one component eviction step. Progress without a leaf can be
-    /// an internal tombstone or a component backup request awaiting its finish;
-    /// no progress means the walk is exhausted.
-    fn evict_device_next_node(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        tracker: HashMap<u8, usize>,
-    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
-        let ct = parse_component_type(component_type)?;
-        let baseline = tracker_from_py(tracker)?;
-        let (node_id, result) =
-            py.detach(move || self.core().evict_device_next_node(ct, &baseline));
-        let made_progress = node_id.is_some()
-            || result.mamba_backup_node_id.is_some()
-            || result.swa_backup_node_id.is_some()
-            || !result.tracker.is_empty()
-            || result.device_frees.values().any(|frees| !frees.is_empty())
-            || result.host_frees.values().any(|frees| !frees.is_empty());
-        Ok(EvictDeviceNextNodeResultBinding {
-            node_id,
-            mamba_backup_node_id: result.mamba_backup_node_id,
-            swa_backup_node_id: result.swa_backup_node_id,
-            swa_backup_num_tokens: result.swa_backup_num_tokens,
-            made_progress,
-            unbacked_tokens: result.unbacked_tokens,
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
-
-    /// Resume a pending internal Mamba tombstone after the host backup attempt.
-    fn finish_mamba_state_eviction(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
-        let result = py.detach(move || self.core().finish_mamba_state_eviction(node_id));
-        self.internal_eviction_finish_to_py(py, result)
-    }
-
-    /// Resume a pending internal SWA tombstone after the host backup attempt.
-    fn finish_swa_state_eviction(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
-        let result = py.detach(move || self.core().finish_swa_state_eviction(node_id));
-        self.internal_eviction_finish_to_py(py, result)
-    }
-
-    fn internal_eviction_finish_to_py(
-        &self,
-        py: Python<'_>,
-        result: EvictionStepResult,
-    ) -> PyResult<EvictDeviceNextNodeResultBinding> {
-        Ok(EvictDeviceNextNodeResultBinding {
-            node_id: None,
-            mamba_backup_node_id: None,
-            swa_backup_node_id: None,
-            swa_backup_num_tokens: 0,
-            // Consuming the pending request advances the finite walk even
-            // when intervening I/O pinned or removed this particular node.
-            made_progress: true,
-            unbacked_tokens: result.unbacked_tokens,
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
-
-    /// Evict one device leaf; an unbacked write-back leaf returns its backup
-    /// action for the caller to execute before demoting.
-    fn evict_device_leaf(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<EvictDeviceLeafResultBinding> {
-        let (backup, result) = py
-            .detach(move || {
-                let mut core = self.core();
-                let is_write_back = core.is_write_back;
-                core.evict_device_leaf(node_id, is_write_back)
-            })
-            .map_err(node_access_error)?;
-        Ok(EvictDeviceLeafResultBinding {
-            unbacked_tokens: result.unbacked_tokens,
-            backup_kv: backup
-                .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
-                .transpose()?,
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
-
-    /// Finish a component's device-eviction walk.
-    fn evict_device_end(&self, py: Python<'_>, component_type: u8) -> PyResult<()> {
-        let ct = parse_component_type(component_type)?;
-        py.detach(|| self.core().evict_device_end(ct));
-        Ok(())
-    }
-
-    /// Verify tree-structure, leaf-set, LRU, size, and ongoing-op invariants;
-    /// ongoing_* args are (id, node_id) pairs.
-    fn sanity_check(
-        &self,
-        py: Python<'_>,
-        ongoing_write_through: Vec<(i64, NodeId)>,
-        ongoing_load_back: Vec<(i64, NodeId)>,
-    ) -> PyResult<()> {
-        py.detach(|| {
-            self.core()
-                .try_sanity_check(&ongoing_write_through, &ongoing_load_back)
-        })
-        .map_err(PyAssertionError::new_err)
-    }
-
-    /// Concatenated FULL device values from from_node up to (exclusive) until_node.
-    fn collect_full_device_indices(
-        &self,
-        py: Python<'_>,
-        from_node_id: NodeId,
-        until_node_id: NodeId,
-    ) -> PyResult<Py<PyAny>> {
-        let value = py
-            .detach(|| {
-                self.core()
-                    .collect_full_device_indices(from_node_id, until_node_id)
-            })
-            .map_err(node_access_error)?;
-        tensor_to_py(py, value)
-    }
-
-    /// Every FULL device value in the tree, concatenated.
-    fn all_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value = py.detach(|| self.core().all_values_flatten());
-        tensor_to_py(py, value)
-    }
-
-    /// Every Mamba device value in the tree, concatenated.
-    fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let value = py.detach(|| self.core().all_mamba_values_flatten());
-        tensor_to_py(py, value)
-    }
-
-    /// Flatten every FULL device slot into (slot, position, prev-slot) rows for the KV-canary sweep.
-    fn walk_for_kv_canary(
-        &self,
-        py: Python<'_>,
-        unlocked_only: bool,
-        swa_resident_only: bool,
-    ) -> PyResult<KvCanaryWalkResultBinding> {
-        let result = py.detach(|| {
-            self.core()
-                .walk_for_kv_canary(unlocked_only, swa_resident_only)
-        });
-        Ok(KvCanaryWalkResultBinding {
-            slot_indices: tensor_to_py(py, Tensor::from_slice(&result.slot_indices))?,
-            positions: tensor_to_py(py, Tensor::from_slice(&result.positions))?,
-            prev_slot_indices: tensor_to_py(py, Tensor::from_slice(&result.prev_slot_indices))?,
-        })
-    }
-
-    /// Evictable token count of the FULL (base) component.
-    fn evictable_size(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.core().evictable_size())
-    }
-
-    /// Protected (locked) token count of the FULL (base) component.
-    fn protected_size(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.core().protected_size())
-    }
-
-    /// FULL component evictable token count.
-    fn full_evictable_size(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.core().full_evictable_size())
-    }
-
-    /// FULL component protected token count.
-    fn full_protected_size(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.core().full_protected_size())
-    }
-
-    /// Evictable token count for one component (0 if the component is absent).
-    fn component_evictable_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
-        let ct = parse_component_type(component_type)?;
-        Ok(py.detach(|| self.core().component_evictable_size(ct)))
-    }
-
-    /// Protected token count for one component (0 if the component is absent).
-    fn component_protected_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
-        let ct = parse_component_type(component_type)?;
-        Ok(py.detach(|| self.core().component_protected_size(ct)))
-    }
-
-    /// (full_tokens, aux_tokens) summed across the whole tree.
-    fn total_size(&self, py: Python<'_>) -> (usize, usize) {
-        py.detach(|| self.core().total_size())
-    }
-
-    /// Whether the node's FULL device value has been evicted.
-    fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.detach(|| self.core().is_full_device_evicted(node_id))
-            .map_err(node_access_error)
-    }
-
-    /// Mark the host tier as buffer-only; wired after the host pools are built.
-    fn set_host_memory_buffer_only(&self, py: Python<'_>) {
-        py.detach(|| self.core().set_host_memory_buffer_only());
-    }
-
-    /// Whether the host tier runs as a storage staging buffer, not a cache.
-    fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().is_host_memory_buffer_only)
-    }
-
-    /// Mark the host tier (HiCache) as wired.
-    fn set_hicache_enabled(&self, py: Python<'_>) {
-        py.detach(|| self.core().set_hicache_enabled());
-    }
-
-    /// Whether the host tier (HiCache) is wired.
-    fn enable_hicache(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().enable_hicache)
-    }
-
-    /// Mark the SWA host pool as wired (HiCache).
-    fn set_has_swa_host_pool(&self, py: Python<'_>) {
-        py.detach(|| self.core().set_has_swa_host_pool());
-    }
-
-    /// Whether the SWA host pool is wired.
-    fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().has_swa_host_pool)
-    }
-
-    /// Insert a host-side (backuped) tree path descending from the given node.
-    fn insert_host(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        extra_key: Option<String>,
-        key: &Bound<'_, PyAny>,
-        host_value: PyTensor,
-        hash_value: Vec<String>,
-        cache_salt: Option<String>,
-    ) -> PyResult<InsertResultBinding> {
-        let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
-        let host_value = host_value.0;
-        if host_value.kind() != Kind::Int64 {
-            return Err(PyValueError::new_err(format!(
-                "insert_host host_value must be an int64 tensor, got {:?}",
-                host_value.kind()
-            )));
-        }
-        let result = py
-            .detach(move || {
-                self.core().insert_host_in_namespace(
-                    node_id,
-                    KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+            /// Insert device values into the tree per the provided key.
+            fn insert(
+                &self,
+                py: Python<'_>,
+                params: &InsertParamsBinding,
+            ) -> PyResult<InsertResultBinding> {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let key = key.as_ref();
+                let value: PyTensor = params.value.bind(py).extract()?;
+                // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
+                self.validate_insert_value(&value.0, key.atom_len())?;
+                let mamba_value = match &params.mamba_value {
+                    Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
+                    None => None,
+                };
+                let params = InsertParams {
+                    rotation_base: params.rotation_base,
                     key,
-                    host_value,
-                    hash_value,
-                )
-            })
-            .map_err(tree_core_runtime_error)?;
-        InsertResultBinding::from_insert_result(py, result)
-    }
+                    namespace: KeyNamespaceRef::new(
+                        params.extra_key.as_deref(),
+                        params.cache_salt.as_deref(),
+                    ),
+                    session_id: params.session_id.as_deref(),
+                    value: value.0,
+                    mamba_value,
+                    prev_prefix_len: params.prev_prefix_len,
+                    swa_evicted_seqlen: params.swa_evicted_seqlen,
+                    swa_branching_seqlen: params.swa_branching_seqlen,
+                    inserted_len: params.inserted_len,
+                    priority: params.priority,
+                    track_adopted_ranges: params.track_adopted_ranges,
+                };
+                let result = py
+                    .detach(move || self.core().try_insert(&params))
+                    .map_err(tree_core_runtime_error)?;
+                InsertResultBinding::from_insert_result(py, result)
+            }
 
-    /// Gather a node's device value plus per-component BACKUP_HOST transfers.
-    fn build_backup_spec(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
-        let (device_value, comp_xfers) = py
-            .detach(|| self.core().build_backup_spec(node_id))
-            .map_err(node_access_error)?;
-        Ok((
-            tensor_to_py(py, device_value)?,
-            comp_xfers_to_py(py, comp_xfers)?,
-        ))
-    }
+            /// Start the resumable insert, running to its first barrier or completion.
+            fn begin_insert(
+                &self,
+                py: Python<'_>,
+                params: &InsertParamsBinding,
+            ) -> PyResult<InsertStepResultBinding> {
+                let key = K::key_from(Cow::Borrowed(&params.key));
+                let key = key.as_ref();
+                let value: PyTensor = params.value.bind(py).extract()?;
+                // The value covers key atoms (bigram: raw len - 1), so validate the converted key.
+                self.validate_insert_value(&value.0, key.atom_len())?;
+                let mamba_value = match &params.mamba_value {
+                    Some(mamba_value) => Some(mamba_value.bind(py).extract::<PyTensor>()?.0),
+                    None => None,
+                };
+                let params = InsertParams {
+                    rotation_base: params.rotation_base,
+                    key,
+                    namespace: KeyNamespaceRef::new(
+                        params.extra_key.as_deref(),
+                        params.cache_salt.as_deref(),
+                    ),
+                    session_id: params.session_id.as_deref(),
+                    value: value.0,
+                    mamba_value,
+                    prev_prefix_len: params.prev_prefix_len,
+                    swa_evicted_seqlen: params.swa_evicted_seqlen,
+                    swa_branching_seqlen: params.swa_branching_seqlen,
+                    inserted_len: params.inserted_len,
+                    priority: params.priority,
+                    track_adopted_ranges: params.track_adopted_ranges,
+                };
+                let step = py
+                    .detach(move || self.core().try_begin_insert(&params))
+                    .map_err(tree_core_runtime_error)?;
+                InsertStepResultBinding::from_insert_step(py, step)
+            }
 
-    /// Gather a node's device->storage backup spec; None if the node is not backuped.
-    fn build_storage_backup_spec(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        pass_prefix_keys: bool,
-    ) -> PyResult<Option<StorageBackupSpecBinding>> {
-        let spec = py
-            .detach(|| {
-                self.core()
-                    .build_storage_backup_spec(node_id, pass_prefix_keys)
-            })
-            .map_err(node_access_error)?;
-        let Some(spec) = spec else {
-            return Ok(None);
-        };
-        let mut token_bytes = Vec::with_capacity(spec.token_ids.len() * 8);
-        for token in &spec.token_ids {
-            token_bytes.extend_from_slice(&token.to_ne_bytes());
-        }
-        Ok(Some(StorageBackupSpecBinding {
-            host_value: tensor_to_py(py, spec.host_value)?,
-            token_ids: PyBytes::new(py, &token_bytes).unbind(),
-            hash_value: spec.hash_value,
-            prefix_keys: spec.prefix_keys,
-            comp_xfers: comp_xfers_to_py(py, spec.comp_xfers)?,
-        }))
-    }
+            /// Continue the suspended insert after its step actions were applied.
+            fn resume_insert(&self, py: Python<'_>) -> PyResult<InsertStepResultBinding> {
+                let step = py
+                    .detach(|| self.core().try_resume_insert())
+                    .map_err(tree_core_runtime_error)?;
+                InsertStepResultBinding::from_insert_step(py, step)
+            }
 
-    /// Route a build_hicache_transfers call to the component for the given type.
-    #[allow(clippy::too_many_arguments)]
-    fn build_hicache_transfers(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        node_id: NodeId,
-        phase: &str,
-        host_indices: Option<PyTensor>,
-        token_ids: Option<Vec<i64>>,
-        prefetch_tokens: usize,
-        staging_tokens: usize,
-        last_hash: Option<String>,
-    ) -> PyResult<Option<Vec<Py<PyAny>>>> {
-        let component_type = parse_component_type(component_type)?;
-        let phase = parse_transfer_phase(phase)?;
-        let host_indices = host_indices.map(|t| t.0);
-        let transfers = py
-            .detach(|| {
-                self.core().build_hicache_transfers(
-                    component_type,
-                    node_id,
-                    phase,
-                    host_indices,
-                    token_ids.as_deref(),
-                    prefetch_tokens,
-                    staging_tokens,
-                    last_hash.as_deref(),
-                )
-            })
-            .map_err(tree_core_assertion_error)?;
-        transfers
-            .map(|transfers| {
-                transfers
-                    .into_iter()
-                    .map(|transfer| transfer_to_py(py, transfer))
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .transpose()
-    }
+            /// Whether an insert walk is suspended at a barrier.
+            fn has_ongoing_insert(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().has_ongoing_insert())
+            }
 
-    /// The anchor node's namespace; None for root-like anchors.
-    fn prefetch_anchor_info(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<(Option<String>, Option<String>)> {
-        py.detach(|| self.core().prefetch_anchor_info(node_id))
-            .map_err(node_access_error)
-    }
+            /// Finish the insert (idempotent); returns still-pending actions to drain.
+            fn end_insert(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+                let actions = py.detach(|| self.core().end_insert());
+                cache_actions_to_py(py, actions)
+            }
 
-    /// Whether the node's Full KV is present on host.
-    fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.detach(|| self.core().node_backuped(node_id))
-            .map_err(node_access_error)
-    }
+            /// Bump the reference count on a node's component locks; the listed
+            /// components are left untaken and recorded in the receipt.
+            fn inc_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                skip_lock_components: Vec<u8>,
+            ) -> PyResult<IncLockRefResultBinding> {
+                let skip = component_set_from_py(&skip_lock_components)?;
+                let result = py
+                    .detach(|| self.core().inc_lock_ref(node_id, skip))
+                    .map_err(node_access_error)?;
+                Ok(IncLockRefResultBinding::from_result(result))
+            }
 
-    /// Whether the node is a (default or named) root.
-    fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.detach(|| self.core().is_root(node_id))
-            .map_err(node_access_error)
-    }
+            /// Pin only the FULL device values on a node's root path.
+            fn inc_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                py.detach(|| self.core().inc_full_pin(node_id))
+                    .map_err(node_access_error)
+            }
 
-    /// The node's last page hash, or None when it was never hashed.
-    fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
-        py.detach(|| self.core().get_last_hash_value(node_id))
-            .map_err(node_access_error)
-    }
+            /// Release a FULL-only root-path pin.
+            fn dec_full_pin(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                py.detach(|| self.core().dec_full_pin(node_id))
+                    .map_err(node_access_error)
+            }
 
-    /// The hash chain of the node's ancestors, in root-to-parent order.
-    fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
-        py.detach(|| self.core().get_prefix_hash_values(node_id))
-            .map_err(node_access_error)
-    }
+            /// Decrease the reference count on a node's component locks.
+            fn dec_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                params: &DecLockRefParamsBinding,
+                skip_swa: bool,
+            ) -> PyResult<()> {
+                let params = params.to_dec_lock_ref_params()?;
+                py.detach(|| self.core().dec_lock_ref(node_id, &params, skip_swa))
+                    .map_err(node_access_error)?;
+                Ok(())
+            }
 
-    fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
-        py.detach(|| self.core().get_hash_values(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn snapshot_buffer_backup(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        pass_prefix_keys: bool,
-    ) -> Option<BufferBackupSnapshotBinding> {
-        py.detach(|| {
-            self.core()
-                .snapshot_buffer_backup(node_id, pass_prefix_keys)
-        })
-        .map(|snapshot| BufferBackupSnapshotBinding::from_snapshot(py, snapshot))
-    }
-
-    fn validate_buffer_backup(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        expected_key_length: usize,
-    ) -> Option<BufferBackupStateBinding> {
-        py.detach(|| {
-            self.core()
-                .validate_buffer_backup(node_id, expected_key_length)
-        })
-        .map(BufferBackupStateBinding::from)
-    }
-
-    /// Hash every node built while storage was disabled.
-    fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.core().backfill_missing_hash_values())
-    }
-
-    fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
-        py.detach(|| self.core().root_node_handle(extra_key.as_deref()))
-    }
-
-    fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
-        py.detach(|| self.core().rotation_base_of(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
-        py.detach(|| self.core().dfs_weight_order(&node_ids))
-            .map_err(node_access_error)
-    }
-
-    /// Commit each component's HiCache transfers; returns the new cache actions.
-    fn commit_hicache_transfers(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        phase: &str,
-        comp_xfers: HashMap<u8, Vec<TransferArgs>>,
-        insert_result: Option<(usize, Option<NodeId>, bool)>,
-        pool_storage_result: Option<(usize, HashMap<String, usize>)>,
-    ) -> PyResult<(Py<PyList>, Option<bool>)> {
-        let phase = parse_transfer_phase(phase)?;
-        let comp_xfers = comp_xfers_from_args(comp_xfers)?;
-        let insert_result =
-            insert_result.map(
-                |(total_len, inserted_host_node, mamba_exist)| InsertResult {
-                    total_len,
-                    inserted_host_node,
-                    mamba_exist,
-                    ..InsertResult::default()
-                },
-            );
-        let pool_storage_result = pool_storage_result
-            .map(|(kv_hit_pages, extra_pool_hit_pages)| {
-                Ok::<_, PyErr>(PoolTransferResult {
-                    kv_hit_pages,
-                    extra_pool_hit_pages: extra_pool_hit_pages
-                        .into_iter()
-                        .map(|(name, pages)| Ok((parse_pool_name(&name)?, pages)))
-                        .collect::<PyResult<HashMap<_, _>>>()?,
-                })
-            })
-            .transpose()?;
-        let (cache_actions, mamba_exist) = py
-            .detach(move || {
-                let mut cache_actions = Vec::new();
-                let mut insert_result = insert_result;
-                self.core().commit_hicache_transfers(
-                    node_id,
-                    phase,
-                    comp_xfers,
-                    &mut cache_actions,
-                    insert_result.as_mut(),
-                    pool_storage_result.as_ref(),
-                )?;
+            /// Release one window's lock, retaining other component locks.
+            fn dec_window_lock_only(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                params: &DecLockRefParamsBinding,
+            ) -> PyResult<(Py<PyDict>, Py<PyDict>, Py<PyList>)> {
+                let component_type = parse_component_type(component_type)?;
+                let params = params.to_dec_lock_ref_params()?;
+                let (device_frees, host_frees, cache_actions) = py
+                    .detach(|| {
+                        let mut device_frees = HashMap::new();
+                        let mut host_frees = HashMap::new();
+                        let mut cache_actions = Vec::new();
+                        self.core().dec_window_lock_only(
+                            node_id,
+                            component_type,
+                            &params,
+                            &mut device_frees,
+                            &mut host_frees,
+                            &mut cache_actions,
+                        )?;
+                        Ok((device_frees, host_frees, cache_actions))
+                    })
+                    .map_err(node_access_error)?;
                 Ok((
-                    cache_actions,
-                    insert_result.map(|result| result.mamba_exist),
+                    frees_to_py(py, device_frees)?,
+                    frees_to_py(py, host_frees)?,
+                    cache_actions_to_py(py, cache_actions)?,
                 ))
-            })
-            .map_err(node_access_error)?;
-        Ok((cache_actions_to_py(py, cache_actions)?, mamba_exist))
-    }
+            }
 
-    /// Commit a successful backup to the node.
-    fn commit_backup(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        host_indices: PyTensor,
-        comp_xfers: HashMap<u8, Vec<TransferArgs>>,
-    ) -> PyResult<()> {
-        let comp_xfers = comp_xfers_from_args(comp_xfers)?;
-        let host_indices = host_indices.0;
-        py.detach(move || self.core().commit_backup(node_id, host_indices, comp_xfers))
-            .map_err(node_access_error)?;
-        Ok(())
-    }
+            /// Early-release the SWA portion of a request's tree lock; returns this
+            /// release's per-component frees and cache actions.
+            fn dec_swa_lock_only(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                params: &DecLockRefParamsBinding,
+            ) -> PyResult<(Py<PyDict>, Py<PyDict>, Py<PyList>)> {
+                let params = params.to_dec_lock_ref_params()?;
+                let (device_frees, host_frees, cache_actions) = py
+                    .detach(|| {
+                        let mut device_frees = HashMap::new();
+                        let mut host_frees = HashMap::new();
+                        let mut cache_actions = Vec::new();
+                        self.core().dec_swa_lock_only(
+                            node_id,
+                            &params,
+                            &mut device_frees,
+                            &mut host_frees,
+                            &mut cache_actions,
+                        )?;
+                        Ok((device_frees, host_frees, cache_actions))
+                    })
+                    .map_err(node_access_error)?;
+                Ok((
+                    frees_to_py(py, device_frees)?,
+                    frees_to_py(py, host_frees)?,
+                    cache_actions_to_py(py, cache_actions)?,
+                ))
+            }
 
-    /// Build the H->D load-back KV transfer plus per-component aux transfers.
-    fn build_load_back_spec(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        mamba_pool_idx: Option<PyTensor>,
-    ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
-        let req = Req {
-            mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
-        };
-        let (kv_xfer, comp_xfers) = py
-            .detach(move || self.core().build_load_back_spec(node_id, Some(&req)))
-            .map_err(tree_core_assertion_error)?;
-        Ok((
-            transfer_to_py(py, kv_xfer)?,
-            comp_xfers_to_py(py, comp_xfers)?,
-        ))
-    }
+            /// Adjust the component's reclaimable device size.
+            fn adjust_component_size(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                delta: i64,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .adjust_component_size(node_id, component_type, delta)
+                })
+                .map_err(tree_core_runtime_error)
+            }
 
-    /// Commit a successful H->D load-back onto the node; returns its actions.
-    fn commit_load_back(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        device_indices: PyTensor,
-        kv_xfer: TransferArgs,
-        comp_xfers: HashMap<u8, Vec<TransferArgs>>,
-    ) -> PyResult<Py<PyList>> {
-        let kv_xfer = transfer_from_args(kv_xfer)?;
-        let comp_xfers = comp_xfers_from_args(comp_xfers)?;
-        let device_indices = device_indices.0;
-        let actions = py
-            .detach(move || {
-                self.core()
-                    .commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
-            })
-            .map_err(node_access_error)?;
-        cache_actions_to_py(py, actions)
-    }
+            /// Collect paths under one tree lock.
+            fn collect_path_info(
+                &self,
+                py: Python<'_>,
+                end_node_ids: Vec<NodeId>,
+            ) -> PyResult<Vec<Vec<TreePathNodeInfoTuple>>> {
+                let paths = py
+                    .detach(|| self.core().collect_path_info(&end_node_ids))
+                    .map_err(tree_core_runtime_error)?;
+                Ok(paths
+                    .into_iter()
+                    .map(|path| {
+                        path.into_iter()
+                            .map(|node| {
+                                (
+                                    node.node_id,
+                                    node.parent_id,
+                                    node.path_start,
+                                    node.path_end,
+                                    node.full_value_len,
+                                    node.num_children,
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect())
+            }
 
-    /// Release a node's device KV once its host copy exists.
-    fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
-        let result = py
-            .detach(move || self.core().demote(node_id))
-            .map_err(tree_core_assertion_error)?;
-        Ok(DemoteResultBinding {
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
+            /// Store a component's device value on a node (the SWA rebuild write-back).
+            fn set_component_device_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                value: PyTensor,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                let value = value.0;
+                if value.kind() != Kind::Int64 {
+                    return Err(PyValueError::new_err(format!(
+                        "component device value must be an int64 tensor, got {:?}",
+                        value.kind()
+                    )));
+                }
+                if value.device() != self.device {
+                    return Err(PyValueError::new_err(format!(
+                        "component device value device {:?} does not match the tree core device {:?}",
+                        value.device(),
+                        self.device
+                    )));
+                }
+                py.detach(|| {
+                    self.core()
+                        .set_component_device_value(node_id, component_type, value)
+                })
+                .map_err(node_access_error)?;
+                Ok(())
+            }
 
-    /// Evict up to num_tokens of one component's host resources.
-    fn drive_host_eviction(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        num_tokens: usize,
-        skip_full_duplicate_reclaim: bool,
-    ) -> PyResult<HostEvictionResultBinding> {
-        let ct = parse_component_type(component_type)?;
-        let result = py.detach(move || {
-            self.core().drive_host_eviction_with_options(
-                ct,
-                num_tokens,
-                skip_full_duplicate_reclaim,
-            )
-        });
-        Ok(HostEvictionResultBinding {
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
+            /// Logical key lengths for the nodes in a load-back transfer.
+            fn get_node_key_lengths(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+                py.detach(|| self.core().get_node_key_lengths(&node_ids))
+                    .map_err(node_access_error)
+            }
 
-    /// Evict shallow Mamba device checkpoints beyond the per-path cap on the
-    /// tail's root path; returns the step's freed tensors.
-    fn evict_excess_path_states(
-        &self,
-        py: Python<'_>,
-        tail_node_id: NodeId,
-    ) -> PyResult<HostEvictionResultBinding> {
-        let result = py
-            .detach(move || self.core().evict_excess_path_states(tail_node_id))
-            .map_err(node_access_error)?;
-        Ok(HostEvictionResultBinding {
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
+            /// A component's device value on a node, if set.
+            fn get_component_device_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<Py<PyAny>>> {
+                let component_type = parse_component_type(component_type)?;
+                let value = py
+                    .detach(|| {
+                        self.core()
+                            .get_component_device_value(node_id, component_type)
+                            .map(|value| value.map(|tensor| tensor.shallow_clone()))
+                    })
+                    .map_err(node_access_error)?;
+                value.map(|value| tensor_to_py(py, value)).transpose()
+            }
 
-    /// Bump the reference count on a node's host-side component locks.
-    fn inc_host_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<IncLockRefResultBinding> {
-        let result = py
-            .detach(|| self.core().inc_host_lock_ref(node_id))
-            .map_err(node_access_error)?;
-        Ok(IncLockRefResultBinding::from_result(result))
-    }
+            // TODO(jialino): batch a full no-backup eviction round in Rust (one crossing
+            // instead of 2N+2); step-wise stays for the write-back interleave.
+            /// Begin a component's device-eviction walk for up to request_cnt tokens.
+            fn evict_device_start(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                request_cnt: usize,
+            ) -> PyResult<()> {
+                let ct = parse_component_type(component_type)?;
+                py.detach(|| self.core().evict_device_start(ct, request_cnt));
+                Ok(())
+            }
 
-    /// Decrease the reference count on a node's host-side component locks.
-    fn dec_host_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        params: &DecLockRefParamsBinding,
-    ) -> PyResult<()> {
-        let params = params.to_dec_lock_ref_params()?;
-        py.detach(|| self.core().dec_host_lock_ref(node_id, &params))
-            .map_err(node_access_error)?;
-        Ok(())
-    }
+            /// Advance one component eviction step. Progress without a leaf can be
+            /// an internal tombstone or a component backup request awaiting its finish;
+            /// no progress means the walk is exhausted.
+            fn evict_device_next_node(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                tracker: HashMap<u8, usize>,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                let ct = parse_component_type(component_type)?;
+                let baseline = tracker_from_py(tracker)?;
+                let (node_id, result) =
+                    py.detach(move || self.core().evict_device_next_node(ct, &baseline));
+                let made_progress = node_id.is_some()
+                    || result.mamba_backup_node_id.is_some()
+                    || result.swa_backup_node_id.is_some()
+                    || !result.tracker.is_empty()
+                    || result.device_frees.values().any(|frees| !frees.is_empty())
+                    || result.host_frees.values().any(|frees| !frees.is_empty())
+                    || !result.cache_actions.is_empty();
+                Ok(EvictDeviceNextNodeResultBinding {
+                    node_id,
+                    mamba_backup_node_id: result.mamba_backup_node_id,
+                    swa_backup_node_id: result.swa_backup_node_id,
+                    swa_backup_num_tokens: result.swa_backup_num_tokens,
+                    made_progress,
+                    unbacked_tokens: result.unbacked_tokens,
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
 
-    fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().is_write_through_compatible())
-    }
+            /// Resume a pending internal Mamba tombstone after the host backup attempt.
+            fn finish_mamba_state_eviction(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                let result = py.detach(move || self.core().finish_mamba_state_eviction(node_id));
+                self.internal_eviction_finish_to_py(py, result)
+            }
 
-    /// Set the write-back (vs write-through) policy; decided at HiCache init.
-    fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
-        py.detach(|| self.core().is_write_back = is_write_back);
-    }
+            /// Resume a pending internal SWA tombstone after the host backup attempt.
+            fn finish_swa_state_eviction(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                let result = py.detach(move || self.core().finish_swa_state_eviction(node_id));
+                self.internal_eviction_finish_to_py(py, result)
+            }
 
-    /// The current write-back (vs write-through) policy.
-    fn is_write_back(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().is_write_back)
-    }
+            fn internal_eviction_finish_to_py(
+                &self,
+                py: Python<'_>,
+                result: EvictionStepResult,
+            ) -> PyResult<EvictDeviceNextNodeResultBinding> {
+                Ok(EvictDeviceNextNodeResultBinding {
+                    node_id: None,
+                    mamba_backup_node_id: None,
+                    swa_backup_node_id: None,
+                    swa_backup_num_tokens: 0,
+                    // Consuming the pending request advances the finite walk even
+                    // when intervening I/O pinned or removed this particular node.
+                    made_progress: true,
+                    unbacked_tokens: result.unbacked_tokens,
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
 
-    /// Set the write-through backup hit threshold; decided at HiCache init.
-    fn set_write_through_threshold(&self, py: Python<'_>, threshold: i64) {
-        py.detach(|| self.core().write_through_threshold = threshold);
-    }
+            /// Evict one device leaf; an unbacked write-back leaf returns its backup
+            /// action for the caller to execute before demoting.
+            fn evict_device_leaf(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<EvictDeviceLeafResultBinding> {
+                let (backup, result) = py
+                    .detach(move || {
+                        let mut core = self.core();
+                        let is_write_back = core.is_write_back();
+                        core.evict_device_leaf(node_id, is_write_back)
+                    })
+                    .map_err(node_access_error)?;
+                Ok(EvictDeviceLeafResultBinding {
+                    unbacked_tokens: result.unbacked_tokens,
+                    backup_kv: backup
+                        .map(|backup| cache_action_to_py(py, CacheAction::BackupKV(backup)))
+                        .transpose()?,
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
 
-    /// The current write-through backup hit threshold.
-    fn write_through_threshold(&self, py: Python<'_>) -> i64 {
-        py.detach(|| self.core().write_through_threshold)
-    }
+            /// Finish a component's device-eviction walk.
+            fn evict_device_end(&self, py: Python<'_>, component_type: u8) -> PyResult<()> {
+                let ct = parse_component_type(component_type)?;
+                py.detach(|| self.core().evict_device_end(ct));
+                Ok(())
+            }
 
-    /// Mark the storage tier (L3) wired; storage attaches after tree construction.
-    fn set_enable_storage(&self, py: Python<'_>, value: bool) {
-        py.detach(|| self.core().set_enable_storage(value));
-    }
+            /// Verify tree-structure, leaf-set, LRU, size, and ongoing-op invariants;
+            /// ongoing_* args are (id, node_id) pairs.
+            fn sanity_check(
+                &self,
+                py: Python<'_>,
+                ongoing_write_through: Vec<(i64, NodeId)>,
+                ongoing_load_back: Vec<(i64, NodeId)>,
+            ) -> PyResult<()> {
+                py.detach(|| {
+                    self.core()
+                        .try_sanity_check(&ongoing_write_through, &ongoing_load_back)
+                })
+                .map_err(PyAssertionError::new_err)
+            }
 
-    /// Whether the storage tier (L3) is wired.
-    fn enable_storage(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().enable_storage)
-    }
+            /// Concatenated FULL device values from from_node up to (exclusive) until_node.
+            fn collect_full_device_indices(
+                &self,
+                py: Python<'_>,
+                from_node_id: NodeId,
+                until_node_id: NodeId,
+            ) -> PyResult<Py<PyAny>> {
+                let value = py
+                    .detach(|| {
+                        self.core()
+                            .collect_full_device_indices(from_node_id, until_node_id)
+                    })
+                    .map_err(node_access_error)?;
+                tensor_to_py(py, value)
+            }
 
-    /// Enable or disable the direct external-cache linker.
-    fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
-        py.detach(|| self.core().set_enable_external_cache_linker(value))
-            .map_err(tree_core_assertion_error)
-    }
+            /// Every FULL device value in the tree, concatenated.
+            fn all_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                let value = py.detach(|| self.core().all_values_flatten());
+                tensor_to_py(py, value)
+            }
 
-    /// Whether the direct external-cache linker is wired.
-    fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
-        py.detach(|| self.core().enable_external_cache_linker)
-    }
+            /// Every Mamba device value in the tree, concatenated.
+            fn all_mamba_values_flatten(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+                let value = py.detach(|| self.core().all_mamba_values_flatten());
+                tensor_to_py(py, value)
+            }
 
-    /// Queue the all-cleared placement event.
-    fn record_all_cleared_event(&self, py: Python<'_>) {
-        py.detach(|| self.core().record_all_cleared_event());
-    }
+            /// Flatten every FULL device slot into (slot, position, prev-slot) rows for the KV-canary sweep.
+            fn walk_for_kv_canary(
+                &self,
+                py: Python<'_>,
+                unlocked_only: bool,
+                swa_resident_only: bool,
+            ) -> PyResult<KvCanaryWalkResultBinding> {
+                let result = py.detach(|| {
+                    self.core()
+                        .walk_for_kv_canary(unlocked_only, swa_resident_only)
+                });
+                Ok(KvCanaryWalkResultBinding {
+                    slot_indices: tensor_to_py(py, Tensor::from_slice(&result.slot_indices))?,
+                    positions: tensor_to_py(py, Tensor::from_slice(&result.positions))?,
+                    prev_slot_indices: tensor_to_py(py, Tensor::from_slice(&result.prev_slot_indices))?,
+                })
+            }
 
-    /// Drain the queued placement events as tagged tuples.
-    fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>>
-    where
-        for<'py> Vec<K::Atom>: IntoPyObject<'py>,
-    {
-        let events = py.detach(|| self.core().take_events());
-        let list = PyList::empty(py);
-        for event in events {
-            match event {
-                KvCacheEvent::BlockStored {
-                    block_hashes,
-                    parent_block_hash,
-                    token_ids,
-                    block_size,
-                    medium,
-                    cache_salt,
-                    session_id,
-                    extra_key,
-                } => {
-                    let item: Py<PyAny> = (
-                        "block_stored",
-                        block_hashes,
-                        parent_block_hash,
-                        token_ids,
-                        block_size,
-                        medium.as_str(),
-                        cache_salt.map(|salt| salt.to_string()),
-                        session_id.map(|session_id| session_id.to_string()),
-                        extra_key.map(|extra_key| extra_key.to_string()),
+            /// Evictable token count of the FULL (base) component.
+            fn evictable_size(&self, py: Python<'_>) -> usize {
+                py.detach(|| self.core().evictable_size())
+            }
+
+            /// Protected (locked) token count of the FULL (base) component.
+            fn protected_size(&self, py: Python<'_>) -> usize {
+                py.detach(|| self.core().protected_size())
+            }
+
+            /// FULL component evictable token count.
+            fn full_evictable_size(&self, py: Python<'_>) -> usize {
+                py.detach(|| self.core().full_evictable_size())
+            }
+
+            /// FULL component protected token count.
+            fn full_protected_size(&self, py: Python<'_>) -> usize {
+                py.detach(|| self.core().full_protected_size())
+            }
+
+            /// Evictable token count for one component (0 if the component is absent).
+            fn component_evictable_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(|| self.core().component_evictable_size(ct)))
+            }
+
+            /// Protected token count for one component (0 if the component is absent).
+            fn component_protected_size(&self, py: Python<'_>, component_type: u8) -> PyResult<usize> {
+                let ct = parse_component_type(component_type)?;
+                Ok(py.detach(|| self.core().component_protected_size(ct)))
+            }
+
+            /// (full_tokens, aux_tokens) summed across the whole tree.
+            fn total_size(&self, py: Python<'_>) -> (usize, usize) {
+                py.detach(|| self.core().total_size())
+            }
+
+            /// Whether the node's FULL device value has been evicted.
+            fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().is_full_device_evicted(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Mark the host tier as buffer-only; wired after the host pools are built.
+            fn set_host_memory_buffer_only(&self, py: Python<'_>) {
+                py.detach(|| self.core().set_host_memory_buffer_only());
+            }
+
+            /// Whether the host tier runs as a storage staging buffer, not a cache.
+            fn is_host_memory_buffer_only(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().is_host_memory_buffer_only())
+            }
+
+            /// Mark the host tier (HiCache) as wired.
+            fn set_hicache_enabled(&self, py: Python<'_>) {
+                py.detach(|| self.core().set_hicache_enabled());
+            }
+
+            /// Whether the host tier (HiCache) is wired.
+            fn enable_hicache(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().enable_hicache())
+            }
+
+            /// Mark the SWA host pool as wired (HiCache).
+            fn set_has_swa_host_pool(&self, py: Python<'_>) {
+                py.detach(|| self.core().set_has_swa_host_pool());
+            }
+
+            /// Whether the SWA host pool is wired.
+            fn has_swa_host_pool(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().has_swa_host_pool())
+            }
+
+            /// Insert a host-side (backuped) tree path descending from the given node.
+            fn insert_host(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                extra_key: Option<String>,
+                key: &Bound<'_, PyAny>,
+                host_value: PyTensor,
+                hash_value: Vec<String>,
+                cache_salt: Option<String>,
+            ) -> PyResult<InsertResultBinding> {
+                let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
+                let host_value = host_value.0;
+                if host_value.kind() != Kind::Int64 {
+                    return Err(PyValueError::new_err(format!(
+                        "insert_host host_value must be an int64 tensor, got {:?}",
+                        host_value.kind()
+                    )));
+                }
+                let result = py
+                    .detach(move || {
+                        self.core().insert_host_in_namespace(
+                            node_id,
+                            KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                            key,
+                            host_value,
+                            hash_value,
+                        )
+                    })
+                    .map_err(tree_core_runtime_error)?;
+                InsertResultBinding::from_insert_result(py, result)
+            }
+
+            fn build_backup_kv_action(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Py<PyAny>> {
+                let backup = py
+                    .detach(|| self.core().build_backup_kv_action(node_id))
+                    .map_err(node_access_error)?;
+                cache_action_to_py(py, CacheAction::BackupKV(backup))
+            }
+
+            /// Gather a node's device value plus per-component BACKUP_HOST transfers.
+            fn build_backup_spec(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
+                let (device_value, comp_xfers) = py
+                    .detach(|| self.core().build_backup_spec(node_id))
+                    .map_err(node_access_error)?;
+                Ok((
+                    tensor_to_py(py, device_value)?,
+                    comp_xfers_to_py(py, comp_xfers)?,
+                ))
+            }
+
+            /// Gather a node's device->storage backup spec; None if the node is not backuped.
+            fn build_storage_backup_spec(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                pass_prefix_keys: bool,
+            ) -> PyResult<Option<StorageBackupSpecBinding>> {
+                let spec = py
+                    .detach(|| {
+                        self.core()
+                            .build_storage_backup_spec(node_id, pass_prefix_keys)
+                    })
+                    .map_err(node_access_error)?;
+                let Some(spec) = spec else {
+                    return Ok(None);
+                };
+                let mut token_bytes = Vec::with_capacity(spec.token_ids.len() * 8);
+                for token in &spec.token_ids {
+                    token_bytes.extend_from_slice(&token.to_ne_bytes());
+                }
+                Ok(Some(StorageBackupSpecBinding {
+                    host_value: tensor_to_py(py, spec.host_value)?,
+                    token_ids: PyBytes::new(py, &token_bytes).unbind(),
+                    hash_value: spec.hash_value,
+                    prefix_keys: spec.prefix_keys,
+                    comp_xfers: comp_xfers_to_py(py, spec.comp_xfers)?,
+                }))
+            }
+
+            /// Route a build_hicache_transfers call to the component for the given type.
+            #[allow(clippy::too_many_arguments)]
+            fn build_hicache_transfers(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                node_id: NodeId,
+                phase: &str,
+                host_indices: Option<PyTensor>,
+                token_ids: Option<Vec<i64>>,
+                prefetch_tokens: usize,
+                staging_tokens: usize,
+                last_hash: Option<String>,
+            ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+                let component_type = parse_component_type(component_type)?;
+                let phase = parse_transfer_phase(phase)?;
+                let host_indices = host_indices.map(|t| t.0);
+                let transfers = py
+                    .detach(|| {
+                        self.core().build_hicache_transfers(
+                            component_type,
+                            node_id,
+                            phase,
+                            host_indices,
+                            token_ids.as_deref(),
+                            prefetch_tokens,
+                            staging_tokens,
+                            last_hash.as_deref(),
+                        )
+                    })
+                    .map_err(tree_core_assertion_error)?;
+                transfers
+                    .map(|transfers| {
+                        transfers
+                            .into_iter()
+                            .map(|transfer| transfer_to_py(py, transfer))
+                            .collect::<PyResult<Vec<_>>>()
+                    })
+                    .transpose()
+            }
+
+            /// The anchor node's namespace; None for root-like anchors.
+            fn prefetch_anchor_info(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<(Option<String>, Option<String>)> {
+                py.detach(|| self.core().prefetch_anchor_info(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Whether the node's Full KV is present on host.
+            fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().node_backuped(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Whether the node is a (default or named) root.
+            fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().is_root(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// The node's last page hash, or None when it was never hashed.
+            fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
+                py.detach(|| self.core().get_last_hash_value(node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// The hash chain of the node's ancestors, in root-to-parent order.
+            fn get_prefix_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
+                py.detach(|| self.core().get_prefix_hash_values(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn get_hash_values(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<String>> {
+                py.detach(|| self.core().get_hash_values(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn snapshot_buffer_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                pass_prefix_keys: bool,
+            ) -> Option<BufferBackupSnapshotBinding> {
+                py.detach(|| {
+                    self.core()
+                        .snapshot_buffer_backup(node_id, pass_prefix_keys)
+                })
+                .map(|snapshot| BufferBackupSnapshotBinding::from_snapshot(py, snapshot))
+            }
+
+            fn validate_buffer_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                expected_key_length: usize,
+            ) -> Option<BufferBackupStateBinding> {
+                py.detach(|| {
+                    self.core()
+                        .validate_buffer_backup(node_id, expected_key_length)
+                })
+                .map(BufferBackupStateBinding::from)
+            }
+
+            /// Hash every node built while storage was disabled.
+            fn backfill_missing_hash_values(&self, py: Python<'_>) -> usize {
+                py.detach(|| self.core().backfill_missing_hash_values())
+            }
+
+            fn root_node_handle(&self, py: Python<'_>, extra_key: Option<String>) -> NodeId {
+                py.detach(|| self.core().root_node_handle(extra_key.as_deref()))
+            }
+
+            fn rotation_base_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+                py.detach(|| self.core().rotation_base_of(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
+                py.detach(|| self.core().dfs_weight_order(&node_ids))
+                    .map_err(node_access_error)
+            }
+
+            /// Commit each component's HiCache transfers; returns the new cache actions.
+            fn commit_hicache_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                phase: &str,
+                comp_xfers: HashMap<u8, Vec<TransferArgs>>,
+                insert_result: Option<(usize, Option<NodeId>, bool)>,
+                pool_storage_result: Option<(usize, HashMap<String, usize>)>,
+            ) -> PyResult<(Py<PyList>, Option<bool>)> {
+                let phase = parse_transfer_phase(phase)?;
+                let comp_xfers = comp_xfers_from_args(comp_xfers)?;
+                let insert_result =
+                    insert_result.map(
+                        |(total_len, inserted_host_node, mamba_exist)| InsertResult {
+                            total_len,
+                            inserted_host_node,
+                            mamba_exist,
+                            ..InsertResult::default()
+                        },
+                    );
+                let pool_storage_result = pool_storage_result
+                    .map(|(kv_hit_pages, extra_pool_hit_pages)| {
+                        Ok::<_, PyErr>(PoolTransferResult {
+                            kv_hit_pages,
+                            extra_pool_hit_pages: extra_pool_hit_pages
+                                .into_iter()
+                                .map(|(name, pages)| Ok((parse_pool_name(&name)?, pages)))
+                                .collect::<PyResult<HashMap<_, _>>>()?,
+                        })
+                    })
+                    .transpose()?;
+                let (cache_actions, mamba_exist) = py
+                    .detach(move || {
+                        let mut cache_actions = Vec::new();
+                        let mut insert_result = insert_result;
+                        self.core().commit_hicache_transfers(
+                            node_id,
+                            phase,
+                            comp_xfers,
+                            &mut cache_actions,
+                            insert_result.as_mut(),
+                            pool_storage_result.as_ref(),
+                        )?;
+                        Ok((
+                            cache_actions,
+                            insert_result.map(|result| result.mamba_exist),
+                        ))
+                    })
+                    .map_err(node_access_error)?;
+                Ok((cache_actions_to_py(py, cache_actions)?, mamba_exist))
+            }
+
+            /// Commit a successful backup to the node.
+            fn commit_backup(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                host_indices: PyTensor,
+                comp_xfers: HashMap<u8, Vec<TransferArgs>>,
+            ) -> PyResult<()> {
+                let comp_xfers = comp_xfers_from_args(comp_xfers)?;
+                let host_indices = host_indices.0;
+                py.detach(move || self.core().commit_backup(node_id, host_indices, comp_xfers))
+                    .map_err(node_access_error)?;
+                Ok(())
+            }
+
+            /// Build the H->D load-back KV transfer plus per-component aux transfers.
+            fn build_load_back_spec(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                mamba_pool_idx: Option<PyTensor>,
+            ) -> PyResult<(Py<PyAny>, Py<PyDict>)> {
+                let req = Req {
+                    mamba_pool_idx: mamba_pool_idx.map(|t| t.0),
+                };
+                let (kv_xfer, comp_xfers) = py
+                    .detach(move || self.core().build_load_back_spec(node_id, Some(&req)))
+                    .map_err(tree_core_assertion_error)?;
+                Ok((
+                    transfer_to_py(py, kv_xfer)?,
+                    comp_xfers_to_py(py, comp_xfers)?,
+                ))
+            }
+
+            /// Commit a successful H->D load-back onto the node; returns its actions.
+            fn commit_load_back(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                device_indices: PyTensor,
+                kv_xfer: TransferArgs,
+                comp_xfers: HashMap<u8, Vec<TransferArgs>>,
+            ) -> PyResult<Py<PyList>> {
+                let kv_xfer = transfer_from_args(kv_xfer)?;
+                let comp_xfers = comp_xfers_from_args(comp_xfers)?;
+                let device_indices = device_indices.0;
+                let actions = py
+                    .detach(move || {
+                        self.core()
+                            .commit_load_back(node_id, device_indices, kv_xfer, comp_xfers)
+                    })
+                    .map_err(node_access_error)?;
+                cache_actions_to_py(py, actions)
+            }
+
+            /// Release a node's device KV once its host copy exists.
+            fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
+                let result = py
+                    .detach(move || self.core().demote(node_id))
+                    .map_err(tree_core_assertion_error)?;
+                Ok(DemoteResultBinding {
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
+
+            /// Evict up to num_tokens of one component's host resources.
+            fn drive_host_eviction(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                num_tokens: usize,
+                skip_full_duplicate_reclaim: bool,
+            ) -> PyResult<HostEvictionResultBinding> {
+                let ct = parse_component_type(component_type)?;
+                let result = py.detach(move || {
+                    self.core().drive_host_eviction_with_options(
+                        ct,
+                        num_tokens,
+                        skip_full_duplicate_reclaim,
                     )
-                        .into_py_any(py)?;
-                    list.append(item)?;
+                });
+                Ok(HostEvictionResultBinding {
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
+
+            /// Evict shallow Mamba device checkpoints beyond the per-path cap on the
+            /// tail's root path; returns the step's freed tensors.
+            fn evict_excess_path_states(
+                &self,
+                py: Python<'_>,
+                tail_node_id: NodeId,
+            ) -> PyResult<HostEvictionResultBinding> {
+                let result = py
+                    .detach(move || self.core().evict_excess_path_states(tail_node_id))
+                    .map_err(node_access_error)?;
+                Ok(HostEvictionResultBinding {
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
+
+            /// Bump the reference count on a node's host-side component locks.
+            fn inc_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<IncLockRefResultBinding> {
+                let result = py
+                    .detach(|| self.core().inc_host_lock_ref(node_id))
+                    .map_err(node_access_error)?;
+                Ok(IncLockRefResultBinding::from_result(result))
+            }
+
+            /// Decrease the reference count on a node's host-side component locks.
+            fn dec_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                params: &DecLockRefParamsBinding,
+            ) -> PyResult<()> {
+                let params = params.to_dec_lock_ref_params()?;
+                py.detach(|| self.core().dec_host_lock_ref(node_id, &params))
+                    .map_err(node_access_error)?;
+                Ok(())
+            }
+
+            fn is_write_through_compatible(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().is_write_through_compatible())
+            }
+
+            /// Set the write-back (vs write-through) policy; decided at HiCache init.
+            fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
+                py.detach(|| self.core().set_is_write_back(is_write_back));
+            }
+
+            /// The current write-back (vs write-through) policy.
+            fn is_write_back(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().is_write_back())
+            }
+
+            /// Set the write-through backup hit threshold; decided at HiCache init.
+            fn set_write_through_threshold(&self, py: Python<'_>, threshold: i64) {
+                py.detach(|| self.core().set_write_through_threshold(threshold));
+            }
+
+            /// The current write-through backup hit threshold.
+            fn write_through_threshold(&self, py: Python<'_>) -> i64 {
+                py.detach(|| self.core().write_through_threshold())
+            }
+
+            /// Mark the storage tier (L3) wired; storage attaches after tree construction.
+            fn set_enable_storage(&self, py: Python<'_>, value: bool) {
+                py.detach(|| self.core().set_enable_storage(value));
+            }
+
+            /// Whether the storage tier (L3) is wired.
+            fn enable_storage(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().enable_storage())
+            }
+
+            /// Enable or disable the direct external-cache linker.
+            fn set_enable_external_cache_linker(&self, py: Python<'_>, value: bool) -> PyResult<()> {
+                py.detach(|| self.core().set_enable_external_cache_linker(value))
+                    .map_err(tree_core_assertion_error)
+            }
+
+            /// Whether the direct external-cache linker is wired.
+            fn enable_external_cache_linker(&self, py: Python<'_>) -> bool {
+                py.detach(|| self.core().enable_external_cache_linker())
+            }
+
+            /// Queue the all-cleared placement event.
+            fn record_all_cleared_event(&self, py: Python<'_>) {
+                py.detach(|| self.core().record_all_cleared_event());
+            }
+
+            /// Drain the queued placement events as tagged tuples.
+            fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>>
+            where
+                for<'py> Vec<K::Atom>: IntoPyObject<'py>,
+            {
+                let events = py.detach(|| self.core().take_events());
+                let list = PyList::empty(py);
+                for event in events {
+                    match event {
+                        KvCacheEvent::BlockStored {
+                            block_hashes,
+                            parent_block_hash,
+                            token_ids,
+                            block_size,
+                            medium,
+                            cache_salt,
+                            session_id,
+                            extra_key,
+                        } => {
+                            let item: Py<PyAny> = (
+                                "block_stored",
+                                block_hashes,
+                                parent_block_hash,
+                                token_ids,
+                                block_size,
+                                medium.as_str(),
+                                cache_salt.map(|salt| salt.to_string()),
+                                session_id.map(|session_id| session_id.to_string()),
+                                extra_key.map(|extra_key| extra_key.to_string()),
+                            )
+                                .into_py_any(py)?;
+                            list.append(item)?;
+                        }
+                        KvCacheEvent::BlockRemoved {
+                            block_hashes,
+                            medium,
+                            extra_key,
+                        } => {
+                            let item: Py<PyAny> = (
+                                "block_removed",
+                                block_hashes,
+                                medium.as_str(),
+                                extra_key.map(|extra_key| extra_key.to_string()),
+                            )
+                                .into_py_any(py)?;
+                            list.append(item)?;
+                        }
+                        KvCacheEvent::AllBlocksCleared => {
+                            let item: Py<PyAny> = ("all_blocks_cleared",).into_py_any(py)?;
+                            list.append(item)?;
+                        }
+                    }
                 }
-                KvCacheEvent::BlockRemoved {
-                    block_hashes,
-                    medium,
-                    extra_key,
-                } => {
-                    let item: Py<PyAny> = (
-                        "block_removed",
-                        block_hashes,
-                        medium.as_str(),
-                        extra_key.map(|extra_key| extra_key.to_string()),
-                    )
-                        .into_py_any(py)?;
-                    list.append(item)?;
-                }
-                KvCacheEvent::AllBlocksCleared => {
-                    let item: Py<PyAny> = ("all_blocks_cleared",).into_py_any(py)?;
-                    list.append(item)?;
-                }
+                Ok(list.unbind())
+            }
+
+            /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
+            /// blocks it.
+            fn drop_subtree_no_host(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<DropSubtreeResultBinding> {
+                let (dropped, result) = py
+                    .detach(move || self.core().drop_subtree_no_host(node_id))
+                    .map_err(node_access_error)?;
+                Ok(DropSubtreeResultBinding {
+                    dropped,
+                    tracker: tracker_to_py(result.tracker),
+                    new_device_frees: frees_to_py(py, result.device_frees)?,
+                    new_host_frees: frees_to_py(py, result.host_frees)?,
+                    cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+                })
+            }
+
+            /// Mark the nodes one write-through backup covers; returns them ancestors first.
+            fn mark_write_through_pending(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+            ) -> PyResult<Vec<NodeId>> {
+                py.detach(move || self.core().mark_write_through_pending(node_ids, ack_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Clear the write-through-pending mark on the acked nodes.
+            fn finish_write_through(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+            ) -> PyResult<()> {
+                py.detach(move || self.core().finish_write_through(node_ids, ack_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Clear the in-flight H->D marks on the anchor's root path at ack time.
+            fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
+                py.detach(|| self.core().finish_load_back(anchor_node_id))
+                    .map_err(node_access_error)
+            }
+
+            /// Build transfers for a node with no stored or pending external copy.
+            fn build_external_linker_offload_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<Vec<Py<PyAny>>>> {
+                let transfers = py
+                    .detach(|| self.core().build_external_linker_offload_transfers(node_id))
+                    .map_err(node_access_error)?;
+                transfers
+                    .map(|transfers| {
+                        transfers
+                            .into_iter()
+                            .map(|transfer| transfer_to_py(py, transfer))
+                            .collect::<PyResult<Vec<_>>>()
+                    })
+                    .transpose()
+            }
+
+            /// Mark an externally restored path, excluding its existing anchor.
+            fn mark_external_cache_stored_path(
+                &self,
+                py: Python<'_>,
+                from_node_id: NodeId,
+                until_node_id: NodeId,
+            ) -> PyResult<()> {
+                py.detach(|| {
+                    self.core()
+                        .mark_external_cache_stored_path(from_node_id, until_node_id)
+                })
+                .map_err(tree_core_runtime_error)
+            }
+
+            /// Publish an accepted external offload as pending.
+            fn mark_external_linker_offload_pending(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<()> {
+                py.detach(|| self.core().mark_external_linker_offload_pending(node_id))
+                    .map_err(tree_core_assertion_error)
+            }
+
+            /// Finalize external-store state for an offload and its split fragments.
+            fn finish_external_linker_offload(
+                &self,
+                py: Python<'_>,
+                node_ids: Vec<NodeId>,
+                ack_id: NodeId,
+                success: bool,
+            ) -> PyResult<()> {
+                py.detach(|| {
+                    self.core()
+                        .finish_external_linker_offload(&node_ids, ack_id, success)
+                })
+                .map_err(tree_core_assertion_error)
+            }
+
+            /// Order-sensitive digest of reclaimed coexisting host values.
+            fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
+                py.detach(|| self.core().write_back_coexist_reclaim_digest())
+            }
+
+            /// Whether the component's data is device-evicted but host-backed.
+            fn component_has_host_value_only(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<bool> {
+                let ct = parse_component_type(component_type)?;
+                py.detach(|| self.core().component_has_host_value_only(node_id, ct))
+                    .map_err(node_access_error)
             }
         }
-        Ok(list.unbind())
-    }
 
-    /// Drop the subtree rooted at an unbacked D-leaf; not dropped when a lock
-    /// blocks it.
-    fn drop_subtree_no_host(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<DropSubtreeResultBinding> {
-        let (dropped, result) = py
-            .detach(move || self.core().drop_subtree_no_host(node_id))
-            .map_err(node_access_error)?;
-        Ok(DropSubtreeResultBinding {
-            dropped,
-            tracker: tracker_to_py(result.tracker),
-            new_device_frees: frees_to_py(py, result.device_frees)?,
-            new_host_frees: frees_to_py(py, result.host_frees)?,
-        })
-    }
+        #[cfg(feature = "inspection")]
+        impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
+            fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                py.detach(|| self.core().inspect_contains_node(node_id))
+            }
 
-    /// Mark the nodes one write-through backup covers; returns them ancestors first.
-    fn mark_write_through_pending(
-        &self,
-        py: Python<'_>,
-        node_ids: Vec<NodeId>,
-        ack_id: NodeId,
-    ) -> PyResult<Vec<NodeId>> {
-        py.detach(move || self.core().mark_write_through_pending(node_ids, ack_id))
-            .map_err(node_access_error)
-    }
+            fn inspect_get_parent_node_id(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<NodeId>> {
+                py.detach(|| self.core().inspect_get_parent_node_id(node_id))
+                    .map_err(node_access_error)
+            }
 
-    /// Clear the write-through-pending mark on the acked nodes.
-    fn finish_write_through(
-        &self,
-        py: Python<'_>,
-        node_ids: Vec<NodeId>,
-        ack_id: NodeId,
-    ) -> PyResult<()> {
-        py.detach(move || self.core().finish_write_through(node_ids, ack_id))
-            .map_err(node_access_error)
-    }
+            fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<NodeId>> {
+                py.detach(|| self.core().inspect_get_child_node_ids(node_id))
+                    .map_err(node_access_error)
+            }
 
-    /// Clear the in-flight H->D marks on the anchor's root path at ack time.
-    fn finish_load_back(&self, py: Python<'_>, anchor_node_id: NodeId) -> PyResult<()> {
-        py.detach(|| self.core().finish_load_back(anchor_node_id))
-            .map_err(node_access_error)
-    }
+            fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> PyResult<usize> {
+                py.detach(|| self.core().inspect_get_node_key_length(node_id))
+                    .map_err(node_access_error)
+            }
 
-    /// Build transfers for a node with no stored or pending external copy.
-    fn build_external_linker_offload_transfers(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<Option<Vec<Py<PyAny>>>> {
-        let transfers = py
-            .detach(|| self.core().build_external_linker_offload_transfers(node_id))
-            .map_err(node_access_error)?;
-        transfers
-            .map(|transfers| {
-                transfers
+            fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<i64>> {
+                py.detach(|| self.core().inspect_get_node_token_ids(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().inspect_is_node_key_bigram(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_get_component_host_value(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<Option<Py<PyAny>>> {
+                let component_type = parse_component_type(component_type)?;
+                let value = py
+                    .detach(|| {
+                        self.core()
+                            .inspect_get_component_host_value(node_id, component_type)
+                    })
+                    .map_err(node_access_error)?;
+                value.map(|value| tensor_to_py(py, value)).transpose()
+            }
+
+            fn inspect_get_component_device_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<u32> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_get_component_device_lock_ref(node_id, component_type)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_get_component_host_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<u32> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_get_component_host_lock_ref(node_id, component_type)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
+                py.detach(|| self.core().inspect_get_node_hit_count(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_get_write_through_pending_id(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Option<usize>> {
+                py.detach(|| self.core().inspect_get_write_through_pending_id(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().inspect_is_external_cache_stored(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_is_node_in_device_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<bool> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_is_node_in_device_lru(node_id, component_type)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_is_node_in_host_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<bool> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_is_node_in_host_lru(node_id, component_type)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_get_component_device_lru_node_ids(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+            ) -> PyResult<Vec<NodeId>> {
+                let component_type = parse_component_type(component_type)?;
+                Ok(py.detach(|| {
+                    self.core()
+                        .inspect_get_component_device_lru_node_ids(component_type)
+                }))
+            }
+
+            fn inspect_is_device_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                py.detach(|| self.core().inspect_is_device_evictable_leaf(node_id))
+            }
+
+            fn inspect_is_host_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
+                py.detach(|| self.core().inspect_is_host_evictable_leaf(node_id))
+            }
+
+            fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
+                py.detach(|| self.core().inspect_is_device_leaf(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
+                py.detach(|| self.core().inspect_get_all_node_ids())
+            }
+
+            fn inspect_component_protected_size(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+            ) -> PyResult<usize> {
+                let component_type = parse_component_type(component_type)?;
+                Ok(py.detach(|| self.core().inspect_component_protected_size(component_type)))
+            }
+
+            fn inspect_set_node_hash_values(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                hash_values: Option<Vec<String>>,
+            ) -> PyResult<()> {
+                py.detach(move || {
+                    self.core()
+                        .inspect_set_node_hash_values(node_id, hash_values)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_set_component_device_value_raw(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                value: Option<PyTensor>,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                let value = value.map(|value| value.0);
+                py.detach(move || {
+                    self.core()
+                        .inspect_set_component_device_value_raw(node_id, component_type, value)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_set_component_host_value_raw(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                value: Option<PyTensor>,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                let value = value.map(|value| value.0);
+                py.detach(move || {
+                    self.core()
+                        .inspect_set_component_host_value_raw(node_id, component_type, value)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_set_component_device_lock_ref(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                lock_ref: u32,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_set_component_device_lock_ref(node_id, component_type, lock_ref)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_remove_node_from_device_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_remove_node_from_device_lru(node_id, component_type)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_insert_node_into_host_lru(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_insert_node_into_host_lru(node_id, component_type)
+                })
+                .map_err(node_access_error)
+            }
+
+            fn inspect_set_component_evictable_size(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                value: usize,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_set_component_evictable_size(component_type, value)
+                });
+                Ok(())
+            }
+
+            fn inspect_set_component_protected_size(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                value: usize,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_set_component_protected_size(component_type, value)
+                });
+                Ok(())
+            }
+
+            fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
+                py.detach(|| self.core().inspect_update_duplicate_tracking(node_id))
+                    .map_err(node_access_error)
+            }
+
+            fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
+                py.detach(|| self.core().inspect_advance_insert_walk_once())
+                    .map_err(PyRuntimeError::new_err)
+            }
+
+            fn inspect_evict_component(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                target: u8,
+            ) -> PyResult<HostEvictionResultBinding> {
+                let component_type = parse_component_type(component_type)?;
+                let target = parse_evict_layer(target)?;
+                let result = py
+                    .detach(|| {
+                        self.core()
+                            .inspect_evict_component(node_id, component_type, target)
+                    })
+                    .map_err(node_access_error)?;
+                HostEvictionResultBinding::from_eviction_step(py, result)
+            }
+
+            fn inspect_validate_cascade_evict(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                component_type: u8,
+                target: u8,
+            ) -> PyResult<()> {
+                let component_type = parse_component_type(component_type)?;
+                let target = parse_evict_layer(target)?;
+                py.detach(|| {
+                    self.core()
+                        .inspect_validate_cascade_evict(node_id, component_type, target)
+                })
+                .map_err(tree_core_assertion_error)
+            }
+
+            fn inspect_cleanup_tombstone_ancestors(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<HostEvictionResultBinding> {
+                let result = py
+                    .detach(|| self.core().inspect_cleanup_tombstone_ancestors(node_id))
+                    .map_err(node_access_error)?;
+                HostEvictionResultBinding::from_eviction_step(py, result)
+            }
+
+            #[allow(clippy::too_many_arguments)]
+            fn inspect_finalize_component_match_result(
+                &self,
+                py: Python<'_>,
+                component_type: u8,
+                result: InspectionMatchResultInput,
+                key: &Bound<'_, PyAny>,
+                extra_key: Option<String>,
+                cache_salt: Option<String>,
+                value_chunks: Vec<PyTensor>,
+                best_value_len: usize,
+            ) -> PyResult<MatchResultBinding> {
+                let component_type = parse_component_type(component_type)?;
+                let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
+                let InspectionMatchResultInput {
+                    device_prefix_len,
+                    last_device_node: last_device_node_id,
+                    last_host_node: last_host_node_id,
+                    best_match_node: best_match_node_id,
+                    host_hit_length,
+                    swa_host_hit_length,
+                    swa_branching_seqlen,
+                    mamba_host_hit_length,
+                    mamba_branching_seqlen,
+                    full_kv_hit_length,
+                } = result;
+                let result = MatchResult {
+                    device_prefix_len,
+                    last_device_node_id,
+                    last_host_node_id,
+                    best_match_node_id,
+                    host_hit_length,
+                    swa_host_hit_length,
+                    swa_branching_seqlen,
+                    mamba_host_hit_length,
+                    mamba_branching_seqlen,
+                    full_kv_hit_length,
+                    cache_actions: Vec::new(),
+                };
+                let value_chunks = value_chunks
                     .into_iter()
-                    .map(|transfer| transfer_to_py(py, transfer))
-                    .collect::<PyResult<Vec<_>>>()
-            })
-            .transpose()
-    }
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>();
+                let result = py.detach(move || {
+                    let params = MatchPrefixParams {
+                        key: &key,
+                        namespace: KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
+                    };
+                    self.core().inspect_finalize_component_match_result(
+                        component_type,
+                        result,
+                        &params,
+                        &value_chunks,
+                        best_value_len,
+                    )
+                });
+                let result = result.map_err(node_access_error)?;
+                MatchResultBinding::from_match_result(py, result)
+            }
 
-    /// Mark an externally restored path, excluding its existing anchor.
-    fn mark_external_cache_stored_path(
-        &self,
-        py: Python<'_>,
-        from_node_id: NodeId,
-        until_node_id: NodeId,
-    ) -> PyResult<()> {
-        py.detach(|| {
-            self.core()
-                .mark_external_cache_stored_path(from_node_id, until_node_id)
-        })
-        .map_err(tree_core_runtime_error)
-    }
+            fn inspect_build_backup_node_ids(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                write_back: bool,
+            ) -> PyResult<Vec<NodeId>> {
+                py.detach(|| {
+                    self.core()
+                        .inspect_build_backup_node_ids(node_id, write_back)
+                })
+                .map_err(node_access_error)
+            }
+        }
 
-    /// Publish an accepted external offload as pending.
-    fn mark_external_linker_offload_pending(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<()> {
-        py.detach(|| self.core().mark_external_linker_offload_pending(node_id))
-            .map_err(tree_core_assertion_error)
-    }
-
-    /// Finalize external-store state for an offload and its split fragments.
-    fn finish_external_linker_offload(
-        &self,
-        py: Python<'_>,
-        node_ids: Vec<NodeId>,
-        ack_id: NodeId,
-        success: bool,
-    ) -> PyResult<()> {
-        py.detach(|| {
-            self.core()
-                .finish_external_linker_offload(&node_ids, ack_id, success)
-        })
-        .map_err(tree_core_assertion_error)
-    }
-
-    /// Order-sensitive digest of reclaimed coexisting host values.
-    fn write_back_coexist_reclaim_digest(&self, py: Python<'_>) -> i64 {
-        py.detach(|| self.core().write_back_coexist_reclaim_digest)
-    }
-
-    /// Whether the component's data is device-evicted but host-backed.
-    fn component_has_host_value_only(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<bool> {
-        let ct = parse_component_type(component_type)?;
-        py.detach(|| self.core().component_has_host_value_only(node_id, ct))
-            .map_err(node_access_error)
-    }
-}
-
-#[cfg(feature = "inspection")]
-impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
-    fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
-        py.detach(|| self.core().inspect_contains_node(node_id))
-    }
-
-    fn inspect_get_parent_node_id(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<Option<NodeId>> {
-        py.detach(|| self.core().inspect_get_parent_node_id(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<NodeId>> {
-        py.detach(|| self.core().inspect_get_child_node_ids(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_get_node_key_length(&self, py: Python<'_>, node_id: NodeId) -> PyResult<usize> {
-        py.detach(|| self.core().inspect_get_node_key_length(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_get_node_token_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<i64>> {
-        py.detach(|| self.core().inspect_get_node_token_ids(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_is_node_key_bigram(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.detach(|| self.core().inspect_is_node_key_bigram(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_get_component_host_value(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<Option<Py<PyAny>>> {
-        let component_type = parse_component_type(component_type)?;
-        let value = py
-            .detach(|| {
-                self.core()
-                    .inspect_get_component_host_value(node_id, component_type)
-            })
-            .map_err(node_access_error)?;
-        value.map(|value| tensor_to_py(py, value)).transpose()
-    }
-
-    fn inspect_get_component_device_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<u32> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_get_component_device_lock_ref(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_get_component_host_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<u32> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_get_component_host_lock_ref(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_get_node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
-        py.detach(|| self.core().inspect_get_node_hit_count(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_get_write_through_pending_id(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<Option<usize>> {
-        py.detach(|| self.core().inspect_get_write_through_pending_id(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_is_external_cache_stored(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.detach(|| self.core().inspect_is_external_cache_stored(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_is_node_in_device_lru(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<bool> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_is_node_in_device_lru(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_is_node_in_host_lru(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<bool> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_is_node_in_host_lru(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_get_component_device_lru_node_ids(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-    ) -> PyResult<Vec<NodeId>> {
-        let component_type = parse_component_type(component_type)?;
-        Ok(py.detach(|| {
-            self.core()
-                .inspect_get_component_device_lru_node_ids(component_type)
-        }))
-    }
-
-    fn inspect_is_device_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
-        py.detach(|| self.core().inspect_is_device_evictable_leaf(node_id))
-    }
-
-    fn inspect_is_host_evictable_leaf(&self, py: Python<'_>, node_id: NodeId) -> bool {
-        py.detach(|| self.core().inspect_is_host_evictable_leaf(node_id))
-    }
-
-    fn inspect_is_device_leaf(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
-        py.detach(|| self.core().inspect_is_device_leaf(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_get_all_node_ids(&self, py: Python<'_>) -> Vec<NodeId> {
-        py.detach(|| self.core().inspect_get_all_node_ids())
-    }
-
-    fn inspect_component_protected_size(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-    ) -> PyResult<usize> {
-        let component_type = parse_component_type(component_type)?;
-        Ok(py.detach(|| self.core().inspect_component_protected_size(component_type)))
-    }
-
-    fn inspect_set_node_hash_values(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        hash_values: Option<Vec<String>>,
-    ) -> PyResult<()> {
-        py.detach(move || {
-            self.core()
-                .inspect_set_node_hash_values(node_id, hash_values)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_set_component_device_value_raw(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        value: Option<PyTensor>,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        let value = value.map(|value| value.0);
-        py.detach(move || {
-            self.core()
-                .inspect_set_component_device_value_raw(node_id, component_type, value)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_set_component_host_value_raw(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        value: Option<PyTensor>,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        let value = value.map(|value| value.0);
-        py.detach(move || {
-            self.core()
-                .inspect_set_component_host_value_raw(node_id, component_type, value)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_set_component_device_lock_ref(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        lock_ref: u32,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_set_component_device_lock_ref(node_id, component_type, lock_ref)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_remove_node_from_device_lru(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_remove_node_from_device_lru(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_insert_node_into_host_lru(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_insert_node_into_host_lru(node_id, component_type)
-        })
-        .map_err(node_access_error)
-    }
-
-    fn inspect_set_component_evictable_size(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        value: usize,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_set_component_evictable_size(component_type, value)
-        });
-        Ok(())
-    }
-
-    fn inspect_set_component_protected_size(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        value: usize,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        py.detach(|| {
-            self.core()
-                .inspect_set_component_protected_size(component_type, value)
-        });
-        Ok(())
-    }
-
-    fn inspect_update_duplicate_tracking(&self, py: Python<'_>, node_id: NodeId) -> PyResult<()> {
-        py.detach(|| self.core().inspect_update_duplicate_tracking(node_id))
-            .map_err(node_access_error)
-    }
-
-    fn inspect_advance_insert_walk_once(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.core().inspect_advance_insert_walk_once())
-            .map_err(PyRuntimeError::new_err)
-    }
-
-    fn inspect_evict_component(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        target: u8,
-    ) -> PyResult<HostEvictionResultBinding> {
-        let component_type = parse_component_type(component_type)?;
-        let target = parse_evict_layer(target)?;
-        let result = py
-            .detach(|| {
-                self.core()
-                    .inspect_evict_component(node_id, component_type, target)
-            })
-            .map_err(node_access_error)?;
-        HostEvictionResultBinding::from_eviction_step(py, result)
-    }
-
-    fn inspect_validate_cascade_evict(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        component_type: u8,
-        target: u8,
-    ) -> PyResult<()> {
-        let component_type = parse_component_type(component_type)?;
-        let target = parse_evict_layer(target)?;
-        py.detach(|| {
-            self.core()
-                .inspect_validate_cascade_evict(node_id, component_type, target)
-        })
-        .map_err(tree_core_assertion_error)
-    }
-
-    fn inspect_cleanup_tombstone_ancestors(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<HostEvictionResultBinding> {
-        let result = py
-            .detach(|| self.core().inspect_cleanup_tombstone_ancestors(node_id))
-            .map_err(node_access_error)?;
-        HostEvictionResultBinding::from_eviction_step(py, result)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn inspect_finalize_component_match_result(
-        &self,
-        py: Python<'_>,
-        component_type: u8,
-        result: InspectionMatchResultInput,
-        key: &Bound<'_, PyAny>,
-        extra_key: Option<String>,
-        cache_salt: Option<String>,
-        value_chunks: Vec<PyTensor>,
-        best_value_len: usize,
-    ) -> PyResult<MatchResultBinding> {
-        let component_type = parse_component_type(component_type)?;
-        let key = K::key_from(Cow::Owned(py_array_to_vec_i64(py, key)?)).into_owned();
-        let InspectionMatchResultInput {
-            device_prefix_len,
-            last_device_node: last_device_node_id,
-            last_host_node: last_host_node_id,
-            best_match_node: best_match_node_id,
-            host_hit_length,
-            swa_host_hit_length,
-            swa_branching_seqlen,
-            mamba_host_hit_length,
-            mamba_branching_seqlen,
-            full_kv_hit_length,
-        } = result;
-        let result = MatchResult {
-            device_prefix_len,
-            last_device_node_id,
-            last_host_node_id,
-            best_match_node_id,
-            host_hit_length,
-            swa_host_hit_length,
-            swa_branching_seqlen,
-            mamba_host_hit_length,
-            mamba_branching_seqlen,
-            full_kv_hit_length,
-            cache_actions: Vec::new(),
-        };
-        let value_chunks = value_chunks
-            .into_iter()
-            .map(|value| value.0)
-            .collect::<Vec<_>>();
-        let result = py.detach(move || {
-            let params = MatchPrefixParams {
-                key: &key,
-                namespace: KeyNamespaceRef::new(extra_key.as_deref(), cache_salt.as_deref()),
-            };
-            self.core().inspect_finalize_component_match_result(
-                component_type,
-                result,
-                &params,
-                &value_chunks,
-                best_value_len,
-            )
-        });
-        let result = result.map_err(node_access_error)?;
-        MatchResultBinding::from_match_result(py, result)
-    }
-
-    fn inspect_build_backup_node_ids(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-        write_back: bool,
-    ) -> PyResult<Vec<NodeId>> {
-        py.detach(|| {
-            self.core()
-                .inspect_build_backup_node_ids(node_id, write_back)
-        })
-        .map_err(node_access_error)
-    }
-}
-
-impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
-    /// Print the tree structure for debugging.
-    fn pretty_print(&self, py: Python<'_>) {
-        py.detach(|| self.core().pretty_print());
-    }
+        impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<$core<K>> {
+            /// Print the tree structure for debugging.
+            fn pretty_print(&self, py: Python<'_>) {
+                py.detach(|| self.core().pretty_print());
+            }
+        }
+    };
 }
 
 // The delegate surface is identical for every key type; the macro stamps the
 // pyclass + pymethods pair per concrete key.
 macro_rules! tree_core_binding {
-    ($(#[$doc:meta])* $name:ident, $key:ty) => {
+    (
+        core = $core:ident;
+        $($(#[$doc:meta])* $name:ident, $key:ty $(, { $($extra:item)* })?;)+
+    ) => {
+        tree_core_methods!($core);
+        $(
         $(#[$doc])*
         #[pyclass]
         pub struct $name {
-            inner: TreeCoreBinding<$key>,
+            inner: TreeCoreBinding<$core<$key>>,
         }
 
         #[pymethods]
@@ -2783,7 +2796,7 @@ macro_rules! tree_core_binding {
             fn new(init_params: &TreeCoreInitParamsBinding, component_types: Vec<u8>) -> PyResult<Self> {
                 catch_native_panic(|| {
                     Ok($name {
-                        inner: TreeCoreBinding::new(init_params, component_types)?,
+                        inner: TreeCoreBinding::<$core<$key>>::new(init_params, component_types)?,
                     })
                 })
             }
@@ -2917,7 +2930,7 @@ macro_rules! tree_core_binding {
                 node_id: NodeId,
                 component_type: u8,
                 params: &DecLockRefParamsBinding,
-            ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
+            ) -> PyResult<(Py<PyDict>, Py<PyDict>, Py<PyList>)> {
                 catch_native_panic(|| {
                     self.inner
                         .dec_window_lock_only(py, node_id, component_type, params)
@@ -2925,14 +2938,14 @@ macro_rules! tree_core_binding {
             }
 
             /// Early-release the SWA portion of a request's tree lock; returns this
-            /// release's per-component (device_frees, host_frees).
+            /// release's per-component frees and cache actions.
             #[pyo3(signature = (node_id, params))]
             fn dec_swa_lock_only(
                 &self,
                 py: Python<'_>,
                 node_id: NodeId,
                 params: &DecLockRefParamsBinding,
-            ) -> PyResult<(Py<PyDict>, Py<PyDict>)> {
+            ) -> PyResult<(Py<PyDict>, Py<PyDict>, Py<PyList>)> {
                 catch_native_panic(|| self.inner.dec_swa_lock_only(py, node_id, params))
             }
 
@@ -3197,6 +3210,14 @@ macro_rules! tree_core_binding {
                         py, node_id, extra_key, key, host_value, hash_value, cache_salt,
                     )
                 })
+            }
+
+            fn build_backup_kv_action(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Py<PyAny>> {
+                catch_native_panic(|| self.inner.build_backup_kv_action(py, node_id))
             }
 
             /// Gather a node's device value plus per-component BACKUP_HOST transfers.
@@ -3983,22 +4004,23 @@ macro_rules! tree_core_binding {
                     Ok(())
                 })
             }
+            $($($extra)*)?
         }
+        )+
     };
 }
 
-tree_core_binding!(
+tree_core_binding! {
+    core = UnifiedTreeCore;
     /// The UnifiedTreeCore Python adapter over single-token (unigram) child keys.
     RustUnifiedTreeCoreBinding,
-    Vec<i64>
-);
+    Vec<i64>;
 
-tree_core_binding!(
     /// The UnifiedTreeCore Python adapter over bigram (EAGLE) child keys; keys
     /// cross the boundary as raw token ids and pair up rust-side.
     RustBigramUnifiedTreeCoreBinding,
-    Vec<(i64, i64)>
-);
+    Vec<(i64, i64)>;
+}
 
 /// Per-page chained hashes over raw token ids.
 #[pyfunction]

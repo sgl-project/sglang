@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
@@ -521,6 +522,34 @@ class TestReturnedValuesDrain(UnifiedRadixCacheFixtures, CustomTestCase):
     result is drained exactly once, in per-component insertion order."""
 
     cfg = CacheConfig()
+
+    def test_action_only_eviction_step_makes_progress(self):
+        # The patched hook is the Python component's; the Rust core runs its own.
+        cache, _, _ = build_fixture(self.cfg, tree_core_backend="python")
+        core = cache.tree_core
+        component = cache.components[ComponentType.FULL]
+        root = cache.root_node_handle()
+        action = UpdatePendingBackupOnNodeSplit(
+            ack_id=None, old_node_id=root, new_node_id=root, new_child_node_id=root
+        )
+
+        def emit_action(tracker, device_frees, host_frees, cache_actions):
+            cache_actions.append(action)
+            return None
+
+        core.evict_device_start(ComponentType.FULL, 1)
+        try:
+            with (
+                mock.patch.object(component, "_evict_device_next_node", emit_action),
+                mock.patch.object(cache, "_apply_cache_action") as apply,
+            ):
+                self.assertEqual(
+                    cache._evict_device_next_node(ComponentType.FULL, {}),
+                    (None, True),
+                )
+                apply.assert_called_once_with(action)
+        finally:
+            core.evict_device_end(ComponentType.FULL)
 
     def test_each_eviction_step_result_is_drained(self):
         """Every step wrapper hands its result's frees to _free_values and

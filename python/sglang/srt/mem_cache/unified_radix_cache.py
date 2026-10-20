@@ -120,6 +120,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+        BaseEvictionResult,
+    )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
@@ -825,6 +828,13 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             self._drain_host_frees(host_frees)
 
+    def _apply_eviction_result(self, result: BaseEvictionResult) -> None:
+        """Drain a tree step before the next allocator-dependent decision."""
+        try:
+            self._free_values(result.device_frees, result.host_frees)
+        finally:
+            self._apply_cache_actions(result.cache_actions)
+
     def _accumulate_tracker(
         self,
         tracker: dict[ComponentType, int],
@@ -842,7 +852,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if result.mamba_backup_node_id is not None:
             assert component_type == ComponentType.MAMBA and result.node_id is None
             assert (
-                not result.device_frees and not result.host_frees and not result.tracker
+                not result.device_frees
+                and not result.host_frees
+                and not result.tracker
+                and not result.cache_actions
             )
             # Reserve a host state slot and wait for the backup acknowledgment
             # before freeing device state. If allocation fails, eviction still
@@ -856,7 +869,10 @@ class UnifiedRadixCache(BasePrefixCache):
         elif result.swa_backup_node_id is not None:
             assert component_type == ComponentType.SWA and result.node_id is None
             assert (
-                not result.device_frees and not result.host_frees and not result.tracker
+                not result.device_frees
+                and not result.host_frees
+                and not result.tracker
+                and not result.cache_actions
             )
             # The backup can cover several unbacked SWA segments. Reserve host
             # space for the whole window before copying it, then resume eviction
@@ -868,7 +884,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.evict_host(needed, ComponentType.SWA)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_swa_state_eviction(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -883,7 +899,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict one device leaf, consuming its step result; returns the
         deferred write-back BackupKV when one must run before the demote."""
         result = self.tree_core.evict_device_leaf(node_id, self.is_write_back)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if self._tracks_write_through_unbacked_evictions():
             self._record_dropped_tokens(
                 result.unbacked_tokens,
@@ -895,7 +911,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _demote(self, node_id: NodeId, tracker: dict[ComponentType, int]) -> None:
         """Demote a backed-up node, consuming its step result."""
         result = self.tree_core.demote(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         self._accumulate_tracker(tracker, result.tracker)
 
     def _drop_subtree_no_host(
@@ -903,7 +919,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> bool:
         """Run the write-back drop fallback, consuming its step result."""
         result = self.tree_core.drop_subtree_no_host(node_id)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         if result.is_dropped:
             self._record_dropped_tokens(
                 result.tracker.get(BASE_COMPONENT_TYPE, 0), reason="host_pressure"
@@ -1072,7 +1088,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable or lock is None or lock.swa_released:
             return
         result = self.tree_core.dec_swa_lock_only(lock.node, lock.receipt)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         lock.swa_released = True
 
     def release_swa_prefix_lock(self, req: Req) -> None:
@@ -1401,7 +1417,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
-        self._free_values(result.device_frees, result.host_frees)
+        self._apply_eviction_result(result)
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----

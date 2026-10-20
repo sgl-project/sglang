@@ -223,6 +223,7 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
             self.components_by_type[component_type],
             result.device_frees,
             result.host_frees,
+            result.cache_actions,
             target,
             result.tracker,
         )
@@ -249,6 +250,7 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
             result.tracker,
             result.device_frees,
             result.host_frees,
+            result.cache_actions,
         )
         return result
 

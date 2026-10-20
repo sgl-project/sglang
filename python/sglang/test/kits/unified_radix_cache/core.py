@@ -51,7 +51,12 @@ class FakeFullComponent(TreeComponent):
         return None
 
     def evict_component(
-        self, node, device_frees, host_frees, target: EvictLayer = EvictLayer.DEVICE
+        self,
+        node,
+        device_frees,
+        host_frees,
+        cache_actions,
+        target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         return 0, 0
 
@@ -64,7 +69,7 @@ class FakeFullComponent(TreeComponent):
     def _evict_device_start(self, request_cnt) -> None:
         pass
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         return None
 
     def _evict_device_end(self) -> None:
