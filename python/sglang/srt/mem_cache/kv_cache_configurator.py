@@ -2132,7 +2132,10 @@ class KVCacheConfigurator:
         max_running_requests: int,
         dsa_pool_class: type,
     ) -> KVCache:
-        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_cp_layer_shard_info,
+            get_glm_dsa_layer_shard_chunk,
+        )
 
         (
             dsa_cp_layer_shard_rank,
@@ -2161,6 +2164,7 @@ class KVCacheConfigurator:
             PoolCls = LayerSplitDSATokenToKVPool
             pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            pool_kwargs["layer_shard_chunk"] = get_glm_dsa_layer_shard_chunk()
         else:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:

@@ -577,10 +577,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             from sglang.srt.layers.cp.utils import (
                 get_glm_dsa_cp_layer_shard_info,
+                get_glm_dsa_layer_shard_chunk,
                 get_layer_shard_range,
             )
 
             _, shard_size = get_glm_dsa_cp_layer_shard_info(kvc)
+            shard_chunk = get_glm_dsa_layer_shard_chunk()
             if shard_size > 1:
                 # GLM-5.3 hybrid-layer support is intentionally limited to the
                 # non-LayerSplit pool below.
@@ -594,7 +596,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 active_set = set(active_indexer_layers)
                 max_owned = 0
                 for rank in range(shard_size):
-                    start, end = get_layer_shard_range(rank, shard_size, num_layers)
+                    start, end = get_layer_shard_range(
+                        rank, shard_size, num_layers, shard_chunk
+                    )
                     max_owned = max(
                         max_owned,
                         sum(

@@ -36,7 +36,7 @@ from sglang.srt.layers.cp.zigzag import (
     ZigzagCPStrategy,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel, uses_mla_backend
+from sglang.srt.runtime_context import get_memory, get_parallel, uses_mla_backend
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -91,30 +91,75 @@ def get_glm_dsa_layer_split_effective_num_layers(
     return max(1, owned_layers_upper_bound + 1)
 
 
+def get_glm_dsa_layer_shard_chunk() -> int:
+    """Layers per LayerSplit chunk: the unified L3 layer grid, else 1.
+
+    Unified L3 keys name absolute layer chunks, so a rank's owned range must
+    start on the fleet's ``--hicache-storage-layer-partition`` grid.
+    """
+    memory = get_memory()
+    if memory.hicache_storage_key_scheme != "unified":
+        return 1
+    return memory.hicache_storage_layer_partition or 1
+
+
 def get_layer_shard_range(
-    rank: int, shard_size: int, total_layers: int
+    rank: int, shard_size: int, total_layers: int, chunk_layers: int = 1
 ) -> Tuple[int, int]:
     """Contiguous ``[start, end)`` local-layer range owned by ``rank``.
 
-    Layers are split as evenly as possible; the first ``total_layers %
-    shard_size`` ranks own one extra layer.
+    Layers are cut into ``chunk_layers``-sized chunks (the last may be short),
+    and whole chunks are split as evenly as possible; the first ``num_chunks %
+    shard_size`` ranks own one extra chunk. ``chunk_layers=1`` is the plain
+    even layer split.
     """
-    base = total_layers // shard_size
-    rem = total_layers % shard_size
-    start = rank * base + min(rank, rem)
-    end = start + base + (1 if rank < rem else 0)
-    return start, end
+    num_chunks = -(-total_layers // chunk_layers)
+    base = num_chunks // shard_size
+    rem = num_chunks % shard_size
+    first_chunk = rank * base + min(rank, rem)
+    last_chunk = first_chunk + base + (1 if rank < rem else 0)
+    return (
+        min(first_chunk * chunk_layers, total_layers),
+        min(last_chunk * chunk_layers, total_layers),
+    )
 
 
-def get_layer_owner(local_layer_idx: int, shard_size: int, total_layers: int) -> int:
+def validate_layer_shard_chunk(
+    shard_size: int, total_layers: int, chunk_layers: int
+) -> None:
+    """Refuse a chunk size that would make some rank own more layers.
+
+    Device and host pools size every rank for ``ceil(total_layers /
+    shard_size)`` owned layers.
+    """
+    if chunk_layers < 1:
+        raise ValueError(f"chunk_layers must be positive: {chunk_layers}")
+    capacity = -(-total_layers // shard_size)
+    for rank in range(shard_size):
+        start, end = get_layer_shard_range(rank, shard_size, total_layers, chunk_layers)
+        if end - start > capacity:
+            raise ValueError(
+                f"a {chunk_layers}-layer chunk grid gives CP rank {rank} the "
+                f"layers [{start}, {end}), more than the {capacity} layers each "
+                f"rank is sized for ({total_layers} layers over {shard_size} "
+                f"ranks); pick a --hicache-storage-layer-partition that splits "
+                f"the layers into at least {shard_size} chunks of at most "
+                f"{capacity} layers."
+            )
+
+
+def get_layer_owner(
+    local_layer_idx: int, shard_size: int, total_layers: int, chunk_layers: int = 1
+) -> int:
     """CP rank that owns ``local_layer_idx`` under the contiguous split."""
     for rank in range(shard_size):
-        start, end = get_layer_shard_range(rank, shard_size, total_layers)
+        start, end = get_layer_shard_range(rank, shard_size, total_layers, chunk_layers)
         if start <= local_layer_idx < end:
             return rank
     raise ValueError(
         f"Invalid local_layer_idx={local_layer_idx} for "
-        f"shard_size={shard_size}, total_layers={total_layers}"
+        f"shard_size={shard_size}, total_layers={total_layers}, "
+        f"chunk_layers={chunk_layers}"
     )
 
 
@@ -354,6 +399,8 @@ __all__ = [
     "is_glm_dsa_cache_layer_split_enabled",
     "get_glm_dsa_cp_layer_shard_info",
     "get_glm_dsa_layer_split_effective_num_layers",
+    "get_glm_dsa_layer_shard_chunk",
     "get_layer_shard_range",
+    "validate_layer_shard_chunk",
     "get_layer_owner",
 ]

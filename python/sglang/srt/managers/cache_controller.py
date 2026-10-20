@@ -578,17 +578,7 @@ class HiCacheController:
         self.storage_config = self._generate_storage_config(
             model_name, storage_backend_extra_config
         )
-        # MLA replicates KV across attention-TP ranks. Full-page prefill CP
-        # also replicates KV, so unified keys need one CP writer per head shard.
-        # Legacy keys include the CP rank and must keep a writer for each copy.
-        self.backup_skip = (
-            self.storage_config.is_mla_model
-            # todo: load balancing
-            and self.storage_config.tp_rank != 0
-        ) or (
-            self.storage_config.unified_suffixes is not None
-            and self.storage_config.attn_cp_rank != 0
-        )
+        self.backup_skip = self._skips_storage_backup()
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -719,6 +709,40 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
+    def _skips_storage_backup(self) -> bool:
+        """Whether a peer rank writes the L3 objects this rank holds."""
+        config = self.storage_config
+        if config.unified_suffixes is not None and self._storage_layer_sharded():
+            # LayerSplit CP ranks own disjoint layer chunks, so every CP rank
+            # writes; only attention-TP replicates the MLA latent.
+            return get_parallel().attn_tp_rank != 0
+        # MLA replicates KV across attention-TP ranks. Full-page prefill CP
+        # also replicates KV, so unified keys need one CP writer per head shard.
+        # Legacy keys include the CP rank and must keep a writer for each copy.
+        return (
+            config.is_mla_model
+            # todo: load balancing
+            and config.tp_rank != 0
+        ) or (config.unified_suffixes is not None and config.attn_cp_rank != 0)
+
+    def _storage_device_pool(self):
+        """The device pool behind the storage anchor's host pool."""
+        # Host pools retain physical buffer descriptors, not the device pool.
+        # A hybrid controller can wrap a different pool than its storage anchor.
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+        return (
+            anchor_entry.device_pool
+            if anchor_entry is not None
+            else self.mem_pool_device
+        )
+
+    def _storage_layer_sharded(self) -> bool:
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+
+        return isinstance(self._storage_device_pool(), LayerSplitDSATokenToKVPool)
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -801,18 +825,11 @@ class HiCacheController:
                 "The unified key scheme requires a single page_unified KV pool; "
                 "composite and sidecar pools are not supported."
             )
-        if host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
-            raise NotImplementedError(
-                "The unified key scheme requires contiguous model layers "
-                "without packed draft layers."
-            )
-        # Host pools retain physical buffer descriptors, not the device pool.
-        # A hybrid controller can wrap a different pool than its storage anchor.
-        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
-        device_pool = (
-            anchor_entry.device_pool
-            if anchor_entry is not None
-            else self.mem_pool_device
+        device_pool = self._storage_device_pool()
+        start_layer, end_layer, is_final_stage = self._unified_layer_range(
+            host_pool=host_pool,
+            device_pool=device_pool,
+            is_final_pp_stage=parallel.pp_rank == parallel.pp_size - 1,
         )
         if getattr(host_pool, "dcp_size", 1) > 1:
             raise NotImplementedError(
@@ -830,9 +847,9 @@ class HiCacheController:
             attn_tp_rank=parallel.attn_tp_rank,
             attn_tp_size=parallel.attn_tp_size,
             attn_cp_size=attn_cp_size,
-            start_layer=host_pool.start_layer,
-            end_layer=host_pool.end_layer,
-            is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            is_final_stage=is_final_stage,
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
@@ -850,6 +867,58 @@ class HiCacheController:
             plan.suffixes,
         )
         return plan.suffixes
+
+    @staticmethod
+    def _unified_layer_range(
+        *, host_pool, device_pool, is_final_pp_stage: bool
+    ) -> tuple[int, int, bool]:
+        """Absolute ``[start, end)`` layers this rank keys, and whether it may end short."""
+        from sglang.srt.layers.cp.utils import get_layer_shard_range
+        from sglang.srt.mem_cache.dsa_cache_layer_split import (
+            LayerSplitDSATokenToKVPool,
+        )
+
+        if not isinstance(device_pool, LayerSplitDSATokenToKVPool):
+            if host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
+                raise NotImplementedError(
+                    "The unified key scheme requires contiguous model layers "
+                    "without packed draft layers."
+                )
+            return host_pool.start_layer, host_pool.end_layer, is_final_pp_stage
+
+        # LayerSplit is keyed like a PP stage: each CP rank names its own
+        # absolute layer range, and only the range ending the model may be short.
+        if host_pool.layer_num != host_pool.target_layer_num:
+            raise NotImplementedError(
+                "The unified key scheme requires contiguous model layers "
+                "without packed draft layers."
+            )
+        owned_counts = [
+            end - start
+            for start, end in (
+                get_layer_shard_range(
+                    rank,
+                    device_pool.layer_shard_size,
+                    device_pool.layer_num,
+                    device_pool.layer_shard_chunk,
+                )
+                for rank in range(device_pool.layer_shard_size)
+            )
+        ]
+        # Every rank's host block holds target_layer_num layers. A rank owning
+        # fewer would publish the padding under its chunk key, so this is
+        # refused on every rank alike until objects are cut per chunk.
+        if min(owned_counts) != host_pool.target_layer_num:
+            raise NotImplementedError(
+                f"LayerSplit ranks own {owned_counts} layers but each host "
+                f"block holds {host_pool.target_layer_num}; unified keys need "
+                f"per-chunk objects to store the shorter ranges."
+            )
+        return (
+            device_pool.layer_shard_start,
+            device_pool.layer_shard_end,
+            is_final_pp_stage and device_pool.layer_shard_end == device_pool.end_layer,
+        )
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any
