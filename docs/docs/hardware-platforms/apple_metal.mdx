@@ -126,7 +126,7 @@ SGLANG_USE_MLX=0 python -m sglang.launch_server \
 ```
 
 The installed `sgl_kernel` package must include `_metal` and
-`sgl_metal_kernels.metallib`; missing artifacts produce an error.
+`_metal.metallib`; missing artifacts produce an error.
 The model graph compiles lazily for each batch shape, so warm up before measuring
 decode throughput. AOT applies to the radix shaders, not the entire model.
 

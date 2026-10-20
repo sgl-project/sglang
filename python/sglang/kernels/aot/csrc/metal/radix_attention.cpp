@@ -183,6 +183,7 @@ nb::object radix_py(
   const int splits = std::min<int64_t>(16, std::max<int64_t>(1, 128 / groups));
   const int warps = page_size == 1 ? 4 : 8;
   const Stream stream = default_stream(Device::gpu);
+  // Keep layout conversion in the graph: compiled inputs can have different strides at replay.
   for (auto& input : inputs)
     input = contiguous(input, false, stream);
   inputs[6] = astype(inputs[6], int64, stream);

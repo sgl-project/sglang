@@ -15,11 +15,7 @@ from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
     CapabilityRequirement,
-<<<<<<< HEAD
     DeviceType,
-    FormatSignature,
-=======
->>>>>>> upstream/main
     KernelBackend,
     KernelSpec,
 )
@@ -30,11 +26,6 @@ register_kernel(
         backend=KernelBackend.AOT,
         target="sglang.kernels.ops.attention.mlx.radix_attention:radix_decode",
         capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
-        format_signature=FormatSignature(
-            supported_dtypes=("float32", "float16", "bfloat16"),
-            description="MLX arrays; read-only GQA decode with optional previous-token K/V",
-        ),
-        description="AOT Metal radix attention with lazy MLX graph integration.",
     )
 )
 

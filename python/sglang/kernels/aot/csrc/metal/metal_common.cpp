@@ -8,6 +8,7 @@ using namespace mlx::core;
 
 namespace sglang::metal_common {
 
+// MLX caches libraries by name, independently of their file paths.
 constexpr const char* kLibraryName = "sgl_metal_kernels";
 
 MTL::Library* g_library = nullptr;
