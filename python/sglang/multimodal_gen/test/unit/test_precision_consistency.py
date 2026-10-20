@@ -245,6 +245,21 @@ class TestDiffusionPrecisionConsistency(unittest.TestCase):
         self.assertEqual(module[1].weight.dtype, torch.float32)
         self.assertEqual(module.scale.dtype, torch.float32)
 
+    def test_temporary_module_dtype_restores_shared_buffer_in_each_owner(self):
+        """One buffer registered in two submodules diverges into two copies
+        after module.to(); both owners must come back in the original dtype."""
+        module = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+        module.to(torch.bfloat16)
+        shared = torch.ones(2, dtype=torch.float32)
+        module[0].register_buffer("shared", shared)
+        module[1].register_buffer("shared", shared)
+
+        with temporary_module_dtype(module, torch.float16):
+            self.assertEqual(module[1].shared.dtype, torch.float16)
+
+        self.assertEqual(module[0].shared.dtype, torch.float32)
+        self.assertEqual(module[1].shared.dtype, torch.float32)
+
     def test_temp_fp32_module_handles_mixed_parameter_dtypes(self):
         class MixedDtypeModule(torch.nn.Module):
             def __init__(self):

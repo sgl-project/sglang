@@ -25,7 +25,9 @@ def test_load_video_removes_downloaded_temp_file(monkeypatch, tmp_path, payload)
     succeeded or not."""
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     response = SimpleNamespace(
-        status_code=200, iter_content=lambda chunk_size: iter([payload])
+        status_code=200,
+        iter_content=lambda chunk_size: iter([payload]),
+        close=lambda: None,
     )
     monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
 
@@ -50,6 +52,42 @@ def test_line_wrapped_base64_image_is_saved_in_full(tmp_path):
 
     with open(path, "rb") as f:
         assert f.read() == raw
+
+
+def test_media_type_with_newline_is_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        save_base64_image_to_path(
+            "data:image/p\nng;base64,aGVsbG8=", str(tmp_path / "upload")
+        )
+    assert not any("\n" in p.name for p in tmp_path.rglob("*"))
+
+
+def test_load_video_rejects_oversized_download(monkeypatch, tmp_path):
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+    monkeypatch.setattr(vision, "_VIDEO_DOWNLOAD_MAX_BYTES", 10)
+    closed = []
+    response = SimpleNamespace(
+        status_code=200,
+        iter_content=lambda chunk_size: iter([b"x" * 8, b"x" * 8]),
+        close=lambda: closed.append(True),
+    )
+    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
+
+    with pytest.raises(ValueError, match="exceeds"):
+        vision.load_video("https://example.com/clip.mp4")
+
+    assert list(tmp_path.iterdir()) == []
+    assert closed == [True]
+
+
+def test_load_video_closes_response_on_bad_status(monkeypatch):
+    closed = []
+    response = SimpleNamespace(status_code=404, close=lambda: closed.append(True))
+    monkeypatch.setattr(vision.requests, "get", lambda *args, **kwargs: response)
+
+    with pytest.raises(ValueError, match="404"):
+        vision.load_video("https://example.com/clip.mp4")
+    assert closed == [True]
 
 
 def test_bool_env_var_warning_is_deduplicated_per_variable(monkeypatch):

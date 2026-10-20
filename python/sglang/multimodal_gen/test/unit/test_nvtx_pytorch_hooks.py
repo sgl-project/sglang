@@ -202,6 +202,26 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         self.assertEqual(push.call_count, pop.call_count)
         self.assertEqual(push.call_count, 1)
 
+    def test_failed_range_push_does_not_pop_in_post_hook(self) -> None:
+        """If range_push raises, the post-hook must not pop a range that was
+        never pushed."""
+        model = torch.nn.Linear(2, 2)
+        hooks = DiffusionNvtxHooks()
+        hooks.register_hooks(model, prefix="lin")
+        hooks.set_enabled(True)
+        with (
+            patch.object(
+                nvtx_pytorch_hooks.nvtx,
+                "range_push",
+                side_effect=RuntimeError("push failed"),
+            ),
+            patch.object(nvtx_pytorch_hooks.nvtx, "range_pop") as pop,
+        ):
+            with self.assertRaises(RuntimeError):
+                model(torch.zeros(2))
+        pop.assert_not_called()
+        self.assertEqual(hooks._range_pushed, [])
+
 
 class _NoOpResidencyStrategy:
     name = "noop"

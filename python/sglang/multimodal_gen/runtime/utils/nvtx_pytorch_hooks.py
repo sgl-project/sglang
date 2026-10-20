@@ -171,13 +171,19 @@ class DiffusionNvtxHooks:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> None:
-        self._range_pushed.append(self._enabled)
         if not self._enabled:
+            self._range_pushed.append(False)
             return
-        name = self._module_to_name_map.get(module, "unknown")
-        shapes = _collect_input_shapes(args, kwargs)
-        marker = f"{name} in={shapes}" if shapes else name
-        nvtx.range_push(marker)
+        try:
+            name = self._module_to_name_map.get(module, "unknown")
+            shapes = _collect_input_shapes(args, kwargs)
+            marker = f"{name} in={shapes}" if shapes else name
+            nvtx.range_push(marker)
+        except BaseException:
+            # Keep the stack aligned with the post-hook, which still fires.
+            self._range_pushed.append(False)
+            raise
+        self._range_pushed.append(True)
 
     def _forward_hook(
         self,
