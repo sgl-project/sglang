@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Ascend DWDP: resident local weights and remote-only prefetch.
-
-Only setup/cleanup use collectives. Two remote page slots are reused in layer
-order; pages intersecting a local shard remain private to that layer.
-"""
+"""Ascend DWDP with resident local shards and double-buffered remote weights."""
 
 from __future__ import annotations
 
@@ -41,7 +37,7 @@ class NPUDwdpManager(DwdpPrefetch):
         self.device = torch.device("npu", torch.npu.current_device())
         self._moe_layer_indices, self._position = [], {}
         self._specs, self._weights, self._exports = {}, {}, {}
-        self._peer_views, self._peer_ranges, self._remote_slices = {}, {}, {}
+        self._peer_views, self._peer_ranges, self._remote_slices = {}, [], {}
         self._vmm = None
         self._state = "new"
 
@@ -50,13 +46,16 @@ class NPUDwdpManager(DwdpPrefetch):
         dist.all_gather_object(values, value, group=self.group.cpu_group)
         return values
 
-    _collect_moe_layers = staticmethod(collect_moe_layers)
-
     def setup(self, model):
         if self._state == "ready":
             return
-        layers = self._collect_moe_layers(model)
+        layers = collect_moe_layers(model)
         num_routed = validate_moe_layers(layers, self.dwdp_size, model)
+        count = num_routed // self.dwdp_size
+        self._peer_ranges = [
+            (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
+        ]
+        local_start, local_end = self._peer_ranges[self.dwdp_rank]
         self._specs.clear()
         for li, layer in layers:
             for name in _WEIGHTS:
@@ -108,16 +107,9 @@ class NPUDwdpManager(DwdpPrefetch):
         for li, layer in layers:
             self._replicate_small_params(layer)
             weights = {name: self._weights[li, name] for name in _WEIGHTS}
-            count = layer.num_global_routed_experts // self.dwdp_size
-            self._peer_ranges[li] = [
-                (rank * count, (rank + 1) * count) for rank in range(self.dwdp_size)
-            ]
             for name, full in weights.items():
                 self._remote_slices[li, name] = build_remote_slices(
-                    full,
-                    self.dwdp_rank * count,
-                    (self.dwdp_rank + 1) * count,
-                    layer.num_global_routed_experts,
+                    full, local_start, local_end, num_routed
                 )
             layer.bind_full_expert_weights(weights)
 
@@ -146,8 +138,7 @@ class NPUDwdpManager(DwdpPrefetch):
         )
 
     def _migrate_weight(self, key, param, peer_pids):
-        # NZ has padding and cannot resize its storage. Rebind to ND before
-        # releasing the source; the unquantized NPU kernel accepts ND weights.
+        # Convert NZ to contiguous ND before copying and releasing its storage.
         data = torch.ops.npu.npu_format_cast(param.data, 2).contiguous()
         torch.npu.current_stream(self.device).synchronize()
         param.data = data
@@ -190,7 +181,7 @@ class NPUDwdpManager(DwdpPrefetch):
             _WEIGHTS,
             self._get_remote_slices,
             self._peer_views,
-            self._peer_ranges[layer_idx],
+            self._peer_ranges,
         )
 
     def cleanup(self):

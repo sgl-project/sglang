@@ -202,8 +202,7 @@ class NPUWeightVMM:
 
     def import_shard(self, share, size, offset):
         handle = self._fabric.import_handle(share)
-        # Keep imported lifetimes separate: all importers must release their
-        # mappings/handles before a producer releases resident physical pages.
+        # Release peer imports before producers free their physical pages.
         self._imports.append([handle, None, False])
         entry = self._imports[-1]
         ptr, ret = self.rt.reserve_mem_address(size, 0, 0, 1)
