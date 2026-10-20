@@ -134,9 +134,17 @@ def is_dspark_spec() -> bool:
 
 def uses_draft_swa_ring() -> bool:
     """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
-    state is tree-owned under encoder replay. The HIP backend still addresses the
-    draft SWA through the target's paged full-to-SWA mapping."""
-    return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
+    state is tree-owned under encoder replay. HIP unified_kv keeps the draft SWA in
+    its own (slot, position) ring instead."""
+    if not get_exec().features.enable_encoder_swa_bounded_replay:
+        return False
+    if _is_hip:
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
+
+        return not is_unified_kv_triton()
+    return True
 
 
 def get_draft_swa_ring_size(
@@ -1244,7 +1252,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         if (
             is_draft_worker
-            and not _is_hip
+            and (not _is_hip or uses_draft_swa_ring())
             and self.swa_kv_pool is not None
             and is_dspark_spec()
         ):

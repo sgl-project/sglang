@@ -1018,6 +1018,10 @@ class DeepseekV4HipRadixBackend(
             # DSpark draft workers verify gamma rows; the server arg keeps the
             # CUDA-side convention gamma + 1.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
+        if self.token_to_kv_pool.swa_valid_from is not None:
+            assert self._uses_dspark_draft_window(), (
+                "the draft SWA ring is addressed only by the V4.1 DSpark block window"
+            )
         self._fp8_decode_num_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1705,6 +1709,7 @@ class DeepseekV4HipRadixBackend(
             isinstance(metadata, DSV4Metadata)
             and forward_batch.out_cache_loc is not None
             and window is None
+            and self.token_to_kv_pool.swa_valid_from is None
         ):
             out_cache_loc = forward_batch.out_cache_loc
             if (
@@ -3541,6 +3546,7 @@ class DeepseekV4HipRadixBackend(
         raw_positions = seq_lens_casual - 1
 
         request_layout = None
+        swa_out_cache_loc = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
             if self.encoder_replay:
@@ -3578,6 +3584,11 @@ class DeepseekV4HipRadixBackend(
                 out_loc=out_loc,
                 block_size=dspark_block_size,
             )
+            if self.token_to_kv_pool.swa_valid_from is not None:
+                swa_out_cache_loc = self._dspark_swa_ring_out_cache_loc(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                )
         elif swa_replay_start is None:
             swa_page_indices = self.get_swa_page_indices(
                 seq_lens_casual=seq_lens_casual,
@@ -3620,6 +3631,7 @@ class DeepseekV4HipRadixBackend(
             index_topk=self.index_topk,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
+            swa_out_cache_loc=swa_out_cache_loc,
         )
 
         if need_compress:
@@ -3660,6 +3672,9 @@ class DeepseekV4HipRadixBackend(
         return swa_indices.to(torch.int32)
 
     get_dspark_swa_page_indices = DeepseekV4AttnBackend.get_dspark_swa_page_indices
+    _dspark_swa_ring_out_cache_loc = (
+        DeepseekV4AttnBackend._dspark_swa_ring_out_cache_loc
+    )
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
