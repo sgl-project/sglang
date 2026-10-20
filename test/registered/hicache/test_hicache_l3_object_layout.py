@@ -712,6 +712,27 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         controller._record_scheduler_init_infos([legacy_reply, legacy_reply])
         self.assertNotIn("hicache_object_layout", controller.get_init_info())
 
+    def test_pp_stage_replies_keep_rank_local_metadata(self):
+        """PP stages differ only in pp_rank, so the disabled reply must survive merging."""
+
+        def merged(*stores):
+            controller = self._controller(dp_controller.DataParallelController)
+            for store in stores:
+                reply = self._scheduler(store).get_init_info()
+                controller._record_scheduler_init_infos([reply])
+            return controller.get_init_info()["hicache_object_layout"]
+
+        layout = merged(
+            self._store(pp_rank=0, pp_size=2), self._store(pp_rank=1, pp_size=2)
+        )
+        self.assertFalse(layout["enabled"])
+        self.assertEqual(layout["hicache_object_layout"]["pp_size"], 2)
+        self.assertTrue(layout["hicache_object_layout"]["is_mla_backend"])
+        layout = merged(
+            self._store(pp_rank=0, pp_size=2), self._store(pp_rank=1, pp_size=3)
+        )
+        self.assertIn("Inconsistent", layout["reason"])
+
     def test_ray_actor_replies_reach_engine_init_info(self):
         """Ray actor replies must survive both controller and parent handshakes."""
         ray = ModuleType("ray")
