@@ -481,3 +481,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def get_structural_tag_name(self) -> str:
         return "qwen_3_coder"
+
+    def use_structural_tag_token_markers(self) -> bool:
+        # <tool_call> is a dedicated token in the qwen3 coder tokenizer, so
+        # match it by token id instead of the text "<tool_call>\n<function=".
+        return True
