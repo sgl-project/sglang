@@ -255,7 +255,9 @@ fn parse_endpoint(endpoint: &str) -> Result<Endpoint, InvalidEndpoint> {
 
 fn classify(code: tonic::Code) -> PrefixIndexError {
     match code {
-        tonic::Code::Unavailable => PrefixIndexError::Unreachable,
+        // A torn-down connection (e.g. an h2 GOAWAY) surfaces as UNKNOWN: degrade
+        // as for an unreachable indexer instead of failing the request.
+        tonic::Code::Unavailable | tonic::Code::Unknown => PrefixIndexError::Unreachable,
         // The indexer sheds an expired query as DEADLINE_EXCEEDED, while tonic
         // reports its own enforcement of the same `grpc-timeout` as CANCELLED.
         // This client cancels a query for no other reason.
@@ -312,6 +314,14 @@ mod tests {
             }
             .encoded_len()
                 <= MAX_GRPC_DECODING_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn classifies_a_torn_down_connection_as_unreachable() {
+        assert_eq!(
+            classify(tonic::Code::Unknown),
+            PrefixIndexError::Unreachable
         );
     }
 

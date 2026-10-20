@@ -26,7 +26,6 @@ import types
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
-import psutil
 import torch
 import torch.nn.functional as F
 import tqdm
@@ -55,12 +54,14 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_lora,
+    get_model,
     get_parallel,
     get_schedule,
     get_spec,
 )
 from sglang.srt.utils import (
     empty_context,
+    get_free_cpu_memory,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -1283,6 +1284,12 @@ class CPUGraphRunner:
         )
 
     def capture(self) -> None:
+        with get_model().override(
+            shared_experts=self.model_runner.model.shared_experts_config
+        ):
+            self._capture()
+
+    def _capture(self) -> None:
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
             if get_parallel().tp_rank == 0
@@ -1290,7 +1297,7 @@ class CPUGraphRunner:
         )
         for bs in capture_range:
             if get_parallel().tp_rank == 0:
-                avail_mem = psutil.virtual_memory().available / (1 << 30)
+                avail_mem = get_free_cpu_memory() / (1 << 30)
                 capture_range.set_description(
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
@@ -1434,6 +1441,7 @@ class CPUGraphRunner:
                     num_tokens,
                     req_pool_indices,
                     seq_lens,
+                    out_cache_loc,
                     None,
                     forward_batch.forward_mode,
                     forward_batch.spec_info,
