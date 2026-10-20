@@ -3674,9 +3674,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_active_rank_status = list(ranks.status)
         active_rank_count = sum(self.elastic_active_rank_status)
         self.recover_elastic_ep_communicator.set_fan_out(active_rank_count)
-        self.observe_elastic_ep_membership_communicator.set_fan_out(
-            active_rank_count
-        )
+        self.observe_elastic_ep_membership_communicator.set_fan_out(active_rank_count)
         self._dispatch_to_scheduler(ranks)
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
@@ -3904,9 +3902,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             membership_epoch=obj.membership_epoch,
         )
         self.auto_create_handle_loop()
-        responses = await self.observe_elastic_ep_membership_communicator(
-            scheduler_obj
-        )
+        responses = await self.observe_elastic_ep_membership_communicator(scheduler_obj)
         if not responses:
             raise RuntimeError(
                 "Membership observation returned no scheduler responses."
