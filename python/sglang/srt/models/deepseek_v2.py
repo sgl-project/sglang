@@ -108,6 +108,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
     post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_use_npu_moe_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -878,6 +879,10 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                # NPU all-gather path: the shared expert runs on local
+                # (scattered) tokens with replicated weights, same as the
+                # FP4 allgather path above.
+                or should_use_npu_moe_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
             self.shared_experts = DeepseekV2MLP(

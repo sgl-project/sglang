@@ -707,11 +707,35 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     )
 
 
+def should_use_npu_moe_allgather() -> bool:
+    """
+    All-gather + reduce-scatter (DP-attention) or all-reduce (non-DP) MoE for
+    NPU (Ascend) with no a2a backend.
+
+    DP-attention path: each rank keeps its DP-local token shard, the standard
+    dispatcher all-gathers tokens (optionally MXFP8-quantized) for local-expert
+    computation and reduce-scatters the expert outputs back.  Requires
+    moe_ep_size == attn_dp_size so the all-gather/reduce-scatter group aligns
+    with both the EP and DP decomposition.
+
+    Non-DP path: every rank already holds the full token set, so dispatch
+    skips the all-gather entirely and combine uses an all-reduce to sum the
+    per-rank partial expert outputs.
+    """
+    # return False
+    if not (_is_npu and get_moe_a2a_backend().is_none()):
+        return False
+    if is_dp_attention_enabled():
+        return get_parallel().moe_ep_size == get_parallel().attn_dp_size
+    return get_parallel().moe_ep_size > 1
+
+
 def is_moe_input_scattered_across_dp_ranks() -> bool:
     """Whether sparse MoE routing runs on a DP-local token shard."""
     return (
         not get_moe_a2a_backend().is_none()
         or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        or (should_use_npu_moe_allgather() and is_dp_attention_enabled())
         or get_parallel().dwdp_size > 1
     )
 
@@ -756,7 +780,7 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     """
     if get_parallel().dwdp_size > 1:
         return True
-    if should_use_flashinfer_cutlass_moe_fp4_allgather():
+    if should_use_flashinfer_cutlass_moe_fp4_allgather() or should_use_npu_moe_allgather():
         # The standard dispatcher all-gathers tokens and reduce-scatters the
         # expert outputs over _TP, which spans the whole EP group
         # (moe_ep_size == attn_dp_size), so both post-experts sums are already

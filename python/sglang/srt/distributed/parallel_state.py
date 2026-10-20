@@ -42,6 +42,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
@@ -1267,6 +1268,50 @@ class GroupCoordinator:
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
 
+        if pynccl_comm is None and _is_npu:
+            # HCCL has no variadic-size collective: the compact input
+            # ([sum(sizes), ...]) is re-padded into per-rank chunks of the max
+            # size, reduce_scatter_tensor sums them, and this rank's chunk is
+            # trimmed back to its real size so the output layout matches the
+            # pynccl path ([sizes[rank], ...]).
+            if sizes is not None:
+                assert len(sizes) == world_size
+                assert input_.shape[0] == sum(sizes)
+                chunk_size = sizes[self.rank_in_group]
+            else:
+                assert input_.shape[0] % world_size == 0
+                sizes = [input_.shape[0] // world_size] * world_size
+                chunk_size = sizes[self.rank_in_group]
+
+            max_tokens = max(sizes)
+            if all(s == max_tokens for s in sizes):
+                padded_input = input_.contiguous()
+            else:
+                padded_input = torch.zeros(
+                    (max_tokens * world_size, *input_.shape[1:]),
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                offset = 0
+                for rank, num_tokens in enumerate(sizes):
+                    padded_input[rank * max_tokens : rank * max_tokens + num_tokens] = (
+                        input_[offset : offset + num_tokens]
+                    )
+                    offset += num_tokens
+
+            gathered = torch.empty(
+                (max_tokens, *input_.shape[1:]),
+                dtype=input_.dtype,
+                device=input_.device,
+            )
+            torch.distributed.reduce_scatter_tensor(
+                gathered, padded_input, group=self.device_group
+            )
+            if output is not None:
+                output.copy_(gathered[:chunk_size])
+                return output
+            return gathered[:chunk_size]
+
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             return self._deterministic_reduce_scatterv(input_, output, sizes)
 
@@ -1451,6 +1496,49 @@ class GroupCoordinator:
         )
         return output_tensor
 
+    def _npu_all_gatherv_single(
+        self, input_: torch.Tensor, sizes: Optional[List[int]]
+    ) -> torch.Tensor:
+        """HCCL all_gatherv fallback for a single tensor (see all_gatherv)."""
+        world_size = self.world_size
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sizes[self.rank_in_group]
+        else:
+            sizes = [input_.shape[0]] * world_size
+
+        total = sum(sizes)
+        if total == 0:
+            return torch.empty(
+                (0, *input_.shape[1:]), dtype=input_.dtype, device=input_.device
+            )
+
+        max_tokens = max(sizes)
+        if all(s == max_tokens for s in sizes):
+            gathered = input_.contiguous()
+        else:
+            # Pad the local chunk so every rank sends max_tokens rows.
+            pad_size = max_tokens - input_.shape[0]
+            padding = [0, 0] * (input_.ndim - 1) + [0, pad_size]
+            gathered = F.pad(input_, padding, mode="constant", value=0)
+
+        output = torch.empty(
+            (max_tokens * world_size, *input_.shape[1:]),
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        torch.distributed.all_gather_into_tensor(
+            output, gathered, group=self.device_group
+        )
+
+        if all(s == max_tokens for s in sizes):
+            return output
+        # Compact: drop each rank's zero padding rows.
+        chunks = output.split(max_tokens, dim=0)
+        return torch.cat(
+            [chunk[:n] for chunk, n in zip(chunks, sizes)], dim=0
+        )
+
     def all_gatherv(
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
@@ -1466,6 +1554,19 @@ class GroupCoordinator:
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
+
+        if pynccl_comm is None and _is_npu:
+            # HCCL has no variadic-size collective: pad every rank's chunk to
+            # the max size, all_gather_into_tensor, then compact each rank's
+            # chunk down to its real size so the output layout matches the
+            # pynccl path ([sum(sizes), ...]).
+            single_input = isinstance(input_, torch.Tensor)
+            if single_input:
+                input_ = [input_]
+            output_list = [
+                self._npu_all_gatherv_single(inp, sizes) for inp in input_
+            ]
+            return output_list
 
         with pynccl_comm.change_state(enable=True):
             assert pynccl_comm is not None and not pynccl_comm.disabled, (

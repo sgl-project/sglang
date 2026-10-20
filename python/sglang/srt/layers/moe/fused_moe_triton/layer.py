@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
+    should_use_npu_moe_allgather,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import (
@@ -171,6 +172,18 @@ def create_moe_dispatcher(
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
+        if should_use_npu_moe_allgather():
+            if (moe_runner_config.num_fused_shared_experts or 0) > 0:
+                # The shared experts would be computed on every rank for all
+                # gathered tokens and over-counted by the combine
+                # reduce-scatter.
+                raise NotImplementedError(
+                    "--enforce-shared-experts-fusion is not supported by the "
+                    "NPU all-gather MoE path"
+                )
+            # NPU all-gather path: the standard dispatcher's all_gatherv +
+            # reduce_scatterv branch replaces the AscendTP TP-compile path.
+            return StandardDispatcher(moe_runner_config)
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()

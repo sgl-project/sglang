@@ -20,6 +20,11 @@ from sglang.srt.hardware_backend.npu.moe.activation import (
     NPUSwigluQuant,
     NPUSwigluStepAndMul,
 )
+from sglang.srt.hardware_backend.npu.moe.finalize_routing import NPUMoETokenUnpermute
+from sglang.srt.hardware_backend.npu.moe.init_routing import (
+    MXFP8_QUANT_MODE,
+    NPUMoEInitRouting_v2,
+)
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
     NPUW4A8Int8MoEMethod,
@@ -76,9 +81,15 @@ if TYPE_CHECKING:
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardCombineInput,
+        StandardDispatchOutput,
+    )
 
 from sglang.srt.layers.moe.utils import (
+    DispatcherOutputDtype,
     MoeRunnerBackend,
+    get_ascend_dispatcher_output_dtype,
     get_moe_a2a_backend,
 )
 
@@ -399,6 +410,98 @@ def post_permute_ascend_to_deepep_normal(
         topk_ids=running_state["topk_ids"],
         topk_weights=running_state["topk_weights"],
     )
+
+
+@register_pre_permute("standard", "ascend")
+def pre_permute_standard_to_ascend(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> AscendRunnerInput:
+    if (runner_config.num_fused_shared_experts or 0) > 0:
+        raise NotImplementedError(
+            "Fused shared experts are not supported by the NPU standard "
+            "all-gather dispatcher: every rank sees all tokens after the "
+            "all-gather, so the shared experts would be computed num_ranks "
+            "times and over-counted by the combine reduce-scatter."
+        )
+
+    topk_output = dispatch_output.topk_output
+    topk_ids = topk_output.topk_ids.to(torch.int32)
+    running_state["topk_weights"] = topk_output.topk_weights
+
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+
+    dispatcher_dtype = get_ascend_dispatcher_output_dtype(
+        runner_config.layer.dispatcher
+    )
+
+    if hidden_states_scale is not None:
+        # Activations were pre-quantized to MXFP8 (fp8_e4m3 payload + e8m0
+        # block scale) before the all-gather; route both through init_routing
+        # with quant_mode=-1 (no re-quantization) and let it carry the block
+        # scale along with the tokens.
+        init = NPUMoEInitRouting_v2(quant_mode=-1)
+        permuted_hidden_states, expanded_row_idx, expert_tokens, hidden_states_scale = (
+            init._init_routing(
+                hidden_states,
+                topk_ids,
+                runner_config.num_local_experts,
+                topk_ids.shape[-1],
+                scale=hidden_states_scale,
+                x_dtype=torch.float8_e4m3fn,
+            )
+        )
+    else:
+        # hidden_states_scale is None: the dispatcher did not pre-quantize,
+        # so dispatcher_dtype can only be BF16 or INT8 here (MXFP8 always
+        # pre-quantizes in StandardDispatcher.dispatch and enters the if
+        # branch above). INT8 quantizes on the fly inside init_routing
+        # (quant_mode=1); BF16 passes through (quant_mode=-1).
+        if dispatcher_dtype == DispatcherOutputDtype.INT8:
+            init = NPUMoEInitRouting_v2(quant_mode=1)
+        else:
+            init = NPUMoEInitRouting_v2(quant_mode=-1)
+        permuted_hidden_states, expanded_row_idx, expert_tokens, hidden_states_scale = (
+            init._init_routing(
+                hidden_states,
+                topk_ids,
+                runner_config.num_local_experts,
+                topk_ids.shape[-1],
+            )
+        )
+
+    running_state["expanded_row_idx"] = expanded_row_idx
+    return AscendRunnerInput(
+        hidden_states=permuted_hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        expert_tokens=expert_tokens,
+        group_list_type=1,
+    )
+
+
+@register_post_permute("ascend", "standard")
+def post_permute_ascend_to_standard(
+    runner_output: AscendRunnerOutput,
+    quant_info: AscendQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> StandardCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    # Restore the global token order (compact layout) and apply routing
+    # weights; the dispatcher's combine then reduce-scatters partial outputs.
+    hidden_states = NPUMoETokenUnpermute()._finalize_routing(
+        runner_output.hidden_states,
+        topk_weights=running_state["topk_weights"].to(
+            runner_output.hidden_states.dtype
+        ),
+        expanded_row_idx=running_state["expanded_row_idx"],
+        topk_ids=None,
+    )
+    return StandardCombineInput(hidden_states=hidden_states)
 
 
 @register_post_permute("ascend", "deepep_ll")
