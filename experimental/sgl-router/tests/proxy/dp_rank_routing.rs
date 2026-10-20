@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
-use sgl_router::config::{Config, PolicyKind, StickyConfig, StickyFallbackKind};
+use sgl_router::config::{Config, DpRankPolicy, PolicyKind, StickyConfig, StickyFallbackKind};
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
 use sgl_router::policies::request_tokens_for;
@@ -18,6 +18,9 @@ use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::state::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
+};
+use sgl_router::state::load_monitor::router_inflight_load::{
+    RouterInflightLoadRegistry, SystemTimeClock,
 };
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{EngineProfile, WireProtocol, WorkerRegistry};
@@ -63,6 +66,8 @@ fn router(
         let profile = EngineProfile {
             protocol: WireProtocol::default(),
             dp_ranks,
+            openai: None,
+            grpc_port: None,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
@@ -71,7 +76,10 @@ fn router(
     let policies = Arc::new(build_registry(&cfg, Arc::clone(&tree), Arc::clone(&oracle)).unwrap());
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    let mut ctx = AppContext::new(cfg, tokenizers, proxy, registry, policies);
+    let stale = Duration::from_secs(cfg.router_inflight_load.stale_request_timeout_secs);
+    let inflight = RouterInflightLoadRegistry::new(Arc::new(SystemTimeClock), stale);
+    let mut ctx =
+        AppContext::with_router_inflight_load(cfg, tokenizers, proxy, registry, policies, inflight);
     ctx.dp_rank_prefix_provider = Some(RadixTreePrefixProvider::new(tree, oracle));
     build_router(Arc::new(ctx))
 }
@@ -166,6 +174,119 @@ async fn pd_room_maps_decode_to_the_prefill_rank() {
     assert_eq!(room % 4, rank.parse::<u64>().unwrap());
 }
 
+async fn send_together(app: &axum::Router, count: usize, stream: bool) -> Vec<StatusCode> {
+    let send = |_| async move {
+        let mut body = body();
+        body["stream"] = json!(stream);
+        let request = Request::post("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(KEY, "conv")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        status
+    };
+    futures::future::join_all((0..count).map(send)).await
+}
+
+fn one_decode_slot() -> Config {
+    let mut cfg = sticky_config();
+    cfg.proxy.decode_dispatch_limit = std::num::NonZeroU32::new(1);
+    cfg
+}
+
+#[tokio::test]
+async fn decode_dispatch_limit_gates_decode_per_prefill_rank() {
+    let prefill = MockWorker::start_hanging(Duration::from_millis(800)).await;
+    let decode = MockWorker::start(vec!["data: chunk\n\n"]).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    for (stream, waits) in [(false, true), (true, false)] {
+        let app = router(one_decode_slot(), &workers, Default::default());
+        let start = Instant::now();
+        let statuses = send_together(&app, 2, stream).await;
+        assert!(statuses.iter().all(StatusCode::is_success));
+        let waited = start.elapsed() >= Duration::from_millis(700);
+        assert_eq!(waited, waits, "stream={stream}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_expiring_before_decode_aborts_its_prefill() {
+    let prefill = MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let decode = MockWorker::start(vec![]).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let mut cfg = one_decode_slot();
+    cfg.router_inflight_load.stale_request_timeout_secs = 1;
+    let app = router(cfg, &workers, Default::default());
+    assert_eq!(send_together(&app, 1, false).await, [StatusCode::OK]);
+    assert_eq!(
+        send_together(&app, 1, false).await,
+        [StatusCode::GATEWAY_TIMEOUT]
+    );
+    let start = Instant::now();
+    while prefill.abort_log.lock().unwrap().is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(2), "no prefill abort");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let aborted = prefill.abort_log.lock().unwrap().clone();
+    assert_eq!(aborted.len(), 1);
+    assert_eq!(aborted[0]["rid"], prefill.captured_json().await["rid"]);
+    assert_ne!(aborted[0]["rid"], decode.captured_json().await["rid"]);
+}
+
+#[tokio::test]
+async fn a_failed_decode_frees_its_slot() {
+    let prefill = MockWorker::start_hanging(Duration::from_secs(2)).await;
+    let decode =
+        MockWorker::start_returning_error(StatusCode::INTERNAL_SERVER_ERROR, json!({})).await;
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 2),
+        (&decode, WorkerMode::Decode, 2),
+    ];
+    let app = router(one_decode_slot(), &workers, Default::default());
+    let start = Instant::now();
+    for _ in 0..2 {
+        assert_eq!(
+            send_together(&app, 1, false).await,
+            [StatusCode::INTERNAL_SERVER_ERROR]
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "a failed decode kept its slot"
+    );
+}
+
+#[tokio::test]
+async fn round_robin_gives_decode_ranks_turns() {
+    let (prefill, decode) = (
+        MockWorker::start(vec![]).await,
+        MockWorker::start(vec![]).await,
+    );
+    let workers = [
+        (&prefill, WorkerMode::Prefill, 4),
+        (&decode, WorkerMode::Decode, 4),
+    ];
+    let mut cfg = sticky_config();
+    cfg.model.dp_rank_policy = DpRankPolicy::RoundRobin;
+    let app = router(cfg, &workers, Default::default());
+    let mut ranks = Vec::new();
+    for _ in 0..8 {
+        ranks.push(send(&app, &decode, &[(KEY, "conv-pd")]).await.unwrap());
+    }
+    assert_eq!(ranks, ["0", "1", "2", "3", "0", "1", "2", "3"]);
+}
+
 #[tokio::test]
 async fn any_policy_picks_the_rank_with_the_deepest_prefix() {
     let worker = MockWorker::start(vec![]).await;
@@ -218,6 +339,7 @@ async fn pd_generate_carries_each_rank_in_its_body() {
         p["bootstrap_room"].as_u64().unwrap() % 4
     );
     assert!(d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2));
+    assert_eq!(d["disagg_prefill_dp_rank"], p["routed_dp_rank"]);
 }
 
 /// The engine gives fan-out item i the room `room + i`, so one pinned prefill rank would break decode.
@@ -228,6 +350,10 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
     for (path, mut body) in [
         ("/v1/chat/completions", chat),
         ("/generate", json!({"text": ["a", "b"]})),
+        (
+            "/v1/completions",
+            json!({"model": MODEL, "prompt": ["a", "b"]}),
+        ),
     ] {
         // A caller's rank is replaced too.
         body["routed_dp_rank"] = 3.into();
@@ -238,7 +364,8 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
             "{path}"
         );
         assert!(
-            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2),
+            d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2)
+                && d.get("disagg_prefill_dp_rank").is_none(),
             "{path}"
         );
     }

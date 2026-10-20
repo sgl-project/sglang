@@ -122,7 +122,6 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.stage.transformer = object()
         self.stage.transformer_2 = None
         self.stage._cache_dit_enabled = False
-        self.stage._cached_num_steps = None
         self.stage._cache_dit_request_overrides = {}
         self.stage._cache_dit_active_key = None
 

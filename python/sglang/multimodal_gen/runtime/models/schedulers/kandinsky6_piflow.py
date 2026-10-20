@@ -25,117 +25,8 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 )
 
 
-class DXPolicy:
-    def __init__(  # noqa: PLR0913
-        self,
-        denoising_output: torch.Tensor,
-        x_t_src: torch.Tensor,
-        sigma_t_src: torch.Tensor,
-        segment_size: float | torch.Tensor = 1.0,
-        shift: float = 1.0,
-        mode: str = "grid",
-        eps: float = 1e-4,
-    ) -> None:
-        self.x_t_src = x_t_src
-        self.ndim = x_t_src.dim()
-        self.shift = shift
-        self.eps = eps
-        if mode not in ("grid", "polynomial"):
-            raise ValueError(f"Unknown mode: {mode}")
-        self.mode = mode
-
-        self.sigma_t_src = sigma_t_src.reshape(
-            *sigma_t_src.size(), *((self.ndim - sigma_t_src.dim()) * [1])
-        )
-        self.raw_t_src = self._unwarp_t(self.sigma_t_src)
-        segment = segment_size
-        if isinstance(segment, torch.Tensor) and segment.dim() < self.raw_t_src.dim():
-            segment = segment.reshape(
-                *segment.size(), *((self.raw_t_src.dim() - segment.dim()) * [1])
-            )
-        self.raw_t_dst = (self.raw_t_src - segment).clamp(min=0)
-        self.segment_size = (self.raw_t_src - self.raw_t_dst).clamp(min=eps)
-        self.denoising_output_x_0 = self._u_to_x_0(
-            denoising_output, self.x_t_src, self.sigma_t_src
-        )
-
-    @staticmethod
-    def _interpolate(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        n = x.size(1)
-        if n < 2:  # noqa: PLR2004
-            return x.squeeze(1)
-        t = t.clamp(min=0, max=1) * (n - 1)
-        t0 = t.floor().to(torch.long).clamp(min=0, max=n - 2)
-        t1 = t0 + 1
-        indices = torch.stack([t0, t1], dim=1)
-        values = torch.gather(x, dim=1, index=indices.expand(-1, -1, *x.shape[2:]))
-        return (t1 - t) * values[:, 0] + (t - t0) * values[:, 1]
-
-    def _unwarp_t(self, sigma_t: torch.Tensor) -> torch.Tensor:
-        return sigma_t / (self.shift + (1 - self.shift) * sigma_t)
-
-    @staticmethod
-    def _u_to_x_0(
-        denoising_output: torch.Tensor,
-        x_t: torch.Tensor,
-        sigma_t: torch.Tensor,
-    ) -> torch.Tensor:
-        return x_t.unsqueeze(1) - sigma_t.unsqueeze(1) * denoising_output
-
-    def pi(self, x_t: torch.Tensor, sigma_t: torch.Tensor) -> torch.Tensor:
-        sigma_t = sigma_t.reshape(*sigma_t.size(), *((self.ndim - sigma_t.dim()) * [1]))
-        raw_t = self._unwarp_t(sigma_t)
-        if self.mode == "grid":
-            x_0 = self._interpolate(
-                self.denoising_output_x_0,
-                (raw_t - self.raw_t_dst) / self.segment_size,
-            )
-        else:
-            p_order = self.denoising_output_x_0.size(1)
-            diff_t = self.raw_t_src - raw_t
-            basis = torch.stack([diff_t**i for i in range(p_order)], dim=1)
-            x_0 = torch.sum(basis * self.denoising_output_x_0, dim=1)
-        return (x_t - x_0) / sigma_t.clamp(min=self.eps)
-
-
 def shift_timesteps(t: torch.Tensor, shift: float) -> torch.Tensor:
     return shift * t / (1 + (shift - 1) * t)
-
-
-def policy_rollout_fm(  # noqa: PLR0913
-    x_t_start: torch.Tensor,
-    sigma_t_start: torch.Tensor,
-    raw_t_start: torch.Tensor,
-    raw_t_end: torch.Tensor,
-    total_substeps: int,
-    policy: DXPolicy,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_batches = x_t_start.size(0)
-    ndim = x_t_start.dim()
-    shape = (num_batches, *((ndim - 1) * [1]))
-    raw_t_start = raw_t_start.reshape(shape)
-    raw_t_end = raw_t_end.reshape(shape)
-    sigma_t = sigma_t_start.reshape(shape)
-
-    delta_raw_t = raw_t_start - raw_t_end
-    num_substeps = (delta_raw_t * total_substeps).round().to(torch.long).clamp(min=1)
-    substep_size = delta_raw_t / num_substeps
-    max_num_substeps = num_substeps.max()
-
-    raw_t = raw_t_start
-    x_t = x_t_start
-    for substep_id in range(max_num_substeps.item()):
-        velocity = policy.pi(x_t, sigma_t)
-        raw_t_minus = (raw_t - substep_size).clamp(min=0)
-        sigma_t_minus = shift_timesteps(raw_t_minus, policy.shift)
-        x_t_minus = x_t + velocity * (sigma_t_minus - sigma_t)
-
-        active_mask = num_substeps > substep_id
-        x_t = torch.where(active_mask, x_t_minus, x_t)
-        sigma_t = torch.where(active_mask, sigma_t_minus, sigma_t)
-        raw_t = torch.where(active_mask, raw_t_minus, raw_t)
-
-    return x_t, sigma_t, sigma_t.flatten() * 1_000
 
 
 class PiflowScheduler(FlowMatchEulerDiscreteScheduler):
@@ -239,25 +130,41 @@ class PiflowScheduler(FlowMatchEulerDiscreteScheduler):
         sigma_src = self.sigmas[step_index].to(device=sample.device)
         token_shape = (sample.shape[0], *((sample.ndim - 1) * [1]))
         sigma = sigma_src.expand(sample.shape[0]).reshape(token_shape)
-        segment = (raw_src - raw_dst).expand(sample.shape[0])
-        policy = DXPolicy(
-            model_output,
-            sample,
-            sigma,
-            segment,
-            shift=float(self.config.shift),
-            mode="grid",
-            eps=self.eps,
-        )
-        updated, _, _ = policy_rollout_fm(
-            sample,
-            sigma,
-            raw_src.expand(sample.shape[0]),
-            raw_dst.expand(sample.shape[0]),
-            self.num_policy_substeps,
-            policy,
-        )
-        return updated.to(dtype=sample.dtype)
+        segment = (raw_src - raw_dst).expand(sample.shape[0]).reshape(token_shape)
+        shift = float(self.config.shift)
+        policy_src = sigma / (shift + (1 - shift) * sigma)
+        policy_dst = (policy_src - segment).clamp(min=0)
+        policy_segment = (policy_src - policy_dst).clamp(min=self.eps)
+        x0_grid = sample.unsqueeze(1) - sigma.unsqueeze(1) * model_output
+
+        raw_t = raw_src.expand(sample.shape[0]).reshape(token_shape)
+        delta = raw_t - raw_dst.expand(sample.shape[0]).reshape(token_shape)
+        substeps = (delta * self.num_policy_substeps).round().long().clamp(min=1)
+        substep_size = delta / substeps
+        for index in range(substeps.max().item()):
+            # the checkpoint predicts x0 on a grid in unwarped time
+            policy_t = sigma / (shift + (1 - shift) * sigma)
+            t = ((policy_t - policy_dst) / policy_segment).clamp(0, 1) * (
+                self.n_grid - 1
+            )
+            t0 = t.floor().long().clamp(0, self.n_grid - 2)
+            t1 = t0 + 1
+            indices = torch.stack([t0, t1], dim=1)
+            values = torch.gather(
+                x0_grid, 1, indices.expand(-1, -1, *x0_grid.shape[2:])
+            )
+            x0 = (t1 - t) * values[:, 0] + (t - t0) * values[:, 1]
+            velocity = (sample - x0) / sigma.clamp(min=self.eps)
+            # release grid interpolation temporaries before the state update/next gather
+            del values, x0, indices, t, t0, t1, policy_t
+            next_raw = (raw_t - substep_size).clamp(min=0)
+            next_sigma = shift_timesteps(next_raw, shift)
+            updated = sample + velocity * (next_sigma - sigma)
+            active = substeps > index
+            sample = torch.where(active, updated, sample)
+            sigma = torch.where(active, next_sigma, sigma)
+            raw_t = torch.where(active, next_raw, raw_t)
+        return sample
 
     def _step_index_for(self, timestep: torch.Tensor | float) -> int:
         if self.step_index is None:
