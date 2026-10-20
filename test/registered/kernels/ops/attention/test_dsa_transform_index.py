@@ -5,8 +5,8 @@ import torch
 
 import sglang.kernels.ops.attention.dsa.transform_index as transform_index_module
 from sglang.kernels.ops.attention.dsa.transform_index import (
-    transform_index_page_table_decode_fast,
-    transform_index_page_table_prefill_fast,
+    transform_index_page_table_decode,
+    transform_index_page_table_prefill,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.dsa_transform_index import (
@@ -121,7 +121,7 @@ class TestDSATransformIndex(CustomTestCase):
         expected[topk_indices < 0] = -1
         result = torch.empty_like(expected) if provide_result else None
 
-        actual = transform_index_page_table_decode_fast(
+        actual = transform_index_page_table_decode(
             page_table=page_table,
             topk_indices=topk_indices,
             result=result,
@@ -158,7 +158,7 @@ class TestDSATransformIndex(CustomTestCase):
             topk_width,
         )
 
-        actual = transform_index_page_table_prefill_fast(
+        actual = transform_index_page_table_prefill(
             page_table=page_table,
             topk_indices=topk_indices,
             extend_lens_cpu=extend_lens_cpu,
@@ -176,10 +176,10 @@ class TestDSATransformIndex(CustomTestCase):
 
         with patch.object(
             transform_index_module,
-            "transform_index_page_table_decode_fast",
+            "transform_index_page_table_decode",
             side_effect=AssertionError("prefill must not launch decode per request"),
         ):
-            transform_index_page_table_prefill_fast(
+            transform_index_page_table_prefill(
                 page_table=page_table,
                 topk_indices=topk_indices,
                 extend_lens_cpu=extend_lens_cpu,
@@ -197,7 +197,7 @@ class TestDSATransformIndex(CustomTestCase):
             "tensor",
             side_effect=AssertionError("must reuse device-side metadata"),
         ):
-            transform_index_page_table_prefill_fast(
+            transform_index_page_table_prefill(
                 page_table=page_table,
                 topk_indices=topk_indices,
                 extend_lens_cpu=extend_lens_cpu,
@@ -282,7 +282,7 @@ class TestDSATransformIndex(CustomTestCase):
                     page_table_is_expanded=page_table_is_expanded,
                 )
                 expected = transform_index_page_table_prefill_ref(**kwargs)
-                actual = transform_index_page_table_prefill_fast(**kwargs)
+                actual = transform_index_page_table_prefill(**kwargs)
                 torch.cuda.synchronize()
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
