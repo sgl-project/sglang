@@ -33,6 +33,22 @@ class WorkerOutOfMemoryError(RuntimeError):
     """The worker ran out of GPU memory on this request."""
 
 
+def _is_out_of_memory(error) -> bool:
+    """Whether a worker error is an OOM: by type when it is an exception,
+    otherwise by the message (the scheduler usually sends a string)."""
+    oom_types = tuple(
+        t
+        for t in (
+            getattr(torch, "OutOfMemoryError", None),
+            getattr(torch.cuda, "OutOfMemoryError", None),
+        )
+        if isinstance(t, type)
+    )
+    if oom_types and isinstance(error, oom_types):
+        return True
+    return "out of memory" in str(error).lower()
+
+
 def _hash_value(digest, value) -> None:
     """Hash ``value`` into ``digest``, framing each item so values cannot merge."""
     if torch.is_tensor(value):
@@ -129,6 +145,14 @@ def _cfg_groups(options, batch: int) -> list[list[int]]:
         )
     per_chunk = batch // len(chunks)
     return [list(range(image, batch, per_chunk)) for image in range(per_chunk)]
+
+
+def _cfg_group_count(options, batch: int):
+    """Number of cfg_only groups, or None when the batch cannot be grouped."""
+    try:
+        return len(_cfg_groups(options, batch))
+    except ValueError:
+        return None
 
 
 def _group_transformer_options(options, image: int, per_chunk: int):
@@ -388,7 +412,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         output_batch = self.generator._send_to_scheduler_and_wait_for_response([req])
         if output_batch.error:
             message = f"SGLang Diffusion worker failed: {output_batch.error}"
-            if "out of memory" in str(output_batch.error).lower():
+            if _is_out_of_memory(output_batch.error):
                 raise WorkerOutOfMemoryError(message)
             raise RuntimeError(message)
         return self.adapter.unpack(output_batch.noise_pred, packed, x)
@@ -399,8 +423,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
         batch = int(x.shape[0]) if torch.is_tensor(x) else 1
         if batch == 1:
             return self._forward_one(x, timestep, context, **kwargs)
+        groups = _cfg_group_count(kwargs.get("transformer_options"), batch)
         while True:
             mode = self._run_batching or self.native_batching
+            if mode == "cfg_only" and groups is None:
+                # No cond chunks to group by: send one request per row instead.
+                mode = "off"
             try:
                 if mode == "full":
                     return self._forward_batch(x, timestep, context, batch, **kwargs)
@@ -413,6 +441,10 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 if mode not in ("full", "cfg_only"):
                     raise
                 lower = NATIVE_BATCHING_MODES[NATIVE_BATCHING_MODES.index(mode) - 1]
+                if lower == "cfg_only" and (groups is None or groups == 1):
+                    # cfg_only would resend the same rows (one group) or
+                    # cannot group them at all: go straight to per row.
+                    lower = "off"
                 logger.warning(
                     "SGLD worker ran out of GPU memory with native_batching=%s; "
                     "using %s for the rest of this sampler run",

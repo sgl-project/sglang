@@ -154,12 +154,37 @@ def test_cfg_only_with_one_image_is_one_request() -> None:
     assert len(ex.sent) == 1 and ex.sent[0].latents.shape[0] == 2
 
 
-def test_cfg_only_needs_the_cond_chunks() -> None:
+def test_cfg_only_without_cond_chunks_falls_back_to_per_row() -> None:
     ex = _Executor(ZImageAdapter(), native_batching="cfg_only")
     x, timestep, context = _zimage_batch(batch=4)
-    with pytest.raises(ValueError, match="cond_or_uncond"):
-        ex(x, timestep, context, transformer_options={"cond_or_uncond": [0, 1, 0]})
-    assert ex.sent == []
+    ex(x, timestep, context, transformer_options={"cond_or_uncond": [0, 1, 0]})
+    assert [p.latents.shape[0] for p in ex.sent] == [1, 1, 1, 1]
+
+
+def test_out_of_memory_without_cond_chunks_skips_cfg_only(caplog) -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="full", max_rows=2)
+    x, timestep, context = _zimage_batch(batch=4)
+    with caplog.at_level(logging.WARNING):
+        ex(x, timestep, context, transformer_options={})
+    assert [p.latents.shape[0] for p in ex.sent] == [1, 1, 1, 1]
+    assert "native_batching=full; using off" in caplog.text
+
+
+def test_out_of_memory_with_one_image_skips_the_identical_retry() -> None:
+    ex = _Executor(ZImageAdapter(), native_batching="full", max_rows=1)
+    ex.attempts = 0
+    execute = ex._execute_packed
+
+    def counting(packed, x, timestep):
+        ex.attempts += 1
+        return execute(packed, x, timestep)
+
+    ex._execute_packed = counting
+    x, timestep, context, options = _cfg_batch(images=1)
+    ex(x, timestep, context, transformer_options=options)
+    # One full attempt that ran out of memory, then two single rows.
+    assert ex.attempts == 3
+    assert [p.latents.shape[0] for p in ex.sent] == [1, 1]
 
 
 def test_out_of_memory_steps_down_for_the_rest_of_the_run(caplog) -> None:
