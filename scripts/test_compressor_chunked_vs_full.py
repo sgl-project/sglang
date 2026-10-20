@@ -225,11 +225,13 @@ def main() -> int:
         [split], [n - split], inp["state_block_size"], args.coff, r, inp["banks_per_batch"]
     )
     state_b = inp["state_cache"].clone().npu()
+    # rope rows per call = min(tokenSize, tokenSize // cmp_ratio + batch):
+    # the extra row covers the partial tail block.
     _call(args, inp, state_b, table_b1, inp["x"][:split],
-          inp["rope_sin"][:first_k], inp["rope_cos"][:first_k], 0, split)
+          inp["rope_sin"][:first_k + 1], inp["rope_cos"][:first_k + 1], 0, split)
     out_b2 = _call(args, inp, state_b, table_b2, inp["x"][split:],
-                   inp["rope_sin"][first_k:first_k + tail_k],
-                   inp["rope_cos"][first_k:first_k + tail_k], split, n - split)
+                   inp["rope_sin"][first_k:first_k + tail_k + 1],
+                   inp["rope_cos"][first_k:first_k + tail_k + 1], split, n - split)
     torch_npu.npu.synchronize()
 
     diffs = []
