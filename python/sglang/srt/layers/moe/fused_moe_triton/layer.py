@@ -359,6 +359,7 @@ class FusedMoE(torch.nn.Module):
         gate_up_interleaved: bool = True,
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
+        uses_expert_location: bool = True,
     ):
         super().__init__()
         if params_dtype is None:
@@ -367,6 +368,7 @@ class FusedMoE(torch.nn.Module):
         self.params_dtype = params_dtype
         self.layer_name = prefix
         self.layer_id = layer_id
+        self.uses_expert_location = uses_expert_location
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -1058,7 +1060,9 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
-        global_expert_location_metadata = get_global_expert_location_metadata()
+        global_expert_location_metadata = (
+            get_global_expert_location_metadata() if self.uses_expert_location else None
+        )
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):
                 expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
