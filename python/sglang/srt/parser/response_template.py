@@ -538,9 +538,9 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             for event in adapter.parse(text)
         )
 
-    def _to_tool_call_item(
-        self, value: Any, tool_indices: dict[str, int], tool_index: int
-    ) -> ToolCallItem | None:
+    def _to_tool_call(
+        self, value: Any, tool_indices: dict[str, int]
+    ) -> tuple[str, str] | None:
         try:
             function = value["function"]
             name = function["name"]
@@ -560,24 +560,27 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments, ensure_ascii=False)
-        return ToolCallItem(tool_index=tool_index, name=name, parameters=arguments)
+        return name, arguments
 
     def _to_tool_call_items(
         self,
         value: Any,
         tool_indices: dict[str, int],
         first_tool_index: int,
-    ) -> list[ToolCallItem] | None:
+    ) -> list[ToolCallItem]:
+        """The region's accepted calls, numbered from `first_tool_index`."""
         values = value if isinstance(value, list) else [value]
-        if not values:
-            return None
-        items = [
-            self._to_tool_call_item(item, tool_indices, first_tool_index + offset)
-            for offset, item in enumerate(values)
+        calls = [
+            call
+            for call in (self._to_tool_call(item, tool_indices) for item in values)
+            if call is not None
         ]
-        if any(item is None for item in items):
-            return None
-        return items
+        return [
+            ToolCallItem(
+                tool_index=first_tool_index + offset, name=name, parameters=arguments
+            )
+            for offset, (name, arguments) in enumerate(calls)
+        ]
 
     def _emit_tool_call(
         self, item: ToolCallItem, pending_calls: list[ToolCallItem]
@@ -633,7 +636,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
 
         def on_close(value: Any) -> bool:
             items = self._to_tool_call_items(value, tool_indices, len(calls))
-            if items is None:
+            if not items:
                 return False
             calls.extend(items)
             return True
@@ -669,7 +672,7 @@ class ResponseTemplateToolDetector(BaseFormatDetector):
             items = self._to_tool_call_items(
                 value, tool_indices, max(self.current_tool_id, 0)
             )
-            if items is None:
+            if not items:
                 return False
             for item in items:
                 self._emit_tool_call(item, pending_calls)

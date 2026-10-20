@@ -122,6 +122,27 @@ DELIMITED_TEMPLATE = {
     },
 }
 
+TRANSFORM_EACH_RESPONSE_TEMPLATE = {
+    "start_anchor": "<assistant>",
+    "fields": {
+        "content": {"content": "text"},
+        "tool_calls": {
+            "open": "<calls>",
+            "close": "</calls>",
+            "content": "json",
+            "repeats": True,
+            "transform_each": True,
+            "transform": {
+                "type": "function",
+                "function": {
+                    "name": "{name}",
+                    "arguments": "{arguments}",
+                },
+            },
+        },
+    },
+}
+
 
 def _tool(name: str = "get_weather") -> Tool:
     return Tool(
@@ -683,25 +704,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(detector.reasoning_default, "always")
 
     def test_transform_each_tool_region_emits_all_calls(self):
-        template = {
-            "start_anchor": "<assistant>",
-            "fields": {
-                "content": {"content": "text"},
-                "tool_calls": {
-                    "open": "<calls>",
-                    "close": "</calls>",
-                    "content": "json",
-                    "transform_each": True,
-                    "transform": {
-                        "type": "function",
-                        "function": {
-                            "name": "{name}",
-                            "arguments": "{arguments}",
-                        },
-                    },
-                },
-            },
-        }
+        template = TRANSFORM_EACH_RESPONSE_TEMPLATE
         tools = [_tool(), _tool("get_forecast")]
         text = (
             '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
@@ -740,6 +743,43 @@ class TestResponseTemplateAdapters(CustomTestCase):
                 ("get_forecast", {"days": 3}),
             ],
         )
+
+    def test_unknown_function_in_array_keeps_valid_siblings(self):
+        """An undefined function in a parallel-call array drops only itself;
+        its valid siblings and later calls keep consecutive indices."""
+        tools = [_tool(), _tool("get_forecast")]
+        text = (
+            '<calls>[{"name":"get_weather","arguments":{"location":"Paris"}},'
+            '{"name":"unknown","arguments":{}},'
+            '{"name":"get_forecast","arguments":{"days":3}}]</calls>'
+            '<calls>[{"name":"get_weather","arguments":{"location":"Rome"}}]</calls>'
+        )
+        expected = [
+            (0, "get_weather", {"location": "Paris"}),
+            (1, "get_forecast", {"days": 3}),
+            (2, "get_weather", {"location": "Rome"}),
+        ]
+
+        parsed = ResponseTemplateToolDetector(
+            response_template=TRANSFORM_EACH_RESPONSE_TEMPLATE,
+            prefix="<assistant>",
+        ).detect_and_parse(text, tools)
+        streaming = ResponseTemplateToolDetector(
+            response_template=TRANSFORM_EACH_RESPONSE_TEMPLATE,
+            prefix="<assistant>",
+        )
+        streamed = streaming.parse_streaming_increment(text, tools).calls
+        streamed += streaming.finish(tools).calls
+
+        for calls in (parsed.calls, streamed):
+            self.assertEqual(
+                [
+                    (call.tool_index, call.name, json.loads(call.parameters))
+                    for call in calls
+                ],
+                expected,
+            )
+        self.assertEqual(streaming.incomplete_tool_call_indices, set())
 
     def test_malformed_call_is_dropped(self):
         detector = ResponseTemplateToolDetector(
