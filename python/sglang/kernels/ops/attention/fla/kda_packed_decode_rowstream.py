@@ -16,9 +16,9 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported
 
-_is_gfx95 = is_hip() and is_gfx95_supported()
+_is_gfx95 = is_gfx95_supported()
 
 # (max batch, rows per iteration, row groups, num_warps, num_stages), measured on
 # MI355X for H=HV=16 (GLM-5.3 TP4), K=V=128, and an fp32 state pool.

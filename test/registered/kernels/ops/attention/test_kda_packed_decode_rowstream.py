@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -66,7 +66,7 @@ def _reference(mixed, a, b, A_log, dt_bias, state, idx, heads, lower_bound):
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and is_hip() and is_gfx95_supported(),
+    torch.cuda.is_available() and is_gfx95_supported(),
     "requires one gfx950 GPU",
 )
 class TestKdaPackedDecodeRowstream(CustomTestCase):
