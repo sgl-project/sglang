@@ -391,6 +391,7 @@ def run_bench_serving(
     gsp_num_groups=None,
     gsp_prompts_per_group=None,
     cache_report=False,
+    min_host_hit_rate_pct=None,
     env=None,
 ):
     metrics_path = os.getenv("METRICS_DATA_FILE")
@@ -602,15 +603,19 @@ def run_bench_serving(
                     # Format: "Cache hit rate:    82.2%" (from --cache-report)
                     parts = stripped_line.split()
                     if len(parts) >= 4:
-                        metrics["cache_hit_rate_pct"] = parts[-1].rstrip("%")
+                        metrics["cache_hit_rate_pct"] = parts[3].rstrip("%")
                 elif stripped_line.startswith("Device:") and stripped_line.endswith(
                     "%"
                 ):
-                    metrics["device_hit_rate_pct"] = stripped_line.split()[-1].rstrip(
-                        "%"
-                    )
+                    # Format: "Device:    19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["device_hit_rate_pct"] = parts[1].rstrip("%")
                 elif stripped_line.startswith("Host:") and stripped_line.endswith("%"):
-                    metrics["host_hit_rate_pct"] = stripped_line.split()[-1].rstrip("%")
+                    # Format: "Host:    19.7%"
+                    parts = stripped_line.split()
+                    if len(parts) >= 2:
+                        metrics["host_hit_rate_pct"] = parts[1].rstrip("%")
         reader_done.set()
         process.wait()
         if process.returncode != 0:
@@ -623,6 +628,24 @@ def run_bench_serving(
         reader_done.set()
         if process.stdout is not None and not process.stdout.closed:
             process.stdout.close()
+
+    if min_host_hit_rate_pct is not None:
+        host_hit = metrics.get("host_hit_rate_pct")
+        if host_hit is None:
+            raise Exception(
+                "No host hit rate found in bench_serving output while "
+                "min_host_hit_rate_pct is set (did the server run with "
+                "--enable-cache-report and the bench with --cache-report?)"
+            )
+        dump_metric("host_hit_rate", float(host_hit), labels={"type": "perf"})
+        dump_metric(
+            "host_hit_rate_baseline",
+            float(min_host_hit_rate_pct),
+            labels={"type": "perf"},
+        )
+        assert float(host_hit) >= float(min_host_hit_rate_pct), (
+            f"L2 host hit rate {host_hit}% is below {min_host_hit_rate_pct}%"
+        )
 
     return metrics
 
