@@ -1707,9 +1707,9 @@ class IndexerKPool(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         if is_hip():
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not is_npu():
-            from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+            from sglang.kernels.ops.quantization.act_quant_triton import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

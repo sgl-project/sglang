@@ -179,7 +179,7 @@ def _pd_prefill_skips_mamba_spec_state() -> bool:
 def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
     """Per-pool fp8 layout. DSpark draft writers scatter bf16, so that pool
     stays a bf16 ring; MTP/EAGLE NextN follows the env."""
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_fp8,
     )
 
@@ -2060,10 +2060,10 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        use_compact_indexer_layout = (
-            is_dsa_model
-            and is_arch35
-            and _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker)
+        # Shared layers never access the indexer; pool sizing uses the same gate
+        # so the saved indexer memory can be used for additional KV tokens.
+        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker
         )
         indexer_layer_ids = None
         if use_compact_indexer_layout:

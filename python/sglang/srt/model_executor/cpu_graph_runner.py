@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_lora,
+    get_model,
     get_parallel,
     get_spec,
 )
@@ -734,6 +735,12 @@ class CPUGraphRunner:
         return is_bs_supported
 
     def capture(self) -> None:
+        with get_model().override(
+            shared_experts=self.model_runner.model.shared_experts_config
+        ):
+            self._capture()
+
+    def _capture(self) -> None:
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_bs)))
             if get_parallel().tp_rank == 0
