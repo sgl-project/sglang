@@ -24,6 +24,10 @@ from sglang.srt.managers.output_store import (  # noqa: E402
     TokenOutputCollector,
     maybe_create_output_store,
 )
+from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
+    ReqState,
+    TokenizerManager,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -81,7 +85,9 @@ class TestTokenOutputCollector(CustomTestCase):
 
     def test_stash_concatenates_chunks_without_copying_tensors(self):
         routed = torch.arange(24, dtype=torch.int32).reshape(3, 2, 4)
-        collector = TokenOutputCollector(routed_experts=routed)
+        collector = TokenOutputCollector(
+            routed_experts=routed, sampling_support_logprobs=True
+        )
         collector.add_sampling_mask(_chunk([2], [5, 6], [-0.5, -1.0]))
         collector.add_sampling_mask(_chunk([1, 1], [7, 8], [-2.0, -3.0]))
 
@@ -99,6 +105,49 @@ class TestTokenOutputCollector(CustomTestCase):
         self.assertIsNone(stash.indexer_topk)
         self.assertEqual(
             collector.inline_meta_info(), {"output_token_sampling_mask_length": 3}
+        )
+
+
+class TestTokenizerSupportLogprobs(CustomTestCase):
+    """Support mode also returns each sampled token's logprob inline, picked from its
+    support; with the store only the support-sized rows are stored."""
+
+    def _add(self, *, via_store):
+        state = ReqState(
+            [], False, None, SimpleNamespace(sampling_logprobs_mode="support"), None
+        )
+        if via_store:
+            state.token_output_collector = TokenOutputCollector(
+                sampling_support_logprobs=True
+            )
+        meta_info = {}
+        for chunk, output_ids in (
+            (_chunk([2], [5, 6], [-0.5, -1.0]), [6]),
+            (_chunk([1, 2], [7, 9, 8], [-0.25, -2.0, -3.0]), [7, 8]),
+        ):
+            TokenizerManager._add_sampling_mask_output(
+                meta_info=meta_info, state=state, chunk=chunk, output_ids=output_ids
+            )
+        return meta_info, state.token_output_collector
+
+    def test_inline_response(self):
+        meta_info, _ = self._add(via_store=False)
+        self.assertEqual(
+            meta_info["output_token_sampling_selected_logprobs"], [-1.0, -0.25, -3.0]
+        )
+        self.assertEqual(
+            meta_info["output_token_sampling_logprobs"],
+            [[-0.5, -1.0], [-0.25], [-2.0, -3.0]],
+        )
+
+    def test_store_response(self):
+        meta_info, collector = self._add(via_store=True)
+        self.assertEqual(
+            meta_info, {"output_token_sampling_selected_logprobs": [-1.0, -0.25, -3.0]}
+        )
+        np.testing.assert_array_equal(
+            collector.to_stash().output_token_sampling_logprobs,
+            [-0.5, -1.0, -0.25, -2.0, -3.0],
         )
 
 

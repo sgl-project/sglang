@@ -4,6 +4,8 @@
 A request that sets ``return_outputs_via_store`` keeps its routed experts, indexer
 top-k, and sampling mask out of the response: the tokenizer collects them, stores them
 when the request finishes, and returns ``meta_info["output_store_ref"]`` instead.
+The sampled tokens' logprobs, one per token, stay in ``meta_info``; support-mode
+logprobs are stored with the mask.
 SGLang-specific assumptions:
 
 - Non-streaming requests only.
@@ -43,6 +45,8 @@ class TokenOutputCollector(msgspec.Struct):
     # None until the first chunk arrives, so a requested mask with zero rows still
     # produces (empty) fields.
     sampling_mask_chunks: Optional[List[SamplingMaskChunk]] = None
+    # Selected-mode chunk logprobs are one per token and stay in meta_info.
+    sampling_support_logprobs: bool = False
 
     def add_sampling_mask(self, chunk: SamplingMaskChunk) -> None:
         if self.sampling_mask_chunks is None:
@@ -78,10 +82,11 @@ class TokenOutputCollector(msgspec.Struct):
                 output_token_sampling_mask_token_ids=np.concatenate(
                     [chunk.token_ids for chunk in chunks]
                 ),
-                output_token_sampling_logprobs=np.concatenate(
-                    [chunk.logprobs for chunk in chunks]
-                ),
             )
+            if self.sampling_support_logprobs:
+                mask["output_token_sampling_logprobs"] = np.concatenate(
+                    [chunk.logprobs for chunk in chunks]
+                )
         return TokenOutputStash(
             routed_experts=_numpy(self.routed_experts),
             indexer_topk=_numpy(self.indexer_topk),

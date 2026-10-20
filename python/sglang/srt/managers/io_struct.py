@@ -238,7 +238,8 @@ class GenerateReqInput:
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
-    # the full sampling support. When omitted, selected mode is used if
+    # the full sampling support; support mode also returns the selected token's in
+    # output_token_sampling_selected_logprobs. When omitted, selected mode is used if
     # return_sampling_mask is enabled.
     sampling_logprobs_mode: Optional[
         Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]

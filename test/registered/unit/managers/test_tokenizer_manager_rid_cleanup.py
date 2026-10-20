@@ -542,12 +542,9 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
 
         self.assertEqual(meta_info["output_store_ref"], _REF.to_builtins())
         self.assertEqual(meta_info["output_token_sampling_mask_length"], 2)
-        for key in (
-            "routed_experts",
-            "indexer_topk",
-            "output_token_sampling_mask",
-            "output_token_sampling_logprobs",
-        ):
+        # The sampled tokens' logprobs are one per token and stay inline.
+        self.assertEqual(meta_info["output_token_sampling_logprobs"], [-0.5, -1.0])
+        for key in ("routed_experts", "indexer_topk", "output_token_sampling_mask"):
             self.assertNotIn(key, meta_info)
         (collector,) = self.store.puts
         stash = collector.to_stash()
@@ -556,6 +553,7 @@ class TestOutputStoreFinalization(unittest.IsolatedAsyncioTestCase, CustomTestCa
         np.testing.assert_array_equal(
             stash.output_token_sampling_mask_token_ids, [5, 6, 7]
         )
+        self.assertIsNone(stash.output_token_sampling_logprobs)
 
     async def test_other_requests_on_a_store_server_stay_inline(self):
         """With the store enabled the detokenizer sends tensors, so the tokenizer

@@ -842,12 +842,17 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
                 for token, mask, logprobs in zip(output_ids, masks, support_logprobs)
             ],
         )
+        self.assertEqual(
+            support["meta_info"]["output_token_sampling_selected_logprobs"],
+            selected["meta_info"]["output_token_sampling_logprobs"],
+        )
 
         streamed = responses["support", True]
         self.assertEqual(streamed["output_ids"], output_ids)
         for key in (
             "output_token_sampling_mask",
             "output_token_sampling_logprobs",
+            "output_token_sampling_selected_logprobs",
             "output_token_sampling_mask_length",
         ):
             self.assertEqual(streamed["meta_info"][key], support["meta_info"][key])

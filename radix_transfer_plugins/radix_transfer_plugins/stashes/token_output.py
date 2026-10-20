@@ -22,7 +22,7 @@ class TokenOutputStash(msgspec.Struct, frozen=True, kw_only=True):
     output_token_sampling_mask_lengths: Optional[np.ndarray] = None
     # [sum(lengths)]
     output_token_sampling_mask_token_ids: Optional[np.ndarray] = None
-    # [sum(lengths)] when every allowed token has a logprob, else [num_tokens]
+    # [sum(lengths)]: a logprob per allowed token; per-token sampled logprobs are not stored
     output_token_sampling_logprobs: Optional[np.ndarray] = None
 
     def is_empty(self) -> bool:
