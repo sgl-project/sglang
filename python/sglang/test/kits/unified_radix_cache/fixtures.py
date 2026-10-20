@@ -109,8 +109,9 @@ def node_host_lock_ref(cache, node_id, component_type):
     return cache.tree_core.get_component_host_lock_ref(node_id, component_type)
 
 
-def match_prefix(cache, tokens):
-    return cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+def match_prefix(cache, tokens, extra_key=None, cache_salt=None):
+    key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
+    return cache.match_prefix(MatchPrefixParams(key=key))
 
 
 def build_fixture(

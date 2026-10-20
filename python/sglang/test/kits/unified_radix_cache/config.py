@@ -56,6 +56,11 @@ class CacheConfig:
         return ComponentType.SWA in self.components
 
     @property
+    def sw_pages(self) -> int:
+        """Pages spanned by the sliding window (ceil(window / page_size))."""
+        return -(-self.sliding_window_size // self.page_size)
+
+    @property
     def non_full_layer_ids(self) -> list[int]:
         full = set(self.full_attention_layer_ids)
         return [i for i in range(self.num_layers) if i not in full]
@@ -230,6 +235,12 @@ requires_swa_only = requires(
 
 requires_swa_and_mamba = requires(
     lambda cfg: cfg.has_swa and cfg.has_mamba, "requires SWA and Mamba"
+)
+
+
+requires_multi_page_window = requires(
+    lambda cfg: cfg.sliding_window_size > cfg.page_size,
+    "requires a sliding window of more than one page",
 )
 
 

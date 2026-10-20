@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import time
@@ -9,6 +10,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
@@ -330,17 +332,12 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             extra_key=extra_key,
             cache_salt=cache_salt,
         )
-        key = RadixKey(array("q", seq), extra_key=extra_key, cache_salt=cache_salt)
-        leaf = prod.match_prefix(MatchPrefixParams(key=key)).last_device_node
+        leaf = match_prefix(prod, seq, extra_key, cache_salt).last_device_node
         expected = None
         if marker is not None:
-            m = prod.match_prefix(MatchPrefixParams(key=key))
-            self._fill_full_kv(
-                prod_alloc, prod.path_device_indices(m.last_device_node), marker=marker
-            )
-            expected = self._snapshot_full_kv(
-                prod_alloc, prod.path_device_indices(m.last_device_node)
-            )
+            indices = prod.path_device_indices(leaf)
+            self._fill_full_kv(prod_alloc, indices, marker=marker)
+            expected = self._snapshot_full_kv(prod_alloc, indices)
         self._buffer_backup_and_wait(prod, leaf)
         return leaf, expected
 
@@ -348,11 +345,196 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         """Sequence long enough for SWA prefetch (one full window + 1)."""
         num_pages = min_pages
         if self.cfg.has_swa:
-            sw_pages = (
-                self.cfg.sliding_window_size + self.cfg.page_size - 1
-            ) // self.cfg.page_size
-            num_pages = max(num_pages, sw_pages + 1)
+            num_pages = max(num_pages, self.cfg.sw_pages + 1)
         return self._make_seq(1, num_pages)
+
+    def _prefetch_until_staged(
+        self, cache, req_id, seq, anchor=None, *, on_submitted=None, **kw
+    ):
+        """Prefetch ``seq`` and pump until the buffer-mode fetch is staged.
+
+        Without ``anchor`` the fetch starts at the root; with one, ``seq`` is the
+        suffix below it and ``kw`` carries ``matched_prefix_tokens``. The other
+        ``kw`` go to ``prefetch_from_storage``. ``on_submitted`` runs between the
+        submit and the pump. Returns the staged prefetch.
+        """
+        if anchor is None:
+            anchor, last_hash = cache.root_node_handle(), None
+        else:
+            last_hash = cache.tree_core.get_last_hash_value(anchor)
+        cache.prefetch_from_storage(
+            req_id, anchor, array("q", seq), last_hash, None, **kw
+        )
+        if on_submitted is not None:
+            on_submitted()
+        self._pump_hicache_until(
+            cache,
+            lambda: (
+                cache.check_prefetch_progress(req_id)
+                and cache.buffer_pipeline.has_staged(req_id)
+            ),
+            f"prefetch {req_id.rid} did not stage",
+        )
+        return cache.buffer_pipeline.staged_prefetches[req_id]
+
+    def _buffer_chain_leaf(self, storage_dir):
+        """Buffer-mode cache holding a two-insert chain, nothing backed up yet.
+        Returns (cache, allocator, req_to_token_pool, seq, leaf)."""
+        cache, allocator, req_to_token_pool = self._build_buffer_hicache_fixture(
+            storage_dir
+        )
+        seq_a = self._make_seq(1, 2)
+        seq = seq_a + self._make_seq(500, 2)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        return cache, allocator, req_to_token_pool, seq, leaf
+
+    def _extra_pool_chain(self, storage_dir):
+        """Buffer-mode cache whose FULL component owns an extra storage pool
+        (``ExtraPoolFullComponent``) and holds one inserted chain, nothing backed
+        up. Returns (cache, allocator, req_to_token_pool, leaf, chain)."""
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_to_token_pool = build_fixture(
+            self.cfg,
+            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        self.assertIn(
+            ExtraPoolFullComponent.EXTRA_POOL,
+            cache.cache_controller.mem_pool_host.entry_map,
+        )
+        seq = self._buffer_swa_seq()
+        self._insert(cache, allocator, req_to_token_pool, seq)
+        leaf = match_prefix(cache, seq).last_device_node
+        return cache, allocator, req_to_token_pool, leaf, self._path_chain(cache, leaf)
+
+    def _tail_only_chain(self):
+        """Tail-only-backup cache holding a three-node chain (a node longer than
+        two windows, one shorter than the window, one exactly a window), nothing
+        backed up yet. Returns a namespace with the cache, the sequence, the
+        chain's page hashes and node ends, ``kept`` (the pages whose SWA is
+        stored once it is backed up), ``swa_query``, and the helpers
+        ``chain_pages(key)``, ``restorable(prefix)`` and ``stored(pool, key)``."""
+        page = self.cfg.page_size
+        sw_pages = self.cfg.sw_pages
+        node_pages = [2 * sw_pages + 3, max(sw_pages - 1, 1), sw_pages]
+        total_pages = sum(node_pages)
+        # Each growing insert allocates its whole sequence next to the
+        # resident prefix before the duplicate is released.
+        if 2 * total_pages * page > self.cfg.kv_size:
+            self.skipTest("chain does not fit the device pool")
+        storage_dir = self._make_storage_dir()
+
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        with envs.SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP.override(True):
+            self._init_buffer_hicache(cache, storage_dir)
+        seq = self._make_seq(1, total_pages)
+        end_pages = 0
+        for pages in node_pages:
+            end_pages += pages
+            self._insert(cache, allocator, req_to_token_pool, seq[: end_pages * page])
+
+        def chain_pages(key):
+            leaf = match_prefix(cache, key).last_device_node
+            hashes: list[str] = []
+            ends: list[int] = []
+            for node in self._path_chain(cache, leaf):
+                hashes.extend(cache.tree_core.get_hash_values(node))
+                ends.append(len(hashes))
+            return leaf, hashes, ends
+
+        leaf, page_hashes, node_ends = chain_pages(seq)
+        self.assertEqual(len(page_hashes), total_pages)
+        kept = set()
+        for end in node_ends:
+            kept.update(range(max(0, end - sw_pages), end))
+
+        def restorable(prefix):
+            """Longest prefix of ``prefix`` pages whose window is stored."""
+            return next(
+                (
+                    length
+                    for length in range(prefix, 0, -1)
+                    if all(p in kept for p in range(max(0, length - sw_pages), length))
+                ),
+                0,
+            )
+
+        backend = cache.cache_controller.storage_backend
+
+        def stored(pool, key):
+            return os.path.exists(
+                os.path.join(
+                    backend.file_path, backend._get_component_key(key, pool) + ".bin"
+                )
+            )
+
+        return SimpleNamespace(
+            storage_dir=storage_dir,
+            cache=cache,
+            allocator=allocator,
+            req_to_token_pool=req_to_token_pool,
+            seq=seq,
+            leaf=leaf,
+            page_hashes=page_hashes,
+            node_ends=node_ends,
+            total_pages=total_pages,
+            kept=kept,
+            swa_query=[
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    keys=["_"] * sw_pages,
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+            ],
+            chain_pages=chain_pages,
+            restorable=restorable,
+            stored=stored,
+        )
+
+    def _swa_l3_abort_fixture(self):
+        """Consumer cache that has just started prefetching an SWA-sized span
+        produced to L3. Returns (cache, controller, req_id, baselines): the KV
+        and SWA host-pool availability and the occupied prefetch tokens before
+        the prefetch."""
+        seq = self._buffer_swa_seq()
+        storage_dir = self._make_storage_dir()
+        self._l3_produce(storage_dir, seq)
+        cons, _, _ = self._l3_consumer(storage_dir)
+        req_id = CacheRequestHandle("abort-req", 0)
+        cc = cons.cache_controller
+        baselines = SimpleNamespace(
+            kv=cc.mem_pool_host.get_pool(PoolName.KV).available_size(),
+            swa=cc.mem_pool_host.get_pool(PoolName.SWA).available_size(),
+            occupied=cc.prefetch_tokens_occupied,
+        )
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self.assertEqual(cc.prefetch_tokens_occupied, baselines.occupied + len(seq))
+        self.assertIn(req_id, cons.ongoing_prefetch)
+        return cons, cc, req_id, baselines
+
+    def _assert_abort_released(self, cons, req_id, baselines):
+        """After an abort and the IO's completion, every prefetch buffer is
+        queued for release, then back in its host pool."""
+        cc = cons.cache_controller
+        self.assertGreater(cc.host_mem_release_queue.qsize(), 0)
+        self.assertGreater(cc.extra_host_mem_release_queues[PoolName.SWA].qsize(), 0)
+        self.assertNotIn(req_id, cons.ongoing_prefetch)
+        self.assertNotIn(req_id, cons.prefetch_loaded_tokens_by_reqid)
+        self.assertEqual(cc.prefetch_tokens_occupied, baselines.occupied)
+
+        cons.drain_storage_control_queues()  # Drain release queue.
+        self.assertEqual(
+            cc.mem_pool_host.get_pool(PoolName.KV).available_size(), baselines.kv
+        )
+        self.assertEqual(
+            cc.mem_pool_host.get_pool(PoolName.SWA).available_size(), baselines.swa
+        )
+        cons.sanity_check()
 
     def _drain_buffer_writes(self, cache):
         pipeline = cache.buffer_pipeline
@@ -667,10 +849,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             self.skipTest("SWA-only fixture required")
         if self._skip_unsupported_hicache_test():
             return None
-        sw_pages = (
-            self.cfg.sliding_window_size + self.cfg.page_size - 1
-        ) // self.cfg.page_size
-        seq = self._make_seq(1, sw_pages + 1)
+        seq = self._make_seq(1, self.cfg.sw_pages + 1)
 
         storage_dir = self._make_storage_dir()
         self._l3_produce(storage_dir, seq)

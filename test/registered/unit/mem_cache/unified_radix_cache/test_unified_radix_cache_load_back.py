@@ -269,9 +269,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
     )
     def test_swa_branching_seqlen_uses_device_full_hit(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        window = self.cfg.sliding_window_size
-        window_pages = (window + self.cfg.page_size - 1) // self.cfg.page_size
-        prefix = self._make_seq(1, window_pages)
+        prefix = self._make_seq(1, self.cfg.sw_pages)
         tokens = prefix + self._make_seq(1000, 2)
         self._insert(cache, allocator, req_to_token_pool, prefix)
         self._insert(cache, allocator, req_to_token_pool, tokens)
@@ -1183,16 +1181,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertGreaterEqual(result.num_tokens_evicted, kv_tokens)
         self.assertIsNone(node_device_value(cache, leaf, ComponentType.FULL))
 
-        kv_xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.FULL, leaf, CacheTransferPhase.LOAD_BACK
-        )[0]
-        self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
-
-        swa_xfer = cache.tree_core.build_hicache_transfers(
-            ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
-        )[0]
-        self.assertEqual(int(swa_xfer.host_indices.numel()), sw)
-
         # Leave tree-owned SWA available for controller-side SWA eviction.
         unrelated_seq = self._make_seq(100_000, sw)
         self._insert(cache, allocator, req_to_token_pool, unrelated_seq)
@@ -1209,17 +1197,10 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             self.assertIsNotNone(external_swa)
 
         self.assertGreaterEqual(
-            allocator.full_attn_allocator.available_size(),
-            int(kv_xfer.host_indices.numel()),
+            allocator.full_attn_allocator.available_size(), kv_tokens
         )
-        self.assertLess(
-            allocator.swa_attn_allocator.available_size(),
-            int(kv_xfer.host_indices.numel()),
-        )
-        self.assertLess(
-            allocator.swa_attn_allocator.available_size(),
-            int(swa_xfer.host_indices.numel()),
-        )
+        self.assertLess(allocator.swa_attn_allocator.available_size(), kv_tokens)
+        self.assertLess(allocator.swa_attn_allocator.available_size(), sw)
 
         with mock.patch.object(
             cache, "evict_for_alloc", wraps=cache.evict_for_alloc

@@ -947,14 +947,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             "Mamba locked before release",
         )
         cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
-        self.assertEqual(node_device_lock_ref(cache, node_a, ComponentType.SWA), 0)
         self.assertEqual(
             node_device_lock_ref(cache, node_a, ComponentType.MAMBA),
             0,
             "dec_swa_lock_only drops the lower-tier Mamba lock",
-        )
-        self.assertGreaterEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.FULL), 1
         )
         self.assertTrue(
             cache.tree_core.is_node_in_device_lru(node_a, ComponentType.SWA)

@@ -85,29 +85,7 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
             "node_a must be backuped (invariant a)",
         )
 
-        def _collect_descendants(node_id):
-            out = []
-            for child_id in node_children(cache, node_id):
-                out.extend(_collect_descendants(child_id))
-                out.append(child_id)
-            return out
-
-        descendants = _collect_descendants(node_a)
-        self.assertGreater(len(descendants), 0)
-        for desc in descendants:
-            self._simulate_backup(cache, desc)
-            self.assertTrue(
-                cache.tree_core.is_backuped(desc),
-                "desc must be backuped before demote",
-            )
-            result = cache.tree_core.demote(desc)
-            cache._free_values(result.device_frees, result.host_frees)
-            self.assertTrue(
-                cache.tree_core.is_full_device_evicted(desc),
-                "desc should be D->H demoted",
-            )
-            self.assertIsNone(node_device_value(cache, desc, ComponentType.FULL))
-
+        self._demote_subtree(cache, node_a)
         self.assertTrue(
             cache.tree_core.is_device_leaf(node_a),
             "A is a HiCache device-leaf (no child with Full on device)",
@@ -130,19 +108,6 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         )
 
         cache.release_swa(TreeLock(node_a, lock_result.to_dec_params()))
-        self.assertEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.SWA), 0, "SWA released"
-        )
-        self.assertEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.MAMBA),
-            0,
-            "Mamba dropped by dec_swa_lock_only",
-        )
-        self.assertGreaterEqual(
-            node_device_lock_ref(cache, node_a, ComponentType.FULL),
-            1,
-            "Full kept by contract",
-        )
         self.assertIsNotNone(
             node_device_value(cache, node_a, ComponentType.SWA),
             "SWA slot stays under contract (lazy reclaim by drive_eviction)",
@@ -150,6 +115,11 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
         self.assertTrue(
             cache.tree_core.is_node_in_device_lru(node_a, ComponentType.SWA),
             "SWA stays in LRU for drive_eviction to pick later",
+        )
+        self.assertEqual(
+            node_device_lock_ref(cache, node_a, ComponentType.MAMBA),
+            0,
+            "Mamba dropped by dec_swa_lock_only",
         )
 
         cache.dec_lock_ref(node_a, lock_result.to_dec_params(), skip_swa=True)

@@ -1,5 +1,8 @@
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
+    node_children,
+    node_device_value,
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 
@@ -28,3 +31,32 @@ class UnifiedRadixCacheHiCacheFixtures(UnifiedRadixCacheFixtures):
         self._insert(cache, allocator, req_to_token_pool, seq_a)
         self._insert(cache, allocator, req_to_token_pool, seq_b)
         return cache, req_to_token_pool, seq_a, seq_b
+
+    def _demote_subtree(self, cache, node):
+        """Demote every descendant of ``node`` D->H, children before parents.
+
+        Each descendant is backed up by simulation: the real backup needs a host
+        pool, which the HiCache fixture lacks for SWA + Mamba stacks.
+        """
+
+        def descendants(node_id):
+            out = []
+            for child_id in node_children(cache, node_id):
+                out.extend(descendants(child_id))
+                out.append(child_id)
+            return out
+
+        nodes = descendants(node)
+        self.assertGreater(len(nodes), 0)
+        for desc in nodes:
+            self._simulate_backup(cache, desc)
+            self.assertTrue(
+                cache.tree_core.is_backuped(desc), "desc must be backuped before demote"
+            )
+            result = cache.tree_core.demote(desc)
+            cache._free_values(result.device_frees, result.host_frees)
+            self.assertTrue(
+                cache.tree_core.is_full_device_evicted(desc),
+                "desc should be D->H demoted",
+            )
+            self.assertIsNone(node_device_value(cache, desc, ComponentType.FULL))
