@@ -473,7 +473,9 @@ def test_generate_video_downloads_result_when_server_path_is_not_local():
             result = client.generate_video(prompt="a cat", output_path=out_dir)
 
         assert os.path.exists(result["file_path"])
-        assert os.path.dirname(result["file_path"]) == out_dir
+        assert os.path.realpath(
+            os.path.dirname(result["file_path"])
+        ) == os.path.realpath(out_dir)
 
 
 @pytest.mark.parametrize("video_id", ["../escape", "a/b", "job.1", ""])
