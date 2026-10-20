@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -1198,7 +1198,12 @@ def test_split_action_retargets_pending_external_offload():
     cache._replace_pending_write_through_node = lambda *args: calls.append(
         ("hicache", *args)
     )
-    action = ReplaceWriteThroughOnNodeSplit(
+    cache.components = {
+        ComponentType.FULL: SimpleNamespace(
+            apply_component_action=lambda action: calls.append(("full", action))
+        )
+    }
+    action = UpdatePendingBackupOnNodeSplit(
         ack_id=7,
         old_node_id=7,
         new_node_id=8,
@@ -1210,6 +1215,7 @@ def test_split_action_retargets_pending_external_offload():
     assert calls == [
         ("hicache", 7, 7, [8, 7]),
         ("linker", 7, 7, [8, 7]),
+        ("full", action),
     ]
 
 

@@ -264,9 +264,18 @@ impl<K: ChildKeyType> Node<K> {
         self.has_value_(ValueSlotIdx::device(component_type))
     }
 
-    /// The component's device value length, or 0 when value-less.
+    /// Logical length of the stored device-index tensor, or 0 when absent.
     pub fn device_value_len(&self, component_type: ComponentType) -> usize {
         self.value_len_(ValueSlotIdx::device(component_type))
+    }
+
+    /// Allocator slots reclaimed on eviction; roots and absent device values contribute zero.
+    /// Ordinary backing uses logical length; released/shared backing needs its own accounting.
+    pub fn device_reclaimable_value_len(&self, component_type: ComponentType) -> usize {
+        if self.is_root() {
+            return 0;
+        }
+        self.device_value_len(component_type)
     }
 
     /// Set the component's device value; panics if already set.
@@ -1489,7 +1498,7 @@ impl<K: ChildKeyType> NodeArena<K> {
         self.node(id).has_device_value(component_type)
     }
 
-    /// The node's device value length for the component, or 0 when value-less.
+    /// Logical length of the node's stored device-index tensor, or 0 when absent.
     pub fn device_value_len(&self, id: NodeIdx_, component_type: ComponentType) -> usize {
         self.node(id).device_value_len(component_type)
     }
