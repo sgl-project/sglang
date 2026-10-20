@@ -64,6 +64,7 @@ _TRITON_KERNELS = [
     ("cache_move", "copy_all_layer_kv_cache_tiled"),
     ("mla_buffer", "set_mla_kv_buffer_triton"),
     ("mla_buffer", "get_mla_kv_buffer_triton"),
+    ("mla_kv_gather", "refresh_mla_kv_shadow"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
