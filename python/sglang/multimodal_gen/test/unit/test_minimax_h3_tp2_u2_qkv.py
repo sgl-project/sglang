@@ -1,7 +1,7 @@
 """MiniMax-H3 TP2 x U2 grouped-QKV ownership gates."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -12,7 +12,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
     _can_use_ulysses_gather_qkv,
+    _minimax_h3_attention_core_impl,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 _MODEL = "sglang.multimodal_gen.runtime.models.dits.minimax_h3"
 
@@ -155,3 +157,93 @@ def test_installed_qkv_loader_preserves_head_ownership(
     expected = dense.reshape(heads, 3, head_dim, hidden)[start : start + local_heads]
     expected = expected.permute(1, 0, 2, 3).reshape_as(projection.weight)
     torch.testing.assert_close(projection.weight, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("qkv_ready", [False, True])
+@pytest.mark.parametrize("pipeline_available", [False, True])
+def test_attention_exchanges_pre_gathered_qkv_only_once(qkv_ready, pipeline_available):
+    q = torch.arange(8, dtype=torch.float32).reshape(4, 1, 2)
+    expected = q + 1
+    attention = SimpleNamespace(
+        _attention_backend_enum=AttentionBackendEnum.FA,
+        _attention_impl=SimpleNamespace(forward_varlen=Mock(return_value=expected)),
+    )
+    usp = "sglang.multimodal_gen.runtime.layers.usp"
+    with (
+        patch(f"{_MODEL}._minimax_h3_bind_attention_backend"),
+        patch(
+            f"{_MODEL}._minimax_h3_pipelined_dense_attention",
+            return_value=expected if pipeline_available else None,
+        ) as pipeline,
+        patch(
+            f"{usp}._usp_input_all_to_all_packed_qkv", return_value=(q, q, q)
+        ) as input_a2a,
+        patch(
+            f"{usp}._usp_output_all_to_all", side_effect=lambda x, **kw: x
+        ) as output_a2a,
+    ):
+        actual = _minimax_h3_attention_core_impl(
+            attention,
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+            cu_seqlens_host=(0, 4),
+            max_seqlen=4,
+            ulysses_active=True,
+            ulysses_qkv_ready=qkv_ready,
+        )
+    torch.testing.assert_close(actual, expected)
+    assert pipeline.call_count == int(not qkv_ready)
+    pipeline_used = pipeline_available and not qkv_ready
+    assert input_a2a.call_count == int(not qkv_ready and not pipeline_used)
+    assert output_a2a.call_count == int(not pipeline_used)
+    assert attention._attention_impl.forward_varlen.call_count == int(not pipeline_used)
+
+
+@pytest.mark.parametrize("qkv_ready", [False, True])
+def test_fused_rope_pipeline_respects_pre_gathered_qkv(qkv_ready):
+    x = torch.zeros(2, 4)
+    q = torch.zeros((4, 1, 2) if qkv_ready else (2, 2, 2))
+    expected = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+    norm = SimpleNamespace(weight=torch.ones(2), eps=1e-6)
+    attention = SimpleNamespace(
+        _use_ulysses_gather_qkv=qkv_ready,
+        _use_fused_qknorm_rope=True,
+        q_norm=norm,
+        k_norm=norm,
+        num_heads=2,
+        head_dim=2,
+        _attention_backend_enum=AttentionBackendEnum.FA,
+        bcg_breakpoint=False,
+    )
+    with (
+        patch(
+            f"{_MODEL}._minimax_h3_qknorm_rope_pipelined_attention",
+            return_value=expected,
+        ) as pipeline,
+        patch(f"{_MODEL}.fused_inplace_qknorm_rope") as fused_rope,
+        patch(
+            f"{_MODEL}._minimax_h3_attention_core_impl", return_value=expected
+        ) as core,
+    ):
+        actual = MiniMaxH3Attention._attend(
+            attention,
+            x,
+            q,
+            q,
+            q,
+            rope_cache=(torch.zeros(4, 2), torch.arange(q.shape[0])),
+            cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+            cu_seqlens_host=(0, 4),
+            max_seqlen=4,
+            subblock_sparse_query_block_mask=None,
+            ulysses_active=True,
+            ring_active=False,
+        )
+    torch.testing.assert_close(actual, expected.reshape(2, 4))
+    assert pipeline.call_count == int(not qkv_ready)
+    assert fused_rope.call_count == int(qkv_ready)
+    assert core.call_count == int(qkv_ready)
+    if qkv_ready:
+        assert core.call_args.kwargs["ulysses_qkv_ready"] is True

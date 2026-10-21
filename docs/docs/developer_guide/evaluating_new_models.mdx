@@ -18,9 +18,8 @@ SGLang provides built-in scripts to evaluate common benchmarks.
 **MMLU**
 
 ```bash Command
-python -m sglang.test.run_eval \
-  --eval-name mmlu \
-  --port 30000 \
+sgl-eval run mmlu \
+  --base-url http://127.0.0.1:30000/v1 \
   --num-examples 1000 \
   --max-tokens 8192
 ```
@@ -28,12 +27,9 @@ python -m sglang.test.run_eval \
 **GSM8K**
 
 ```bash Command
-python -m sglang.test.run_eval \
-  --eval-name gsm8k \
-  --host 127.0.0.1 \
-  --port 30000 \
-  --num-examples 200 \
-  --num-shots 5
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:30000/v1 \
+  --num-examples 200
 ```
 
 **HellaSwag**
@@ -49,16 +45,15 @@ python benchmark/hellaswag/bench_sglang.py \
 **GPQA**
 
 ```bash Command
-python -m sglang.test.run_eval \
-  --eval-name gpqa \
-  --port 30000 \
+sgl-eval run gpqa \
+  --base-url http://127.0.0.1:30000/v1 \
   --num-examples 198 \
   --max-tokens 120000 \
-  --repeat 8
+  --n-repeats 8
 ```
 
 <Tip>
-For reasoning models, add `--thinking-mode <mode>`. Supported values are `deepseek-v3`, `qwen-3`, `glm-45`, and `kimi-k2`. You may skip it if the model has forced thinking enabled.
+For reasoning models, add `--thinking` (DeepSeek-V3 / Kimi-K2 style `thinking` key) or `--chat-template-kwarg enable_thinking=true` (Qwen3 / GLM style). You may skip it if the model has forced thinking enabled.
 </Tip>
 
 **HumanEval**

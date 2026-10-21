@@ -54,11 +54,26 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
+        # The shared host pool must match KV transfer's per-layer buffers.
+        declare_resolution(
+            server_args, "handle_hicache", hicache_mem_layout="layer_first"
+        )
+
     # Step 1: Initial layout-io compatibility normalization.
     resolve_layout_io_compatibility(server_args)
 
     # Step 2: Storage-layout normalization without changing io backend.
     resolve_storage_layout_compatibility(server_args)
+    resolve_unified_memory_layout_io(server_args)
+    if (
+        cfg.disaggregation_decode_host_receive_threshold < 1
+        and cfg.hicache_mem_layout != "layer_first"
+    ):
+        raise ValueError(
+            f"The resolved HiCache storage layout {cfg.hicache_mem_layout!r} "
+            "cannot share the layer_first decode host pool used by KV transfer"
+        )
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
@@ -189,6 +204,25 @@ def resolve_storage_layout_compatibility(server_args: Any):
     )
 
 
+def resolve_unified_memory_layout_io(server_args: Any):
+    # The unified pool's token-major entries make each layer's device rows
+    # strided; the direct page_first_direct copies assume packed rows.
+    cfg = resolving_view(server_args)
+    if not cfg.enable_unified_memory or cfg.hicache_mem_layout != "page_first_direct":
+        return
+    declare_resolution(
+        server_args,
+        "_resolve_unified_memory_layout_io",
+        hicache_mem_layout="page_first",
+        hicache_io_backend="kernel",
+    )
+    logger.warning(
+        "--enable-unified-memory: the direct io backend cannot copy the unified "
+        "pool's strided KV rows, switching to the page_first layout with the "
+        "kernel io backend"
+    )
+
+
 def validate_hicache_host_memory_mode(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.hicache_host_memory_mode not in ("cache", "buffer_only"):
@@ -221,10 +255,15 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "and all cached data lives in storage."
         )
     if cfg.hicache_write_policy == "write_back":
-        raise ValueError(
-            "--hicache-host-memory-mode buffer_only does not support "
-            "--hicache-write-policy write_back; use write_through or "
-            "write_through_selective."
+        # buffer_only has no host tier to write back to; pages go to storage.
+        declare_resolution(
+            server_args,
+            "_validate_hicache_host_memory_mode",
+            hicache_write_policy="write_through",
+        )
+        logger.info(
+            "--hicache-host-memory-mode buffer_only resolves "
+            "--hicache-write-policy write_back to write_through"
         )
     if cfg.disaggregation_mode == "decode":
         raise ValueError(

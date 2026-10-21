@@ -20,12 +20,12 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxV
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    pack_latents_2x2,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 
 
@@ -141,7 +141,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return pack_latents_2x2(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[1]
@@ -251,7 +253,44 @@ class FluxPipelineConfig(ImagePipelineConfig):
             "pooled_projections": (
                 batch.pooled_embeds[0] if batch.pooled_embeds else None
             ),
-        }
+        } | self.prepare_control_residual_kwargs(batch, device, dtype)
+
+    def prepare_control_residual_kwargs(self, batch, device, dtype):
+        """Map ComfyUI ControlNet residuals in ``batch.extra`` to DiT kwargs.
+
+        Residuals arrive full-length on the sender's device and dtype; move
+        them to the compute dtype and shard them like the image latents.
+        """
+        control = (batch.extra or {}).get("comfyui_control")
+        if not control:
+            return {}
+
+        # Blocks that share one residual object share one prepared tensor.
+        prepared: dict[int, torch.Tensor] = {}
+
+        def prepare_one(residual):
+            residual = residual.to(device=device, dtype=dtype)
+            if batch.did_sp_shard_latents:
+                residual, _ = self.shard_latents_for_sp(batch, residual)
+            return residual
+
+        def prepare(residuals):
+            out = []
+            for residual in residuals:
+                if residual is not None:
+                    key = id(residual)
+                    if key not in prepared:
+                        prepared[key] = prepare_one(residual)
+                    residual = prepared[key]
+                out.append(residual)
+            return out
+
+        kwargs = {}
+        if control.get("input"):
+            kwargs["controlnet_block_samples"] = prepare(control["input"])
+        if control.get("output"):
+            kwargs["controlnet_single_block_samples"] = prepare(control["output"])
+        return kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         """Build Flux negative-conditioning kwargs using T5 sequence lengths."""
@@ -347,6 +386,13 @@ def _patchify_latents(latents):
         batch_size, num_channels_latents * 4, height // 2, width // 2
     )
     return latents
+
+
+def flux2_vae_bn_stats(vae, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(like)
+    variance = vae.bn.running_var.view(1, -1, 1, 1)
+    std = torch.sqrt(variance + vae.config.arch_config.batch_norm_eps).to(like)
+    return mean, std
 
 
 def _unpatchify_latents(latents):
@@ -823,3 +869,61 @@ class Flux2KleinBasePipelineConfig(Flux2KleinPipelineConfig):
                 txt_seq_lens,
             )
         }
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.flux import (
+        Flux2KleinBaseSamplingParams,
+        Flux2KleinSamplingParams,
+        Flux2SamplingParams,
+        FluxSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=FluxPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.1-dev",
+        ],
+        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" not in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2KleinBaseSamplingParams,
+        pipeline_config_cls=Flux2KleinBasePipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-base-4B",
+            "black-forest-labs/FLUX.2-klein-base-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                ("flux.2-klein" in hf_id.lower() or "flux2-klein" in hf_id.lower())
+                and "base" in hf_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=Flux2SamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+            "black-forest-labs/FLUX.2-dev-NVFP4",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
+    )

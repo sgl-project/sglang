@@ -67,18 +67,21 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
     DSA = 1
     TRTLLM_MHA = 2
+    DSV4 = 3
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "fa4", "flashinfer"):
             return cls.FLASH_ATTENTION
-        if value in ("dsa"):
+        if value == "dsa":
             return cls.DSA
         if value == "trtllm_mha":
             return cls.TRTLLM_MHA
+        if value == "dsv4":
+            return cls.DSV4
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha'}"
+            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha', 'dsv4'}"
         )
 
 
@@ -105,6 +108,10 @@ class ContextParallelStrategy(ABC):
     @property
     def per_layer_attn_cp_comm(self) -> bool:
         return _is_dsa_active()
+
+    def moe_num_token_non_padded(self, forward_batch):
+        """Valid local rows when MoE dispatch consumes this strategy's shard."""
+        return forward_batch.num_token_non_padded
 
     @abstractmethod
     def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
