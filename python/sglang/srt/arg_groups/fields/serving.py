@@ -23,6 +23,18 @@ class Serving(msgspec.Struct):
     """Namespace ``serving``."""
 
     _NS_PATH = "serving"
+    enable_gr: A[
+        bool,
+        "Enable generative recommendation: disable EOS termination, require "
+        "positive max_new_tokens, reject stop settings, and use beam_width "
+        "candidates for native beam search (beam_width <= vocab_size).",
+    ] = False
+    gr_catalog_manifest: A[
+        Optional[str],
+        "Path to an immutable JSON object mapping GR catalog names to JSONL "
+        "files (paths relative to the manifest). Select a catalog with "
+        "sampling_params.custom_params.gr_catalog; requires --enable-gr and fixed-depth paths.",
+    ] = None
     enable_response_store: A[
         bool,
         "Enable in-memory Responses storage for retrieval, chaining, and background "

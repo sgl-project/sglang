@@ -188,6 +188,11 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     is_normalized: bool = False  # set by normalize()
     ebnf_full_assistant: bool = False
 
+    @property
+    def gr_catalog(self):
+        """Named GR catalog carried through the existing extensible wire field."""
+        return (self.custom_params or {}).get("gr_catalog")
+
     def __post_init__(self):
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
@@ -249,7 +254,26 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
+    def apply_gr_policy(self) -> None:
+        """Enforce fixed-length generative-recommendation requests."""
+        if type(self.max_new_tokens) is not int or self.max_new_tokens <= 0:
+            raise ValueError("--enable-gr requires a positive integer max_new_tokens.")
+        if self.stop_token_ids or self.stop_strs or self.stop_regex_strs:
+            raise ValueError(
+                "--enable-gr does not support stop_token_ids, stop, or stop_regex; "
+                "set max_new_tokens to the desired SID length."
+            )
+        # EOS remains a vocabulary token; only its termination behavior changes.
+        self.ignore_eos = True
+
     def verify(self, vocab_size):
+        if self.gr_catalog is not None:
+            if not isinstance(self.gr_catalog, str) or not self.gr_catalog:
+                raise ValueError("gr_catalog must be a nonempty catalog name.")
+            if type(self.beam_width) is not int or self.beam_width <= 1:
+                raise ValueError(
+                    "gr_catalog requires native beam search (beam_width > 1)."
+                )
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:

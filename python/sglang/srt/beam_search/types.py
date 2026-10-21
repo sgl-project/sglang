@@ -32,4 +32,5 @@ class BeamSearchSequence(msgspec.Struct, omit_defaults=True):
 
     finish_reason: Optional[object] = None
     text: Optional[str] = None
-    beam_score: Optional[float] = None  # length-normalized; the sort key
+    beam_score: Optional[float] = None  # Sort key; cumulative log-probability for GR.
+    catalog_result: Optional[dict] = None

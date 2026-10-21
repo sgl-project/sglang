@@ -33,7 +33,6 @@ from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
 
-
 class BeamGroupState(enum.Enum):
     DECODING = enum.auto()
     FINISHED = enum.auto()
@@ -69,10 +68,15 @@ class BeamGroup:
         stop_token_ids: Sequence[int] = (),
         max_new_tokens: int,
         num_return: Optional[int] = None,
+        num_candidates: Optional[int] = None,
         device: torch.device | str = "cpu",
     ):
         self.beam_width = beam_width
-        self.num_candidates = 2 * beam_width
+        self.num_candidates = (
+            num_candidates if num_candidates is not None else 2 * beam_width
+        )
+        if self.num_candidates < beam_width:
+            raise ValueError("num_candidates must be at least beam_width.")
         self.length_penalty = length_penalty
         self.max_new_tokens = max_new_tokens
         self.num_return = num_return if num_return is not None else beam_width
@@ -98,6 +102,11 @@ class BeamGroup:
         # Scheduler wiring, filled in from outside the search core. Members have
         # no Req, so their seq len and KV lengths are implied by the leader's.
         self.leader = None
+        # Immutable catalog storage is shared by groups; frontier nodes belong
+        # to this group and advance in the launch half alongside the KV map.
+        self.catalog = None
+        self.catalog_id = None
+        self.catalog_nodes = None
         # Device [k-1] member row indices, and the same rows on host (for
         # row-slot free). None until the post-prefill spawn / after free.
         self.member_rows: Optional[torch.Tensor] = None
@@ -159,6 +168,20 @@ class BeamGroup:
             if up_to_tick is not None and tick > up_to_tick:
                 break
             self._pending_steps.pop(0)
+            if self.catalog is not None:
+                scores = (
+                    sel.cum_logprobs
+                    if isinstance(sel, FinalSelect)
+                    else sel.new_cum_logprobs
+                )
+                if not bool(torch.isfinite(scores).all()):
+                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+                    self.leader.to_finish = FINISH_ABORT(
+                        "Catalog selection produced non-finite scores."
+                    )
+                    self._pending_steps.clear()
+                    return True
             finished = (
                 self._commit_final(sel)
                 if isinstance(sel, FinalSelect)

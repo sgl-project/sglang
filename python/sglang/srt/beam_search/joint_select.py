@@ -59,9 +59,15 @@ def _scatter_fixed(src: torch.Tensor, slot: torch.Tensor, size: int) -> torch.Te
     return buf[:size]
 
 
-def _ranked_candidates(cum_logprobs, top_logprobs, top_tokens, num_out):
+def _ranked_candidates(
+    cum_logprobs, top_logprobs, top_tokens, num_out, *, preserve_order=False
+):
     num_candidates = top_logprobs.shape[1]
     scores = cum_logprobs.unsqueeze(1) + top_logprobs
+    if preserve_order and scores.shape == (1, num_out):
+        # Initial candidates are already sorted by the vocabulary top-K.
+        # Ranking K out of those same K again can permute exact-score ties.
+        return scores[0], torch.zeros_like(top_tokens[0]), top_tokens[0]
     cand_scores, cand_idx = scores.reshape(-1).topk(num_out, sorted=True)
     parent = cand_idx // num_candidates
     tokens = top_tokens.reshape(-1).gather(0, cand_idx)
@@ -74,12 +80,24 @@ def joint_select(
     top_tokens: torch.Tensor,  # [num_rows, num_candidates] int64
     stop_token_ids: torch.Tensor,  # [num_stop] int64, may be empty (ignore_eos)
     beam_width: int,
+    *,
+    preserve_prefill_order: bool = False,
 ) -> SelectResult:
+    # The caller requests this only for GR prefill, whose row candidates
+    # already come from a sorted vocabulary top-K. Other frontiers still rank.
     num_candidates = top_logprobs.shape[1]
     k = beam_width
 
     cand_scores, parent, tokens = _ranked_candidates(
-        cum_logprobs, top_logprobs, top_tokens, num_candidates
+        cum_logprobs,
+        top_logprobs,
+        top_tokens,
+        num_candidates,
+        preserve_order=(
+            preserve_prefill_order
+            and num_candidates == k
+            and stop_token_ids.numel() == 0
+        ),
     )
 
     if stop_token_ids.numel() > 0:  # static-shape branch, constant under capture
@@ -115,10 +133,16 @@ def select_final_topk(
     top_logprobs: torch.Tensor,  # [num_rows, num_candidates] float32
     top_tokens: torch.Tensor,  # [num_rows, num_candidates] int64
     beam_width: int,
+    *,
+    preserve_prefill_order: bool = False,
 ) -> FinalSelect:
     """Length-terminated step: the best beam_width extensions all finish. No
     stop check needed -- the caller decides this step from the step counter."""
     cand_scores, parent, tokens = _ranked_candidates(
-        cum_logprobs, top_logprobs, top_tokens, beam_width
+        cum_logprobs,
+        top_logprobs,
+        top_tokens,
+        beam_width,
+        preserve_order=preserve_prefill_order,
     )
     return FinalSelect(tokens=tokens, parent_idx=parent, cum_logprobs=cand_scores)

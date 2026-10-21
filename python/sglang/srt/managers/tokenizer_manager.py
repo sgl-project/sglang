@@ -1629,9 +1629,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
         sampling_params = self.sampling_params_class(**sampling_kwargs)
+        if isinstance(obj, GenerateReqInput) and get_serving().enable_gr:
+            sampling_params.apply_gr_policy()
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)
+        if isinstance(obj, GenerateReqInput) and sampling_params.gr_catalog is not None:
+            from sglang.srt.beam_search.catalog import get_catalog
+
+            serving = get_serving()
+            if not serving.enable_gr:
+                raise ValueError("gr_catalog requires --enable-gr.")
+            catalog = get_catalog(
+                serving.gr_catalog_manifest,
+                sampling_params.gr_catalog,
+                self.model_config.vocab_size,
+            )
+            catalog.validate_budget(sampling_params.max_new_tokens)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
