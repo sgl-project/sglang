@@ -28,7 +28,7 @@ def _spec(width: int = 6, *, ragged=False, draft=False):
 
 def _model_runner(*, hybrid=True):
     runner = MagicMock()
-    runner.model_config = object()
+    runner.model_config = SimpleNamespace(hf_config=SimpleNamespace())
     runner.is_draft_worker = False
     runner.enable_elastic_ep = False
     runner.attn_tp_sequence_sharded.return_value = False
@@ -92,12 +92,7 @@ def _prepare(
                 attn_tp_size=attn_tp_size,
                 attn_tp_rank=0,
                 attn_dp_rank=attn_dp_rank,
-            )
-        )
-        stack.enter_context(
-            patch(
-                "sglang.srt.layers.dp_attention.get_attention_dp_size",
-                return_value=attn_dp_size,
+                attn_dp_size=attn_dp_size,
             )
         )
         stack.enter_context(
@@ -123,9 +118,8 @@ def _prepare(
             )
         )
         stack.enter_context(
-            patch.object(
-                fbi,
-                "set_dp_buffer_len",
+            patch(
+                "sglang.srt.layers.dp_attention.set_dp_buffer_len",
                 side_effect=lambda *args: calls.setdefault("dp_buffer", args),
             )
         )
@@ -174,8 +168,7 @@ class TestHybridVerifyGroupPadding(CustomTestCase):
         self.assertEqual(logits_output.next_token_logits.shape[0], 228)
         self.assertEqual(logits_output.hidden_states.shape[0], 228)
         # Target-verify callers consume the sliced outputs above. The prepared
-        # input metadata remains padded today; keep that as an explicit
-        # diagnostic rather than a required contract without a caller proving it.
+        # input metadata retains its physical domain on current main.
         self.assertEqual(fb.positions.shape[0], 240)
         self.assertEqual(fb.req_pool_indices.shape[0], 40)
         self.assertEqual(fb.seq_lens.shape[0], 40)
