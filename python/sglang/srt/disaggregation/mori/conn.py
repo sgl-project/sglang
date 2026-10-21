@@ -1918,7 +1918,7 @@ class MoriKVManager(CommonKVManager):
             src_desc = src_state_mem_descs[i]
             dst_desc = dst_state_mem_descs[j]
             state_item_len = src_state_item_lens[i]
-            if is_elided_entry(state_item_len, dst_state_item_lens, i):
+            if is_elided_entry(state_item_len, dst_state_item_lens, j):
                 # DSA index-K elision gives every shared-topk layer a 0-row
                 # buffer; either peer eliding it means nothing moves, and the
                 # descriptor describes an empty allocation. Skipping keeps the

@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers.io_struct import FlushCacheReqInput
+from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
@@ -17,15 +18,15 @@ class TestSchedulerFlushCache(unittest.TestCase):
         """The wrapper plus the three collaborators it was handed."""
         flush_cache = MagicMock(return_value=True)
         is_fully_idle = MagicMock(return_value=False)
-        ipc_channels = MagicMock()
+        send_output = MagicMock()
         return SimpleNamespace(
             flush_cache=flush_cache,
             is_fully_idle=is_fully_idle,
-            ipc_channels=ipc_channels,
+            send_output=send_output,
             flush_wrapper=SchedulerFlushWrapper(
                 flush_cache=flush_cache,
                 is_fully_idle=is_fully_idle,
-                ipc_channels=ipc_channels,
+                send_output=send_output,
             ),
         )
 
@@ -89,8 +90,9 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
         scheduler.flush_cache.assert_called_once()
-        out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        out, answered = scheduler.send_output.call_args.args
         self.assertTrue(out.success)
+        self.assertIs(answered, req)
 
     def test_pending_flush_expires_on_timeout(self):
         scheduler = self._new_scheduler()
@@ -105,7 +107,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
         scheduler.flush_cache.assert_not_called()
-        out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        out = scheduler.send_output.call_args.args[0]
         self.assertFalse(out.success)
 
     def test_pending_flush_survives_before_deadline(self):
@@ -120,7 +122,23 @@ class TestSchedulerFlushCache(unittest.TestCase):
             scheduler.flush_wrapper.check_pending()
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
-        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.send_output.assert_not_called()
+
+    def test_control_output_goes_to_the_embedded_rust_server(self):
+        """A control reply, deferred flush included, takes the Rust server's
+        egress ring when the scheduler embeds one, else the tokenizer socket."""
+        output = FlushCacheReqOutput(success=True)
+        req = FlushCacheReqInput(rid="r", timeout_s=1.0)
+        rust = SimpleNamespace(rust_server=MagicMock(), ipc_channels=MagicMock())
+        Scheduler.send_control_output(rust, output, req)
+        rust.rust_server.push_control_output.assert_called_once_with(req, output)
+        rust.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+
+        python = SimpleNamespace(rust_server=None, ipc_channels=MagicMock())
+        Scheduler.send_control_output(python, output, req)
+        python.ipc_channels.send_to_tokenizer.send_output.assert_called_once_with(
+            output, req
+        )
 
 
 if __name__ == "__main__":

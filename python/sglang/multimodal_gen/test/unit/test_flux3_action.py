@@ -317,6 +317,9 @@ def test_reference_dit_config_fields_are_translated():
     arch = config.dit_config.arch_config
     assert arch.num_attention_heads == 24
     assert "image" not in arch.in_channels
+    # Every stream keeps an output head and the latent is the video stream.
+    assert arch.out_modes is None
+    assert arch.num_channels_latents == 96
     with pytest.raises(NotImplementedError):
         config.load_policy_config(
             {**DROID_CONFIG, "dit_config": {"depth_late_blocks": 2}}
