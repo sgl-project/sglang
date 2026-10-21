@@ -1,5 +1,12 @@
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    NamedTuple,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 
 import torch
 
@@ -112,6 +119,19 @@ class _SupportsDSparkTargetHiddenProjection(Protocol):
         forward_mode: ForwardMode,
         capture_hidden_mode: CaptureHiddenMode,
     ) -> bool: ...
+
+
+class _PrefillInject(NamedTuple):
+    """Per-token placement of a prefill's target hidden in the draft pool."""
+
+    cache_loc: torch.Tensor
+    positions: torch.Tensor
+    state_slot: Optional[torch.Tensor]  # draft req slot, for a SWA ring
+    final_pos: Optional[torch.Tensor]  # the request's last position, for a ring
+    swa_loc: Optional[torch.Tensor]  # SWA rows, for a pool that takes them
+
+    def select(self, token_indices: torch.Tensor) -> "_PrefillInject":
+        return _PrefillInject(*(None if t is None else t[token_indices] for t in self))
 
 
 def _configure_target_hidden_projection(
@@ -643,11 +663,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        inject = self._plan_prefill_inject(batch)
         batch_output = self.target_worker.forward_batch_generation(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            return_kv_loc_plan=True,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -670,6 +690,54 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
+        # Must inject before prefill returns: the scheduler may update radix
+        # afterward, invalidating out_cache_loc.
+        device = inject.positions.device
+        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
+        if (
+            getattr(draft_pool, "swa_valid_from", None) is not None
+            and batch.encoder_swa_reset is not None
+        ):
+            # A newly placed request's ring holds nothing below its cached prefix.
+            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+            if placed:
+                # Pinned copies and a device gather: a list index or a pageable
+                # copy here would wait for the whole target forward.
+                placed_rows = async_h2d(placed, dtype=torch.int64, device=device)
+                valid_from = async_h2d(
+                    [batch.prefix_lens[i] for i in placed],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                draft_pool.set_swa_valid_from(
+                    batch.req_pool_indices.index_select(0, placed_rows), valid_from
+                )
+        token_indices = logits_output.hidden_states_token_indices
+        if token_indices is not None:
+            inject = inject.select(token_indices)
+        self._kv_injector.inject_target_hidden(
+            target_hidden=logits_output.hidden_states,
+            cache_loc=inject.cache_loc,
+            positions=inject.positions,
+            state_slot=inject.state_slot,
+            final_pos=inject.final_pos,
+            target_hidden_is_projected=target_hidden_is_projected,
+            swa_loc=inject.swa_loc,
+        )
+        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+        logits_output.hidden_states = None
+        logits_output.hidden_states_token_indices = None
+
+        batch_output.next_draft_input = make_next_draft_input(
+            bonus_tokens=next_token_ids,
+            new_seq_lens=new_seq_lens,
+        )
+        return batch_output
+
+    def _plan_prefill_inject(self, batch: ScheduleBatch) -> "_PrefillInject":
+        """Where the target hidden goes in the draft pool, read before the target
+        forward: prefill read-done lets the scheduler rewrite req_to_token and
+        the SWA mapping once the target's own reads are done."""
         if batch.extend_lens is None or batch.prefix_lens is None:
             raise RuntimeError(
                 "DSpark expected extend_lens / prefix_lens in extend mode, got None."
@@ -677,9 +745,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
 
-        # Must inject before prefill returns: the scheduler may update radix
-        # afterward, invalidating out_cache_loc.
-        device = next_token_ids.device
+        device = self.model_runner.device
         pin_memory = is_pin_memory_available(device)
         ctx_lens = torch.tensor(
             batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
@@ -710,52 +776,22 @@ class DSparkWorkerV2(BaseSpecWorker):
                 repeats,
                 output_size=num_tokens,
             )
-        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
-        if (
-            getattr(draft_pool, "swa_valid_from", None) is not None
-            and batch.encoder_swa_reset is not None
-        ):
-            # A newly placed request's ring holds nothing below its cached prefix.
-            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
-            if placed:
-                # Pinned copies and a device gather: a list index or a pageable
-                # copy here would wait for the whole target forward.
-                placed_rows = async_h2d(placed, dtype=torch.int64, device=device)
-                valid_from = async_h2d(
-                    [batch.prefix_lens[i] for i in placed],
-                    dtype=torch.int64,
-                    device=device,
-                )
-                draft_pool.set_swa_valid_from(
-                    batch.req_pool_indices.index_select(0, placed_rows), valid_from
-                )
-        # The draft KV goes to the slots the target prefill just wrote.
-        cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
-        batch_output.kv_loc_plan = None
-        token_indices = logits_output.hidden_states_token_indices
-        if token_indices is not None:
-            cache_loc = cache_loc[token_indices]
-            positions = positions[token_indices]
-            if state_slot is not None:
-                state_slot = state_slot[token_indices]
-                final_pos = final_pos[token_indices]
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
+        # The draft KV goes to the slots the target prefill writes.
+        cache_loc = self._kv_injector.ids_for(
+            self.target_worker.model_runner.kv_index_translator.own_plan(batch)
+        )
+        return _PrefillInject(
             cache_loc=cache_loc,
             positions=positions,
             state_slot=state_slot,
             final_pos=final_pos,
-            target_hidden_is_projected=target_hidden_is_projected,
+            swa_loc=self._kv_injector.prefill_swa_loc(
+                cache_loc=cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            ),
         )
-        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
-        logits_output.hidden_states_token_indices = None
-
-        batch_output.next_draft_input = make_next_draft_input(
-            bonus_tokens=next_token_ids,
-            new_seq_lens=new_seq_lens,
-        )
-        return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:

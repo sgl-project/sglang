@@ -42,6 +42,39 @@ class TargetHiddenKvInjector:
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.kv_index_translator, cols=cols)
 
+    def prefill_swa_loc(
+        self,
+        *,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        state_slot: Optional[torch.Tensor],
+        final_pos: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """The SWA rows a prefill's target hidden lands in, for a draft pool
+        that takes them (None otherwise): `inject_target_hidden` reads them
+        instead of translating ``cache_loc`` itself."""
+        pool = self.draft_model_runner.token_to_kv_pool
+        if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            return None
+        device = self.model_runner.device
+        return self._mla_swa_loc(
+            pool=pool,
+            cache_loc=cache_loc.to(device=device, dtype=torch.int64),
+            positions=positions.to(device=device, dtype=torch.int64),
+            cache_loc_2d=None,
+            commit_lens=None,
+            state_slot=(
+                None
+                if state_slot is None
+                else state_slot.to(device=device, dtype=torch.int64)
+            ),
+            final_pos=(
+                None
+                if final_pos is None
+                else final_pos.to(device=device, dtype=torch.int64)
+            ),
+        )
+
     def inject_target_hidden(
         self,
         *,
@@ -53,6 +86,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
             return
@@ -97,9 +131,11 @@ class TargetHiddenKvInjector:
                 commit_lens=commit_lens,
                 state_slot=state_slot,
                 final_pos=final_pos,
+                swa_loc=swa_loc,
             )
             return
 
+        assert swa_loc is None, "only an MLA draft pool takes SWA rows"
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
@@ -122,7 +158,37 @@ class TargetHiddenKvInjector:
         commit_lens: Optional[torch.Tensor],
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
+        if swa_loc is None:
+            swa_loc = self._mla_swa_loc(
+                pool=pool,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+        with torch.inference_mode():
+            self.draft_model.write_target_hidden_kv(
+                main_hidden=target_hidden,
+                swa_loc=swa_loc,
+                positions=positions,
+                pool=pool,
+            )
+
+    def _mla_swa_loc(
+        self,
+        *,
+        pool,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor],
+        commit_lens: Optional[torch.Tensor],
+        state_slot: Optional[torch.Tensor],
+        final_pos: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         if pool.swa_req_ring_size is not None:
             swa_loc = self._ring_inject_loc(
                 pool=pool,
@@ -162,13 +228,7 @@ class TargetHiddenKvInjector:
                     committed_mask, swa_loc, torch.full_like(swa_loc, -1)
                 )
 
-        with torch.inference_mode():
-            self.draft_model.write_target_hidden_kv(
-                main_hidden=target_hidden,
-                swa_loc=swa_loc,
-                positions=positions,
-                pool=pool,
-            )
+        return swa_loc
 
     def _ring_inject_loc(
         self,
