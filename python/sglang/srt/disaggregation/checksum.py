@@ -101,9 +101,9 @@ class KvChecksumComputer:
         kv_page_indices_gpu: torch.Tensor,
         state_indices_gpu: Optional[torch.Tensor] = None,
     ) -> int:
-        expected_device = self._device.type
+        expected_device = kv_page_indices_gpu.device.type
         assert (
-            kv_page_indices_gpu.device.type == expected_device
+            expected_device in ("cuda", "npu")
             and kv_page_indices_gpu.is_contiguous()
         )
         all_ptrs = list(self._kv_data_ptrs)

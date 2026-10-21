@@ -441,7 +441,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=self.token_to_kv_pool.device,
+                device=torch.device(f"cuda:{get_device().gpu_id}"),
                 kv_data_ptrs=kv_args.kv_data_ptrs,
                 kv_item_lens=kv_args.kv_item_lens,
                 state_data_ptrs=kv_args.state_data_ptrs,
