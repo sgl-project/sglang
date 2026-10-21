@@ -105,10 +105,10 @@ def fused_post_expert_norm_weighted_sum(
     block_h = triton.next_power_of_2(hidden)
     _post_expert_norm_weighted_sum_kernel[(tokens,)](
         x,
-        norm_weight if norm_weight is not None else x,
+        norm_weight.contiguous() if norm_weight is not None else x,
         topk_scores.contiguous(),
         out,
-        slot_expert_ids if slot_expert_ids is not None else x,
+        slot_expert_ids.contiguous() if slot_expert_ids is not None else x,
         TOPK=topk,
         H=hidden,
         eps=eps,

@@ -118,6 +118,30 @@ def test_post_expert_finalize_triton(num_tokens, weight_first, with_ids):
         assert torch.count_nonzero(out[0]) == 0
 
 
+@pytest.mark.parametrize("strided_input", ["ids", "weight"])
+def test_post_expert_finalize_preserves_input_layout(strided_input):
+    """Small-batch finalization respects transposed IDs and sliced norm weights."""
+    tokens, topk, hidden = 2, 2, 8
+    x = torch.ones((tokens, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    scores = torch.ones((tokens, topk), device="cuda")
+    ids = torch.tensor([[0, 0], [-1, -1]], device="cuda", dtype=torch.int32)
+    weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    if strided_input == "ids":
+        ids = ids.T.contiguous().T
+        assert not ids.is_contiguous()
+    else:
+        weight = torch.arange(1, 2 * hidden + 1, device="cuda", dtype=torch.bfloat16)[
+            ::2
+        ]
+        assert not weight.is_contiguous()
+    out = fused_post_expert_norm_weighted_sum(
+        x, scores, weight, eps=1e-6, slot_expert_ids=ids
+    )
+    ref = _post_expert_reference(x, scores, weight, 1e-6, True, ids)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+    assert torch.count_nonzero(out[1]) == 0
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_post_expert_fallback_preserves_product_rounding(dtype):
     """Fallback rounds each product before summing and ignores poisoned slots."""
