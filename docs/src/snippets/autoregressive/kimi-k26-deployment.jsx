@@ -176,7 +176,6 @@ export const KimiK26Deployment = () => {
       (toolcall === 'enabled' ? ' \\\n    --tool-call-parser kimi_k2' : '');
 
     const draftLine = spec ? 'DRAFT_MODEL_PATH=/path/to/kimi-k2.6-eagle3\n' : '';
-    const specEnv = spec ? 'export SGLANG_ENABLE_SPEC_V2=1\n' : '';
     const specFlags = spec
       ? ' \\\n    --speculative-algorithm EAGLE3' +
         ' \\\n    --speculative-draft-model-path $DRAFT_MODEL_PATH' +
@@ -216,7 +215,6 @@ export const KimiK26Deployment = () => {
         'export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96\n' +
         'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600\n' +
         'export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1\n' +
-        specEnv +
         'export SGLANG_NPU_USE_MLAPO=1\n' +
         'export SGLANG_NPU_USE_MULTI_STREAM=1\n' +
         'export SGLANG_SET_CPU_AFFINITY=1\n' +
@@ -238,8 +236,7 @@ export const KimiK26Deployment = () => {
         '    --enable-multimodal \\\n' +
         '    --mm-attention-backend ascend_attn \\\n' +
         '    --sampling-backend ascend \\\n' +
-        '    --enable-dp-attention \\\n' +
-        '    --dp-size 16 \\\n' +
+        '    --attn-dp-size 16 \\\n' +
         '    --moe-a2a-backend deepep \\\n' +
         '    --deepep-mode auto \\\n' +
         '    --cuda-graph-bs-decode 1 2 3 4 5 \\\n' +
@@ -282,8 +279,7 @@ export const KimiK26Deployment = () => {
       '    --device npu \\\n' +
       '    --tp-size 16 \\\n' +
       '    --disable-radix-cache \\\n' +
-      '    --cuda-graph-backend-decode=disabled \\\n' +
-      '    --cuda-graph-backend-prefill=disabled \\\n' +
+      '    --disable-cuda-graph \\\n' +
       '    --mem-fraction-static 0.78 \\\n' +
       '    --max-running-requests 1 \\\n' +
       '    --moe-a2a-backend deepep \\\n' +
@@ -304,7 +300,6 @@ export const KimiK26Deployment = () => {
       'export HCCL_SOCKET_IFNAME=<network-interface>\n' +
       'export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=64\n' +
       'export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1\n' +
-      specEnv +
       'export SGLANG_NPU_USE_MLAPO=1\n' +
       'export SGLANG_NPU_USE_MULTI_STREAM=1\n\n' +
       'sglang serve \\\n' +
@@ -321,8 +316,6 @@ export const KimiK26Deployment = () => {
       '    --tp-size 16 \\\n' +
       '    --mem-fraction-static 0.82 \\\n' +
       '    --max-running-requests 16 \\\n' +
-      '    --enable-dp-attention \\\n' +
-      '    --dp-size 1 \\\n' +
       '    --enable-dp-lm-head \\\n' +
       '    --disable-radix-cache \\\n' +
       '    --enable-multimodal \\\n' +
