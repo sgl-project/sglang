@@ -1907,8 +1907,20 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950 with AITER and no MoE all-to-all backend: retain MXFP4 copies of the BF16 latent down/up projections (7168 to 3584 and back). Use them for batches meeting the token threshold; keep the original projections for smaller batches and unsupported weights/devices. This is lossy activation and weight quantization, disabled by default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4_MIN_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Minimum tokens per batch for Kimi-K3 MXFP4 latent projections. Must be positive when enabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>2048</code></td>
+    </tr>
   </tbody>
 </table>
+
+Kimi-K3 MXFP4 latent projection copies are replicated on every rank alongside the BF16 originals (about 2.34 GiB per GPU for 92 latent MoE layers), consuming memory that would otherwise be available to the KV cache. Check the startup token capacity and admitted concurrency after enabling this optimization; a smaller KV pool can outweigh the projection speedup. If physical memory permits, retune `--mem-fraction-static` and validate accuracy and serving performance again.
 
 ## NPU (Ascend)
 
