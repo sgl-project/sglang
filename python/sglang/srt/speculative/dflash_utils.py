@@ -9,6 +9,10 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative.verify_sampling import (
+    tree_speculative_sampling_target_only,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -18,14 +22,12 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
-from sglang.utils import LazyImport
+from sglang.srt.utils import is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
-_DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -40,43 +42,10 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda():
-    from sglang.kernels.ops.speculative.sampling import (
-        tree_speculative_sampling_target_only,
-    )
-
-    # Resolved on first call: CUDA builds without FlashInfer must still import
-    # this module.
-    top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
-    top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
-
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-elif is_musa():
-    try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-    except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
-        tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
-else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
-    tree_speculative_sampling_target_only = None
+# DFlash has never run sampling verify on NPU; enabling it is its own change.
+_DFLASH_SAMPLING_VERIFY_AVAILABLE = (
+    tree_speculative_sampling_target_only is not None and not is_npu()
+)
 
 
 def is_dflash_sampling_verify_available() -> bool:
