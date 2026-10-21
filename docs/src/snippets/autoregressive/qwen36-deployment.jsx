@@ -38,7 +38,7 @@ export const Qwen36Deployment = () => {
       name: 'quantization',
       title: 'Quantization',
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
-      // On Ascend NPU the verified options are BF16 for both sizes and W8A8
+      // The Ascend NPU best-practice recipes cover BF16 for both sizes and W8A8
       // (modelslim) for the 27B dense variant.
       // RTX Spark only has a validated NVFP4 recipe (35B-A3B).
       getDynamicItems: (values) => {
@@ -208,7 +208,7 @@ export const Qwen36Deployment = () => {
     const sizeConfig = modelConfigs[modelSize];
 
     // Atlas 800I A3 (Ascend NPU): PD-mixed single-node serving. Follows the
-    // verified recipes in the Ascend NPU best practices — ascend attention
+    // baseline settings in the Ascend NPU tutorials — ascend attention
     // backend, bfloat16 mamba state, NEXTN speculative decoding on the built-in
     // MTP weights, and modelslim W8A8 checkpoints for the 27B dense variant.
     if (hardware === 'a3') {
@@ -216,7 +216,9 @@ export const Qwen36Deployment = () => {
       const modelName = quantization === 'w8a8'
         ? `Eco-Tech/Qwen3.6-${sizeConfig.baseName}-w8a8`
         : `Qwen/Qwen3.6-${sizeConfig.baseName}`;
-      let cmd = `sglang serve --model-path ${modelName}`;
+      // Resolve the Eco-Tech checkpoint from its documented ModelScope source.
+      const envPrefix = quantization === 'w8a8' ? 'SGLANG_USE_MODELSCOPE=1 ' : '';
+      let cmd = `${envPrefix}sglang serve --model-path ${modelName}`;
       cmd += ` \\\n  --tp-size ${cards * 2} --nnodes 1`;
       cmd += ` \\\n  --attention-backend ascend --device npu`;
       if (quantization === 'w8a8') {
