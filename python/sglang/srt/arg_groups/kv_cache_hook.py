@@ -639,10 +639,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
+        # trtllm_mha verifies DSPARK on the target-verify path EAGLE and DFLASH run.
         _assert_spec_verify_backends(
             server_args,
             algorithm="DSPARK",
-            allowed=_SPEC_VERIFY_AUDITED_BACKENDS | {"fa4"},
+            allowed=_SPEC_VERIFY_AUDITED_BACKENDS | {"fa4", "trtllm_mha"},
         )
     if cfg.speculative_algorithm == "DFLASH":
         _assert_spec_verify_backends(

@@ -107,12 +107,15 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
     UNAUDITED = ("fa4",)
 
     def test_dspark_verify_backends(self):
-        for backend in self.VERIFY_BACKENDS + ("fa4",):
+        """DSPARK verifies on the audited verify set, on fa4, and on trtllm_mha,
+        whose target verify is the one EAGLE and DFLASH run."""
+        for backend in self.VERIFY_BACKENDS + ("fa4", "trtllm_mha"):
             self.assertTrue(_accepts("DSPARK", backend=backend), backend)
-        self.assertTrue(_accepts("DSPARK", backend="fa4", draft_backend="fa4"))
-        # trtllm_mha is audited for the EAGLE and DFLASH arms only.
-        for backend in ("trtllm_mha",):
-            self.assertFalse(_accepts("DSPARK", backend=backend), backend)
+        for backend in ("fa4", "trtllm_mha"):
+            self.assertTrue(
+                _accepts("DSPARK", backend=backend, draft_backend=backend), backend
+            )
+        self.assertFalse(_accepts("DSPARK", backend="torch_native"))
 
     def test_dcp_keeps_flashinfer_off_the_verify_list(self):
         """Under DCP flashinfer's spec verify reads DCP-widened ids; the MLA
