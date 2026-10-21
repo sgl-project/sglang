@@ -76,12 +76,9 @@ _CPU = torch.device("cpu")
 
 
 @pytest.fixture(autouse=True)
-def _skip_cuda_ipc_acknowledgement(monkeypatch):
-    """Keep CPU embedding tests independent of tensor-parallel runtime state."""
+def _default_cuda_platform(monkeypatch):
+    """CPU tests default to the CUDA batching path unless a test opts into NPU."""
     monkeypatch.setattr(mm_schedule, "_is_npu", False)
-    monkeypatch.setattr(
-        mm_schedule, "_acknowledge_deferred_cuda_ipc_cache_hits", lambda _items: None
-    )
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:
