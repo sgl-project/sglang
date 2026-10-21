@@ -1,6 +1,6 @@
 """Regenerate native DeepSeek fixtures with SGLang's actual serving pipeline.
 
-Run from experimental/sgl-router in a SGLang Python environment:
+Run from sgl-router in a SGLang Python environment:
     python tests/scripts/generate_deepseek_parity.py
 
 The Rust tests always compare rendered text, even without cached model files.

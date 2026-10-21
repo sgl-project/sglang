@@ -67,7 +67,7 @@ whole-block events. `REPORT` replaces the component snapshot for one
 ## Build
 
 ```bash
-cd experimental/sgl-router
+cd sgl-router
 cargo build --release -p sgl-kv-indexer
 ```
 
