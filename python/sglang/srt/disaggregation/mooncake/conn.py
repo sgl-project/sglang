@@ -1353,55 +1353,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
-    def _get_dcp_draft_slice(
-        self, src_ptr, dst_ptr, src_width, dst_width, dst_tp_rank, dst_attn_tp_size
-    ):
-        if self.is_mla_backend:
-            raise ValueError(
-                "PD DCP draft head slicing is unsupported for pure MLA: "
-                "dummy prefill senders may omit draft head shards"
-            )
-        copy_width = min(src_width, dst_width)
-        if max(src_width, dst_width) % copy_width:
-            raise ValueError("PD DCP draft KV head shards must divide evenly")
-        if dst_attn_tp_size is None:
-            raise ValueError("PD DCP draft head slicing requires destination TP size")
-        src_span = src_width * self.attn_tp_size
-        dst_span = dst_width * dst_attn_tp_size
-        src_rank = (self.kv_args.engine_rank % self.attn_tp_size) // max(
-            1, src_span // dst_span
-        )
-        dst_rank = dst_tp_rank // max(1, dst_span // src_span)
-        return (
-            src_ptr + (dst_rank * dst_width) % src_width,
-            dst_ptr + (src_rank * src_width) % dst_width,
-            src_width,
-            dst_width,
-            copy_width,
-        )
-
-    def _send_dcp_draft_slices(
-        self, mooncake_session_id, params, src_token_indices, dst_token_indices
-    ) -> int:
-        batch_size = self.max_transfer_batch_indices
-        if batch_size <= 0:
-            batch_size = 4096
-        for start in range(0, src_token_indices.size, batch_size):
-            src_indices = src_token_indices[start : start + batch_size]
-            dst_indices = dst_token_indices[start : start + batch_size]
-            blocks = []
-            for src_ptr, dst_ptr, src_width, dst_width, copy_width in params:
-                src_addrs = src_ptr + src_indices * src_width
-                dst_addrs = dst_ptr + dst_indices * dst_width
-                blocks.extend(
-                    (int(src), int(dst), copy_width)
-                    for src, dst in zip(src_addrs, dst_addrs)
-                )
-            ret = self._transfer_data(mooncake_session_id, blocks)
-            if ret != 0:
-                return ret
-        return 0
-
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -1527,14 +1478,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     )
                     continue
-                params = MooncakeKVManager._get_dcp_draft_slice(
-                    self,
-                    src_kv_ptrs[entry],
-                    dst_kv_ptrs[entry],
+                if self.is_mla_backend:
+                    raise ValueError(
+                        "PD DCP draft head slicing is unsupported for pure MLA: "
+                        "dummy prefill senders may omit draft head shards"
+                    )
+                copy_width = min(src_width, dst_width)
+                if max(src_width, dst_width) % copy_width:
+                    raise ValueError("PD DCP draft KV head shards must divide evenly")
+                if dst_attn_tp_size is None:
+                    raise ValueError(
+                        "PD DCP draft head slicing requires destination TP size"
+                    )
+                src_span = src_width * self.attn_tp_size
+                dst_span = dst_width * dst_attn_tp_size
+                src_rank = (self.kv_args.engine_rank % self.attn_tp_size) // max(
+                    1, src_span // dst_span
+                )
+                dst_rank = dst_tp_rank // max(1, dst_span // src_span)
+                src_offset = (dst_rank * dst_width) % src_width
+                dst_offset = (src_rank * src_width) % dst_width
+                params = (
+                    src_kv_ptrs[entry] + src_offset,
+                    dst_kv_ptrs[entry] + dst_offset,
                     src_width,
                     dst_width,
-                    dst_tp_rank,
-                    dst_attn_tp_size,
+                    copy_width,
                 )
                 if pack_buffer is not None and src_width > dst_width:
                     draft_to_pack.append(params)
@@ -1571,13 +1540,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
 
         def process_sliced_draft(params) -> int:
-            return MooncakeKVManager._send_dcp_draft_slices(
-                self,
-                mooncake_session_id,
-                params,
-                plan.draft_src_token_indices,
-                plan.draft_dst_token_indices,
-            )
+            batch_size = self.max_transfer_batch_indices
+            if batch_size <= 0:
+                batch_size = 4096
+            for start in range(0, plan.draft_src_token_indices.size, batch_size):
+                src_indices = plan.draft_src_token_indices[start : start + batch_size]
+                dst_indices = plan.draft_dst_token_indices[start : start + batch_size]
+                blocks = []
+                for src_ptr, dst_ptr, src_width, dst_width, copy_width in params:
+                    src_addrs = src_ptr + src_indices * src_width
+                    dst_addrs = dst_ptr + dst_indices * dst_width
+                    blocks.extend(
+                        (int(src), int(dst), copy_width)
+                        for src, dst in zip(src_addrs, dst_addrs)
+                    )
+                ret = self._transfer_data(mooncake_session_id, blocks)
+                if ret != 0:
+                    return ret
+            return 0
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, token_item_len: int, groups

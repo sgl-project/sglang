@@ -489,20 +489,6 @@ class AscendKVManager(MooncakeKVManager):
         )
 
         transfer_blocks: List[Tuple[int, int, int]] = []
-        sliced_draft_params = []
-        num_draft = getattr(self.kv_args, "num_draft_entries", 0)
-        if (
-            num_draft
-            and not dst_kv_item_lens
-            and dst_attn_tp_size
-            not in (
-                None,
-                self.attn_tp_size,
-            )
-        ):
-            raise ValueError(
-                "PD DCP with different draft TP sizes requires destination KV lengths"
-            )
         for entry, uses_global_slots in enumerate(layout):
             page_bytes = self.kv_args.kv_item_lens[entry]
             if page_bytes != dcp_token_item_lens[entry] * self.kv_args.page_size:
@@ -514,27 +500,6 @@ class AscendKVManager(MooncakeKVManager):
                     dst_dcp_size if uses_global_slots else 1
                 )
                 if dst_kv_item_lens[entry] != expected_dst_bytes:
-                    if uses_global_slots and entry >= num_entries - num_draft:
-                        src_width = dcp_token_item_lens[entry]
-                        dst_width, remainder = divmod(
-                            dst_kv_item_lens[entry],
-                            self.kv_args.page_size * dst_dcp_size,
-                        )
-                        if remainder or dst_width <= 0:
-                            raise ValueError(
-                                "Invalid PD DCP draft destination token width"
-                            )
-                        sliced_draft_params.append(
-                            self._get_dcp_draft_slice(
-                                src_kv_ptrs[entry],
-                                dst_kv_ptrs[entry],
-                                src_width,
-                                dst_width,
-                                dst_tp_rank,
-                                dst_attn_tp_size,
-                            )
-                        )
-                        continue
                     raise RuntimeError(
                         "Ascend PD DCP destination geometry differs at entry "
                         f"{entry}: expected={expected_dst_bytes}, "
@@ -553,19 +518,7 @@ class AscendKVManager(MooncakeKVManager):
                     )
                 )
 
-        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
-        if ret != 0 or not sliced_draft_params:
-            return ret
-        offsets = np.arange(self.kv_args.page_size, dtype=np.int64)
-        src_tokens = (global_src[:, None] * self.kv_args.page_size + offsets).reshape(
-            -1
-        )
-        dst_tokens = (global_dst[:, None] * self.kv_args.page_size + offsets).reshape(
-            -1
-        )
-        return self._send_dcp_draft_slices(
-            mooncake_session_id, sliced_draft_params, src_tokens, dst_tokens
-        )
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.
