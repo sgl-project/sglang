@@ -34,6 +34,9 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
+    # Feature-only source ownership fence; each final chunk retains its own
+    # generation even after the sender or bootstrap room is reused.
+    deferred_draft_source_fence: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:

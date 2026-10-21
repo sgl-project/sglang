@@ -56,6 +56,27 @@ class Disagg(msgspec.Struct):
         Literal["null", "prefill", "decode"],
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',
     ] = "null"
+    disaggregation_defer_draft_prefill: A[
+        bool,
+        "Run target prefill on P and initialize the full EAGLE/NEXTN draft "
+        "prefix on D from transferred target hidden states. Enable on both "
+        "roles; P does not load or execute the draft model. Experimental, "
+        "Mooncake, text-only, and prefix cache disabled. Requests requiring "
+        "retraction or rebootstrap terminate with error status 503.",
+    ] = False
+    disaggregation_draft_prefill_max_input_tokens: A[
+        Optional[int],
+        "Maximum prompt length accepted by deferred draft prefill. Required "
+        "with --disaggregation-defer-draft-prefill; bounds each hidden staging "
+        "slot. Decode --max-prefill-tokens must be at least this value.",
+    ] = None
+    disaggregation_draft_prefill_slots: A[
+        int,
+        "Number of in-flight target-hidden staging slots on decode for deferred "
+        "draft prefill. Prefill source slots follow its metadata allocator "
+        "(2 * max-running-requests) to preserve pipeline admission ordering. "
+        "This limits transfers, not active decode requests.",
+    ] = 2
     disaggregation_decode_allocation_policy: A[
         Literal["early", "prefill_complete"],
         "When to reserve per-request decode KV in disaggregated serving. "

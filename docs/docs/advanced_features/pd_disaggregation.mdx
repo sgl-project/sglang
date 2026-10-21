@@ -74,6 +74,89 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Deferred draft prefill
+
+For an experimental target-only prefill worker, enable
+`--disaggregation-defer-draft-prefill` on **both prefill and decode**. Keep
+`--speculative-algorithm EAGLE` or `NEXTN` on both workers. Prefill does not
+instantiate or load the draft model: it runs the target and sends every prompt
+token's target hidden state alongside the existing target KV/state transfer.
+Decode initializes the complete draft prefix from those hidden states before
+its first speculative decode step. This initialization runs only the draft;
+it does not replay or advance the target model, target KV, or recurrent state.
+
+### Usage and limits
+
+On Linux with NVIDIA CUDA and Mooncake installed, start from a working PD
+configuration for a DSA checkpoint with exactly one NextN prediction layer.
+Use the same serving revision and deferred-draft settings on both workers.
+For example, define these common arguments on each worker host; `MODEL_PATH`
+is a local checkpoint directory or Hugging Face model ID. Retain any additional
+model-specific options required by that checkpoint.
+
+```bash
+MODEL_PATH=/path/to/one-layer-dsa-nextn-checkpoint
+DEFERRED_DRAFT_ARGS=(
+  --model-path "$MODEL_PATH"
+  --speculative-algorithm EAGLE
+  --speculative-num-steps 4
+  --speculative-eagle-topk 1
+  --speculative-num-draft-tokens 5
+  --disaggregation-transfer-backend mooncake
+  --disaggregation-defer-draft-prefill
+  --disaggregation-draft-prefill-max-input-tokens 9216
+  --disaggregation-draft-prefill-slots 8
+  --disable-radix-cache
+  --max-running-requests 8
+  --skip-server-warmup
+)
+```
+
+Run prefill on a host with four GPUs, using TP 1 and PP 4:
+
+```bash
+python3 -m sglang.launch_server "${DEFERRED_DRAFT_ARGS[@]}" \
+  --disaggregation-mode prefill --tp-size 1 --pp-size 4 \
+  --chunked-prefill-size 2048 --pp-async-batch-depth 0 \
+  --host 0.0.0.0 --port 30000
+```
+
+Run decode on another host with four GPUs, using TP 4 and PP 1:
+
+```bash
+python3 -m sglang.launch_server "${DEFERRED_DRAFT_ARGS[@]}" \
+  --disaggregation-mode decode --tp-size 4 --pp-size 1 \
+  --max-prefill-tokens 9216 --host 0.0.0.0 --port 30001
+```
+
+Connect the workers through the [PD router](/docs/advanced_features/sgl_model_gateway#prefill-decode-disaggregation)
+and send a complete PD warmup request before measuring. Local server warmup is
+skipped in this example. Decode's `--max-prefill-tokens` must be at least
+`--disaggregation-draft-prefill-max-input-tokens`, because draft initialization
+processes the whole prompt at once. The input limit bounds each hidden staging
+slot. Decode's slot count bounds concurrent hidden transfers, not active decode
+requests; prefill source slots follow its metadata allocator
+(`2 * max-running-requests`). These buffers reserve additional GPU memory.
+
+The initial path requires the Python bootstrap registry, prefill TP 1, decode
+PP 1, and data, context, and expert parallel sizes of one. It supports text-only,
+single-layer DSA NextN drafts with unexpanded target hidden states. Multi-layer
+or adaptive speculation, prefix caching, HiCache, HiSparse, unified memory,
+host KV receive, decode KV offload, optimistic prefill, `prefill_complete`
+allocation, role switching, PD multiplexing, encoder disaggregation, gRPC,
+LoRA, and decoupled speculation are unsupported. Requests with input embeddings,
+constrained decoding, sessions, or custom logit processors are also rejected.
+Keep `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE` enabled.
+
+Requests requiring retraction or rebootstrap terminate with error status 503 for
+the client to retry. For streaming responses, inspect the abort finish reason:
+HTTP 200 headers may already have been sent. Hidden buffers are reused only after
+transfer and CUDA consumer completion; if transfer completion cannot be
+established, the affected hidden slots are quarantined. This does not extend the
+existing target-KV recovery contract. Compare latency, throughput, and outputs
+against ordinary PD
+speculation for your workload before enabling this option in production.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

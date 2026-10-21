@@ -104,6 +104,22 @@ class SchedulerInternalStateController:
         state["decode_cuda_graph_memory_gb"] = round(
             sum(graph_memory[phase] for phase in _DECODE_GRAPH_PHASES), 3
         )
+        pool = getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        if pool is not None:
+            stats: Dict[str, Any] = {"hidden_slots": pool.get_slot_stats()}
+            if mode == DisaggregationMode.PREFILL:
+                retirements = getattr(
+                    self.scheduler, "deferred_draft_source_retirements", None
+                )
+                stats["pending_source_retirements"] = (
+                    len(retirements) if retirements is not None else 0
+                )
+                stats["quarantined_source_metadata_slots"] = (
+                    retirements.quarantined_metadata_slots
+                    if retirements is not None
+                    else 0
+                )
+            state["deferred_draft_prefill"] = stats
 
     def _add_elastic_ep(self, state: Dict[str, Any]) -> None:
         if get_exec().moe.elastic_ep_backend is None:

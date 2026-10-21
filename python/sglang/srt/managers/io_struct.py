@@ -1178,6 +1178,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
 
+    # Internal PP-only generation for deferred draft source retirement. P0
+    # assigns it once; later stages must consume the relayed value. Append-only
+    # tail placement keeps older array-like IPC senders compatible.
+    pd_deferred_draft_source_generation: Optional[str] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 

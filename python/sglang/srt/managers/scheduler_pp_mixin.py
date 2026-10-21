@@ -361,7 +361,9 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
-                if len(self.disagg_prefill_inflight_queue) == 0:
+                if len(self.disagg_prefill_inflight_queue) == 0 and not bool(
+                    getattr(self, "deferred_draft_source_retirements", None)
+                ):
                     self.on_idle()
 
     @DynamicGradMode()
@@ -612,27 +614,42 @@ class SchedulerPPMixin:
         self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Retired feature sources can outlive the normal inflight queue. Carry
+        # their ownership decisions around the existing PP transfer/release ring.
+        retirements = getattr(self, "deferred_draft_source_retirements", None)
+        current_states = retirements.snapshot() if retirements is not None else None
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
-        # if other ranks, do intersection with the previous rank's transferred rids
         else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
+            )
+            if retirements is not None:
+                from sglang.srt.disaggregation.deferred_draft_prefill_lifecycle import (
+                    merge_deferred_draft_prefill_retirements,
+                )
+
+                current_states = merge_deferred_draft_prefill_retirements(
+                    getattr(prev_transferred_rids, "retirement_states", {}),
+                    current_states,
+                )
+        if retirements is not None:
+            from sglang.srt.disaggregation.deferred_draft_prefill_lifecycle import (
+                DeferredDraftPrefillReleaseRids,
+            )
+
+            return DeferredDraftPrefillReleaseRids(
+                transferred_rids, retirement_states=current_states
             )
         return transferred_rids
 
@@ -746,6 +763,12 @@ class SchedulerPPMixin:
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
+        if getattr(self, "deferred_draft_source_retirements", None) is not None:
+            from sglang.srt.disaggregation.deferred_draft_prefill_lifecycle import (
+                pack_deferred_draft_prefill_release,
+            )
+
+            data = pack_deferred_draft_prefill_release(data)
         p2p_work = []
         if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
             dp_offset = (
@@ -785,6 +808,14 @@ class SchedulerPPMixin:
             data = None
 
         data = attn_cp_tp_broadcast_pyobj(data)
+        if getattr(self, "deferred_draft_source_retirements", None) is not None:
+            from sglang.srt.disaggregation.deferred_draft_prefill_lifecycle import (
+                unpack_deferred_draft_prefill_release,
+            )
+
+            # Keep the envelope intact through the TP broadcast: its empty
+            # fast path would otherwise discard the retirement votes again.
+            data = unpack_deferred_draft_prefill_release(data)
         return data
 
     def _pp_prepare_tensor_dict(
