@@ -544,26 +544,6 @@ class AscendAttnBackend(AttentionBackend):
         )
         return local_kv_lens, block_tables
 
-    def _init_dsa_dcp_metadata(self, forward_batch: ForwardBatch) -> None:
-        """Prepare eager DSA reads from the existing global CPU lengths."""
-        metadata = self.forward_metadata
-        metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
-        is_spec = forward_batch.forward_mode.is_target_verify()
-        local_lens_cpu, block_tables = self._get_kv_lens_and_block_tables(
-            kv_lens_cpu=metadata.seq_lens_cpu_int,
-            req_pool_indices=forward_batch.req_pool_indices,
-            is_spec=is_spec,
-        )
-        local_lens = local_lens_cpu.to(device=self.device, dtype=torch.int32)
-        if is_spec:
-            metadata.dcp_spec_seq_lens_cpu_int = local_lens_cpu
-            metadata.dcp_spec_seq_lens = local_lens
-            metadata.dcp_spec_block_tables = block_tables
-        else:
-            metadata.dcp_seq_lens_cpu_int = local_lens_cpu
-            metadata.dcp_seq_lens = local_lens
-            metadata.dcp_block_tables = block_tables
-
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
@@ -739,7 +719,23 @@ class AscendAttnBackend(AttentionBackend):
         # Draft workers retain allocator-global cache slots and use the non-DCP
         # attention path, so only target workers need DCP-specific metadata.
         if self._use_dsa_dcp():
-            self._init_dsa_dcp_metadata(forward_batch)
+            metadata = self.forward_metadata
+            metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
+            is_spec = forward_batch.forward_mode.is_target_verify()
+            local_lens_cpu, block_tables = self._get_kv_lens_and_block_tables(
+                kv_lens_cpu=metadata.seq_lens_cpu_int,
+                req_pool_indices=forward_batch.req_pool_indices,
+                is_spec=is_spec,
+            )
+            local_lens = local_lens_cpu.to(device=self.device, dtype=torch.int32)
+            if is_spec:
+                metadata.dcp_spec_seq_lens_cpu_int = local_lens_cpu
+                metadata.dcp_spec_seq_lens = local_lens
+                metadata.dcp_spec_block_tables = block_tables
+            else:
+                metadata.dcp_seq_lens_cpu_int = local_lens_cpu
+                metadata.dcp_seq_lens = local_lens
+                metadata.dcp_block_tables = block_tables
 
         if (
             self.use_mla
