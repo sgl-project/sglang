@@ -225,9 +225,6 @@ def split_fp32_to_bf16x3(
     return torch.cat([hi, mid, lo], out=out)
 
 
-_split_scratch: Dict[Tuple[torch.device, int, int], torch.Tensor] = {}
-
-
 def router_gemm_bf16x3_cublas(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """[M, K] bf16 x [N, K] fp32 router logits on BF16 tensor cores.
 
@@ -236,11 +233,6 @@ def router_gemm_bf16x3_cublas(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     tensor-core accumulation is not IEEE fp32: the error is a few times that of
     an fp32 SGEMM.
     """
-    n, k = w.shape
-    key = (w.device, n, k)
-    if key not in _split_scratch:
-        _split_scratch[key] = torch.empty(
-            3 * n, k, dtype=torch.bfloat16, device=w.device
-        )
-    w3 = split_fp32_to_bf16x3(w, out=_split_scratch[key])
+    n = w.shape[0]
+    w3 = split_fp32_to_bf16x3(w)
     return torch.mm(x, w3.t(), out_dtype=torch.float32).view(-1, 3, n).sum(dim=1)
