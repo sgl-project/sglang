@@ -1,8 +1,9 @@
 """HiCache progress must not depend on whether a prefill batch is admitted."""
 
 import unittest
+from collections import deque
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -23,6 +24,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def setUp(self):
         self.calls = Mock()
         self.scheduler = s = Scheduler.__new__(Scheduler)
+        s.batch_result_processor = MagicMock(deferred_kv_releases=deque())
+        s.waiting_queue = []
         s.scheduler_stage_metrics = None
         s.enable_hierarchical_cache = True
         s.enable_unified_cache_external_linker = False

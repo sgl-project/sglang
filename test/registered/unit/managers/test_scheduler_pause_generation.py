@@ -69,6 +69,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.batch_result_processor = MagicMock(deferred_kv_releases=deque())
         scheduler._engine_paused = False
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
