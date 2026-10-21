@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import (
     Literal,
     Optional,
@@ -39,6 +40,10 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_boundary_reduction: A[
+        Literal["ar", "rs", "rsv", "rs+rsv"],
+        Arg(no_cli=True, resolvable=True),
+    ] = "rs+rsv"
     speculative_draft_model_revision: A[
         Optional[str],
         "The specific draft model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
@@ -112,6 +117,11 @@ class Spec(msgspec.Struct):
     speculative_use_rejection_sampling: A[
         bool, "Use rejection sampling for speculative decoding (requires topk=1)."
     ] = False
+    speculative_use_block_verification: A[
+        bool,
+        "Use block verification for EAGLE/EAGLE3/NEXTN (requires topk=1) or for "
+        "sampled DFLASH/DSPARK drafts, on CUDA or ROCm.",
+    ] = False
     speculative_token_map: A[
         Optional[str],
         "The path of the draft model's small vocab table.",
@@ -162,7 +172,7 @@ class Spec(msgspec.Struct):
     speculative_moe_runner_backend: A[
         Optional[str],
         Arg(
-            help="Choose the runner backend for MoE in speculative decoding.",
+            help="Choose the runner backend for MoE in speculative decoding. Defaults to --moe-runner-backend, except flashinfer_megamoe defaults the draft to flashinfer_trtllm (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support).",
             choices=MOE_RUNNER_BACKEND_CHOICES,
             resolvable=True,
         ),
@@ -170,7 +180,7 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support).",
             choices=[
                 "none",
                 "deepep",
@@ -187,6 +197,21 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    speculative_enable_w4a4_mxfp4_megamoe: A[
+        Optional[bool],
+        Arg(
+            help="Whether the draft model's MXFP4 MegaMoE layers use the W4A4 "
+            "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
+            "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
+            "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
+            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
+            "MegaMoE with a different MMA type from the target may allocate an "
+            "additional MegaMoE symmetric buffer after the KV pool is sized; "
+            "lower --mem-fraction-static if CUDA-graph capture runs out of "
+            "memory.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
     speculative_draft_model_quantization: A[
         Optional[str],
         Arg(
@@ -201,10 +226,6 @@ class Spec(msgspec.Struct):
         Optional[bool],
         Arg(no_cli=True),
     ] = None
-    speculative_skip_dp_mlp_sync: A[
-        bool,
-        "Skip the extra MLP sync that the scheduler performs before merging a new batch when speculative decoding + DP attention are both enabled.",
-    ] = False
     enable_multi_layer_eagle: A[
         bool,
         Arg(

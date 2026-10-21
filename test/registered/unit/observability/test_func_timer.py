@@ -7,10 +7,10 @@ register_cpu_ci(est_time=4, suite="stage-b-test-cpu-intel")
 
 import asyncio
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import sglang.srt.observability.func_timer as func_timer
-from sglang.srt.observability.func_timer import enable_func_timer, time_func_latency
+from sglang.srt.observability.func_timer import time_func_latency
 
 
 class TestFuncTimer(unittest.TestCase):
@@ -21,14 +21,6 @@ class TestFuncTimer(unittest.TestCase):
     def tearDown(self):
         func_timer.enable_metrics = self.orig_enable
         func_timer.FUNC_LATENCY = self.orig_latency
-
-    @patch("prometheus_client.Histogram")
-    def test_enable_func_timer(self, MockHistogram):
-        """Sets enable_metrics and creates FUNC_LATENCY histogram."""
-        enable_func_timer()
-        self.assertTrue(func_timer.enable_metrics)
-        self.assertIs(func_timer.FUNC_LATENCY, MockHistogram.return_value)
-        MockHistogram.assert_called_once()
 
     def test_sync_disabled(self):
         """Sync function passes through when metrics disabled."""

@@ -23,6 +23,7 @@ from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -899,6 +900,10 @@ class C4IndexerAscendBackendMixin:
             )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
+        compress_layer_id = self.token_to_kv_pool.layer_mapping[
+            c4_indexer.layer_id
+        ].compress_layer_id
+        maybe_capture_indexer_topk(compress_layer_id, topk_idxs)
 
     def _cp_local_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Per-rank positions under CP-v2 (the batch keeps full-length ones)."""
@@ -1016,6 +1021,18 @@ class DeepseekV4AscendAttnBackend(
             out_cache_loc=out_cache_loc,
             block_size=block_size,
         )
+        # The query is padded to an attn_tp multiple (prepare_mlp_sync_batch),
+        # but seq_lens is not, so pad the tail with -1 ("skip") to match.
+        num_padded_tokens = out_cache_loc.shape[0]
+        if ori_sparse_indices.shape[0] < num_padded_tokens:
+            pad_rows = num_padded_tokens - ori_sparse_indices.shape[0]
+            pad = torch.full(
+                (pad_rows, ori_sparse_indices.shape[1]),
+                -1,
+                dtype=ori_sparse_indices.dtype,
+                device=ori_sparse_indices.device,
+            )
+            ori_sparse_indices = torch.cat([ori_sparse_indices, pad], dim=0)
         ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
 
         fm.ori_sparse_indices = ori_sparse_indices
