@@ -4,7 +4,9 @@ indexer) on MTP verify grids: 6 rows per request sharing one page table.
 Each sample is one CUDA graph replay of NUM_LAYERS launches, each reading a
 different KV pool (as the layers of a decode step do), after a 1 GiB read that
 evicts L2 and MALL; the reported time is graph time / NUM_LAYERS.  Each setup is
-timed with the per-row kernel and with the shared-page kernel (share_pages).
+timed with the per-row kernel and with the shared-page kernel (share_pages);
+the server selects the shared-page kernel only for <= 18 rows whose longest
+context is >= 96k tokens.
 
     python benchmark/kernels/deepseek/benchmark_dsa_gfx950_logits_hist.py
 """
@@ -106,19 +108,29 @@ def main():
     gen = torch.Generator(device="cuda").manual_seed(0)
     pools = [make_pool(gen) for _ in range(a.layers)]
     flush = torch.ones((1 << 30) // 4, dtype=torch.float32, device="cuda")
-    print(f"{'requests':>8} {'rows':>4} {'ctx':>8} {'us':>8}")
+    print(
+        f"{'requests':>8} {'rows':>4} {'ctx':>8} {'per-row us':>10} "
+        f"{'shared us':>10} {'speedup':>8}"
+    )
     for reqs in a.requests:
         for c in a.ctx:
-            us = bench(
-                mod,
-                loader.LOGITS_BLOCKS_PER_ROW,
-                [c] * reqs,
-                pools,
-                gen,
-                flush,
-                a.iters,
+            us = [
+                bench(
+                    mod,
+                    loader.LOGITS_BLOCKS_PER_ROW,
+                    share,
+                    [c] * reqs,
+                    pools,
+                    gen,
+                    flush,
+                    a.iters,
+                )
+                for share in (0, 1)
+            ]
+            print(
+                f"{reqs:>8} {6 * reqs:>4} {c:>8} {us[0]:>10.2f} {us[1]:>10.2f} "
+                f"{us[0] / us[1]:>7.2f}x"
             )
-            print(f"{reqs:>8} {6 * reqs:>4} {c:>8} {us:>8.2f}")
 
 
 if __name__ == "__main__":
