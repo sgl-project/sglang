@@ -158,6 +158,7 @@ class TestPageShardScratchSizing(CustomTestCase):
             page_size=16,
             kv_cache_dtype=torch.bfloat16,
             model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(),
                 context_len=context_len,
                 kv_lora_rank=16,
                 qk_rope_head_dim=8,
@@ -450,9 +451,9 @@ class TestMTPKVShardConfig(CustomTestCase):
         ] + [
             (kvc.model_config, "num_nextn_predict_layers", None, "EAGLE MTP"),
             (kvc.model_config, "num_nextn_predict_layers", 0, "EAGLE MTP"),
-            (kvc, "is_hybrid_swa", True, "dense MLA and MHA"),
-            (kvc, "mambaish_config", object(), "dense MLA and MHA"),
-            (kvc, "sliding_window_size", 128, "dense MLA and MHA"),
+            (kvc, "is_hybrid_swa", True, "MLA, DSA and MHA"),
+            (kvc, "mambaish_config", object(), "MLA, DSA and MHA"),
+            (kvc, "sliding_window_size", 128, "MLA, DSA and MHA"),
             (kvc, "post_capture_kv_active", True, "plain per-layer KV layout"),
             (kvc, "kv_cache_dtype_str", "mxfp8", "plain per-layer KV layout"),
         ]
@@ -463,10 +464,13 @@ class TestMTPKVShardConfig(CustomTestCase):
                 self.assertRaisesRegex(ValueError, message),
             ):
                 _build_mtp_pool(kvc)
-        for options in ({"is_dsa_model": True}, {"is_dsv4_model": True}):
+        for options, message in (
+            ({"is_dsa_model": True}, "same DSA indexer layout"),
+            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+        ):
             with (
                 self.subTest(options=options),
-                self.assertRaisesRegex(ValueError, "dense MLA and MHA"),
+                self.assertRaisesRegex(ValueError, message),
             ):
                 _build_mtp_pool(kvc, **options)
         for context, options, message in (
@@ -1722,31 +1726,43 @@ class TestShardSendFilter(CustomTestCase):
 
 def _host_pool(shard_rank, device_pages=32):
     """A real MLA host pool (CPU, unpinned) striped for ``shard_rank``."""
-    device_pool = SimpleNamespace(
+    device_pool = MLATokenToKVPool(
         size=device_pages * PS,
-        host_capacity_tokens=None,
-        store_dtype=torch.float16,
+        page_size=PS,
+        dtype=torch.float16,
         kv_lora_rank=8,
         qk_rope_head_dim=4,
         layer_num=2,
         start_layer=0,
         end_layer=2,
         device="cpu",
-        layers_to_capture=None,
-        layer_shard_enabled=False,
-        placement=PageInterleavePlacement(_make_spec(shard_rank=shard_rank)),
-        shard_rank=shard_rank,
-        shard_size=N,
+        enable_memory_saver=False,
     )
-    return page_interleave_host_pool_cls(MLATokenToKVPoolHost)(
-        device_pool,
-        host_to_device_ratio=2.0,
-        host_size=0,
-        page_size=PS,
-        layout="layer_first",
-        pin_memory=False,
-        device="cpu",
-    )
+    # These tiny CPU fixtures test ownership, not the machine's free-RAM budget.
+    with (
+        unittest.mock.patch(
+            "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+            side_effect=lambda requested: requested,
+        ),
+        unittest.mock.patch(
+            "sglang.srt.mem_cache.pool_host.common.alloc_mmap",
+            side_effect=lambda dims, dtype: torch.empty(dims, dtype=dtype),
+        ),
+    ):
+        return page_interleave_host_pool_cls(MLATokenToKVPoolHost)(
+            device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=PS,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            device_capacity_tokens=device_pool.size,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=device_pool.layer_num,
+            placement=PageInterleavePlacement(_make_spec(shard_rank=shard_rank)),
+        )
 
 
 def _page_classes(indices):
@@ -1943,6 +1959,7 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             shard_rank=0,
             shard_size=N,
             _send_rows=torch.arange(PS),
+            _gather_send_rows=lambda name: torch.arange(PS),
             _gather_pairs=gather_pairs,
             kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
             device_module=SimpleNamespace(

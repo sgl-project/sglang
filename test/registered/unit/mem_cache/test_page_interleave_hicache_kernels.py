@@ -41,8 +41,10 @@ DTYPE = torch.bfloat16
 
 
 def _shard(pool, rank):
-    """Give a stock pool the attributes the striped host pool reads off a
-    PageInterleave pool (its buffers already have the per-rank geometry)."""
+    """Give a stock pool the placement passed to its striped host pool.
+
+    Its buffers already have the per-rank geometry.
+    """
     pool.placement = PageInterleavePlacement(
         PageShardSpec(
             shard_rank=rank,
@@ -107,12 +109,29 @@ class TestStripedHostRoundTrip(CustomTestCase):
 
     def _round_trip(self, make_pool, host_cls, layout, io_backend):
         pools = [make_pool(r) for r in range(N)]
-        hosts = [
-            page_interleave_host_pool_cls(host_cls)(
-                pools[r], 2.0, 0, PS, layout, pin_memory=True, device="cpu"
+        hosts = []
+        for pool in pools:
+            kwargs = (
+                {"target_layer_num": pool.layer_num}
+                if isinstance(pool, MLATokenToKVPool)
+                else {}
             )
-            for r in range(N)
-        ]
+            hosts.append(
+                page_interleave_host_pool_cls(host_cls)(
+                    pool.get_device_pool_infos()[0].buffer_info,
+                    2.0,
+                    0,
+                    PS,
+                    layout,
+                    pin_memory=True,
+                    device="cpu",
+                    device_capacity_tokens=pool.size,
+                    start_layer=pool.start_layer,
+                    end_layer=pool.end_layer,
+                    placement=pool.placement,
+                    **kwargs,
+                )
+            )
         for h in hosts:
             # Unpin now: a leaked registration fails the next case's (rc 712).
             self.addCleanup(h.destroy)
