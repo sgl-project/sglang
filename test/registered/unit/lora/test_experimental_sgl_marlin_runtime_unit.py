@@ -324,7 +324,12 @@ def _run_marlin_flow(
         output.fill_(0)
         return output
 
-    def fake_silu_and_mul_add_delta(_x, _delta, output):
+    def fake_silu_and_mul_add_delta(
+        _x, _delta, output, *, topk_ids, token_lora_mapping, adapter_enabled
+    ):
+        assert topk_ids is dispatch_output.topk_output.topk_ids
+        assert token_lora_mapping is lora_info.token_lora_mapping
+        assert adapter_enabled is lora_info.adapter_enabled
         calls.schedule.append(("activation", stream_state["current"].name))
         output.fill_(0)
 
@@ -410,6 +415,7 @@ def _run_marlin_flow(
             else torch.arange(tokens, dtype=torch.int32).remainder(slots)
         ),
         experts_shared_outer_loras=True,
+        adapter_enabled=torch.full((slots,), active_lora, dtype=torch.int32),
     )
     runner_config = SimpleNamespace(
         activation="silu",

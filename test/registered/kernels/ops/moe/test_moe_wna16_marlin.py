@@ -1069,6 +1069,7 @@ def _check_marlin_inactive_routes(
                         max_lora_rank=rank,
                         has_active_lora=True,
                         experts_shared_outer_loras=True,
+                        adapter_enabled=torch.ones(1, device="cuda", dtype=torch.int32),
                         gate_up_lora_a_weights=x.new_zeros((1, 1, 2 * rank, hidden)),
                         gate_up_lora_b_weights=x.new_zeros(
                             (1, experts, 2 * intermediate, rank)
