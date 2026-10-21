@@ -280,7 +280,6 @@ class EncoderScheduler:
             return
         group = valid
 
-        requests = [p.request for p in group]
         start = time.time()
         modality_str = modality.name.lower()
         if observe_queue_wait and server_module.encoder_metrics_collector is not None:
@@ -294,6 +293,12 @@ class EncoderScheduler:
             # lock, while allowing concurrent HTTP handlers to enqueue before
             # waiting on their individual futures.
             async with self.encoder.encode_dispatch_lock:
+                # A health probe or direct dispatch can hold this lock past a
+                # caller's timeout. Recheck before starting any TP work.
+                group = [pending for pending in group if not pending.future.done()]
+                if not group:
+                    return
+                requests = [p.request for p in group]
                 for sock in self.send_sockets:
                     sock_send(
                         sock,
