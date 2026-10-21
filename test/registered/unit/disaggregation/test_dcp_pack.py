@@ -345,6 +345,9 @@ class TestTryDcpPack(CustomTestCase):
         )
         with (
             patch(
+                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.set_device"
+            ) as set_device_mock,
+            patch(
                 "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.default_stream"
             ),
             patch(
@@ -360,6 +363,7 @@ class TestTryDcpPack(CustomTestCase):
             overflow = mgr._pack_dcp_rank_once(buf, dst, src, {})
 
         self.assertIsNone(overflow)
+        set_device_mock.assert_called_once_with(pack.device)
         gather_stream.synchronize.assert_called_once_with()
         self.assertIsNotNone(packed)
         ptrs, indices = packed
