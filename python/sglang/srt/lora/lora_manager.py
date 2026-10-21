@@ -1164,12 +1164,12 @@ class LoRAManager:
                     # `self.lora_modules` with `None`.
                     continue
                 if isinstance(module, InklingBatchDenseMLP):
-                    from sglang.srt.models.inkling_common.lora import (
-                        InklingBatchDenseMLPWithLoRA,
-                    )
-
-                    module.__class__ = InklingBatchDenseMLPWithLoRA
                     module.initialize_lora(self.lora_backend)
+                    logger.info_once(
+                        "Inkling shared-sink LoRA: %s on the %s backend",
+                        type(module).__name__,
+                        self.lora_backend.name,
+                    )
                     lora_module = module
                 else:
                     lora_module = self.set_lora_module(module_name, module)
