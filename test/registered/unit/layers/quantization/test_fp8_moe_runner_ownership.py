@@ -7,6 +7,7 @@ the MxFP4 wrapper methods borrow an `Fp8MoEMethod` for weight loading only
 and never give it a `moe_runner_config` (issue #36264).
 """
 
+import math
 import sys
 import types
 import unittest
@@ -160,6 +161,81 @@ class TestFp8MoEAiterQuantInfo(CustomTestCase):
         self.assertEqual(quant_info.swiglu_limit, 10.0)
         self.assertEqual(quant_info.fused_moe_kwargs, {"gate_mode": "separated"})
         self.assertIs(quant_info.expert_mask, layer.dispatcher.expert_mask_gpu)
+
+
+class TestFp8MoEAiterWeightLayout(CustomTestCase):
+    @staticmethod
+    def _make_layer():
+        layer = torch.nn.Module()
+        for name, shape in (("w13_weight", (2, 32, 16)), ("w2_weight", (2, 16, 16))):
+            weight = (torch.arange(math.prod(shape)).reshape(shape) % 13).to(
+                torch.float8_e4m3fn
+            )
+            weight.view(torch.int8).reshape(-1)[0] = -128
+            layer.register_parameter(
+                name, torch.nn.Parameter(weight, requires_grad=False)
+            )
+            layer.register_parameter(
+                f"{name}_scale_inv",
+                torch.nn.Parameter(torch.ones((2, 1, 1)), requires_grad=False),
+            )
+        return layer
+
+    @staticmethod
+    def _shuffle(weight, block):
+        return weight.view(torch.uint8).flip(-1).contiguous().view(weight.dtype)
+
+    def _check_layout(self, fnuz):
+        with get_flags().moe.override(runner_backend=MoeRunnerBackend.TRITON):
+            for backend in (MoeRunnerBackend.TRITON, None, MoeRunnerBackend.AITER):
+                with self.subTest(backend=backend, fnuz=fnuz):
+                    method = Fp8MoEMethod(
+                        Fp8Config(
+                            is_checkpoint_fp8_serialized=True,
+                            weight_block_size=[128, 128],
+                        )
+                    )
+                    if backend is not None:
+                        method.runner = SimpleNamespace(runner_backend=backend)
+                    layer = self._make_layer()
+                    expected = {}
+                    for name in ("w13_weight", "w2_weight"):
+                        weight = getattr(layer, name).detach().clone()
+                        if fnuz:
+                            weight, _, _ = fp8_module.normalize_e4m3fn_to_e4m3fnuz(
+                                weight, getattr(layer, f"{name}_scale_inv"), None
+                            )
+                        if backend == MoeRunnerBackend.AITER:
+                            weight = self._shuffle(weight, (16, 16))
+                        expected[name] = weight
+                    with (
+                        patch.object(fp8_module, "_is_fp8_fnuz", fnuz),
+                        patch.object(fp8_module, "_use_aiter", True),
+                        patch.object(
+                            fp8_module, "shuffle_weight", self._shuffle, create=True
+                        ),
+                    ):
+                        method.process_weights_after_loading_block_quant(layer)
+                    for name, weight in expected.items():
+                        actual = getattr(layer, name)
+                        self.assertEqual(actual.dtype, weight.dtype)
+                        self.assertTrue(
+                            torch.equal(
+                                actual.view(torch.uint8), weight.view(torch.uint8)
+                            )
+                        )
+                        self.assertTrue(
+                            torch.equal(
+                                getattr(layer, f"{name}_scale_inv"),
+                                torch.full((2, 1, 1), 2.0 if fnuz else 1.0),
+                            )
+                        )
+
+    def test_fnuz_shuffles_only_for_aiter_runner(self):
+        self._check_layout(fnuz=True)
+
+    def test_non_fnuz_shuffles_only_for_aiter_runner(self):
+        self._check_layout(fnuz=False)
 
 
 if __name__ == "__main__":

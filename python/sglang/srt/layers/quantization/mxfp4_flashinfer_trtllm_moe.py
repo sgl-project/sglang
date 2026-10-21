@@ -11,7 +11,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -126,7 +126,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             and config.scoring_func == "sigmoid"
             and config.correction_bias is not None
             and config.custom_routing_function is None
-            and config.num_fused_shared_experts == 0
+            and config.num_shared_topk_slots == 0
             and not config.torch_native
         )
         self._bypassed_routing_method = (
@@ -163,6 +163,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_MXFP4
 
     def create_weights(
         self,
