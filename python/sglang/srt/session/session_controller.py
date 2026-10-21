@@ -317,6 +317,7 @@ class Session:
             return_hidden_states=req.return_hidden_states,
             return_routed_experts=req.return_routed_experts,
             routed_experts_start_len=req.routed_experts_start_len,
+            return_indexer_topk=req.return_indexer_topk,
             bootstrap_host=req.bootstrap_host,
             bootstrap_port=req.bootstrap_port,
             bootstrap_room=req.bootstrap_room,
