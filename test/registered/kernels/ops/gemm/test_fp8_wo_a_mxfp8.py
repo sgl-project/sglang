@@ -28,9 +28,12 @@ pytestmark = pytest.mark.skipif(
 def require_configurable_fp8_epilogue():
     import deep_gemm
 
+    epilogue_type = getattr(
+        getattr(deep_gemm, "epilogue", None), "FP8CastWithClamp", None
+    )
     if (
-        "amax_eps"
-        not in inspect.signature(deep_gemm.epilogue.FP8CastWithClamp).parameters
+        epilogue_type is None
+        or "amax_eps" not in inspect.signature(epilogue_type).parameters
     ):
         pytest.skip("Requires the configurable FP8 floor in sgl-project/DeepGEMM#111")
 
