@@ -4,6 +4,12 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MOSS-Image",
+      modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
+      cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
+      note: "Base is the reference checkpoint; SFT checkpoint validation is pending.",
+    },
+    {
       name: "HunyuanImage-3.0",
       modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
       cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
@@ -30,6 +36,11 @@ export const DiffusionModelCatalog = ({ category }) => {
         "black-forest-labs/FLUX.2-klein-base-9B",
       ],
       cookbook: "/cookbook/diffusion/FLUX/FLUX",
+    },
+    {
+      name: "FLUX.3 Image",
+      modelIds: ["black-forest-labs/flux-3-image-klein", "black-forest-labs/flux-3-image-klein-base"],
+      cookbook: "/cookbook/diffusion/FLUX/FLUX.3",
     },
     {
       name: "Qwen-Image",
@@ -286,6 +297,21 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "Cosmos-Dreams (Cosmos3-Interactive)",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+      note: "Causal action-conditioned Cosmos3; local checkpoints are also detected by the CosmosDreamsPipeline class name.",
+    },
+    {
+      name: "Cosmos-Dreams-Transfer",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
+      note: "Causal control-video (edge/blur/depth/seg) Cosmos3; local checkpoints are also detected by the CosmosDreamsTransferPipeline class name.",
+    },
+    {
+      name: "Cosmos3 Multiview-AV",
+      modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
+      note: "11-camera WSM-to-RGB transfer in one pass with block-sparse cross-camera attention (single GPU or 2-GPU CFG parallel; no SP/TP); local checkpoints are also detected by the Cosmos3MultiviewPipeline class name.",
     },
     {
       name: "FLUX 3 Action",

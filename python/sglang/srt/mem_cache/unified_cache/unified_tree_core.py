@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
@@ -78,6 +78,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     InsertStepResult,
     NodeId,
     RadixCacheWalkResult,
+    TreePathNodeInfo,
     UnifiedTreeCoreInterface,
 )
 from sglang.srt.mem_cache.utils import (
@@ -460,7 +461,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         self.kv_events = KVCacheEventRecorder(
-            enabled=params.enable_kv_cache_events, page_size=self.page_size
+            enabled=params.enable_kv_cache_events,
+            page_size=self.page_size,
+            dynamo_format=params.dynamo_kv_event_format,
+            lora_names=params.kv_event_lora_names,
         )
 
         self.reset()
@@ -664,6 +668,35 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
+    def collect_path_info(
+        self, end_node_ids: Sequence[NodeId]
+    ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:
+        paths = []
+        for node_id in end_node_ids:
+            node = self.node_by_id(node_id)
+            chain = []
+            while node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+            path = []
+            start = 0
+            for node in reversed(chain):
+                end = start + len(node.key)
+                value = node.component_data[BASE_COMPONENT_TYPE].value
+                path.append(
+                    TreePathNodeInfo(
+                        node.id,
+                        node.parent.id,
+                        start,
+                        end,
+                        None if value is None else len(value),
+                        len(node.children),
+                    )
+                )
+                start = end
+            paths.append(tuple(path))
+        return tuple(paths)
+
     def _new_node(self, priority: int = 0) -> UnifiedTreeNode:
         """Create and register a tree node in the arena."""
         node = UnifiedTreeNode(self.component_types, priority=priority)
@@ -696,8 +729,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     @staticmethod
     def _assert_receipt_anchor(node: UnifiedTreeNode, params: DecLockRefParams) -> None:
         """A receipt releases only the node its acquire returned; a mispaired
-        node would silently release (or steal) another holder's segment."""
-        assert params.node_id is None or params.node_id == node.id, (
+        or unanchored one would silently release (or steal) another holder's segment."""
+        assert params.node_id == node.id, (
             f"lock receipt anchored on node {params.node_id} released on node {node.id}"
         )
 
@@ -1237,7 +1270,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Fire-and-forget actions safe to batch until the next barrier."""
         return isinstance(
             action,
-            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+            (FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit),
         )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
@@ -1366,18 +1399,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state.phase = _InsertPhase.TAIL
 
     def _needs_incremental_component_backup(self, node: UnifiedTreeNode) -> bool:
-        components = self.components
-        if self.is_write_back:
-            swa = self.components_by_type.get(ComponentType.SWA)
-            components = () if swa is None else (swa,)
         return any(
             component.needs_incremental_backup(node)
-            for component in components
+            for component in self.components
             if component.component_type != BASE_COMPONENT_TYPE
         )
 
     def _should_backup_after_insert(self, state: _InsertWalkState) -> bool:
         """Check whether the insert target needs a Host backup."""
+        if self.is_write_back:
+            return False
         if state.is_new_leaf:
             leaf_end = state.total_prefix_length + len(state.target_node.key)
             return (
@@ -1448,12 +1479,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        # A split of a backuped node tells the cache to fix its publish list.
+        # Buffer-mode dependencies are tracked by the cache, without an ack here.
         action: Optional[CacheAction | ComponentAction] = None
-        if child.write_through_pending_id is not None:
-            ack_id = child.write_through_pending_id
+        ack_id = child.write_through_pending_id
+        if ack_id is not None:
             new_node.write_through_pending_id = ack_id
-            action = ReplaceWriteThroughOnNodeSplit(
+        if ack_id is not None or self.is_host_memory_buffer_only:
+            action = UpdatePendingBackupOnNodeSplit(
                 ack_id=ack_id,
                 old_node_id=child.id,
                 new_node_id=new_node.id,
@@ -1498,7 +1530,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
             BASE_COMPONENT_TYPE
-        ].reclaimable_tokens(new_node)
+        ].reclaimable_value_len(new_node)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1519,7 +1551,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[ct]
         assert cd.value is None
         cd.value = fresh_value.clone()
-        n = self.components_by_type[ct].reclaimable_tokens(node)
+        n = self.components_by_type[ct].reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:
@@ -1644,6 +1676,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             or result.mamba_backup_node_id is not None
             or result.swa_backup_node_id is not None
             or bool(result.tracker)
+            or any(result.device_frees.values())
+            or any(result.host_frees.values())
         )
         return result
 
@@ -2754,7 +2788,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             remaining = remaining[prefix_len:]
 
     def swa_tombstone_ranges(
-        self, key: RadixKey, start: int, end: int
+        self,
+        key: RadixKey,
+        start: int,
+        end: int,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[tuple[int, int]]:
         """Return the maximal SWA-tombstoned ranges within ``[start, end)``."""
         ranges: list[tuple[int, int]] = []
@@ -2762,7 +2800,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             seg_end = pos + prefix_len
             if seg_end <= start:
                 continue
-            if child.component_data[ComponentType.SWA].value is not None:
+            if child.component_data[component_type].value is not None:
                 continue
             lo, hi = max(start, pos), min(end, seg_end)
             if ranges and ranges[-1][1] == lo:
@@ -2779,6 +2817,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         window_start: int,
         window_end: int,
         swa_values: torch.Tensor,
+        component_type: ComponentType = ComponentType.SWA,
     ) -> list[CacheAction | ComponentAction]:
         """Attach a loaded SWA slice to an existing tombstoned tree span."""
         assert len(swa_values) == window_end - window_start, (
@@ -2793,7 +2832,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 continue
             seg_start = max(pos, window_start)
             assign_end = min(seg_end, window_end)
-            assert child.component_data[ComponentType.SWA].value is None, (
+            assert child.component_data[component_type].value is None, (
                 f"attach_swa_window over live SWA at [{seg_start}, {assign_end}) "
                 f"of [{window_start}, {window_end})"
             )
@@ -2804,6 +2843,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 assign_end,
                 swa_values[seg_start - window_start : assign_end - window_start],
                 actions,
+                component_type,
             )
             covered = assign_end
             if covered >= window_end:
@@ -2821,6 +2861,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         seg_end: int,
         values: torch.Tensor,
         actions: list[CacheAction | ComponentAction],
+        component_type: ComponentType,
     ) -> None:
         target = node
         if seg_start > node_start:
@@ -2832,7 +2873,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if action is not None:
                 actions.append(action)
             target = fragment
-        self.set_component_device_value(target.id, ComponentType.SWA, values.clone())
+        self.set_component_device_value(target.id, component_type, values.clone())
 
     def set_component_device_value(
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
@@ -2849,28 +2890,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.lru_lists[component_type].insert_mru(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.
-        ledger = self.components_by_type[component_type].reclaimable_tokens(node)
+        ledger = self.components_by_type[component_type].reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[component_type] += ledger
         else:
             self.component_evictable_size_[component_type] += ledger
 
-    def adjust_component_ledger(
-        self, node: UnifiedTreeNode, component_type: ComponentType, delta: int
+    def adjust_component_size(
+        self, node_id: NodeId, component_type: ComponentType, delta: int
     ) -> None:
-        """A component changed how many pool tokens evicting ``node`` would
-        reclaim (``TreeComponent.reclaimable_tokens``) while the value stays
-        on device: move the ledger the node is on by ``delta``. A tombstoned
-        value is on neither ledger."""
-        if delta == 0:
-            return
+        node = self.node_by_id(node_id)
+        if component_type not in self.components_by_type:
+            raise ValueError(f"component is not enabled: {component_type}")
         cd = node.component_data[component_type]
-        if cd.value is None:
+        if node is self.root_node or cd.value is None:
             return
-        if cd.lock_ref > 0:
-            self.component_protected_size_[component_type] += delta
-        else:
-            self.component_evictable_size_[component_type] += delta
+        sizes = (
+            self.component_protected_size_
+            if cd.lock_ref > 0
+            else self.component_evictable_size_
+        )
+        updated = sizes[component_type] + delta
+        if updated < 0:
+            raise ValueError(f"component size cannot be negative: {updated}")
+        sizes[component_type] = updated
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -3091,7 +3134,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 cd = n.component_data[ct]
                 if cd.value is not None:
-                    toks = self.components_by_type[ct].reclaimable_tokens(n)
+                    toks = self.components_by_type[ct].reclaimable_value_len(n)
                     if cd.lock_ref > 0:
                         protected += toks
                     else:

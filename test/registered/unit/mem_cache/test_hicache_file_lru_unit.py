@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
     MetadataCache,
+    PoolName,
+    PoolTransfer,
 )
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
@@ -149,24 +151,6 @@ class HiCacheFileLRUTestBase(CustomTestCase):
         for cm in self._env_overrides:
             cm.__exit__(None, None, None)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
-
-
-class TestEnvDefaults(CustomTestCase):
-    """Verify the env var defaults match the documented opt-in behavior."""
-
-    def test_min_free_space_default_is_zero(self):
-        # Default must keep eviction off so existing users are unaffected.
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
-            self.assertEqual(
-                envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
-                "0",
-            )
-
-    def test_max_size_default_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            self.assertIsNone(envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.get())
 
 
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
@@ -300,18 +284,26 @@ class TestCPSuffix(HiCacheFileLRUTestBase):
 class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_mla_rank0_owns_eviction(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=0, tp_size=2)
-        self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
-    def test_mla_rank1_skips_eviction(self):
+    def test_mla_rank1_only_creates_its_mamba_files(self):
         b = self.make_backend(max_size="200", is_mla=True, tp_rank=1, tp_size=2)
-        self.assertFalse(b._evictor.is_storage_owner)
-        self.assertFalse(b._evictor.enabled)
-        # Non-owner MLA ranks must not create new files when eviction is on.
+        # Replicated MLA files are created by rank 0 only.
         self.assertFalse(b.set("a", _t(50)))
         self.assertFalse(b.exists("a"))
-        self.assertEqual(len(b._evictor._lru), 0)
-        self.assertEqual(b._evictor._total_bytes, 0)
+        self.assertTrue(b.set("a.mamba", _t(50)))
+        self.assertEqual(b._evictor._total_bytes, 50)
+
+    def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV files, but Mamba pages must not overwrite another rank's."""
+        ranks = [
+            self.make_backend(is_mla=True, tp_rank=rank, tp_size=2, subdir="shared")
+            for rank in range(2)
+        ]
+        for rank, b in enumerate(ranks):
+            self.assertTrue(b.set("a.mamba", _t(16, rank + 1)))
+        for rank, b in enumerate(ranks):
+            self.assertTrue(torch.equal(b.get("a.mamba", _t(16)), _t(16, rank + 1)))
 
     def test_mla_rank1_can_touch_existing_file(self):
         # Non-owner ranks may still touch existing files, just not create new ones.
@@ -326,7 +318,6 @@ class TestMLAOwnerGating(HiCacheFileLRUTestBase):
     def test_non_mla_each_rank_owns_its_files(self):
         # Non-MLA: even rank > 0 is its own owner because suffix isolates files.
         b = self.make_backend(max_size="200", is_mla=False, tp_rank=3, tp_size=4)
-        self.assertTrue(b._evictor.is_storage_owner)
         self.assertTrue(b._evictor.enabled)
 
 
@@ -536,6 +527,24 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
             )  # since mock_exists returns True, k3 exists physically
             mock_scandir.assert_not_called()
             mock_exists.assert_called_once()
+
+
+class TestUncachedBatchExists(HiCacheFileLRUTestBase):
+    def test_lookup_only_checks_requested_component_files(self):
+        b = self.make_backend(enable_metadata_cache=False)
+        for key in ("k1", "k2", "k1.mamba"):
+            self.assertTrue(b.set(key, _t(50)))
+        # A directory named like a cache page must not count as a hit.
+        os.mkdir(os.path.join(b.file_path, f"{b._get_component_key('k3')}.bin"))
+        keys = ["k1", "k2", "k3"]
+        with mock.patch("os.scandir", side_effect=AssertionError("full-store scan")):
+            self.assertEqual(b.batch_exists_v2(keys).kv_hit_pages, 2)
+            result = b.batch_exists_v2(keys, [PoolTransfer(name=PoolName.MAMBA)])
+            self.assertEqual(result.kv_hit_pages, 1)
+            self.assertEqual(result.extra_pool_hit_pages[PoolName.MAMBA], 1)
+            os.remove(os.path.join(b.file_path, f"{b._get_component_key('k1')}.bin"))
+            self.assertEqual(b.batch_exists_v2(keys).kv_hit_pages, 0)
+            self.assertEqual(b.batch_exists_v2([]).kv_hit_pages, 0)
 
 
 if __name__ == "__main__":

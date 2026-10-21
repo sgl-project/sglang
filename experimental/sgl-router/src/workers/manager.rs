@@ -34,8 +34,9 @@ const BOOTSTRAP_PORT_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// Resolve the circuit-breaker config for all model IDs carried by a spec.
 ///
 /// The router serves a single configured model; apply its circuit-breaker
-/// config when this worker advertises that model id. Falls back to `None`
-/// (default config) otherwise.
+/// config when this worker advertises that model id, and the default config
+/// otherwise. Under `--disable-circuit-breaker` there is none, so the worker's
+/// breaker never opens.
 fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerConfig> {
     let model = &cfg.model;
     let cbc = model.circuit_breaker.as_ref()?;
@@ -45,7 +46,7 @@ fn cb_config_for_spec(spec: &WorkerSpec, cfg: &Config) -> Option<CircuitBreakerC
             cool_down: Duration::from_secs(cbc.cool_down_secs),
         });
     }
-    None
+    Some(CircuitBreakerConfig::default())
 }
 
 /// Whether `worker_url` is one the router will dial in cleartext.
@@ -119,8 +120,7 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// `router_inflight_load` is `None` the active-load bookkeeping is not pruned
 /// on worker removal (leaks one `WorkerCounters` slot per departed
 /// worker — fine for tests, but production passes `Some(...)`); when
-/// `cfg` is `None` the default CB config is used for every worker
-/// (threshold = 3).
+/// `cfg` is `None` no worker's circuit breaker ever opens.
 ///
 /// Introspects workers with a 2-second timeout, sending `--worker-api-key`
 /// when set.  Tests that want a tighter timeout call
@@ -565,6 +565,34 @@ async fn register_one(
             spec.bootstrap_port = new_port;
         }
     }
+    // `--decode-dispatch-limit` sends a request to decode only once earlier
+    // KV has arrived, and a default prefill engine computes only once decode
+    // has bootstrapped, so the two would wait on each other: at most N
+    // requests per rank ever run and the rest die at the bootstrap timeout.
+    // Refuse such a prefill rather than register a worker that cannot serve.
+    if spec.mode == WorkerMode::Prefill
+        && cfg
+            .as_ref()
+            .is_some_and(|c| c.proxy.decode_dispatch_limit.is_some())
+    {
+        match info.prefill_before_bootstrap {
+            Some(true) => {}
+            Some(false) => {
+                tracing::error!(
+                    worker_url = %worker_url,
+                    "worker manager: refused to register prefill worker: --decode-dispatch-limit \
+                     needs prefill engines with --optimistic-prefill-attempts above 0 or \
+                     --disaggregation-decode-allocation-policy prefill_complete",
+                );
+                return;
+            }
+            None => tracing::warn!(
+                worker_url = %worker_url,
+                "worker manager: /server_info does not report optimistic_prefill_attempts; \
+                 --decode-dispatch-limit needs prefill engines that compute before decode connects",
+            ),
+        }
+    }
     let cleartext = dials_cleartext(&worker_url);
     let protocol = resolve_protocol(info.enable_http2, cleartext);
     // Captured before the insert: `reconcile_unresolved_workers` re-runs this
@@ -580,6 +608,7 @@ async fn register_one(
         protocol,
         dp_ranks: info.dp_ranks,
         openai: info.openai.map(Arc::new),
+        grpc_port: info.grpc_port,
     };
     if let Err(e) = registry.add_with_cb(spec, cb, profile) {
         // Mixed PD + plain on the same model is rejected at registration
@@ -599,6 +628,12 @@ async fn register_one(
     // traffic — a spec refused above never reaches the wire at all.
     if previous_protocol != Some(protocol) {
         log_protocol_resolution(&worker_url, info.enable_http2, cleartext);
+        if info.grpc_port.is_none() && cfg.is_some_and(|c| c.server.grpc_port.is_some()) {
+            tracing::warn!(
+                worker_url = %worker_url,
+                "worker reports no --grpc-port; gRPC requests routed to it fail",
+            );
+        }
     }
     if let Some(idx) = kv_index {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
@@ -637,6 +672,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 decode_policy: Default::default(),
                 dp_aware: false,
+                dp_rank_policy: Default::default(),
                 bucket_config: None,
                 reorg_buckets: None,
                 reorg_admission: Default::default(),
@@ -673,6 +709,22 @@ mod tests {
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
         assert_eq!(cb.cool_down, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn cb_config_for_spec_is_none_only_when_disabled() {
+        let mut cfg = cfg_with_model_cb("m", 5, 60);
+        let spec = WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("other".into())],
+            ..Default::default()
+        };
+        let cb = cb_config_for_spec(&spec, &cfg).expect("default breaker for another model");
+        assert_eq!(cb.threshold.get(), 3);
+        cfg.model.circuit_breaker = None;
+        assert!(cb_config_for_spec(&spec, &cfg).is_none());
     }
 
     #[test]
@@ -1153,6 +1205,51 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    /// Under `--decode-dispatch-limit`, a prefill that computes only after
+    /// decode bootstraps could never start a gated request, so it is refused;
+    /// one with optimistic prefill registers as usual.
+    #[tokio::test]
+    async fn manager_refuses_prefill_that_cannot_compute_before_bootstrap() {
+        let mut cfg = cfg_with_model_cb("m", 5, 60);
+        cfg.proxy.decode_dispatch_limit = NonZeroU32::new(1);
+        let cfg = Some(Arc::new(cfg));
+        for (attempts, registered) in [(0, false), (2, true)] {
+            let (worker_url, _shutdown) = spawn_fake_server_info_worker(json!({
+                "served_model_name": "m",
+                "disaggregation_mode": "prefill",
+                "disaggregation_bootstrap_port": 8998,
+                "optimistic_prefill_attempts": attempts,
+            }))
+            .await;
+            let registry = Arc::new(WorkerRegistry::default());
+            let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+            let manager_handle = tokio::spawn(run_with_introspector(
+                rx,
+                registry.clone(),
+                cfg.clone(),
+                None,
+                None,
+                fast_introspector(),
+            ));
+            let spec = WorkerSpec {
+                id: WorkerId("w-prefill".into()),
+                url: worker_url,
+                mode: WorkerMode::Prefill,
+                model_ids: Vec::new(),
+                ..Default::default()
+            };
+            tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+            // Shutdown joins the in-flight registration.
+            drop(tx);
+            let _ = manager_handle.await;
+            assert_eq!(
+                registry.get(&spec.id).is_some(),
+                registered,
+                "optimistic_prefill_attempts={attempts}"
+            );
+        }
     }
 
     /// Fake worker whose readiness is switchable at runtime. While `ready` is

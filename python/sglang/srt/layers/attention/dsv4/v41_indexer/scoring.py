@@ -5,7 +5,7 @@ a selection back into pool slots."""
 from __future__ import annotations
 
 import itertools
-from typing import TYPE_CHECKING, Generator, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -40,6 +40,21 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
     q_sf: torch.Tensor  # [rows, 1, heads] int32, packed ue8m0
     weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
     k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
+
+    def paged_logits_args(self, metadata, rows=slice(None)):
+        """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
+        ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
+        n = metadata.rows_per_request
+        q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
+        lens = metadata.compressed_seq_lens[rows]
+        table = metadata.page_table[rows]
+        if n > 1:
+            heads = q_fp4.shape[2]
+            q_fp4 = q_fp4.view(-1, n, heads, 64)
+            q_sf = q_sf.view(-1, n, heads)
+            lens = lens.view(-1, n)
+            table = table[::n]
+        return (q_fp4, q_sf), lens, table
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
@@ -88,7 +103,7 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
 
 
 def quantize_index_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    from sglang.kernels.ops.quantization.fp4_indexer_quant import (
         quantize_fp4_indexer_tensor,
     )
 
@@ -207,12 +222,7 @@ def get_deep_gemm_prefill_data(
     )
 
 
-def score_tiles(
-    data: DeepGEMMPrefillData,
-    kv: Tuple[torch.Tensor, torch.Tensor],
-    *,
-    width_align: int,
-) -> Generator[Tuple[slice, torch.Tensor], None, None]:
+def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]):
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,
@@ -221,8 +231,33 @@ def score_tiles(
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
         budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
-        width_align=width_align,
     )
+
+
+def topk_ragged(
+    logits: torch.Tensor,
+    lens: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    offsets: torch.Tensor,
+) -> None:
+    """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
+    ``-1`` padded, unordered: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    if logits.dtype == torch.bfloat16:
+        from sglang.kernels.ops.attention.deep_select import topk
+
+        topk(
+            logits,
+            out.shape[1],
+            end=lens,
+            output_idx=out,
+            output_idx_offset=offsets,
+            idx_oob_fill_value=-1,
+        )
+        return
+    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+
+    topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
 
 
 def dense_prefill_topk(
@@ -232,16 +267,11 @@ def dense_prefill_topk(
     out: torch.Tensor,
 ) -> None:
     """Request-local compressed positions into ``out``, ``-1`` padded, unordered."""
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
-
     # Score columns are request-relative, so a zero offset emits request-local positions.
     zero_offsets = torch.zeros_like(data.request_starts)
-    for tile, logits in score_tiles(data, kv, width_align=4):
-        topk_transform_ragged_v2(
-            logits,
-            data.compress_lens[tile],
-            out_offsets=zero_offsets[tile],
-            out_indices=out[tile],
+    for tile, logits in score_tiles(data, kv):
+        topk_ragged(
+            logits, data.compress_lens[tile], out=out[tile], offsets=zero_offsets[tile]
         )
         # Free this tile's logits before the generator scores the next one.
         del logits
@@ -367,7 +397,7 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     req: torch.Tensor
     req_to_token: torch.Tensor
     ratio: int
-    plan: torch.Tensor
+    plan: Optional[torch.Tensor]  # None when the caller skips the top-k v2 plan
     has_candidate_mask: bool
 
 
@@ -377,6 +407,7 @@ def decode_scores(
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
+    compute_topk_plan: bool = True,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -405,7 +436,7 @@ def decode_scores(
     if paged:
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
-        plan = plan_topk_v2(lens)
+        plan = plan_topk_v2(lens) if compute_topk_plan else None
         scores = fp4_index_logits_paged(
             q,
             weights,
@@ -445,6 +476,7 @@ def select_decode(
 ) -> None:
     k = min(topk, d.lmax)
     if isinstance(d, PagedDecodeScores):
+        assert d.plan is not None, "paged select_decode needs the top-k v2 plan"
         idx = torch.empty((d.bs, k), dtype=torch.int32, device=d.scores.device)
         topk_transform_paged_v2(d.scores, d.lens, None, idx, 1, d.plan)
         finish_paged_indexer_topk(

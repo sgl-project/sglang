@@ -469,11 +469,37 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
   PDLTriggerSecondary<kUsePDL>();
 }
 
-/// \brief `fused_qknorm_rope_warp` for head_dim 128 with the norm rounded before
-/// NeoX RoPE, two rows per warp: 16 lanes per row, 16 B per lane. Each lane keeps
-/// the partial sums of the two warp-kernel lanes it covers and replays their xor
-/// butterfly, so the output is bit-identical to the one-row-per-warp kernel.
-template <int64_t kRopeDim, bool kUsePDL, typename DType, typename CacheDType, typename IdType, bool kOutOfPlace>
+/// \brief `kCount` consecutive cache entries, in the widest aligned loads the run allows.
+template <uint32_t kCount, typename CacheDType>
+SGL_DEVICE void load_cache_run(const CacheDType* ptr, CacheDType (&out)[kCount]) {
+  using namespace device;
+  constexpr uint32_t kVecElems = 16 / sizeof(CacheDType) < kCount ? 16 / sizeof(CacheDType) : kCount;
+  using CacheVec = AlignedVector<CacheDType, kVecElems>;
+#pragma unroll
+  for (uint32_t c = 0; c < kCount / kVecElems; ++c) {
+    const auto vec = load_as<CacheVec>(ptr, c);
+#pragma unroll
+    for (uint32_t e = 0; e < kVecElems; ++e) {
+      out[c * kVecElems + e] = vec[e];
+    }
+  }
+}
+
+/// \brief `fused_qknorm_rope_warp` for head_dim 128, two rows per warp: 16 lanes
+/// per row, 16 B per lane. Lane r of a row covers warp-kernel lanes 2r and 2r + 1:
+/// it keeps their two partial sums, replays their xor butterfly and repeats their
+/// arithmetic element by element, so the output is bit-identical to the
+/// one-row-per-warp kernel for every RoPE layout and rounding mode.
+template <
+    int64_t kRopeDim,
+    bool kIsNeox,
+    bool kUsePDL,
+    typename DType,
+    typename CacheDType,
+    bool kRoundNormBeforeRope,
+    bool kCacheHasFullWidth,
+    typename IdType,
+    bool kOutOfPlace>
 __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutOfPlace> __grid_constant__ params) {
   using namespace device;
 
@@ -482,8 +508,12 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
   constexpr uint32_t kElems = kHeadDim / kRowLanes;
   constexpr uint32_t kRotaryLanes = kRopeDim / kElems;
   constexpr uint32_t kHalfRotaryLanes = kRotaryLanes / 2;
-  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(CacheDType);
-  static_assert(kRopeDim > 0 && kRopeDim <= kHeadDim && kRopeDim % (2 * kElems) == 0);
+  constexpr int64_t kCacheRotaryDim = kCacheHasFullWidth ? 2 * kRopeDim : kRopeDim;
+  constexpr int64_t kCosSinStrideBytes = kCacheRotaryDim * sizeof(CacheDType);
+  static_assert(kRopeDim > 0 && kRopeDim <= kHeadDim && kRopeDim % (kIsNeox ? 2 * kElems : kElems) == 0);
+  static_assert(
+      !kRoundNormBeforeRope || std::is_same_v<DType, CacheDType> || std::is_same_v<CacheDType, fp32_t>,
+      "Rounded QKNorm+RoPE requires cache and activation dtypes to match or an FP32 cache");
 
   using Packed = packed_t<DType>;
   using Storage = AlignedVector<Packed, kElems / 2>;
@@ -499,9 +529,15 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
   const uint32_t num_qk_heads = num_qo_heads + num_kv_heads;
   const uint32_t num_rows = num_qk_heads * num_tokens;
   const uint32_t num_pairs = div_ceil(num_rows, 2u);
+  // NeoX pairs element e with e +- kRopeDim / 2, kHalfRotaryLanes lanes away
   const uint32_t partner_lane = row_base + (row_lane < kHalfRotaryLanes ? row_lane + kHalfRotaryLanes
                                             : row_lane < kRotaryLanes   ? row_lane - kHalfRotaryLanes
                                                                         : row_lane);
+  // first cache entry of this lane's run; an interleaved half-width cache holds
+  // one entry per pair
+  const uint32_t cache_base = kIsNeox ? (kCacheHasFullWidth ? row_lane : row_lane % kHalfRotaryLanes) * kElems
+                                      : row_lane * (kCacheHasFullWidth ? kElems : kElems / 2);
+  constexpr uint32_t kCacheRun = kIsNeox || kCacheHasFullWidth ? kElems : kElems / 2;
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -526,72 +562,132 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
     auto vec = load_as<Storage>(input, row_lane);
     const auto weight_vec = load_as<Storage>(load_q ? q_weight_ptr : k_weight_ptr, row_lane);
 
-    // part[h] is the sum of warp-kernel lane 2 * row_lane + h, and the shuffles
-    // below are that kernel's 16..2 xor steps; its final step adds the pair.
-    float part[2] = {0.0f, 0.0f};
-#pragma unroll
-    for (uint32_t j = 0; j < kElems / 2; ++j) {
-      const auto x = cast<fp32x2_t>(vec[j]);
-      part[j / 2] += x.x * x.x;
-      part[j / 2] += x.y * x.y;
-    }
-#pragma unroll
-    for (uint32_t mask = kRowLanes / 2; mask >= 1; mask >>= 1) {
-      part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
-      part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
-    }
-    const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + eps);
-
-#pragma unroll
-    for (uint32_t j = 0; j < kElems / 2; ++j) {
-      const auto x = cast<fp32x2_t>(vec[j]);
-      const auto w = cast<fp32x2_t>(weight_vec[j]);
-      vec[j] = cast<Packed, fp32x2_t>({x.x * norm_factor * w.x, x.y * norm_factor * w.y});
-    }
-
-    Storage partner_vec;
-#pragma unroll
-    for (uint32_t j = 0; j < kElems / 2; ++j) {
-      auto bits = reinterpret_cast<const uint32_t&>(vec[j]);
-      bits = __shfl_sync(0xffffffffu, bits, partner_lane);
-      reinterpret_cast<uint32_t&>(partner_vec[j]) = bits;
-    }
+    CacheDType cos_vals[kCacheRun];
+    CacheDType sin_vals[kCacheRun];
     if (row_lane < kRotaryLanes) {
       const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
       const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
-      const auto sin_ptr = cos_ptr + kRopeDim / 2;
-      const uint32_t cache_base = (row_lane % kHalfRotaryLanes) * kElems;
-      // one 16 B load per lane for a 16-bit cache; FP32 rows take two
-      CacheDType cos_vals[kElems];
-      CacheDType sin_vals[kElems];
-      constexpr uint32_t kCacheVecElems = 16 / sizeof(CacheDType);
-      using CacheVec = AlignedVector<CacheDType, kCacheVecElems>;
-#pragma unroll
-      for (uint32_t c = 0; c < kElems / kCacheVecElems; ++c) {
-        const auto cos_vec = load_as<CacheVec>(cos_ptr + cache_base, c);
-        const auto sin_vec = load_as<CacheVec>(sin_ptr + cache_base, c);
-#pragma unroll
-        for (uint32_t e = 0; e < kCacheVecElems; ++e) {
-          cos_vals[c * kCacheVecElems + e] = cos_vec[e];
-          sin_vals[c * kCacheVecElems + e] = sin_vec[e];
-        }
-      }
+      const auto sin_ptr = cos_ptr + (kCacheHasFullWidth ? kRopeDim : kRopeDim / 2);
+      load_cache_run(cos_ptr + cache_base, cos_vals);
+      load_cache_run(sin_ptr + cache_base, sin_vals);
+    }
+    // cache entry of element 2 * p + i of this lane's run
+    const auto cache_at = [](uint32_t p, uint32_t i) { return kIsNeox || kCacheHasFullWidth ? 2 * p + i : p; };
+
+    if constexpr (kRoundNormBeforeRope) {
+      // part[h] is the sum of warp-kernel lane 2 * row_lane + h, and the shuffles
+      // below are that kernel's 16..2 xor steps; its final step adds the pair.
+      float part[2] = {0.0f, 0.0f};
 #pragma unroll
       for (uint32_t j = 0; j < kElems / 2; ++j) {
-        auto& values = unpack(vec[j]);
-        const auto& partner_values = unpack(partner_vec[j]);
+        const auto x = cast<fp32x2_t>(vec[j]);
+        part[j / 2] += x.x * x.x;
+        part[j / 2] += x.y * x.y;
+      }
 #pragma unroll
-        for (uint32_t i = 0; i < 2; ++i) {
-          const auto cos = cos_vals[2 * j + i];
-          const auto sin = sin_vals[2 * j + i];
-          if constexpr (std::is_same_v<CacheDType, fp32_t>) {
-            values[i] = row_lane < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
-                                                    : rotary_add_fp32(values[i], cos, partner_values[i], sin);
-          } else {
-            values[i] = row_lane < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
-                                                    : rotary_add(values[i], cos, partner_values[i], sin);
+      for (uint32_t mask = kRowLanes / 2; mask >= 1; mask >>= 1) {
+        part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
+        part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
+      }
+      const float norm_factor = math::rsqrt((part[0] + part[1]) / kHeadDim + eps);
+
+#pragma unroll
+      for (uint32_t j = 0; j < kElems / 2; ++j) {
+        const auto x = cast<fp32x2_t>(vec[j]);
+        const auto w = cast<fp32x2_t>(weight_vec[j]);
+        vec[j] = cast<Packed, fp32x2_t>({x.x * norm_factor * w.x, x.y * norm_factor * w.y});
+      }
+
+      if constexpr (kIsNeox) {
+        Storage partner_vec;
+#pragma unroll
+        for (uint32_t j = 0; j < kElems / 2; ++j) {
+          auto bits = reinterpret_cast<const uint32_t&>(vec[j]);
+          bits = __shfl_sync(0xffffffffu, bits, partner_lane);
+          reinterpret_cast<uint32_t&>(partner_vec[j]) = bits;
+        }
+        if (row_lane < kRotaryLanes) {
+#pragma unroll
+          for (uint32_t j = 0; j < kElems / 2; ++j) {
+            auto& values = unpack(vec[j]);
+            const auto& partner_values = unpack(partner_vec[j]);
+#pragma unroll
+            for (uint32_t i = 0; i < 2; ++i) {
+              const auto cos = cos_vals[2 * j + i];
+              const auto sin = sin_vals[2 * j + i];
+              if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+                values[i] = row_lane < kHalfRotaryLanes ? rotary_sub_fp32(values[i], cos, partner_values[i], sin)
+                                                        : rotary_add_fp32(values[i], cos, partner_values[i], sin);
+              } else {
+                values[i] = row_lane < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
+                                                        : rotary_add(values[i], cos, partner_values[i], sin);
+              }
+            }
           }
         }
+      } else if (row_lane < kRotaryLanes) {
+#pragma unroll
+        for (uint32_t j = 0; j < kElems / 2; ++j) {
+          auto& values = unpack(vec[j]);
+          const auto cos_0 = cos_vals[cache_at(j, 0)];
+          const auto sin_0 = sin_vals[cache_at(j, 0)];
+          const auto cos_1 = cos_vals[cache_at(j, 1)];
+          const auto sin_1 = sin_vals[cache_at(j, 1)];
+          const auto x = values[0];
+          const auto y = values[1];
+          if constexpr (std::is_same_v<CacheDType, fp32_t>) {
+            values[0] = rotary_sub_fp32(x, cos_0, y, sin_0);
+            values[1] = rotary_add_fp32(y, cos_1, x, sin_1);
+          } else {
+            values[0] = rotary_sub(x, cos_0, y, sin_0);
+            values[1] = rotary_add(y, cos_1, x, sin_1);
+          }
+        }
+      }
+    } else {
+      // the FP32 path: the warp kernel's lane sums its squares a pair at a time
+      // and keeps every value in FP32 until the store
+      float elems[kElems];
+      float part[2] = {0.0f, 0.0f};
+#pragma unroll
+      for (uint32_t j = 0; j < kElems / 2; ++j) {
+        const auto [x0, x1] = cast<fp32x2_t>(vec[j]);
+        elems[2 * j] = x0;
+        elems[2 * j + 1] = x1;
+        part[j / 2] += x0 * x0 + x1 * x1;
+      }
+#pragma unroll
+      for (uint32_t mask = kRowLanes / 2; mask >= 1; mask >>= 1) {
+        part[0] += __shfl_xor_sync(0xffffffffu, part[0], mask);
+        part[1] += __shfl_xor_sync(0xffffffffu, part[1], mask);
+      }
+      const float norm_factor = math::rsqrt((part[0] + part[1]) / static_cast<float>(kHeadDim) + eps);
+
+#pragma unroll
+      for (uint32_t j = 0; j < kElems / 2; ++j) {
+        const auto [w0, w1] = cast<fp32x2_t>(weight_vec[j]);
+        elems[2 * j] *= norm_factor * w0;
+        elems[2 * j + 1] *= norm_factor * w1;
+      }
+
+      static_assert(!kIsNeox, "the FP32 NeoX path keeps the one-row-per-warp kernel");
+      if (row_lane < kRotaryLanes) {
+#pragma unroll
+        for (uint32_t j = 0; j < kElems / 2; ++j) {
+          const float x = elems[2 * j];
+          const float y = elems[2 * j + 1];
+          const float cos_0 = cast<fp32_t>(cos_vals[cache_at(j, 0)]);
+          const float sin_0 = cast<fp32_t>(sin_vals[cache_at(j, 0)]);
+          const float cos_1 = cast<fp32_t>(cos_vals[cache_at(j, 1)]);
+          const float sin_1 = cast<fp32_t>(sin_vals[cache_at(j, 1)]);
+          elems[2 * j] = x * cos_0 - y * sin_0;
+          elems[2 * j + 1] = y * cos_1 + x * sin_1;
+        }
+      }
+
+#pragma unroll
+      for (uint32_t j = 0; j < kElems / 2; ++j) {
+        vec[j] = cast<Packed, fp32x2_t>({elems[2 * j], elems[2 * j + 1]});
       }
     }
     if (wanted_row < num_rows) store_as<Storage>(output, vec, row_lane);
@@ -600,13 +696,16 @@ __global__ void fused_qknorm_rope_half_warp(const QKNormRopeParamsT<false, kOutO
   PDLTriggerSecondary<kUsePDL>();
 }
 
-/// \brief Whether `fused_qknorm_rope_half_warp` covers this instantiation.
-template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kRoundNormBeforeRope, bool kCacheHasFullWidth>
+/// \brief Whether `fused_qknorm_rope_half_warp` covers this instantiation: head_dim
+/// 128 with a rotary width that ends on a lane boundary (NeoX: on both halves).
+/// NeoX in FP32 is left out: which of `e * cos + swapped * sin`'s products nvcc
+/// fuses there depends on the cache dtype, so the two kernels can disagree.
+template <int64_t kHeadDim, int64_t kRopeDim, bool kIsNeox, bool kRoundNormBeforeRope>
 inline constexpr bool kUseHalfWarp =
 #ifdef USE_ROCM
     false;
 #else
-    kHeadDim == 128 && kIsNeox && kRoundNormBeforeRope && !kCacheHasFullWidth && kRopeDim > 0 && kRopeDim % 16 == 0;
+    kHeadDim == 128 && kRopeDim > 0 && (kIsNeox ? kRoundNormBeforeRope && kRopeDim % 16 == 0 : kRopeDim % 8 == 0);
 #endif
 
 /// \brief Shared launch tail of the three host runners: pick the index-type
@@ -639,12 +738,20 @@ template <
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   // kAllowHalfWarp = false keeps the one-row-per-warp kernel, which tests compare against
-  static constexpr bool kHalfWarp =
-      kAllowHalfWarp && kUseHalfWarp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kCacheHasFullWidth>;
+  static constexpr bool kHalfWarp = kAllowHalfWarp && kUseHalfWarp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope>;
   template <typename IdType>
   static constexpr auto kernel = [] {
     if constexpr (kHalfWarp) {
-      return fused_qknorm_rope_half_warp<kRopeDim, kUsePDL, DType, CacheDType, IdType, false>;
+      return fused_qknorm_rope_half_warp<
+          kRopeDim,
+          kIsNeox,
+          kUsePDL,
+          DType,
+          CacheDType,
+          kRoundNormBeforeRope,
+          kCacheHasFullWidth,
+          IdType,
+          false>;
     } else {
       return fused_qknorm_rope_warp<
           kHeadDim,
@@ -738,12 +845,20 @@ template <
 struct QKNormRopeOutOfPlaceKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   // kAllowHalfWarp = false keeps the one-row-per-warp kernel, which tests compare against
-  static constexpr bool kHalfWarp =
-      kAllowHalfWarp && kUseHalfWarp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope, kCacheHasFullWidth>;
+  static constexpr bool kHalfWarp = kAllowHalfWarp && kUseHalfWarp<kHeadDim, kRopeDim, kIsNeox, kRoundNormBeforeRope>;
   template <typename IdType>
   static constexpr auto kernel = [] {
     if constexpr (kHalfWarp) {
-      return fused_qknorm_rope_half_warp<kRopeDim, kUsePDL, DType, CacheDType, IdType, true>;
+      return fused_qknorm_rope_half_warp<
+          kRopeDim,
+          kIsNeox,
+          kUsePDL,
+          DType,
+          CacheDType,
+          kRoundNormBeforeRope,
+          kCacheHasFullWidth,
+          IdType,
+          true>;
     } else {
       return fused_qknorm_rope_warp<
           kHeadDim,

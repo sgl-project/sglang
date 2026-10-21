@@ -17,7 +17,9 @@ from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
     is_musa_runtime,
+    is_sail_runtime,
 )
+from sglang.srt.utils.common import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,14 @@ def _jit_cuda_version() -> tuple[int, ...]:
     return get_cuda_version()
 
 
+def _sail_arch_suffix(major: int, minor: int) -> str:
+    """SAIL devices below the SM89 capability require the arch-specific target
+    variant for JIT compilation (the ``"a"`` suffix); SM89+ SAIL devices stay
+    unsuffixed like HIP/MUSA.
+    """
+    return "a" if (major <= 8 and minor < 9) else ""
+
+
 def _cuda_arch_suffix(major: int, minor: int) -> str:
     """Mirror FlashInfer's `_normalize_cuda_arch`: 9.x/10.x+ -> "a"; 12.0 -> "f"
     and 12.x (x>0) -> "a" (SM120/SM121 need separate cubins to avoid
@@ -103,11 +113,13 @@ def _init_jit_cuda_arch_once():
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).
     # HIP/MUSA capability numbers aren't CUDA SM versions and stay unsuffixed.
-    suffix = (
-        ""
-        if (is_hip_runtime() or is_musa_runtime())
-        else _cuda_arch_suffix(major, minor)
-    )
+    if is_hip_runtime() or is_musa_runtime():
+        suffix = ""
+    elif is_sail_runtime():
+        suffix = _sail_arch_suffix(major, minor)
+    else:
+        suffix = _cuda_arch_suffix(major, minor)
+
     _CUDA_ARCH = ArchInfo(major, minor, suffix)
 
 
@@ -182,8 +194,6 @@ def is_arch_support_pdl() -> bool:
 
 
 def get_activation_cuda_cflags() -> list[str]:
-    """Match the AOT activation fast-math policy without changing other kernels."""
-    # Blackwell needs precise expf; HIP clang rejects --use_fast_math.
-    if is_hip_runtime() or get_jit_cuda_arch().major >= 10:
-        return []
-    return ["--use_fast_math"]
+    if is_cuda():
+        return ["--use_fast_math"]
+    return []

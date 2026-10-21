@@ -104,6 +104,30 @@ GSM8K is too easy for many state-of-the-art models, so use a more challenging or
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](./benchmark_and_profiling).
 
+## Pull request titles
+
+Use the repository-wide format checked by CI:
+
+```text
+[Type] scope: title
+[Type] [Hardware] scope: title
+```
+
+- **Type**: `Feat`, `Fix`, `Refactor`, `Perf`, `Doc`, `Test`, `CI`, or `Chore`.
+- **Scope**: A required module or model name. Use `/` for submodules, such as `diffusion/scheduler`; there is no fixed scope list or letter-case requirement.
+- **Hardware**: Optional, for hardware-specific changes only. Use a single uppercase tag, such as `AMD` or `NVIDIA`, except for the canonical spellings `Intel`, `Apple`, `Huawei`, and `Ascend`.
+- **Title**: A short, clear description in the imperative mood. Use one space between fields and after the colon, with no leading or trailing whitespace.
+
+For example:
+
+```text
+[Fix] attention: Fix KV cache indexing
+[Perf] diffusion/scheduler: Reduce scheduling overhead
+[Perf] [AMD] diffusion/attention: Optimize decode performance
+```
+
+For reverts, keep GitHub's default `Revert "original title"` format. The PR-title check validates PR titles, not individual development commit messages.
+
 ## Requesting a review for merge
 You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
 You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
