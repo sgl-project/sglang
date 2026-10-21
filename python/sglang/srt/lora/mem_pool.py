@@ -146,6 +146,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        max_rank_spaced_layout: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -160,6 +161,8 @@ class LoRAMemoryPool:
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
+        # See BaseLoRABackend.uses_max_rank_spaced_lora_layout.
+        self.max_rank_spaced_layout: bool = max_rank_spaced_layout
         self.pin_memory_available: bool = is_pin_memory_available()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
@@ -953,6 +956,11 @@ class LoRAMemoryPool:
             else:
                 logger.warning(msg)
 
+        if self.max_rank_spaced_layout:
+            # The kernels contract over the full max_lora_rank, so rank tails left
+            # by an evicted higher-rank adapter must not survive into this slot.
+            self._clear_buffer_slot_for_base(buffer_id)
+
         for layer_id in range(self.num_layer):
             layer = lora_adapter.layers[layer_id]
             layer_weights = layer.weights
@@ -1262,7 +1270,6 @@ class LoRAMemoryPool:
                                     ],
                                 )
                 else:
-                    buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     if weights is not None:
                         assert isinstance(weights_cache_key, str)
                         weights = self._get_maybe_cached_weight_for_transfer(
@@ -1270,7 +1277,22 @@ class LoRAMemoryPool:
                             weights_cache_key,
                             weights,
                         )
-                    load_lora_weight_tensor(buffer_view, weights)
+                    if self.max_rank_spaced_layout:
+                        for ci in range(c):
+                            load_lora_weight_tensor(
+                                target_buffer[
+                                    buffer_id, ci * max_r : ci * max_r + lora_rank, :
+                                ],
+                                (
+                                    None
+                                    if weights is None
+                                    else weights[ci * lora_rank : (ci + 1) * lora_rank]
+                                ),
+                            )
+                    else:
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, : lora_rank * c, :], weights
+                        )
 
             for name, weights in temp_B_buffer.items():
                 if name not in active_target_modules:

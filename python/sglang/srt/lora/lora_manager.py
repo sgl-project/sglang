@@ -1027,6 +1027,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            max_rank_spaced_layout=self.lora_backend.uses_max_rank_spaced_lora_layout,
         )
 
         # Initializing memory pool with base model

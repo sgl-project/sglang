@@ -113,6 +113,7 @@ def create_attention_lora_adapter(
     output_dir: str,
     seed: int = 0,
     lora_b_std: float = SINGLE_LORA_B_STD,
+    rank: int = SYNTH_LORA_RANK,
 ):
     """
     Create a randomly-initialized (untrained) LoRA adapter on the attention
@@ -133,8 +134,8 @@ def create_attention_lora_adapter(
     peft_model = get_peft_model(
         model,
         LoraConfig(
-            r=SYNTH_LORA_RANK,
-            lora_alpha=2 * SYNTH_LORA_RANK,
+            r=rank,
+            lora_alpha=2 * rank,
             target_modules=SYNTH_TARGET_MODULES,
             lora_dropout=0,
             bias="none",
@@ -173,8 +174,10 @@ def create_attention_lora_adapter(
 ADAPTER_A = "A"
 ADAPTER_B = "B"
 ADAPTER_C = "C"
+ADAPTER_MAX_RANK = "R"  # rank SYNTH_MAX_LORA_RANK; the others are SYNTH_LORA_RANK
 BASE_SLOT = None  # "no adapter" -- the base model
-ADAPTER_SEEDS = {ADAPTER_A: 1, ADAPTER_B: 2, ADAPTER_C: 3}
+ADAPTER_SEEDS = {ADAPTER_A: 1, ADAPTER_B: 2, ADAPTER_C: 3, ADAPTER_MAX_RANK: 4}
+ADAPTER_RANKS = {ADAPTER_MAX_RANK: SYNTH_MAX_LORA_RANK}
 
 _adapter_dirs = {}
 
@@ -189,7 +192,11 @@ def synth_adapter_path(
     if key not in _adapter_dirs:
         path = lora_temp_dir(f"sglang_test_lora_{identity}_{lora_b_std}_")
         create_attention_lora_adapter(
-            base_model, path, seed=ADAPTER_SEEDS[identity], lora_b_std=lora_b_std
+            base_model,
+            path,
+            seed=ADAPTER_SEEDS[identity],
+            lora_b_std=lora_b_std,
+            rank=ADAPTER_RANKS.get(identity, SYNTH_LORA_RANK),
         )
         _adapter_dirs[key] = path
     return _adapter_dirs[key]
@@ -352,9 +359,12 @@ class TestLoRAAccuracy(CustomTestCase):
             )
         empty_gpu_cache()
 
-    def _check_backend(self, backend: str):
+    def _check_backend(self, backend: str, **extra):
         with lora_runner(
-            backend=backend, lora_paths=[self.lora_path], max_loras_per_batch=1
+            backend=backend,
+            lora_paths=[self.lora_path],
+            max_loras_per_batch=1,
+            **extra,
         ) as runner:
             srt_outputs = runner.forward(
                 TEST_PROMPTS,
@@ -394,6 +404,12 @@ class TestLoRAAccuracy(CustomTestCase):
         for backend in DENSE_BACKENDS:
             with self.subTest(backend=backend):
                 self._check_backend(backend)
+
+    def test_lora_below_max_rank_matches_hf(self):
+        # Stacked q/k/v slices must be read at the adapter's rank, not max_lora_rank.
+        for backend in DENSE_BACKENDS:
+            with self.subTest(backend=backend):
+                self._check_backend(backend, max_lora_rank=SYNTH_MAX_LORA_RANK)
 
 
 # ==============================================================================
@@ -621,6 +637,9 @@ class TestDynamicLoRAUpdate(CustomTestCase):
     def test_dynamic_load_unload_reload_torch_native(self):
         self._check_load_unload_reload("torch_native")
 
+    def test_dynamic_load_unload_reload_intel_xpu(self):
+        self._check_load_unload_reload("intel_xpu")
+
 
 class TestPinnedLoRAAdapters(CustomTestCase):
     """
@@ -692,9 +711,11 @@ class TestLoRAEvictionEndToEnd(CustomTestCase):
     test_lora_eviction_policy.py's job.
     """
 
-    def _check_eviction(self, *, policy: str, backend: str = "triton"):
-        label = f"{policy},{backend}"
-        paths = synth_slot_paths([ADAPTER_A, ADAPTER_B])
+    def _check_eviction(
+        self, *, policy: str, backend: str = "triton", slots=(ADAPTER_A, ADAPTER_B)
+    ):
+        label = f"{policy},{backend},{'/'.join(slots)}"
+        paths = synth_slot_paths(slots)
         with lora_runner(
             backend=backend,
             lora_paths=paths,
@@ -729,6 +750,18 @@ class TestLoRAEvictionEndToEnd(CustomTestCase):
 
     def test_eviction_fifo_torch_native(self):
         self._check_eviction(policy="fifo", backend="torch_native")
+
+    def test_eviction_lru_intel_xpu(self):
+        self._check_eviction(policy="lru", backend="intel_xpu")
+
+    def test_eviction_fifo_intel_xpu(self):
+        self._check_eviction(policy="fifo", backend="intel_xpu")
+
+    def test_eviction_mixed_rank_intel_xpu(self):
+        # A reloads into the max-rank adapter's slot; its rank tails must not leak.
+        self._check_eviction(
+            policy="lru", backend="intel_xpu", slots=(ADAPTER_A, ADAPTER_MAX_RANK)
+        )
 
 
 # ==============================================================================
@@ -823,6 +856,9 @@ class TestEmbeddingLoRA(CustomTestCase):
 
     def test_embedding_lora_applies_and_routes_torch_native(self):
         self._check_embedding_backend("torch_native")
+
+    def test_embedding_lora_applies_and_routes_intel_xpu(self):
+        self._check_embedding_backend("intel_xpu")
 
 
 # ==============================================================================

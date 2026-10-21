@@ -35,6 +35,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     supports_prefill_cuda_graph: bool = False
     # Supporting backends must handle both eager execution and decode CUDA graphs.
     supports_dp_attention: bool = False
+    # Kernels ignore lora_ranks and read stacked slice p at p * max_lora_rank;
+    # the pool spaces stacked A at max_lora_rank and zeroes rank tails.
+    uses_max_rank_spaced_lora_layout: bool = False
 
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
