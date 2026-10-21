@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
@@ -19,6 +20,7 @@ from sglang.srt.managers.kv_control.contracts import (
     Location,
     LogicalTarget,
     OperationRef,
+    Seconds,
     TokensTarget,
     Value,
     validated,
@@ -26,7 +28,7 @@ from sglang.srt.managers.kv_control.contracts import (
 from sglang.srt.managers.kv_control.controller import KVControl
 from sglang.srt.managers.kv_control.index import IndexCursor
 from sglang.srt.managers.kv_control.policy_runtime import (
-    PolicyDefinition,
+    PolicyConfig,
     validate_definitions,
 )
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
@@ -47,7 +49,9 @@ class ServiceConfig(Value):
     engine_id: Identifier | None = None
     limits: Limits = Limits()
     cache_limits: CacheLimits = CacheLimits()
-    policies: tuple[PolicyDefinition, ...] = ()
+    policies: tuple[PolicyConfig, ...] = ()
+    policy_max_wait_seconds: Seconds = 1.0
+    max_policy_requests: Annotated[int, msgspec.Meta(ge=1, le=4096)] = 128
 
     def cache_config(self):
         return CacheControlConfig(
@@ -58,7 +62,32 @@ class ServiceConfig(Value):
 def parse_config(value):
     if value is None:
         return None
+    if isinstance(value, dict) and isinstance(value.get("policies"), (tuple, list)):
+        value = dict(value)
+        policies = []
+        for original in value["policies"]:
+            if not isinstance(original, dict):
+                policies.append(original)
+                continue
+            definition = {"implementation": "retention", **original}
+            options = definition.get("options")
+            if (
+                definition["implementation"] == "quota"
+                and isinstance(options, dict)
+                and isinstance(options.get("shares"), dict)
+            ):
+                definition["options"] = {
+                    **options,
+                    "shares": [
+                        {"session_id": name, "weight": weight}
+                        for name, weight in options["shares"].items()
+                    ],
+                }
+            policies.append(definition)
+        value["policies"] = policies
     config = validated(value, ServiceConfig)
+    if not math.isfinite(config.policy_max_wait_seconds):
+        raise ValueError("Policy wait budget must be finite")
     config.cache_config()
     validate_definitions(config.policies)
     return config
@@ -189,8 +218,10 @@ class KVControlService:
         self.namespace_keys = namespace_keys
         self.idle_check = idle_check
         self.cache_available = cache_available
-        self.cache, self.config = cache, validated(config, ServiceConfig)
-        validate_definitions(self.config.policies)
+        config = parse_config(config)
+        if config is None:
+            raise ValueError("An enabled KV service requires configuration")
+        self.cache, self.config = cache, config
         self.base_namespace = self.config.namespace
         if self.namespace_keys:
             self.cache_salt(None)  # Reject an unencodable namespace at startup.
@@ -239,6 +270,8 @@ class KVControlService:
         return encode_cache_salt(self.config.namespace, original)
 
     def prepare_request(self, req):
+        if self.policy_runtime is not None:
+            self.policy_runtime.register_request(req)
         if not self.namespace_keys:
             return
         if hasattr(req, "kv_control_logical_cache_salt"):
@@ -392,6 +425,8 @@ class KVControlService:
             envelope, context, execute_primitives=not unsupported
         )
         req.kv_control_context = context
+        if self.policy_runtime is not None:
+            self.policy_runtime.bind_request(req, context)
         req.kv_hints = msgspec.structs.replace(
             envelope, actions=list(submission.unhandled_actions)
         )
@@ -399,6 +434,8 @@ class KVControlService:
     def finish_request(
         self, req, *, committed_len=0, checkpointed=False, aborted=False
     ):
+        if self.policy_runtime is not None:
+            self.policy_runtime.finish_request(req)
         context = getattr(req, "kv_control_context", None)
         if context is None or (not aborted and not req.finished()):
             return
@@ -476,6 +513,20 @@ class KVControlService:
             associations=control.index.capacity(),
             copies=control.executor.claims.capacity(),
         )
+
+    @property
+    def guides_requests(self):
+        return self.policy_runtime is not None and self.policy_runtime.has_guidance
+
+    def update_policy_guidance(self, scheduler, running_batch):
+        if self.guides_requests:
+            self.policy_runtime.observe_scheduler(scheduler, running_batch)
+
+    def policy_request_key(self, req, original_order, priority_sign):
+        return self.policy_runtime.request_key(req, original_order, priority_sign)
+
+    def policy_allows_request(self, req):
+        return not self.guides_requests or self.policy_runtime.allows_request(req)
 
 
 def dispatch(service, data):

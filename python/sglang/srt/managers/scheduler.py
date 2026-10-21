@@ -4194,6 +4194,19 @@ class Scheduler(
             running_batch,
             processed_tokens=self.processed_tokens_counter,
         )
+        kv_service = getattr(self, "kv_control_service", None)
+        kv_guidance = kv_service is not None and kv_service.guides_requests
+        if kv_guidance:
+            kv_service.update_policy_guidance(self, running_batch)
+            order = {id(req): i for i, req in enumerate(self.waiting_queue)}
+            priority_sign = (
+                self.policy.priority_sign if self.enable_priority_scheduling else 0
+            )
+            self.waiting_queue.sort(
+                key=lambda req: kv_service.policy_request_key(
+                    req, order[id(req)], priority_sign
+                )
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4269,6 +4282,8 @@ class Scheduler(
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
                 break
+            if kv_guidance and not kv_service.policy_allows_request(req):
+                continue
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 

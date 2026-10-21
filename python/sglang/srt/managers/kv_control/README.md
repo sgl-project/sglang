@@ -846,3 +846,67 @@ from copy references to preparation and then to a real cache request lock,
 including pressure eviction before and after release. The small fixture checks
 physical references; configured scheduler selection/expiry integration remains
 a separate unit.
+
+## Optional capacity and ordering guidance
+
+Configure `quota` in the same single-owner FULL-cache profile to enable soft
+session shares and local request guidance:
+
+```json
+{
+  "namespace": "model-weights-v1",
+  "policy_max_wait_seconds": 1,
+  "max_policy_requests": 128,
+  "policies": [
+    {
+      "name": "capacity",
+      "implementation": "quota",
+      "options": {
+        "shares": {"important-task": 2, "other-task": 1},
+        "borrow_idle_capacity": true,
+        "max_wait_seconds": 1,
+        "aging_seconds": 1,
+        "importance_ttl": 60
+      }
+    }
+  ]
+}
+```
+
+Omitted shares use weight one among observed active sessions. Shares are advisory
+and borrowable; they do not partition memory. Whole-view spare capacity permits
+borrowing. The native scheduler applies combined guidance after its ordinary
+prefix matching, preserving native request-priority tiers in ordering. Old
+requests escape advisory deferral and use arrival order after the owner wait
+budget. Physical feasibility remains mandatory in PrefillAdder with fresh
+matches, running growth and previously booked batch demand. No policy estimate
+is carried as an extra allocator reservation.
+
+Quota consumes importance/resume for a tracked SessionTarget. Attach that signal
+to the resuming inference request to bind its actual task incarnation; a native
+SGLang session ID can also map to an already-tracked task. Content equality never
+creates task ownership. Multiple/unknown ownership and truncated/missing demand
+fall back to native admission. Importance state is bounded and expires; task
+finish and epoch changes clear it. Retention and quota can run together.
+
+The owner observes at most max_policy_requests entries on an actual admission
+opportunity. It reuses native fresh-match node metadata instead of walking input
+tokens again. Pool capacity/reference/reclaimability are facts. Incremental
+request demand and running growth are estimates; unknowns stay None. Newly
+protected cached prefixes are part of demand, and shared unreferenced prefixes
+are counted once in the cohort estimate. Per-session held-row sums are a
+conservative upper bound when requests share prefixes. Those soft estimates
+cannot authorize an allocation. Importance signals do not build request views;
+unconsumed token-target quota signals do not resolve history.
+
+Startup definitions use typed implementation variants. Existing retention JSON
+may still omit implementation; parsing fills that default on a copy of the
+configuration. Invalid options, nonfinite values, duplicate names/shares and
+excessive state are rejected. The manual server smoke accepts --quota, associates
+a logical task and binds it on the real model request before exercising cache
+reuse. No fairness/performance claim follows from the small functional probe.
+
+Consumed signals freeze their historical scope at submission, before any sibling
+association can extend it. Owner-registered children retain that resolved scope;
+a same-envelope task finish cancels a later signal rather than resurrecting
+policy declarations for a finished incarnation.

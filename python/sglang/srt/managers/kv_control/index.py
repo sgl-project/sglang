@@ -140,6 +140,11 @@ class LogicalIndex:
             raise ControlError("missing", "Session is not tracked")
         return session.revision
 
+    def task_identity(self, session_id: str) -> TaskIdentity | None:
+        validated(session_id, Identifier)
+        session = self._sessions.get(session_id)
+        return session.identity if session is not None else None
+
     @staticmethod
     def _expect(expected, actual):
         if type(expected) is not int or expected != actual:

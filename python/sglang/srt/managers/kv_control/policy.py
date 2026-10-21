@@ -61,6 +61,7 @@ class PolicyObservation:
     requests_complete: bool = False
     measured_save_seconds: float | None = None
     measured_load_seconds: float | None = None
+    estimated_waiting_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,9 @@ class KVPolicy:
     consumed_signals: frozenset[str] = frozenset()
     observation_categories: frozenset[str] = frozenset()
     uses_guidance = False
+
+    def consumes(self, payload):
+        return payload.signal in self.consumed_signals
 
     def on_signal(self, signal: PolicySignal, view: PolicyObservation):
         return None

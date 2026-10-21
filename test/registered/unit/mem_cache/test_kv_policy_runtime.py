@@ -233,3 +233,105 @@ def test_unsupported_request_profile_does_not_execute_policy_and_can_finish_task
         service.control.executor = executor
     assert observed(service) == [0]
     assert not dma.pending
+
+
+@pytest.mark.parametrize("signal_first", [False, True])
+def test_consumed_signal_uses_submission_snapshot_across_sibling_association(
+    owner, signal_first
+):
+    _, cache, service, dma = owner
+    fixtures.seed(cache)
+    record = service.control.index.associate(
+        Associate(
+            session_id="task",
+            continuation_id="c",
+            expected_revision=0,
+            target=cache_fixtures.target(),
+        )
+    )
+    association = KvHintAction(
+        action_id="extend",
+        action_type="sglang.associate",
+        action_version="1.0",
+        payload=msgspec.json.decode(
+            msgspec.json.encode(
+                Associate(
+                    session_id="task",
+                    continuation_id="c",
+                    expected_revision=record.revision,
+                    target=cache_fixtures.target((1, 2, 3, 4, 5)),
+                )
+            )
+        ),
+    )
+    signal = KvHintAction(
+        action_id="signal",
+        action_type="sglang.signal",
+        action_version="1.0",
+        payload={
+            "target": {
+                "kind": "session",
+                "namespace": "ns",
+                "session_id": "task",
+                "expected_revision": service.control.index.session_revision("task"),
+            },
+            "signal": "resume",
+        },
+    )
+    actions = [signal, association] if signal_first else [association, signal]
+    results = service.control.submit(
+        KvHintsEnvelope(protocol_version="0.1", message_id="sibling", actions=actions),
+        service.control.context("router"),
+    ).results
+    parent = next(r for r in results if r.ref.action_id == "signal")
+    assert parent.status == Status.COMPLETED
+    (child,) = parent.update.derived_operations
+    completed = service.control.registry.get(child)
+    assert completed.status == Status.COMPLETED, completed
+    assert max(o.coverage.end_token for o in completed.update.target_outcomes) == 4
+    assert len(service.control.index.get("task", "c").content.token_ids) == 5
+
+
+def test_finish_before_consumed_signal_does_not_resurrect_task_policy(owner):
+    _, cache, service, dma = owner
+    fixtures.seed(cache)
+    service.control.index.associate(
+        Associate(
+            session_id="task",
+            continuation_id="c",
+            expected_revision=0,
+            target=cache_fixtures.target(),
+        )
+    )
+    envelope = KvHintsEnvelope(
+        protocol_version="0.1",
+        message_id="finish-signal",
+        actions=[
+            KvHintAction(
+                action_id="finish",
+                action_type="sglang.finish_task",
+                action_version="1.0",
+                payload={
+                    "session_id": "task",
+                    "expected_revision": service.control.index.session_revision("task"),
+                },
+            ),
+            KvHintAction(
+                action_id="signal",
+                action_type="sglang.signal",
+                action_version="1.0",
+                payload={
+                    "target": {
+                        "kind": "session",
+                        "namespace": "ns",
+                        "session_id": "task",
+                    },
+                    "signal": "resume",
+                },
+            ),
+        ],
+    )
+    result = service.control.submit(envelope, service.control.context("router"))
+    assert [r.status for r in result.results] == [Status.COMPLETED, Status.CANCELLED]
+    assert not result.results[1].update.derived_operations
+    assert observed(service) == [0] and not service.has_pending

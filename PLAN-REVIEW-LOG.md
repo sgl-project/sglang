@@ -703,3 +703,51 @@ Optional JIT row warning remains outside the explicitly selected direct backend.
 No model-quality/performance claim. Approve private handoff mechanism. Actual
 configured request selection, timers/abort release and tool/quota policy remain
 pending implementation.
+
+## Unit 8 — Soft quota guidance at real scheduler admission
+
+Added strict tagged retention/quota startup variants while preserving omitted
+retention implementation and share-map JSON through nonmutating normalization.
+Quota has bounded incarnation-scoped importance/TTL, borrowable weighted shares,
+aging and reuse scoring. Its SessionTarget importance/resume inputs carry no
+physical actions. Per-request task attribution comes from an attached consumed
+signal's authoritative binding or an already-tracked native session; matching
+content does not imply ownership.
+
+The scheduler owner builds a bounded read-only view only at an admission
+opportunity after native matching, combines guidance and orders requests within
+native priority tiers, then skips advisory deferrals. Expired requests escape
+advice in arrival order. Actual PrefillAdder still refreshes prefix matches and
+checks its live budget/booked candidates/running growth; no duplicate growth
+reservation was introduced. Newly protected cache nodes are charged as a
+commitment, with shared cohort nodes counted once. Per-task running held sums
+are conservative advice; unknown/truncated observations fall back to native
+physical checks. No live queue/allocator object reaches policy classes.
+
+Review found consumed signals resolved history during dispatch, so a sibling
+association could change the proposal's scope. They now freeze at submission;
+private child registration accepts only owner-attested historical resolutions,
+checks epoch/namespace and keeps old scope. Finished incarnations cancel later
+same-envelope signals. Tests cover both association/signal permutations and
+finish-before-signal, including a child that must cover four old tokens even
+when the live continuation grows to five.
+
+New quota policy/guidance tests: 12 passed. Combined quota/retention/schema and
+history-boundary proof: 37 passed (/tmp/sglang-kv-quota-cpu-proof.log). Existing
+control/composition/child/preparation/service/weight regressions: 143 passed
+(/tmp/sglang-kv-quota-regressions.log). A further final schema/history/private
+registration run is retained at /tmp/sglang-kv-quota-final-cpu-proof.log.
+Tests demonstrate advisory allowance cannot spend allocator space consumed
+before actual prefill; real PrefillAdder refuses without adding the request.
+Native matching's shared four-token prefix is charged once in cohort demand,
+not twice across two requests.
+
+GPU 1 real OPT dummy-weight serving passed with quota configuration, logical
+association and an attached task-binding signal:
+/tmp/sglang-kv-opt-quota-smoke/{server.log,result.json}. Generation and repeat
+cache reuse (3 cached tokens, identical IDs), epoch reset and stale rejection
+pass. This validates scheduler integration, not fairness/throughput/model
+quality. Owned process-group cleanup only. Strict Ruff/new Scheduler finding
+delta, isort, formatting and whitespace pass; parent reviewed all changes.
+Approve local quota feature. Tool-wait movement and configured preparation
+selection/expiry/revocation through actual admission remain ongoing.

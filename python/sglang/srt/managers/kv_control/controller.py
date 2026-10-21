@@ -130,11 +130,12 @@ class KVControl:
             )
         )
 
-    def _reserve_policy_operations(self, proposals):
+    def _reserve_policy_operations(self, proposals, *, resolutions=None):
         """Owner-only reservation of a complete plan before any physical effect.
 
         Each (action_id, primitive) is validated and resolved at this boundary.
-        The composer cannot assert history or residency by supplying a snapshot.
+        The owner runtime may retain an already-resolved signal snapshot when a
+        sibling updated history; policies cannot supply authoritative snapshots.
         Registered children remain queued until the runtime explicitly starts
         them after dependency/admission checks. Public submit never uses this
         authority, even with the same caller name.
@@ -146,6 +147,10 @@ class KVControl:
         kinds = {SetPriority: "set_priority", CopyTo: "copy_to", MoveTo: "move_to"}
         if not proposals or len(proposals) > self.limits.max_actions:
             raise ControlError("capacity", "Policy operation batch exceeds limit")
+        if resolutions is not None and len(resolutions) != len(proposals):
+            raise ControlError(
+                "invalid_payload", "Policy resolutions must match actions"
+            )
         actions = []
         for action_id, payload in proposals:
             if type(payload) not in kinds:
@@ -167,11 +172,15 @@ class KVControl:
         )
         batch, _ = snapshot_envelope(envelope, self.limits)
         prepared = []
-        for frozen in batch.actions:
+        for i, frozen in enumerate(batch.actions):
             payload = parse_action(frozen.thaw())
             if payload.target == "request_cached":
                 raise ControlError(
                     "invalid_payload", "Policy children require logical targets"
+                )
+            if payload.target.namespace != self.index.namespace:
+                raise ControlError(
+                    "incompatible_namespace", "Policy target namespace differs"
                 )
             locations = (
                 (payload.location,)
@@ -189,7 +198,20 @@ class KVControl:
                 raise ControlError(
                     "invalid_payload", "Source and destination must differ"
                 )
-            prepared.append((payload, self.index.resolve(payload.target)))
+            scope = (
+                self.index.resolve(payload.target)
+                if resolutions is None
+                else validated(resolutions[i], ResolvedTarget)
+            )
+            if (
+                scope.engine_epoch != self.registry.engine_epoch
+                or scope.namespace != self.index.namespace
+                or scope.index_generation > self.index.generation
+            ):
+                raise ControlError(
+                    "stale_epoch", "Policy snapshot belongs to another owner generation"
+                )
+            prepared.append((payload, scope))
         submission = self.registry.reserve(batch, self.context("local-policy"))
         for result, (payload, scope) in zip(submission.results, prepared, strict=True):
             self._pending[result.ref.operation_id] = _Pending(
@@ -259,12 +281,18 @@ class KVControl:
                     isinstance(payload, (SetPriority, CopyTo, MoveTo))
                     or isinstance(payload, Signal)
                     and self.policy_runtime is not None
-                    and self.policy_runtime.consumes(payload.signal)
+                    and self.policy_runtime.consumes(payload)
                 ):
                     raise ControlError(
                         "unsupported",
                         "This request profile cannot execute native cache operations",
                     )
+                if (
+                    isinstance(payload, Signal)
+                    and self.policy_runtime is not None
+                    and self.policy_runtime.consumes(payload)
+                ):
+                    scope = self.index.resolve(payload.target)
                 if isinstance(payload, (SetPriority, CopyTo, MoveTo)):
                     locations = (
                         (payload.location,)
@@ -327,9 +355,28 @@ class KVControl:
     def _dispatch(self, ref, payload, scope):
         if isinstance(payload, Signal):
             if self.policy_runtime is not None and self.policy_runtime.consumes(
-                payload.signal
+                payload
             ):
-                self.policy_runtime.on_signal(ref, payload)
+                if scope is None:
+                    raise ControlError(
+                        "invalid_payload", "Signal consumer lacks a submission snapshot"
+                    )
+                if any(
+                    branch.continuation is not None
+                    and self.index.task_identity(branch.continuation.task.session_id)
+                    != branch.continuation.task
+                    for branch in scope.branches
+                ):
+                    self.registry.update(
+                        ref,
+                        ExecutionUpdate(
+                            status=Status.CANCELLED,
+                            quiescent=True,
+                            code="task_finished_before_policy",
+                        ),
+                    )
+                else:
+                    self.policy_runtime.on_signal(ref, payload, scope=scope)
                 return
             # No consumer: do not resolve a session or build observations.
             self.registry.update(

@@ -27,6 +27,11 @@ def main():
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--hicache", action="store_true")
     parser.add_argument(
+        "--quota",
+        action="store_true",
+        help="Verify configured task guidance in the real scheduler",
+    )
+    parser.add_argument(
         "--retention",
         action="store_true",
         help="Verify configured policy children and explicit priority precedence",
@@ -60,6 +65,10 @@ def main():
         control_config["policies"] = [
             {"name": "retain", "options": {"priority": 50, "ttl_seconds": 60}}
         ]
+    if args.quota:
+        control_config.setdefault("policies", []).append(
+            {"name": "quota", "implementation": "quota"}
+        )
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -199,13 +208,75 @@ def main():
                 },
                 "kv_hints": hints,
             }
+            if args.quota:
+                registration = control(
+                    {
+                        "kind": "submit",
+                        "context": dict(context, caller_id="router"),
+                        "envelope": {
+                            "protocol_version": "0.1",
+                            "message_id": "quota-associate",
+                            "actions": [
+                                {
+                                    "action_id": "associate",
+                                    "action_type": "sglang.associate",
+                                    "action_version": "1.0",
+                                    "payload": {
+                                        "session_id": "smoke-task",
+                                        "continuation_id": "prompt",
+                                        "expected_revision": 0,
+                                        "target": {
+                                            "kind": "tokens",
+                                            "namespace": namespace,
+                                            "token_ids": body["input_ids"],
+                                        },
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                )
+                assert registration["results"][0]["update"]["status"] == "completed", (
+                    registration
+                )
+                hints["actions"].append(
+                    {
+                        "action_id": "quota-bind",
+                        "action_type": "sglang.signal",
+                        "action_version": "1.0",
+                        "payload": {
+                            "target": {
+                                "kind": "session",
+                                "namespace": namespace,
+                                "session_id": "smoke-task",
+                            },
+                            "signal": "resume",
+                        },
+                    }
+                )
             generated = requests.post(base + "/generate", json=body, timeout=60)
             generated.raise_for_status()
             generated = generated.json()
             messages = control(
                 {"kind": "lookup", "context": context, "message_id": "attached-smoke"}
             )
-            results = [r for message in messages for r in message["results"]]
+            results = [
+                r
+                for message in messages
+                for r in message["results"]
+                if r["ref"]["action_id"] == "keep"
+            ]
+            quota_binding = [
+                r
+                for message in messages
+                for r in message["results"]
+                if r["ref"]["action_id"] == "quota-bind"
+            ]
+            if args.quota:
+                assert (
+                    len(quota_binding) == 1
+                    and quota_binding[0]["update"]["status"] == "completed"
+                ), quota_binding
             assert (
                 len(results) == 1 and results[0]["update"]["status"] == "completed"
             ), results
@@ -319,7 +390,7 @@ def main():
                     )
 
                 if args.retention:
-                    assert owner["policies"] == ["retain"]
+                    assert "retain" in owner["policies"]
                     retention("retain-before-move", 200, 90)
                 movements.append(
                     movement(
@@ -475,6 +546,7 @@ def main():
                 "stale_status": stale.status_code,
                 "weights_validation": weights_validation,
                 "policy_validation": policy_validation,
+                "quota_binding": quota_binding,
             }
             (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(
