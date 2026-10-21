@@ -5,10 +5,10 @@ including on the row-strided qkvr-slice layouts."""
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.log_scaling_tau import (
+from sglang.kernels.ops.elementwise.row_scale import (
     _apply_log_scaling_tau_kernel,
+    row_scale_bf16,
 )
-from sglang.kernels.ops.elementwise.row_scale import row_scale_bf16
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -45,7 +45,7 @@ def test_row_scale_bitexact(rows, inner, strided):
 
 
 def test_dispatch_through_apply_log_scaling_tau():
-    from sglang.kernels.ops.attention.log_scaling_tau import apply_log_scaling_tau
+    from sglang.kernels.ops.elementwise.row_scale import apply_log_scaling_tau
 
     torch.manual_seed(0)
     for shape, view in (((7, 16, 16), (-1, 1, 1)), ((7, 2048), (-1, 1))):

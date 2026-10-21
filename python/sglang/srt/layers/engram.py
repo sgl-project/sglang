@@ -22,7 +22,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
@@ -34,6 +33,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
+from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,

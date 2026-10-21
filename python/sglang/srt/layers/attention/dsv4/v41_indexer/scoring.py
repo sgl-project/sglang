@@ -41,6 +41,21 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
     weights: torch.Tensor  # [rows, heads] bf16/fp32 head weights
     k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
 
+    def paged_logits_args(self, metadata, rows=slice(None)):
+        """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
+        ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
+        n = metadata.rows_per_request
+        q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
+        lens = metadata.compressed_seq_lens[rows]
+        table = metadata.page_table[rows]
+        if n > 1:
+            heads = q_fp4.shape[2]
+            q_fp4 = q_fp4.view(-1, n, heads, 64)
+            q_sf = q_sf.view(-1, n, heads)
+            lens = lens.view(-1, n)
+            table = table[::n]
+        return (q_fp4, q_sf), lens, table
+
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     """The rows of one request are consecutive; a selection is a flattened-K
@@ -88,7 +103,7 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
 
 
 def quantize_index_q(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    from sglang.kernels.ops.quantization.fp4_indexer_quant import (
         quantize_fp4_indexer_tensor,
     )
 
