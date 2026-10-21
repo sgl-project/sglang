@@ -34,7 +34,10 @@ def test_packed_shards_lse_empty_owner_and_graph(dcp, rows, heads):
     packed[:, 512:528] = scales.view(torch.uint8)
     packed[:, 528:] = rope.view(torch.uint8)
     dequant = torch.cat(
-        [(latent.float().view(capacity, 4, 128) * scales[..., None]).flatten(1), rope.float()],
+        [
+            (latent.float().view(capacity, 4, 128) * scales[..., None]).flatten(1),
+            rope.float(),
+        ],
         dim=-1,
     )
     query = (torch.randn(rows, heads, 576, device=device) * 0.25).to(torch.bfloat16)
@@ -47,10 +50,18 @@ def test_packed_shards_lse_empty_owner_and_graph(dcp, rows, heads):
 
     def attention(kv, indices, counts):
         return flashinfer_sparse_mla_forward(
-            q=query, kv_cache=kv, indices=indices, seq_lens=counts,
-            workspace_buffer=workspace, page_size=64, kv_cache_dim=656,
-            qk_nope_head_dim=128, kv_lora_rank=512, qk_rope_head_dim=64,
-            sm_scale=192**-0.5, skip_softmax_threshold_scale_factor=None,
+            q=query,
+            kv_cache=kv,
+            indices=indices,
+            seq_lens=counts,
+            workspace_buffer=workspace,
+            page_size=64,
+            kv_cache_dim=656,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            sm_scale=192**-0.5,
+            skip_softmax_threshold_scale_factor=None,
             return_lse=True,
         )
 
@@ -64,8 +75,10 @@ def test_packed_shards_lse_empty_owner_and_graph(dcp, rows, heads):
             outputs.append(out)
             lses.append(lse)
         merged, merged_lse = dcp_lse_combine_triton(
-            torch.stack(outputs), torch.stack(lses),
-            is_lse_base_on_e=False, return_lse=True,
+            torch.stack(outputs),
+            torch.stack(lses),
+            is_lse_base_on_e=False,
+            return_lse=True,
         )
         return merged, merged_lse, outputs, lses
 
@@ -73,18 +86,24 @@ def test_packed_shards_lse_empty_owner_and_graph(dcp, rows, heads):
         merged, merged_lse, outputs, lses = result
         expected, expected_lse = attention(packed, table, (table >= 0).sum(-1).int())
         torch.testing.assert_close(merged[:3], expected[:3], atol=0.004, rtol=0.02)
-        torch.testing.assert_close(merged_lse[:3], expected_lse[:3], atol=0.004, rtol=0.002)
+        torch.testing.assert_close(
+            merged_lse[:3], expected_lse[:3], atol=0.004, rtol=0.002
+        )
         assert torch.all(merged[3:] == 0)
         assert torch.isneginf(merged_lse[3:]).all()
         for row in range(3):
             ids = table[row][table[row] >= 0].long()
             scores = query[row].float() @ dequant[ids].T * (192**-0.5)
             torch.testing.assert_close(
-                expected_lse[row], torch.logsumexp(scores, -1) / math.log(2),
-                atol=0.01, rtol=0.002,
+                expected_lse[row],
+                torch.logsumexp(scores, -1) / math.log(2),
+                atol=0.01,
+                rtol=0.002,
             )
             reference = scores.softmax(-1) @ dequant[ids, :512]
-            torch.testing.assert_close(expected[row].float(), reference, atol=0.004, rtol=0.02)
+            torch.testing.assert_close(
+                expected[row].float(), reference, atol=0.004, rtol=0.02
+            )
         for rank in range(dcp):
             empty = ~((table >= 0) & (table % dcp == rank)).any(-1)
             assert torch.all(outputs[rank][empty] == 0)
