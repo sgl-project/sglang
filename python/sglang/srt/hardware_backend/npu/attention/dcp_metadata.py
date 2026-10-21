@@ -5,9 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import triton
 
-from sglang.kernels.ops.attention.dcp_kernels import create_mla_kv_page_table_for_dcp
 from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
 
 if TYPE_CHECKING:
@@ -26,7 +24,7 @@ def init_mla_dcp_metadata(
     dcp_size: int,
     dcp_rank: int,
 ) -> torch.Tensor:
-    """Build token-interleaved FIA metadata for eager decode/verify.
+    """Build page-interleaved FIA metadata for eager decode/verify.
 
     The caller selects target dense MLA only; DSA's page-interleaved metadata
     and replicated draft KV do not use these builders.
@@ -39,7 +37,7 @@ def init_mla_dcp_metadata(
             query_len,
             dcp_size,
             dcp_rank,
-            interleave_size=1,
+            interleave_size=page_size,
         )
     else:
         metadata.dcp_spec_seq_lens = None
@@ -67,6 +65,7 @@ def init_mla_dcp_metadata(
             query_len,
             dcp_size,
             dcp_rank,
+            page_size=page_size,
             max_local_kv_len=required_mask_width,
             local_query_lens=metadata.dcp_spec_seq_lens,
         )
@@ -88,7 +87,7 @@ def init_mla_dcp_metadata(
     ):
         effective_seq_lens_cpu = effective_seq_lens_cpu + int(speculative_step_id + 1)
     metadata.seq_lens_cpu_int = get_dcp_lens(
-        effective_seq_lens_cpu, dcp_size, dcp_rank
+        effective_seq_lens_cpu, dcp_size, dcp_rank, interleave_size=page_size
     ).int()
     return local_seq_lens
 
@@ -104,8 +103,9 @@ def init_mla_dcp_graph_state(
     dcp_rank: int,
 ) -> dict[str, torch.Tensor]:
     """Allocate local FIA page tables, lengths and mask at fixed graph addresses."""
-    max_local_context_len = graph_context_len // dcp_size + int(
-        dcp_rank < graph_context_len % dcp_size
+    cycle_size = page_size * dcp_size
+    max_local_context_len = graph_context_len // cycle_size * page_size + min(
+        page_size, max(0, graph_context_len % cycle_size - dcp_rank * page_size)
     )
     graph_num_pages = max(1, (max_local_context_len + page_size - 1) // page_size)
     buffers = {
@@ -156,31 +156,26 @@ def update_mla_dcp_graph_metadata(
     else:
         effective_seq_lens = seq_lens[:bs].to(torch.int64)
 
-    max_local_len = max_len // dcp_size + int(dcp_rank < max_len % dcp_size)
+    cycle_size = page_size * dcp_size
+    max_local_len = max_len // cycle_size * page_size + min(
+        page_size, max(0, max_len % cycle_size - dcp_rank * page_size)
+    )
     active_num_pages = min(
         metadata.block_tables.shape[1],
         max(1, (max_local_len + page_size - 1) // page_size),
     )
-    local_seq_lens = get_dcp_lens(effective_seq_lens, dcp_size, dcp_rank).to(
-        torch.int32
+    metadata.block_tables.zero_()
+    _, local_seq_lens = build_mla_dcp_local_block_tables(
+        req_to_token,
+        req_pool_indices[:bs],
+        effective_seq_lens,
+        page_size,
+        dcp_size,
+        dcp_rank,
+        num_pages=active_num_pages,
+        block_tables=metadata.block_tables[:, :active_num_pages],
     )
     metadata.seq_lens.copy_(local_seq_lens)
-    metadata.block_tables.zero_()
-    if req_pool_indices[:bs].numel():
-        create_mla_kv_page_table_for_dcp[(bs, triton.cdiv(active_num_pages, 128))](
-            req_to_token,
-            req_pool_indices[:bs],
-            metadata.seq_lens,
-            metadata.block_tables[:, :active_num_pages],
-            None,
-            req_to_token.stride(0),
-            metadata.block_tables.stride(0),
-            PHYSICAL_PAGE_SIZE=page_size,
-            DCP_SIZE=dcp_size,
-            DCP_RANK=dcp_rank,
-            PAGES_PER_BLOCK=128,
-            HAS_V2P=False,
-        )
     # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
     if in_capture:
         metadata.seq_lens_cpu_list = local_seq_lens.cpu().int().tolist()
@@ -192,7 +187,7 @@ def update_mla_dcp_graph_metadata(
                 query_len,
                 dcp_size,
                 dcp_rank,
-                interleave_size=1,
+                interleave_size=page_size,
             )
         )
         dcp_mask = build_mla_dcp_mtp_mask(
@@ -200,6 +195,7 @@ def update_mla_dcp_graph_metadata(
             query_len,
             dcp_size,
             dcp_rank,
+            page_size=page_size,
             max_local_kv_len=active_num_pages * page_size,
             local_query_lens=metadata.dcp_spec_seq_lens,
         )
@@ -217,38 +213,33 @@ def build_mla_dcp_local_block_tables(
     dcp_rank: int,
     *,
     num_pages: int | None = None,
+    block_tables: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate the FIA view and fill it with the common DCP page-table kernel.
+    """Allocate or fill FIA's page-interleaved rank-local block table.
 
     Lengths must fit req_to_token; an explicit num_pages must cover every
     local sequence. The graph caller sizes it from the CPU length upper bound.
     """
-    local_seq_lens = get_dcp_lens(seq_lens, dcp_size, dcp_rank).to(torch.int32)
+    local_seq_lens = get_dcp_lens(
+        seq_lens, dcp_size, dcp_rank, interleave_size=physical_page_size
+    ).to(torch.int32)
     if num_pages is None:
         max_len = int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
         num_pages = max(1, (max_len + physical_page_size - 1) // physical_page_size)
-    block_tables = torch.zeros(
-        (req_pool_indices.numel(), num_pages),
-        dtype=torch.int32,
-        device=req_to_token.device,
-    )
+    if block_tables is None:
+        block_tables = torch.zeros(
+            (req_pool_indices.numel(), num_pages),
+            dtype=torch.int32,
+            device=req_to_token.device,
+        )
     if not req_pool_indices.numel():
         return block_tables, local_seq_lens
-    create_mla_kv_page_table_for_dcp[
-        (req_pool_indices.numel(), triton.cdiv(num_pages, 128))
-    ](
-        req_to_token,
-        req_pool_indices,
-        local_seq_lens,
-        block_tables,
-        None,
-        req_to_token.stride(0),
-        block_tables.stride(0),
-        PHYSICAL_PAGE_SIZE=physical_page_size,
-        DCP_SIZE=dcp_size,
-        DCP_RANK=dcp_rank,
-        PAGES_PER_BLOCK=128,
-        HAS_V2P=False,
+    page_stride = physical_page_size * dcp_size
+    torch.div(
+        req_to_token[req_pool_indices, : num_pages * page_stride : page_stride],
+        page_stride,
+        rounding_mode="floor",
+        out=block_tables,
     )
     return block_tables, local_seq_lens
 
@@ -259,15 +250,19 @@ def build_mla_dcp_mtp_mask(
     dcp_size: int,
     dcp_rank: int,
     *,
+    page_size: int = 1,
     max_local_kv_len: int | None = None,
     local_query_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Adapt common per-query DCP frontiers to FIA's fixed verify mask."""
     prefix_lens = prefix_lens.to(torch.int64)
     if max_local_kv_len is None:
-        local_seq_lens = get_dcp_lens(prefix_lens + query_len, dcp_size, dcp_rank).to(
-            torch.int32
-        )
+        local_seq_lens = get_dcp_lens(
+            prefix_lens + query_len,
+            dcp_size,
+            dcp_rank,
+            interleave_size=page_size,
+        ).to(torch.int32)
         max_local_kv_len = (
             int(local_seq_lens.max().item()) if local_seq_lens.numel() else 0
         )
@@ -286,7 +281,7 @@ def build_mla_dcp_mtp_mask(
             query_len,
             dcp_size,
             dcp_rank,
-            interleave_size=1,
+            interleave_size=page_size,
         )
     k_idx = torch.arange(max_local_kv_len, device=prefix_lens.device, dtype=torch.int64)
     mask = k_idx[None, None, :] >= local_query_lens.view(

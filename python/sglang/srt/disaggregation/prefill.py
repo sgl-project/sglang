@@ -318,6 +318,8 @@ class PrefillBootstrapQueue:
                 get_layout = getattr(pool, "get_dcp_remote_decode_layout", None)
                 if get_layout is not None:
                     dcp_remote_decode_layout.extend(get_layout())
+                elif pool is not None and pool is draft_kv_pool:
+                    dcp_remote_decode_layout.extend([True] * num_draft_entries)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

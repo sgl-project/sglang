@@ -786,12 +786,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self._finalize_allocation_log(size)
 
-    @property
-    def dcp_localizes_write_indices(self):
-        # Dense MLA's token-interleaved KV writer consumes global slots. DSA
-        # instead consumes the page-interleaved slots localized by KVLocPlan.
-        return self.index_head_dim is None and not self.is_draft_worker
-
     def _mla_buffer_info(self):
         from sglang.srt.mem_cache.device_pool_info import MLABufferInfo
 
@@ -838,9 +832,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             indices,
             self.dcp_size,
             self.dcp_rank,
-            1
-            if getattr(self, "dcp_localizes_write_indices", False)
-            else self.page_size,
+            self.page_size,
         )
         return local_indices[local_indices >= 0]
 
@@ -1047,10 +1039,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
-        parallel = get_parallel()
-        if parallel.dcp_enabled and self.dcp_localizes_write_indices:
-            # Separate NPU latent/RoPE buffers share the DCP-aware Triton body,
-            # not the CUDA host wrapper or its non-DCP no-RoPE specialization.
+        if (
+            self.dcp_size > 1
+            and self.index_head_dim is None
+            and not self.is_draft_worker
+        ):
+            # KVLocPlan has already localized page-interleaved slots. This
+            # fixed-shape store only skips -1 rows; it does not shard again.
             loc = loc.contiguous()
             for dst, src in (
                 (self.k_buffer[layer_id - self.start_layer], cache_k),
@@ -1065,15 +1060,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     src,
                     src,
                     loc,
-                    0,
+                    -1,
                     buffer_stride=dst.stride(0),
                     nope_stride=src.stride(0),
                     rope_stride=src.stride(0),
                     nope_dim=src.shape[-1],
                     rope_dim=0,
                     BLOCK=triton.next_power_of_2(src.shape[-1]),
-                    DCP_RANK=parallel.dcp_rank,
-                    DCP_WORLD_SIZE=parallel.dcp_size,
+                    DCP_RANK=0,
+                    DCP_WORLD_SIZE=1,
                     USE_GDC=False,
                 )
             return

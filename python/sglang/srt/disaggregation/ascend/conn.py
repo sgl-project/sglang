@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -106,8 +107,8 @@ class AscendKVManager(MooncakeKVManager):
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
-    def _is_npu_dsa_layout(self) -> bool:
-        return getattr(self.kv_args, "kv_buf_groups", 1) == 3
+    def _uses_page_interleaved_dcp(self) -> bool:
+        return getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3)
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
@@ -142,11 +143,11 @@ class AscendKVManager(MooncakeKVManager):
             self.engine.batch_register(ptrs, lens)
 
     def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
-        if self._is_npu_dsa_layout() and self.dcp_size != dst_dcp_size:
+        if self._uses_page_interleaved_dcp() and self.dcp_size != dst_dcp_size:
             if self.dcp_size == 1 and dst_dcp_size > 1:
                 return True
             raise RuntimeError(
-                "NPU DSA PD supports prefill DCP 1 -> decode DCP N only, got "
+                "NPU MLA PD supports prefill DCP 1 -> decode DCP N only, got "
                 f"prefill={self.dcp_size}, decode={dst_dcp_size}"
             )
         return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
@@ -162,7 +163,7 @@ class AscendKVManager(MooncakeKVManager):
     def prepare_dcp_token_item_lens(
         self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
     ) -> List[int]:
-        if not self._is_npu_dsa_layout():
+        if not self._uses_page_interleaved_dcp():
             return super().prepare_dcp_token_item_lens(dst_page_item_lens, dst_dcp_size)
         self._get_dcp_remote_decode_layout()
         page_size = self.kv_args.page_size
@@ -424,7 +425,7 @@ class AscendKVManager(MooncakeKVManager):
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
     ) -> int:
-        if not self._is_npu_dsa_layout():
+        if not self._uses_page_interleaved_dcp():
             return super().send_kvcache_dcp(
                 mooncake_session_id,
                 prefill_kv_indices,
@@ -445,11 +446,23 @@ class AscendKVManager(MooncakeKVManager):
             )
 
         src_kv_ptrs = self.kv_args.kv_data_ptrs
-        _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
-        if dst_kv_item_lens:
-            _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_item_lens, dst_kv_item_lens
+        src_layer_ids = getattr(self.kv_args, "kv_layer_ids", None)
+        if src_layer_ids or dst_layer_ids:
+            dst_entries = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
             )
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_entries]
+            if dst_kv_item_lens:
+                dst_kv_item_lens = [dst_kv_item_lens[j] for j in dst_entries]
+        else:
+            _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+            if dst_kv_item_lens:
+                _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_item_lens, dst_kv_item_lens
+                )
 
         layout = self._get_dcp_remote_decode_layout()
         num_entries = len(src_kv_ptrs)
@@ -476,6 +489,20 @@ class AscendKVManager(MooncakeKVManager):
         )
 
         transfer_blocks: List[Tuple[int, int, int]] = []
+        sliced_draft_params = []
+        num_draft = getattr(self.kv_args, "num_draft_entries", 0)
+        if (
+            num_draft
+            and not dst_kv_item_lens
+            and dst_attn_tp_size
+            not in (
+                None,
+                self.attn_tp_size,
+            )
+        ):
+            raise ValueError(
+                "PD DCP with different draft TP sizes requires destination KV lengths"
+            )
         for entry, uses_global_slots in enumerate(layout):
             page_bytes = self.kv_args.kv_item_lens[entry]
             if page_bytes != dcp_token_item_lens[entry] * self.kv_args.page_size:
@@ -487,6 +514,45 @@ class AscendKVManager(MooncakeKVManager):
                     dst_dcp_size if uses_global_slots else 1
                 )
                 if dst_kv_item_lens[entry] != expected_dst_bytes:
+                    if uses_global_slots and entry >= num_entries - num_draft:
+                        src_width = dcp_token_item_lens[entry]
+                        dst_width, remainder = divmod(
+                            dst_kv_item_lens[entry],
+                            self.kv_args.page_size * dst_dcp_size,
+                        )
+                        if remainder or dst_width <= 0:
+                            raise ValueError(
+                                "Invalid PD DCP draft destination token width"
+                            )
+                        if self.is_mla_backend:
+                            raise ValueError(
+                                "PD DCP draft head slicing is unsupported for pure MLA"
+                            )
+                        copy_width = min(src_width, dst_width)
+                        if max(src_width, dst_width) % copy_width:
+                            raise ValueError(
+                                "PD DCP draft KV head shards must divide evenly"
+                            )
+                        if dst_attn_tp_size is None:
+                            raise ValueError(
+                                "PD DCP draft head slicing requires destination TP size"
+                            )
+                        src_span = src_width * self.attn_tp_size
+                        dst_span = dst_width * dst_attn_tp_size
+                        src_rank = (
+                            self.kv_args.engine_rank % self.attn_tp_size
+                        ) // max(1, src_span // dst_span)
+                        dst_rank = dst_tp_rank // max(1, dst_span // src_span)
+                        sliced_draft_params.append(
+                            (
+                                src_kv_ptrs[entry] + (dst_rank * dst_width) % src_width,
+                                dst_kv_ptrs[entry] + (src_rank * src_width) % dst_width,
+                                src_width,
+                                dst_width,
+                                copy_width,
+                            )
+                        )
+                        continue
                     raise RuntimeError(
                         "Ascend PD DCP destination geometry differs at entry "
                         f"{entry}: expected={expected_dst_bytes}, "
@@ -505,7 +571,38 @@ class AscendKVManager(MooncakeKVManager):
                     )
                 )
 
-        return self._transfer_data(mooncake_session_id, transfer_blocks)
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+        if ret != 0 or not sliced_draft_params:
+            return ret
+        offsets = np.arange(self.kv_args.page_size, dtype=np.int64)
+        src_tokens = (global_src[:, None] * self.kv_args.page_size + offsets).reshape(
+            -1
+        )
+        dst_tokens = (global_dst[:, None] * self.kv_args.page_size + offsets).reshape(
+            -1
+        )
+        batch_size = self.max_transfer_batch_indices
+        if batch_size <= 0:
+            batch_size = 4096
+        for start in range(0, src_tokens.size, batch_size):
+            blocks = []
+            for (
+                src_ptr,
+                dst_ptr,
+                src_width,
+                dst_width,
+                copy_width,
+            ) in sliced_draft_params:
+                src_addrs = src_ptr + src_tokens[start : start + batch_size] * src_width
+                dst_addrs = dst_ptr + dst_tokens[start : start + batch_size] * dst_width
+                blocks.extend(
+                    (int(src), int(dst), copy_width)
+                    for src, dst in zip(src_addrs, dst_addrs)
+                )
+            ret = self._transfer_data(mooncake_session_id, blocks)
+            if ret != 0:
+                return ret
+        return 0
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.

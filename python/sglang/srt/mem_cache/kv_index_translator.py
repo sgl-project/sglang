@@ -182,14 +182,7 @@ class KVIndexTranslator:
             self._translate_full = None
             self.defer_read_translate = False
             parallel = get_parallel()
-            # Dense MLA's NPU writer localizes token-interleaved slots itself;
-            # its plan must keep global ids until that store.
-            if (
-                _is_npu
-                and parallel.dcp_enabled
-                and not is_draft_worker
-                and not getattr(token_to_kv_pool, "dcp_localizes_write_indices", False)
-            ):
+            if _is_npu and parallel.dcp_enabled and not is_draft_worker:
                 # An NPU DCP target writes its rank's share of the window in
                 # rank-local slots (-1: another rank's); the scheduler,
                 # `req_to_token` and the replicated draft pool keep the

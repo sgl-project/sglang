@@ -356,7 +356,7 @@ class AscendAttnBackend(AttentionBackend):
         # Draft KV remains replicated even when the target uses DCP.
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
         self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
-        self.dcp_interleave_size = self.page_size if self.use_dsa else 1
+        self.dcp_interleave_size = self.page_size
         if self._use_dense_mla_dcp_target():
             if model_runner.kv_cache_dtype not in (torch.float16, torch.bfloat16):
                 raise NotImplementedError(
@@ -365,7 +365,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             if is_fia_nz():
                 raise NotImplementedError(
-                    "Ascend DCP currently requires token-major MLA KV storage; "
+                    "Ascend DCP currently requires ND MLA KV storage; "
                     "set SGLANG_USE_FIA_NZ=0."
                 )
         if self.use_mla:
@@ -535,7 +535,12 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_cpu = forward_batch.seq_lens.cpu()
         if forward_batch.forward_mode.is_target_verify():
             seq_lens_cpu = seq_lens_cpu + query_len
-        local_seq_lens = get_dcp_lens(seq_lens_cpu, self.dcp_size, self.dcp_rank)
+        local_seq_lens = get_dcp_lens(
+            seq_lens_cpu,
+            self.dcp_size,
+            self.dcp_rank,
+            interleave_size=self.dcp_interleave_size,
+        )
         return local_seq_lens.tolist() + [0] * (bs - local_seq_lens.numel())
 
     def _get_kv_lens_and_block_tables(
@@ -1753,7 +1758,10 @@ class AscendAttnBackend(AttentionBackend):
                 device="cpu",
             )
             gathered = all_gather_kv_cache_for_dcp(
-                kv_cached, k_rope_cached, prefix_lens_cpu
+                kv_cached,
+                k_rope_cached,
+                prefix_lens_cpu,
+                interleave_size=self.dcp_interleave_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 

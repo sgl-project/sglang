@@ -35,6 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
@@ -322,6 +323,8 @@ def all_gather_kv_cache_for_dcp(
     prefix_k_pe: torch.Tensor,
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
+    *,
+    interleave_size: int = 1,
 ):
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
@@ -336,17 +339,38 @@ def all_gather_kv_cache_for_dcp(
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
 
-    left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
-    left_pads = left_pads.to(torch.int32)
-    right_pads = (
-        prefix_starts_cpu + prefix_kv_lens_cpu - 1
-    ) % dcp_world_size < dcp_rank
-    right_pads = right_pads.to(torch.int32)
-    padded_lens = (
-        prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1
-    ) // dcp_world_size
-
-    local_kv_lens = padded_lens - left_pads - right_pads
+    cycle_size = dcp_world_size * interleave_size
+    if interleave_size == 1:
+        left_pads = (prefix_starts_cpu % dcp_world_size > dcp_rank).to(torch.int32)
+        right_pads = (
+            (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % dcp_world_size < dcp_rank
+        ).to(torch.int32)
+        padded_lens = (
+            prefix_kv_lens_cpu
+            + (prefix_starts_cpu % dcp_world_size)
+            + dcp_world_size
+            - 1
+        ) // dcp_world_size
+        local_kv_lens = padded_lens - left_pads - right_pads
+    else:
+        left_pads = get_dcp_lens(
+            prefix_starts_cpu % cycle_size,
+            dcp_world_size,
+            dcp_rank,
+            interleave_size=interleave_size,
+        ).to(torch.int32)
+        padded_lens = (
+            (prefix_kv_lens_cpu + (prefix_starts_cpu % cycle_size) + cycle_size - 1)
+            // cycle_size
+            * interleave_size
+        )
+        local_kv_lens = get_dcp_lens(
+            prefix_kv_lens_cpu,
+            dcp_world_size,
+            dcp_rank,
+            start=prefix_starts_cpu,
+            interleave_size=interleave_size,
+        ).to(torch.int32)
     local_kv_lens_cu = torch.zeros(
         len(prefix_kv_lens_cpu) + 1,
         dtype=torch.int32,
@@ -366,7 +390,13 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
 
-    gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    if interleave_size == 1:
+        gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    else:
+        gathered_pages = _all_gather_dcp_kv_cache(
+            padded_kv_cache.reshape(-1, interleave_size, *padded_kv_cache.shape[1:])
+        )
+        gatherd_kv_cache = gathered_pages.flatten(0, 1)
 
     # 2. re-org kv cache to query orders
     padded_lens_cu = torch.zeros(
@@ -379,7 +409,7 @@ def all_gather_kv_cache_for_dcp(
         kv_cache_tuple += (
             gatherd_kv_cache[
                 padded_lens_cu[req_idx] * dcp_world_size
-                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
+                + (prefix_starts_cpu[req_idx] % cycle_size) :
             ][: prefix_kv_lens_cpu[req_idx]],
         )
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
