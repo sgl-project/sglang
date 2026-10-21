@@ -135,34 +135,22 @@ hicache:
       - 'python/sglang/srt/mem_cache/**/*storage*'
       - 'python/sglang/srt/mem_cache/l2_transfer.py'
 
-# Mooncake transfer, HiCache store, and MoE EP share one label.
-# Paths are listed per subsystem so a repo-wide *mooncake* glob is not
-# used: that glob also hits the serving-trace dataset
-# (python/sglang/benchmark/datasets/mooncake.py).
-#
-# Left unlabeled on purpose:
-# - python/sglang/srt/elastic_ep/elastic_ep.py (mooncake and nixl)
-# - server args, models, scheduler, encoder, and docs that only select
-#   mooncake as one backend
-# - python/sglang/srt/mem_cache/utils.py (shared mem-cache helper)
-# - radix-cache linker tests that launch MooncakeTestServices
-# - test/registered/observability/test_tracing_disaggregation.py
-# Store paths still match hicache via storage/**/*, so those PRs get both.
+# A *mooncake* filename glob also matches benchmark/datasets/mooncake.py.
 mooncake:
   - changed-files:
     - any-glob-to-any-file:
-      # PD KV transfer and the shared transfer engine.
+      # PD KV transfer.
       - 'python/sglang/srt/disaggregation/mooncake/**/*'
       - 'python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py'
       - 'python/sglang/srt/observability/mooncake_trace.py'
       - 'test/registered/unit/disaggregation/**/*mooncake*'
       - 'test/manual/kv_transfer/**/*mooncake*'
-      # HiCache storage backend (MooncakeDistributedStore).
+      # HiCache store.
       - 'python/sglang/srt/mem_cache/storage/mooncake_store/**/*'
       - 'python/sglang/test/mooncake_utils.py'
       - 'test/registered/unit/mem_cache/**/*mooncake*'
       - 'test/registered/hicache/**/*mooncake*'
-      # MoE all-to-all and elastic-EP expert backup. elastic_ep.py stays out.
+      # MoE EP. elastic_ep.py also implements nixl.
       - 'python/sglang/srt/layers/moe/token_dispatcher/mooncake.py'
       - 'python/sglang/srt/elastic_ep/expert_backup_client.py'
       - 'python/sglang/srt/elastic_ep/expert_backup_manager.py'
