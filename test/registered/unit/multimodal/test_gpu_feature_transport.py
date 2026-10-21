@@ -483,7 +483,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         transport = object.__new__(CudaVmmFeatureTransport)
-        transport.pool = object()
+        transport.pool = None
         transport._publisher_executor = MagicMock()
         transport._enabled = True
 
@@ -492,6 +492,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
 
         self.assertEqual(result, [])
+        self.assertIsNone(transport.pool)
         transport._publisher_executor.submit.assert_not_called()
 
     def test_pageable_copy_source_is_pinned(self):
@@ -1201,7 +1202,7 @@ class TestCudaVmmLazyInit(CustomTestCase):
             SimpleNamespace(base_gpu_id=0), mm_processor=object()
         )
 
-    def test_pool_is_created_lazily_on_first_publication_and_reused(self):
+    def test_pool_is_created_lazily_on_first_mm_dispatch_and_reused(self):
         transport = self._build()
         self.assertIsNone(transport.pool)
         self.assertEqual(_LazyFakePool.instances, 0)
