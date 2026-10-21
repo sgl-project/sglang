@@ -42,11 +42,6 @@ def get_cp_bcg_input_type(strategy: ContextParallelStrategyKind):
 def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
     """Return whether the selected prefill-CP configuration supports BCG."""
 
-    from sglang.srt.layers.cp.bcg import (
-        PREFILL_CP_BCG_SUPPORTED_COMBINATIONS,
-        get_cp_bcg_input_type,
-    )
-
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
     if not (

@@ -49,9 +49,8 @@ class TestGLM53FlashB200ContextParallel(
         "incoai/GLM-5.3-Flash-DFlash2",
         "--speculative-draft-attention-backend",
         "fa4",
-        # Leave room for the larger prefill graph capture.
         "--mem-fraction-static",
-        "0.75",
+        "0.85",
         "--enable-prefill-cp",
         "--cp-strategy",
         "interleave",

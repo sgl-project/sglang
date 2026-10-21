@@ -1059,6 +1059,7 @@ class KVCacheConfigurator:
         The pool factories decide whether a decline refuses the boot.
         Asymmetric K/V rows fuse only on backends that carry v_head_dim through
         to the kernel."""
+        from sglang.srt.layers.cp.base import is_cp_enabled
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             PlacementContext,
@@ -1145,9 +1146,9 @@ class KVCacheConfigurator:
             num_layers=int(aux.draft_kv_num_layers),
             attn_tp_size=(
                 get_parallel().tp_size
-                if self.spec_algorithm.is_dflash()
-                and get_parallel().attn_cp_size > 1
+                if is_cp_enabled()
                 and get_parallel().attn_dp_size == 1
+                and self.spec_algorithm.is_dflash()
                 else get_parallel().attn_tp_size
             ),
             # A DFLASH-family draft config inherits the target's NEXTN depth
