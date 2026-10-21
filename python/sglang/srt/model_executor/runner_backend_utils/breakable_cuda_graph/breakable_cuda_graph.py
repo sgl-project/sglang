@@ -47,6 +47,7 @@ __all__ = [
     "BreakableCUDAGraph",
     "BreakableCUDAGraphCapture",
     "break_graph",
+    "is_capturing",
 ]
 
 
@@ -67,6 +68,13 @@ _current_capture_var: ContextVar["BreakableCUDAGraphCapture | None"] = ContextVa
 _current_stream_var: ContextVar[torch.Stream | None] = ContextVar(
     "current_stream", default=None
 )
+
+
+def is_capturing() -> bool:
+    """Whether a breakable CUDA graph is being captured; False during replay."""
+    return _current_capture_var.get() is not None
+
+
 _forked_streams_var: ContextVar[set[torch.Stream] | None] = ContextVar(
     "forked_streams", default=None
 )

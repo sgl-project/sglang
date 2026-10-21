@@ -668,18 +668,14 @@ def _check_dsv4_indexer_page_size(key: DSV4PagedBufferInfo, page_size: int) -> N
         )
 
 
-def _dsv4_low_ratio_entries(
-    kvcache: Any,
-    infos: dict[PoolName, DevicePoolInfo],
-    page_size: int,
-    num_host_pages: int,
-    transfer_layer_id_max: int,
-):
-    """Mirror each shared source once, in FULL-page units. Prefixes end on an even
-    page boundary, so ratio-2's request-scoped ring is rebuilt, not cached."""
+def _dsv4_low_ratio_regions(
+    kvcache: Any, infos: dict[PoolName, DevicePoolInfo], page_size: int
+) -> list[tuple[PoolName, Any, list, dict[int, int]]]:
+    """(name, device_pool, buffers, layer_mapping) per shared source KV and
+    indexer buffer group, in FULL-page units."""
     import torch
 
-    entries = []
+    regions = []
     for ratio, names in (
         (
             1,
@@ -707,12 +703,19 @@ def _dsv4_low_ratio_entries(
         assert slots_per_page % key.page_slots == 0
         index_pages_per_full_page = slots_per_page // key.page_slots
         layer_mapping = _dsv4_transfer_layer_mapping(kv.layer_ids, kvcache.start_layer)
-        regions = [(names[0], kvcache.kv_pools[ratio], kv.buffer_info.buffers)]
+        regions.append(
+            (
+                names[0],
+                kvcache.kv_pools[ratio],
+                list(kv.buffer_info.buffers),
+                layer_mapping,
+            )
+        )
         for name in names[1:]:
             index = infos.get(name)
             if index is None:
                 continue
-            # Coarsen native index pages to the consumer's FULL logical pages.
+            # Drop only the padding rows past the FULL page address space.
             rows = []
             for buffer in index.buffer_info.buffers:
                 full_pages = buffer.shape[0] // index_pages_per_full_page
@@ -721,26 +724,40 @@ def _dsv4_low_ratio_entries(
                     .view(torch.uint8)
                     .reshape(full_pages, -1)
                 )
-            regions.append((name, kvcache.index_pools[ratio], rows))
-        for name, device_pool, buffers in regions:
-            entries.append(
-                build_pool_entry(
-                    name=name,
-                    host_pool=DeepSeekV4PagedHostPool(
-                        pool_name=str(name),
-                        device_buffers=buffers,
-                        item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
-                        num_host_pages=num_host_pages,
-                        slot_page_size=page_size,
-                        layout=get_memory().hicache_mem_layout,
-                        allocator_type=_get_allocator_type(),
-                        page_aligned_only=True,
-                    ),
-                    device_pool=device_pool,
-                    layer_mapping=layer_mapping,
-                    transfer_layer_id_max=transfer_layer_id_max,
-                )
+            regions.append((name, kvcache.index_pools[ratio], rows, layer_mapping))
+    return regions
+
+
+def _dsv4_low_ratio_entries(
+    kvcache: Any,
+    infos: dict[PoolName, DevicePoolInfo],
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+):
+    """Mirror shared KV; ratio-2 request state is rebuilt at page boundaries."""
+    entries = []
+    for name, device_pool, buffers, layer_mapping in _dsv4_low_ratio_regions(
+        kvcache, infos, page_size
+    ):
+        entries.append(
+            build_pool_entry(
+                name=name,
+                host_pool=DeepSeekV4PagedHostPool(
+                    pool_name=str(name),
+                    device_buffers=buffers,
+                    item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                    num_host_pages=num_host_pages,
+                    slot_page_size=page_size,
+                    layout=get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                    page_aligned_only=True,
+                ),
+                device_pool=device_pool,
+                layer_mapping=layer_mapping,
+                transfer_layer_id_max=transfer_layer_id_max,
             )
+        )
     return entries
 
 
@@ -1792,6 +1809,13 @@ class _MambaStrategy(StackStrategy):
             ComponentType.FULL,
             ComponentType.MAMBA,
         }
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_mamba_device_pool_group,
+        )
+
+        return _build_mamba_device_pool_group(kvcache, params, page_size)
 
     def build(
         self,

@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import ceil_pow2
+from sglang.kernels.ops.quantization.fp4_fake_quant import ceil_pow2
 
 KV_DIM = 512
 FP4_GROUP = 16  # values per e4m3 scale
