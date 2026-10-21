@@ -16,8 +16,6 @@ values); callers still verify the first call and fall back on mismatch.
 
 from __future__ import annotations
 
-import contextlib
-
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
@@ -76,8 +74,8 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if not (
         a.dtype is torch.bfloat16
         and b.dtype is torch.bfloat16
-        and (a.is_cuda or a.is_npu)
-        and (b.is_cuda or b.is_npu)
+        and a.is_cuda
+        and b.is_cuda
         and a.device == b.device
         and a.shape == b.shape
         and a.is_contiguous()
@@ -87,8 +85,7 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("invalid input for fused_silu_mul_bitexact")
     out = torch.empty_like(a)
     numel = a.numel()
-    # NPU launches target the tensor's own device; only CUDA needs the device context.
-    with torch.cuda.device(a.device) if a.is_cuda else contextlib.nullcontext():
+    with torch.cuda.device(a.device):
         _silu_mul_kernel[(triton.cdiv(numel, 1024),)](
             out,
             a,

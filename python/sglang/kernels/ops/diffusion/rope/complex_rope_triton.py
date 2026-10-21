@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paired RoPE preserving PyTorch CUDA complex64 multiplication rounding."""
 
-import contextlib
 from functools import lru_cache
 
 import torch
@@ -63,7 +62,7 @@ def _fake_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
 def fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
     """Rotate contiguous BSHD activations with a shared S×(D/2) complex cache."""
     if not (
-        (x.is_cuda or x.is_npu)
+        x.is_cuda
         and torch.version.hip is None
         and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and x.ndim == 4
@@ -78,8 +77,7 @@ def fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("invalid input for fused_complex_rope")
     out = torch.empty_like(x)
     pairs = x.numel() // 2
-    # NPU launches target the tensor's own device; only CUDA needs the device context.
-    with torch.cuda.device(x.device) if x.is_cuda else contextlib.nullcontext():
+    with torch.cuda.device(x.device):
         _complex_rope_kernel[(triton.cdiv(pairs, 256),)](
             x,
             torch.view_as_real(rope),

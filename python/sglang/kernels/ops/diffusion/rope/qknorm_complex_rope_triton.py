@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fuse 128-wide RMSNorm and complex RoPE with native rounding boundaries."""
 
-import contextlib
-
 import torch
 import triton
 import triton.language as tl
@@ -80,7 +78,7 @@ def _qknorm_complex_rope_onepass_kernel(
 
 def _validate_qknorm_complex_rope(x, weight, rope):
     if not (
-        (x.is_cuda or x.is_npu)
+        x.is_cuda
         and torch.version.hip is None
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.ndim == 4
@@ -117,8 +115,7 @@ def qknorm_complex_rope(
     x = x.contiguous()
     _validate_qknorm_complex_rope(x, weight, rope)
     out = torch.empty_like(x)
-    # NPU launches target the tensor's own device; only CUDA needs the device context.
-    with torch.cuda.device(x.device) if x.is_cuda else contextlib.nullcontext():
+    with torch.cuda.device(x.device):
         _qknorm_complex_rope_onepass_kernel[(triton.cdiv(x.numel() // 128, 4),)](
             x,
             weight,
