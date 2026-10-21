@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
 from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -53,6 +53,29 @@ class TestOnIdleStallPublish(CustomTestCase):
             mono.return_value = 100.10  # > LOAD_STALL_REFRESH_S
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
+
+    def test_stalled_mooncake_decode_gives_transfer_workers_time_to_run(self):
+        for mode in DisaggregationMode:
+            for backend in (TransferBackend.MOONCAKE, TransferBackend.NIXL):
+                with self.subTest(mode=mode, backend=backend):
+                    s = self._stalled_scheduler()
+                    s.disaggregation_mode = mode
+                    s.transfer_backend = backend
+                    with patch("sglang.srt.managers.scheduler.time.sleep") as sleep:
+                        s.on_idle()
+                    if mode == DisaggregationMode.NULL:
+                        sleep.assert_not_called()
+                    elif (
+                        mode == DisaggregationMode.DECODE
+                        and backend == TransferBackend.MOONCAKE
+                    ):
+                        # sleep(0) can immediately reacquire the GIL; a bounded
+                        # positive wait lets the background transfer progress.
+                        sleep.assert_called_once()
+                        self.assertGreater(sleep.call_args.args[0], 0)
+                        self.assertLessEqual(sleep.call_args.args[0], 0.001)
+                    else:
+                        sleep.assert_called_once_with(0)
 
 
 if __name__ == "__main__":

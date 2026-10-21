@@ -5179,6 +5179,13 @@ class Scheduler(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
             if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.transfer_backend == TransferBackend.MOONCAKE
+            ):
+                # No runnable batch: let background KV transfers make progress.
+                # sleep(0) can immediately reacquire the GIL and starve workers.
+                time.sleep(0.001)
+            elif (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
