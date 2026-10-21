@@ -105,5 +105,22 @@ class TestPixtralAdaptorVisionFeature(unittest.TestCase):
                 self.assertEqual(out.shape, (3 * TOKENS, HIDDEN))
 
 
+class TestMistral3WrapperAttrs(unittest.TestCase):
+    def test_attr_set_on_wrapper_survives_eval(self):
+        """Loaders keep what ``model.eval()`` returns (the inner Llava module), so
+        state set on the wrapper must reach it or the runner fails at startup."""
+        inner = torch.nn.Module()
+        # Skip __init__, which builds the full Llava model from an HF config.
+        wrapper = object.__new__(Mistral3ForConditionalGeneration)
+        wrapper.inner = inner
+        sentinel = object()
+
+        wrapper.shared_experts_config = sentinel
+
+        loaded = wrapper.eval()
+        self.assertIs(loaded, inner)
+        self.assertIs(loaded.shared_experts_config, sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -151,6 +151,14 @@ class Mistral3ForConditionalGeneration:
     def __getattr__(self, name):
         return getattr(self.inner, name)
 
+    # Loaders keep whatever `model.eval()` returns, which is `inner`, so state
+    # set on the wrapper (e.g. `shared_experts_config`) must land on `inner`.
+    def __setattr__(self, name, value):
+        if name == "inner":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self.inner, name, value)
+
     def __hasattr__(self, name):
         return hasattr(self.inner, name)
 
