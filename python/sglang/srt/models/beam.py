@@ -338,6 +338,20 @@ class BeamMoE(nn.Module):
             quant_method=BeamUnquantizedFusedMoEMethod() if bf16_experts else None,
             prefix=add_prefix("experts", prefix),
         )
+        # The opt-in single-token GEMV is built for exactly this shard on SM103.
+        self.use_decode_gemv = (
+            envs.SGLANG_OPT_BEAM_DECODE_GEMV.get()
+            and _is_cuda
+            and self.tp_size == 4
+            and self.ep_size == 1
+            and tuple(self.experts.w13_weight.shape) == (256, 1280, 5120)
+            and torch.cuda.get_device_capability() == (10, 3)
+        )
+        if envs.SGLANG_OPT_BEAM_DECODE_GEMV.get() and not self.use_decode_gemv:
+            logger.warning_once(
+                "SGLANG_OPT_BEAM_DECODE_GEMV is unused: it needs BF16 experts "
+                "with MoE TP4/EP1 on SM103."
+            )
         # Some expert methods consume routing weights with scale already applied.
         if self.experts.should_fuse_routed_scaling_factor_in_topk:
             self.topk.topk_config.routed_scaling_factor = config.routed_scaling_factor
@@ -418,15 +432,12 @@ class BeamMoE(nn.Module):
             )
         if defer_sum:
             if (
-                envs.SGLANG_OPT_BEAM_DECODE_GEMV.get()
-                and hidden_states.shape == (1, 5120)
+                self.use_decode_gemv
+                and hidden_states.shape[0] == 1
                 and hidden_states.dtype == torch.bfloat16
                 and hidden_states.is_contiguous()
-                and self.tp_size == 4
-                and self.ep_size == 1
+                # Interleaving is decided after weight loading.
                 and self.experts.quant_method.w13_swiglu_interleaved
-                and self.experts.w13_weight.shape == (256, 1280, 5120)
-                and torch.cuda.get_device_capability() == (10, 3)
             ):
                 from sglang.kernels.ops.moe.beam_decode_gemv import beam_decode_gemv
 
@@ -450,7 +461,6 @@ class BeamMoE(nn.Module):
                 inplace=False,
                 filter_expert=False,
                 defer_sum=True,
-                routed_scaling_factor=self.config.routed_scaling_factor,
                 fuse_swiglu_interleaved=self.experts.quant_method.w13_swiglu_interleaved,
             )
         output = self.experts(hidden_states, topk_output)
