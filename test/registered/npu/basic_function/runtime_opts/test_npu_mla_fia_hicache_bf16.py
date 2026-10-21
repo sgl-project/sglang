@@ -24,7 +24,10 @@ register_npu_ci(est_time=1400, suite="nightly-2-npu-a3", nightly=True)
 class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
     # PR runs the mixin smoke request; nightly runs the full GSM8K set.
     gsm8k_num_examples = 1319
-    # sgl_eval measures 0.809-0.823 across runs on the full 1319-question set.
+    # sgl_eval and evalscope probe the same model with different harnesses:
+    # evalscope asks 5-shot and samples with the server default temperature,
+    # sgl_eval asks 0-shot and decodes greedily. Greedy 0-shot scores lower, so
+    # the 0.83 evalscope baseline becomes 0.809-0.823 here (1319 questions).
     gsm8k_accuracy_thres = 0.79
     gsm8k_backend = "sgl_eval"
     gsm8k_max_tokens = 4096
