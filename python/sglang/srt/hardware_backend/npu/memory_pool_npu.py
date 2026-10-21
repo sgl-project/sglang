@@ -1042,6 +1042,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if (
             self.dcp_size > 1
             and not self.is_draft_worker
+            and self.index_head_dim is None
             and self.dtype in (torch.float16, torch.bfloat16)
         ):
             # KVLocPlan has already localized page-interleaved slots. This
