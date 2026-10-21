@@ -196,7 +196,7 @@ The Ascend model tutorials document support for [Qwen3.6-27B](/docs/hardware-pla
 
 Launch a compatible container using the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start), including its driver, firmware, and runtime mounts, then run the generated `sglang serve` command inside it. Select the device IDs for your cards: one A3 card exposes two dies. For example, a 1-card deployment using dies 0 and 1 needs `--device /dev/davinci0 --device /dev/davinci1`, together with the management devices and mounts in the quickstart.
 
-**Weights:** BF16 checkpoints are available from [Qwen](https://huggingface.co/Qwen) and mirrored on ModelScope. The 27B W8A8 (modelslim) checkpoint is [Eco-Tech/Qwen3.6-27B-w8a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8). The generated W8A8 command includes `SGLANG_USE_MODELSCOPE=1`; ensure the `modelscope` Python package is installed in your environment. For BF16, add the same environment variable if you want to download from ModelScope. Alternatively, pre-download the weights and set `--model-path` to their local directory.
+**Weights:** BF16 checkpoints are available from [Qwen](https://huggingface.co/Qwen) and mirrored on ModelScope. To download from ModelScope, install the `modelscope` Python package and set `SGLANG_USE_MODELSCOPE=1`. Alternatively, pre-download the weights and set `--model-path` to their local directory.
 
 The generator offers the following card counts. Weight sizes exclude KV cache, Mamba state, and runtime buffers; choose capacity and concurrency for your workload.
 
@@ -215,13 +215,6 @@ The generator offers the following card counts. Weight sizes exclude KV cache, M
       <td>Qwen3.6-27B</td>
       <td><a href="https://huggingface.co/Qwen/Qwen3.6-27B">Qwen/Qwen3.6-27B</a></td>
       <td>~54 GB (BF16)</td>
-      <td>Available</td>
-      <td>Available</td>
-    </tr>
-    <tr>
-      <td>Qwen3.6-27B (W8A8)</td>
-      <td><a href="https://www.modelscope.cn/models/Eco-Tech/Qwen3.6-27B-w8a8">Eco-Tech/Qwen3.6-27B-w8a8</a></td>
-      <td>~36 GB</td>
       <td>Available</td>
       <td>Available</td>
     </tr>
@@ -269,41 +262,6 @@ The TPOT values below are reproduced from the linked Ascend best-practice pages.
       <td>1</td>
       <td>BF16</td>
       <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-1p-in64k-out1k-prefix90-50ms">64k+1k (90% prefix cache hit rate)</a></td>
-      <td>50ms</td>
-    </tr>
-    <tr>
-      <td>Qwen3.6-27B</td>
-      <td>1</td>
-      <td>W8A8 INT8</td>
-      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-w8a8-1p-in3k5-out1k5-50ms">3.5k+1.5k</a></td>
-      <td>50ms</td>
-    </tr>
-    <tr>
-      <td>Qwen3.6-27B</td>
-      <td>1</td>
-      <td>W8A8 INT8</td>
-      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-w8a8-1p-in64k-out1k-50ms">64k+1k</a></td>
-      <td>50ms</td>
-    </tr>
-    <tr>
-      <td>Qwen3.6-27B</td>
-      <td>2</td>
-      <td>W8A8 INT8</td>
-      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-w8a8-2p-in16k-out1k-50ms">16k+1k</a></td>
-      <td>50ms</td>
-    </tr>
-    <tr>
-      <td>Qwen3.6-27B</td>
-      <td>2</td>
-      <td>W8A8 INT8</td>
-      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-w8a8-2p-in64k-out1k-50ms">64k+1k</a></td>
-      <td>50ms</td>
-    </tr>
-    <tr>
-      <td>Qwen3.6-27B</td>
-      <td>2</td>
-      <td>W8A8 INT8</td>
-      <td><a href="/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b#qwen3-6-27b-w8a8-2p-in128k-out1k-50ms">128k+1k</a></td>
       <td>50ms</td>
     </tr>
     <tr>
@@ -377,7 +335,7 @@ See the [27B best practices](/docs/hardware-platforms/ascend-npus/model-deployme
 <Note>
 - Multimodal serving on A3 additionally enables `--enable-multimodal --mm-attention-backend ascend_attn`; see the image-input best-practice scenarios for the full flag set.
 - The generator leaves the NPU Mamba cache strategy to the installed SGLang version. Ascend prefix-cache recipes use `--mamba-radix-cache-strategy extra_buffer`; copy the complete matching recipe when enabling prefix caching.
-- Use a version-matched Ascend stack and check output quality with the [accuracy evaluation guide](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation) before [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing), especially for W8A8. Successful checkpoint loading alone does not establish generation accuracy.
+- Use a version-matched Ascend stack and check output quality with the [accuracy evaluation guide](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation) before [performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing). Successful checkpoint loading alone does not establish generation accuracy.
 </Note>
 
 ## 4. Model Invocation
