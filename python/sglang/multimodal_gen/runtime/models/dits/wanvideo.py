@@ -757,7 +757,6 @@ class WanTransformerBlock(nn.Module):
         if (
             self.use_offline_qk_rotation
             and self.attn1.backend is AttentionBackendEnum.FA
-            and query.shape[2:] == key.shape[2:]
             and key.shape == value.shape
         ):
             self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)

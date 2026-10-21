@@ -1358,10 +1358,9 @@ SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION=1 sglang generate \
 </details>
 <br />
 
-The MXFP8 path currently requires MHA with matching Q/K/V head dimensions of
-64 or 128. Causal and cross-attention use the regular attention path. MXFP8 FA
-does not return softmax LSE; MXFP8 ring attention is not supported. Only ascend_fa
-backend currently supports mxfp8 quantization
+The MXFP8 path is not used for causal and cross-attention; the regular attention path is used.
+MXFP8 FA does not return softmax LSE; MXFP8 ring attention is not supported.
+Only the `ascend_fa` backend currently supports MXFP8 attention quantization.
 
 Use `SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE` to control head splitting optimization
 (default: `4`; `0` disables splitting). See the

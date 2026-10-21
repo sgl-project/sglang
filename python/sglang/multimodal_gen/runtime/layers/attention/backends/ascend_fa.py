@@ -312,7 +312,6 @@ class AscendFAImpl(AttentionImpl):
             self._quant_scheme == "MXFP8"
             and not self.causal
             and not self._is_cross_attention
-            and query.shape[2:] == key.shape[2:]
             and key.shape == value.shape
         ):
             batch_size, query_length, num_heads, head_size = query.shape
@@ -375,7 +374,6 @@ class AscendFAImpl(AttentionImpl):
             self._quant_scheme == "MXFP8"
             and not self.causal
             and not self._is_cross_attention
-            and query.shape == key.shape
             and key.shape == value.shape
         ):
             boundaries = _packed_boundaries(
@@ -491,11 +489,17 @@ class AscendFAImpl(AttentionImpl):
 
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
-        if num_heads != num_kv_heads:
-            raise NotImplementedError("MXFP8 attention currently requires MHA")
+        if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+            raise ValueError(
+                "MXFP8 attention requires query heads to be divisible by KV heads"
+            )
 
         head_chunk_size = self._mxfp8_head_chunk_size
-        if head_chunk_size > 0 and num_heads > head_chunk_size:
+        if (
+            head_chunk_size > 0
+            and num_heads > head_chunk_size
+            and num_heads == num_kv_heads
+        ):
             num_groups, remainder = divmod(num_heads, head_chunk_size)
             head_groups = [head_chunk_size] * num_groups
             if remainder:
