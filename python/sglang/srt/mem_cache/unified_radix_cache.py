@@ -2102,6 +2102,8 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
+        *,
+        minimum_prefetch_tokens: Optional[int] = None,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2160,7 +2162,12 @@ class UnifiedRadixCache(BasePrefixCache):
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
-        if prefetch_length < self.prefetch_threshold:
+        threshold = (
+            self.prefetch_threshold
+            if minimum_prefetch_tokens is None
+            else minimum_prefetch_tokens
+        )
+        if prefetch_length < threshold:
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
             # No lookup was issued, so no retry is armed: polling here would
@@ -2244,6 +2251,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # the hit hash chain can shrink as device coverage changes.
         operation.stats_requested_tokens = prefetch_length
         operation.storage_start = storage_start
+        if minimum_prefetch_tokens is not None:
+            operation.native_prefetch_threshold = threshold
         if submission.decision is not None:
             return submission.decision
 
@@ -2497,6 +2506,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self._apply_cache_actions(commit_actions)
             # The commit emits via commit_actions only; the walk's were applied above.
             assert not insert_result.cache_actions
+
+            on_publish = getattr(operation, "native_on_publish", None)
+            if on_publish is not None:
+                on_publish()
 
             self.cache_controller.mem_pool_host.free(
                 host_indices[: insert_result.prefix_len]
@@ -2995,6 +3008,11 @@ class UnifiedRadixCache(BasePrefixCache):
         info = self.ongoing_prefetch.get(request)
         if info is None:
             return
+        if (
+            getattr(info.operation, "native_query_done", False)
+            and info.host_indices is None
+        ):
+            info.operation.native_quiescent = True
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
         # release_aborted_request instead.
@@ -3105,8 +3123,10 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=True,
-                min_tokens=self.prefetch_threshold,
+                allow_partial=not hasattr(operation, "native_prefetch_threshold"),
+                min_tokens=getattr(
+                    operation, "native_prefetch_threshold", self.prefetch_threshold
+                ),
                 evict_host=self.evict_host,
             )
             if host_indices is None:
@@ -3155,6 +3175,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         break
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+                if hasattr(operation, "native_prefetch_threshold"):
+                    operation.native_query_done = True
+                threshold = getattr(
+                    operation, "native_prefetch_threshold", self.prefetch_threshold
+                )
                 self._invalidate_absent_from_hit_query(operation)
                 request = operation.handle
                 hit_tokens = operation.storage_hit_count
@@ -3171,7 +3196,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         reason = None
                         if operation.deadline_expired:
                             reason = "deadline"
-                        elif hit_tokens < self.prefetch_threshold:
+                        elif hit_tokens < threshold:
                             reason = "below_threshold"
                         self._finish_storage_prefetch(
                             request, fulfilled_tokens=0, reason=reason
@@ -3183,7 +3208,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
-                if hit_tokens < self.prefetch_threshold:
+                if hit_tokens < threshold:
                     # Below-threshold hits are not worth the transfer.
                     self._account_prefetch_outcome(operation, revoked=True)
                     self._finish_storage_prefetch(
@@ -3232,6 +3257,8 @@ class UnifiedRadixCache(BasePrefixCache):
                                 else None
                             ),
                         )
+                    if hasattr(operation, "native_prefetch_threshold"):
+                        operation.native_quiescent = True
 
         def _drain_backup():
             drained = 0

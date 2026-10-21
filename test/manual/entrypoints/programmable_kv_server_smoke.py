@@ -27,12 +27,19 @@ def main():
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--hicache", action="store_true")
     parser.add_argument(
+        "--storage",
+        action="store_true",
+        help="Round-trip KV through file storage across a physical cache flush",
+    )
+    parser.add_argument(
         "--check-weight-update",
         action="store_true",
         help="OPT fixture: mutate attention LayerNorm biases and verify a cold new namespace",
     )
     parser.add_argument("--output-dir")
     args = parser.parse_args()
+    if args.storage:
+        args.hicache = True
     root = Path(__file__).resolve().parents[3]
     output = Path(args.output_dir or tempfile.mkdtemp(prefix="sglang-kv-server-smoke-"))
     output.mkdir(parents=True, exist_ok=True)
@@ -92,6 +99,13 @@ def main():
             "layer_first",
             "--hicache-io-backend",
             "direct",
+        ]
+    if args.storage:
+        command += [
+            "--hicache-storage-backend",
+            "file",
+            "--hicache-storage-backend-extra-config",
+            json.dumps({"file_storage_path": str(output / "cold")}),
         ]
     environment = dict(
         os.environ,
@@ -242,7 +256,18 @@ def main():
                         )
                     raise TimeoutError("Control operation did not retire")
 
-                movements.append(movement("move_to", "gpu", "host", "save"))
+                movements.append(
+                    movement(
+                        "move_to", "gpu", "storage" if args.storage else "host", "save"
+                    )
+                )
+                if args.storage:
+                    flushed = requests.post(base + "/flush_cache", timeout=15)
+                    flushed.raise_for_status()
+                    before_epoch = owner["engine_epoch"]
+                    owner = get_capabilities()
+                    assert owner["engine_epoch"] != before_epoch
+                    router = dict(router, engine_epoch=owner["engine_epoch"])
                 absent = control(
                     {"kind": "residency", "context": router, "target": target}
                 )
@@ -255,8 +280,18 @@ def main():
                         "location": {"tier": "host"},
                     }
                 )
-                assert host["items"] and not host["missing"], host
-                movements.append(movement("copy_to", "host", "gpu", "restore"))
+                if args.storage:
+                    assert not host["items"] and host["missing"], host
+                else:
+                    assert host["items"] and not host["missing"], host
+                movements.append(
+                    movement(
+                        "copy_to",
+                        "storage" if args.storage else "host",
+                        "gpu",
+                        "restore",
+                    )
+                )
                 loaded = control(
                     {"kind": "residency", "context": router, "target": target}
                 )
@@ -363,6 +398,7 @@ def main():
                 "model_path": args.model_path,
                 "load_format": args.load_format,
                 "hicache": args.hicache,
+                "storage": args.storage,
                 "capabilities": owner,
                 "generated": generated,
                 "attached_result": results[0],

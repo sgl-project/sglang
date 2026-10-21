@@ -96,6 +96,7 @@ class UnifiedCacheExecutor:
         self.cache_available = None
         self.transfers = None
         self.storage = None
+        self.storage_reads = None
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
             from sglang.srt.mem_cache.unified_cache.control_transfers import (
                 HostCacheTransfers,
@@ -116,12 +117,23 @@ class UnifiedCacheExecutor:
             )
 
             self.storage = StorageCacheTransfers(self)
+            from sglang.srt.mem_cache.unified_cache.control_storage_reads import (
+                StorageCacheReads,
+            )
+
+            self.storage_reads = StorageCacheReads(self)
         elif not enabled and self.storage is not None:
-            if self.storage.jobs or self.storage.interests:
+            if (
+                self.storage.jobs
+                or self.storage.interests
+                or self.storage_reads.jobs
+                or self.storage_reads.interests
+            ):
                 raise ControlError(
                     "busy", "Storage control must drain before detaching"
                 )
             self.storage = None
+            self.storage_reads = None
 
     def _transfer_unsupported_reason(self):
         if self.core.component_types != (ComponentType.FULL,):
@@ -189,7 +201,12 @@ class UnifiedCacheExecutor:
                 {
                     "copy_to": (("gpu", "host"), ("host", "gpu"))
                     + (
-                        (("gpu", "storage"), ("host", "storage"))
+                        (
+                            ("gpu", "storage"),
+                            ("host", "storage"),
+                            ("storage", "host"),
+                            ("storage", "gpu"),
+                        )
                         if self.storage is not None
                         else ()
                     ),
@@ -653,6 +670,11 @@ class UnifiedCacheExecutor:
             if not isinstance(work.payload, SetPriority) and self.transfers is not None:
                 if work.payload.dst.tier == "storage" and self.storage is not None:
                     return self.storage.start(work)
+                if (
+                    work.payload.src.tier == "storage"
+                    and self.storage_reads is not None
+                ):
+                    return self.storage_reads.start(work)
                 return self.transfers.start(work)
             if not isinstance(work.payload, SetPriority):
                 raise ControlError(
@@ -737,6 +759,11 @@ class UnifiedCacheExecutor:
             )
 
     def poll(self, ref):
+        if (
+            self.storage_reads is not None
+            and ref.operation_id in self.storage_reads.interests
+        ):
+            return self.storage_reads.poll(ref)
         if self.storage is not None and ref.operation_id in self.storage.interests:
             return self.storage.poll(ref)
         return self.transfers.poll(ref) if self.transfers is not None else None
@@ -746,8 +773,15 @@ class UnifiedCacheExecutor:
             self.transfers.begin_poll(limit=limit)
         if self.storage is not None:
             self.storage.begin_poll(limit=limit)
+        if self.storage_reads is not None:
+            self.storage_reads.begin_poll(limit=limit)
 
     def cancel(self, ref):
+        if (
+            self.storage_reads is not None
+            and ref.operation_id in self.storage_reads.interests
+        ):
+            return self.storage_reads.cancel(ref)
         if self.storage is not None and ref.operation_id in self.storage.interests:
             return self.storage.cancel(ref)
         return (

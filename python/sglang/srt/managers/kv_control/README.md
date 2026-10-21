@@ -213,8 +213,8 @@ Cancelling a logical interest never authorizes freeing a buffer still accessed
 by a worker or another waiter. Serving integration must continue progress until
 those obligations end, even after a task's finish action completes.
 
-Multi-rank publication, storage reads/linker transfers, policies and event feeds
-remain pending. File-backed storage writes are described below. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
+Multi-rank publication, linker transfers, policies and event feeds remain
+pending. File-backed storage transfers are described below. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
 tests cover the explicitly described one-owner FULL profile. No serving
 performance or model-quality claim follows from these smoke tests.
 
@@ -232,7 +232,7 @@ built-in unified cache and ordinary text generation. Speculative decoding, PD
 disaggregation and alternate caches are rejected at startup. Persistent-host
 HiCache requires FULL-only state and `--disable-overlap-schedule`; buffer-only
 and direct-linker control paths remain unsupported. File-backed native storage
-writes are available for one complete token prefix. Python backend
+transfers are available for one complete token prefix. Python backend
 fallback is deliberate.
 LoRA, multimodal and StreamingSession primitive execution returns unsupported;
 ordinary inference and opaque action consumers retain their existing behavior.
@@ -487,8 +487,7 @@ Discovery lists these directions only when the actual cache/controller supports
 them. Transfers address whole page-aligned prefixes at existing radix boundaries
 using tokens, token-backed session snapshots or `request_cached`. Other ranges,
 descriptor-only transfers, hybrid state, buffer/draft/sidecar paths, host→GPU
-MOVE and direct-linker publication are unsupported in this stage. Storage reads
-are not exposed by this adapter yet.
+MOVE and direct-linker publication are unsupported in this stage. Storage transfers support a single complete token prefix.
 
 Approval counts each selected physical fragment once, including shared branch
 prefixes. It protects already-resident members and checks the complete reusable
@@ -593,15 +592,15 @@ attempt still fails before cache initialization at the existing DualGemm
 the validation record. Neither fixture establishes model quality or throughput.
 
 
-## File storage writes
+## File storage transfers
 
 With persistent FULL HiCache and the actual `file` storage backend, discovery
 adds COPY GPU→storage, COPY host→storage and MOVE GPU→storage. The optional
 `dst.backend` must be `file` or omitted. A storage write requires one complete
 page-aligned token prefix at an existing radix boundary, with at least two
-result slots for a possible short write. Multi-branch cold writes, other
-storage backends and storage reads return unsupported. Ordinary storage
-prefetch and backups retain their existing behavior.
+result slots for a possible short write. Multi-branch cold transfers and other
+storage backends return unsupported. Ordinary storage prefetch and backups
+retain their existing behavior.
 
 GPU-source writes first use the existing host copy path with whole-scope
 capacity approval. Explicit GPU→host COPY does not enqueue an additional cold
@@ -638,6 +637,51 @@ PYTHONPATH=python CUDA_VISIBLE_DEVICES=1 python \
 ```
 
 The A100 FP16 direct-I/O fixture verifies nonzero file bytes, waits for storage
-completion before source reclaim, poisons free GPU rows and restores them from
-host, then checks locks/jobs/allocator balance. It does not measure serving
-throughput or model quality.
+completion before source reclaim, evicts both local tiers, poisons free GPU
+rows and restores from the file backend, then checks locks/jobs/allocator
+balance. It does not measure serving throughput or model quality.
+
+
+### Exact restoration from file storage
+
+COPY storage→host and storage→GPU use real asynchronous HiCache lookup,
+hit-sized host allocation, file reads and host insertion. A token target may
+have no remaining physical radix nodes. Existing resident endpoints still need
+to be radix boundaries; general ranges and multi-branch cold restoration are
+unsupported. A destination already published for the complete scope satisfies
+COPY without another cold read. Missing tails are queried under the actual
+namespace and layout hash chain; a generation change cannot load old pages.
+
+Native reads override the ordinary prefetch size threshold for their own
+operation only. They do not use ordinary best-effort/timeout termination. An
+entire missing host scope must fit before lookup, and GPU destinations also
+need the owner's current copy budget. Capacity waits retain no buffers or
+correctness references. Different cold scopes serialize and re-evaluate existing
+host matches to avoid charging shared prefixes twice. Identical destination
+loads coalesce with independent interests. Actual hit allocation refuses a
+partial capacity allocation if headroom changed while the lookup was pending.
+
+Storage lookup completion, partial progress, cancellation flags and installed
+GPU indices do not certify final readiness. Query-only rejection/miss retires
+when the query result is consumed. Submitted reads wait for completed_req ACK,
+which follows all worker access. The existing cache insertion publishes actual
+completed coverage. A native callback holds it before ordinary admissions can
+evict it; GPU restoration then uses the existing host transfer path and prefill
+barrier until its real fence. These internal holds end at operation completion;
+COPY alone does not hold a prefix until a future request is admitted.
+
+Cancellation of the last reader drains disk/DMA access and unused scratch-page
+releases. Failed ACK causes survive late cancellation and acknowledgement.
+Partial file reads report actual published destination coverage and do not
+start a GPU load for an incomplete host scope. Native accounting/retry entries
+are removed when the job retires.
+
+
+The server smoke probe accepts `--storage` (implies `--hicache`) with the same
+Linux/CUDA, one-GPU topology and model-path/load-format arguments described
+above. It stores an actual generated prefix in files, flushes physical GPU/host
+state without clearing storage, discovers the new epoch, restores independently
+through `/v1/kv/control`, then verifies subsequent generation reuses that KV.
+The OPT-125m dummy-weight probe reports three cached input tokens and identical
+output IDs. Real nonzero low-level KV byte checks complement that serving
+interface proof.

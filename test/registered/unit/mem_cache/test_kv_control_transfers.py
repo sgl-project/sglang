@@ -89,7 +89,8 @@ def owner(request):
     assert torch.cuda.device_count() == 0
     case = fixtures.TestKVControlCache()
     case.setUp()
-    storage = getattr(request, "param", None) == "file"
+    fixture_kind = getattr(request, "param", None)
+    storage = fixture_kind in ("file", "file_namespaced")
     storage_args = {}
     if storage:
         storage_args = dict(
@@ -128,10 +129,20 @@ def owner(request):
         )
         with patch.object(host_memory, "_cuda_host_register"):
             cache.init_hicache(get_server_args(), params)
+        if storage:
+            # This fixture has ordinary CPU tensors and no CUDA allocator.
+            # File-read scratch pages must use the same unpinned CPU allocation.
+            cache.host_pool_group.anchor_entry.host_pool.pin_memory = False
         atexit.unregister(cache.shutdown)
         dma = ControlledDMA()
         cache.cache_controller.l2_transfer_engine = dma
-        service = KVControlService(cache, config, clock=case.clock)
+        service = KVControlService(
+            cache,
+            config,
+            clock=case.clock,
+            namespace_keys=fixture_kind == "file_namespaced",
+            idle_check=(lambda: True) if fixture_kind == "file_namespaced" else None,
+        )
         try:
             yield case, cache, service, dma
             assert not service.has_pending, "Test must retire every operation"
@@ -218,7 +229,9 @@ def seed(cache, tokens=(1, 2, 3, 4), value=7):
             pool.v_buffer[0][slots[start:matched]] = source.v_buffer[0][old[:length]]
     result = cache.insert(
         fixtures.InsertParams(
-            key=fixtures.RadixKey(fixtures.array("q", tokens)),
+            key=fixtures.RadixKey(
+                fixtures.array("q", tokens), cache_salt=compatibility.cache_salt
+            ),
             value=slots.to(torch.int64),
         )
     )

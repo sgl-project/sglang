@@ -453,3 +453,61 @@ Parent read the complete implementation and diff. New strict Ruff checks and
 existing-file finding deltas, isort, formatting and whitespace checks pass.
 Storage reads, multi-branch cold jobs, other backends/linkers and policy/admission
 work remain separate implementation units; discovery does not claim them.
+
+## Unit 6b — Exact native restoration from file storage
+
+Implemented COPY file-storage→host/GPU for one complete token-backed prefix,
+including absent physical radix nodes. Native operations reuse real async hit
+queries, hit-sized host allocations, file reads and host insertion, with a
+per-operation minimum size; normal prefetch thresholds and stop policies remain
+unchanged. Complete missing host scope and scheduler GPU copy headroom pass
+before lookup; queued capacity waits retain no holds. Distinct cold scopes
+serialize and re-evaluate shared host prefixes, while identical destinations
+coalesce with independent interests. Actual hit allocation requires a full fit.
+
+Owner cache publication acquires native prefix holds before ordinary admission
+can evict the inserted rows. Host publication waits for completed_req ACK after
+all worker access; H2D then uses actual HiCache fences and the existing native
+prefill barrier. Query-only misses/revocations have a separate query-consumed
+quiescence boundary. Last cancellation drains workers/DMA and scratch releases;
+partial reads never start an incomplete GPU restore. Native per-request metrics,
+loaded-token and retry state retire with the job. COPY holds end on completion,
+so future admission preparation remains a policy responsibility.
+
+Review found two integration mistakes during the first probes: CPU scratch
+allocation inherited pin_memory=True without a CUDA allocator; the controlled
+CPU fixture now explicitly uses unpinned scratch pages. Native prefetch also
+passed list keys into a radix tree using array('q'); it now uses that canonical
+representation. Initial GPU timeout is retained at
+/tmp/sglang-kv-gpu-file-roundtrip-key-type-failed.log, not counted as passing.
+Real low-level GPU 1 roundtrip then passed at
+/tmp/sglang-kv-gpu-file-roundtrip-smoke.log: both GPU and host copies evicted,
+nonzero files restored into poisoned GPU rows, all actual bytes/refs verified.
+
+Audit also found that cancellation could hide a composite child staging failure.
+Write/read adapters now propagate failed child results and already-observed
+short-read ACK causes through late cancellation. Dedicated tests exercise both.
+
+New read CPU suite: 11 passed, all with actual namespace-encoded file keys.
+Existing-host suffix read has only two free host rows for two missing rows,
+which proves the existing two-row prefix isn't charged twice. Namespace change
+cannot read old-generation files. Disk and GPU cancellation, capacity no-I/O,
+miss/short reads and failed-ACK cancellation are covered. Write suite now has
+11 passing cases including the composite-failure regression. Final 22-case
+proof: /tmp/sglang-kv-storage-read-final-cpu-proof.log. Earlier combined read/
+write/host/service proof: 46 passed; HiCache lifecycle/namespace/weight regressions:
+43 passed (/tmp/sglang-kv-storage-read-regressions.log). Two existing real GPU
+FULL_ps4 L3 write/prefetch tests passed unchanged in
+/tmp/sglang-kv-storage-read-existing-gpu-proof.log.
+
+Actual model-serving proof passed on GPU 1 with OPT-125m configuration and dummy
+weights: /tmp/sglang-kv-opt-file-storage-roundtrip-smoke/{server.log,result.json}.
+It generates/sets priority, independently MOVEs to file storage, flushes physical
+cache (new control epoch), proves both GPU/host absent, independently COPYs
+storage→GPU, checks fresh priority, and repeats generation with 3 cached input
+tokens and equal output IDs. Final flush rejects stale refs. Low-level nonzero
+byte evidence complements the dummy-weight interface check; no quality claim.
+Only the owned server process group was terminated. Parent reviewed all changes;
+strict new-file Ruff, no added old-file findings, isort/format/whitespace pass.
+Verdict: approve local exact file-restoration feature. Linker/multi-branch cold
+work and composable policies with actual admission cooperation remain pending.

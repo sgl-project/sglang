@@ -261,7 +261,7 @@ def test_write_geometry_survives_ordinary_radix_split(owner):
 def test_invalid_and_excessive_scopes_refuse_before_io(owner):
     _, cache, service, dma = owner
     seed(cache)
-    result = transfer(service, src="storage", dst="gpu")
+    result = transfer(service, kind="move_to", src="storage", dst="gpu")
     assert result.status == Status.UNSUPPORTED
     result = transfer(
         service, kind="move_to", src="host", dst="storage", message="host-move"
@@ -292,3 +292,21 @@ def test_receipts_do_not_certify_a_prefix_evicted_during_write(owner):
     assert done.update.code == "incomplete_storage_write"
     assert not done.update.completed_steps
     assert node.component_data[FULL].value is not None
+
+
+def test_cancel_preserves_failed_host_staging_cause(owner):
+    _, cache, service, dma = owner
+    node = seed(cache)
+    with patch.object(
+        cache.cache_controller,
+        "write",
+        side_effect=RuntimeError("staging backend failed"),
+    ):
+        result = transfer(service, dst="storage")
+    service.control.cancel(result.ref)
+    done = wait(service, result)
+    assert done.status == Status.FAILED, done
+    assert "staging backend failed" in done.update.reason
+    assert node.component_data[FULL].value is not None
+    assert node.component_data[FULL].lock_ref == 0
+    assert not dma.pending

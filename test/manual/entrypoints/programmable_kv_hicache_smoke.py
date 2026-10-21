@@ -32,7 +32,7 @@ def main():
     parser.add_argument(
         "--storage",
         action="store_true",
-        help="Verify a real file-backed cold write before the host restore",
+        help="Verify a real file-backed write and restore after evicting both local tiers",
     )
     args = parser.parse_args()
     assert torch.cuda.device_count() == 1, "Select exactly one GPU"
@@ -122,10 +122,13 @@ def main():
                 )
                 return result.results[0]
 
+            observed_barriers = []
+
             def wait(result):
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     service.progress()
+                    observed_barriers.append(service.blocks_prefill)
                     current = service.control.registry.get(result.ref)
                     if current.status.terminal:
                         assert current.status == Status.COMPLETED, current
@@ -166,9 +169,22 @@ def main():
             # merely by reusing slots that still contain their old values.
             pool.k_buffer[0].fill_(-17)
             pool.v_buffer[0].fill_(-18)
-            restore = submit("copy_to", "host", "gpu", "restore")
-            assert service.blocks_prefill
+            if args.storage:
+                assert cache.evict_host(4) == 4
+            restore = submit(
+                "copy_to", "storage" if args.storage else "host", "gpu", "restore"
+            )
+            if not args.storage:
+                assert service.blocks_prefill
             loaded = wait(restore)
+            if args.storage:
+                target = TokensTarget(
+                    namespace=config.namespace, token_ids=tuple(tokens)
+                )
+                node = service.control.executor._walk(
+                    tuple(tokens), service.control.executor._compatibility(target)
+                )[-1][0]
+            assert any(observed_barriers)
             assert not service.blocks_prefill
             restored = node.component_data[ComponentType.FULL].value
             assert torch.all(pool.k_buffer[0][restored] == 17).item()

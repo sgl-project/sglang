@@ -208,6 +208,12 @@ class StorageCacheTransfers:
                 ):
                     update = self.host.cancel(job.staging.ref)
                     if update.quiescent:
+                        if update.status not in (Status.COMPLETED, Status.CANCELLED):
+                            job.failure = (
+                                update.code or "staging_failed",
+                                update.reason,
+                            )
+                            job.failure_status = update.status
                         self._retire(job)
                 else:
                     self._stage(job)
@@ -382,5 +388,8 @@ class StorageCacheTransfers:
         if job.operation_id is None:
             update = self.host.cancel(job.staging.ref)
             if update.quiescent:
+                if update.status not in (Status.COMPLETED, Status.CANCELLED):
+                    job.failure = (update.code or "staging_failed", update.reason)
+                    job.failure_status = update.status
                 self._retire(job)
         return self._take(interest)

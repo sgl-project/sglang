@@ -99,3 +99,28 @@ I/O。可选 JIT 对该 fixture 的 16 字节行给出不支持提示，未据�
 
 Storage 读取、跨分支冷存储操作、其他后端与策略/调度协作尚待实现，能力发现接口
 保留对应限制。
+
+## 文件读取与服务往返
+
+实现 COPY Storage→Host/GPU，可在 GPU、Host 和对应 radix 节点都已淘汰后，根据
+实际命名空间和完整 hash 链恢复。显式读取使用独立的最小长度，普通 prefetch 阈值
+及提前结束策略保持原有行为。完整 Host 缺失范围与 GPU 预算须在发起查询前通过，
+容量等待不持有引用。Host 发布时取得内部引用，GPU 阶段等待真实 H2D fence。
+
+新增读取 CPU 测试 11 项通过，全部使用编码后的实际命名空间文件键。覆盖只为
+缺失后缀计费、GPU 预算不足时无 I/O、部分读取、查询取消、磁盘/DMA 取消、共享
+读取与参数命名空间隔离。写入测试补了组合操作失败后取消的场景，共 11 项通过。
+两组最终共 22 项通过，日志为 `/tmp/sglang-kv-storage-read-final-cpu-proof.log`。
+既有生命周期、命名空间和参数更新回归 43 项通过；既有 FULL_ps4 的真实 GPU L3
+写入/读取测试 2 项通过。
+
+1 号卡非零 KV 往返验证通过：淘汰 GPU 和 Host 数据后，污染空闲 GPU 行，再从文件
+恢复并检查字节、引用及 allocator。早期探针发现 list 与 array 类型不一致，修正后
+通过；失败日志仍保存在 `/tmp/sglang-kv-gpu-file-roundtrip-key-type-failed.log`。
+
+1 号卡 OPT-125m dummy-weight 服务验证通过：生成前缀、独立 MOVE 到文件、清空物理
+缓存并取得新 epoch、确认两级本地副本缺失、独立 COPY 回 GPU、再次生成命中
+3 个输入 token 且输出 token 一致。日志与结果保存在
+`/tmp/sglang-kv-opt-file-storage-roundtrip-smoke/`。该结果用于验证接口与缓存行为，
+不代表模型质量或服务吞吐表现。内部 COPY 引用在操作完成后释放，等待未来请求
+admission 的保留行为仍需策略层实现。
