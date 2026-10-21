@@ -456,7 +456,7 @@ async def _download_capped_to_temp_file(response: httpx.Response) -> str:
                 total += len(chunk)
                 if total > _MAX_IMAGE_DOWNLOAD_BYTES:
                     raise ValueError(too_large)
-                f.write(chunk)
+                await asyncio.to_thread(f.write, chunk)
     except BaseException:
         os.remove(part_path)
         raise
@@ -537,7 +537,7 @@ async def _save_url_image_to_path(
 
                     if uploads_root is not None:
                         target_path = ensure_path_within_root(target_path, uploads_root)
-                    shutil.move(part_path, target_path)
+                    await asyncio.to_thread(shutil.move, part_path, target_path)
 
                     return target_path
                 except Exception as e:

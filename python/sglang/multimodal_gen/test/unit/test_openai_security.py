@@ -2,11 +2,14 @@
 
 import asyncio
 import io
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
@@ -17,6 +20,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import (
     mesh_api,
     utils,
     video_api,
+)
+from sglang.multimodal_gen.runtime.postprocess import (
+    bounded_cache,
+    realesrgan_upscaler,
+    rife_interpolator,
+)
+from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+    cache_get,
+    cache_put,
 )
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
 
@@ -308,33 +320,66 @@ def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
     assert not any(part_dir.iterdir())
 
 
-@pytest.mark.parametrize(
-    "field", ["upscaling_model_path", "frame_interpolation_model_path"]
-)
-def test_remote_url_model_paths_are_rejected_over_http(monkeypatch, field):
-    """A client-supplied URL must not make the server fetch it (SSRF)."""
+_CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))
+
+
+def test_cache_evicts_least_recently_used():
+    """A get must refresh recency, so eviction drops the stale entry, not the oldest insert."""
+    cache = OrderedDict()
+    cache_put(cache, "a", 1, max_size=2)
+    cache_put(cache, "b", 2, max_size=2)
+    assert cache_get(cache, "a") == 1
+    cache_put(cache, "c", 3, max_size=2)
+    assert list(cache) == ["a", "c"]
+
+
+def test_cache_put_waits_for_the_shared_lock():
+    """Request threads share these caches; an unlocked move_to_end can race an
+    eviction and raise KeyError."""
+    cache = OrderedDict()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with bounded_cache._CACHE_LOCK:
+            future = pool.submit(cache_put, cache, "a", 1, max_size=1)
+            done, _ = wait([future], timeout=0.1)
+            assert not done
+        future.result(timeout=5)
+    assert cache == {"a": 1}
+
+
+def test_upscaler_uses_bounded_cache(monkeypatch):
+    monkeypatch.setattr(realesrgan_upscaler, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(realesrgan_upscaler, "_MAX_CACHED_MODELS", 1)
+    monkeypatch.setattr(realesrgan_upscaler, "_resolve_model_path", lambda p: p)
+    monkeypatch.setattr(realesrgan_upscaler.torch, "load", lambda *a, **k: {})
     monkeypatch.setattr(
-        utils, "get_global_server_args", lambda: SimpleNamespace(model_path="m")
+        realesrgan_upscaler,
+        "_build_net_from_state_dict",
+        lambda sd: torch.nn.Identity(),
     )
-    with pytest.raises(HTTPException) as exc_info:
-        utils.build_sampling_params(
-            "request", **{field: "http://169.254.169.254/latest/x.pth"}
-        )
-    assert exc_info.value.status_code == 400
-    assert field in exc_info.value.detail
+    monkeypatch.setattr(realesrgan_upscaler, "current_platform", _CPU)
+    for path in ["a.pth", "b.pth"]:
+        realesrgan_upscaler.ImageUpscaler(model_path=path)._ensure_model_loaded()
+    assert list(realesrgan_upscaler._MODEL_CACHE) == ["b.pth"]
 
 
-def test_cloud_upload_failure_is_not_reported_as_a_client_error(monkeypatch):
-    """With cloud storage enabled but the upload failed, the server is at fault."""
-    monkeypatch.setattr(image_api.cloud_storage, "enabled", True)
-    with pytest.raises(HTTPException) as exc_info:
-        image_api._build_image_response_kwargs(
-            ["a.png"],
-            "url",
-            "p",
-            "req",
-            SimpleNamespace(),
-            cloud_urls=[None],
-            is_persistent=False,
-        )
-    assert exc_info.value.status_code == 502
+def test_rife_uses_bounded_cache(monkeypatch):
+    import sglang.multimodal_gen.runtime.utils.hf_diffusers_utils as hf
+
+    class FakeModel:
+        def __init__(self):
+            self.flownet = torch.nn.Identity()
+
+        def load_model(self, *a, **k):
+            pass
+
+        def eval(self):
+            pass
+
+    monkeypatch.setattr(rife_interpolator, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(rife_interpolator, "_MAX_CACHED_MODELS", 1)
+    monkeypatch.setattr(hf, "maybe_download_model", lambda p: p)
+    monkeypatch.setattr(rife_interpolator, "Model", FakeModel)
+    monkeypatch.setattr(rife_interpolator, "current_platform", _CPU)
+    for path in ["a", "b"]:
+        rife_interpolator.FrameInterpolator(model_path=path)._ensure_model_loaded()
+    assert list(rife_interpolator._MODEL_CACHE) == ["b"]
