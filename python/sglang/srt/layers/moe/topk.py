@@ -643,70 +643,6 @@ def _can_bypass_trtllm_routing(config: TopKConfig) -> bool:
     return False
 
 
-def _simulated_routing() -> Tuple[bool, bool]:
-    """(overridden, uniform) from the SGLANG_SIMULATE_*_EXPERTS benchmark switches."""
-    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
-    if simulate_uniform_experts and simulate_round_robin_experts:
-        raise ValueError(
-            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
-            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
-        )
-    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
-    return routing_overridden, simulate_uniform_experts
-
-
-def _override_routing(
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    *,
-    num_experts: int,
-    top_k: int,
-    num_routed_topk: int,
-    layer_id: Optional[int],
-    uniform: bool,
-) -> None:
-    # Benchmark-only: override gating with a balanced expert assignment (so
-    # dummy/random benchmark tokens don't skew MoE load) via a single fused
-    # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
-    # replaces, to minimize timing perturbation. Do NOT use in production.
-    parallel = get_parallel()
-    if is_moe_input_scattered_across_dp_ranks():
-        token_shard_rank = parallel.attn_dp_rank
-        num_token_shards = parallel.attn_dp_size
-        forward = get_forward()
-        if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
-            # This forward routes attention-TP-local rows (sequence-sharded
-            # attention TP, or the layer-boundary attention input scatter):
-            # each attention-TP rank holds its own slice of the DP shard, so
-            # it is a shard of its own rather than a replica of its peers.
-            token_shard_rank = (
-                token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
-            )
-            num_token_shards *= parallel.attn_tp_size
-    else:
-        # Gathered MoE presents one global token buffer to every rank, so
-        # its routing must remain identical across those replicas.
-        token_shard_rank, num_token_shards = 0, 1
-
-    override_topk_ids, override_topk_weights = topk_ids, topk_weights
-    if num_routed_topk < top_k:
-        # Only the routed columns are simulated; a fused shared-expert
-        # column keeps the id and weight the router gave it.
-        override_topk_ids = topk_ids[:, :num_routed_topk]
-        override_topk_weights = topk_weights[:, :num_routed_topk]
-    _simulate_balanced_routing(
-        override_topk_ids,
-        override_topk_weights,
-        num_experts,
-        random=uniform,
-        num_ranks=parallel.moe_ep_size,
-        layer_id=layer_id,
-        token_shard_rank=token_shard_rank,
-        num_token_shards=num_token_shards,
-    )
-
-
 # -------------------------------- TopK ---------------------------------------
 
 
@@ -2450,6 +2386,64 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
+def routing_simulation_enabled() -> bool:
+    return (
+        envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
+
+
+def apply_routing_simulation(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    *,
+    num_routed_topk: int,
+    top_k: int,
+    layer_id: Optional[int],
+) -> None:
+    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+    # Benchmark-only: override gating with a balanced expert assignment (so
+    # dummy/random benchmark tokens don't skew MoE load) via a single fused
+    # Triton kernel — one launch instead of the ~5-7 small elementwise ops it
+    # replaces, to minimize timing perturbation. Do NOT use in production.
+    parallel = get_parallel()
+    if is_moe_input_scattered_across_dp_ranks():
+        token_shard_rank = parallel.attn_dp_rank
+        num_token_shards = parallel.attn_dp_size
+        forward = get_forward()
+        if forward.attn_tp_sequence_sharded or forward.attn_input_scattered:
+            # This forward routes attention-TP-local rows (sequence-sharded
+            # attention TP, or the layer-boundary attention input scatter):
+            # each attention-TP rank holds its own slice of the DP shard, so
+            # it is a shard of its own rather than a replica of its peers.
+            token_shard_rank = (
+                token_shard_rank * parallel.attn_tp_size + parallel.attn_tp_rank
+            )
+            num_token_shards *= parallel.attn_tp_size
+    else:
+        # Gathered MoE presents one global token buffer to every rank, so
+        # its routing must remain identical across those replicas.
+        token_shard_rank, num_token_shards = 0, 1
+
+    override_topk_ids, override_topk_weights = topk_ids, topk_weights
+    if num_routed_topk < top_k:
+        # Only the routed columns are simulated; a fused shared-expert
+        # column keeps the id and weight the router gave it.
+        override_topk_ids = topk_ids[:, :num_routed_topk]
+        override_topk_weights = topk_weights[:, :num_routed_topk]
+    _simulate_balanced_routing(
+        override_topk_ids,
+        override_topk_weights,
+        num_experts,
+        random=simulate_uniform_experts,
+        num_ranks=parallel.moe_ep_size,
+        layer_id=layer_id,
+        token_shard_rank=token_shard_rank,
+        num_token_shards=num_token_shards,
+    )
+
+
 def is_routed_scaling_factor_fused_in_topk(topk_config: TopKConfig) -> bool:
     """Whether routing already applied the scale that the MoE epilogue must skip."""
     if topk_config.apply_routed_scaling_factor_on_output:
@@ -2849,7 +2843,14 @@ def select_experts(
     # True when the router itself masked rows >= num_token_non_padded.
     padded_rows_masked = False
 
-    routing_overridden, simulate_uniform_experts = _simulated_routing()
+    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    if simulate_uniform_experts and simulate_round_robin_experts:
+        raise ValueError(
+            "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
+            "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS are mutually exclusive"
+        )
+    routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
 
     if router_logits_partials is not None and not (
         _use_aiter
@@ -3100,14 +3101,13 @@ def select_experts(
         topk_weights[:, :num_routed_for_gate] *= routed_scaling_factor
 
     if routing_overridden:
-        _override_routing(
+        apply_routing_simulation(
             topk_ids,
             topk_weights,
-            num_experts=router_logits.shape[1],
-            top_k=top_k,
+            router_logits.shape[1],
             num_routed_topk=num_routed_topk,
+            top_k=top_k,
             layer_id=layer_id,
-            uniform=simulate_uniform_experts,
         )
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False

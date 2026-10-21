@@ -4578,8 +4578,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             if backend is None or not backend.is_flashinfer_cutedsl():
                 continue
             if method.block_fp8_as_mxfp8:
-                # Small shapes and deterministic execution keep their pinned tactic.
-                method.mxfp8_prefill_autotune_min_tokens = 4096
+                # Deterministic execution keeps its pinned tactic.
+                method.mxfp8_prefill_autotune_min_tokens = 1
             weight = layer.weight
             scale = layer.weight_scale_inv_swizzled
             key = (

@@ -8,10 +8,10 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     StandardTopKOutputPacked,
     _mask_topk_ids_padded_region,
-    _override_routing,
     _post_process_topk_ids,
-    _simulated_routing,
     _zero_topk_weights_padded_region,
+    apply_routing_simulation,
+    routing_simulation_enabled,
 )
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -53,7 +53,7 @@ def vision_topk(
             num_shared_topk_slots == 0
             and expert_location_dispatch_info is None
             and not use_mega_moe
-            and not _simulated_routing()[0]
+            and not routing_simulation_enabled()
             and config.runner_backend is not None
             and config.runner_backend.is_flashinfer_mxfp4()
         ):
@@ -141,18 +141,15 @@ def _finish_vision_topk(
 ):
     config = moe.topk.topk_config
     use_mega_moe = get_moe_a2a_backend().is_megamoe()
-    routing_overridden, uniform = _simulated_routing()
-    if routing_overridden:
-        _override_routing(
+    if routing_simulation_enabled():
+        apply_routing_simulation(
             indices,
             weights,
-            num_experts=logits.shape[1],
-            top_k=config.top_k,
+            logits.shape[1],
             num_routed_topk=config.top_k - config.num_shared_topk_slots,
+            top_k=config.top_k,
             layer_id=moe.layer_id,
-            uniform=uniform,
         )
-        # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
     indices, weights, recorder_ids = _post_process_topk_ids(
         indices,
