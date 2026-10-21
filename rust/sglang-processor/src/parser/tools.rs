@@ -115,6 +115,10 @@ pub fn tool_constraint(
         return Ok(None);
     };
     let parser = dynamo_tool_parser_name(parser);
+    if parser == "deepseekv41" {
+        let tag = deepseek_v41_tag(tool_choice, tools, parallel_tool_calls);
+        return Ok(tag.map(ToolConstraint::StructuralTag));
+    }
     let config = get_tool_parser_map()
         .get(parser)
         .ok_or_else(|| format!("tool-call parser `{parser}` is not supported by Dynamo"))?;
@@ -298,6 +302,48 @@ pub async fn parse_tool_calls(
     Ok((calls.collect(), Some(normal)))
 }
 
+/// xgrammar's `deepseek_v4_1` tag for `required` and named choices, as SGLang
+/// builds it under a reasoning parser; `auto` stays unconstrained.
+fn deepseek_v41_tag(
+    tool_choice: &ToolChoice,
+    tools: &[ToolDefinition],
+    parallel_tool_calls: Option<bool>,
+) -> Option<String> {
+    let invoke = |tool: &ToolDefinition| {
+        let schema = tool.parameters.clone();
+        serde_json::json!({
+            "type": "tag",
+            "begin": format!("<｜DSML｜ invoke name=\"{}\">\n", tool.name),
+            "content": {
+                "type": "json_schema",
+                "json_schema": schema.unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+                "style": "deepseek_v4_1_xml",
+                "any_order": false,
+                "max_whitespace_cnt": null
+            },
+            "end": "</｜DSML｜ invoke>\n"
+        })
+    };
+    let calls = match tool_choice {
+        ToolChoice::Required => serde_json::json!({
+            "type": "tags_with_separator",
+            "tags": tools.iter().map(invoke).collect::<Vec<_>>(),
+            "separator": "",
+            "at_least_one": true,
+            "stop_after_first": parallel_tool_calls == Some(false)
+        }),
+        ToolChoice::Named(name) => invoke(tools.iter().find(|tool| &tool.name == name)?),
+        _ => return None,
+    };
+    let elements = [
+        serde_json::json!({"type": "const_string", "value": "\n\n<｜DSML｜ calls>\n"}),
+        calls,
+        serde_json::json!({"type": "const_string", "value": "</｜DSML｜ calls>"}),
+    ];
+    let format = serde_json::json!({"type": "sequence", "elements": elements});
+    Some(serde_json::json!({"type": "structural_tag", "format": format}).to_string())
+}
+
 pub(super) fn tool_call_delta(call: ChatCompletionMessageToolCallChunk) -> ChatToolCallDelta {
     ChatToolCallDelta {
         index: call.index,
@@ -324,6 +370,29 @@ mod tests {
             })),
             strict: Some(strict),
         }
+    }
+
+    /// `required` is xgrammar's `deepseek_v4_1` tag; `auto` adds no constraint.
+    #[test]
+    fn deepseek_v41_constraint_matches_xgrammar() {
+        let tools = [tool("get_weather", false)];
+        let auto = tool_constraint(Some("deepseekv41"), &ToolChoice::Auto, &tools, None);
+        assert_eq!(auto.unwrap(), None);
+        let required = tool_constraint(
+            Some("deepseekv41"),
+            &ToolChoice::Required,
+            &tools,
+            Some(false),
+        );
+        let Some(ToolConstraint::StructuralTag(tag)) = required.unwrap() else {
+            panic!("expected a structural tag");
+        };
+        // xgrammar.get_model_structural_tag("deepseek_v4_1", ..., reasoning=False).
+        let xgrammar = r#"{"type": "structural_tag", "format": {"type": "sequence", "elements": [{"type": "const_string", "value": "\n\n<｜DSML｜ calls>\n"}, {"type": "tags_with_separator", "tags": [{"type": "tag", "begin": "<｜DSML｜ invoke name=\"get_weather\">\n", "content": {"type": "json_schema", "json_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}, "style": "deepseek_v4_1_xml", "any_order": false, "max_whitespace_cnt": null}, "end": "</｜DSML｜ invoke>\n"}], "separator": "", "at_least_one": true, "stop_after_first": true}, {"type": "const_string", "value": "</｜DSML｜ calls>"}]}}"#;
+        assert_eq!(
+            serde_json::from_str::<Value>(&tag).unwrap(),
+            serde_json::from_str::<Value>(xgrammar).unwrap()
+        );
     }
 
     fn json_schema(constraint: Option<ToolConstraint>) -> serde_json::Value {

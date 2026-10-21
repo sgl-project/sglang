@@ -131,13 +131,10 @@ pub fn select_chat_formatter(
             );
             (Some(formatter), None)
         }
-        Err(error) => {
-            tracing::warn!(%error, "OpenAI chat completions disabled");
-            (
-                None,
-                Some(format!("this model has no usable chat template: {error}")),
-            )
-        }
+        Err(error) => (
+            None,
+            Some(format!("this model has no usable chat template: {error}")),
+        ),
     }
 }
 
