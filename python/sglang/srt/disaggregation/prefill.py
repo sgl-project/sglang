@@ -1703,10 +1703,8 @@ class SchedulerDisaggregationPrefillMixin:
                 sender.kv_mgr.enable_all_cp_ranks_for_transfer
                 and not get_parallel().enable_dsa_cache_layer_split
             ):
-                # No host sync on the scheduler thread: the schedule stream is
-                # fenced behind the in-flight forward, so a .cpu() here would
-                # wait for that forward. Copy asynchronously into pinned memory
-                # and let the transfer worker wait on the event instead.
+                # The schedule stream waits on the in-flight forward; move the
+                # D2H wait to the transfer worker so scheduling can continue.
                 page_indices_dev = kv_indices[::page_size] // page_size
                 page_indices = torch.empty(
                     page_indices_dev.shape,

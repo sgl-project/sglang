@@ -11,8 +11,8 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
-import torch
 import numpy.typing as npt
+import torch
 import zmq
 from prometheus_client import Counter
 
@@ -2474,8 +2474,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ):
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
-                # Page indices copied to pinned host memory without blocking the
-                # scheduler: wait for the copy here, then hand NumPy to the transfer.
                 if kv_chunk.indices_event is not None:
                     kv_chunk.indices_event.synchronize()
                     kv_chunk.indices_event = None
@@ -3173,8 +3171,6 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         self.init_time = time.time()
         self._init_trace_ctx()
 
-    # The scheduler may pass kv_indices as a pinned host tensor still being filled
-    # by a non-blocking copy, with indices_event recorded after the copy.
     supports_host_tensor_indices = True
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
