@@ -928,7 +928,13 @@ class GenerateReqInput:
         elif not isinstance(self.bootstrap_room, list):
             self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
         elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            if len(self.bootstrap_room) == self.batch_size:
+                self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
+            elif len(self.bootstrap_room) != num:
+                raise ValueError(
+                    "bootstrap_room must have one entry per prompt or per "
+                    "expanded parallel sample"
+                )
 
         # Normalize bootstrap_pair_key
         if self.bootstrap_pair_key is None:
