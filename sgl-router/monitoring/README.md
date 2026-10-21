@@ -3,16 +3,16 @@ SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# sgl-router (experimental) monitoring
+# sgl-router monitoring
 
-Grafana dashboard for the experimental router's Prometheus metrics, exposed
+Grafana dashboard for sgl-router's Prometheus metrics, exposed
 on `/metrics` (text/plain, version 0.0.4) on the router's serving port
 (default `30000`).
 
 ## Files
 
-- `grafana-dashboard.json` — importable Grafana dashboard, **SGLang Router
-  (experimental)** (uid `sgl-router-experimental`).
+- `grafana-dashboard.json` — importable Grafana dashboard, **SGLang Router**
+  (uid `sgl-router-experimental`, kept so existing imports update in place).
 
 ## Metrics covered
 
