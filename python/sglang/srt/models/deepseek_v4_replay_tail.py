@@ -28,7 +28,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_attn_backend,
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
@@ -163,6 +168,15 @@ class DecoderReplayTail:
             max_rows=max_rows,
         )
 
+    @staticmethod
+    def _can_capture_moe_bound(forward_batch: ForwardBatch) -> bool:
+        # The row runner replaces only the local count with a graph-owned buffer.
+        bound = forward_batch.moe_num_token_non_padded()
+        return bound is None or (
+            bound is forward_batch.num_token_non_padded
+            and bound is not forward_batch.global_num_token_non_padded
+        )
+
     def plan(
         self,
         tail: Optional[LateLayerTail],
@@ -199,6 +213,7 @@ class DecoderReplayTail:
             or get_global_expert_distribution_recorder().recording
             or not self.runner.warm
             or (tail is not None and tail.cp_metadata is not None)
+            or not self._can_capture_moe_bound(forward_batch)
         ):
             return False, None
         if not dp:
@@ -414,7 +429,14 @@ class DecoderReplayTail:
                 gathered = input_ids.new_empty((sum(dp_rows), 1))
                 dp_gather_replicate(gathered, input_ids[:, None].clone(), tail_batch)
                 input_ids_global = gathered.squeeze(-1)
-            with self._break_context(tail_batch):
+            with (
+                (
+                    forward_context(get_forward_context(), forward_batch=tail_batch)
+                    if has_forward_context()
+                    else nullcontext()
+                ),
+                self._break_context(tail_batch),
+            ):
                 return self._layer_stack(
                     state,
                     positions=positions,
@@ -681,6 +703,7 @@ def _tail_layers_in_prefill_graph(
         if (
             not get_flags().dp.capturing_prefill_graph
             and runner.warm
+            and tail_layers._can_capture_moe_bound(forward_batch)
             and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
         ):
             residual, pre, aux = tail_layers.run(**kwargs)

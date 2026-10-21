@@ -471,6 +471,10 @@ pub struct AffinityArgs {
     #[arg(long)]
     pub disable_pressure_guard: bool,
 
+    /// Match prefill buckets on uncached tokens (--policy cache_aware with --bucket-config).
+    #[arg(long)]
+    pub route_by_uncached_tokens: bool,
+
     /// Pressure-guard token gap (session_aware or cache_aware). Defaults to 1024.
     #[arg(long)]
     pub pressure_abs_threshold_tokens: Option<u64>,
@@ -963,7 +967,8 @@ impl AffinityArgs {
             || cache.cache_switch_margin_tokens.is_some()
             || cache.worker_queue_limit.is_some()
             || cache.saturation_queue_floor.is_some()
-            || cache.min_load_choices.is_some();
+            || cache.min_load_choices.is_some()
+            || self.route_by_uncached_tokens;
         // Value checks before the policy check: a value that is wrong under
         // every policy should say so, rather than pointing at --policy.
         ensure!(
@@ -1102,6 +1107,7 @@ impl AffinityArgs {
                 .saturation_queue_floor
                 .or(defaults.saturation_queue_floor),
             min_load_choices: cache.min_load_choices.unwrap_or(defaults.min_load_choices),
+            route_by_uncached_tokens: self.route_by_uncached_tokens,
         }))
     }
 
@@ -2859,6 +2865,13 @@ mod tests {
 
         let err = cfg_of("--policy power_of_two --worker-queue-limit 4")
             .expect_err("the gate only governs cache-affinity selection")
+            .to_string();
+        assert!(
+            err.contains("cache candidate tuning flags require --policy cache_aware"),
+            "got: {err}"
+        );
+        let err = cfg_of("--policy session_aware --route-by-uncached-tokens")
+            .expect_err("bucket matching on E only runs under cache_aware")
             .to_string();
         assert!(
             err.contains("cache candidate tuning flags require --policy cache_aware"),
