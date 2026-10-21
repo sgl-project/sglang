@@ -1,7 +1,10 @@
 export const config = {
   modelName: "GLM-5.3-Flash",
 
-  supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x"],
+  supportedHardware: ["b300", "gb300", "h100", "h200", "b200", "gb200", "mi355x", "tpu7x"],
+
+  // One TPU7x (Ironwood) host: 4 chips, 8 TensorCores, served by sglang-torchtpu.
+  hardware: [{ id: "tpu7x", label: "TPU7x", vram: "192GB", vendor: "tpu" }],
 
   matchDims: [
     {
@@ -9,7 +12,13 @@ export const config = {
       title: "Strategy",
       options: [
         { id: "low-latency", label: "Low Latency", subtitle: "MTP 5/1/6" },
-        { id: "high-throughput", label: "High Throughput", subtitle: "Spec decode off" },
+        {
+          id: "high-throughput",
+          label: "High Throughput",
+          subtitle: "Spec decode off",
+          disabled: (s) => s.hw === "tpu7x",
+          disableReason: "The TPU7x recipe is qualified for Low Latency only.",
+        },
       ],
     },
     {
@@ -41,6 +50,7 @@ export const config = {
 
   isRecommendedSelection(s) {
     const pairing = s.hw === "mi355x" ? "fp8-tilelang"
+      : s.hw === "tpu7x" ? "fp8-pallas"
       : ["h100", "h200"].includes(s.hw) ? "bf16-tilelang" : "fp8-trtllm";
     return (
       s.kvDsaPair === pairing &&
@@ -59,8 +69,8 @@ export const config = {
         {
           id: "fp8-trtllm",
           label: "FP8 + TRT-LLM",
-          disabled: (s) => ["h100", "h200", "mi355x"].includes(s.hw),
-          disableReason: "FP8 KV cache with TRT-LLM DSA is not supported on Hopper or MI355X.",
+          disabled: (s) => ["h100", "h200", "mi355x", "tpu7x"].includes(s.hw),
+          disableReason: "FP8 KV cache with TRT-LLM DSA is not supported on Hopper, MI355X or TPU7x.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype fp8_e4m3",
@@ -84,6 +94,8 @@ export const config = {
         {
           id: "bf16-tilelang",
           label: "BF16 + TileLang",
+          disabled: (s) => s.hw === "tpu7x",
+          disableReason: "TileLang is not available on TPU; TPU7x uses the Pallas sparse MLA kernels.",
           stripPrefixes: ["--kv-cache-dtype", "--dsa-prefill-backend", "--dsa-decode-backend"],
           flags: [
             "--kv-cache-dtype bfloat16",
@@ -107,6 +119,17 @@ export const config = {
           ],
           hints: ["Measured on H200: higher prefill throughput than BF16 + TileLang; requires a build with PR #41790."],
         },
+        {
+          id: "fp8-pallas",
+          label: "FP8 + Pallas (TPU)",
+          disabled: (s) => s.hw !== "tpu7x",
+          disableReason: "The Pallas sparse MLA kernels are TPU-only.",
+          stripPrefixes: ["--kv-cache-dtype", "--attention-backend"],
+          flags: [
+            "--kv-cache-dtype fp8_e4m3",
+            "--attention-backend pallas_tpu_mla_sparse",
+          ],
+        },
       ],
     },
     {
@@ -118,8 +141,8 @@ export const config = {
         {
           id: "on",
           label: "On",
-          disabled: (s) => s.hw === "mi355x",
-          disableReason: "The breakable prefill CUDA graph path is not qualified on ROCm.",
+          disabled: (s) => ["mi355x", "tpu7x"].includes(s.hw),
+          disableReason: "The breakable prefill CUDA graph path is not qualified on ROCm or TPU.",
           flags: ["--cuda-graph-backend-prefill breakable"],
           hints: ["Enables breakable prefill CUDA graphs; requires a build with PR #38522."],
         },
@@ -136,6 +159,8 @@ export const config = {
           id: "cpu",
           label: "CPU",
           subtitle: "Save GPU memory",
+          disabled: (s) => s.hw === "tpu7x",
+          disableReason: "The TPU7x recipe serves the language model only (--language-model-only).",
           stripPrefixes: ["--mm-feature-transport"],
           flags: ["--mm-feature-transport cpu"],
         },
@@ -151,6 +176,8 @@ export const config = {
           id: "l2",
           label: "L1 + L2",
           subtitle: "Host memory",
+          disabled: (s) => s.hw === "tpu7x",
+          disableReason: "HiCache is not qualified for GLM-5.3-Flash on TPU7x.",
           flags: (s) => s.hw === "mi355x"
             ? ["--enable-hierarchical-cache", "--hicache-size 180",
               "--hicache-write-policy write_through"]
@@ -163,6 +190,8 @@ export const config = {
           id: "l3",
           label: "+ L3",
           subtitle: "Mooncake",
+          disabled: (s) => s.hw === "tpu7x",
+          disableReason: "HiCache is not qualified for GLM-5.3-Flash on TPU7x.",
           flags: ["--enable-hierarchical-cache", "--hicache-size 32", "--hicache-storage-backend mooncake"],
           env: ["SGLANG_HICACHE_MOONCAKE_CONFIG_PATH={{MOONCAKE_CONFIG}}"],
           hints: ["Start Mooncake and place the configuration file on every serving node."],
@@ -204,8 +233,9 @@ export const config = {
     "nvfp4-nvda": "nvidia/GLM-5.3-Flash-NVFP4",
   },
 
-  // MI355X uses a ROCm environment; the Docker images below are NVIDIA-only.
-  runModes: (s) => s.hw === "mi355x" ? ["python"] : ["python", "docker"],
+  // MI355X uses a ROCm environment and TPU7x an sglang-torchtpu install; the
+  // Docker images below are NVIDIA-only.
+  runModes: (s) => ["mi355x", "tpu7x"].includes(s.hw) ? ["python"] : ["python", "docker"],
 
   placeholders: {
     HOST_IP: { target: "command", label: "Bind host", default: "0.0.0.0" },
@@ -290,7 +320,7 @@ sgl-eval run gsm8k \\
           id: "cp", label: "CP",
           values: [null, 1, 2, 4, {
             value: 8,
-            disable: { hw: ["gb300", "gb200", "h100", "h200", "mi355x"] },
+            disable: { hw: ["gb300", "gb200", "h100", "h200", "mi355x", "tpu7x"] },
             disableReason: "CP=8 is available on the eight-GPU B200 and B300 recipes. Set TP=8 first.",
           }],
           disable: { pdMode: ["prefill", "decode"] },
@@ -331,20 +361,23 @@ sgl-eval run gsm8k \\
             id: "flashinfer_trtllm",
             label: "flashinfer_trtllm",
             flags: ["--moe-runner-backend flashinfer_trtllm"],
-            disable: { hw: ["h100", "h200", "mi355x"] },
-            disableReason: "Use flashinfer_trtllm on B200, B300, GB200 or GB300; Hopper uses DeepGemm and MI355X uses AITER.",
+            disable: { hw: ["h100", "h200", "mi355x", "tpu7x"] },
+            disableReason: "Use flashinfer_trtllm on B200, B300, GB200 or GB300; Hopper uses DeepGemm, MI355X uses AITER and TPU7x its own Pallas MoE kernel.",
           },
           {
             id: "deep_gemm",
             label: "DeepGemm",
             flags: ["--moe-runner-backend deep_gemm"],
-            disable: [{ when: { hw: ["mi355x"] }, reason: "DeepGemm is a CUDA backend; MI355X uses AITER." }],
+            disable: [
+              { when: { hw: ["mi355x"] }, reason: "DeepGemm is a CUDA backend; MI355X uses AITER." },
+              { when: { hw: ["tpu7x"] }, reason: "DeepGemm is a CUDA backend; TPU7x uses its own Pallas MoE kernel." },
+            ],
           },
           {
             id: "aiter",
             label: "AITER (ROCm)",
             flags: ["--moe-runner-backend aiter"],
-            disable: [{ when: { hw: ["gb300", "h100", "h200", "b200", "b300", "gb200"] }, reason: "AITER is a ROCm backend." }],
+            disable: [{ when: { hw: ["gb300", "h100", "h200", "b200", "b300", "gb200", "tpu7x"] }, reason: "AITER is a ROCm backend." }],
           },
         ],
       },
@@ -371,7 +404,9 @@ sgl-eval run gsm8k \\
           stripFlags: ["--attn-cp-size", "--enable-prefill-cp", "--cp-strategy"] },
       ],
       transferBackends: [{ id: "mooncake", label: "Mooncake" }],
-      notes: [{ mode: ["prefill", "decode"], when: { pdMode: ["prefill", "decode"] },
+      notes: [{ mode: ["prefill", "decode"], when: { hw: ["tpu7x"] },
+        text: "PD disaggregation is not qualified for GLM-5.3-Flash on TPU7x." },
+        { mode: ["prefill", "decode"], when: { pdMode: ["prefill", "decode"] },
         text: "PD serving is a preview. Prefill CP is disabled: CP/TP group sharing cannot currently transfer the KDA state between PD workers." }],
     },
 
@@ -409,6 +444,10 @@ sgl-eval run gsm8k \\
               when: { dpAttnOn: [true] },
               reason: "MTP speculative decoding with DP-Attention is not validated on this model. Turn DP-Attention off in the Attention card above.",
             },
+            {
+              when: { hw: ["tpu7x"] },
+              reason: "TPU7x runs MTP through the NEXTN flags its Low Latency recipe already carries.",
+            },
           ],
         },
         {
@@ -425,7 +464,7 @@ sgl-eval run gsm8k \\
           ],
           note: "⚠️ The draft checkpoint incoai/GLM-5.3-Flash-DFlash2 is access-gated: request access on its Hugging Face page, then download it alongside the target before serving.",
           disable: [
-            { when: { hw: ["mi355x"] }, reason: "The FA4 draft-attention path is CUDA-only." },
+            { when: { hw: ["mi355x", "tpu7x"] }, reason: "The FA4 draft-attention path is CUDA-only." },
             {
               when: { dpAttnOn: [true] },
               reason: "DFLASH speculative decoding does not support DP-Attention — the server rejects the combination at startup. Turn DP-Attention off in the Attention card above.",
@@ -1153,6 +1192,70 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // One TPU7x host (4 chips, 8 TensorCores), sglang-torchtpu main: DSA through the
+    // Pallas sparse MLA kernels, MTP 3/1/4 on the chain spec worker. Sized for
+    // 8k-in / 1k-out at concurrency 1.
+    {
+      match: { hw: "tpu7x", strategy: "low-latency", quant: "fp8" },
+      nnodes: 1,
+      verified: true,
+      verificationStatus: (s) =>
+        s.kvDsaPair === "fp8-pallas" && s.parsers === "auto" ? "verified" : "unverified",
+      env: [
+        "SGLANG_PLATFORM=tpu",
+        'LIBTPU_INIT_ARGS="--xla_tpu_enable_async_collective_fusion=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_latency_hiding_scheduler=true --xla_latency_hiding_scheduler_rerun=10 --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false --xla_tpu_offload_gather_to_sparsecore=false --xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false"',
+        "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false",
+        "SGLANG_MAMBA_SSM_DTYPE=float32",
+        "SGLANG_OPT_USE_TILELANG_MHC_PRE=0",
+        "SGLANG_OPT_USE_TILELANG_MHC_POST=0",
+        "SGLANG_OPT_FUSE_MHC_POST_PRE=0",
+        "SGLANG_TPU_ENABLE_GLM5_NEXT_FUSED_MHC=1",
+        "SGLANG_TPU_ENABLE_STREAMING_MOE_KERNEL=1",
+        "SGLANG_TPU_ENABLE_FP8_LINEAR_SMALL_M_KERNEL=1",
+        "SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL=1",
+        "SGLANG_TPU_FP8_MOE_FP32_SCALES=1",
+        "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=512",
+        "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1",
+        "SGLANG_TPU_ENABLE_NN_MODULE_GUARD_FILTER=1",
+        "SGLANG_SPEC_TP_SYNC=rng",
+        "SGLANG_SET_CPU_AFFINITY=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device tpu",
+        "--tp-size 8",
+        "--ep-size 1",
+        "--language-model-only",
+        "--quantization fp8",
+        "--kv-cache-dtype fp8_e4m3",
+        "--attention-backend pallas_tpu_mla_sparse",
+        "--page-size 128",
+        "--context-length 10240",
+        "--chunked-prefill-size 8192",
+        "--max-prefill-tokens 8192",
+        "--max-running-requests 1",
+        "--max-total-tokens 20480",
+        "--max-mamba-cache-size 1",
+        "--mem-fraction-static 0.9",
+        "--disable-radix-cache",
+        "--disable-shared-experts-fusion",
+        "--enable-attn-tp-input-scattered",
+        "--enable-torch-compile",
+        "--torch-compile-max-bs 1",
+        "--tpu-compile-bs 1",
+        "--tpu-compile-tokens 1024 2048 4096 8192",
+        "--grammar-backend none",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        `--json-model-override-args '{"index_share_for_mtp_iteration": false, "text_config": {"index_share_for_mtp_iteration": false}}'`,
+        "--gc-threshold 50000 100 100",
+        "--watchdog-timeout 1800",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],

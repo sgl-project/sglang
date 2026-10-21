@@ -2,10 +2,11 @@
 //! and `/server_info` on every transport.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::{DisaggregationMode, PreferredSamplingParams};
+use super::config::{DeploymentInfo, DisaggregationMode, PreferredSamplingParams};
 
 /// Static model metadata shared by every public transport.
 #[derive(Clone, Debug, Serialize)]
@@ -25,6 +26,10 @@ pub(crate) struct ModelInfo {
 /// Public server metadata plus scheduler-owned runtime metrics.
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct ServerInfo {
+    /// Python's launch-time `/server_info` fields, which the HTTP response
+    /// carries beneath the fields below.
+    #[serde(skip)]
+    pub(crate) launch_fields: Arc<serde_json::Map<String, serde_json::Value>>,
     pub(crate) model_path: String,
     pub(crate) served_model_name: String,
     pub(crate) tokenizer_path: String,
@@ -32,7 +37,28 @@ pub(crate) struct ServerInfo {
     pub(crate) max_total_num_tokens: u64,
     pub(crate) version: String,
     pub(crate) frontend: &'static str,
+    /// The server's startup phase durations in seconds, Python's
+    /// `TokenizerManager.startup_time` shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) startup_time: Option<serde_json::Value>,
     pub(crate) internal_states: Vec<InternalState>,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) incremental_streaming_output: bool,
+    pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) deployment_info: DeploymentInfo,
+}
+
+impl ServerInfo {
+    /// The HTTP body: the launch-time fields, with every field of this struct
+    /// over them.
+    pub(crate) fn to_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut body = (*self.launch_fields).clone();
+        if let serde_json::Value::Object(fields) = serde_json::to_value(self)? {
+            body.extend(fields);
+        }
+        Ok(serde_json::Value::Object(body))
+    }
 }
 
 /// Scheduler-owned runtime metrics used by the public server-info operation.
@@ -55,6 +81,10 @@ pub(crate) struct InternalState {
     pub(crate) step_time_dict: Option<BTreeMap<u64, Vec<f64>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rust_mm_transport: Option<BTreeMap<String, u64>>,
+    /// The embedded server's own startup timings, which `/server_info`
+    /// reports at the top level as `startup_time`.
+    #[serde(skip_serializing)]
+    pub(crate) rust_server_startup_time: Option<serde_json::Value>,
 }
 
 /// Public subset of scheduler memory metrics.
