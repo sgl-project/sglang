@@ -13,7 +13,6 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 )
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparse_kv_budget,
     get_sparse_kv_indexer_impl,
@@ -263,9 +262,7 @@ class SparseKVCacheManager:
                 LIMDecodeAdapter,
             )
 
-            self.lim_adapter = LIMDecodeAdapter(
-                self, library=envs.SGLANG_NPU_LIM_LIBRARY.get()
-            )
+            self.lim_adapter = LIMDecodeAdapter(self)
 
         self._install_req_alloc_hook(req_to_token_pool)
 

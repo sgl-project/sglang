@@ -1064,7 +1064,6 @@ class Envs:
     # the same page-aligned prefix + visible tail attention policy.
     SGLANG_NPU_SPARSE_KV_INDEXER = EnvStr("legacy")
     # Optional operator-enabled library; loaded once before graph capture.
-    SGLANG_NPU_LIM_LIBRARY = EnvStr(None)
     # Use FIAS V2 for DSpark MLA target verify and MHA draft paths. Graph
     # replay requires torch_npu's V2 handler to update actual_seq_kvlen.
     SGLANG_NPU_USE_FIAS_V2_BSND = EnvBool(False)
@@ -2103,6 +2102,9 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead.
 _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_NPU_LIM_LIBRARY": _DeprecatedEnv(
+        note="LIM is loaded from sgl-kernel-npu; external library paths are ignored."
+    ),
     "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION": _DeprecatedEnv(
         note=(
             "Pass --flashinfer-allreduce-fusion-backend cutedsl instead. "

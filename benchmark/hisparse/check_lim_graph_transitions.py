@@ -7,6 +7,7 @@ The newly visible page has high index scores, forcing real new-prefix misses.
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,16 +18,25 @@ from bench_lim_framework import FrameworkCase, inputs
 
 def run(args):
     torch.npu.set_device(0)
-    sys.path.insert(0, str(args.registered_host_helper))
-    from hisparse_registered_host_view import allocate_registered_host, make_npu_view
-
+    allocator = nullcontext()
     owners = []
+    if args.registered_host_helper:
+        sys.path.insert(0, str(args.registered_host_helper))
+        from hisparse_registered_host_view import (
+            allocate_registered_host,
+            make_npu_view,
+        )
 
-    def allocate_host(*, shape, dtype, **kwargs):
-        owner = allocate_registered_host(torch.zeros(shape, dtype=dtype))
-        view, host_ptr, _, mapped_ptr = make_npu_view(owner)
-        owners.append((owner, view))
-        return owner, int(host_ptr), int(mapped_ptr)
+        def allocate_host(*, shape, dtype, **kwargs):
+            owner = allocate_registered_host(torch.zeros(shape, dtype=dtype))
+            view, host_ptr, _, mapped_ptr = make_npu_view(owner)
+            owners.append((owner, view))
+            return owner, int(host_ptr), int(mapped_ptr)
+
+        allocator = patch(
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.create_shm_tensor",
+            allocate_host,
+        )
 
     config = SimpleNamespace(
         batch=2,
@@ -61,10 +71,7 @@ def run(args):
         (f.host, torch.randn(3, 128, 1, 576, dtype=torch.bfloat16)), dim=1
     )
     outcomes = {}
-    with patch(
-        "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager.create_shm_tensor",
-        allocate_host,
-    ):
+    with allocator:
         for mode in ("li_reference", "lim"):
             case = FrameworkCase(mode, f, config)
             case.step(0)
@@ -125,6 +132,10 @@ def run(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--registered-host-helper", type=Path, required=True)
+    parser.add_argument(
+        "--registered-host-helper",
+        type=Path,
+        help="Optional legacy test allocator; production host allocation is the default",
+    )
     parser.add_argument("--output", type=Path, required=True)
     run(parser.parse_args())

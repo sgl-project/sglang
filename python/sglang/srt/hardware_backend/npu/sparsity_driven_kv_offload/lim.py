@@ -49,7 +49,7 @@ def prepare_lim_rows(seq_lens, request_slots, last_prefix, capacity, request_row
 
 
 class LIMDecodeAdapter:
-    def __init__(self, manager, *, library=None):
+    def __init__(self, manager):
         self.impl = manager.indexer_impl
         self.is_native = self.impl == "lim"
         self.capacity = manager.device_cache_size
@@ -58,7 +58,7 @@ class LIMDecodeAdapter:
         self.source_capacity = (manager.max_context_len + 127) // 128 * 128
         self.width = self.top_k + 128
         device = manager.device
-        self.operator = load_fused_lim_operator(library) if self.is_native else None
+        self.operator = load_fused_lim_operator() if self.is_native else None
         self.source_ids = torch.empty(
             (self.rows, 1, self.top_k), dtype=torch.int32, device=device
         )

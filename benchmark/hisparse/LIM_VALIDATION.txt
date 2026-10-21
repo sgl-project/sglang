@@ -13,7 +13,6 @@ The default remains legacy. Experimental modes are explicit:
   SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1
   SGLANG_NPU_SPARSE_KV_INDEXER=li_reference|lim
   SGLANG_NPU_SPARSE_KV_CACHE_SIZE=4096
-  SGLANG_NPU_LIM_LIBRARY=/absolute/path/to/native/operator.so
 
 Alternatively set CACHE_SIZE=0 and SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB to derive C.
 This per-rank manager budget covers persistent resident KV, slot maps, policy
@@ -24,11 +23,20 @@ The native dummy key-scale workspace is reserved separately in pool sizing.
 Current adapter limits: BF16 indexer/main KV, Q1, K=2048, page=128, PP=1,
 DCP disabled, speculative decoding disabled; C is a multiple of 128 in
 [2048,32640], and source capacity is at most 2**21. C8 is unsupported here.
-The native operator must already be installed; this change does not build it.
-Native source, a pinned upstream manifest and a standalone CANN/torch build
-entry are now provided in 3rdparty/ascend/lim/. See its README.md for setup
-and the separate validation status of that new build entry. SGLang startup
-does not compile the operator automatically.
+LIM is provided by the sgl-kernel-npu wheel. Build the matching kernel branch
+with its normal `bash build.sh -a kernels Ascend910_9382` flow and install the
+resulting wheel. Source is in the kernel repository's
+csrc/fused_lightning_indexer_manage/, with a direct AscendC launch and normal
+torch.ops.npu registration. No extra LIM vendor package, external .so path,
+vLLM checkout or standalone operator installer is used at build/startup.
+SGLANG_NPU_LIM_LIBRARY is removed and warns if still set; its value is ignored.
+Kernel source branch: McZyWu/sgl-kernel-npu feat/lim-native-kv-offload.
+Kernel source commit: 293a16e0eac94cea110873307aa1d1f4dcbe854e
+
+Migration validation status, 2026-10-21: this direct-launch source port has
+not been compiled/executed on Ascend because 217 SSH was unreachable.
+The measurements below retain their original commits and external-probe
+provenance. They are not new performance or accuracy claims for this port.
 
 Selection semantics and accuracy status
 --------------------------------------
@@ -141,10 +149,10 @@ Dynamic graph check: benchmark/hisparse/check_lim_graph_transitions.py
 151 container runner: benchmark/hisparse/run_lim_151.sh
 151 monitored A/B matrix: benchmark/hisparse/run_lim_benefit_151.py
 
-The 151 runners require staged source, the existing container/native library,
-and the external registered-host helper. Inspect their defaults or override
-TASK_ROOT/CONTAINER/NPU_DEVICE/PROBE_ROOT and --task-root as appropriate. They do
-not install dependencies or replace a production SGLang installation.
+The 151 runners require staged source, an existing container and the matching
+sgl-kernel-npu wheel. Production registered-host allocation is the default;
+the historical host helper is an optional test-only override. Inspect
+TASK_ROOT/CONTAINER/NPU_DEVICE and --task-root before use.
 
 Keep this feature experimental: full-model tests below do not establish
 numerical equivalence or low-latency offload.

@@ -1,9 +1,8 @@
 """Adapter for the optional Ascend FusedLightningIndexerManage native extension.
 
-ABI: vllm-project/vllm-ascend#16640, 19 tensors, in-place output buffers.
-The extension must be installed/loaded before graph capture; importing this
-module neither imports torch_npu nor compiles or loads a native library.
-Native source and the manual build entry are under ``3rdparty/ascend/lim/``.
+The 19-tensor in-place ABI is implemented by sgl-kernel-npu. Its native
+source and direct AscendC launch live in that repository; importing this
+module neither imports torch_npu nor loads/compiles a native library.
 """
 
 from __future__ import annotations
@@ -11,16 +10,21 @@ from __future__ import annotations
 import torch
 
 
-def load_fused_lim_operator(library: str | None = None):
-    if library:
-        torch.ops.load_library(library)
+def load_fused_lim_operator():
+    """Resolve the operator from the installed sgl-kernel-npu wheel."""
     try:
-        return torch.ops._C_ascend.npu_fused_lightning_indexer_manage.default
-    except AttributeError as error:
+        from sgl_kernel_npu.sparsity_driven_kv_offload import (
+            fused_lightning_indexer_manage as operator,
+        )
+
+        # Resolve eagerly before graph capture, including the native registration.
+        torch.ops.npu.fused_lightning_indexer_manage.default
+        return operator
+    except (ImportError, AttributeError) as error:
         raise RuntimeError(
-            "LIM was requested, but _C_ascend::npu_fused_lightning_indexer_manage "
-            "is not registered. Install the operator-enabled native build or set "
-            "SGLANG_NPU_LIM_LIBRARY to its shared library before starting SGLang."
+            "LIM requires an sgl-kernel-npu A2/A3 build containing "
+            "npu::fused_lightning_indexer_manage. Build/install the matching "
+            "kernel wheel; no external LIM library or custom vendor is loaded."
         ) from error
 
 
