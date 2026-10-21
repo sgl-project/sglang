@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
+from collections import deque
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
@@ -87,3 +92,53 @@ def test_without_an_idle_hook_each_request_still_releases(worker):
     assert releases == [clock.now]
     worker.release_cache_if_idle()
     assert releases == [clock.now]
+
+
+def test_idle_scheduler_sleeps_until_the_release_is_due(worker):
+    worker, releases, clock = worker
+    worker.defer_cache_release = True
+    _finish_request(worker)
+    due = clock.now + gpu_worker_module._IDLE_CACHE_RELEASE_S
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(
+        sp_degree=1, tp_size=1, enable_cfg_parallel=False
+    )
+    scheduler.worker = worker
+    scheduler._disagg_role = RoleType.MONOLITHIC
+    scheduler._disagg_metrics = None
+    scheduler.metrics = None
+    scheduler.dp_replica = 0
+    scheduler.receiver = Mock()
+    scheduler.context = Mock()
+    scheduler.waiting_queue = deque()
+    scheduler._async_output_save = False
+    scheduler._inflight_finalizes = deque()
+    scheduler._socket_lock = threading.Lock()
+    scheduler._running = True
+    scheduler._log_batch_metrics_summary = Mock()
+    scheduler._cleanup_disagg = Mock()
+    scheduler.process_received_reqs_with_req_based_warmup = lambda reqs: reqs
+    scheduler.get_next_batch_to_run = lambda: None
+    loops = []
+
+    def recv_reqs():
+        # a spinning loop never advances the clock, so stop it
+        loops.append(None)
+        scheduler._running = len(loops) < 4
+        return []
+
+    timeouts = []
+
+    def poll(timeout):
+        timeouts.append(timeout)
+        if timeout is None:
+            scheduler._running = False
+        else:
+            clock.now += timeout / 1000.0
+
+    scheduler.recv_reqs = recv_reqs
+    scheduler._poller = SimpleNamespace(poll=poll)
+    scheduler.event_loop()
+    assert timeouts == [gpu_worker_module._IDLE_CACHE_RELEASE_S * 1000.0, None]
+    assert releases == [due]
