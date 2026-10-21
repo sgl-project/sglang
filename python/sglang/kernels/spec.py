@@ -46,6 +46,7 @@ class KernelBackend(str, Enum):
     FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
     HELION = "helion"
     KDA = "KDA"  # Kernel Design Agents generated implementation
+    CAKE = "cake"  # Cake-generated implementation, distributed by FlashInfer
     FLASHINFER = "flashinfer"
     DEEPGEMM = "deepgemm"
     AITER = "aiter"  # AMD aiter library (device=HIP)

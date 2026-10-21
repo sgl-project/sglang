@@ -1711,7 +1711,6 @@ class Req(ReqDllmMixin):
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
-            self.determine_dllm_phase()
         else:
             self.refresh_fill_ids()
 
@@ -1761,6 +1760,9 @@ class Req(ReqDllmMixin):
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
+        if self.is_dllm():
+            self.determine_dllm_phase()
+
         if (
             self.is_retracted
             and self.multimodal_inputs is not None
@@ -1786,6 +1788,15 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.is_dllm():
+            # Appended masks and a partial prompt/output block are not reusable
+            # KV: bidirectional attention depends on the rest of that block.
+            # Bound the lookup by real tokens, even if another cached prompt
+            # happens to contain the same token IDs as our synthetic masks.
+            block_size = self.dllm_config.block_size
+            committed_len = len(self.origin_input_ids) + len(self.output_ids)
+            max_prefix_len = min(max_prefix_len, committed_len)
+            max_prefix_len = max_prefix_len // block_size * block_size
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -1887,7 +1898,8 @@ class Req(ReqDllmMixin):
         *,
         stop_str: Optional[str] = None,
         stop_regex: Optional[str] = None,
-    ) -> int:
+        full_window_matched: bool = True,
+    ) -> Optional[int]:
         """Map a matched stop string/regex to output_ids length (stop included)."""
 
         def matched(text: str) -> bool:
@@ -1906,6 +1918,8 @@ class Req(ReqDllmMixin):
             if matched(self.tokenizer.decode(token_window[:token_count])):
                 return start + token_count
 
+        if not full_window_matched:
+            return None
         # The full tail window is already known to match by the caller.
         return len(self.output_ids)
 
@@ -1953,12 +1967,24 @@ class Req(ReqDllmMixin):
                         )
                         break
                     if matched:
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_regex=stop_regex_str
+                        )
+                    elif new_accepted_len > 1:
+                        # An end-anchored pattern can match after a token
+                        # accepted mid-step but not after the last one.
+                        finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len,
+                            stop_regex=stop_regex_str,
+                            full_window_matched=False,
+                        )
+                    else:
+                        finished_len = None
+                    if finished_len is not None:
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
-                        self.finished_len = self._locate_str_stop_finished_len(
-                            new_accepted_len, stop_regex=stop_regex_str
-                        )
+                        self.finished_len = finished_len
                         return True
 
         return False
@@ -2932,6 +2958,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # flag will always True
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
+                if req.is_dllm():
+                    # Denoising revisits the current block while only earlier
+                    # blocks are a reusable prefix. Recomputing that block must
+                    # not subtract its size from cross-request cache hits.
+                    new_cached = max(0, new_cached)
                 req.cached_tokens += new_cached
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)

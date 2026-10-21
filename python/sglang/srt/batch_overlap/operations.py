@@ -125,6 +125,10 @@ class _StageExecutor:
 
         # handling DP attention
         forward_batch: ForwardBatch = inputs["forward_batch"]
+        self._child_ctx = replace(
+            child_ctx if child_ctx is not None else get_forward_context(),
+            moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+        )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len
         self._global_num_tokens = forward_batch.global_num_tokens_cpu

@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
 from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
     CacheRequestHandle,
     InitLoadBackParams,
 )
@@ -223,6 +224,79 @@ def _two_rank_prefetch_deadline(rank, rendezvous):
         assert not cache.storage_prefetch_retries._pending
     finally:
         torch.distributed.destroy_process_group()
+
+
+class TestWaitingStorageSpan(unittest.TestCase):
+    def test_base_cache_has_no_storage_span(self):
+        self.assertIsNone(BasePrefixCache.waiting_storage_span(None, _REQ))
+
+    def test_query_result_waits_for_scheduler_acceptance(self):
+        cache, pipeline, _ = _staged_fixture()
+        pipeline.staged_prefetches.clear()
+        operation = SimpleNamespace(
+            storage_start=2,
+            storage_hit_count=6,
+            host_indices=torch.arange(6),
+        )
+        cache.ongoing_prefetch[_REQ] = _OngoingPrefetch(
+            0, RadixKey(range(6)), None, operation, None, {}
+        )
+
+        self.assertIsNone(cache.waiting_storage_span(_REQ))
+        cache.ongoing_prefetch[_REQ] = cache.ongoing_prefetch[_REQ]._replace(
+            host_indices=operation.host_indices
+        )
+        self.assertEqual(cache.waiting_storage_span(_REQ), (2, 8))
+
+    def test_accepted_span_uses_logical_length_not_worker_progress(self):
+        for host_length in (0, 2, 6):
+            with self.subTest(host_length=host_length):
+                cache, pipeline, _ = _staged_fixture()
+                pipeline.staged_prefetches.clear()
+                operation = SimpleNamespace(
+                    storage_start=2,
+                    storage_hit_count=6,
+                    host_indices=None,
+                    completed_tokens=0,
+                    is_terminated=Mock(return_value=True),
+                )
+                cache.ongoing_prefetch[_REQ] = _OngoingPrefetch(
+                    0,
+                    RadixKey(range(6)),
+                    torch.arange(host_length),
+                    operation,
+                    None,
+                    {},
+                )
+
+                self.assertEqual(cache.waiting_storage_span(_REQ), (2, 8))
+                operation.completed_tokens = 4
+                self.assertEqual(cache.waiting_storage_span(_REQ), (2, 8))
+                operation.is_terminated.assert_not_called()
+                del cache.ongoing_prefetch[_REQ]
+                self.assertIsNone(cache.waiting_storage_span(_REQ))
+
+    def test_staged_span_disappears_when_the_hold_is_released(self):
+        cache, pipeline, _ = _staged_fixture()
+        self.assertEqual(cache.waiting_storage_span(_REQ), (2, 8))
+        self.assertIsNone(cache.waiting_storage_span(CacheRequestHandle("r", 1)))
+
+        pipeline.release_staged_hold(_REQ)
+
+        self.assertIsNone(cache.waiting_storage_span(_REQ))
+
+    def test_resident_mode_keeps_existing_accounting(self):
+        cache, _, _ = _staged_fixture()
+        cache.buffer_pipeline = None
+        self.assertIsNone(cache.waiting_storage_span(_REQ))
+        operation = SimpleNamespace(
+            storage_start=2, storage_hit_count=6, completed_tokens=0
+        )
+        cache.ongoing_prefetch[_REQ] = _OngoingPrefetch(
+            0, RadixKey(range(6)), torch.arange(6), operation, None, {}
+        )
+        # An accepted resident fetch may await admission-time completion handling.
+        self.assertIsNone(cache.waiting_storage_span(_REQ))
 
 
 class TestStoragePrefetchTimeout(unittest.TestCase):
@@ -440,6 +514,9 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     self.assertTrue(operation.assume_stored)
                     operation.hash_value = ["h0", "h1", "h2", "h3"]
                     operation.storage_hit_count = 8
+                    self.assertIsNone(
+                        cache.waiting_storage_span(req.cache_request_handle)
+                    )
                     matched_len, hit_tokens = 2, 8
                     for trim in trims:
                         matched_len += trim
@@ -485,6 +562,11 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     )
                     cache.cache_controller.prefetch_tokens_occupied = hit_tokens
                     cache.storage_existence_cache = Mock()
+                    if hit_tokens:
+                        self.assertEqual(
+                            cache.waiting_storage_span(req.cache_request_handle),
+                            (matched_len, 10),
+                        )
                     pipeline.stage_completed_prefetch(
                         req.cache_request_handle, hit_tokens, operation.hash_value
                     )
@@ -492,6 +574,10 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
                     self.assertEqual(held.key_tokens, tokens)
                     self.assertEqual(held.matched_len, matched_len)
                     self.assertEqual(held.num_tokens, hit_tokens)
+                    self.assertEqual(
+                        cache.waiting_storage_span(req.cache_request_handle),
+                        (matched_len, 10),
+                    )
                     self.assertEqual(
                         len(RadixKey(held.key_tokens, is_bigram=bigram)), 10
                     )

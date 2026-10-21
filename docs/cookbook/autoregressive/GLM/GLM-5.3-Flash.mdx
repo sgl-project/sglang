@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3-Flash
-description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, and MI355X, with MTP and multimodal serving."
+description: "Deploy GLM-5.3-Flash with SGLang using recipes for H100, H200, B200, B300, GB200, GB300, MI355X, and TPU7x, with MTP and multimodal serving."
 tag: NEW
 ---
 
@@ -20,6 +20,16 @@ For the listed NVIDIA hardware, the deployment panel can render a complete `dock
 
 For MI355X, follow the [AMD GPU installation guide](/docs/hardware-platforms/amd_gpu) and run the generated **Python** command on four GPUs. Select FP8 or [MXFP4](https://huggingface.co/OneNexus/GLM-5.3-Flash-MXFP4); SGLang downloads the model and tokenizer automatically.
 
+For TPU7x, install [sglang-torchtpu](https://github.com/sgl-project/sglang-torchtpu) from source (its `main` branch; the `v0.1.0-tpu` image predates the GLM-5.3-Flash MTP fixes) and run the generated **Python** command on one TPU7x host with 4 chips:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang-torchtpu.git
+cd sglang-torchtpu
+cp python/pyproject_tpu.toml python/pyproject.toml
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e python/
+pip install --no-deps -e .
+```
+
 </Accordion>
 
 The cookbook opens on **B300**. Choose your hardware, then choose the operating point that matches your workload:
@@ -27,7 +37,7 @@ The cookbook opens on **B300**. Choose your hardware, then choose the operating 
 - **Low Latency** starts with MTP 5/1/6 speculative decoding and tensor parallelism to shorten interactive responses.
 - **High Throughput** starts with speculative decoding off, which avoids draft-and-verify overhead under sustained batches.
 
-Every listed hardware platform exposes both strategies. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
+Every listed GPU platform exposes both strategies; TPU7x has a Low Latency recipe only. A **Verified** badge means that exact hardware and command were tested. **Final Verification In Progress** means the recipe runs and is queued for measurement on the final weights. **Not Verified** means the command is a supported starting point that still needs workload validation. A choice is disabled only when the underlying runtime combination is known to be unsupported.
 
 The recommended selection is only a starting point. The same panel also lets you override the KV/DSA pairing, multimodal feature transport, Breakable Cuda Graph, and HiCache tiers. The MI355X commands are marked **Not Verified** because the selector defaults to HiCache off, whereas the measured AgentX configuration adds the host tier described in [Extend the cache hierarchy](#extend-the-cache-hierarchy). Do not treat the CUDA benchmark rows as MI355X measurements.
 
@@ -109,6 +119,10 @@ The **Speculative** card in the Playground changes the algorithm without leaving
 - **DFlash2** swaps the in-checkpoint MTP head for the trained block-diffusion draft in [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2). The draft proposes a whole block per step and the target verifies it in one forward pass, so output quality stays the target's. Its block size comes from the draft checkpoint, and the draft runs on `fa4` rather than the target's DSA backends. The hidden-state capture it needs ([PR #36708](https://github.com/sgl-project/sglang/pull/36708)) shipped with the GLM-5.3-Flash support in v0.5.20, so the image pinned above is enough. The draft repository is access-gated: request access on its model page, then download it alongside the target before serving. This combination is not yet measured on the cookbook hardware, so treat it as a starting point.
 
 Neither algorithm runs with DP-Attention; the card disables the affected chips and names the reason. DFlash2's FA4 draft path is also disabled on MI355X.
+
+### Serve on TPU7x
+
+The TPU7x recipe serves the language model with DeepSeek Sparse Attention on the Pallas sparse MLA kernels and MTP 3/1/4 on the experimental chain speculative worker (`SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=1`). On TPU7x, 3/1/4 decodes faster than 5/1/6 at the same accept length, because each extra draft row widens the target verify. It is sized for one request with 8K input and 1K output: `--context-length 10240`, `--max-running-requests 1`, and a 20,480-token KV pool. Raise `--context-length`, `--max-total-tokens`, `--max-running-requests` and `--max-mamba-cache-size` together for longer or concurrent requests; those settings are outside the verified command. The first start compiles every decode and prefill shape listed in `--tpu-compile-bs` and `--tpu-compile-tokens`, so it takes longer than later starts that reuse the compilation cache.
 
 ### Size both memory pools
 
