@@ -11,7 +11,6 @@ from sglang.srt.runtime_context import get_parallel
 
 def get_mla_dcp_backend(backend):
     """Find the full-attention backend behind TBO and hybrid dispatchers."""
-    backend = getattr(backend, "primary", backend)
     return getattr(backend, "full_attn_backend", backend)
 
 
