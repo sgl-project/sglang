@@ -170,7 +170,7 @@ class TextEncodingStage(ConditionEncodingStage):
         return (
             self.freeze_for_dedup(batch.prompt),
             self.freeze_for_dedup(batch.negative_prompt),
-            bool(batch.do_classifier_free_guidance),
+            bool(batch.needs_negative_cond),
             self.freeze_for_dedup(batch.prompt_template),
             batch.max_sequence_length,
         )
@@ -369,7 +369,7 @@ class TextEncodingStage(ConditionEncodingStage):
             max_length=max_seq_length,
         )
 
-        if batch.do_classifier_free_guidance:
+        if batch.needs_negative_cond:
             assert isinstance(batch.negative_prompt, str)
             (
                 neg_embeds_list,
@@ -390,8 +390,7 @@ class TextEncodingStage(ConditionEncodingStage):
             prompt_seq_lens_list,
         )
 
-        # Encode negative prompt if CFG is enabled
-        if batch.do_classifier_free_guidance:
+        if batch.needs_negative_cond:
             self._append_negative_text_outputs(
                 batch,
                 prompt_embeds_list,
@@ -411,7 +410,7 @@ class TextEncodingStage(ConditionEncodingStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or isinstance(x, str),
+            lambda x: not batch.needs_negative_cond or isinstance(x, str),
         )
         result.add_check(
             "do_classifier_free_guidance",
@@ -854,8 +853,7 @@ class TextEncodingStage(ConditionEncodingStage):
             "negative_prompt_embeds",
             batch.negative_prompt_embeds,
             lambda x: (
-                not batch.do_classifier_free_guidance
-                or V.list_of_tensors_with_min_dims(x, 2)
+                not batch.needs_negative_cond or V.list_of_tensors_with_min_dims(x, 2)
             ),
         )
         if batch.debug:
