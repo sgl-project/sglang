@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
     _NUM_COMPONENT_TYPES,
@@ -690,6 +690,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                         start,
                         end,
                         None if value is None else len(value),
+                        len(node.children),
                     )
                 )
                 start = end
@@ -1269,7 +1270,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Fire-and-forget actions safe to batch until the next barrier."""
         return isinstance(
             action,
-            (FreeDeviceKV, FreeDeviceKVFullOnly, ReplaceWriteThroughOnNodeSplit),
+            (FreeDeviceKV, FreeDeviceKVFullOnly, UpdatePendingBackupOnNodeSplit),
         )
 
     def _insert_walk_step(self, state: _InsertWalkState) -> None:
@@ -1478,12 +1479,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        # A split of a backuped node tells the cache to fix its publish list.
+        # Buffer-mode dependencies are tracked by the cache, without an ack here.
         action: Optional[CacheAction | ComponentAction] = None
-        if child.write_through_pending_id is not None:
-            ack_id = child.write_through_pending_id
+        ack_id = child.write_through_pending_id
+        if ack_id is not None:
             new_node.write_through_pending_id = ack_id
-            action = ReplaceWriteThroughOnNodeSplit(
+        if ack_id is not None or self.is_host_memory_buffer_only:
+            action = UpdatePendingBackupOnNodeSplit(
                 ack_id=ack_id,
                 old_node_id=child.id,
                 new_node_id=new_node.id,
@@ -1528,7 +1530,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += self.components_by_type[
             BASE_COMPONENT_TYPE
-        ].reclaimable_tokens(new_node)
+        ].reclaimable_value_len(new_node)
         if self.enable_storage or self.enable_external_cache_linker:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
@@ -1549,7 +1551,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[ct]
         assert cd.value is None
         cd.value = fresh_value.clone()
-        n = self.components_by_type[ct].reclaimable_tokens(node)
+        n = self.components_by_type[ct].reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[ct] += n
         else:
@@ -1674,6 +1676,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             or result.mamba_backup_node_id is not None
             or result.swa_backup_node_id is not None
             or bool(result.tracker)
+            or any(result.device_frees.values())
+            or any(result.host_frees.values())
         )
         return result
 
@@ -2886,7 +2890,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.lru_lists[component_type].insert_mru(node)
         # A value materialized under lock is protected; the last release
         # moves it to evictable.
-        ledger = self.components_by_type[component_type].reclaimable_tokens(node)
+        ledger = self.components_by_type[component_type].reclaimable_value_len(node)
         if cd.lock_ref > 0:
             self.component_protected_size_[component_type] += ledger
         else:
@@ -2901,10 +2905,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         cd = node.component_data[component_type]
         if node is self.root_node or cd.value is None:
             return
-        if cd.lock_ref > 0:
-            self.component_protected_size_[component_type] += delta
-        else:
-            self.component_evictable_size_[component_type] += delta
+        sizes = (
+            self.component_protected_size_
+            if cd.lock_ref > 0
+            else self.component_evictable_size_
+        )
+        updated = sizes[component_type] + delta
+        if updated < 0:
+            raise ValueError(f"component size cannot be negative: {updated}")
+        sizes[component_type] = updated
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
@@ -3125,7 +3134,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 cd = n.component_data[ct]
                 if cd.value is not None:
-                    toks = self.components_by_type[ct].reclaimable_tokens(n)
+                    toks = self.components_by_type[ct].reclaimable_value_len(n)
                     if cd.lock_ref > 0:
                         protected += toks
                     else:

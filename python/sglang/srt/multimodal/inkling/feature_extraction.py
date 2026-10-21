@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import math
 from dataclasses import dataclass
@@ -29,6 +30,10 @@ class InklingAudioEncoderParams:
     audio_token_duration_s: float = 0.05
 
 
+# Anything else (EMFILE, ENOSPC, EACCES, ...) is a server-side fault, not a bad path.
+_EXPECTED_PATH_ERRNOS = {errno.ENOENT, errno.ENOTDIR, errno.EISDIR, errno.ENAMETOOLONG}
+
+
 def _load_audio_bytes(audio) -> bytes:
     """Coerce a single audio input into raw file bytes for the encoder.
 
@@ -41,8 +46,19 @@ def _load_audio_bytes(audio) -> bytes:
         return audio.read()
     if isinstance(audio, str):
         path = audio[len("file://") :] if audio.startswith("file://") else audio
-        with open(path, "rb") as f:
-            return f.read()
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError as e:
+            if e.errno not in _EXPECTED_PATH_ERRNOS:
+                raise
+            path_str = path
+            if len(path_str) > 100:
+                path_str = path_str[:100] + "..."
+            # str(e) re-embeds the full, untruncated path; use e.strerror instead.
+            raise ValueError(
+                f"Could not read audio from path {path_str}: {e.strerror}"
+            ) from e
     raise TypeError(
         f"Unsupported audio input type for Inkling audio extractor: {type(audio)}"
     )
@@ -56,9 +72,12 @@ def _to_exact_int(value: float, name: str, tolerance: float = 1e-6) -> int:
 
 
 def _decode_audio(audio_bytes: bytes, sample_rate: int) -> torch.Tensor:
-    samples, src_sample_rate = sf.read(
-        io.BytesIO(audio_bytes), dtype="float32", always_2d=True
-    )
+    try:
+        samples, src_sample_rate = sf.read(
+            io.BytesIO(audio_bytes), dtype="float32", always_2d=True
+        )
+    except sf.LibsndfileError as e:
+        raise ValueError(f"Could not decode audio: {e}") from e
     mono = samples.mean(axis=1)
     if src_sample_rate != sample_rate:
         mono = _resample(mono, src_sample_rate, sample_rate)

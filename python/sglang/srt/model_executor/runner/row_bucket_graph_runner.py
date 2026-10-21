@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Callable, ContextManager, List, Optional
 
 import torch
@@ -19,7 +20,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_attn_backend,
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
@@ -38,6 +44,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 Body = Callable[[List[torch.Tensor], "ForwardBatch"], List[Optional[torch.Tensor]]]
+# Wraps capture and replay with the body's batch and the bucket's static inputs.
+BatchScope = Callable[["ForwardBatch", List[torch.Tensor]], ContextManager]
+
+
+def _no_scope(batch: ForwardBatch, inputs: List[torch.Tensor]) -> ContextManager:
+    return nullcontext()
 
 
 class _Graph:
@@ -90,15 +102,20 @@ class RowBucketGraphRunner:
         forward_batch: ForwardBatch,
         body: Body,
         context: Callable[[ForwardBatch], ContextManager],
+        batch_scope: BatchScope = _no_scope,
+        bucket_from: Optional[int] = None,
+        out_rows: Optional[int] = None,
     ) -> List[Optional[torch.Tensor]]:
         """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
-        it on first use. ``key`` names whatever besides row count and input shapes
-        changes what ``body`` records; ``context`` wraps capture and replay with
-        the batch the eager breaks read. Returns the outputs cut to the live
-        rows, as views of graph buffers valid until the next replay."""
+        it on first use. ``key`` names what besides row count and input shapes
+        changes the recording; ``context`` and ``batch_scope`` wrap capture and
+        replay with the breaks' and the body's batch; ``bucket_from`` picks the
+        bucket from another row count. Returns views valid until the next replay,
+        cut to ``out_rows`` rows."""
         num_rows = live[0].shape[0]
-        rows = self.bucket_rows(num_rows)
-        assert rows is not None, num_rows
+        out_rows = num_rows if out_rows is None else out_rows
+        rows = self.bucket_rows(num_rows if bucket_from is None else bucket_from)
+        assert rows is not None, (num_rows, bucket_from)
         # Inputs of one shape share their static buffers across keys.
         input_key = tuple((t.dtype, t.shape[1:]) for t in live)
         static = self._static_inputs(input_key, live)
@@ -108,7 +125,14 @@ class RowBucketGraphRunner:
         # The eager breaks read the step's real row count off this view.
         step_batch = copy.copy(forward_batch)
         step_batch.global_num_token_non_padded_cpu = num_rows
-        with context(step_batch):
+        with (
+            (
+                forward_context(get_forward_context(), forward_batch=step_batch)
+                if has_forward_context()
+                else nullcontext()
+            ),
+            context(step_batch),
+        ):
             if (rows, graph_key) not in self._graphs:
                 # Largest first, so smaller buckets reuse the pool memory the
                 # larger ones took; a bucket below this step's rows cannot be
@@ -116,14 +140,15 @@ class RowBucketGraphRunner:
                 for r in range(self.max_rows, rows - 1, -self.row_step):
                     if (r, graph_key) not in self._graphs:
                         self._graphs[(r, graph_key)] = self._capture(
-                            r, num_rows, static, forward_batch, body
+                            r, num_rows, static, forward_batch, body, batch_scope
                         )
             graph = self._graphs[(rows, graph_key)]
-            if graph.num_token_non_padded is not None:
-                graph.num_token_non_padded.fill_(num_rows)
-            with graph_pool_replay_scope():
-                graph.graph.replay()
-        return [None if t is None else t[:num_rows] for t in graph.outputs]
+            with batch_scope(step_batch, [buf[:rows] for buf in static]):
+                if graph.num_token_non_padded is not None:
+                    graph.num_token_non_padded.fill_(num_rows)
+                with graph_pool_replay_scope():
+                    graph.graph.replay()
+        return [None if t is None else t[:out_rows] for t in graph.outputs]
 
     def _static_inputs(self, input_key, live) -> List[torch.Tensor]:
         static = self._static.get(input_key)
@@ -140,6 +165,7 @@ class RowBucketGraphRunner:
         static: List[torch.Tensor],
         forward_batch: ForwardBatch,
         body: Body,
+        batch_scope: BatchScope,
     ) -> _Graph:
         start = time.perf_counter()
         free_before = torch.cuda.mem_get_info()[0]
@@ -154,14 +180,25 @@ class RowBucketGraphRunner:
                 forward_batch.num_token_non_padded, num_rows
             )
             capture_batch.num_token_non_padded = num_token_non_padded
-        return self._record(
-            lambda: body(inputs, capture_batch),
-            rows,
-            num_token_non_padded,
-            capture_batch,
-            start,
-            free_before,
-        )
+        with (
+            (
+                forward_context(get_forward_context(), forward_batch=capture_batch)
+                if has_forward_context()
+                else nullcontext()
+            ),
+            batch_scope(capture_batch, inputs),
+        ):
+            graph = self._record(
+                lambda: body(inputs, capture_batch),
+                rows,
+                num_token_non_padded,
+                capture_batch,
+                start,
+                free_before,
+            )
+            # The graph reads device tensors the scope put on the batch.
+            graph.batch += (dict(vars(capture_batch)),)
+        return graph
 
     def _record(
         self,

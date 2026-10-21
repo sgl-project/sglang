@@ -272,6 +272,7 @@ except ImportError:
     _flashinfer_softmax = None
 
 
+# Not sampling.softmax: the FlashInfer and Triton paths are not bitwise torch.softmax(x / t).
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
