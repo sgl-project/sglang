@@ -3353,7 +3353,6 @@ class SchedulerDisaggregationDecodeMixin:
             getattr(self.tree_cache, "linker", None) is not None
             and self.tree_cache.linker.pending_offloads
         ):
-            # Every rank queues the same tree offloads, so the gate is rank-consistent.
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

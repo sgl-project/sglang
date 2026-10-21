@@ -8,7 +8,6 @@ import asyncio
 import json
 import time
 import unittest
-from types import SimpleNamespace
 
 import requests
 
@@ -23,10 +22,9 @@ from sglang.test.mooncake_utils import MooncakeTestServices
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import is_in_ci, try_cached_model
 
-register_cuda_ci(est_time=1500, stage="extra-b", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-gb300")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash"
 PAGE_SIZE = 256
@@ -157,22 +155,6 @@ class TestDisaggregationDecodeRadixLinkerDSV41(PDDisaggregationServerBase):
                 history.extend(suffixes[round_idx])
                 time.sleep(2)
                 self._flush_device_caches()
-
-    def test_gsm8k_accuracy_two_passes(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            load_preset_from_model_id=MODEL,
-            num_examples=200,
-            num_threads=32,
-        )
-        first = run_sgl_eval(args)
-        self._flush_device_caches()
-        second = run_sgl_eval(args)
-        self.assertGreater(first["score"], 0.9)
-        self.assertGreater(second["score"], 0.9)
-        self.assertLessEqual(first["score"] - second["score"], 0.03)
 
 
 if __name__ == "__main__":

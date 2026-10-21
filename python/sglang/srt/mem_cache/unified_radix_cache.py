@@ -633,7 +633,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def _prefill_stored_prefix(self, length: int):
-        # The PD prefill already stored these pages; decode SWA below its window is also unwritten.
+        # PD prefill already stored these pages, so decode must not write them.
         if self.linker is None or get_disagg().disaggregation_mode != "decode":
             return nullcontext()
         return self.linker.prefill_stored_prefix(length)
@@ -1254,19 +1254,18 @@ class UnifiedRadixCache(BasePrefixCache):
             and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
             and 0 < len(prompt_key) < len(radix_key)
         ):
-            with self._prefill_stored_prefix(len(prefill_key)):
-                self.insert(
-                    replace(
-                        insert_params,
-                        key=prompt_key,
-                        value=values[: len(prompt_key)],
-                        prev_prefix_len=len(prompt_key),
-                        inserted_len=len(prompt_key),
-                        priority=min(
-                            insert_params.priority + 1, torch.iinfo(torch.int64).max
-                        ),
-                    )
+            self.insert(
+                replace(
+                    insert_params,
+                    key=prompt_key,
+                    value=values[: len(prompt_key)],
+                    prev_prefix_len=len(prompt_key),
+                    inserted_len=len(prompt_key),
+                    priority=min(
+                        insert_params.priority + 1, torch.iinfo(torch.int64).max
+                    ),
                 )
+            )
 
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.

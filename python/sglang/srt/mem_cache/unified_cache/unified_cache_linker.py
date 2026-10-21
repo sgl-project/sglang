@@ -247,7 +247,7 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
-        # Path prefix (key units) the PD prefill already stored for the insert in progress.
+        # Path prefix the PD prefill already stored, set during a decode insert.
         self.stored_prefix_len = 0
 
         cache.tree_core.enable_external_cache_linker = True
@@ -500,7 +500,6 @@ class UnifiedCacheLinkerWrapper:
         page = self.cache.page_size
         kept = []
         for transfer in transfers:
-            # Every transfer covers the trailing pages of the node.
             first = info.path_end - len(transfer.keys) * page
             drop = min(
                 len(transfer.keys), max(0, (self.stored_prefix_len - first) // page)
