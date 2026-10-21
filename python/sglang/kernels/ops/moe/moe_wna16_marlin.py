@@ -67,10 +67,14 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    expert_ids_are_sorted: bool = False,
 ) -> torch.Tensor:
     """Project routes, preserving inactive rows in a caller-provided output.
 
     Inactive rows are zero when this function allocates the output.
+    ``expert_ids_are_sorted`` certifies ascending block expert IDs within the
+    padded token count, with any -1 blocks first. Unused tail entries are ignored.
+    Leave it false after remapping that can produce scattered inactive blocks.
     """
     device = a.device
 
@@ -175,6 +179,7 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        expert_ids_are_sorted,
     )
 
     return c

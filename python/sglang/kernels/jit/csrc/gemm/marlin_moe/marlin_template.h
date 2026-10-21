@@ -81,7 +81,8 @@ __global__ void Marlin(
     int* locks,                                              // extra global storage for barrier synchronization
     bool use_atomic_add,                                     // whether to use atomic add to reduce
     bool use_fp32_reduce,                                    // whether to use fp32 global reduce
-    int max_shared_mem) {}
+    int max_shared_mem,
+    bool expert_ids_are_sorted) {}
 
 }  // namespace device::marlin_moe
 
@@ -328,7 +329,8 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    bool expert_ids_are_sorted) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -383,14 +385,18 @@ __global__ void Marlin(
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
-  // Every warp counts the same inactive blocks without a serial per-thread scan.
+  if (parallel == 0) return;
   int num_invalid_blocks = 0;
-  for (int i = threadIdx.x % 32; i < parallel; i += 32) {
-    num_invalid_blocks += expert_ids_ptr[i] == -1;
-  }
+  // A sorted table with a valid first block cannot contain inactive blocks.
+  // Generic and EP callers retain the full scan, including scattered -1 IDs.
+  if (kIsEP || !expert_ids_are_sorted || expert_ids_ptr[0] < 0) {
+    for (int i = threadIdx.x % 32; i < parallel; i += 32) {
+      num_invalid_blocks += expert_ids_ptr[i] == -1;
+    }
 #pragma unroll
-  for (int offset = 16; offset > 0; offset /= 2) {
-    num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
+    for (int offset = 16; offset > 0; offset /= 2) {
+      num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
+    }
   }
   parallel -= num_invalid_blocks;
   if (parallel == 0) return;

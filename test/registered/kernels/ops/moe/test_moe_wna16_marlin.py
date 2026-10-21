@@ -1,5 +1,6 @@
 import itertools
 import sys
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1145,22 +1146,19 @@ def _check_marlin_inactive_routes(
 
 
 def test_moe_wna16_marlin_inactive_output_ownership():
-    """An allocated output zeros inactive rows; caller-owned rows stay untouched."""
+    """Sorted admission and generic scattered masks preserve output ownership."""
     torch.manual_seed(57)
-    m, e, k, n, topk, block_m = 1, 8, 256, 256, 2, 8
-    _, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
+    m, e, k, n, topk, block_m = 1, 8, 256, 256, 3, 8
+    w_ref, qweight, scales, zeros, g_idx, permutation = _marlin_inactive_weights(
         e, n, k, scalar_types.uint4b8
     )
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    ids = torch.full((m, topk), -1, device="cuda", dtype=torch.int32)
     routing_weights = torch.ones((m, topk), device="cuda", dtype=torch.float32)
-    sorted_ids, expert_ids, num_post = moe_align_block_size(ids, block_m, e)
     workspace = torch.zeros(
         torch.cuda.get_device_properties(x.device).multi_processor_count * 4,
         device="cuda",
         dtype=torch.int32,
     )
-    caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
     original_empty = torch.empty
 
     def poisoned_empty(*args, **kwargs):
@@ -1169,36 +1167,76 @@ def test_moe_wna16_marlin_inactive_output_ownership():
             tensor.fill_(float("nan"))
         return tensor
 
-    for output in (None, caller_output):
-        with patch.object(torch, "empty", side_effect=poisoned_empty):
-            result = _run_single_gemm(
-                moe_wna16_marlin_gemm,
-                x,
-                output,
-                qweight,
-                scales,
-                zeros,
-                g_idx,
-                permutation,
-                workspace,
-                sorted_ids,
-                expert_ids,
-                num_post,
-                routing_weights,
-                scalar_types.uint4b8,
-                block_m,
-                topk,
-                m,
-                n,
-                k,
-                False,
-                True,
-                True,
-            )
-        expected = (
-            torch.zeros_like(result) if output is None else torch.full_like(result, 3.0)
+    cases = (
+        ("inactive-default", (-1, -1, -1), False, False),
+        ("inactive-sorted", (-1, -1, -1), True, False),
+        ("empty-sorted", (-1, -1, -1), True, False),
+        ("mixed-default", (-1, 0, 1), False, False),
+        ("mixed-sorted", (-1, 0, 1), True, False),
+        ("mixed-scattered", (-1, 0, 1), False, True),
+        ("valid-default", (0, 1, 2), False, False),
+        ("valid-sorted", (0, 1, 2), True, False),
+    )
+    for case, route_ids, sorted_proof, scatter in cases:
+        ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
+        sorted_ids, expert_ids, num_post = moe_align_block_size(ids, block_m, e)
+        if scatter:
+            # Keep the matching token blocks, but move the inactive block to
+            # the middle so a first-ID shortcut without proof would be unsafe.
+            order = torch.tensor([1, 0, 2], device="cuda")
+            sorted_ids = sorted_ids.view(topk, block_m)[order].reshape(-1)
+            expert_ids = expert_ids[order]
+        elif case == "empty-sorted":
+            sorted_ids, expert_ids = sorted_ids[:0], expert_ids[:0]
+            num_post.zero_()
+        # Omit the new argument on generic calls to guard its safe default.
+        gemm = (
+            partial(moe_wna16_marlin_gemm, expert_ids_are_sorted=True)
+            if sorted_proof
+            else moe_wna16_marlin_gemm
         )
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        caller_output = torch.full((m * topk, n), 3.0, device="cuda", dtype=x.dtype)
+        for output in (None, caller_output):
+            with patch.object(torch, "empty", side_effect=poisoned_empty):
+                result = _run_single_gemm(
+                    gemm,
+                    x,
+                    output,
+                    qweight,
+                    scales,
+                    zeros,
+                    g_idx,
+                    permutation,
+                    workspace,
+                    sorted_ids,
+                    expert_ids,
+                    num_post,
+                    routing_weights,
+                    scalar_types.uint4b8,
+                    block_m,
+                    topk,
+                    m,
+                    n,
+                    k,
+                    False,
+                    True,
+                    True,
+                )
+            expected = (
+                torch.zeros_like(result)
+                if output is None
+                else torch.full_like(result, 3.0)
+            )
+            for slot, expert in enumerate(route_ids):
+                if expert >= 0:
+                    expected[slot] = (x[0].float() @ w_ref[expert].float().T).to(
+                        expected.dtype
+                    )
+            torch.testing.assert_close(result, expected, rtol=0.03, atol=0.02)
+            inactive = ids.reshape(-1) < 0
+            torch.testing.assert_close(
+                result[inactive], expected[inactive], rtol=0, atol=0
+            )
 
 
 def test_marlin_lora_direct_inactive_routes():

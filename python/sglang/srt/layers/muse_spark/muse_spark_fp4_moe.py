@@ -428,6 +428,8 @@ class MuseSpark1xFp4Experts(nn.Module):
                 local_topk_ids, block_size_m, align_num_experts
             )
 
+        # Both aligners emit ascending block IDs with inactive blocks first;
+        # no expert remapping occurs after this ordering is established.
         workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
         cache2 = torch.empty(
             (num_tokens * topk, size_n),
@@ -469,6 +471,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
+            expert_ids_are_sorted=True,
         )
         silu_and_mul(
             cache1.view(-1, gemm1_n),
@@ -503,6 +506,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
+            expert_ids_are_sorted=True,
         ).view(num_tokens, topk, size_k), local_topk_ids
 
     def _forward_marlin(
