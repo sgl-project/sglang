@@ -228,7 +228,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
 
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
-    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only).
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only), and the
+    FastH3 Omni Ref2VA PDD student.
 
     The flat single-partition repo is materialized into the base-H3 layout by
     its registered model overlay (see runtime/utils/model_overlay.py), so every stage, loader,
