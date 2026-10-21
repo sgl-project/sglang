@@ -1773,6 +1773,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
+    # SM10x WO-A emits native DeepGEMM MXFP8 input for WO-B at measured
+    # small/medium row counts; other consumers retain the BF16 output.
+    SGLANG_OPT_FP8_WO_A_MXFP8_OUTPUT = EnvBool(False)
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
     # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.

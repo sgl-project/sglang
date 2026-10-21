@@ -26,6 +26,15 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+register_kernel(
+    KernelSpec(
+        op="gemm.fp8_wo_a_mxfp8",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.gemm.fp8_wo_a:fp8_wo_a_mxfp8",
+        capabilities=_SM10X,
+    )
+)
+
 
 def _prefer_torch_rowwise_fp8(
     mat_a: torch.Tensor,

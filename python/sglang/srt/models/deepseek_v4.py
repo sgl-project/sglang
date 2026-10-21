@@ -104,7 +104,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_deepgemm_input,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -665,7 +668,14 @@ def _fp8_wo_a_einsum(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     recipe: Tuple[int, int, int],
-) -> torch.Tensor:
+    *,
+    out_mxfp8: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    if out_mxfp8:
+        from sglang.kernels.ops.gemm.fp8_wo_a import fp8_wo_a_mxfp8
+
+        return fp8_wo_a_mxfp8(o_fp8, o_s, weight, weight_scale, recipe)
+
     import deep_gemm
 
     groups, rank = weight.shape[:2]
@@ -801,7 +811,11 @@ def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> N
     if real_num_tokens:
         output[:real_num_tokens].copy_(
             layer._mega_core(
-                query[:real_num_tokens], attn_sink, forward_batch, get_attn_backend()
+                query[:real_num_tokens],
+                attn_sink,
+                forward_batch,
+                get_attn_backend(),
+                out_mxfp8_allowed=False,
             )
         )
     output[real_num_tokens:].zero_()
@@ -1085,6 +1099,16 @@ class MqaAttentionBase(nn.Module):
         ) == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL and (
             getattr(quant_method, "use_mxfp8", False)
             or getattr(self.wo_b, "block_fp8_mxfp8_ready", False)
+        )
+
+    def _wo_a_emits_deepgemm_mxfp8(self, num_tokens: int) -> bool:
+        return (
+            envs.SGLANG_OPT_FP8_WO_A_MXFP8_OUTPUT.get()
+            and get_platform().is_sm100
+            and not get_exec().deterministic.enable_deterministic_inference
+            and 0 < num_tokens <= (384 if self.n_local_groups <= 2 else 96)
+            and not get_forward().sp_active
+            and accepts_mxfp8_deepgemm_input(self.wo_b)
         )
 
     def _kernel_num_heads(self, num_tokens: int) -> int:
@@ -1480,7 +1504,7 @@ class MQALayer(MqaAttentionBase):
         attn_sink: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         from sglang.srt.layers.attention.deepseek_v4_mega_backend import pack_query
 
         if forward_batch.forward_mode.is_idle():
@@ -1499,7 +1523,9 @@ class MQALayer(MqaAttentionBase):
         attn_sink: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend,
-    ) -> torch.Tensor:
+        *,
+        out_mxfp8_allowed: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1513,7 +1539,13 @@ class MQALayer(MqaAttentionBase):
         )
         groups = self.n_local_groups
         return _fp8_wo_a_einsum(
-            data[:, :groups], scale[:, :groups], *self.mega_wo_a, recipe=(1, 1, 32)
+            data[:, :groups],
+            scale[:, :groups],
+            *self.mega_wo_a,
+            recipe=(1, 1, 32),
+            out_mxfp8=(
+                out_mxfp8_allowed and self._wo_a_emits_deepgemm_mxfp8(data.shape[0])
+            ),
         )
 
     def _get_npu_rope_position_cache(
@@ -2863,6 +2895,7 @@ class MQALayer(MqaAttentionBase):
                     self.wo_a.weight.view(G, R, D),
                     self.wo_a.weight_scale_inv.data,
                     recipe=recipe,
+                    out_mxfp8=self._wo_a_emits_deepgemm_mxfp8(T),
                 )
             else:
                 wo_a_weight = getattr(self.wo_a, "weight", None)
