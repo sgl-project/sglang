@@ -75,13 +75,6 @@ class ModelSlimConfig(QuantizationConfig):
         )
         if descriptor is None or descriptor == "FLOAT":
             return None
-        if descriptor == "FP8_DYNAMIC":
-            raise ValueError(
-                f"Unsupported attention descriptor for {prefix}: {descriptor}. "
-                "FP8 attention is no longer supported (it requires custom MindIE "
-                "kernels); re-quantize this checkpoint with MXFP4 attention or keep "
-                "attention in BF16"
-            )
         if descriptor != "MXFP4_DYNAMIC":
             raise ValueError(
                 f"Unsupported attention descriptor for {prefix}: {descriptor}"

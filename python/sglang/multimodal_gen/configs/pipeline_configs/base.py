@@ -638,13 +638,7 @@ class PipelineConfig:
 
         # Zero-padding a non-divisible time dim would enter self-attention
         # unmasked (video models pass no attn_mask) and corrupt real tokens.
-        # Models with a token-level sequence-shard forward (see
-        # ``resolve_sequence_shard``) can still shard such shapes: they pad
-        # the flattened token sequence, slice a contiguous per-rank range, and
-        # compute the local RoPE range themselves. Delegate to that path
-        # instead of leaving every rank replicated -- a replicated input
-        # silently breaks the Ulysses all-to-all (sequence inflated by the SP
-        # degree) and the rank-offset RoPE grid.
+        # Use token sharding where supported to preserve Ulysses and RoPE offsets.
         if time_dim > 0 and time_dim % sp_world_size != 0:
             from sglang.multimodal_gen.configs.sample.sampling_params import (
                 resolve_sequence_shard,

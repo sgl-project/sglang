@@ -1040,10 +1040,7 @@ def _resolve_quant_config(
 
         # modelslim requires a per-layer quant description file; load it from
         # the component directory rather than constructing an empty config.
-        # The description uses checkpoint-side layer names, so the reverse
-        # mapping must flow in exactly like the flagless path below; without
-        # it, scheme lookups compare model names against description keys and
-        # fail on the first linear.
+        # Scheme lookups must use checkpoint-side layer names.
         if server_args.quantization == "modelslim":
             return get_quant_config(
                 hf_config,

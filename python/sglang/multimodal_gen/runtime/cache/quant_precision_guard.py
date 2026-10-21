@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cache-DiT precision guard for timestep-quantized diffusion transformers.
-
-Kept separate from :mod:`cache_dit_integration` because it is pure SGLang
-bookkeeping: it knows about quantization schemes and forward contexts, not
-about the cache-dit library. The integration module installs it after
-``enable_cache``; nothing here calls into cache-dit directly.
-"""
+"""Cache-DiT precision guard for timestep-quantized diffusion transformers."""
 
 from functools import wraps
 
@@ -15,15 +9,7 @@ logger = init_logger(__name__)
 
 
 def install_quant_precision_guard(transformer):
-    """Invalidate Cache-DiT histories when the effective quant precision changes.
-
-    Timestep-quantized schedules (e.g. W4A8 at the schedule boundaries, W4A4
-    elsewhere) change the numerics of cached residuals mid-run. MXFP4 attention
-    and linear schemes with a ``precision_policy_target`` contribute to the
-    per-run signature; when the signature changes,
-    both CFG branch histories and calibrator caches are dropped and the step
-    is recomputed.
-    """
+    """Clear both CFG histories and force computation when quant precision changes."""
     modules = getattr(transformer, "modules", None)
     if modules is None:
         return

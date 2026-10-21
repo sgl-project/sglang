@@ -18,12 +18,7 @@ logger = logging.getLogger(__name__)
 MXFP8_BLOCK_SIZE = 32
 # W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
-# MindIE-SD f1b15b4 "C7" activation-quantization defaults for single-level
-# MXFP4. Applied to every npu_dynamic_mx_quant call with an FP4 destination
-# (linear activations and quantized-attention Q/K/V); checkpoints override
-# either value via mxfp4_scale_alg / mxfp4_dst_type_max descriptors. Kept as a
-# local constant because srt must not import multimodal_gen, whose
-# mxfp4_utils.mxfp4_quant_kwargs reads the same descriptors.
+# MindIE-SD C7 defaults; kept local to avoid an SRT dependency on multimodal_gen.
 MXFP4_C7_ACTIVATION_QUANT_DEFAULTS = {"scale_alg": 2, "dst_type_max": 7.25}
 
 
@@ -679,9 +674,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation (A8). The destination is FP8,
-        # so the MXFP4 C7 arguments (dst_type_max=7.25 et al.) do not apply;
-        # operator-default rounding is kept for the W4A8 boundary steps.
+        # FP8 activations use operator defaults rather than FP4 C7 arguments.
         quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
@@ -713,19 +706,11 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """Shared single-level W4A4 linear kernel for Ascend 950.
+    """Single-level W4A4 kernel with MindIE-SD activation quantization defaults.
 
-    Offline ModelSlim schemes reuse apply; direct callers can also quantize
-    BF16/FP16 weights at load time. Packed ND weights are [in/2, out], with
-    UE8M0 scales [in/64, out, 2]. Activation quantization matches MindIE-SD's
-    C7 defaults (``rint`` rounding plus ``scale_alg=2``/``dst_type_max=7.25``;
-    per-layer checkpoint descriptors override the two kwargs). Weight-side
-    quantization keeps ``round``. The online SRT --quantization mxfp4 route
-    uses the dual-level subclass.
-    """
+    Packed ND weights are [in/2, out]; UE8M0 scales are [in/64, out, 2]."""
 
-    # MindIE-SD rounds activations to nearest-even; the npu_dynamic_mx_quant
-    # operator default ("round", half-away-from-zero) is less accurate.
+    # Match MindIE-SD nearest-even activation rounding.
     activation_round_mode = "rint"
 
     def create_weights(
@@ -820,8 +805,6 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic single-level MXFP4 activation quantisation (A4 — FP4) with
-        # MindIE's C7 defaults; per-layer checkpoint descriptors override.
         quant_kwargs = {
             **MXFP4_C7_ACTIVATION_QUANT_DEFAULTS,
             **getattr(layer, "mxfp4_quant_kwargs", {}),
@@ -861,9 +844,6 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
     [out, in/32]). The weight remains ND and is transposed for matmul.
-    Activation quantization inherits the base class's MindIE C7 defaults
-    (``rint``); the scheme additionally attaches any checkpoint ``mxfp4_*``
-    descriptors to the layer as ``mxfp4_quant_kwargs`` overrides.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

@@ -910,11 +910,7 @@ def load_model_from_full_model_state_dict(
         )
 
     if skipped_checkpoint_keys:
-        # Quantized attention is calibrated against the checkpoint's exported
-        # Q/K rotations, so silently skipping them skews every attention score.
-        # When attention runs unquantized (descriptor FLOAT, or the legacy
-        # online-MXFP8 path) the rotations may legitimately be skipped -- any
-        # orthogonal matrix preserves scores -- so those stay a warning.
+        # MXFP4 calibration requires the exported Q/K rotations; BF16 may skip them.
         skipped_rotations = [
             key for key in skipped_checkpoint_keys if key.endswith(("q_rot", "k_rot"))
         ]

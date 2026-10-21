@@ -118,14 +118,7 @@ def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
 
 
 def load_quant_description(model_path: pathlib.Path) -> Dict[str, Any]:
-    """Load the inference description, ignoring quantization-time artifacts.
-
-    w4a4_mxfp4 exports place per-variant descriptions next to the shared
-    weight file (e.g. `quant_model_description_w4a4_mxfp4_svd.json` for the
-    SVD-calibrated variant) plus `calib_data_*.pth` and `configuration.json`.
-    Those describe how the export was calibrated, not how it is served; the
-    plain `quant_model_description*.json` is the inference contract.
-    """
+    """Load the inference description, excluding SVD calibration variants."""
     candidates = sorted(model_path.glob("quant_model_description*.json"))
     ignored = [c for c in candidates if c.stem.endswith("_svd")]
     for path in ignored:

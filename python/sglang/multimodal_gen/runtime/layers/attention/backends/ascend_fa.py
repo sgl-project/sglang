@@ -200,12 +200,7 @@ def fused_infer_attention_varlen(
 
 
 def _attention_quant_kwargs(description: dict, quant_op) -> dict:
-    """MXFP4 Q/K/V quantization kwargs with MindIE's C7 defaults.
-
-    ``round_mode`` is kept out of :func:`mxfp4_quant_kwargs` (linear callers
-    pass it separately) and added here, feature-detected so older torch_npu
-    builds without a ``round_mode`` parameter keep operator-default rounding.
-    """
+    """Use C7 defaults and rint rounding when the operator supports it."""
     kwargs = mxfp4_quant_kwargs(description)
     try:
         has_round_mode = "round_mode" in inspect.signature(quant_op).parameters
@@ -222,18 +217,9 @@ def _attention_quant_kwargs(description: dict, quant_op) -> dict:
 
 
 class AscendMXFP4Attention:
-    """MXFP4 self-attention kernel for Ascend 950 (offline MXFP4 checkpoints).
+    """MXFP4 self-attention through the experimental CANN quant_flash_attn kernel.
 
-    Q/K/V are dynamically quantized to packed FP4 per call and evaluated by the
-    CANN experimental ``quant_flash_attn`` extension. Sequences are padded up
-    to a kernel-friendly length and the *real* lengths are passed as
-    ``seqused_q``/``seqused_kv``, so padded rows are quantized (to keep the
-    tensor shapes aligned) but excluded from the softmax.
-
-    The kernel is created by :class:`AscendFAImpl` when the checkpoint
-    descriptor selects ``MXFP4`` attention; per-step FLOAT precision falls back
-    to the backend's unquantized paths.
-    """
+    Real seqused_q/seqused_kv lengths exclude padding from the softmax."""
 
     def __init__(self, description: dict, head_size: int, causal: bool) -> None:
         if causal or head_size != 128 or get_ring_parallel_world_size() > 1:
@@ -281,8 +267,6 @@ class AscendMXFP4Attention:
             self.description, torch_npu.npu_dynamic_mx_quant
         )
 
-    # -- Public entry points -------------------------------------------------
-
     def forward(
         self,
         query: torch.Tensor,
@@ -312,13 +296,7 @@ class AscendMXFP4Attention:
         scale: float,
         boundaries: tuple[int, ...],
     ) -> torch.Tensor:
-        """Packed attention over [T, N, D] inputs with ``cu_seqlens`` boundaries.
-
-        Sequences are bucketed by padded length so each ``quant_flash_attn``
-        call sees a uniform shape; the real per-sequence lengths are passed via
-        ``seqused`` so one another's (and the alignment) padding never enters
-        the softmax. This is the path varlen models such as minimax-h3 use.
-        """
+        """Bucket packed [T, N, D] sequences by padded length; seqused excludes padding."""
         if query.ndim != 3 or query.shape != key.shape or key.shape != value.shape:
             raise ValueError(
                 "Packed MXFP4 attention requires matching [T, N, D] Q/K/V shapes"
@@ -355,8 +333,6 @@ class AscendMXFP4Attention:
                     position, :, : stop - start
                 ].transpose(0, 1)
         return output
-
-    # -- Internals -----------------------------------------------------------
 
     def _validate(self, query, key, value) -> None:
         if query.device.type != "npu" or not (

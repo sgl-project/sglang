@@ -64,9 +64,6 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 NPUSingleLevelMXFP4OfflineLinearMethod,
             )
 
-            # The kernel class defaults already match MindIE (rint rounding
-            # plus the C7 scale_alg/dst_type_max kwargs), so no per-model
-            # activation-rounding override is needed here.
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
             self.w4a8_kernel = NPUMXFP4W4A8OfflineLinearMethod()
             self.w4a8_kernel.use_wan_bias = True
@@ -76,14 +73,11 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
                 "Check that the model was exported with dual-level quantization."
             )
 
-    # -- Timestep precision policy (consumed by the Cache-DiT guard) ---------
-
     precision_policy_target = "w4a4_linear"
     precision_policy_default = "W4A4"
 
     def resolve_precision(self, default_policy: dict | None = None) -> str:
-        # Dual-scale layers stay W4A4: they reject W4A8 switching and honor
-        # only the checkpoint's own policy, never the caller's schedule.
+        # Dual-scale layers must not inherit the single-level W4A8 schedule.
         return resolve_precision(
             self.quant_config,
             self.precision_policy_target,
