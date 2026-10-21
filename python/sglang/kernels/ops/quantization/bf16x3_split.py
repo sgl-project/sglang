@@ -32,9 +32,11 @@ def split_fp32_to_bf16x3(
     hi + mid + lo == w for 2**-110 <= |w| < 2**128 - 2**119: below that the last
     remainder drops under BF16's subnormals, above it hi rounds to infinity.
     """
-    n, k = w.shape
-    if not (w.is_cuda and w.dtype == torch.float32 and w.is_contiguous()):
+    if not (
+        w.is_cuda and w.ndim == 2 and w.dtype == torch.float32 and w.is_contiguous()
+    ):
         raise ValueError("w must be a contiguous CUDA fp32 [N, K] tensor")
+    n, k = w.shape
     if out is None:
         out = torch.empty(3 * n, k, dtype=torch.bfloat16, device=w.device)
     elif not (
