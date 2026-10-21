@@ -383,6 +383,8 @@ def fused_moe_kernel(
     USE_GDC: tl.constexpr = False,
     GDC_EARLY: tl.constexpr = False,
     A_OUTPUT_SLICES: tl.constexpr = 1,
+    A_OUTPUT_SLICE_WIDTH: tl.constexpr = 0,
+    A_OUTPUT_SLICE_K: tl.constexpr = 0,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -424,8 +426,8 @@ def fused_moe_kernel(
     if A_OUTPUT_SLICES == 2:
         # Gate/up outputs use separate rank halves of the same shrink result.
         # Keep each N tile inside one half, including ragged output widths.
-        slice_width = N // 2
-        num_pid_n_per_slice = tl.cdiv(slice_width, BLOCK_SIZE_N)
+        slice_width: tl.constexpr = A_OUTPUT_SLICE_WIDTH
+        num_pid_n_per_slice: tl.constexpr = tl.cdiv(slice_width, BLOCK_SIZE_N)
         num_pid_n = 2 * num_pid_n_per_slice
     else:
         num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -493,7 +495,7 @@ def fused_moe_kernel(
             offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
         )
         if A_OUTPUT_SLICES == 2:
-            a_ptrs += output_slice * K * stride_ak
+            a_ptrs += output_slice * A_OUTPUT_SLICE_K * stride_ak
 
     if b_desc is not None:
         start_offs_n = pid_n * BLOCK_SIZE_N
@@ -847,6 +849,8 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
     assert a_output_slices in (1, 2)
+    a_output_slice_width = 0
+    a_output_slice_k = 0
     if a_output_slices == 2:
         assert fuse_add_to_output
         assert add_output_mask is not None
@@ -865,6 +869,8 @@ def invoke_fused_moe_kernel(
         assert A.shape[1] == 2 * B.shape[2]
         assert B.shape[1] > 0 and B.shape[1] % 2 == 0
         assert C.shape[-1] == B.shape[1]
+        a_output_slice_width = B.shape[1] // 2
+        a_output_slice_k = B.shape[2]
 
     if fuse_swiglu:
         # The epilogue assumes an interleaved-gate/up bf16 up-GEMM writing a
@@ -941,7 +947,7 @@ def invoke_fused_moe_kernel(
         * (
             triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])
             if a_output_slices == 1
-            else 2 * triton.cdiv(B.shape[1] // 2, META["BLOCK_SIZE_N"])
+            else 2 * triton.cdiv(a_output_slice_width, META["BLOCK_SIZE_N"])
         ),
     )
 
@@ -1093,6 +1099,8 @@ def invoke_fused_moe_kernel(
             swap_ab=swap_ab,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             A_OUTPUT_SLICES=a_output_slices,
+            A_OUTPUT_SLICE_WIDTH=a_output_slice_width,
+            A_OUTPUT_SLICE_K=a_output_slice_k,
             MASK_OUTPUT=mask_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
