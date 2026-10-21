@@ -120,8 +120,8 @@ class AscendOpsConfig:
     Selects the prefill and decode execution paths:
     - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
       or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
-    - ``decode``: ``low_latency`` (discrete init_routing -> gmm -> activation ->
-      gmm -> finalize_routing) or ``fused_op`` (single dispatch_ffn_combine).
+    - ``decode``: ``low_latency`` (EP DS v2 dispatch_v2 -> gmm -> activation ->
+      gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
     """
 
     PREFILL_CHOICES = ("allgather", "alltoallv")
