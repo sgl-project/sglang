@@ -30,6 +30,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -1019,8 +1020,10 @@ def prepare_deepgemm_mxfp8_input_path(layer) -> bool:
         .view(torch.float32)
         .view(n, k // 32)
     )
-    layer.weight_scale_inv_deepgemm_input = (
-        deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_fp32)
+    copy_or_rebind_param(
+        layer,
+        "weight_scale_inv_deepgemm_input",
+        deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_fp32),
     )
     return True
 

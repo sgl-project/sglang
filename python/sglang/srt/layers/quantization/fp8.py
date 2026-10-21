@@ -789,6 +789,8 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
+            if getattr(layer, "prepare_deepgemm_mxfp8_input", False):
+                prepare_deepgemm_mxfp8_input_path(layer)
             return
         elif _is_npu and is_npu_arch35():
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
