@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Logits processing."""
+"""Content hash of a GPU tensor: per-tile 32-bit word hashes reduced to one 64-bit value."""
 
 import torch
 import triton

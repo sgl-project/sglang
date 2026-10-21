@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.moe.router import (
+from sglang.kernels.ops.gemm.router_gate_matvec import (
     ROUTER_GATE_MATVEC_MAX_M,
     router_gate_matvec,
 )
@@ -21,7 +21,6 @@ from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -598,6 +597,7 @@ class BailingMoE(nn.Module):
                 and getattr(quant_config, "is_fp4_experts", False)
             ),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,
@@ -831,10 +831,6 @@ class BailingMoE(nn.Module):
                 hidden_states,
                 router_logits,
                 dynamic_expert_bias=dynamic_expert_bias,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
