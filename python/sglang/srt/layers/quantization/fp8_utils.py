@@ -979,6 +979,84 @@ def block_fp8_scale_to_mxfp8_e8m0(
     return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
 
 
+def prepare_deepgemm_mxfp8_input_path(layer) -> bool:
+    if not (
+        _is_cuda
+        and get_platform().is_blackwell
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+    ):
+        return False
+    method = getattr(layer, "quant_method", None)
+    backend = getattr(method, "mxfp8_dense_backend", None)
+    weight = getattr(layer, "weight", None)
+    if (
+        method is None
+        or backend is None
+        or not (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass())
+        or weight is None
+        or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_contiguous()
+    ):
+        return False
+    n, k = weight.shape
+    if n % 64 != 0 or k % 128 != 0:
+        return False
+    if getattr(method, "use_mxfp8", False):
+        scale_u8 = layer.weight_scale_inv.data.view(torch.uint8).reshape(n, k // 32)
+    elif getattr(method, "block_fp8_as_mxfp8", False) and getattr(
+        layer, "block_fp8_mxfp8_ready", False
+    ):
+        scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
+            layer.weight_scale_inv.data, (n, k), method.weight_block_size
+        )
+    else:
+        return False
+    import deep_gemm.utils.layout
+
+    scale_fp32 = (
+        (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+        .view(torch.float32)
+        .view(n, k // 32)
+    )
+    layer.weight_scale_inv_deepgemm_input = (
+        deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_fp32)
+    )
+    return True
+
+
+def deepgemm_mxfp8_prequantized_linear(
+    layer, x, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    from sglang.kernels.ops.gemm.fp8_kernel import w8a8_mxfp8_matmul_deepgemm
+
+    data, scales = x
+    m, k = data.shape
+    if not (
+        data.dtype == torch.float8_e4m3fn
+        and data.is_contiguous()
+        and scales.dtype == torch.int32
+        and scales.shape == (m, k // 128)
+        and (m <= 1 or scales.stride(0) == 1)
+        and k == layer.weight.shape[1]
+    ):
+        raise ValueError(
+            "Mxfp8DeepGemmInput needs contiguous [M, K] E4M3 data and packed "
+            f"MN-major UE8M0 scales [M, K // 128]; got {tuple(data.shape)} "
+            f"{tuple(scales.shape)} {scales.stride()} for K={layer.weight.shape[1]}"
+        )
+    output = w8a8_mxfp8_matmul_deepgemm(
+        data,
+        layer.weight,
+        scales,
+        layer.weight_scale_inv_deepgemm_input,
+        output_dtype=torch.bfloat16,
+    )
+    if bias is not None:
+        output += bias
+    return output
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():

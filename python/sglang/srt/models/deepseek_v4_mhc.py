@@ -33,11 +33,14 @@ from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8DeepGemmInput,
+    Mxfp8SwizzledInput,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.models.deepseek_v2 import MoEOutput
-from sglang.srt.runtime_context import get_parallel, get_platform
+from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
 
 _is_gfx95_supported = is_gfx95_supported()
@@ -47,6 +50,7 @@ _is_xpu = is_xpu()
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
+FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -103,7 +107,7 @@ class HcQuantized(NamedTuple):
     """Normed, and already swizzled for the sublayer's first projection."""
 
     rows: torch.Tensor
-    swizzled: Mxfp8SwizzledInput
+    swizzled: Union[Mxfp8SwizzledInput, Mxfp8DeepGemmInput]
 
 
 HcPreOutput: TypeAlias = Union[HcNormed, HcQuantized]
@@ -203,6 +207,7 @@ class HcNextBoundary(NamedTuple):
     accepts_mxfp8: bool
     norm_fusable: bool
     hc: Optional[HcSubLayer] = None
+    accepts_mxfp8_deepgemm: bool = False
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -214,8 +219,17 @@ def is_deferred_finalize(routed) -> bool:
     return isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput)
 
 
+def accepts_mxfp8_deepgemm_input(attn) -> bool:
+    method = getattr(attn, "accepts_mxfp8_deepgemm_input", None)
+    return bool(method is not None and method())
+
+
 def make_boundary(
-    norm: RMSNorm, *, accepts_mxfp8: bool, hc: Optional[HcSubLayer] = None
+    norm: RMSNorm,
+    *,
+    accepts_mxfp8: bool,
+    hc: Optional[HcSubLayer] = None,
+    accepts_mxfp8_deepgemm: bool = False,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -231,6 +245,7 @@ def make_boundary(
             and norm.weight.is_contiguous()
         ),
         hc=hc,
+        accepts_mxfp8_deepgemm=accepts_mxfp8 and accepts_mxfp8_deepgemm,
     )
 
 
@@ -394,6 +409,8 @@ def combine(
     whatever the previous post left in ``state.input``."""
     shortcut = state.input
     if isinstance(shortcut, HcQuantized):
+        if quantized is None and isinstance(shortcut.swizzled, Mxfp8DeepGemmInput):
+            return shortcut.rows
         assert quantized is not None
         quantized.append(shortcut.swizzled)
         return shortcut.rows
@@ -617,7 +634,13 @@ def _post_fusion(
         and y.shape[0] > 0
     ):
         next_hc = next.hc
-        updated, normalized, stats = mhc_mega_boundary(
+        emit_mxfp8 = (
+            next.accepts_mxfp8_deepgemm
+            and y.shape[0] <= FUSED_MXFP8_PRODUCER_MAX_ROWS
+            and not get_forward().is_extend_in_batch
+            and not get_forward().sp_active
+        )
+        out = mhc_mega_boundary(
             y,
             residual,
             pre,
@@ -631,7 +654,17 @@ def _post_fusion(
             next_hc.cfg.eps,
             next_hc.norm.variance_epsilon,
             next_hc.cfg.sinkhorn_iters,
+            emit_mxfp8=emit_mxfp8,
         )
+        if emit_mxfp8:
+            updated, normalized, stats, (y_fp8, y_sf) = out
+            return HcState(
+                updated,
+                pre,
+                HcQuantized(normalized, Mxfp8DeepGemmInput(y_fp8, y_sf)),
+                stats,
+            )
+        updated, normalized, stats = out
         return HcState(updated, pre, HcNormed(normalized), stats)
     if (
         next is not None

@@ -16,6 +16,11 @@ class Mxfp8SwizzledInput(NamedTuple):
     scales: torch.Tensor
 
 
+class Mxfp8DeepGemmInput(NamedTuple):
+    data: torch.Tensor
+    scales: torch.Tensor
+
+
 def accepts_mxfp8_swizzled_input(linear) -> bool:
     """Whether a linear can consume the explicit 128x4 producer contract."""
     qm = getattr(linear, "quant_method", None)
