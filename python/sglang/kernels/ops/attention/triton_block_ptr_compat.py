@@ -9,9 +9,16 @@ Triton is left untouched.
 import triton.language as tl
 from triton.language import core
 
+try:
+    from triton.language import advance  # noqa: F401
+
+    _HAS_BLOCK_PTR = True
+except ImportError:  # removed in triton-lang/triton#10833
+    _HAS_BLOCK_PTR = False
+
 # TODO: Drop this once the kernels are ported off block pointers, as upstream FLA
 # did in fla-org/flash-linear-attention#1062.
-if not hasattr(tl, "advance"):
+if not _HAS_BLOCK_PTR:
 
     @core._aggregate
     class _BlockPtr:
