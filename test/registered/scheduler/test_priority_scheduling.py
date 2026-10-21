@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
     send_concurrent_generate_requests_with_custom_params,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=166, stage="extra-a", runner_config="1-gpu-small")
@@ -350,6 +351,67 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
 
         # FIXME(harrison lim)
         # assert e2e_latencies[2] < e2e_latencies[3] < e2e_latencies[1] < e2e_latencies[0]
+
+
+class TestPrioritySchedulingPreemptionOnKV(CustomTestCase):
+    """Preemption fires when KV memory, not the request cap, is what blocks a
+    higher-priority request. With the cap above the running count, such a
+    request used to wait until the running one finished."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=(
+                "--enable-priority-scheduling",
+                "--max-running-requests",  # never the limiter here
+                "8",
+                "--max-total-tokens",  # one 1,500-token output fills the pool
+                "2048",
+            ),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_higher_priority_request_preempts_for_kv(self):
+        # ignore_eos keeps the low-priority request running and reserves its
+        # whole output in the KV budget, so the second request does not fit.
+        async def _send(priority):
+            return await send_concurrent_generate_requests_with_custom_params(
+                self.base_url,
+                [
+                    {
+                        "priority": priority,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 1500,
+                            "ignore_eos": True,
+                        },
+                    }
+                ],
+            )
+
+        async def _run():
+            low = asyncio.create_task(_send(0))
+            await asyncio.sleep(1.0)
+            high = asyncio.create_task(_send(20))
+            return (await low) + (await high)
+
+        responses = asyncio.run(_run())
+
+        e2e_latencies = []
+        _verify_genereate_responses(
+            responses, [(200, None), (200, None)], e2e_latencies
+        )
+        # Only a preempting request finishes before the one that was running.
+        assert e2e_latencies[1] < e2e_latencies[0]
 
 
 # Holds the only running slot while later waves arrive: ignore_eos keeps it
