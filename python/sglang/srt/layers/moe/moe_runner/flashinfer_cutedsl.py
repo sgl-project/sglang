@@ -514,10 +514,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
 @register_fused_func("flashinfer", "flashinfer_cutedsl")
 def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     """CuteDSL fused func for flashinfer alltoall dispatcher.
 
     Two cases depending on whether the dispatcher did FP4 quantization:
@@ -527,8 +527,16 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+    # Eager prefill uses all-gather, including idle ranks in a prefill batch.
+    # Preserve the standard combine format so the dispatcher reduce-scatters it.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutedsl_fp4(
+            dispatch_output, quant_info, runner_config
+        )
 
     assert runner_config.activation in (
         "silu",

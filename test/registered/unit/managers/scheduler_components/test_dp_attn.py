@@ -444,6 +444,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
         ):
             return dp_attn._local_prefill_cuda_graph_vote(
                 local_batch=batch,
+                num_tokens=2,
                 prefill_graph_runner=runner,
                 coordinated_prefill=True,
                 breakable_prefill=True,
@@ -483,6 +484,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         )
         vote = dp_attn._local_prefill_cuda_graph_vote(
             local_batch=batch,
+            num_tokens=4,
             prefill_graph_runner=runner,
             coordinated_prefill=True,
             breakable_prefill=True,
@@ -542,6 +544,7 @@ class TestPrefillCudaGraphVote(CustomTestCase):
             )
             return dp_attn._local_prefill_cuda_graph_vote(
                 local_batch=batch,
+                num_tokens=48,
                 prefill_graph_runner=runner,
                 coordinated_prefill=True,
                 breakable_prefill=True,

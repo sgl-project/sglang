@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeDeviceKV,
     FreeDeviceKVFullOnly,
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 
 # UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
@@ -227,11 +227,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
-        # SWA window size (None when SWA is not enabled).
+        # Required cache history, shared by retention, budgeting and transfers.
         self._sliding_window_size = (
-            params.sliding_window_size if self.is_swa_enabled else None
+            params.swa_retain_window if self.is_swa_enabled else None
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
+        self.draft_swa_window = params.draft_swa_window
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
         self._tree_core_backend = select_tree_core_backend(params)
@@ -1347,19 +1348,19 @@ class UnifiedRadixCache(BasePrefixCache):
         # Component actions route to their component class; the rest are
         # cache-owned and handled here by type.
         if isinstance(action, ComponentAction):
-            self.components[action.component_type].apply_component_action(action)
-        elif isinstance(action, ReplaceWriteThroughOnNodeSplit):
-            self._replace_pending_write_through_node(
-                action.ack_id,
-                action.old_node_id,
-                [action.new_node_id, action.new_child_node_id],
-            )
-            if self.linker is not None:
-                self.linker.replace_pending_offload_node(
-                    action.ack_id,
-                    action.old_node_id,
-                    [action.new_node_id, action.new_child_node_id],
+            if (
+                isinstance(action, UpdatePendingBackupOnNodeSplit)
+                and action.ack_id is not None
+            ):
+                node_ids = [action.new_node_id, action.new_child_node_id]
+                self._replace_pending_write_through_node(
+                    action.ack_id, action.old_node_id, node_ids
                 )
+                if self.linker is not None:
+                    self.linker.replace_pending_offload_node(
+                        action.ack_id, action.old_node_id, node_ids
+                    )
+            self.components[action.component_type].apply_component_action(action)
         elif isinstance(action, FreeDeviceKV):
             # tree values are page-aligned copies of a kv row: page-exact segments
             for indices in action.indices:
@@ -2323,6 +2324,23 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self._handle_prefetch_result(operation)
         return True
+
+    def waiting_storage_span(
+        self, request: CacheRequestHandle
+    ) -> Optional[tuple[int, int]]:
+        if self.buffer_pipeline is None:
+            return None
+        info = self.ongoing_prefetch.get(request)
+        if info is not None:
+            if info.host_indices is None:
+                return None
+            # Scheduler-accepted logical span; worker progress can count pool rows.
+            op = info.operation
+            return op.storage_start, op.storage_start + op.storage_hit_count
+        staged = self.buffer_pipeline.staged_prefetches.get(request)
+        if staged is not None:
+            return staged.matched_len, staged.matched_len + staged.num_tokens
+        return None
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
@@ -3690,7 +3708,7 @@ class UnifiedRadixCache(BasePrefixCache):
         writes late-layer window KV only for an extend's tail rows, so a matched
         prefix may lack it; a streaming turn borrowing its own record has it.
         """
-        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
 
