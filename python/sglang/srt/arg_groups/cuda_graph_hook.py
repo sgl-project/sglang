@@ -103,7 +103,7 @@ def parse_cuda_graph_config(server_args: Any):
 
 def apply_prefill_cp_cuda_graph_default(server_args: Any):
     """Select BCG for supported CP after the backend and topology resolve."""
-    from sglang.srt.layers.cp.bcg.bcg import supports_prefill_cp_bcg
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     cfg = resolving_view(server_args)
     # Preserve explicit graph choices, but enable supported CP paths even if
@@ -178,7 +178,7 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         is_deepseek_v4,
         uses_kda_attention,
     )
-    from sglang.srt.layers.cp.bcg.bcg import supports_prefill_cp_bcg
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
     rules = [
         (
