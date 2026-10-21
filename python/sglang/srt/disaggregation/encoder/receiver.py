@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -2611,7 +2611,7 @@ class MMReceiverBase(ABC):
             return flat
 
         def to_raw_url(mm_item):
-            if isinstance(mm_item, ImageData):
+            if isinstance(mm_item, (ImageData, VideoData)):
                 return mm_item.url
             if isinstance(mm_item, dict):
                 # tolerate {"url": ...} shaped payloads
