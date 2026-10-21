@@ -52,6 +52,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         output_streamer=Mock(),
         beam_coordinator=Mock(),
         abort_request=lambda *args, **kwargs: None,
+        policy=SimpleNamespace(update_finished_reqs_info=lambda req: None),
     )
 
 
