@@ -325,7 +325,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             core.clone(),
             &cfg.server_args,
         ));
-        let http_tokenizer = dyn_tokenizer.clone();
         let grpc_server = grpc_listener.map(|listener| {
             let service = api_server::grpc::service::GrpcService::new(
                 core.clone(),
@@ -360,7 +359,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         http_layer,
                         shutdown_rx.clone(),
                         hicache_manager,
-                        http_tokenizer,
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(

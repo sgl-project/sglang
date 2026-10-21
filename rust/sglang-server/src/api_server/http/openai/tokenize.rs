@@ -104,10 +104,17 @@ async fn tokenize(
         Ok(body) => body,
         Err(error) => return invalid_body(error.to_string()),
     };
+    let max_model_len = state.server_args.tokenizer_model_max_length;
+    let one = |tokens: TokenIds| {
+        json!({
+            "tokens": tokens,
+            "count": tokens.len(),
+            "max_model_len": max_model_len,
+        })
+    };
     let (texts, add_special_tokens) = match (body.prompt, body.messages) {
         (Some(prompt), None) => (prompt, body.add_special_tokens),
-        // The rendered template owns its special tokens, as on the chat path
-        // (Python encodes it with `add_special_tokens=False`).
+        // Encoded as on the chat path (Python's `add_special_tokens=False`).
         (None, Some(messages)) => {
             let rendered = match render_chat_prompt(&state, messages, body.rest) {
                 Ok(rendered) => rendered,
@@ -115,37 +122,16 @@ async fn tokenize(
                     return error_body(StatusCode::BAD_REQUEST, error_type, message);
                 }
             };
-            match &state.prompt_encoder {
-                // Encoded as the chat path does, keeping segments and the continuation apart.
-                Some(encoder) => {
-                    return match encoder.encode_blocking(rendered).await {
-                        Ok(tokens) => Json(json!({
-                            "tokens": tokens,
-                            "count": tokens.len(),
-                            "max_model_len": state.server_args.tokenizer_model_max_length,
-                        }))
-                        .into_response(),
-                        Err(message) => {
-                            error_body(StatusCode::BAD_REQUEST, "BadRequestError", message)
-                        }
-                    };
-                }
-                None => (
-                    OneOrMany::One(rendered.into_text()),
-                    false, /* add_special_tokens */
-                ),
-            }
+            return match state.core.tokenize_chat(rendered).await {
+                Ok(tokens) => Json(one(tokens)).into_response(),
+                Err(error) => core_error(error, "tokenization"),
+            };
         }
         _ => return invalid_body("Exactly one of 'prompt' or 'messages' must be provided."),
     };
-    let max_model_len = state.server_args.tokenizer_model_max_length;
     let response = match texts {
         OneOrMany::One(text) => match state.core.tokenize(text, add_special_tokens).await {
-            Ok(tokens) => json!({
-                "tokens": tokens,
-                "count": tokens.len(),
-                "max_model_len": max_model_len,
-            }),
+            Ok(tokens) => one(tokens),
             Err(error) => return core_error(error, "tokenization"),
         },
         OneOrMany::Many(texts) => {
@@ -202,7 +188,7 @@ fn render_chat_prompt(
     let Some(formatter) = &state.chat_formatter else {
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
-    render_chat(formatter, &body, &request, chat_template_kwargs.as_ref())
+    render_chat(formatter, body, &request, chat_template_kwargs.as_ref())
         .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
@@ -251,7 +237,7 @@ mod tests {
     use super::*;
     use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::ServerArgs;
-    use crate::message::request::RequestKind;
+    use crate::message::request::{RequestKind, TokenizeInput};
     use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -264,13 +250,19 @@ mod tests {
             while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
                 assert!(admission.try_accept());
                 let item = match &request.kind {
-                    RequestKind::Tokenize {
+                    RequestKind::Tokenize(TokenizeInput::Text {
                         text,
                         add_special_tokens,
-                    } => {
+                    }) => {
                         let bos = add_special_tokens.then_some(0);
                         let words = text.split_whitespace().map(|w| w.len() as i64);
                         ResponseItem::TokenIds(bos.into_iter().chain(words).collect())
+                    }
+                    RequestKind::Tokenize(TokenizeInput::Chat(chat)) => {
+                        let text = chat.as_ref().clone().into_text();
+                        ResponseItem::TokenIds(
+                            text.split_whitespace().map(|w| w.len() as i64).collect(),
+                        )
                     }
                     RequestKind::Detokenize {
                         token_ids,
@@ -311,7 +303,6 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            prompt_encoder: None,
         })
     }
 
