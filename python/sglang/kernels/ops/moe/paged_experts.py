@@ -57,19 +57,19 @@ def paged_experts_decide(
 def paged_experts_gather(
     hosts: torch.Tensor,
     gpus: torch.Tensor,
-    words: torch.Tensor,
+    row_bytes: torch.Tensor,
     src: torch.Tensor,
     dst: torch.Tensor,
     count: torch.Tensor,
 ) -> None:
     """Copy experts ``src[i]`` into slots ``dst[i]`` for ``i < count[0]``, for every paged tensor.
 
-    ``hosts``/``gpus``/``words`` are int64 GPU tensors with one entry per paged tensor: the UVA
+    ``hosts``/``gpus``/``row_bytes`` are int64 GPU tensors with one entry per paged tensor: the UVA
     device pointer of its pinned host store (``paged_experts_host_device_pointer``), the address of
-    its GPU table, and its size per expert in 4-byte words. Rows of a multiple of 16 bytes are
-    copied in 16-byte loads.
+    its GPU table, and its size per expert in bytes, even. Rows are copied in 16-byte loads when
+    their size allows, else in 4- or 2-byte loads.
     """
-    _jit_module().paged_experts_gather(hosts, gpus, words, src, dst, count)
+    _jit_module().paged_experts_gather(hosts, gpus, row_bytes, src, dst, count)
 
 
 def paged_experts_host_device_pointer(pinned: torch.Tensor) -> int:
