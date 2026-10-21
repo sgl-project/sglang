@@ -17,7 +17,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm, mmap_allocator
+from sglang.srt.mem_cache.storage.mmap import (
+    alloc_mmap,
+    alloc_shm,
+    mmap_allocator,
+    tensor_uses_hugepage,
+)
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
 
 
@@ -107,6 +112,43 @@ class TestMmapAllocator(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "C library"),
         ):
             mmap_allocator.alloc_mmap((4,), torch.float32)
+
+    def test_alloc_mmap_marks_only_hugepage_mappings(self):
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("off"),
+            envs.SGLANG_HUGEPAGE_SIZE.override(""),
+        ):
+            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+            self.assertFalse(tensor_uses_hugepage(buf))
+
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                return_value=(ctypes.c_uint8 * 16)(),
+            ),
+        ):
+            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+            self.assertTrue(tensor_uses_hugepage(buf))
+        # A freed buffer must not stay marked as hugepage-backed.
+        del buf
+        self.assertEqual(mmap_allocator._hugepage_storage_keys, set())
+
+        # Prefer-mode fallback to plain pages must not register as hugepage.
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("prefer"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            unittest.mock.patch.object(mmap_allocator, "_libc", object()),
+            unittest.mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                side_effect=OSError("no hugepages"),
+            ),
+        ):
+            buf = mmap_allocator.alloc_mmap((4,), torch.float32)
+            self.assertFalse(tensor_uses_hugepage(buf))
 
     def test_alloc_shm(self):
         dims = (10, 1024)
@@ -257,12 +299,16 @@ class TestHugetlbPool(unittest.TestCase):
                 with open(os.path.join(root, name, counter), "w") as f:
                     f.write(f"{value}\n")
 
-    def test_hugepage_size_requested_parses_the_env(self):
+    def test_hugepage_env_parsing(self):
         for raw, expected in {"": 0, "2MB": 2 * 1024**2, " 1gb ": 1024**3}.items():
             with self.subTest(raw=raw), envs.SGLANG_HUGEPAGE_SIZE.override(raw):
                 self.assertEqual(mmap_allocator.hugepage_size_requested(), expected)
+        with (
+            envs.SGLANG_HUGEPAGE_SIZE.override("4MB"),
+            self.assertLogs(mmap_allocator.logger, "WARNING"),
+        ):
+            self.assertEqual(mmap_allocator.hugepage_size_requested(), 0)
 
-    def test_hugepage_mode_defaults_and_parses_the_env(self):
         for raw_mode, size, expected in (
             ("", 0, mmap_allocator.HUGEPAGE_MODE_OFF),
             ("", 2 * 1024**2, mmap_allocator.HUGEPAGE_MODE_PREFER),
@@ -273,13 +319,6 @@ class TestHugetlbPool(unittest.TestCase):
                 envs.SGLANG_HUGEPAGE_MODE.override(raw_mode),
             ):
                 self.assertEqual(mmap_allocator.hugepage_mode(size), expected)
-
-    def test_unrecognized_hugepage_size_means_plain_pages(self):
-        with (
-            envs.SGLANG_HUGEPAGE_SIZE.override("4MB"),
-            self.assertLogs(mmap_allocator.logger, "WARNING"),
-        ):
-            self.assertEqual(mmap_allocator.hugepage_size_requested(), 0)
 
     def test_hugetlb_pool_free_bytes_reads_the_requested_pool(self):
         # sysfs keeps one pool per page size; MemAvailable excludes all of them.

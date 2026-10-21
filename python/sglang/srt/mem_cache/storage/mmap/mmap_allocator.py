@@ -45,12 +45,15 @@ _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
 
+HUGEPAGE_BYTES_2MB = 2 * 1024 * 1024
+HUGEPAGE_BYTES_1GB = 1024 * 1024 * 1024
+
 # Hugetlb pools as the kernel exposes them: one sysfs directory per page size.
 _HUGEPAGE_SYSFS_DIR = "/sys/kernel/mm/hugepages"
-_HUGEPAGE_SIZES = {"2MB": 2 * 1024 * 1024, "1GB": 1024 * 1024 * 1024}
+_HUGEPAGE_SIZES = {"2MB": HUGEPAGE_BYTES_2MB, "1GB": HUGEPAGE_BYTES_1GB}
 _HUGEPAGE_MMAP_FLAGS = {
-    2 * 1024 * 1024: _MAP_HUGETLB | _MAP_HUGE_2MB,
-    1024 * 1024 * 1024: _MAP_HUGETLB | _MAP_HUGE_1GB,
+    HUGEPAGE_BYTES_2MB: _MAP_HUGETLB | _MAP_HUGE_2MB,
+    HUGEPAGE_BYTES_1GB: _MAP_HUGETLB | _MAP_HUGE_1GB,
 }
 
 HUGEPAGE_MODE_OFF = "off"
@@ -61,6 +64,8 @@ _HUGEPAGE_MODES = {
     HUGEPAGE_MODE_PREFER,
     HUGEPAGE_MODE_REQUIRED,
 }
+
+_hugepage_storage_keys: set[int] = set()
 
 
 def hugepage_size_requested() -> int:
@@ -135,6 +140,17 @@ def hugetlb_pool_free_bytes() -> int:
     return free_bytes
 
 
+def _tensor_storage_key(tensor: torch.Tensor) -> int:
+    return tensor.untyped_storage().data_ptr()
+
+
+def _track_hugepage_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    key = _tensor_storage_key(tensor)
+    _hugepage_storage_keys.add(key)
+    weakref.finalize(tensor, _hugepage_storage_keys.discard, key)
+    return tensor
+
+
 def _mmap_page_size_and_flags(mode: str, hugepage_size: int) -> tuple[int, int]:
     if mode == HUGEPAGE_MODE_OFF or hugepage_size == 0:
         return mmap.PAGESIZE, 0
@@ -205,6 +221,19 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     return array
 
 
+def tensor_uses_hugepage(tensor) -> bool:
+    """Whether the tensor's mapping came from _alloc_hugepage (MAP_HUGETLB).
+
+    cudaHostRegister rejects hugetlb-backed ranges whose base or size is not
+    hugepage-aligned, so the registration path must know which buffers are
+    hugepage-backed -- a prefer-mode fallback to plain pages must not round up.
+    """
+    untyped_storage = getattr(tensor, "untyped_storage", None)
+    if untyped_storage is None:
+        return False
+    return untyped_storage().data_ptr() in _hugepage_storage_keys
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
     """Allocate a host tensor via anonymous mmap.
 
@@ -240,9 +269,11 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         else:
             try:
                 array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
-                return torch.frombuffer(
-                    array, dtype=dtype, count=math.prod(dims)
-                ).reshape(dims)
+                return _track_hugepage_tensor(
+                    torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(
+                        dims
+                    )
+                )
             except OSError as e:
                 error_message = (
                     f"Hugepage mmap via libc failed ({e}); "

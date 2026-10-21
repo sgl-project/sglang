@@ -297,7 +297,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             device=self.gpu_device,
         )
         available_bytes = host_memory_budget_bytes(
-            allocator=self.allocator, device=self.gpu_device
+            allocation_bytes,
+            allocator=self.allocator,
+            device=self.gpu_device,
         )
         if allocation_bytes > available_bytes:
             raise ValueError(
@@ -826,7 +828,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
             device=self.gpu_device,
         )
         available_bytes = host_memory_budget_bytes(
-            allocator=self.allocator, device=self.gpu_device
+            allocation_bytes,
+            allocator=self.allocator,
+            device=self.gpu_device,
         )
         if allocation_bytes > available_bytes:
             raise ValueError(

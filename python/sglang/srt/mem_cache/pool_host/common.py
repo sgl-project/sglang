@@ -13,7 +13,12 @@ from typing import Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, hugetlb_pool_free_bytes
+from sglang.srt.mem_cache.storage.mmap import (
+    alloc_mmap,
+    hugetlb_pool_free_bytes,
+    tensor_uses_hugepage,
+)
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import hugepage_size_requested
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_hip
 
@@ -163,6 +168,11 @@ def _cuda_host_register(
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
+    # cudaHostRegister requires hugetlb-backed ranges whose base or size are
+    # hugepage-aligned, so round the size up to the hugepage size.
+    hugepage_size = hugepage_size_requested() if tensor_uses_hugepage(buffer) else 0
+    if hugepage_size:
+        total = -(-total // hugepage_size) * hugepage_size
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
@@ -185,6 +195,23 @@ def _cuda_host_register(
         chunk_bytes = (
             chunk_limit_bytes // registration_granularity_bytes
         ) * registration_granularity_bytes
+    if hugepage_size:
+        page_aligned_chunk = max(chunk_bytes // hugepage_size, 1) * hugepage_size
+        if (
+            registration_granularity_bytes is not None
+            and page_aligned_chunk % registration_granularity_bytes != 0
+        ):
+            logger.warning(
+                "Hugepage rounding moved host-registration chunk boundaries off "
+                "the copy granularity (chunk=%d, granularity=%d, hugepage=%d); "
+                "a batched copy may span two registrations. Make "
+                "registration_granularity_bytes a multiple of the hugepage size "
+                "to keep every copy inside one registration.",
+                page_aligned_chunk,
+                registration_granularity_bytes,
+                hugepage_size,
+            )
+        chunk_bytes = page_aligned_chunk
     registered_ranges: list[tuple[int, int]] = []
     try:
         offset = 0

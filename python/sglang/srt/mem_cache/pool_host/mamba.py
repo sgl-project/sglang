@@ -439,6 +439,10 @@ class MambaPoolHost(HostKVCache):
                 token_layer_bytes * elem_size * self.conv_dtype.itemsize
                 for elem_size in self.conv_state_elem_sizes
             ),
+            *(
+                self.size * state[0].numel() * state.element_size()
+                for state in self.slot_state_device_tensors
+            ),
         ]
 
     @staticmethod

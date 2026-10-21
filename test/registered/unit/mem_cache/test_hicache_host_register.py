@@ -1,3 +1,4 @@
+import ctypes
 import gc
 import os
 import unittest
@@ -32,6 +33,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage.mmap import mmap_allocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -349,8 +351,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                # 4 pages x 11 B x 3 layers, booked against the budget scope.
                 budget.assert_called_once_with(
-                    allocator=pool.allocator, device=torch.device("cpu")
+                    132, allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -384,8 +387,9 @@ class TestHiCacheHostRegister(unittest.TestCase):
                         layout=layout,
                     )
 
+                # 4 pages x (ring 2 x 3 B slots) x 2 layers, scope-booked.
                 budget.assert_called_once_with(
-                    allocator=pool.allocator, device=torch.device("cpu")
+                    48, allocator=pool.allocator, device=torch.device("cpu")
                 )
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
@@ -587,6 +591,71 @@ class TestHiCacheHostRegister(unittest.TestCase):
         )
         for ptr, _, _ in cudart.registrations:
             self.assertEqual((ptr - base) % page_copy_bytes, 0)
+
+    def test_hugepage_buffer_registers_the_rounded_mapping(self):
+        mib = 1024**2
+        cudart = _FakeCudart()
+        with (
+            envs.SGLANG_HUGEPAGE_MODE.override("required"),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            mock.patch.object(
+                mmap_allocator,
+                "_alloc_hugepage",
+                return_value=(ctypes.c_uint8 * 16)(),
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            buffer = mmap_allocator.alloc_mmap((4,), torch.float32)
+            _cuda_host_register(buffer)
+            _cuda_host_unregister(buffer)
+
+        # 16 tensor bytes round up to one 2 MiB hugepage; the whole page must
+        # be registered, not the unaligned tensor size.
+        self.assertEqual(cudart.registrations, [(buffer.data_ptr(), 2 * mib, 0)])
+        self.assertEqual(cudart.unregistrations, [buffer.data_ptr()])
+
+    def test_hugepage_registration_chunks_align_to_the_page_size(self):
+        mib = 1024**2
+        two_mib = 2 * mib
+        base = 0x10000000
+        total = 3076 * mib  # 1538 whole 2 MiB hugepages
+        cudart = _FakeCudart()
+
+        with (
+            mock.patch.object(host_common, "tensor_uses_hugepage", return_value=True),
+            envs.SGLANG_HUGEPAGE_SIZE.override("2MB"),
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=1,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            # Raise a warning if the granularity-derived chunk is not hugepage-aligned.
+            with self.assertLogs(host_common.logger, level="WARNING") as logs:
+                _cuda_host_register(
+                    _FakeBuffer(base, total), registration_granularity_bytes=301 * mib
+                )
+            self.assertTrue(any("copy granularity" in line for line in logs.output))
+            # A page-multiple granularity keeps the grid and stays silent.
+            with self.assertNoLogs(host_common.logger, level="WARNING"):
+                _cuda_host_register(
+                    _FakeBuffer(base, total), registration_granularity_bytes=300 * mib
+                )
+
+        # 902, 902, 902, 370 MiB.
+        self.assertEqual(
+            cudart.registrations[:4],
+            [
+                (base, 902 * mib, 0),
+                (base + 902 * mib, 902 * mib, 0),
+                (base + 1804 * mib, 902 * mib, 0),
+                (base + 2706 * mib, 370 * mib, 0),
+            ],
+        )
+        for ptr, size, _ in cudart.registrations:
+            self.assertEqual((ptr - base) % two_mib, 0)
+            self.assertEqual(size % two_mib, 0)
 
     def test_null_pinned_allocation_raises(self):
         """On XPU a null pinned buffer must fail at allocation, not at first transfer."""

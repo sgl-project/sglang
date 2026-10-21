@@ -148,6 +148,8 @@ def host_memory_budget_bytes(
     hugepage policy and retain the plain-RAM budget. On supported paths,
     ``required`` uses only hugetlb; in ``prefer`` mode an unexpected hugetlb
     allocation failure may fall back to plain RAM that was not budgeted for.
+    When the hugepage policy applies the budget is handed out in whole pages,
+    matching the per-mapping round-up every allocation pays.
     """
     available = _host_memory_budget.get()
     if available is not None:
@@ -159,6 +161,7 @@ def host_memory_budget_bytes(
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
+    alignment = 0
     if _hugetlb_supported(allocator, device):
         size = hugepage_size_requested()
         mode = hugepage_mode(size)
@@ -173,7 +176,12 @@ def host_memory_budget_bytes(
             hugetlb_free = allocator.free_hugetlb_bytes()
             if hugetlb_free > 0:
                 free = max(free, hugetlb_free)
-    return free // ranks_per_host()
+        if mode != HUGEPAGE_MODE_OFF:
+            alignment = size
+    free //= ranks_per_host()
+    if alignment:
+        free = free // alignment * alignment
+    return free
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -292,6 +300,18 @@ class HostKVCache(abc.ABC):
         self.lock = threading.RLock()
         self.clear()
 
+    def _budget_device(self) -> Optional[Union[str, torch.device]]:
+        """Device the host-memory budget/hugetlb accounting dispatches on.
+
+        Buffer-info pools set ``_transfer_device`` before super().__init__();
+        older pools still register their device pool with the base class.
+        """
+        device = getattr(self, "_transfer_device", None)
+        if device is not None:
+            return device
+        pool = getattr(self, "device_pool", None)
+        return pool.device if pool is not None else None
+
     def _allocate_host_buffer(self) -> None:
         if self.size <= self.device_capacity_tokens:
             logger.warning(
@@ -304,13 +324,12 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
+        budget_device = self._budget_device()
         allocation_bytes = host_memory_allocation_bytes(
-            self.get_mapping_lengths(),
-            self.allocator,
-            self.device_pool.device,
+            self.get_mapping_lengths(), self.allocator, budget_device
         )
         available_bytes = host_memory_budget_bytes(
-            allocation_bytes, self.allocator, self.device_pool.device
+            allocation_bytes, self.allocator, budget_device
         )
         if allocation_bytes > available_bytes:
             raise ValueError(
