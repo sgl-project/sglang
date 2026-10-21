@@ -17,12 +17,13 @@ from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(5, "base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 
-class TestJsonSchemaConstraint(unittest.TestCase):
+class TestJsonSchemaConstraint(CustomTestCase):
     """Test JSON schema constraint generation for tool choices"""
 
     def setUp(self):
@@ -68,6 +69,28 @@ class TestJsonSchemaConstraint(unittest.TestCase):
                 ),
             ),
         ]
+
+    def test_parallel_tool_call_defaults(self):
+        """Null must not silently restrict required or named calls to one."""
+        named = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        calls = [
+            {"name": "get_weather", "parameters": {"location": "NYC"}},
+            {"name": "get_weather", "parameters": {"location": "LA"}},
+        ]
+        for choice in ("required", named):
+            for options, accepts_multiple in (
+                ({}, True),
+                ({"parallel_tool_calls": None}, True),
+                ({"parallel_tool_calls": True}, True),
+                ({"parallel_tool_calls": False}, False),
+            ):
+                with self.subTest(choice=choice, options=options):
+                    schema = get_json_schema_constraint(self.tools, choice, **options)
+                    validator = jsonschema.Draft202012Validator(schema)
+                    self.assertTrue(validator.is_valid(calls[:1]))
+                    self.assertEqual(validator.is_valid(calls), accepts_multiple)
 
     def test_required_tool_choice_schema(self):
         """Test schema generation for tool_choice='required'"""

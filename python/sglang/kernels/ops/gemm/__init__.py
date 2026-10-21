@@ -387,9 +387,7 @@ register_kernel(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
-        capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
-        ),
+        capabilities=_SM90 | _SM12X,
     )
 )
 register_kernel(
@@ -439,6 +437,22 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_moe_mtp_mma",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:nvfp4_moe_mtp_mma",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_nvfp4_moe",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:try_nvfp4_moe",
+        capabilities=_SM120,
     )
 )
 register_kernel(
@@ -508,6 +522,21 @@ register_kernel(
         op="gemm.muse_spark_router_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.split_fp32_to_bf16x3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.router_gemv:split_fp32_to_bf16x3",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemm_bf16x3_cublas",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
     )
 )

@@ -78,3 +78,17 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# Beam fused op, built per layer: inventoried through its class methods.
+for _bk in ("torch", "triton"):
+    register_kernel(
+        KernelSpec(
+            op="elementwise.beam_attention_gate",
+            backend=KernelBackend(_bk),
+            target="sglang.kernels.ops.elementwise.beam_fused:BeamAttentionGateOp."
+            + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+            capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+        )
+    )
+del _bk
