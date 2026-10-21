@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.common import build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -47,6 +48,7 @@ def _build_server_args(
     *,
     extension: Optional[ModuleType] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
+    default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -158,13 +160,18 @@ def _build_server_args(
             if get_serving().preferred_sampling_params is not None
             else None
         ),
+        default_max_new_tokens=default_max_new_tokens,
         lora_ids={
             ref.lora_name: ref.lora_id
             for ref in (get_lora().lora_paths or [])
             if ref.lora_name is not None
         },
         enable_strict_thinking=get_serving().enable_strict_thinking,
-        limit_mm_data_per_request=get_mm().limit_mm_data_per_request or {},
+        # A list of pairs keeps the configured order, which decides the error
+        # when several modalities are over their limit.
+        limit_mm_data_per_request=list(
+            (get_mm().limit_mm_data_per_request or {}).items()
+        ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
         # Not a `server_args` field: `TokenizerManager` derives it, and the

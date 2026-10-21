@@ -3833,8 +3833,6 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
-        if self.enable_fpm:
-            self._fpm_batch_t0 = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3959,8 +3957,6 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-            if self.enable_fpm:
-                ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -5112,11 +5108,18 @@ class Scheduler(
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+            if self.rust_server is not None:
+                # The zmq tokenizer socket is not consumed in Rust mode. Rust
+                # probes share one heartbeat, so one acknowledgement answers
+                # every probe skipped so far.
+                self.return_health_check_ipcs.clear()
+                self.rust_server.push_health_ack()
+            else:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=self.return_health_check_ipcs.popleft()
+                    )
                 )
-            )
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
