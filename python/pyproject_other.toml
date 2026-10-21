@@ -56,13 +56,13 @@ runtime_base = [
   "regex",
   "requests",
   "scipy",
-  "sentencepiece",
+  "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "tqdm",
-  "transformers==5.12.1",
+  "transformers==5.19.0",
   "uvicorn",
   "uvloop",
   "xxhash",
@@ -107,6 +107,11 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+# Monokernels for gfx950 (--monokernel-backend amd); the ROCm image checks out this pin too.
+monokernels_hip = [
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e07665c8b36f7d42a48f6615bacf911d0656f5c5",
+]
+
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
 #
@@ -114,6 +119,7 @@ tracing = [
 # in its compressed-tensors and torch pins. A dependency added here has to be
 # added there too; nothing enforces that.
 srt_hip = [
+  "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch",
   "petit_kernel==0.0.2",
@@ -126,8 +132,19 @@ srt_hip_rocm724 = [
   # torch<2.11, while 0.16.0 supports torch>=2.10.
   "compressed-tensors==0.16.0",
   "petit_kernel==0.0.2",
+  "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch==2.11.0",
+  "wave-lang==3.8.2",
+]
+
+# Same as srt_hip_rocm724 above except for the torch pin; keep them in step by
+# hand. ROCm 10.1 publishes no torch 2.11 wheel, so it has to be 2.12.
+srt_hip_rocm101 = [
+  "compressed-tensors==0.16.0",
+  "petit_kernel==0.0.2",
+  "sglang[runtime_common]",
+  "torch==2.12.0",
   "wave-lang==3.8.2",
 ]
 
@@ -143,6 +160,14 @@ diffusion_hip = [
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
+
+# https://docs.sglang.io/hardware-platforms/sail
+srt_sail = [
+  "sailify==1.0.0",
+  "sglang[runtime_common]",
+  "torch-for-sail",
+  "triton-for-sail",
+]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
@@ -162,7 +187,7 @@ srt_musa = [
   "torch==2.11.0.post1+musa5.2.0",
   "torch-c-dlpack-ext==0.1.5",
   "torch_musa==2.11.0.post1+musa5.2.0",
-  "torchada>=0.1.86",
+  "torchada>=0.1.90",
   "torchaudio==2.11.0+musa5.2.0",
   "torchvision==0.26.0.post1+musa5.2.0",
   "triton==3.2.0",
@@ -178,7 +203,7 @@ diffusion_musa = [
 
 # https://docs.sglang.io/hardware-platforms/apple_metal
 srt_mps = [
-    "mlx>=0.32.0",
+    "mlx>=0.32.4",
     "mlx-lm",
     "sglang[runtime_common]",
     "torch==2.13.0",
@@ -216,13 +241,17 @@ test = [
 
 all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
 all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
+all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
+all_sail = ["sglang[srt_sail]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
+dev_hip_rocm101 = ["sglang[all_hip_rocm101]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_sail = ["sglang[all_sail]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
 
@@ -247,6 +276,10 @@ rust-extensions = ["multimodal"]
   "srt/**/*",
   "kernels/**/*"
 ]
+
+[tool.setuptools.exclude-package-data]
+# .claude/skills is a directory symlink; setuptools build_py cannot copy it.
+"sglang.multimodal_gen" = [".claude/*"]
 
 [tool.setuptools.packages.find]
 exclude = [

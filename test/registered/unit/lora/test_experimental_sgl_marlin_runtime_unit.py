@@ -189,6 +189,7 @@ def _run_marlin_flow(
         fused_tails=0,
         marlin_is_ep=[],
         marlin_output_ids=[],
+        marlin_output_initialized=[],
         align_num_experts=[],
         schedule=[],
         zeroed=[],
@@ -248,6 +249,15 @@ def _run_marlin_flow(
         return _ORIGINAL_TENSOR_ZERO(tensor, *args, **kwargs)
 
     monkeypatch.setattr(torch.Tensor, "zero_", tracked_zero)
+    original_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        result = original_empty(*args, **kwargs)
+        if result.is_floating_point():
+            result.fill_(float("nan"))
+        return result
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
 
     def merged_experts_fused_moe_lora_add(**kwargs):
         intermediate = kwargs.get("intermediate_buffer")
@@ -273,7 +283,7 @@ def _run_marlin_flow(
     )
     _stub_module(
         monkeypatch,
-        "sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts",
+        "sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts",
         merged_experts_fused_moe_lora_add=merged_experts_fused_moe_lora_add,
     )
     _stub_module(
@@ -298,11 +308,13 @@ def _run_marlin_flow(
     def fake_marlin_gemm(_x, output, *_args, **kwargs):
         calls.marlin_is_ep.append(kwargs["is_ep"])
         calls.marlin_output_ids.append(id(output))
+        calls.marlin_output_initialized.append(
+            bool(torch.isfinite(output).all() and torch.count_nonzero(output) == 0)
+        )
         calls.schedule.append(
             ("marlin", stream_state["current"].name, len(calls.marlin_is_ep))
         )
-        # ``fill_``, never ``zero_``: the zero-fill contracts are asserted by
-        # watching ``Tensor.zero_`` calls, so the fakes must not forge one.
+        # Inspect initialization before the fake GEMM writes its result.
         output.fill_(0)
         return output
 
@@ -410,22 +422,14 @@ def _run_marlin_flow(
 
 
 def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
-    """Guards expert-parallel index localization and both accumulator clears;
-    reds when ``moe_align_block_size`` gets the global expert count, ``is_ep``
-    is dropped on a Marlin GEMM, or an accumulator is left uninitialized."""
+    """EP alignment stays local and the down accumulator starts finite and zero."""
 
     calls = _run_marlin_flow(monkeypatch, tokens=16, ep=True, slots=2, rank=128)
 
     assert calls.align_num_experts == [1]
     assert calls.marlin_is_ep == [True, True]
 
-    down_gemm_output = calls.marlin_output_ids[1]
-    assert [item[2] for item in calls.zeroed] == [down_gemm_output]
-    zero_index = calls.schedule.index(("zero", "main", down_gemm_output))
-    down_gemm_index = [
-        index for index, item in enumerate(calls.schedule) if item[0] == "marlin"
-    ][1]
-    assert zero_index < down_gemm_index
+    assert calls.marlin_output_initialized[1]
 
     down_stage = [
         call for call in calls.merged if call["stage"] == "all" and call["shared_b"]

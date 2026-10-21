@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -34,6 +34,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftSWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -45,7 +46,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_device,
-    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -79,6 +79,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
     rotate_input_ids,
     stash_append_boundary_state_triton,
 )
+from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -98,7 +99,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.profile_utils import build_step_span_name
 
@@ -107,6 +108,7 @@ _is_cpu = is_cpu()
 
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
@@ -190,9 +192,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         ]
         # Retain the target's attention topology when swapping TP groups.
         self.draft_owns_attention = False
-        self.draft_tp_context = (
-            draft_tp_context if get_parallel().enable_dp_attention else empty_context
-        )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -221,10 +220,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_runner_list[0].tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
         ):
             super().init_attention_backends()
@@ -232,10 +228,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            self.draft_tp_context(
-                self.draft_runner_list[0].tp_group,
-                owns_attention=self.draft_owns_attention,
-            ),
+            draft_tp_context(self.draft_owns_attention),
             speculative_moe_backend_context(),
         ):
             super().init_cuda_graphs()
@@ -367,9 +360,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_runner = self.target_worker.model_runner
         # Share the embedding and lm_head
         for i in range(self.speculative_num_steps):
+            embed, head = resolve_draft_embed_and_head(
+                target_model=target_runner.model,
+                draft_model=self.draft_runner_list[i].model,
+                model_path=target_runner.model_config.model_path,
+                revision=target_runner.model_config.revision,
+                load_config=target_runner.load_config,
+            )
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
@@ -400,6 +400,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner_list[
                     step
                 ].attn_backend = self.draft_extend_attn_backend_list[-1]
+            # Boot guard: every backend a draft forward reaches must carry
+            # its runner's translator or the index builders emit virtual ids.
+            translator = self.draft_runner_list[step].kv_index_translator
+            if translator.is_translating:
+                translator.bind_and_verify_backends(
+                    [self.draft_extend_attn_backend_list[-1]]
+                )
 
     def _capture_cuda_graphs(self):
         self.cuda_graph_runner = None
@@ -455,7 +462,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
     def draft(self, batch: ScheduleBatch):
         draft_input: EagleDraftInput = batch.spec_info
-        forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+        forward_batch, can_run_decode_cuda_graph, kv_loc_plan = prepare_for_draft(
             draft_input,
             self.req_to_token_pool,
             batch,
@@ -463,12 +470,14 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0],
             self.topk,
             self.speculative_num_steps,
+            target_translator=self.target_worker.model_runner.kv_index_translator,
+            num_draft_tokens=self.speculative_num_draft_tokens,
         )
 
         # Run draft
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -482,6 +491,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if kv_loc_plan is not None:
+            # Verify and draft extend write the window the draft planned.
+            verify_input.kv_loc_plan = kv_loc_plan
+            verify_input.prepared_out_cache_loc = kv_loc_plan.write_virtual
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -574,14 +588,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return
         seen = set()
         for runner in self.draft_runner_list:
-            pool = runner.req_to_token_pool.mamba_pool
+            req_pool = runner.req_to_token_pool
+            pool = req_pool.mamba_pool
             if id(pool) in seen:
                 continue
             seen.add(id(pool))
+            # The pool is a PHYSICAL store; a unified req pool hands out
+            # virtual slot ids (identity on a static pool).
             if clear is not None and len(clear) > 0:
-                pool.clear_slots(clear)
+                pool.clear_slots(req_pool.translate_mamba_indices(clear))
             if cow_src is not None and len(cow_src) > 0:
-                pool.copy_from(cow_src, cow_dst)
+                pool.copy_from(
+                    req_pool.translate_mamba_indices(cow_src),
+                    req_pool.translate_mamba_indices(cow_dst),
+                )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
@@ -591,6 +611,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         """
         Run draft model extend to correctly fill the KV cache.
@@ -599,6 +620,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             batch: The batch to run.
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
+            kv_loc_plan: The target prefill's plan; the draft writes the same
+                slots.
         """
         # The draft embed clamps unconditionally (to tolerate multimodal pad
         # sentinels), so probe next_token_ids here first -- otherwise a corrupted id
@@ -636,6 +659,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner_list[0],
             capture_hidden_mode=draft_capture_hidden_mode,
             return_hidden_states_before_norm=True,
+            kv_loc_plan=kv_loc_plan,
         )
 
         self._apply_deferred_mamba_init_to_draft_pools(forward_batch)
@@ -761,11 +785,20 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 draft_token_num=self.speculative_num_draft_tokens,
                 device=batch.device,
             )
+        seq_lens = batch.seq_lens + self.speculative_num_draft_tokens
         runner.stage_shared_reads(
-            seq_lens=batch.seq_lens + self.speculative_num_draft_tokens,
+            seq_lens=seq_lens,
             req_pool_indices=batch.req_pool_indices,
             out_cache_loc=locs,
             positions=positions,
+            # Both loc sources read req_to_token untranslated: `locs` is virtual.
+            out_cache_loc_virtual=locs,
+            kv_loc_plan=self.draft_runner_list[0].kv_index_translator.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=None,
+                write_virtual=locs,
+            ),
         )
         return True
 
@@ -775,6 +808,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         batch_result: GenerationBatchResult,
         *,
         staged: bool = False,
+        kv_loc_plan: Optional[KVLocPlan] = None,
     ):
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
@@ -818,6 +852,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 return_hidden_states_before_norm=True,
                 widened_out_cache_loc=boundary_kv_locs,
                 widened_positions=boundary_kv_positions,
+                kv_loc_plan=kv_loc_plan,
             )
 
         if self.plan_stream:
@@ -1064,6 +1099,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             ),
         )
 
+    @property
+    def draft_swa_window(self) -> int:
+        # The widened extend starts front rows below the committed length, and
+        # each depth reads its own window back from there.
+        draft = self._draft_worker
+        windows = [
+            runner.sliding_window_size
+            for runner in draft.draft_runner_list
+            if isinstance(runner.token_to_kv_pool, UnifiedDraftSWAKVPool)
+        ]
+        if not windows:
+            return 0
+        return max(windows) + draft.draft_extend_num_front_tokens
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1083,7 +1132,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=target_capture_mode,
+                return_kv_loc_plan=True,
             )
+            kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
@@ -1098,6 +1149,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
+                kv_loc_plan=kv_loc_plan,
             )
             return batch_output
         else:
@@ -1126,7 +1178,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(
-                batch, batch_output, staged=staged
+                batch,
+                batch_output,
+                staged=staged,
+                kv_loc_plan=verify_input.kv_loc_plan,
             )
             return batch_output
 

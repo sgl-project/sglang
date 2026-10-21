@@ -22,20 +22,32 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+import sglang.srt.models.deepseek_v4_replay_tail as replay_tail
 from sglang.srt.layers.moe import utils as moe_utils
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     compute_local_num_token_non_padded,
     compute_local_num_token_non_padded_cpu,
+    enable_num_token_non_padded,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_forward_context,
+    has_forward_context,
+)
+from sglang.srt.model_executor.runner.row_bucket_graph_runner import (
+    RowBucketGraphRunner,
+)
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,7 +66,7 @@ def sparse_moe_input(rows):
             "is_moe_input_scattered_across_dp_ranks", return_value=local
         ),
         patch_communicator("is_enable_moe_cp_allgather", return_value=rows == "moe_cp"),
-        patch_communicator("_gathers_over_attention_cp", return_value=False),
+        patch_communicator("_cp_gathers_over_attn_cp", return_value=False),
     ):
         yield
 
@@ -233,6 +245,203 @@ class TestMoeNumTokenNonPaddedTable(CustomTestCase):
                 sparse_moe_input(mode),
             ):
                 self.assertIsNone(_value(_forward_batch(sharded=False, local=None)))
+
+
+class TestEnableNumTokenNonPadded(CustomTestCase):
+    def test_customized_a2a_backend_fills_the_count_at_ep1(self):
+        """At EP 1 without a WORLD-group DP gather, the customized backend
+        enables the count and `none` leaves it disabled."""
+        for backend, expected in (
+            (MoeA2ABackend.NONE, False),
+            (MoeA2ABackend.CUSTOMIZED, True),
+        ):
+            with (
+                self.subTest(backend=backend.value),
+                get_parallel().override(moe_ep_size=1),
+                get_flags().moe.override(a2a_backend=backend),
+                get_flags().dp.override(use_world_group_for_gather=False),
+            ):
+                self.assertIs(enable_num_token_non_padded(), expected)
+
+
+class TestRowBucketMoeBound(CustomTestCase):
+    def test_capture_owns_the_moe_bound_and_restores_the_outer_context(self):
+        """A bucket's recorded routing must retain its own mutable count buffer."""
+        for active_context in (False, True):
+            with (
+                self.subTest(active_context=active_context),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                sparse_moe_input("local"),
+            ):
+                outer_batch = _forward_batch(sharded=False, local=3, glob=3)
+                outer = ForwardContext(attn_backend=None)
+                scope = (
+                    forward_context(outer, forward_batch=outer_batch)
+                    if active_context
+                    else nullcontext()
+                )
+                observed = []
+
+                def body(inputs, capture_batch):
+                    if active_context:
+                        bound = get_forward_context().moe_num_token_non_padded()
+                        self.assertIs(bound, capture_batch.num_token_non_padded)
+                        observed.append(bound)
+                    else:
+                        self.assertFalse(has_forward_context())
+                    return inputs
+
+                def record(body, rows, count, batch, start, free_before):
+                    body()
+                    return SimpleNamespace(batch=(), num_token_non_padded=count)
+
+                runner = RowBucketGraphRunner(row_step=8, max_rows=8, label="test")
+                with (
+                    scope,
+                    patch.object(torch.cuda, "mem_get_info", return_value=(1, 2)),
+                    patch.object(runner, "_record", side_effect=record),
+                ):
+                    graph = runner._capture(
+                        8,
+                        3,
+                        [torch.zeros(8, 1)],
+                        outer_batch,
+                        body,
+                        lambda batch, inputs: nullcontext(),
+                    )
+                    graph.num_token_non_padded.fill_(7)
+                    outer_batch.num_token_non_padded.fill_(1)
+                    if active_context:
+                        self.assertEqual(int(observed[0]), 7)
+                        self.assertIs(
+                            get_forward_context().moe_num_token_non_padded(),
+                            outer_batch.num_token_non_padded,
+                        )
+                self.assertFalse(has_forward_context())
+
+
+class TestDecoderReplayTailMoeBound(CustomTestCase):
+    # A row graph replaces LOCAL only, so even equal-valued or aliased GLOBAL
+    # buffers cannot establish that the captured getter reads its own count.
+    _CASES = (
+        ("local", False, 3, 7, False, True),
+        ("global", True, 3, 7, False, False),
+        ("equal_global", True, 3, 3, False, False),
+        ("aliased_local", False, 3, 3, True, False),
+        ("aliased_global", True, 3, 3, True, False),
+        ("unbounded_global", True, 3, None, False, True),
+        ("absent_local", True, None, 7, False, True),
+    )
+
+    @staticmethod
+    def _batch_and_tail(sharded, local, glob, alias):
+        batch = _forward_batch(
+            sharded=sharded, local=local, glob=glob, forward_mode=ForwardMode.EXTEND
+        )
+        batch.input_ids = torch.arange(4)
+        if alias:
+            batch.global_num_token_non_padded = batch.num_token_non_padded
+        tail = SimpleNamespace(
+            positions=torch.arange(3), cp_metadata=None, rows=lambda t: t[:3]
+        )
+        return batch, tail
+
+    def test_eager_prefill_declines_a_separate_moe_count_buffer(self):
+        for label, sharded, local, glob, alias, expected in self._CASES:
+            with (
+                self.subTest(bound=label),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                sparse_moe_input("ffn"),
+            ):
+                batch, tail = self._batch_and_tail(sharded, local, glob, alias)
+                original_global = batch.global_num_token_non_padded
+                tail_layers = replay_tail.DecoderReplayTail.__new__(
+                    replay_tail.DecoderReplayTail
+                )
+                tail_layers.runner = SimpleNamespace(
+                    ready=Mock(), warm=True, bucket_rows=lambda n: 8
+                )
+                with (
+                    patch.object(
+                        replay_tail, "get_is_capture_mode", return_value=False
+                    ),
+                    patch.object(
+                        replay_tail,
+                        "get_global_expert_distribution_recorder",
+                        return_value=SimpleNamespace(recording=False),
+                    ),
+                    patch(
+                        "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+                        return_value=False,
+                    ),
+                ):
+                    use_graph, dp_rows = tail_layers.plan(
+                        tail,
+                        forward_batch=batch,
+                        num_tokens=4,
+                        tail_in_graph=False,
+                        late_dp_counts=None,
+                    )
+                self.assertEqual(use_graph, expected)
+                self.assertIsNone(dp_rows)
+                self.assertIs(batch.global_num_token_non_padded, original_global)
+
+    def test_prefill_graph_break_keeps_a_separate_moe_count_eager(self):
+        for label, sharded, local, glob, alias, expected in self._CASES:
+            with (
+                self.subTest(bound=label),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                sparse_moe_input("ffn"),
+            ):
+                batch, tail = self._batch_and_tail(sharded, local, glob, alias)
+                original_global = batch.global_num_token_non_padded
+                output = torch.tensor([11])
+                tail_layers = SimpleNamespace(
+                    runner=SimpleNamespace(warm=True, bucket_rows=lambda n: 8),
+                    _can_capture_moe_bound=(
+                        replay_tail.DecoderReplayTail._can_capture_moe_bound
+                    ),
+                    run=Mock(return_value=(output, None, [])),
+                    _run_layers_eagerly=Mock(return_value=(output, None, [])),
+                    _bridge_outputs=lambda rows, outputs: tuple(outputs),
+                )
+                backend = SimpleNamespace(
+                    forward_metadata=SimpleNamespace(late_layer_tail=tail),
+                    exit_late_layer_tail=Mock(),
+                )
+                with (
+                    patch.object(replay_tail, "get_attn_backend", return_value=backend),
+                    patch.object(
+                        replay_tail,
+                        "get_tc_piecewise_forward_context",
+                        return_value=SimpleNamespace(forward_batch=batch),
+                    ),
+                    patch.object(
+                        replay_tail,
+                        "_enter_eager_tail_in_prefill_graph",
+                        return_value=(None, batch),
+                    ),
+                    get_flags().dp.override(capturing_prefill_graph=False),
+                ):
+                    outputs = replay_tail._tail_layers_in_prefill_graph(
+                        tail_layers,
+                        lambda tensors: tensors,
+                        False,
+                        4,
+                        None,
+                        False,
+                        [torch.zeros(4, 1)],
+                        torch.arange(4),
+                        batch.input_ids,
+                        batch.input_ids,
+                    )
+                self.assertIs(outputs[0], output)
+                self.assertEqual(tail_layers.run.call_count, expected)
+                self.assertEqual(
+                    tail_layers._run_layers_eagerly.call_count, not expected
+                )
+                backend.exit_late_layer_tail.assert_called_once_with(None, batch)
+                self.assertIs(batch.global_num_token_non_padded, original_global)
 
 
 if __name__ == "__main__":

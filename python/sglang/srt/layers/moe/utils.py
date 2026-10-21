@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import NamedTuple
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -79,6 +80,9 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_mori_epv2(self):
+        return self.is_mori() and envs.SGLANG_MORI_EP_V2.get()
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
@@ -375,11 +379,9 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 5. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
-    if (
-        get_moe_runner_backend().is_flashinfer_cutedsl()
-        or get_moe_runner_backend().is_cutlass()
-        or get_moe_runner_backend().is_humming()
+    backend = self.runner_backend
+    if backend is not None and (
+        backend.is_flashinfer_cutedsl() or backend.is_cutlass() or backend.is_humming()
     ):
         return DispatcherOutputDtype.BF16
 
@@ -440,6 +442,27 @@ def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
     )
 
 
+# Only flashinfer_megamoe is special-cased: its global-expert-id dispatch
+# assumes quantized layers, which draft (MTP/NextN) layers typically are not.
+# DeepGEMM megamoe (a2a "megamoe") falls back per-layer when its weights
+# are not prepared, so drafts can inherit it. A quantized draft that wants
+# flashinfer_megamoe must set the --speculative-moe-* flags explicitly.
+def _default_speculative_a2a_backend(
+    target_a2a_backend: MoeA2ABackend,
+) -> MoeA2ABackend:
+    if target_a2a_backend.is_flashinfer_megamoe():
+        return MoeA2ABackend.NONE
+    return target_a2a_backend
+
+
+def _default_speculative_moe_runner_backend(
+    target_runner_backend: MoeRunnerBackendLike,
+) -> MoeRunnerBackendLike:
+    if target_runner_backend.is_flashinfer_megamoe():
+        return MoeRunnerBackend.FLASHINFER_TRTLLM
+    return target_runner_backend
+
+
 def initialize_moe_config():
     """Seed the MoE runtime flags from the published configuration.
 
@@ -457,12 +480,12 @@ def initialize_moe_config():
     moe.speculative_runner_backend = (
         resolve_moe_runner_backend(spec.speculative_moe_runner_backend)
         if spec.speculative_moe_runner_backend is not None
-        else moe.runner_backend
+        else _default_speculative_moe_runner_backend(moe.runner_backend)
     )
     moe.speculative_a2a_backend = (
         MoeA2ABackend(spec.speculative_moe_a2a_backend)
         if spec.speculative_moe_a2a_backend is not None
-        else moe.a2a_backend
+        else _default_speculative_a2a_backend(moe.a2a_backend)
     )
     moe.deepep_mode = DeepEPMode(exec_moe.deepep_mode)
     moe.deepep_config = exec_moe.deepep_config or ""
@@ -476,12 +499,6 @@ def initialize_moe_config():
     moe.tbo_token_distribution_threshold = overlap.tbo_token_distribution_threshold
     moe.disable_fp4_allgather = exec_moe.disable_flashinfer_cutlass_moe_fp4_allgather
     moe.quantization = get_model().quantization
-    # Seeded with the user's intent; each model's gate refines the ACTIVE
-    # value for its own build (install_shared_experts_fusion_decision).
-    moe.disable_shared_experts_fusion = exec_moe.disable_shared_experts_fusion
-    moe.speculative_disable_shared_experts_fusion = (
-        exec_moe.disable_shared_experts_fusion
-    )
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -519,82 +536,78 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
 
 
 def is_shared_experts_fusion_disabled() -> bool:
-    """The ACTIVE shared-experts-fusion decision for the model being built.
+    return get_model().shared_experts.fusion_disabled
 
-    Written (both ways) by each MoE model's gate before its layers construct;
-    falls back to the config intent when no gate has run (models without an
-    auto-disable gate read the intent directly off the bag instead).
 
-    Construction-time only: a forward reads what its build baked in
-    (``num_fused_shared_experts`` on the layer). During a draft's build this
-    flag holds the DRAFT's decision, so a forward-time read would race the
-    build window — refuse it loudly."""
-    from sglang.srt.model_executor.forward_context import has_forward_context
-
-    if has_forward_context():
-        raise AssertionError(
-            "is_shared_experts_fusion_disabled() called inside a forward: the "
-            "fusion decision is construction-time state (it can hold the draft's "
-            "value while a draft builds). Read the value your build baked in, "
-            "e.g. the layer's num_fused_shared_experts."
-        )
-    moe = get_flags().moe
-    if moe.disable_shared_experts_fusion is None:
-        return get_exec().moe.disable_shared_experts_fusion
-    return moe.disable_shared_experts_fusion
+def get_num_fused_shared_experts() -> int:
+    return get_model().shared_experts.num_fused_shared_experts
 
 
 @contextmanager
 def draft_model_build_scope():
-    """Brackets a draft model's CONSTRUCTION: the gates it runs record their
-    fusion decision on the speculative leaf as well, and the target's ACTIVE
-    value returns on exit.
+    """Brackets a draft model's CONSTRUCTION with the draft's construction-time
+    settings; every value below returns to the target's on exit, including on
+    error.
+
+    - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
+      Boundaries built here keep the resolved value after exit.
+    - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
+      when set, else inherited. ``FusedMoE`` layers built here keep the
+      draft's MegaMoE MMA type after exit.
 
     Deliberately does not touch ``runner_backend`` — swapping that is
     ``speculative_moe_backend_context``'s job and has to bracket the draft's
     whole lifecycle (build + capture + forward), which not every worker does.
     """
     moe = get_flags().moe
-    original_fusion = moe.disable_shared_experts_fusion
     original_scope = moe.in_speculative_scope
     try:
         moe.in_speculative_scope = True
-        yield
+        # Boundaries capture this resolved preference while the draft builds.
+        # Restoring it cannot change an already constructed target plan.
+        with (
+            get_exec().comm.override(
+                boundary_reduction=get_spec().speculative_boundary_reduction
+            ),
+            _draft_w4a4_mxfp4_megamoe_override(),
+        ):
+            yield
     finally:
         moe.in_speculative_scope = original_scope
-        moe.disable_shared_experts_fusion = original_fusion
 
 
-def install_shared_experts_fusion_decision(
+def _draft_w4a4_mxfp4_megamoe_override() -> AbstractContextManager:
+    # FusedMoE pins its MegaMoE MMA type at construction, so the draft's layers
+    # keep this value after the scope exits.
+    draft_w4a4 = get_spec().speculative_enable_w4a4_mxfp4_megamoe
+    if draft_w4a4 is None:
+        return nullcontext()
+    return get_exec().moe.override(enable_w4a4_mxfp4_megamoe=draft_w4a4)
+
+
+def resolve_shared_experts_config(
     model_class, hf_config, quant_config
-) -> None:
-    """Decide whether this runner's model fuses its shared experts, and install
-    the answer for the model it is about to build.
-
-    Called from the loader's single model-instantiation point, so the decision
-    is made once per runner — before any layer exists — and the model classes
-    are pure readers (``is_shared_experts_fusion_disabled``). A model family
-    that can auto-disable exposes the conditions as
-    ``shared_experts_fusion_disable_reason(hf_config, quant_config)``; families
-    without one follow the user's intent.
-
-    Inside ``draft_model_build_scope`` the answer also lands on the speculative
-    leaf, so a flags dump afterwards shows both runners' decisions.
-    """
-
+) -> SharedExpertsConfig:
+    """Resolve a model layout before construction; fusion requires both hooks."""
     disabled = get_exec().moe.disable_shared_experts_fusion
+    gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
     if not disabled:
-        gate = getattr(model_class, "shared_experts_fusion_disable_reason", None)
         reason = gate(hf_config, quant_config) if gate is not None else None
         if reason:
             log_info_on_rank0(
                 logger, f"{reason} Shared experts fusion optimization is disabled."
             )
             disabled = True
-    moe = get_flags().moe
-    moe.disable_shared_experts_fusion = disabled
-    if moe.in_speculative_scope:
-        moe.speculative_disable_shared_experts_fusion = disabled
+    count_fusable = getattr(model_class, "num_fusable_shared_experts", None)
+    if disabled or gate is None or count_fusable is None:
+        num_fused = 0
+    else:
+        num_fused = count_fusable(hf_config)
+    return SharedExpertsConfig(
+        fusion_disabled=disabled,
+        num_fused_shared_experts=num_fused,
+        use_waterfill=num_fused > 0 and get_exec().moe.enable_waterfill,
+    )
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -644,9 +657,9 @@ def uses_per_rank_fused_shared_slots() -> bool:
     return is_deepep_class_backend() or get_moe_a2a_backend().is_megamoe()
 
 
-def has_per_rank_fused_shared_slots(num_fused_shared_experts: int) -> bool:
-    """Check whether this layer has fused shared experts in per-rank slots."""
-    return num_fused_shared_experts > 0 and uses_per_rank_fused_shared_slots()
+def has_per_rank_fused_shared_slots(num_shared: int) -> bool:
+    """Whether the backend gives each rank its own fused shared-expert slots."""
+    return num_shared > 0 and uses_per_rank_fused_shared_slots()
 
 
 def is_flashinfer_cutedsl_v1_path() -> bool:
@@ -703,9 +716,10 @@ def is_moe_input_scattered_across_dp_ranks() -> bool:
 
 def should_use_dp_reduce_scatterv():
     """
-    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
-    with EP, replacing the default all-reduce + dp_scatter path.
-    Only changes the combine (post-kernel) communication; dispatch is unchanged.
+    Whether the parallel configuration allows reduce_scatterv for returning an
+    FFN output over attention DP (DP attention with EP), replacing the default
+    all-reduce + dp_scatter path; a stage boundary also needs boundary_reduction
+    rsv or rs+rsv. Only that post-expert return changes; dispatch is unchanged.
 
     The reduce_scatterv group is the global TP group, while its variable split
     sizes are one entry per attention-DP rank. Therefore this optimization is
@@ -725,12 +739,10 @@ def should_use_dp_reduce_scatterv():
 def should_skip_mlp_all_reduce() -> bool:
     """Whether dense MLP / row-parallel projections should skip their all-reduce.
 
-    True when the decoder published ``fuse_mlp_allreduce`` (next residual+LN
-    absorbs the AR) or ``mlp_reduce_scatter`` (postprocess will reduce-scatter)
-    on ``get_forward()``.
+    True when the decoder published ``mlp_reduce_scatter`` (postprocess will
+    reduce-scatter) on ``get_forward()``.
     """
-    f = get_forward()
-    return f.fuse_mlp_allreduce or f.mlp_reduce_scatter
+    return get_forward().mlp_reduce_scatter
 
 
 def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
@@ -743,8 +755,13 @@ def post_experts_output_is_complete(*, is_tp_path: bool) -> bool:
     """
     if get_parallel().dwdp_size > 1:
         return True
-    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
-        # The combine reduce-scatters back to the local tokens.
+    if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        # The standard dispatcher all-gathers tokens and reduce-scatters the
+        # expert outputs over _TP, which spans the whole EP group
+        # (moe_ep_size == attn_dp_size), so both post-experts sums are already
+        # done. An extra EP all-reduce would reduce DP-local outputs of
+        # different tokens, and mismatched token counts across ranks crash or
+        # hang the collective.
         return True
     a2a = get_moe_a2a_backend()
     # The flashinfer and pplx combines, and the megamoe kernel's internal
@@ -759,10 +776,8 @@ def should_skip_post_experts_all_reduce(*, is_tp_path: bool) -> bool:
 
     Pass ``is_tp_path=True`` for the TP all-reduce, ``False`` for the EP one.
     """
-    return (
-        should_skip_mlp_all_reduce()
-        or should_use_dp_reduce_scatterv()
-        or post_experts_output_is_complete(is_tp_path=is_tp_path)
+    return should_skip_mlp_all_reduce() or post_experts_output_is_complete(
+        is_tp_path=is_tp_path
     )
 
 
@@ -794,6 +809,18 @@ def should_add_replicated_moe_output() -> bool:
     return not (parallel.tp_size > 1 and summed_later and parallel.tp_rank != 0)
 
 
+def adds_replicated_output_to_partial() -> bool:
+    """For a MoE block whose stage boundary completes its sum: whether this rank
+    adds an output every TP rank holds in full, such as a shared expert
+    replicated with tp_size=1, to its MoE output. While the output still owes a
+    TP sum, only TP rank 0 adds it, so the sum counts it once."""
+    parallel = get_parallel()
+    owes_sum = parallel.tp_size > 1 and not post_experts_output_is_complete(
+        is_tp_path=True
+    )
+    return not owes_sum or parallel.tp_rank == 0
+
+
 def can_merge_post_experts_all_reduce() -> bool:
     """Whether the EP and MoE-TP reductions can collapse into one _TP all-reduce.
 
@@ -815,18 +842,36 @@ def post_experts_all_reduce(hidden_states: torch.Tensor) -> torch.Tensor:
     sequential ones, which also restores the invariant the fused residual+LN path
     depends on.
     """
+    parallel = get_parallel()
+    return _post_experts_sum(
+        hidden_states,
+        reduce_ep=parallel.moe_ep_size > 1
+        and not should_skip_post_experts_all_reduce(is_tp_path=False),
+        reduce_tp=parallel.moe_tp_size > 1
+        and not should_skip_post_experts_all_reduce(is_tp_path=True),
+    )
+
+
+def sum_post_experts_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Complete the sum a MoE output owes over the EP and MoE-TP groups, for the
+    boundary that owns it; a path the combine already summed is left alone."""
+    parallel = get_parallel()
+    return _post_experts_sum(
+        hidden_states,
+        reduce_ep=parallel.moe_ep_size > 1
+        and not post_experts_output_is_complete(is_tp_path=False),
+        reduce_tp=parallel.moe_tp_size > 1
+        and not post_experts_output_is_complete(is_tp_path=True),
+    )
+
+
+def _post_experts_sum(
+    hidden_states: torch.Tensor, *, reduce_ep: bool, reduce_tp: bool
+) -> torch.Tensor:
     from sglang.srt.distributed.communication_op import (
         moe_expert_parallel_all_reduce,
         moe_tensor_model_parallel_all_reduce,
         tensor_model_parallel_all_reduce,
-    )
-
-    parallel = get_parallel()
-    reduce_ep = parallel.moe_ep_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=False
-    )
-    reduce_tp = parallel.moe_tp_size > 1 and not should_skip_post_experts_all_reduce(
-        is_tp_path=True
     )
 
     if reduce_ep and reduce_tp and can_merge_post_experts_all_reduce():

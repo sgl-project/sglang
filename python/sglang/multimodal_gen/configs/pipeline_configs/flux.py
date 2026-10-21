@@ -20,12 +20,12 @@ from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxV
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    pack_latents_2x2,
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 
 
@@ -141,7 +141,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+        return pack_latents_2x2(
+            latents, batch_size, num_channels_latents, height, width
+        )
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[1]
@@ -347,6 +349,13 @@ def _patchify_latents(latents):
         batch_size, num_channels_latents * 4, height // 2, width // 2
     )
     return latents
+
+
+def flux2_vae_bn_stats(vae, like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = vae.bn.running_mean.view(1, -1, 1, 1).to(like)
+    variance = vae.bn.running_var.view(1, -1, 1, 1)
+    std = torch.sqrt(variance + vae.config.arch_config.batch_norm_eps).to(like)
+    return mean, std
 
 
 def _unpatchify_latents(latents):

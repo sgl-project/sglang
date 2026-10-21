@@ -17,7 +17,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -158,6 +158,41 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
+    # EAGLE/NEXTN to FROZEN_KV_MTP.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm})"
+        )
+
+    if cfg.speculative_use_block_verification:
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
+            raise ValueError(
+                "--speculative-use-block-verification only supports EAGLE / EAGLE3 / "
+                "NEXTN / DFLASH / DSPARK."
+            )
+        if cfg.device != "cuda":
+            raise ValueError(
+                "--speculative-use-block-verification only supports CUDA or ROCm."
+            )
+        # Block verification needs sampled proposals and their full distributions.
+        # The DFLASH family's sampled drafts always carry them.
+        if (
+            cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+            and not cfg.speculative_use_rejection_sampling
+        ):
+            declare_resolution(
+                server_args,
+                "handle_speculative_decoding",
+                speculative_use_rejection_sampling=True,
+            )
+
     # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
     # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
     # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
@@ -213,19 +248,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 algo.validate_server_args,
             )
 
-    if cfg.speculative_skip_dp_mlp_sync:
-        assert cfg.speculative_algorithm == "EAGLE", (
-            "--speculative-skip-dp-mlp-sync is only supported with "
-            f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
-        )
-
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
-            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3")
+            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK")
             or cfg.enable_multi_layer_eagle
         ):
             raise ValueError(
-                "DP spec/prefill coordination requires single-layer EAGLE or EAGLE3"
+                "DP spec/prefill coordination requires single-layer EAGLE, EAGLE3 or DSPARK"
             )
 
     if cfg.speculative_adaptive:
@@ -271,7 +300,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
+    if attn_dp_enabled_of(cfg) and not cfg.device == "npu":
         raise ValueError(
             "Currently DFLASH speculative decoding does not support dp "
             "attention on non-NPU devices."
@@ -538,7 +567,7 @@ def _handle_uno(server_args: ServerArgs) -> None:
 
     if (cfg.tp_size, cfg.pp_size) != (1, 1):
         raise ValueError("UNO requires TP=PP=1.")
-    if cfg.enable_dp_attention or cfg.attn_cp_size != 1:
+    if attn_dp_enabled_of(cfg) or cfg.attn_cp_size != 1:
         raise ValueError("UNO does not support DP attention or context parallelism.")
     if cfg.enable_lora or cfg.lora_paths:
         raise ValueError("UNO does not support public Multi-LoRA serving.")
@@ -583,13 +612,12 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "xpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU or XPU device."
         )
 
-    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
-    if cfg.enable_dp_attention and cfg.dp_size > 1:
+    if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
         if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
@@ -598,7 +626,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "(built-in TP MoE), 'megamoe', or 'mori', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
-        if not _is_npu and cfg.moe_a2a_backend != "none":
+        if not _is_npu and (
+            cfg.moe_a2a_backend != "none"
+            or envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        ):
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
@@ -606,8 +637,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
             if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    "DSpark with dp attention + "
-                    f"moe_a2a_backend={cfg.moe_a2a_backend!r} requires "
+                    "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.attn_cp_size > 1:
@@ -867,6 +897,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
+            # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
+            if not current_platform.is_out_of_tree() and get_platform().is_sm100:
+                fallback_backend = "fa4"
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "
@@ -910,12 +943,59 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
+    from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    target = model_config_of(server_args).hf_config
+    if target.architectures[0] != "IQuestQ1ForCausalLM":
+        return False
+    cfg = resolving_view(server_args)
+    if cfg.speculative_draft_model_path in (None, cfg.model_path):
+        raise ValueError("IQuest Q1 requires an independent draft model path.")
+    draft = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+    )
+    if not isinstance(draft, IQuestQ1MTPConfig):
+        raise ValueError("IQuest Q1 requires an independent MTP draft checkpoint.")
+    if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
+        raise ValueError("MTP draft hidden size and vocabulary must match the target.")
+    if draft.num_target_layers != target.num_hidden_layers:
+        raise ValueError("MTP draft target layer count must match the target.")
+    if cfg.speculative_token_map is not None:
+        raise ValueError("MTP uses its own full-vocabulary embedding and head.")
+    steps = cfg.speculative_num_steps
+    if steps is None:
+        steps = draft.num_draft_slots
+    if steps < 1:
+        raise ValueError("MTP requires positive speculative_num_steps.")
+    if steps > draft.num_draft_slots:
+        logger.warning(
+            "MTP depth %d exceeds the checkpoint's num_draft_slots=%d.",
+            steps,
+            draft.num_draft_slots,
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError("MTP requires --speculative-eagle-topk 1.")
+    if cfg.speculative_num_draft_tokens not in (None, steps + 1):
+        raise ValueError("MTP verification width must equal draft steps + 1.")
+    declare_resolution(
+        server_args,
+        "_handle_iquest_q1_mtp_draft",
+        speculative_num_steps=steps,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=steps + 1,
+    )
+    return True
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if (
-        cfg.speculative_algorithm == "STANDALONE"
-        and resolved_view(server_args).enable_dp_attention
+    if cfg.speculative_algorithm == "STANDALONE" and attn_dp_enabled_of(
+        resolved_view(server_args)
     ):
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
@@ -994,6 +1074,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                     "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
 
+    _handle_iquest_q1_mtp_draft(server_args)
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
         assert (
             cfg.speculative_eagle_topk is None
@@ -1203,7 +1284,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "and produces incorrect results for paged attention backends. "
             "This combination is only supported for the 'flashinfer' backend."
         )
-    if view.enable_dp_attention:
+    if attn_dp_enabled_of(view):
         # TODO: support dp attention for ngram speculative decoding
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."

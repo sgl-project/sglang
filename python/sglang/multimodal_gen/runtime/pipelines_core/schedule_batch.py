@@ -82,6 +82,7 @@ class Req:
     """
 
     sampling_params: SamplingParams | None = None
+    runtime_lora_scale: float = 1.0
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
@@ -134,6 +135,7 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    source_latents: list[torch.Tensor] | None = None
     y: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
@@ -145,6 +147,7 @@ class Req:
     did_sp_shard_audio_latents: bool = False
     sp_audio_start_frame: int = 0
     sp_audio_orig_num_frames: int = 0
+    sp_audio_has_padding: bool = False
 
     # Audio Parameters
     generate_audio: bool = True
@@ -155,6 +158,7 @@ class Req:
     raw_latent_shape: torch.Tensor | None = None
     did_sp_shard_latents: bool = False
     sp_video_start_frame: int = 0
+    sp_video_has_padding: bool = False
     noise_pred: torch.Tensor | list | tuple | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
@@ -345,41 +349,13 @@ class Req:
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
-        self.num_inference_steps = warmup_steps
+        floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
+        self.num_inference_steps = max(warmup_steps, floor)
 
     def copy_as_warmup(self, warmup_steps: int = 1) -> Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
-
-    def record_stage_iterations(
-        self,
-        measured_iterations: int,
-        target_iterations: int | None = None,
-    ) -> None:
-        """Record a stage loop against its full default-request work.
-
-        Most stages declare the count as a formula of the step count
-        (``PipelineStage.default_workload_iterations``) and never call this.
-        It is for loops whose length is only known inside them (chunked or
-        block-wise schedules); ``target_iterations`` defaults to scaling the
-        measured count from the probe's steps to the default workload's.
-        """
-        if not self.is_warmup or self.metrics is None:
-            return
-        measured = max(1, int(measured_iterations))
-        if target_iterations is None:
-            measured_request_steps = max(1, int(self.num_inference_steps))
-            target_request_steps = int(
-                self.extra.get(
-                    "warmup_target_num_inference_steps", measured_request_steps
-                )
-            )
-            target_iterations = (
-                measured * max(1, target_request_steps) + measured_request_steps - 1
-            ) // measured_request_steps
-        self.metrics.record_stage_iterations(measured, target_iterations)
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -390,13 +366,7 @@ class Req:
             self.metrics = RequestMetrics(request_id=self.request_id)
             return
 
-        # Prefer true_cfg_scale when it is explicitly provided.
-        cfg_scale = (
-            self.true_cfg_scale
-            if self.true_cfg_scale is not None
-            else self.guidance_scale
-        )
-        if cfg_scale > 1.0 and self.negative_prompt is not None:
+        if self.sampling_params.should_use_classifier_free_guidance():
             self.do_classifier_free_guidance = True
         if self.negative_prompt_embeds is None:
             self.negative_prompt_embeds = []
@@ -470,6 +440,13 @@ class Req:
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
+        # Add model-specific fields if present
+        bot_task = getattr(self, "bot_task", None)
+        system_prompt = getattr(self, "system_prompt", None)
+        if bot_task is not None:
+            debug_str += f"            bot_task: {bot_task}\n"
+        if system_prompt is not None:
+            debug_str += f"               system_prompt: {system_prompt}\n"
         logger.info(debug_str)
 
 
@@ -486,6 +463,12 @@ class OutputBatch:
     raw_frame_metadata: dict[str, Any] | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # The effective fps the worker actually produced ``output`` at (e.g. a model whose input
+    # stage resamples / resolves the request's nominal fps to a source-derived one, such as
+    # Kandinsky6 SR). ``None`` means the worker did not resolve its own fps; callers that save
+    # ``output`` client-side (return_file_paths_only=False) then fall back to the originating
+    # request's own fps field, as before this field existed.
+    fps: int | None = None
     action_pred: torch.Tensor | None = None
     action_mode: str | None = None
     action_domain_id: int | None = None
@@ -496,6 +479,9 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
+    # plus range_m/intensity/validity arrays when the client asked for frames.
+    lidar: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -514,5 +500,6 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None

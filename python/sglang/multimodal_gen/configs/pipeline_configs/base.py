@@ -5,9 +5,8 @@ import json
 import math
 import os
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
-from operator import attrgetter
 from typing import Any, ClassVar
 
 import numpy as np
@@ -54,6 +53,16 @@ class STA_Mode(str, Enum):
     STA_TUNING = "STA_tuning"
     STA_TUNING_CFG = "STA_tuning_cfg"
     NONE = None
+
+
+def pack_latents_2x2(latents, batch_size, num_channels_latents, height, width):
+    latents = latents.view(
+        batch_size, num_channels_latents, height // 2, 2, width // 2, 2
+    )
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    return latents.reshape(
+        batch_size, (height // 2) * (width // 2), num_channels_latents * 4
+    )
 
 
 def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
@@ -159,6 +168,9 @@ class PipelineConfig:
     generator_device: str | None = None
     flow_shift: float | None = None
     scheduler_class_override: str | None = None
+    # Registered DiT class to load instead of the checkpoint's ``_class_name``,
+    # for pipelines that drive shared weights with a different forward.
+    transformer_class_override: str | None = None
     disable_autocast: bool = False
 
     # Model configuration
@@ -321,6 +333,12 @@ class PipelineConfig:
 
         return False
 
+    def action_metadata(self, server_args: Any) -> dict[str, Any] | None:
+        """Model-owned ``GET /v1/actions/metadata`` payload; None uses the generic one."""
+
+        del server_args
+        return None
+
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 
@@ -462,6 +480,10 @@ class PipelineConfig:
 
     def supports_native_grouped_requests(self):
         """Return whether dynamic batches should run as grouped Req lists."""
+        return False
+
+    def supports_batching_image_conditioning(self):
+        """Return whether image-conditioned requests may join dynamic batches."""
         return False
 
     def supports_sequential_dit_inference(self):
@@ -1112,8 +1134,8 @@ class PipelineConfig:
                 # (e.g. SanaWMRealtimePipeline -> SanaWMRealtimeConfig, a subclass of
                 # the model-resolved SanaWMPipelineConfig), prefer the pipeline's own
                 # config so realtime-only wiring (the /v1/realtime_video adapter) is
-                # selected. Only applies when the explicit config strictly subclasses
-                # the model default, so non-realtime pipelines are unaffected.
+                # selected. A registered explicit config also replaces the generic
+                # Diffusers fallback used for package roots without model_index.json.
                 if pipeline_class_name:
                     explicit_config_classes = get_pipeline_config_classes(
                         pipeline_class_name
@@ -1124,7 +1146,11 @@ class PipelineConfig:
                             isinstance(explicit_config_cls, type)
                             and isinstance(pipeline_config_cls, type)
                             and explicit_config_cls is not pipeline_config_cls
-                            and issubclass(explicit_config_cls, pipeline_config_cls)
+                            and (
+                                issubclass(explicit_config_cls, pipeline_config_cls)
+                                or pipeline_config_cls.__name__
+                                == "DiffusersGenericPipelineConfig"
+                            )
                         ):
                             logger.info(
                                 f"Refining pipeline config {pipeline_config_cls.__name__} "
@@ -1191,35 +1217,6 @@ class PipelineConfig:
             raise ValueError(
                 f"Length of text postprocess functions ({len(self.postprocess_text_funcs)}) must be equal to length of text preprocessing functions ({len(self.preprocess_text_funcs)})"
             )
-
-    def dump_to_json(self, file_path: str):
-        output_dict = {f.name: attrgetter(f.name)(self) for f in fields(self)}
-        del_keys = []
-        for key, value in output_dict.items():
-            if isinstance(value, ModelConfig):
-                model_dict = asdict(value)
-                # Model Arch Config should be hidden away from the users
-                model_dict.pop("arch_config")
-                output_dict[key] = model_dict
-            elif isinstance(value, tuple) and all(
-                isinstance(v, ModelConfig) for v in value
-            ):
-                model_dicts = []
-                for v in value:
-                    model_dict = asdict(v)
-                    # Model Arch Config should be hidden away from the users
-                    model_dict.pop("arch_config")
-                    model_dicts.append(model_dict)
-                output_dict[key] = model_dicts
-            elif isinstance(value, tuple) and all(callable(f) for f in value):
-                # Skip dumping functions
-                del_keys.append(key)
-
-        for key in del_keys:
-            output_dict.pop(key, None)
-
-        with open(file_path, "w") as f:
-            json.dump(output_dict, f, indent=2)
 
     def load_from_json(self, file_path: str):
         with open(file_path) as f:
@@ -1351,24 +1348,6 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
         return self._gather_sp_tensor(latents, dim=2)
-
-
-@dataclass
-class SlidingTileAttnConfig(PipelineConfig):
-    """Configuration for sliding tile attention."""
-
-    # Override any BaseConfig defaults as needed
-    # Add sliding tile specific parameters
-    window_size: int = 16
-    stride: int = 8
-
-    # You can provide custom defaults for inherited fields
-    height: int = 576
-    width: int = 1024
-
-    # Additional configuration specific to sliding tile attention
-    pad_to_square: bool = False
-    use_overlap_optimization: bool = True
 
 
 def parse_int_list(value: str) -> list[int]:

@@ -322,10 +322,10 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
     round. Reuse the independent UE8M0 oracle, and compare both layouts only
     on active rows; an empty expert and a partial slab exercise masked counts.
     """
-    from sglang.kernels.ops.moe.dsv4 import (
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
         silu_and_mul_contig_post_quant,
-        silu_and_mul_masked_post_quant,
     )
+    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 
     torch.manual_seed(123 + hidden)
     experts, capacity = 3, 32
@@ -409,6 +409,86 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
             # A rare fast-math boundary flip is allowed, but systematic BF16
             # intermediate rounding (the other fused path) must fail this gate.
             assert mismatch.item() < 1e-4
+
+
+@pytest.mark.parametrize("counts_kind", ["all_zero", "one_hot", "uneven", "full"])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind):
+    """The masked kernel's grid is capped at the resident CTAs, so one CTA may walk
+    several real rows of masked_m. Every real row must match the contig kernel
+    byte for byte, and no padded row may be written."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+        silu_and_mul_contig_post_quant,
+    )
+    from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
+
+    group_size, hidden, experts, topk = 128, 2048, 8, 8
+    scale_ue8m0 = transposed
+    # 4x the resident CTAs at hidden 2048 (256 threads, at most 8 CTAs per SM).
+    capacity = 4 * torch.cuda.get_device_properties(0).multi_processor_count
+    counts = {
+        "all_zero": [0] * experts,
+        "one_hot": [0, 0, 0, 0, 0, capacity, 0, 0],
+        "uneven": [0, capacity, 1, 0, 0, capacity - 1, 37, 2],
+        "full": [capacity] * experts,
+    }[counts_kind]
+    masked_m = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    groups = hidden // group_size
+    rows = experts * capacity
+
+    torch.manual_seed(7)
+    x = torch.randn(experts, capacity, 2 * hidden, device="cuda").bfloat16() * 5
+
+    sentinel = 0x5A5A5A5A
+    q = torch.full((experts, capacity, hidden // 4), sentinel, dtype=torch.int32)
+    q = q.cuda().view(fp8_dtype)
+    scale_shape = (
+        (experts, groups // 4, capacity) if transposed else (experts, capacity, groups)
+    )
+    scale = torch.full(scale_shape, sentinel, device="cuda", dtype=torch.int32)
+    silu_and_mul_masked_post_quant(
+        x,
+        q,
+        scale if transposed else scale.view(torch.float32),
+        group_size,
+        masked_m,
+        scale_ue8m0=scale_ue8m0,
+        topk=topk,
+        transposed=transposed,
+    )
+
+    q_ref = torch.empty(rows, hidden, device="cuda", dtype=fp8_dtype)
+    if transposed:
+        scale_ref = torch.empty(groups // 4, rows, device="cuda", dtype=torch.int32)
+        scale_ref_arg = scale_ref.T
+    else:
+        scale_ref = torch.empty(rows, groups, device="cuda", dtype=torch.float32)
+        scale_ref_arg = scale_ref
+    silu_and_mul_contig_post_quant(
+        x.flatten(0, 1),
+        q_ref,
+        scale_ref_arg,
+        group_size,
+        scale_ue8m0=scale_ue8m0,
+        transposed=transposed,
+    )
+    torch.cuda.synchronize()
+
+    q_bytes = q.view(torch.uint8)
+    q_ref_bytes = q_ref.view(torch.uint8).view(experts, capacity, hidden)
+    if transposed:
+        scale_ref = scale_ref.view(groups // 4, experts, capacity).permute(1, 0, 2)
+    else:
+        scale_ref = scale_ref.view(torch.int32).view(experts, capacity, groups)
+    for expert, count in enumerate(counts):
+        assert torch.equal(q_bytes[expert, :count], q_ref_bytes[expert, :count])
+        assert (q_bytes[expert, count:] == 0x5A).all()
+        if transposed:
+            assert torch.equal(scale[expert, :, :count], scale_ref[expert, :, :count])
+            assert (scale[expert, :, count:] == sentinel).all()
+        else:
+            assert torch.equal(scale[expert, :count], scale_ref[expert, :count])
+            assert (scale[expert, count:] == sentinel).all()
 
 
 @pytest.mark.parametrize("column_major", [True, False])
@@ -549,6 +629,45 @@ def test_masked_fused():
         if m > 0:
             assert _dequant_rel_err(x_q[e, :m], deq_scale[e, :m], act[e, :m], G) < 0.05
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
+
+
+@pytest.mark.parametrize("column_major", [False, True])
+def test_sorted_rows(column_major):
+    """Sorted MoE layout (TMA down input): rows the MoE GEMM never reads are
+    skipped, every other row is bit-identical to the flat kernel. hidden=512 is
+    one warp per row (4 groups), so each padding row is skipped as a whole."""
+    torch.manual_seed(11)
+    num_valid, block_m, num_blocks, hidden = 300, 16, 40, 512
+    rows = num_blocks * block_m + 7
+    num_post = (num_blocks - 3) * block_m
+    sorted_ids = torch.randint(0, num_valid, (rows,), dtype=torch.int32, device="cuda")
+    sorted_ids[torch.rand(rows, device="cuda") < 0.3] = num_valid
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16)
+
+    ref_q = torch.zeros(rows, hidden, device="cuda", dtype=fp8_dtype)
+    ref_s = _alloc_scale((rows, hidden), column_major=column_major, scale_ue8m0=False)
+    per_token_group_quant(x, ref_q, ref_s, G)
+    x_q = torch.full_like(ref_q.view(torch.uint8), 0x7F).view(fp8_dtype)
+    x_s = _alloc_scale((rows, hidden), column_major=column_major, scale_ue8m0=False)
+    x_s.fill_(float("nan"))
+    per_token_group_quant(
+        x,
+        x_q,
+        x_s,
+        G,
+        sorted_token_ids=sorted_ids,
+        num_tokens_post_padded=torch.tensor(
+            [num_post], dtype=torch.int32, device="cuda"
+        ),
+        num_valid_tokens=num_valid,
+    )
+
+    row = torch.arange(rows, device="cuda")
+    kept = (row < num_post) & (sorted_ids < num_valid)
+    assert torch.equal(x_q.view(torch.uint8)[kept], ref_q.view(torch.uint8)[kept])
+    assert torch.equal(x_s[kept], ref_s[kept])
+    assert (x_q.view(torch.uint8)[~kept] == 0x7F).all(), "padding row written"
+    assert torch.isnan(x_s[~kept]).all(), "padding scale written"
 
 
 NON_FINITE_CASES = get_ci_test_range(
