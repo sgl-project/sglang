@@ -73,6 +73,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -4060,7 +4061,15 @@ class DeepseekV4Model(nn.Module):
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
-                if not (
+                if cp_extend:
+                    # MoE consumes rank-major IDs, so rebuild them from the
+                    # compact local tail rather than indexing the full gather.
+                    input_ids_global = (
+                        attn_cp_interleave_gather(input_ids[:, None]).squeeze(-1)
+                        if get_moe_a2a_backend().is_none()
+                        else input_ids
+                    )
+                elif not (
                     get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
                 ):
                     input_ids_global = tail.rows(input_ids_global)
@@ -4890,6 +4899,82 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if tail.real_rows_count is not None
                 else tail.token_indices
             )
+        return output
+
+    def logits_from_cp_hidden_states(
+        self, hidden_states, aux_hidden_states, forward_batch
+    ):
+        """Gather a full CP prefill or its compact DSpark tail before logits."""
+        from sglang.srt.layers.cp.utils import cp_gather_after_forward
+
+        tail = None
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        saved_cp = forward_batch.attn_cp_metadata
+        token_indices = None
+        try:
+            if tail is not None:
+                forward_batch.attn_cp_metadata = tail.cp_metadata
+            stream = torch.cuda.current_stream()
+            hidden_states, pre_hc_head = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            if aux_hidden_states is not None:
+                if isinstance(aux_hidden_states, torch.Tensor):
+                    aux_hidden_states = cp_gather_after_forward(
+                        aux_hidden_states, forward_batch, stream
+                    )
+                else:
+                    aux_hidden_states = [
+                        cp_gather_after_forward(aux, forward_batch, stream)
+                        for aux in aux_hidden_states
+                    ]
+            if tail is not None:
+                # Tail indices address the original rank-local interleave shard.
+                parallel = get_parallel()
+                local_indices = (
+                    tail.token_indices * parallel.attn_cp_size + parallel.attn_cp_rank
+                )
+                token_indices = cp_gather_after_forward(
+                    local_indices, forward_batch, stream
+                )
+        finally:
+            forward_batch.attn_cp_metadata = saved_cp
+
+        input_ids = forward_batch.input_ids
+        logits_metadata = forward_batch
+        if tail is not None:
+            input_ids = input_ids[token_indices]
+            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+            logits_metadata.extend_seq_lens = tail.extend_seq_lens
+            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+            logits_metadata.extend_logprob_start_lens_cpu = (
+                [
+                    min(start, length)
+                    for start, length in zip(
+                        forward_batch.extend_logprob_start_lens_cpu,
+                        tail.extend_seq_lens_cpu,
+                    )
+                ]
+                if forward_batch.return_logprob
+                else tail.extend_seq_lens_cpu
+            )
+        output = self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states,
+            hidden_states_before_norm=(
+                pre_hc_head if aux_hidden_states is None else None
+            ),
+        )
+        if token_indices is not None:
+            output.hidden_states_token_indices = token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:

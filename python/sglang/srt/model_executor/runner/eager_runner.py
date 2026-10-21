@@ -412,6 +412,9 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        if cp_logits := getattr(model, "logits_from_cp_hidden_states", None):
+            return cp_logits(hidden_states, aux_hidden_states, forward_batch)
+
         stream = torch.cuda.current_stream()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
         # DSpark aux tensors ride the same CP token split; gather them the same way.
