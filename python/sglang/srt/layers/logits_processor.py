@@ -912,8 +912,19 @@ class LogitsProcessor(nn.Module):
             if self.do_tensor_parallel_all_gather_dp_attn
             else LoRABatchLayout.DP_LOCAL
         )
-        with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        direct_buffer = self._direct_fp32_logits_buffer(
+            hidden_states, lm_head, logits_metadata, embedding_bias, use_logits_buffer
+        )
+        if direct_buffer is not None:
+            logits = torch.mm(
+                hidden_states,
+                lm_head.weight.T,
+                out_dtype=torch.float32,
+                out=direct_buffer,
+            )
+        else:
+            with get_forward().scoped(lora_batch_layout=lora_batch_layout):
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -1055,6 +1066,41 @@ class LogitsProcessor(nn.Module):
             )
         assert output.dtype == torch.float32
         return gathered_softcap_logits(gathered, self.final_logit_softcapping, output)
+
+    def _direct_fp32_logits_buffer(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor],
+        use_logits_buffer: bool,
+    ) -> Optional[torch.Tensor]:
+        if not envs.SGLANG_OPT_LM_HEAD_FP32_LOGITS_BUFFER.get():
+            return None
+        buffer = logits_metadata.next_token_logits_buffer if use_logits_buffer else None
+        weight = getattr(lm_head, "weight", None)
+        if (
+            buffer is None
+            or weight is None
+            or embedding_bias is not None
+            or self.logit_scale is not None
+            or self.final_logit_softcapping
+            or self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+            or hasattr(lm_head, "set_lora")
+            or should_apply_lm_head_quant_method(
+                lm_head, getattr(lm_head, "quant_method", None)
+            )
+            or not hidden_states.is_cuda
+            or hidden_states.dtype != torch.bfloat16
+            or weight.dtype != torch.bfloat16
+            or buffer.dtype != torch.float32
+            or not buffer.is_contiguous()
+            or tuple(buffer.shape) != (hidden_states.shape[0], weight.shape[0])
+            or weight.shape[0] != self.vocab_size
+        ):
+            return None
+        return buffer
 
     def _compute_lm_head(
         self,
@@ -1248,6 +1294,14 @@ class LogitsProcessor(nn.Module):
         softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
+        if (
+            logits_buffer is not None
+            and softcap is None
+            and logits.dtype == torch.float32
+            and logits.data_ptr() == logits_buffer.data_ptr()
+            and logits.shape == logits_buffer.shape
+        ):
+            return logits
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]
