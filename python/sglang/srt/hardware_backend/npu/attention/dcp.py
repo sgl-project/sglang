@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import torch
-
 from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mla_npu,
     dcp_a2a_lse_reduce,
@@ -66,30 +64,3 @@ def forward_mla_attention_npu(
                 comm_backend="a2a",
             )
     return attn_output.view(-1, module.num_local_heads, module.kv_lora_rank)
-
-
-def mask_empty_mla_dcp_shards_npu(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    local_seq_lens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Represent an empty local KV shard as the online-softmax identity.
-
-    Lengths may be per request (decode) or per query (target verify). A verify
-    query can have no visible local KV even when a later query in that request
-    has one. FIA's empty-row output must not enter the cross-rank LSE merge.
-    """
-    num_rows = partial_output.shape[0]
-    num_lengths = local_seq_lens.numel()
-    if num_lengths == 0:
-        return partial_output, partial_lse
-    rows_per_length = num_rows // num_lengths
-    valid = (local_seq_lens > 0).repeat_interleave(rows_per_length).view(-1, 1, 1)
-    return (
-        torch.where(valid, partial_output, torch.zeros_like(partial_output)),
-        torch.where(
-            valid,
-            partial_lse,
-            torch.full_like(partial_lse, float("-inf")),
-        ),
-    )
