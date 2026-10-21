@@ -627,6 +627,137 @@ def copy_cache_planned_mla(
     )
 
 
+@functools.cache
+def _jit_v41_module(
+    block_size: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    compress_ratio: int,
+    data_bytes: int,
+    scale_bytes: int,
+    page_bits: int,
+) -> Module:
+    template_args = make_cpp_args(
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        compress_ratio,
+        data_bytes,
+        scale_bytes,
+        page_bits,
+    )
+    return load_jit(
+        "sparse_cache_v41",
+        *template_args,
+        cuda_files=["kvcacheio/hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "load_cache_to_device_buffer_v41",
+                f"load_cache_to_device_buffer_v41<{template_args}>",
+            )
+        ],
+    )
+
+
+def load_cache_to_device_buffer_v41(
+    *,
+    top_k_tokens: torch.Tensor,
+    compressed_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    host_locs: torch.Tensor,
+    hot_slots: torch.Tensor,
+    residency: torch.Tensor,
+    lru_slots: torch.Tensor,
+    host_binding: torch.Tensor,
+    device_buffer: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    error_count: torch.Tensor,
+    num_top_k: int,
+    compress_ratio: int,
+    data_bytes: int,
+    scale_bytes: int,
+    page_size: int,
+    block_size: int = 512,
+) -> None:
+    """HiSparse V2 swap-in for one DeepSeek-V4.1 compressed KV layer.
+
+    ``top_k_tokens`` are positions in each request's compressed sequence (ratio 1 or
+    2). A position whose page is in the GPU pool resolves to
+    ``req_to_token[pos * ratio] // ratio``; a demoted one to a hot-buffer slot of the
+    request, copying the row from the host page at ``host_locs[pos * ratio] //
+    ratio`` on a miss. ``device_buffer`` is the pool layer's ``[pages, page_bytes]``
+    paged buffer and ``host_binding`` the run-time ``[base address, page stride]`` of
+    the same layer in the HiCache host pool. Results land in ``top_k_device_locs``.
+    """
+    if compress_ratio not in (1, 2):
+        raise ValueError(f"compress_ratio must be 1 or 2, got {compress_ratio}")
+    page_bits = page_size.bit_length() - 1
+    if page_size != 1 << page_bits:
+        raise ValueError(f"page_size must be a power of two, got {page_size}")
+    if block_size % 64 or not 64 <= block_size <= 1024:
+        raise ValueError(f"block_size must be a wave multiple in [64, 1024], got {block_size}")
+    hot_buffer_size = hot_slots.shape[1]
+    for name, tensor, dtype in (
+        ("top_k_tokens", top_k_tokens, torch.int32),
+        ("compressed_seq_lens", compressed_seq_lens, torch.int32),
+        ("req_to_token", req_to_token, torch.int32),
+        ("host_locs", host_locs, torch.int32),
+        ("hot_slots", hot_slots, torch.int32),
+        ("residency", residency, torch.int32),
+        ("lru_slots", lru_slots, torch.int16),
+        ("host_binding", host_binding, torch.int64),
+        ("device_buffer", device_buffer, torch.uint8),
+        ("top_k_device_locs", top_k_device_locs, torch.int32),
+        ("num_real_reqs", num_real_reqs, torch.int32),
+        ("error_count", error_count, torch.int32),
+    ):
+        if tensor.dtype != dtype:
+            raise ValueError(f"{name} must be {dtype}, got {tensor.dtype}")
+    if residency.shape[1] != hot_buffer_size or lru_slots.shape[1] != hot_buffer_size:
+        raise ValueError("hot_slots, residency and lru_slots must share one width")
+    if top_k_tokens.shape[1] < num_top_k or top_k_device_locs.shape[1] < num_top_k:
+        raise ValueError("top-k tensors are narrower than num_top_k")
+    if req_to_token.shape != host_locs.shape:
+        raise ValueError("req_to_token and host_locs must share one shape")
+    for name, tensor in (
+        ("top_k_tokens", top_k_tokens),
+        ("req_to_token", req_to_token),
+        ("host_locs", host_locs),
+        ("hot_slots", hot_slots),
+        ("residency", residency),
+        ("lru_slots", lru_slots),
+        ("top_k_device_locs", top_k_device_locs),
+    ):
+        if tensor.stride(1) != 1:
+            raise ValueError(f"{name} rows must be contiguous")
+    module = _jit_v41_module(
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        compress_ratio,
+        data_bytes,
+        scale_bytes,
+        page_bits,
+    )
+    module.load_cache_to_device_buffer_v41(
+        top_k_tokens,
+        compressed_seq_lens,
+        req_pool_indices,
+        req_to_token,
+        host_locs,
+        hot_slots,
+        residency,
+        lru_slots,
+        host_binding,
+        device_buffer,
+        top_k_device_locs,
+        num_real_reqs,
+        error_count,
+    )
+
+
 def load_cache_to_device_buffer_dsv4_mla(
     top_k_tokens: torch.Tensor,
     device_buffer_tokens: torch.Tensor,

@@ -1037,4 +1037,445 @@ void copy_cache_planned(
       item_size_bytes);
 }
 
+// ---------------------------------------------------------------------------
+// HiSparse V2 swap-in for DeepSeek-V4.1 compressed KV (compress ratio 1 or 2).
+//
+// The selector hands over positions in the request's compressed sequence. Entry j
+// covers tokens [j * R, (j + 1) * R), so req_to_token[j * R] / R is its pool slot
+// while the page is in the GPU pool, and host_locs[j * R] / R its host row once
+// HiCache demoted the page. Device and host pages share the paged FlashMLA row
+// layout: 2^PAGE_BITS data rows, then as many scale rows, padded to DATA_BYTES.
+// Host pages are host_binding[1] bytes apart (page_first interleaves layers).
+// ---------------------------------------------------------------------------
+template <int DATA_BYTES, int SCALE_BYTES, int PAGE_BITS>
+struct V41PagedRows {
+  static_assert(DATA_BYTES % 8 == 0 && SCALE_BYTES % 8 == 0, "rows must be whole 64-bit words");
+  static constexpr int64_t kSlots = int64_t{1} << PAGE_BITS;
+  static constexpr int64_t kPageBytes = (kSlots * (DATA_BYTES + SCALE_BYTES) + DATA_BYTES - 1) / DATA_BYTES * DATA_BYTES;
+  static constexpr int64_t kScaleBase = int64_t{DATA_BYTES} << PAGE_BITS;
+  static constexpr int32_t kDataWords = DATA_BYTES / 8;
+  static constexpr int32_t kTotalWords = (DATA_BYTES + SCALE_BYTES) / 8;
+  static constexpr int32_t kPasses = (kTotalWords + WARP_SIZE - 1) / WARP_SIZE;
+};
+
+// One warp moves the data row and the scale row of one slot. A compile-time pass
+// count lets every load issue before the first store, as transfer_dsv4_item_warp.
+template <int DATA_BYTES, int SCALE_BYTES, int PAGE_BITS>
+__device__ __forceinline__ void
+copy_v41_row_warp(int32_t lane_id, const uint8_t* src_page, int64_t src_slot, uint8_t* dst_page, int64_t dst_slot) {
+  using Rows = V41PagedRows<DATA_BYTES, SCALE_BYTES, PAGE_BITS>;
+  const auto* src_data = reinterpret_cast<const int64_t*>(src_page + src_slot * DATA_BYTES);
+  const auto* src_scale = reinterpret_cast<const int64_t*>(src_page + Rows::kScaleBase + src_slot * SCALE_BYTES);
+  auto* dst_data = reinterpret_cast<int64_t*>(dst_page + dst_slot * DATA_BYTES);
+  auto* dst_scale = reinterpret_cast<int64_t*>(dst_page + Rows::kScaleBase + dst_slot * SCALE_BYTES);
+
+  int64_t staged[Rows::kPasses];
+#pragma unroll
+  for (int32_t p = 0; p < Rows::kPasses; ++p) {
+    const int32_t i = p * WARP_SIZE + lane_id;
+    if (i < Rows::kDataWords) {
+      staged[p] = src_data[i];
+    } else if (i < Rows::kTotalWords) {
+      staged[p] = src_scale[i - Rows::kDataWords];
+    }
+  }
+#pragma unroll
+  for (int32_t p = 0; p < Rows::kPasses; ++p) {
+    const int32_t i = p * WARP_SIZE + lane_id;
+    if (i < Rows::kDataWords) {
+      dst_data[i] = staged[p];
+    } else if (i < Rows::kTotalWords) {
+      dst_scale[i - Rows::kDataWords] = staged[p];
+    }
+  }
+}
+
+// One block per request. Resident positions pass through; demoted positions hit or
+// replace hot-buffer entries in LRU order (hot entries are pool slots the request
+// owns), and every miss copies its row from the host page.
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int COMPRESS_RATIO,
+    int DATA_BYTES,
+    int SCALE_BYTES,
+    int PAGE_BITS,
+    typename ReqPoolIndicesT>
+__global__ void load_cache_to_device_buffer_v41_kernel(
+    const int32_t* __restrict__ top_k,
+    int64_t top_k_stride,
+    const int32_t* __restrict__ seq_lens,
+    const ReqPoolIndicesT* __restrict__ req_pool_indices,
+    const int32_t* __restrict__ req_to_token,
+    int64_t req_to_token_stride,
+    const int32_t* __restrict__ host_locs,
+    int64_t host_locs_stride,
+    const int32_t* __restrict__ hot_slots,
+    int64_t hot_slots_stride,
+    int32_t* __restrict__ residency,
+    int64_t residency_stride,
+    int16_t* __restrict__ lru_slots,
+    int64_t lru_stride,
+    const int64_t* __restrict__ host_binding,
+    uint8_t* __restrict__ device_buffer,
+    int32_t* __restrict__ out,
+    int64_t out_stride,
+    const int32_t* __restrict__ num_real_reqs,
+    int32_t* __restrict__ error_count) {
+  using Rows = V41PagedRows<DATA_BYTES, SCALE_BYTES, PAGE_BITS>;
+  static_assert(HOT_BUFFER_SIZE >= NUM_TOP_K, "the hot buffer must hold one full selection");
+  static_assert(HOT_BUFFER_SIZE <= 32767, "LRU slots are int16");
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr int64_t kSlotMask = Rows::kSlots - 1;
+
+  const int bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  int32_t* req_out = out + bid * out_stride;
+
+  // CUDA graphs pad the batch; padded rows stay invalid.
+  if (bid >= num_real_reqs[0]) {
+    for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+      req_out[i] = -1;
+    }
+    return;
+  }
+
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const BallotMask lanes_before = (BallotMask(1) << lane_id) - BallotMask(1);
+
+  const int64_t rid = static_cast<int64_t>(req_pool_indices[bid]);
+  const int32_t seq_len = seq_lens[bid];
+  const int32_t* req_top_k = top_k + bid * top_k_stride;
+  const int32_t* req_r2t = req_to_token + rid * req_to_token_stride;
+  const int32_t* req_host = host_locs + rid * host_locs_stride;
+  const int32_t* req_hot_slots = hot_slots + rid * hot_slots_stride;
+  int32_t* req_residency = residency + rid * residency_stride;
+  int16_t* req_lru = lru_slots + rid * lru_stride;
+
+  extern __shared__ char smem_raw[];
+  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
+  constexpr int HASH_SIZE = Layout::HASH_SIZE;
+  int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+  int32_t* s_top_k_tokens = smem_i32;
+  int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;
+  int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
+  int32_t& s_total_misses = s_hash_keys[HASH_SIZE + 1];
+  int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
+  int16_t* s_lru_slots_out = smem_i16;
+  int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
+
+  if (tid == 0) {
+    s_total_hits = 0;
+    s_total_misses = 0;
+  }
+  for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
+    s_hash_keys[i] = HASH_EMPTY;
+  }
+  for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
+    s_chunk_offset[i] = 0;
+    s_evict_chunk_offset[i] = 0;
+  }
+  __syncthreads();
+
+  // Pass 1: resolve resident positions; hash the demoted ones.
+  int has_demoted = 0;
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    const int32_t token = req_top_k[i];
+    if (token < 0 || token >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_out[i] = -1;
+      continue;
+    }
+    const int64_t full_pos = static_cast<int64_t>(token) * COMPRESS_RATIO;
+    const int32_t pool_loc = req_r2t[full_pos];
+    if (pool_loc >= 0) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_out[i] = pool_loc / COMPRESS_RATIO;
+      continue;
+    }
+    if (req_host[full_pos] < 0) {
+      // Neither tier holds this position: read the reserved slot 0 rather than
+      // indexing out of the pool, and let the host side report it.
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_out[i] = 0;
+      atomicAdd(error_count, 1);
+      continue;
+    }
+    has_demoted = 1;
+    int slot = hash_slot(token, HASH_SIZE);
+    while (true) {
+      const int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token);
+      if (old == HASH_EMPTY || old == token) {
+        s_hash_vals[slot] = static_cast<int16_t>(i);
+        break;
+      }
+      slot = (slot + 1) % HASH_SIZE;
+    }
+    s_top_k_tokens[i] = token;
+  }
+  // A request with no demoted selection leaves its hot buffer and LRU untouched.
+  if (!__syncthreads_or(has_demoted)) {
+    return;
+  }
+
+  // Pass 2: scan the hot buffer in LRU order; hits grow forward, evictables backward.
+  constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  int total_hit_count = 0;
+  int total_evict_count = 0;
+  for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
+    const int chunk_idx = warp_id + iter * NUM_WARPS;
+    const bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
+    const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
+    const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
+    const int16_t buf_slot = has_valid_slot ? req_lru[slot_idx] : -1;
+    const int32_t my_buffer_token = (buf_slot >= 0) ? req_residency[buf_slot] : -1;
+    int my_found_top_k_idx = -1;
+    if (my_buffer_token >= 0) {
+      int h = hash_slot(my_buffer_token, HASH_SIZE);
+      while (true) {
+        const int32_t k = s_hash_keys[h];
+        if (k == my_buffer_token) {
+          my_found_top_k_idx = static_cast<int32_t>(s_hash_vals[h]);
+          break;
+        }
+        if (k == HASH_EMPTY) break;
+        h = (h + 1) % HASH_SIZE;
+      }
+    }
+    const bool is_hit = my_found_top_k_idx >= 0;
+    const bool is_evictable = has_valid_slot && !is_hit;
+    if (is_hit) {
+      s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
+      req_out[my_found_top_k_idx] = req_hot_slots[buf_slot];
+    }
+
+    int local_hit_offset = 0;
+    int local_evict_offset = 0;
+    if (has_valid_chunk) {
+      const BallotMask hit_mask = __ballot_sync(FULL_WARP_MASK, is_hit);
+      const BallotMask evict_mask = __ballot_sync(FULL_WARP_MASK, is_evictable);
+      local_hit_offset = popc_mask(hit_mask & lanes_before);
+      local_evict_offset = popc_mask(evict_mask & lanes_before);
+      if (lane_id == 0) {
+        s_chunk_offset[chunk_idx + 1] = popc_mask(hit_mask);
+        s_evict_chunk_offset[chunk_idx + 1] = popc_mask(evict_mask);
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+#ifdef USE_ROCM
+      // Bound the scan window to this iteration's NUM_WARPS chunks (see the
+      // generic kernel above).
+      const int scan_offset = iter * NUM_WARPS + 1;
+      const int scan_count = min(scan_offset + NUM_WARPS, NUM_BUFFER_CHUNKS + 1);
+      total_hit_count = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_hit_count);
+      total_evict_count =
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, scan_offset, scan_count, total_evict_count);
+#else
+      total_hit_count =
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+      total_evict_count =
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+#endif
+      if (tid == 0) {
+        s_total_hits = total_hit_count;
+      }
+    }
+    __syncthreads();
+
+    if (is_hit) {
+      s_lru_slots_out[s_chunk_offset[chunk_idx] + local_hit_offset] = buf_slot;
+    }
+    if (is_evictable) {
+      s_lru_slots_out[HOT_BUFFER_SIZE - 1 - (s_evict_chunk_offset[chunk_idx] + local_evict_offset)] = buf_slot;
+    }
+  }
+  __syncthreads();
+
+  for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
+    s_chunk_offset[i] = 0;
+  }
+  __syncthreads();
+
+  // Pass 3: bind every miss to the least recently used evictable entry.
+  int total_misses = 0;
+  constexpr int ITERATIONS_PER_WARP_TOKEN = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  for (int iter = 0; iter < ITERATIONS_PER_WARP_TOKEN; iter++) {
+    const int chunk_idx = warp_id + iter * NUM_WARPS;
+    const bool has_valid_chunk = chunk_idx < NUM_TOKEN_CHUNKS;
+    const int my_token_idx = chunk_idx * WARP_SIZE + lane_id;
+    const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
+
+    int32_t my_token = 0;
+    bool is_miss = false;
+    int local_miss_offset = 0;
+    if (has_valid_token) {
+      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+      if (is_miss) {
+        my_token = s_top_k_tokens[my_token_idx];
+      }
+    }
+    if (has_valid_chunk) {
+      const BallotMask miss_mask = __ballot_sync(FULL_WARP_MASK, is_miss);
+      local_miss_offset = popc_mask(miss_mask & lanes_before);
+      if (lane_id == 0) {
+        s_chunk_offset[chunk_idx + 1] = popc_mask(miss_mask);
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+#ifdef USE_ROCM
+      const int scan_offset = iter * NUM_WARPS + 1;
+      const int scan_count = min(scan_offset + NUM_WARPS, NUM_TOKEN_CHUNKS + 1);
+      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, scan_offset, scan_count, total_misses);
+#else
+      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+#endif
+      if (tid == 0) {
+        s_total_misses = total_misses;
+      }
+    }
+    __syncthreads();
+
+    if (is_miss) {
+      const int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
+      const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      // miss_offset < my_token_idx, so compacted writes never overrun pending reads.
+      s_top_k_tokens[miss_offset] = my_token;
+      req_out[my_token_idx] = req_hot_slots[evict_slot];
+      req_residency[evict_slot] = my_token;
+    }
+  }
+  __syncthreads();
+
+  total_misses = s_total_misses;
+  // Write the LRU order back: stale evictables first, fresh misses, then hits.
+  {
+    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+      if (i < total_misses) {
+        req_lru[total_evictable - total_misses + i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else if (i < total_evictable) {
+        req_lru[i - total_misses] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else {
+        req_lru[i] = s_lru_slots_out[i - total_evictable];
+      }
+    }
+  }
+
+  // Pass 4: one warp per miss copies the host row into its hot slot.
+  const auto* host_base = reinterpret_cast<const uint8_t*>(host_binding[0]);
+  const int64_t host_page_stride = host_binding[1];
+  for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
+    const int32_t miss_token = s_top_k_tokens[miss_idx];
+    const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+    const int64_t src_row = req_host[static_cast<int64_t>(miss_token) * COMPRESS_RATIO] / COMPRESS_RATIO;
+    const int64_t dst_row = req_hot_slots[evict_slot];
+    copy_v41_row_warp<DATA_BYTES, SCALE_BYTES, PAGE_BITS>(
+        lane_id,
+        host_base + (src_row >> PAGE_BITS) * host_page_stride,
+        src_row & kSlotMask,
+        device_buffer + (dst_row >> PAGE_BITS) * Rows::kPageBytes,
+        dst_row & kSlotMask);
+  }
+}
+
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    int COMPRESS_RATIO,
+    int DATA_BYTES,
+    int SCALE_BYTES,
+    int PAGE_BITS>
+void load_cache_to_device_buffer_v41(
+    tvm::ffi::TensorView top_k,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView req_to_token,
+    tvm::ffi::TensorView host_locs,
+    tvm::ffi::TensorView hot_slots,
+    tvm::ffi::TensorView residency,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView host_binding,
+    tvm::ffi::TensorView device_buffer,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView num_real_reqs,
+    tvm::ffi::TensorView error_count) {
+  using namespace host;
+  using Rows = V41PagedRows<DATA_BYTES, SCALE_BYTES, PAGE_BITS>;
+  const int64_t bs = top_k.shape()[0];
+  if (bs == 0) {
+    return;
+  }
+  if (device_buffer.strides()[0] * static_cast<int64_t>(device_buffer.dtype().bits / 8) != Rows::kPageBytes) {
+    throw std::runtime_error("load_cache_to_device_buffer_v41: device page bytes do not match the row layout");
+  }
+  const auto device = LaunchKernel::resolve_device(top_k.device());
+  constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+  auto launch = [&](auto kernel_fn, const auto* req_pool_indices_ptr) {
+#ifndef USE_ROCM
+    if constexpr (smem_bytes > 48u * 1024u) {
+      runtime::init_per_device(top_k.device(), [=] { runtime::set_max_dynamic_smem(kernel_fn, smem_bytes); });
+    }
+#endif
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k.data_ptr()),
+        top_k.strides()[0],
+        static_cast<const int32_t*>(seq_lens.data_ptr()),
+        req_pool_indices_ptr,
+        static_cast<const int32_t*>(req_to_token.data_ptr()),
+        req_to_token.strides()[0],
+        static_cast<const int32_t*>(host_locs.data_ptr()),
+        host_locs.strides()[0],
+        static_cast<const int32_t*>(hot_slots.data_ptr()),
+        hot_slots.strides()[0],
+        static_cast<int32_t*>(residency.data_ptr()),
+        residency.strides()[0],
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        lru_slots.strides()[0],
+        static_cast<const int64_t*>(host_binding.data_ptr()),
+        static_cast<uint8_t*>(device_buffer.data_ptr()),
+        static_cast<int32_t*>(out.data_ptr()),
+        out.strides()[0],
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        static_cast<int32_t*>(error_count.data_ptr()));
+  };
+  const auto rpi_dtype = req_pool_indices.dtype();
+  if (rpi_dtype.code == kDLInt && rpi_dtype.bits == 64) {
+    launch(
+        load_cache_to_device_buffer_v41_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            COMPRESS_RATIO,
+            DATA_BYTES,
+            SCALE_BYTES,
+            PAGE_BITS,
+            int64_t>,
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_v41_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            COMPRESS_RATIO,
+            DATA_BYTES,
+            SCALE_BYTES,
+            PAGE_BITS,
+            int32_t>,
+        static_cast<const int32_t*>(req_pool_indices.data_ptr()));
+  }
+}
+
 }  // namespace sglang
