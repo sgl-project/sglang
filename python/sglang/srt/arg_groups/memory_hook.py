@@ -231,8 +231,8 @@ def handle_gpu_memory_settings(server_args: Any):
         decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
     if prefill_cuda_graph_config.max_bs is None:
-        # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
-        prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
+        # Default to the chunked prefill size, capped at 8192 to limit capture memory.
+        prefill_cuda_graph_config.max_bs = min(8192, cfg.chunked_prefill_size)
 
         # For opt-in PP breakable graphs, capture small aggregate-token
         # buckets by default and leave larger forwards on the eager path.
