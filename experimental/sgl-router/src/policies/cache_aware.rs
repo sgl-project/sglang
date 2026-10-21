@@ -203,7 +203,7 @@ fn cap_matched_prefix_blocks(query_blocks: usize, matched_prefix_blocks: u32) ->
     matched_prefix_blocks.min(u32::try_from(query_blocks).unwrap_or(u32::MAX))
 }
 
-fn estimate_matched_prefix_tokens(
+pub(crate) fn estimate_matched_prefix_tokens(
     input_tokens: u64,
     query_blocks: usize,
     matched_prefix_blocks: u32,

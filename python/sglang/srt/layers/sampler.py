@@ -34,15 +34,21 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
 )
+from sglang.utils import LazyImport
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
+    )
+
+    # Resolved on first call: CUDA builds without FlashInfer must still import
+    # this module; they default to the pytorch sampling backend.
+    min_p_sampling_from_probs = LazyImport(
+        "flashinfer.sampling", "min_p_sampling_from_probs"
+    )
+    top_k_top_p_sampling_from_probs = LazyImport(
+        "flashinfer.sampling", "top_k_top_p_sampling_from_probs"
     )
 
 if is_musa() or is_xpu():
