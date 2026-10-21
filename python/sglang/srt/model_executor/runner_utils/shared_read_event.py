@@ -5,9 +5,8 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -24,22 +23,22 @@ def make_external_event(device_module) -> Optional[torch.cuda.Event]:
 
 
 def maybe_publish_prefill_shared_read_done(
-    model_runner, forward_batch, device_module
+    model_runner, shared_read_ends: SharedReadEnds, device_module
 ) -> None:
-    """Publish prefill read-done after compliant metadata initialization."""
-    if not envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.get():
-        return
-    if forward_batch.forward_mode != ForwardMode.EXTEND:
-        return
-    # The record lands right after replay prep, so PRE_REPLAY only.
-    declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)
-    if declared is not SharedReadEnds.PRE_REPLAY:
+    """Publish prefill read-done at the resolved pre-replay boundary."""
+    if shared_read_ends is not SharedReadEnds.PRE_REPLAY:
         return
     if not model_runner.spec_algorithm.supports_prefill_shared_read_done():
-        # Stage the draft's shared reads before publishing the read-done event.
-        stage = getattr(model_runner, "prefill_shared_read_stager", None)
-        if stage is None or not stage(forward_batch):
-            return
+        return
+    # Host and storage offload copy a stashed chunk's KV ordered only behind the
+    # schedule stream, so they need the whole-forward barrier.
+    memory = get_memory()
+    if (
+        memory.enable_hierarchical_cache
+        or memory.hicache_storage_backend is not None
+        or memory.enable_lmcache
+    ):
+        return
     logger.info_once(
         "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,

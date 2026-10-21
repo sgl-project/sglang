@@ -18,6 +18,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa:
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    PPBatchMetadata,
     SchedulerPPMixin,
     _pp_exchange_outputs_before_forward,
 )
@@ -248,7 +249,7 @@ class TestDSparkPPOutput(CustomTestCase):
         result = SchedulerPPMixin._pp_prep_batch_result(
             scheduler,
             batch,
-            SimpleNamespace(can_run_cuda_graph=False),
+            PPBatchMetadata(can_run_cuda_graph=False),
             PPProxyTensors(wire),
         )
         self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)

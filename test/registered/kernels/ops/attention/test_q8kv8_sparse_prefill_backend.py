@@ -18,6 +18,8 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
+    cast_q_fp8_for_q8kv8_prefill,
+    q8kv8_padded_num_heads,
     sparse_mla_q8kv8_prefill_fwd,
 )
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
@@ -443,6 +445,8 @@ def _patched_sparse_kernels(
     q8_module_name = "sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90"
     q8_mod = types.ModuleType(q8_module_name)
     q8_mod.sparse_mla_q8kv8_prefill_fwd = fake_sparse_mla_q8kv8_prefill_fwd
+    q8_mod.q8kv8_padded_num_heads = q8kv8_padded_num_heads
+    q8_mod.cast_q_fp8_for_q8kv8_prefill = cast_q_fp8_for_q8kv8_prefill
 
     old_modules = {
         name: sys.modules.get(name)
