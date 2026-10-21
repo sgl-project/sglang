@@ -608,6 +608,11 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        linker = getattr(self.tree_cache, "linker", None)
+        if self.enable_overlap and linker is not None:
+            # Chunks are checkpointed, and may be offloaded, while their forward
+            # still writes KV on forward_stream.
+            linker.cache_linker.set_kv_producer_stream(self.forward_stream)
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:

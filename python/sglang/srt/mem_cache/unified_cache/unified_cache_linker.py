@@ -173,6 +173,13 @@ class UnifiedCacheLinker(ABC):
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Queue every transfer for atomic persistence."""
 
+    def set_kv_producer_stream(self, stream) -> None:
+        """Set the stream the forward pass writes KV on, when it is not the caller's.
+
+        Under overlap scheduling a prefill chunk is checkpointed, and may be
+        offloaded, while the forward that writes its KV still runs on this stream.
+        """
+
     @abstractmethod
     def num_completed_offloads(self) -> int:
         """Return the number of completed offloads waiting to be consumed."""

@@ -91,8 +91,8 @@ class _PoolRangePlan:
     entries_per_page: int
 
 
-# One queued offload: the pools it resolved to, and the event guarding its KV.
-_OffloadTask = tuple[list[PoolTransfer], object]
+# One queued offload: the pools it resolved to, and the events guarding its KV.
+_OffloadTask = tuple[list[PoolTransfer], list]
 
 
 def _offload_task_pages(expanded: list[PoolTransfer]) -> int:
@@ -145,6 +145,9 @@ def _parse_storage_extra_config(raw_config):
 
 
 class UMBPDirectLinker(UnifiedCacheLinker):
+    # Forward stream under overlap scheduling; see set_kv_producer_stream.
+    _kv_producer_stream = None
+
     def __init__(
         self,
         server_args,
@@ -359,7 +362,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
             Queue()
         )
-        self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
+        self._offload_queue: Queue[_OffloadTask | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {
             "lookup": 0,
@@ -849,14 +852,22 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for start in range(0, self.num_layers, self.layer_group)
         ]
 
+    def set_kv_producer_stream(self, stream) -> None:
+        self._kv_producer_stream = stream
+
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = device_module.Event()
-        ready_event.record()
-        self._offload_queue.put((expanded, ready_event))
+        # The current stream produced the index tensors; the producer stream may
+        # still be running the forward that writes these pages.
+        ready_events = [device_module.Event()]
+        ready_events[0].record()
+        if self._kv_producer_stream is not None:
+            ready_events.append(device_module.Event())
+            ready_events[1].record(self._kv_producer_stream)
+        self._offload_queue.put((expanded, ready_events))
         return True
 
     def _take_offload_batch(self) -> tuple[list[_OffloadTask], bool]:
@@ -910,8 +921,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 self._offload_results.put(success)
 
     def _run_offload(self, tasks: list[_OffloadTask]) -> bool:
-        for _, ready_event in tasks:
-            ready_event.synchronize()
+        for _, ready_events in tasks:
+            for ready_event in ready_events:
+                ready_event.synchronize()
         next_slot = 0
 
         def materialize_indices(indices: torch.Tensor) -> torch.Tensor:
