@@ -68,6 +68,26 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
             self.out_page_indices.fill_(-1)
 
 
+def materialize_prefill_request_rows(inputs: PrefillInputs) -> torch.Tensor:
+    """Map real local query rows to request-pool IDs, including interleaved CP.
+
+    CP keeps request order but changes each request's local row count. Pool IDs
+    are not batch ordinals, and zero-row requests must remain in the count map.
+    The CPU counts also exclude padding and account for a bounded-replay tail.
+    """
+    if inputs.req_rows is not None:
+        return inputs.req_rows
+    counts = inputs.rows_per_request
+    assert counts is not None and len(counts) == inputs.req_pool_indices.numel()
+    assert sum(counts) == inputs.positions.shape[0]
+    repeats = inputs.rows_per_request_device
+    if repeats is None:
+        repeats = async_h2d(counts, dtype=torch.int32, device=inputs.positions.device)
+    return torch.repeat_interleave(
+        inputs.req_pool_indices, repeats, output_size=inputs.positions.shape[0]
+    )
+
+
 class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     """Decode (one row per request) or verify (one row per draft token)."""
 
