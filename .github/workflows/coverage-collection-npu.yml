@@ -2,6 +2,7 @@
 # Delegates to pr-test-npu.yml with coverage_mode=true, which switches:
 #   - Runners to the coverage pool (shared /root/.cache with setup-covstub)
 #   - use_coverage_runner=true on all test jobs
+#   - Runs the base-a unit suite on the coverage pool (base-a-test-npu-cov)
 #   - Skips pr-gate, multimodal-gen, recommend, analyze
 #   - Runs setup-covstub to assemble coverage data and publish it to the
 #     shared disk at a fixed path (/root/.cache/tests/precise-test/coverage)

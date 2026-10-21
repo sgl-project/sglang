@@ -764,6 +764,20 @@ def _get_cp_rank_page_bounds(
     return local_start, local_start + n_pages
 
 
+def filter_kv_indices_for_shard_rank(
+    *,
+    kv_indices: np.ndarray,
+    index_slice: slice,
+    shard_rank: int,
+    shard_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Logical page l lives on rank l % N as local page l // N; returns the owned
+    local ids and their send positions, which replace the contiguous index_slice."""
+    owned = kv_indices % shard_size == shard_rank
+    positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
+    return kv_indices[owned] // shard_size, positions[owned]
+
+
 def filter_kv_indices_for_cp_rank(
     kv_mgr: CommonKVManager,
     kv_indices: np.ndarray,
@@ -1843,6 +1857,15 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
     }
+
+
+def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
+    """The KV byte layout both PD roles must share, for pools that have more than one."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
+        return token_to_kv_pool.pd_kv_layout()
+    return None
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

@@ -22,7 +22,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import FP8_BLOCK_SIZE
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 from sglang.kernels.ops.embeddings.engram_hash import (
@@ -34,6 +33,7 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
+from sglang.kernels.ops.quantization.fp4_fake_quant import FP8_BLOCK_SIZE
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
@@ -998,10 +998,11 @@ def engram_gate(
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy."""
+    # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
+    # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
         _cuda_kernels(x)
         and x.ndim == 3
-        and kv.shape == (x.shape[0], (x.shape[1] + 1) * x.shape[2])
         and x.dtype == kv.dtype
         and x.dtype in (torch.bfloat16, torch.float32)
         and q_weight.dtype in (torch.bfloat16, torch.float32)

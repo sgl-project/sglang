@@ -240,6 +240,36 @@ fn total_tokens_over_context_is_rejected() {
     assert_eq!(g.sampling_params.max_new_tokens, Some(7), "left alone");
 }
 
+/// A launcher whose default for an omitted `max_new_tokens` is `None` (no
+/// limit) under `--context-length` lets a prompt near the window through
+/// untouched; the scheduler clamps the output to the room the window leaves.
+/// A fixed default (128) or an explicit context-length value would be a 400.
+#[test]
+fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
+    let limits = Limits {
+        context_len: 1000,
+        ..test_limits()
+    };
+    let request = |max_new_tokens| GenerateRequest {
+        input_ids: Some(vec![1; 990]),
+        sampling_params: SamplingParams {
+            max_new_tokens,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut g = request(None);
+    assert!(check_total_tokens(&mut g, &limits).is_ok());
+    assert_eq!(
+        g.sampling_params.max_new_tokens, None,
+        "left to the scheduler"
+    );
+    for rejected in [Some(128), Some(1000)] {
+        let err = check_total_tokens(&mut request(rejected), &limits).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "{rejected:?}");
+    }
+}
+
 /// The reserved slots (eagle draft tokens) count as input, so a request can be
 /// rejected for them even when the prompt alone would fit.
 #[test]
@@ -575,9 +605,9 @@ fn tokenize_goes_to_the_pool_without_detok_registration() {
 /// The detok entry is dropped either way — that is the half that must not
 /// depend on the channel.
 ///
-/// Channel capacity 1: the first abort pushes, the second finds it full.
+/// Request-ring capacity does not limit the reserved abort lane.
 #[test]
-fn abort_deregisters_even_when_the_channel_push_is_dropped() {
+fn abort_deregisters_and_bypasses_request_ring_capacity() {
     let (tok_tx, _tok_rx) = flume::unbounded();
     let (detok_tx, detok_rx) = flume::unbounded();
     let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
@@ -587,7 +617,7 @@ fn abort_deregisters_even_when_the_channel_push_is_dropped() {
         tokenizer_tx: tok_tx,
         detokenizer_tx: vec![detok_tx],
     };
-    let (producer, _consumer) = to_scheduler(1);
+    let (producer, consumer) = to_scheduler(1);
     let (_tm_tx, tm_rx) = flume::unbounded();
     let (sd_tx, sd_rx) = flume::unbounded::<()>();
     std::mem::forget(sd_tx);
@@ -611,6 +641,7 @@ fn abort_deregisters_even_when_the_channel_push_is_dropped() {
             "{expected}: the detok entry must be dropped even when the to_scheduler channel is full",
         );
     }
+    assert_eq!(consumer.drain(8).len(), 2, "both aborts must be delivered");
 }
 
 /// The rid keys the detok table and rides on every chunk of every decode step,

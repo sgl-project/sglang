@@ -89,6 +89,7 @@ class TestDeepseekV41BCGMultimodal(CustomTestCase):
             pp_group=SimpleNamespace(world_size=1),
             engram_hasher=lambda *a: torch.zeros((3, 1), dtype=torch.long),
             late_layer_start=None,
+            decoder_replay_tail=None,
             start_layer=0,
             end_layer=1,
             layers=[layer],
