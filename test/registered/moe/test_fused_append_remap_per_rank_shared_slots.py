@@ -360,7 +360,7 @@ class TestAiterGroupedTopkSharedFuse(CustomTestCase):
                 renormalize=True,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
-                num_fused_shared_experts=n_shared,
+                shared_experts=SharedExpertsConfig(num_fused_shared_experts=n_shared),
                 correction_bias=correction_bias,
                 routed_scaling_factor=rsf,
                 fused_shared_experts_scaling_factor=factor,
@@ -377,7 +377,7 @@ class TestAiterGroupedTopkSharedFuse(CustomTestCase):
         return biased_grouped_topk_gpu(
             hidden_states,
             gating_output,
-            correction_bias,
+            correction_bias.to(dtype=gating_output.dtype),
             topk_routed,
             renormalize=True,
             num_expert_group=num_expert_group,
@@ -439,7 +439,7 @@ class TestAiterGroupedTopkSharedFuse(CustomTestCase):
             renormalize=True,
             num_expert_group=1,
             topk_group=1,
-            num_fused_shared_experts=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             correction_bias=bias,
             routed_scaling_factor=2.827,
             fused_shared_experts_scaling_factor=0.25,
@@ -502,7 +502,7 @@ class TestAiterGroupedTopkSharedFuse(CustomTestCase):
             renormalize=True,
             num_expert_group=1,
             topk_group=1,
-            num_fused_shared_experts=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
             correction_bias=bias,
         )
         with get_parallel().override(moe_ep_size=1):
@@ -520,6 +520,7 @@ class TestAiterGroupedTopkSharedFuse(CustomTestCase):
                 "SGLANG_SIMULATE_UNIFORM_EXPERTS",
                 "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
                 "SGLANG_K3_RADIX4_TOPK",
+                "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK",
             ):
                 with (
                     self.subTest(setting=setting),
@@ -658,7 +659,7 @@ class TestAiterGroupedTopkFusionContract(CustomTestCase):
             renormalize=True,
             num_expert_group=1,
             topk_group=1,
-            num_fused_shared_experts=self.N_SHARED,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=self.N_SHARED),
             correction_bias=torch.randn(
                 (self.NUM_EXPERTS,), dtype=torch.float32, device=get_device()
             ),
@@ -695,7 +696,7 @@ class TestAiterGroupedTopkFusionContract(CustomTestCase):
         config_cases = {
             "not_grouped_topk": {"use_grouped_topk": False},
             "no_correction_bias": {"correction_bias": None},
-            "no_shared_experts": {"num_fused_shared_experts": 0, "top_k": 8},
+            "no_shared_experts": {"shared_experts": SharedExpertsConfig(), "top_k": 8},
             "no_expert_group": {"num_expert_group": None},
             "no_topk_group": {"topk_group": None},
             "scaling_on_output": {"apply_routed_scaling_factor_on_output": True},
@@ -741,6 +742,7 @@ class TestAiterGroupedTopkFusionContract(CustomTestCase):
             "SGLANG_SIMULATE_UNIFORM_EXPERTS",
             "SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS",
             "SGLANG_K3_RADIX4_TOPK",
+            "SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK",
         ):
             with self.subTest(case=setting):
                 with (

@@ -99,7 +99,7 @@ def try_select_experts(
 ) -> Optional["StandardTopKOutput"]:
     """Return fused routing, or None to use the ordinary routing/append path."""
     config = topk_config
-    n_shared = config.num_fused_shared_experts
+    n_shared = config.num_shared_topk_slots
     if (
         not config.use_grouped_topk
         or config.correction_bias is None
@@ -111,6 +111,7 @@ def try_select_experts(
         or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
         or envs.SGLANG_K3_RADIX4_TOPK.get()
+        or envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         or config.apply_routed_scaling_factor_on_output
         or config.num_expert_group is None
         or config.topk_group is None

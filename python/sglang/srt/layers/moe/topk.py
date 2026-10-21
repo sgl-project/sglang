@@ -2818,7 +2818,12 @@ def select_experts(
     dynamic_expert_bias: Optional[torch.Tensor] = None,
     router_logits_partials: Optional[torch.Tensor] = None,
 ) -> StandardTopKOutput:
-    if _is_hip and _use_aiter:
+    if (
+        _is_hip
+        and _use_aiter
+        and dynamic_expert_bias is None
+        and router_logits_partials is None
+    ):
         from sglang.srt.layers.moe.aiter_topk import try_select_experts
 
         output = try_select_experts(
