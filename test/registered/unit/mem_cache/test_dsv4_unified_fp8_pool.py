@@ -243,14 +243,14 @@ class TestDSV4UnifiedRegionBuffers(CustomTestCase):
 
 class TestResolveUnifiedKvFp8(CustomTestCase):
     def test_override_false_wins_over_env(self):
-        env_mod = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        env_mod = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
         with patch(f"{env_mod}.is_unified_kv_fp8", return_value=True):
             self.assertFalse(resolve_unified_kv_fp8(False))
             self.assertTrue(resolve_unified_kv_fp8(True))
             self.assertTrue(resolve_unified_kv_fp8(None))
 
     def test_none_follows_env_off(self):
-        env_mod = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        env_mod = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
         with patch(f"{env_mod}.is_unified_kv_fp8", return_value=False):
             self.assertFalse(resolve_unified_kv_fp8(None))
             self.assertFalse(resolve_unified_kv_fp8(False))
@@ -258,27 +258,13 @@ class TestResolveUnifiedKvFp8(CustomTestCase):
 
 
 class TestDsv4PoolFp8Gate(CustomTestCase):
-    _ENV = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+    _ENV = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
 
     def _layout(self, *, is_draft_worker, algo, env_on=True):
         with patch(f"{self._ENV}.is_unified_kv_fp8", return_value=env_on):
             return unified_fp8_for_dsv4_pool(
                 is_draft_worker=is_draft_worker, spec_algorithm=algo
             )
-
-    def test_dspark_draft_stays_bf16_when_env_on(self):
-        self.assertFalse(
-            self._layout(
-                is_draft_worker=True, algo=SpeculativeAlgorithm.DSPARK, env_on=True
-            )
-        )
-
-    def test_eagle_draft_stays_two_pool_when_env_on(self):
-        self.assertTrue(
-            self._layout(
-                is_draft_worker=True, algo=SpeculativeAlgorithm.EAGLE, env_on=True
-            )
-        )
 
     def test_target_stays_two_pool_under_dspark_and_eagle(self):
         for algo in (SpeculativeAlgorithm.DSPARK, SpeculativeAlgorithm.EAGLE):
@@ -316,7 +302,7 @@ class TestUnifiedKvPoolFollowsCtorFp8(CustomTestCase):
         )
 
     def test_dspark_draft_layout_has_no_rope_pool(self):
-        env = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        env = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
         with patch(f"{env}.is_unified_kv_fp8", return_value=True):
             fp8 = unified_fp8_for_dsv4_pool(
                 is_draft_worker=True, spec_algorithm=SpeculativeAlgorithm.DSPARK
@@ -329,7 +315,7 @@ class TestUnifiedKvPoolFollowsCtorFp8(CustomTestCase):
         self.assertIsNone(pool.kv_buffer_rope[0])
 
     def test_eagle_draft_layout_has_rope_pool(self):
-        env = "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate"
+        env = "sglang.srt.layers.attention.dsv4.unified_kv_gate"
         with patch(f"{env}.is_unified_kv_fp8", return_value=True):
             fp8 = unified_fp8_for_dsv4_pool(
                 is_draft_worker=True, spec_algorithm=SpeculativeAlgorithm.EAGLE

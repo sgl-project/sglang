@@ -34,8 +34,11 @@ def _jit_qknorm_rope_module(
     pack_kv: bool = False,
     cache_has_full_width: bool = False,
     out_of_place: bool = False,
+    half_warp: bool = True,
 ) -> Module:
-    args = make_cpp_args(
+    """``half_warp=False`` keeps the one-row-per-warp kernel where the two-rows
+    variant would apply; tests use it as the bit-exactness oracle."""
+    template_args = [
         head_dim,
         rope_dim,
         is_neox,
@@ -44,13 +47,16 @@ def _jit_qknorm_rope_module(
         cache_dtype,
         round_norm_before_rope,
         cache_has_full_width,
-    )
+    ]
     if pack_kv:
         op_name, kernel_name = "qknorm_rope_pack_kv", "QKNormRopePackKVKernel"
     elif out_of_place:
         op_name, kernel_name = "qknorm_rope_out_of_place", "QKNormRopeOutOfPlaceKernel"
     else:
         op_name, kernel_name = "qknorm_rope", "QKNormRopeKernel"
+    if not pack_kv:
+        template_args.append(half_warp)
+    args = make_cpp_args(*template_args)
     return load_jit(
         op_name,
         *args,

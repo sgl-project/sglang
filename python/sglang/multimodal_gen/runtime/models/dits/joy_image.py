@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -11,6 +10,7 @@ from einops import rearrange
 
 from sglang.kernels.ops import diffusion as diffusion_kernels
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
@@ -78,10 +78,10 @@ def _joy_image_qk_rope(
         )
 
     # Read the packed projection directly, using the same CUDA arithmetic as
-    # the original contiguous in-place operation. Keep unmeasured paths native.
+    # the original contiguous in-place operation; apply_qk_norm_rope only fuses
+    # in place, so it needs the contiguous copies. Keep unmeasured paths native.
     if (
-        _JOY_IMAGE_QK_ROPE.disabled
-        or not q.is_cuda
+        not q.is_cuda
         or torch.version.hip
         or torch.compiler.is_compiling()
         or q.ndim != 4
@@ -113,19 +113,15 @@ def _joy_image_qk_rope(
                 x.requires_grad for x in (q, k, q_norm.weight, k_norm.weight, cache)
             )
         )
-        or os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        in {"0", "false", "off", "no"}
+        or not envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
     ):
-        return reference()
-    sig = (q.device, tuple(q.shape), tuple(q.stride()), q_norm.variance_epsilon)
-    verified = _JOY_IMAGE_QK_ROPE.is_verified(sig)
-    if not verified and torch.cuda.is_current_stream_capturing():
         return reference()
     if not diffusion_kernels.can_use_fused_inplace_qknorm_rope(
         128, 128, False, q.dtype, cache.dtype
     ):
         return reference()
-    try:
+
+    def fused():
         q_out = torch.empty(q.shape, device=q.device, dtype=q.dtype)
         k_out = torch.empty_like(q_out)
         positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
@@ -145,18 +141,14 @@ def _joy_image_qk_rope(
             head_dim=128,
             rope_dim=128,
         )
-    except Exception as exc:
-        # The out-of-place operation leaves packed Q/K/V pristine, including
-        # when it has written part of an output before raising.
-        _JOY_IMAGE_QK_ROPE.on_exception(exc, logger=logger)
-        return reference()
-    out = (q_out, k_out)
-    if verified:
-        return out
-    return _JOY_IMAGE_QK_ROPE.accept_or_fallback(
-        out,
-        reference(),
-        sig=sig,
+        return q_out, k_out
+
+    # The out-of-place kernel leaves packed Q/K/V pristine, including when it
+    # has written part of an output before raising, so a failure falls back.
+    return _JOY_IMAGE_QK_ROPE.run(
+        fused,
+        reference,
+        sig=(q.device, tuple(q.shape), tuple(q.stride()), q_norm.variance_epsilon),
         equal=lambda actual, expected: all(
             torch.equal(a.view(torch.int16), b.view(torch.int16))
             for a, b in zip(actual, expected, strict=True)
@@ -172,31 +164,20 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
     # Below 32 MiB per image tensor, eager dispatch costs more than the copy
     # saves. Keep small resolutions and short sequence-parallel shards native.
     if (
-        _JOY_QKV_CAT.disabled
-        or inputs[0].numel() < 16 * 1024 * 1024
+        inputs[0].numel() < 16 * 1024 * 1024
         or not inputs[0].is_cuda
         or torch.version.hip
         or torch.compiler.is_compiling()
-        or not diffusion_kernels.can_use_joint_qkv_cat(*inputs)
+        or inputs[0].dtype not in (torch.float16, torch.bfloat16)
+        or inputs[0].shape[-2] * inputs[0].shape[-1] > 8192
+        or any(x.requires_grad for x in inputs)
     ):
         return reference()
-    sig = (inputs[0].device, inputs[0].dtype) + tuple(
-        (tuple(x.shape), tuple(x.stride())) for x in inputs
-    )
-    verified = _JOY_QKV_CAT.is_verified(sig)
-    if not verified and torch.cuda.is_current_stream_capturing():
-        return reference()
-    try:
-        out = diffusion_kernels.joint_qkv_cat(*inputs)
-    except Exception as exc:
-        _JOY_QKV_CAT.on_exception(exc, logger=logger)
-        return reference()
-    if verified:
-        return out
-    return _JOY_QKV_CAT.accept_or_fallback(
-        out,
-        reference(),
-        sig=sig,
+    return _JOY_QKV_CAT.run(
+        lambda: diffusion_kernels.joint_qkv_cat(*inputs),
+        reference,
+        sig=(inputs[0].device, inputs[0].dtype)
+        + tuple((tuple(x.shape), tuple(x.stride())) for x in inputs),
         equal=lambda actual, expected: all(
             torch.equal(a.view(torch.int16), b.view(torch.int16))
             for a, b in zip(actual, expected, strict=True)

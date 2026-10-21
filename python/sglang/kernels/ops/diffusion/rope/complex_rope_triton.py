@@ -50,22 +50,6 @@ def _fuse_real_sin(device: torch.device) -> bool:
     return (z[0] * z[1]).imag.item() != 0
 
 
-def can_use_fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> bool:
-    return (
-        x.is_cuda
-        and torch.version.hip is None
-        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and x.ndim == 4
-        and x.numel() > 0
-        and x.shape[-1] % 2 == 0
-        and x.is_contiguous()
-        and rope.dtype == torch.complex64
-        and rope.device == x.device
-        and rope.shape == (x.shape[1], x.shape[-1] // 2)
-        and rope.is_contiguous()
-    )
-
-
 def _fake_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(x)
 
@@ -77,7 +61,20 @@ def _fake_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
 )
 def fused_complex_rope(x: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
     """Rotate contiguous BSHD activations with a shared S×(D/2) complex cache."""
-    assert can_use_fused_complex_rope(x, rope)
+    if not (
+        x.is_cuda
+        and torch.version.hip is None
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and x.ndim == 4
+        and x.numel() > 0
+        and x.shape[-1] % 2 == 0
+        and x.is_contiguous()
+        and rope.dtype == torch.complex64
+        and rope.device == x.device
+        and rope.shape == (x.shape[1], x.shape[-1] // 2)
+        and rope.is_contiguous()
+    ):
+        raise RuntimeError("invalid input for fused_complex_rope")
     out = torch.empty_like(x)
     pairs = x.numel() // 2
     with torch.cuda.device(x.device):

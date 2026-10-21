@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    pack_qsa_prefill_kv,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -41,6 +42,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     cp_materialize_global_token_order,
@@ -50,7 +52,8 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import is_hip
+from sglang.srt.runtime_context import get_spec
+from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +65,6 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 def _resolve_trtllm_sparse_decode():
     """FlashInfer paged decode for the post-gather sparse attention;
     the FA4 varlen fallback runs a prefill-shaped kernel at decode row counts."""
-    from sglang.srt.utils import is_sm100_supported, is_sm120
-
     # This path is numerically validated on SM100 and SM120. Do not widen it
     # to every SM12x device: it silently corrupts long-context decode on
     # SM121/GB10.
@@ -252,6 +253,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_counters = {}
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+        self._verify_mask = None
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -795,11 +797,24 @@ class QwenSparseAttnBackend(AttentionBackend):
                 num_padding=num_padding if num_padding is not None else 0,
             )
 
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         if self.device is None:
             raise RuntimeError(
                 "QSA backend requires a ModelRunner to initialize CUDA graph state"
             )
+        self._verify_mask = maybe_create_verify_mask(
+            is_draft_runner=self.runner is not None and self.runner.is_draft_worker,
+            skip_prefill=False,
+            max_bs=max_bs,
+            max_context_len=self.max_context_len,
+            num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            device=self.device,
+            is_read=False,
+        )
         self._cuda_graph_max_tokens = max_num_tokens
         max_blocks = math.ceil(self.max_context_len / self.compress_ratio)
         max_pages = max(
@@ -1489,33 +1504,26 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        # The validated chunk-prefill kernel consumes tightly packed full-context
-        # K/V. Current-chunk K/V has already been committed to the cache above.
+        # Current-chunk K/V has already been committed to the cache above.
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
-        req_to_token = self.req_to_token_pool.req_to_token
-        req_indices = forward_batch.req_pool_indices.tolist()
-        k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
-        v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
-            for i in range(len(sequence_lens))
-        ]
         sequence_lens_tensor = torch.tensor(
             sequence_lens, dtype=torch.int32, device=q.device
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=pool.get_key_buffer(layer.layer_id),
+            v=pool.get_value_buffer(layer.layer_id),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=sum(sequence_lens),
+            max_k=max(sequence_lens, default=1),
+            output_dtype=q.dtype,
+        )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
-            torch.cat(k_parts),
-            torch.cat(v_parts),
+            packed_k,
+            packed_v,
             topk_indices,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -1645,9 +1653,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         buffers = self._fa2_scratch.get(key)
         if buffers is None or buffers[0].shape[0] < capacity:
             shape = (capacity, num_kv_heads, head_dim)
+            # Zeroed once: a row is packed only up to its last visible page, so
+            # bytes past it are never written and must not be NaN garbage.
             buffers = (
-                torch.empty(shape, dtype=dtype, device=device),
-                torch.empty(shape, dtype=dtype, device=device),
+                torch.zeros(shape, dtype=dtype, device=device),
+                torch.zeros(shape, dtype=dtype, device=device),
             )
             self._fa2_scratch[key] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
@@ -1701,13 +1711,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             batch, pages_per_row, page, device
         )
         capacity_rows = self._cuda_graph_max_tokens if metadata.is_cuda_graph else batch
-        # Gather into the query dtype: an FP8 pool is dequantized on the way in, so the
-        # paged kernel always runs the bf16 q + bf16 KV path.
+        # TRTLLM-gen takes BF16 q with FP8-E4M3 KV, so an FP8 pool stays FP8 here;
+        # validated on SM10x only, SM120 keeps the BF16 scratch.
+        packed_dtype = (
+            k_buffer.dtype
+            if k_buffer.dtype == torch.float8_e4m3fn and is_sm100_supported()
+            else q.dtype
+        )
         packed_k, packed_v = self._get_fa2_scratch(
             max(capacity_rows, batch) * stride,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            q.dtype,
+            packed_dtype,
             k_buffer.device,
         )
         if new_kv is not None:
@@ -1736,6 +1751,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                     if compress_ratio > 1
                     else None
                 ),
+                # trtllm_decode reads each row only up to valid_counts.
+                visible_page_size=page,
             )
         else:
             qwen_sparse_valid_counts_triton(
