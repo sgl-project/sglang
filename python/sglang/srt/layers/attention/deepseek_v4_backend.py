@@ -3948,10 +3948,15 @@ class DeepseekV4AttnBackend(
         )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Idle always re-translates at store time: its metadata may be stale, and
-        translating the zero-padded out_cache_loc writes to the dummy slot."""
+        """Idle never trusts its metadata, which may be stale or unset: it writes
+        the request window's idle layout, or translates the zero-padded
+        out_cache_loc to the dummy slot."""
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
+            if forward_batch.forward_mode.is_idle():
+                return self.token_to_kv_pool.request_window.activate_idle(
+                    forward_batch.out_cache_loc.shape[0]
+                )
             layout = metadata.core_attn_metadata.request_window_layout
             self.token_to_kv_pool.request_window.activate(layout)
             return layout.write_loc

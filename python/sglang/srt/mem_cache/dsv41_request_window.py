@@ -222,6 +222,7 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self._idle_layout = None
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -261,6 +262,24 @@ class RequestWindow:
                 f"request-window workspace too small: {self.workspace.size} rows "
                 f"for a layout of {layout.size}"
             )
+
+    def activate_idle(self, num_rows: int) -> torch.Tensor:
+        """Activate a layout for an idle forward, whose attention metadata is
+        stale or unset. Its rows write the workspace past an empty history, and
+        an idle forward never commits them."""
+        layout = self._idle_layout
+        if layout is None or layout.pos.numel() != num_rows:
+            zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
+            layout = window_layout(
+                zeros,
+                zeros,
+                zero_row=self.zero_row,
+                capacity=self.capacity,
+                num_groups=1,
+            )
+            self._idle_layout = layout
+        self.activate(layout)
+        return layout.write_loc
 
     def initialize_dummy_history(self):
         layout = self.layout
