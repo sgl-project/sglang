@@ -395,7 +395,7 @@ def test_coordinator_parallel_join_and_cleanup():
                 {
                     "method": "encode",
                     "job_id": "leased",
-                    "request": Req(),
+                    "request": Req(prompt="leased"),
                     "outputs": None,
                 },
                 5,
