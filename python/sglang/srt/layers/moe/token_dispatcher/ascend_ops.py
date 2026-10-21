@@ -51,13 +51,28 @@ _DISPATCH_COMM_ALG = "fullmesh_v1"
 _COMBINE_COMM_ALG = ""
 
 
+_DEBUG_PRINT_BUDGET = 8
+_debug_prints = 0
+
+
 def _debug_rank0() -> bool:
-    """True on global rank 0 while SGLANG_ASCEND_OPS_DEBUG is enabled."""
+    """True on global rank 0 while SGLANG_ASCEND_OPS_DEBUG is enabled.
+
+    The budget keeps the device syncs behind ``.item()`` off the per-layer hot
+    path: every print stalls the calling rank while the others keep issuing
+    collectives, which is enough to trip the HCCL execute timeout over 61 layers.
+    """
+    global _debug_prints
     if not envs.SGLANG_ASCEND_OPS_DEBUG.get():
+        return False
+    if _debug_prints >= _DEBUG_PRINT_BUDGET:
         return False
     import torch.distributed as dist
 
-    return not dist.is_initialized() or dist.get_rank() == 0
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return False
+    _debug_prints += 1
+    return True
 
 
 class AscendOpsDispatchOutput(NamedTuple):
