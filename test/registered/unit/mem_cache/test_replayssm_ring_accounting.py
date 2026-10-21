@@ -4,9 +4,8 @@ The memory solver charges this on top of mamba_cache_per_req so num_slots is not
 over-provisioned (the ring is allocated per slot but is NOT part of the state
 cache cost). Pins the arithmetic against hand-computed byte counts for the
 fold window (raw v / pre-norm k / g / beta) across both gate layouts: GDN
-per-head scalar g vs KDA per-K vector g (KDA also keeps the chunked d/k rings
-under spec, see MambaPool). If the MambaPool allocation changes shape, update
-both the allocation and this expectation together.
+per-head scalar g vs KDA per-K vector g. If the MambaPool allocation changes
+shape, update both the allocation and this expectation together.
 """
 
 import pytest
@@ -20,6 +19,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,8 +28,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 # temporal = (hv=4, v_dim=8, k_dim=8), num_k_heads_per_tp = 4, record_len = 8,
 # 2 layers. conv bf16 (2B), fp32 gate/beta (4B). Ring tensors (per slot, per
 # layer):
-# GDN stores compact d/k plus scalar g. KDA stores raw v/k, vector g, beta,
-# and its existing d/k rings.
+# GDN stores compact d/k plus scalar g. KDA stores raw v/k, vector g, and beta.
 DTYPE = Mamba2StateDType(conv=torch.bfloat16, temporal=torch.float32)
 RL = 8
 LAYERS = [0, 1]
@@ -74,11 +73,37 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         )
 
     def test_kda_fold(self):
-        # rawv 512 + rawk 512 + g(per-K, 4*8*8*4) 1024 + beta 128
-        # + d 512 + k 512 (KDA keeps the chunked rings under spec) = 3200
+        # rawv 512 + rawk 512 + g(per-K, 4*8*8*4) 1024 + beta 128 = 2176
         self.assertEqual(
             _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
-            3200 * len(LAYERS),
+            2176 * len(LAYERS),
+        )
+
+    def test_kda_spec_pool_allocates_accounted_ring(self):
+        mamba_size = 3
+        pool = HybridReqToTokenPool(
+            size=2,
+            mamba_size=mamba_size,
+            mamba_spec_state_size=2,
+            max_context_len=16,
+            device="cpu",
+            enable_memory_saver=False,
+            cache_params=_kda_params(),
+            mamba_layer_ids=LAYERS,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=4,
+            linear_replayssm_cache_len=RL,
+            enable_linear_replayssm_spec=True,
+        )
+        cache = pool.mamba_pool.mamba_cache
+        rings = [
+            getattr(cache, f"replayssm_{name}")
+            for name in ("d", "k", "g", "rawv", "rawk", "beta")
+        ]
+        self.assertEqual(
+            sum(t.numel() * t.element_size() for t in rings if t is not None),
+            _kda_params().replayssm_ring_bytes_per_req(record_len=RL)
+            * (mamba_size + 1),
         )
 
     def test_zero_len_ring(self):
