@@ -286,36 +286,21 @@ impl ChatFormatter {
     }
 
     /// `--chat-encoding-backend recipe`: DeepSeek-V4 / V4.1 render through
-    /// deepseek-recipe, which also tokenizes its prompts when the checkpoint's
-    /// `tokenizer.json` is given. Any other model keeps its formatter, as the
-    /// engine does.
-    pub fn with_recipe_backend(mut self, tokenizer_json: Option<&str>) -> Self {
+    /// deepseek-recipe, which tokenizes its prompts with the checkpoint's
+    /// `tokenizer.json`. Any other model keeps its formatter, as the engine does.
+    pub fn with_recipe_backend(mut self, tokenizer_json: Option<&str>) -> Result<Self> {
         let model = match self.processor {
             Some(ProcessorFormatter::DeepSeekV41) => RecipeModel::V41,
             Some(ProcessorFormatter::DeepSeekV4(_)) => RecipeModel::V4,
-            _ => return self,
+            _ => return Ok(self),
         };
-        let formatter =
-            match tokenizer_json.map(|json| RecipeFormatter::from_tokenizer_json(model, json)) {
-                Some(Ok(formatter)) => formatter,
-                Some(Err(error)) => {
-                    tracing::warn!(
-                        %error,
-                        "deepseek-recipe cannot use this tokenizer.json; its prompts are \
-                         encoded with the router tokenizer instead"
-                    );
-                    RecipeFormatter::new(model)
-                }
-                None => {
-                    tracing::warn!(
-                        "no tokenizer.json for deepseek-recipe; its prompts are encoded with \
-                         the router tokenizer instead"
-                    );
-                    RecipeFormatter::new(model)
-                }
-            };
+        let json = tokenizer_json
+            .context("--chat-encoding-backend recipe needs the model's tokenizer.json")?;
+        let formatter = RecipeFormatter::from_tokenizer_json(model, json)
+            .map_err(anyhow::Error::msg)
+            .context("--chat-encoding-backend recipe")?;
         self.processor = Some(ProcessorFormatter::DeepSeekRecipe(formatter));
-        self
+        Ok(self)
     }
 
     /// Whether prompts render through deepseek-recipe, which the workers must match.
@@ -441,22 +426,13 @@ impl ChatFormatter {
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
         if let Some(formatter @ ProcessorFormatter::DeepSeekRecipe(_)) = &self.processor {
-            // recipe tokenizes its own prompt (special tokens by id, plain text as
-            // plain BPE); without its tokenizer the segments go to the router's.
+            // recipe tokenizes its own prompt: special tokens by id, plain text as plain BPE.
             let render = formatter
                 .render_recipe(request.clone(), &self.worker_defaults)
                 .context("render chat")?;
-            return match render.token_ids {
-                Some(ids) => Ok(ids),
-                None => {
-                    let segments: Vec<EncodeSegment<'_>> = render
-                        .segments
-                        .iter()
-                        .map(|segment| EncodeSegment::new(&segment.text, segment.allow_special))
-                        .collect();
-                    Ok(tokenizer.encode_segments(&segments)?.token_ids().to_vec())
-                }
-            };
+            return render
+                .token_ids
+                .context("deepseek-recipe formatter has no tokenizer");
         }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
@@ -843,23 +819,24 @@ mod tests {
     /// `--chat-encoding-backend recipe` swaps only the DeepSeek-V4 family's encoder.
     #[test]
     fn recipe_backend_applies_to_deepseek_v4_only() {
+        let tokenizer_json = include_str!("../../tests/fixtures/tiny_tokenizer.json");
         let v41 = ChatFormatter::deepseek_native(Some("deepseek_v41"), "alias")
             .unwrap()
-            .with_recipe_backend(None);
+            .with_recipe_backend(Some(tokenizer_json))
+            .unwrap();
         assert!(v41.is_recipe());
         assert_eq!(
             v41.forwarding_scope(),
             super::super::ForwardingScope::AllText
         );
-        let v4 = ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias")
-            .unwrap()
-            .with_recipe_backend(None);
-        assert!(v4.is_recipe());
+        let v4 = ChatFormatter::deepseek_native(Some("deepseek_v4"), "alias").unwrap();
+        assert!(v4.with_recipe_backend(None).is_err());
         let v32 = ChatFormatter::deepseek_native(Some("deepseek_v32"), "DeepSeek-V3.2")
             .unwrap()
-            .with_recipe_backend(None);
+            .with_recipe_backend(None)
+            .unwrap();
         assert!(!v32.is_recipe());
-        // The recipe_parity fixture's `a1_empty_chat`: recipe's own prompt, not Dynamo's.
+        // The recipe parity fixture's `a1_empty_chat`: recipe's own prompt, not Dynamo's.
         let request = serde_json::json!({
             "messages": [{"role": "user", "content": ""}],
             "chat_template_kwargs": {"thinking": false},

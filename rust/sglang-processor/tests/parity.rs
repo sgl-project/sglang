@@ -35,6 +35,10 @@ fn fixtures_match_sglang() {
 fn check(fixture: &Value) {
     let model = fixture["model"].as_str().unwrap();
     let revision = fixture["revision"].as_str().unwrap();
+    if fixture["chat_encoding_backend"] == "recipe" && !cfg!(feature = "recipe") {
+        eprintln!("{model}: a deepseek-recipe fixture; skipped without the `recipe` feature");
+        return;
+    }
     let formatter = formatter(model, fixture);
     let tokenizer = cached_tokenizer(model, revision);
     // The fixture records Python's DeepSeek-V4 profile; the checkpoint's encoder must agree.
@@ -77,6 +81,10 @@ fn check_case(
     let defaults: HashMap<String, Value> = (case["default_chat_template_kwargs"].as_object())
         .map(|defaults| defaults.clone().into_iter().collect())
         .unwrap_or_default();
+    #[cfg(feature = "recipe")]
+    if let ChatFormatter::DeepSeekRecipe(_) = formatter {
+        return check_recipe_case(formatter, &defaults, case);
+    }
     let rendered = formatter.render_request(case["request"].clone(), &defaults);
     if !case["error"].is_null() {
         return match rendered {
@@ -92,7 +100,35 @@ fn check_case(
     let Some(tokenizer) = tokenizer else {
         return Ok(());
     };
-    let ids = encode(tokenizer, &prompt, &prefix, bos);
+    check_tokens(&encode(tokenizer, &prompt, &prefix, bos), case)
+}
+
+/// deepseek-recipe renders and tokenizes on its own; without the checkpoint's
+/// `tokenizer.json` only the prompt text is checked.
+#[cfg(feature = "recipe")]
+fn check_recipe_case(
+    formatter: &ChatFormatter,
+    defaults: &HashMap<String, Value>,
+    case: &Value,
+) -> Result<(), String> {
+    let render = formatter.render_recipe(case["request"].clone(), defaults);
+    if !case["error"].is_null() {
+        return match render {
+            Ok(_) => Err("SGLang rejects this request".into()),
+            Err(_) => Ok(()),
+        };
+    }
+    let render = render.map_err(|error| error.to_string())?;
+    if render.prompt != case["prompt"] {
+        return Err(format!("prompt differs: {}", render.prompt));
+    }
+    match render.token_ids {
+        Some(ids) => check_tokens(&ids, case),
+        None => Ok(()),
+    }
+}
+
+fn check_tokens(ids: &[u32], case: &Value) -> Result<(), String> {
     let digest = ids.iter().fold(Sha256::new(), |hash, id| {
         hash.chain_update(id.to_le_bytes())
     });
@@ -104,8 +140,25 @@ fn check_case(
     Ok(())
 }
 
-/// What `select_chat_formatter` picks for the fixture's `config.json` and Jinja template.
+/// What `select_chat_formatter` picks for the fixture's `config.json` and Jinja
+/// template. A deepseek-recipe fixture builds the recipe formatter as the hosts do,
+/// with the cached `tokenizer.json` when there is one.
 fn formatter(model: &str, fixture: &Value) -> ChatFormatter {
+    #[cfg(feature = "recipe")]
+    if fixture["chat_encoding_backend"] == "recipe" {
+        use sglang_processor::{RecipeFormatter, RecipeModel};
+        let config = &fixture["config"];
+        let recipe_model = RecipeModel::detect(
+            config["model_type"].as_str(),
+            config["architectures"][0].as_str(),
+        )
+        .unwrap_or_else(|| panic!("{model}: not a DeepSeek-V4 family config"));
+        let formatter = match resolve_tokenizer_file(model, fixture["revision"].as_str()) {
+            Some(file) => RecipeFormatter::from_tokenizer_file(recipe_model, &file).unwrap(),
+            None => RecipeFormatter::new(recipe_model),
+        };
+        return ChatFormatter::DeepSeekRecipe(formatter);
+    }
     let dir = std::env::temp_dir().join(format!(
         "sglang-processor-parity-{}-{}",
         std::process::id(),

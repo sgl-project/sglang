@@ -1,14 +1,14 @@
 //! DeepSeek-V4 and V4.1 prompts rendered by `deepseek-recipe`, the encoder behind
-//! the official API. `pre_normalize` mirrors `deepseek_recipe_bridge.pre_normalize`
-//! (python/sglang/srt/entrypoints/openai/) rule for rule; `tests/recipe_parity.rs`
-//! pins both to the same outputs.
+//! the official API. `pre_normalize` mirrors `serving_deepseek_recipe.pre_normalize`
+//! (python/sglang/srt/entrypoints/openai/); the `*-recipe.json` fixtures of
+//! `tests/parity.rs` pin both to the Python serving path.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
 use deepseek_recipe::openai::ChatCompletionRequest;
-use deepseek_recipe::request::{ConversionOptions, ModelVersion, ProtocolRequest};
+use deepseek_recipe::request::{ConversionOptions, ProtocolRequest};
 use deepseek_recipe_core::special_tokens::SpecialTokensMap;
 use deepseek_recipe_encoding::v4::dsv4::DeepseekV4Encoding;
 use deepseek_recipe_encoding::v4::dsv41::DeepseekV41Encoding;
@@ -18,11 +18,6 @@ use serde_json::{Value, json};
 
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
-/// The request `model` recipe sees. recipe resolves the model version by looking
-/// the name up in its alias table and rejects any other name, while SGLang serves
-/// whatever name the client sent; [`RecipeFormatter`] binds this alias to the
-/// checkpoint's version.
-pub const RECIPE_MODEL_ALIAS: &str = "sglang-deepseek";
 /// The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it `<｜image｜>`.
 pub const IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
 
@@ -34,9 +29,19 @@ pub enum RecipeModel {
 }
 
 impl RecipeModel {
+    /// recipe's own name for the version. It resolves the version from the request
+    /// `model` and rejects any other name; SGLang serves whatever name the client
+    /// sent, so this replaces it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::V4 => "DeepSeek-V4-Pro",
+            Self::V41 => "DeepSeek-V4.1-Flash",
+        }
+    }
+
     /// The encoding for a checkpoint, from `config.json`'s `model_type` and first
-    /// `architectures` entry: V4.1 checkpoints may keep a `deepseek_v4` model type.
-    /// The test `chat_encoding.resolve_chat_encoding_spec` applies for `dsv41` / `dsv4`.
+    /// `architectures` entry, as `chat_encoding.resolve_chat_encoding_spec` tells
+    /// `dsv41` from `dsv4`: V4.1 checkpoints may keep a `deepseek_v4` model type.
     pub fn detect(model_type: Option<&str>, architecture: Option<&str>) -> Option<Self> {
         let architecture = architecture.unwrap_or_default();
         if model_type == Some("deepseek_v41") || architecture.contains("DeepseekV41") {
@@ -47,13 +52,6 @@ impl RecipeModel {
         }
         None
     }
-
-    fn version(self) -> ModelVersion {
-        match self {
-            Self::V4 => ModelVersion::DeepseekV4Pro,
-            Self::V41 => ModelVersion::DeepseekV41Flash,
-        }
-    }
 }
 
 /// The recipe formatter for one checkpoint: recipe's conversion options and
@@ -62,6 +60,7 @@ impl RecipeModel {
 /// `tokenizer.json` is attached.
 #[derive(Clone)]
 pub struct RecipeFormatter {
+    model: RecipeModel,
     options: ConversionOptions,
     encoding: Arc<dyn PromptEncoding + Send + Sync>,
     tokenizer: Option<Arc<PromptTokenizer>>,
@@ -79,9 +78,8 @@ impl RecipeFormatter {
             RecipeModel::V41 => Arc::new(DeepseekV41Encoding::new().with_special_tokens(tokens())),
         };
         Self {
-            options: ConversionOptions::default()
-                .with_model_alias(RECIPE_MODEL_ALIAS, model.version())
-                .with_special_tokens(tokens()),
+            model,
+            options: ConversionOptions::default().with_special_tokens(tokens()),
             encoding,
             tokenizer: None,
         }
@@ -101,26 +99,6 @@ impl RecipeFormatter {
         Ok(Self::new(model).with_tokenizer(PromptTokenizer::new(&tokenizer)))
     }
 
-    /// Attach the checkpoint's tokenizer resolved from `model_path` (a model
-    /// directory, a tokenizer file or a cached HF repo id); render only when
-    /// none is found.
-    pub fn for_checkpoint(model: RecipeModel, model_path: &str, revision: Option<&str>) -> Self {
-        let loaded = crate::resolve_model_file(model_path, revision, "tokenizer.json")
-            .ok_or_else(|| "no tokenizer.json".to_owned())
-            .and_then(|file| Self::from_tokenizer_file(model, &file));
-        match loaded {
-            Ok(formatter) => formatter,
-            Err(err) => {
-                tracing::warn!(
-                    %model_path,
-                    error = %err,
-                    "deepseek-recipe renders without a tokenizer; it produces no token ids"
-                );
-                Self::new(model)
-            }
-        }
-    }
-
     fn with_tokenizer(mut self, tokenizer: PromptTokenizer) -> Self {
         self.tokenizer = Some(Arc::new(tokenizer));
         self
@@ -131,34 +109,24 @@ impl RecipeFormatter {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecipeRender {
     pub prompt: String,
-    /// Byte ranges of `prompt` holding explicit special tokens.
-    pub special_ranges: Vec<Range<usize>>,
-    /// `prompt` split at the special ranges; plain text never parses control tokens.
+    /// `prompt` split at its special tokens; plain text never parses control tokens.
     pub segments: Vec<RenderedSegment>,
-    /// recipe's token ids when the formatter has a tokenizer: the special ranges
+    /// recipe's token ids when the formatter has a tokenizer: the special tokens
     /// as their ids, the text between them as plain BPE.
     pub token_ids: Option<Vec<u32>>,
     pub thinking_mode: bool,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub max_tokens: Option<u32>,
-    /// `OutputConstraint::kind` and `OutputConstraint::schema`, when recipe selects one.
-    pub output_constraint: Option<(String, String)>,
-    /// The prompt ends inside an opened DSML calls block. Always false today:
-    /// `pre_normalize` renders required and named tool choices as `auto`.
-    pub starts_in_tool_calls: bool,
-}
-
-/// Python's `bool()`, which is how serving_chat reads a kwargs flag.
-fn is_true(value: &Value) -> bool {
-    minijinja::Value::from_serialize(value).is_true()
 }
 
 /// Rewrite an SGLang chat request body into what recipe's Chat Completions
-/// adapter accepts. Mirrors `deepseek_recipe_bridge.pre_normalize`: the hosts
-/// pass the wire body, so the thinking and effort rules repeat what
-/// `protocol.normalize_reasoning_inputs` and serving_chat do for the builtin
-/// DeepSeek encoders.
+/// adapter accepts. Mirrors `serving_deepseek_recipe.pre_normalize`: only SGLang's
+/// own request extensions are translated, recipe validates and renders the rest.
+/// The hosts pass the wire body, so the `reasoning` fold of
+/// `protocol.normalize_reasoning_inputs` and serving_chat's kwargs-effort and
+/// default-kwargs steps, which the Python handler runs before its adapter, are
+/// repeated here.
 pub(crate) fn pre_normalize(
     body: &mut Value,
     defaults: &HashMap<String, Value>,
@@ -169,76 +137,55 @@ pub(crate) fn pre_normalize(
     if request.get("task").is_some_and(|task| !task.is_null()) {
         return Err("task is not supported by the deepseek-recipe chat encoding backend".into());
     }
-    request.insert("model".into(), Value::String(RECIPE_MODEL_ALIAS.into()));
 
-    let kwargs = request
-        .remove("chat_template_kwargs")
-        .and_then(|kwargs| match kwargs {
-            Value::Object(kwargs) => Some(kwargs),
-            _ => None,
-        })
-        .unwrap_or_default();
-    // What `render::reasoning` reads: `reasoning.effort`, then
-    // `reasoning.reasoning_effort`, then the request field, as the validator does.
+    // protocol.normalize_reasoning_inputs, via `render::reasoning`: `reasoning`
+    // folds into the effort and, with setdefault, the kwargs thinking flag.
+    let mut kwargs = match request.remove("chat_template_kwargs") {
+        Some(Value::Object(kwargs)) => kwargs,
+        _ => serde_json::Map::new(),
+    };
     let reasoning_view = json!({
         "reasoning": request.remove("reasoning"),
         "reasoning_effort": request.get("reasoning_effort"),
     });
-    // The API's own `thinking` object wins. Otherwise the kwargs flag, which
-    // serving_chat reads for the DeepSeek encoders and the validator only fills
-    // with setdefault; then what the effort or `reasoning.enabled` implies; then
-    // the server defaults.
-    if request.get("thinking").is_none_or(Value::is_null) {
-        let toggle = ["thinking", "enable_thinking"]
-            .iter()
-            .find_map(|key| kwargs.get(*key).filter(|value| !value.is_null()))
-            .map(is_true)
-            .or_else(|| requested_thinking(&reasoning_view))
-            .or_else(|| {
-                defaults
-                    .get("thinking")
-                    .filter(|value| !value.is_null())
-                    .map(is_true)
-            });
-        if let Some(enabled) = toggle {
-            let kind = if enabled { "enabled" } else { "disabled" };
-            request.insert("thinking".into(), json!({ "type": kind }));
-        }
+    if let Some(effort) = requested_effort(&reasoning_view) {
+        request.insert("reasoning_effort".into(), effort.clone());
     }
-
+    if let Some(thinking) = requested_thinking(&reasoning_view) {
+        kwargs.entry("thinking").or_insert(Value::Bool(thinking));
+    }
+    // `protocol.ReasoningEffortType` has no `ultra`: the Python host rejects it
+    // where recipe would accept it.
+    if request.get("reasoning_effort") == Some(&Value::String("ultra".into())) {
+        return Err("invalid reasoning_effort: ultra".into());
+    }
     // serving_chat._convert_to_internal_request: the kwargs effort replaces the
-    // request's; _process_messages: the default fills in last.
-    let effort = kwargs
-        .get("reasoning_effort")
-        .filter(|value| !value.is_null())
-        .cloned()
-        .or_else(|| requested_effort(&reasoning_view).cloned())
-        .or_else(|| {
-            defaults
-                .get("reasoning_effort")
-                .filter(|value| !value.is_null())
-                .cloned()
-        });
-    match effort.as_ref().and_then(effort_tier) {
-        Some(tier) => {
-            request.insert("reasoning_effort".into(), Value::String(tier.into()));
-        }
-        None => {
-            request.remove("reasoning_effort");
-        }
+    // request's; _process_messages: the server defaults fill in.
+    if let Some(effort) = kwargs
+        .remove("reasoning_effort")
+        .filter(|effort| !effort.is_null())
+    {
+        request.insert("reasoning_effort".into(), effort);
+    }
+    for (key, value) in defaults {
+        kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    if request.get("reasoning_effort").is_none_or(Value::is_null)
+        && let Some(effort) = kwargs.get("reasoning_effort")
+    {
+        request.insert("reasoning_effort".into(), effort.clone());
+    }
+    // The dsv41 branch reads the kwargs flag with Python truthiness; the API's own
+    // `thinking` object wins.
+    if request.get("thinking").is_none_or(Value::is_null)
+        && let Some(flag) = kwargs.get("thinking")
+    {
+        let enabled = minijinja::Value::from_serialize(flag).is_true();
+        let kind = if enabled { "enabled" } else { "disabled" };
+        request.insert("thinking".into(), json!({ "type": kind }));
     }
 
-    if request.get("max_tokens").is_none_or(Value::is_null)
-        && let Some(max_completion_tokens) = request
-            .get("max_completion_tokens")
-            .filter(|value| !value.is_null())
-            .cloned()
-    {
-        request.insert("max_tokens".into(), max_completion_tokens);
-    }
-    // The host samples `n` completions from one prompt and enforces
-    // structural_tag, which recipe does not know, with its grammar.
-    request.remove("n");
+    // The host enforces structural_tag with its grammar; recipe does not know it.
     if request
         .get("response_format")
         .is_some_and(|format| format["type"] == "structural_tag")
@@ -249,7 +196,7 @@ pub(crate) fn pre_normalize(
 
     let continue_final = request
         .remove("continue_final_message")
-        .is_some_and(|value| is_true(&value));
+        .is_some_and(|value| minijinja::Value::from_serialize(value).is_true());
     let Some(Value::Array(messages)) = request.get_mut("messages") else {
         return Err("messages must be an array".into());
     };
@@ -260,15 +207,25 @@ pub(crate) fn pre_normalize(
 /// `required` and a named tool render as `auto`: recipe would pre-open the DSML
 /// calls block in the prompt, but SGLang enforces the choice with its own grammar
 /// and its parsers expect the model to emit the block. A named tool keeps only
-/// that tool, as `serving_chat._process_messages` does.
+/// that tool, and `none` or no tools drops them, as `serving_chat._process_messages`
+/// hands them to the encoder.
 fn normalize_tool_choice(request: &mut serde_json::Map<String, Value>) {
+    // `_process_messages` hands the encoder no tools when the request has none
+    // or turns them off.
+    if request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+        || request.get("tool_choice") == Some(&Value::String("none".into()))
+    {
+        request.remove("tools");
+        request.remove("tool_choice");
+        return;
+    }
     let Some(choice) = request.get("tool_choice") else {
         return;
     };
-    if let Some(name) = choice["function"]["name"]
-        .as_str()
-        .filter(|_| choice.is_object())
-    {
+    if let Some(name) = choice["function"]["name"].as_str() {
         let name = name.to_owned();
         if let Some(Value::Array(tools)) = request.get("tools") {
             let chosen: Vec<Value> = tools
@@ -286,11 +243,12 @@ fn normalize_tool_choice(request: &mut serde_json::Map<String, Value>) {
     }
 }
 
-/// In place: developer -> system, ids for historical tool calls and their tool
-/// messages, serialized arguments, and the continuation `prefix` mark.
+/// In place: `developer` turns become `system` (recipe has no developer role),
+/// object-typed tool call arguments become the JSON string recipe takes, and
+/// `continue_final_message` marks the last assistant turn as recipe's `prefix`.
+/// recipe parses the arguments and prints the values itself, so the string's own
+/// formatting (Python's `json.dumps` on the engine) does not reach the prompt.
 fn normalize_history(messages: &mut [Value], continue_final: bool) {
-    let mut pending_call_ids: Vec<String> = Vec::new();
-    let mut synthesized = 0usize;
     for message in messages.iter_mut() {
         let Some(object) = message.as_object_mut() else {
             continue;
@@ -298,45 +256,17 @@ fn normalize_history(messages: &mut [Value], continue_final: bool) {
         if object.get("role").and_then(Value::as_str) == Some("developer") {
             object.insert("role".into(), Value::String("system".into()));
         }
-        match object.get("role").and_then(Value::as_str) {
-            Some("assistant") => {
-                pending_call_ids.clear();
-                if let Some(Value::Array(tool_calls)) = object.get_mut("tool_calls") {
-                    for tool_call in tool_calls.iter_mut() {
-                        let Some(call) = tool_call.as_object_mut() else {
-                            continue;
-                        };
-                        if call.get("id").is_none_or(Value::is_null) {
-                            call.insert(
-                                "id".into(),
-                                Value::String(format!("call_{synthesized:02}_sglang")),
-                            );
-                            synthesized += 1;
-                        }
-                        if let Some(id) = call.get("id").and_then(Value::as_str) {
-                            pending_call_ids.push(id.to_owned());
-                        }
-                        if let Some(Value::Object(function)) = call.get_mut("function")
-                            && let Some(arguments) = function.get("arguments")
-                            && !arguments.is_string()
-                        {
-                            let text = python_json_dumps(arguments);
-                            function.insert("arguments".into(), Value::String(text));
-                        }
-                    }
-                }
-            }
-            Some("tool") => {
-                if object.get("tool_call_id").is_none_or(Value::is_null)
-                    && !pending_call_ids.is_empty()
+        // SGLang's message models have no `prefix`; Pydantic drops it.
+        object.remove("prefix");
+        if let Some(Value::Array(tool_calls)) = object.get_mut("tool_calls") {
+            for call in tool_calls.iter_mut() {
+                if let Some(Value::Object(function)) = call.get_mut("function")
+                    && let Some(arguments) = function.get("arguments")
+                    && !arguments.is_string()
                 {
-                    let id = pending_call_ids.remove(0);
-                    object.insert("tool_call_id".into(), Value::String(id));
-                } else if let Some(id) = object.get("tool_call_id").and_then(Value::as_str) {
-                    pending_call_ids.retain(|pending| pending != id);
+                    function.insert("arguments".into(), Value::String(arguments.to_string()));
                 }
             }
-            _ => {}
         }
     }
     if continue_final
@@ -347,140 +277,16 @@ fn normalize_history(messages: &mut [Value], continue_final: bool) {
     }
 }
 
-/// `json.dumps(value, ensure_ascii=False, separators=(",", ":"))`: compact JSON
-/// whose floats print as Python's `repr` does (`1e-05`, `1e+16`, `100.0`).
-fn python_json_dumps(value: &Value) -> String {
-    fn write(value: &Value, out: &mut String) {
-        match value {
-            Value::Null => out.push_str("null"),
-            Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
-            Value::Number(number) => match number.as_f64().filter(|_| number.is_f64()) {
-                Some(float) => out.push_str(&python_float_repr(float)),
-                None => out.push_str(&number.to_string()),
-            },
-            // Both escape only `"`, `\` and control characters.
-            Value::String(text) => out.push_str(&Value::String(text.clone()).to_string()),
-            Value::Array(items) => {
-                out.push('[');
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    write(item, out);
-                }
-                out.push(']');
-            }
-            Value::Object(fields) => {
-                out.push('{');
-                for (index, (key, item)) in fields.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&Value::String(key.clone()).to_string());
-                    out.push(':');
-                    write(item, out);
-                }
-                out.push('}');
-            }
-        }
-    }
-    let mut out = String::new();
-    write(value, &mut out);
-    out
-}
-
-/// Python's `repr(float)`: the shortest round-trip digits, positional for
-/// exponents in -4..16 and `d.ddde±XX` otherwise.
-fn python_float_repr(float: f64) -> String {
-    let scientific = format!("{float:e}");
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("Rust's {:e} has an exponent");
-    let exponent: i32 = exponent
-        .parse()
-        .expect("Rust's {:e} exponent is an integer");
-    let (sign, mantissa) = match mantissa.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", mantissa),
-    };
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    if (-4..16).contains(&exponent) {
-        let point = exponent + 1;
-        let positional = if point <= 0 {
-            format!("0.{}{digits}", "0".repeat(point.unsigned_abs() as usize))
-        } else if point as usize >= digits.len() {
-            format!("{digits}{}.0", "0".repeat(point as usize - digits.len()))
-        } else {
-            format!(
-                "{}.{}",
-                &digits[..point as usize],
-                &digits[point as usize..]
-            )
-        };
-        format!("{sign}{positional}")
-    } else {
-        let mantissa = if digits.len() > 1 {
-            format!("{}.{}", &digits[..1], &digits[1..])
-        } else {
-            digits
-        };
-        let exponent_sign = if exponent < 0 { '-' } else { '+' };
-        format!("{sign}{mantissa}e{exponent_sign}{:02}", exponent.abs())
-    }
-}
-
-/// recipe's effort tiers (`deepseek_recipe_bridge._EFFORT_TIERS`).
-/// recipe's request-level efforts. It folds them onto four: minimal and low ->
-/// Low, medium and high -> High, xhigh -> Xhigh, ultra and max -> Max. V4.1
-/// renders Low as 50, High and Xhigh as 75, Max as 100; V4 renders Xhigh like High.
-const EFFORT_TIERS: [&str; 8] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
-];
-
-/// Map an SGLang effort onto recipe's tiers; `None` for an unusable value, which
-/// recipe treats as unset (high). Tier names pass through. SGLang's numeric
-/// budgets, an int in 1-100 from `chat_template_kwargs` or a float in 0-0.99 from
-/// the request field, collapse onto low / high / max at the thresholds of
-/// `encoding_dsv41.REASONING_EFFORT_MAPPINGS` (50 / 75 / 100): recipe 0.2.0 takes
-/// no number, and those three tiers are all the distinct renderings it has, so
-/// only the exact budget is lost (60 renders as 75 where the builtin writes 60).
-fn effort_tier(effort: &Value) -> Option<&'static str> {
-    let budget = match effort {
-        Value::String(text) => {
-            let text = text.trim();
-            if let Some(tier) = EFFORT_TIERS.iter().find(|tier| **tier == text) {
-                return Some(tier);
-            }
-            text.parse::<f64>().ok()?
-        }
-        Value::Number(number) => number.as_f64()?,
-        _ => return None,
-    };
-    // Python's round() is ties-to-even.
-    let budget = if (0.0..1.0).contains(&budget) {
-        (budget * 100.0).round_ties_even().max(1.0)
-    } else {
-        budget
-    };
-    if !(1.0..=100.0).contains(&budget) {
-        return None;
-    }
-    Some(if budget <= 50.0 {
-        "low"
-    } else if budget <= 75.0 {
-        "high"
-    } else {
-        "max"
-    })
-}
-
-/// Render an SGLang chat request body with recipe.
+/// Render an SGLang chat request body with recipe; `encode` also tokenizes it
+/// when the formatter has the checkpoint's tokenizer.
 pub(crate) fn render(
     formatter: &RecipeFormatter,
     mut body: Value,
     defaults: &HashMap<String, Value>,
+    encode: bool,
 ) -> Result<RecipeRender, String> {
     pre_normalize(&mut body, defaults)?;
+    body["model"] = Value::String(formatter.model.name().into());
     let request: ChatCompletionRequest =
         serde_json::from_value(body).map_err(|err| format!("invalid request body: {err}"))?;
     let converted = request
@@ -491,22 +297,18 @@ pub(crate) fn render(
         .render_conversation(&converted.conversation);
     let segments = segments(&rendered.prompt, &rendered.special_ranges);
     let token_ids = match &formatter.tokenizer {
-        Some(tokenizer) => Some(tokenizer.encode_ids(&rendered.prompt, &rendered.special_ranges)?),
-        None => None,
+        Some(tokenizer) if encode => {
+            Some(tokenizer.encode_ids(&rendered.prompt, &rendered.special_ranges)?)
+        }
+        _ => None,
     };
     let inference = &converted.inference_options;
     Ok(RecipeRender {
         token_ids,
-        output_constraint: inference
-            .output_constraint
-            .as_ref()
-            .map(|constraint| (constraint.kind().to_owned(), constraint.schema())),
         temperature: inference.temperature,
         top_p: inference.top_p,
         max_tokens: inference.max_tokens,
         thinking_mode: converted.conversation.thinking_mode,
-        starts_in_tool_calls: converted.parsing_options.starts_in_tool_calls,
-        special_ranges: rendered.special_ranges,
         prompt: rendered.prompt,
         segments,
     })
@@ -562,38 +364,38 @@ mod tests {
         pre_normalize(&mut request, &HashMap::new()).unwrap();
         assert_eq!(request["messages"][0]["role"], "system");
         assert_eq!(request["thinking"], json!({"type": "disabled"}));
-        assert_eq!(request["model"], RECIPE_MODEL_ALIAS);
         assert!(request.get("chat_template_kwargs").is_none());
     }
 
     #[test]
-    fn continuation_and_tool_call_ids() {
+    fn continuation_and_object_arguments() {
         let mut request = body(json!([
             {"role": "user", "content": "weather?"},
             {"role": "assistant", "content": null, "tool_calls": [
-                {"type": "function", "function": {"name": "get_weather", "arguments": {"location": "Paris"}}}
+                {"id": "call_0", "type": "function", "function": {"name": "get_weather", "arguments": {"location": "Paris"}}}
             ]},
-            {"role": "tool", "content": "sunny"},
+            {"role": "tool", "tool_call_id": "call_0", "content": "sunny"},
             {"role": "assistant", "content": "It is"}
         ]));
         request["continue_final_message"] = json!(true);
-        request["n"] = json!(2);
         pre_normalize(&mut request, &HashMap::new()).unwrap();
         let call = &request["messages"][1]["tool_calls"][0];
-        assert_eq!(call["id"], "call_00_sglang");
         assert_eq!(call["function"]["arguments"], "{\"location\":\"Paris\"}");
-        assert_eq!(request["messages"][2]["tool_call_id"], "call_00_sglang");
         assert_eq!(request["messages"][3]["prefix"], true);
-        assert!(request.get("n").is_none());
+        assert!(request.get("continue_final_message").is_none());
     }
 
     #[test]
-    fn numeric_efforts_collapse_onto_tiers() {
-        assert_eq!(effort_tier(&json!(75)), Some("high"));
-        assert_eq!(effort_tier(&json!(0.3)), Some("low"));
-        assert_eq!(effort_tier(&json!(100)), Some("max"));
-        assert_eq!(effort_tier(&json!("minimal")), Some("minimal"));
-        assert_eq!(effort_tier(&json!("bogus")), None);
+    fn efforts_pass_through_and_ultra_is_not_an_sglang_tier() {
+        let mut request = body(json!([{"role": "user", "content": "hi"}]));
+        request["reasoning_effort"] = json!("high");
+        request["chat_template_kwargs"] = json!({"reasoning_effort": 30});
+        pre_normalize(&mut request, &HashMap::new()).unwrap();
+        // The kwargs effort replaces the request's verbatim; recipe rejects the number.
+        assert_eq!(request["reasoning_effort"], 30);
+        let mut request = body(json!([{"role": "user", "content": "hi"}]));
+        request["reasoning_effort"] = json!("ultra");
+        assert!(pre_normalize(&mut request, &HashMap::new()).is_err());
     }
 
     #[test]
@@ -605,6 +407,7 @@ mod tests {
             &RecipeFormatter::new(RecipeModel::V41),
             request,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -612,7 +415,11 @@ mod tests {
             "<｜begin▁of▁sentence｜><｜User｜><｜User｜><｜Assistant｜></think>"
         );
         // Template tokens are special; the user's spelling is plain text.
-        assert_eq!(render.special_ranges.len(), 4);
+        let special = render
+            .segments
+            .iter()
+            .filter(|segment| segment.allow_special);
+        assert_eq!(special.count(), 4);
         let plain: Vec<&str> = render
             .segments
             .iter()
@@ -634,11 +441,11 @@ mod tests {
             &RecipeFormatter::new(RecipeModel::V41),
             request,
             &HashMap::new(),
+            false,
         )
         .unwrap();
         // SGLang's grammar enforces the choice; the prompt does not pre-open the block.
         assert!(render.prompt.ends_with("<｜Assistant｜></think>"));
-        assert!(!render.starts_in_tool_calls);
     }
 
     #[test]
@@ -656,34 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn a_null_kwargs_toggle_falls_through_to_the_next_source() {
+    fn a_null_kwargs_toggle_turns_thinking_off_as_serving_chat_does() {
         let mut request = body(json!([{"role": "user", "content": "hi"}]));
-        request["chat_template_kwargs"] = json!({"thinking": null, "enable_thinking": false});
+        request["chat_template_kwargs"] = json!({"thinking": null});
         pre_normalize(&mut request, &HashMap::new()).unwrap();
         assert_eq!(request["thinking"], json!({"type": "disabled"}));
-    }
-
-    #[test]
-    fn floats_print_like_python() {
-        for (value, expected) in [
-            (0.00001, "1e-05"),
-            (1e16, "1e+16"),
-            (1e15, "1000000000000000.0"),
-            (100.0, "100.0"),
-            (0.0001, "0.0001"),
-            (1.5, "1.5"),
-            (-0.0, "-0.0"),
-            (0.30000000000000004, "0.30000000000000004"),
-            (2.5e-7, "2.5e-07"),
-            (1e22, "1e+22"),
-            (-123456.789, "-123456.789"),
-        ] {
-            assert_eq!(python_float_repr(value), expected, "{value}");
-        }
-        assert_eq!(
-            python_json_dumps(&json!({"a": 1, "b": [1.0, "x\"y"], "c": {"d": null, "e": true}})),
-            r#"{"a":1,"b":[1.0,"x\"y"],"c":{"d":null,"e":true}}"#
-        );
     }
 
     #[test]
@@ -694,7 +478,8 @@ mod tests {
             render(
                 &RecipeFormatter::new(RecipeModel::V41),
                 request,
-                &HashMap::new()
+                &HashMap::new(),
+                false
             )
             .unwrap_err()
             .contains("task is not supported")
@@ -702,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_the_checkpoint_family_like_the_python_bridge() {
+    fn detects_the_checkpoint_family() {
         assert_eq!(
             RecipeModel::detect(Some("deepseek_v41"), None),
             Some(RecipeModel::V41)

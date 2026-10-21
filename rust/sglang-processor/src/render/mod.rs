@@ -153,9 +153,10 @@ impl ChatFormatter {
         }
     }
 
-    /// Render an SGLang chat request body with deepseek-recipe: the prompt, its
-    /// special-token ranges, and the sampling, constraint and parsing settings
-    /// recipe resolved. Only [`ChatFormatter::DeepSeekRecipe`] renders this way.
+    /// Render an SGLang chat request body with deepseek-recipe: the prompt split at
+    /// its special tokens, recipe's token ids when the formatter has the checkpoint's
+    /// tokenizer, and the thinking mode and sampling recipe resolved. Only
+    /// [`ChatFormatter::DeepSeekRecipe`] renders this way.
     #[cfg(feature = "recipe")]
     pub fn render_recipe(
         &self,
@@ -164,7 +165,7 @@ impl ChatFormatter {
     ) -> Result<RecipeRender, TemplateError> {
         match self {
             ChatFormatter::DeepSeekRecipe(formatter) => {
-                render_deepseek_recipe(formatter, request, default_kwargs)
+                render_deepseek_recipe(formatter, request, default_kwargs, true)
                     .map_err(|message| TemplateError::Renderer { message })
             }
             _ => Err(TemplateError::Renderer {
@@ -192,7 +193,7 @@ impl ChatFormatter {
             ChatFormatter::DeepSeekV41 => render_deepseek_v41(request, default_kwargs).map(text),
             #[cfg(feature = "recipe")]
             ChatFormatter::DeepSeekRecipe(formatter) => {
-                render_deepseek_recipe(formatter, request, default_kwargs)
+                render_deepseek_recipe(formatter, request, default_kwargs, false)
                     .map(|render| (RenderedPrompt::segmented(render.segments), String::new()))
             }
             ChatFormatter::Glm53(formatter) => {

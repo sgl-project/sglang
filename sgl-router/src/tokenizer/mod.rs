@@ -6,7 +6,7 @@ pub mod chat_formatter;
 mod kimi;
 pub mod stats;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chat_formatter::ChatFormatter;
 use dashmap::DashMap;
 use dynamo_tokenizers::{EncodeSegment, Tokenizer};
@@ -170,16 +170,10 @@ impl TokenizerRegistry {
             Ok(Some(formatter)) => {
                 let mut formatter = formatter.with_defaults(&m.default_chat_template_kwargs);
                 if m.chat_encoding_backend == crate::config::ChatEncodingBackend::Recipe {
-                    let tokenizer_json = match files.text("tokenizer.json") {
-                        Ok(Some(json)) => Some(json),
-                        Ok(None) => None,
-                        Err(e) => {
-                            tracing::warn!(model = %m.id, error = %format!("{e:#}"),
-                                "cannot read tokenizer.json for deepseek-recipe");
-                            None
-                        }
-                    };
-                    formatter = formatter.with_recipe_backend(tokenizer_json.as_deref());
+                    let tokenizer_json = files
+                        .text("tokenizer.json")
+                        .context("--chat-encoding-backend recipe reads tokenizer.json")?;
+                    formatter = formatter.with_recipe_backend(tokenizer_json.as_deref())?;
                     if formatter.is_recipe() {
                         tracing::info!(model = %m.id,
                             "chat prompts render through deepseek-recipe; the workers must run \

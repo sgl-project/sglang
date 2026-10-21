@@ -1,6 +1,6 @@
-"""The deepseek-recipe chat encoding bridge: SGLang request normalization, the
-sampling overlay, and, when the deepseek-recipe package is installed, parity with
-the recipe_parity fixtures the Rust processor is checked against."""
+"""The deepseek-recipe chat encoding backend: the request translation, the
+sampling overlay, the adapter registration and, with the deepseek-recipe package
+installed, the prompt the parity fixture records."""
 
 import hashlib
 import json
@@ -9,15 +9,15 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.entrypoints.openai import deepseek_recipe_bridge as bridge
+from sglang.srt.entrypoints.openai import serving_deepseek_recipe as recipe
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-FIXTURES = (
+FIXTURE = (
     Path(__file__).resolve().parents[5]
-    / "rust/sglang-processor/tests/fixtures/recipe_parity"
+    / "rust/sglang-processor/tests/fixtures/parity/deepseek-v4.1-flash-1017-recipe.json"
 )
 
 
@@ -26,33 +26,41 @@ def _user(content="x"):
 
 
 class TestPreNormalize(CustomTestCase):
-    def test_model_is_replaced_and_task_rejected(self):
-        body = bridge.pre_normalize({"model": "anything", "messages": [_user()]})
-        self.assertEqual(body["model"], bridge.RECIPE_MODEL_ALIAS)
-        with self.assertRaises(bridge.RecipeRequestError):
-            bridge.pre_normalize({"messages": [_user()], "task": "title"})
+    def test_task_is_rejected(self):
+        with self.assertRaises(ValueError):
+            recipe.pre_normalize({"messages": [_user()], "task": "title"})
 
     def test_developer_becomes_system(self):
-        body = bridge.pre_normalize(
+        body = recipe.pre_normalize(
             {"messages": [{"role": "developer", "content": "Be terse."}, _user()]}
         )
         self.assertEqual(body["messages"][0]["role"], "system")
 
     def test_thinking_toggle_sources(self):
-        kwargs = bridge.pre_normalize(
+        kwargs = recipe.pre_normalize(
             {"messages": [_user()], "chat_template_kwargs": {"thinking": False}}
         )
         self.assertEqual(kwargs["thinking"], {"type": "disabled"})
         self.assertNotIn("chat_template_kwargs", kwargs)
-        reasoning = bridge.pre_normalize(
+        # protocol.normalize_reasoning_inputs: reasoning.effort sets the effort and
+        # the kwargs flag; an explicit kwargs flag keeps its value.
+        reasoning = recipe.pre_normalize(
             {"messages": [_user()], "reasoning": {"effort": "low", "enabled": True}}
         )
         self.assertEqual(reasoning["thinking"], {"type": "enabled"})
         self.assertEqual(reasoning["reasoning_effort"], "low")
         self.assertNotIn("reasoning", reasoning)
-        none = bridge.pre_normalize({"messages": [_user()], "reasoning_effort": "none"})
+        none = recipe.pre_normalize({"messages": [_user()], "reasoning_effort": "none"})
         self.assertEqual(none["thinking"], {"type": "disabled"})
-        explicit = bridge.pre_normalize(
+        overridden = recipe.pre_normalize(
+            {
+                "messages": [_user()],
+                "reasoning_effort": "high",
+                "chat_template_kwargs": {"thinking": False},
+            }
+        )
+        self.assertEqual(overridden["thinking"], {"type": "disabled"})
+        explicit = recipe.pre_normalize(
             {
                 "messages": [_user()],
                 "thinking": {"type": "enabled"},
@@ -60,32 +68,32 @@ class TestPreNormalize(CustomTestCase):
             }
         )
         self.assertEqual(explicit["thinking"], {"type": "enabled"})
-        default = bridge.pre_normalize({"messages": [_user()]}, {"thinking": False})
+        default = recipe.pre_normalize({"messages": [_user()]}, {"thinking": False})
         self.assertEqual(default["thinking"], {"type": "disabled"})
-        self.assertNotIn("thinking", bridge.pre_normalize({"messages": [_user()]}))
+        self.assertNotIn("thinking", recipe.pre_normalize({"messages": [_user()]}))
 
-    def test_numeric_efforts_collapse_onto_tiers(self):
-        self.assertEqual(bridge.effort_tier(75), "high")
-        self.assertEqual(bridge.effort_tier(0.3), "low")
-        self.assertEqual(bridge.effort_tier("100"), "max")
-        self.assertEqual(bridge.effort_tier("xhigh"), "xhigh")
-        self.assertIsNone(bridge.effort_tier("bogus"))
-        self.assertIsNone(bridge.effort_tier(True))
-        body = bridge.pre_normalize(
+    def test_effort_sources(self):
+        # serving_chat: the kwargs effort replaces the request's verbatim (recipe
+        # rejects a number, as the API does); the server default fills in last.
+        body = recipe.pre_normalize(
             {
                 "messages": [_user()],
                 "reasoning_effort": "high",
                 "chat_template_kwargs": {"reasoning_effort": 30},
             }
         )
-        self.assertEqual(body["reasoning_effort"], "low")
+        self.assertEqual(body["reasoning_effort"], 30)
+        default = recipe.pre_normalize(
+            {"messages": [_user()]}, {"reasoning_effort": "max"}
+        )
+        self.assertEqual(default["reasoning_effort"], "max")
 
     def test_tool_choice_renders_as_auto_with_the_chosen_tool(self):
         tools = [
             {"type": "function", "function": {"name": "a"}},
             {"type": "function", "function": {"name": "b"}},
         ]
-        named = bridge.pre_normalize(
+        named = recipe.pre_normalize(
             {
                 "messages": [_user()],
                 "tools": tools,
@@ -94,14 +102,21 @@ class TestPreNormalize(CustomTestCase):
         )
         self.assertEqual(named["tool_choice"], "auto")
         self.assertEqual([t["function"]["name"] for t in named["tools"]], ["b"])
-        required = bridge.pre_normalize(
+        required = recipe.pre_normalize(
             {"messages": [_user()], "tools": tools, "tool_choice": "required"}
         )
         self.assertEqual(required["tool_choice"], "auto")
         self.assertEqual(len(required["tools"]), 2)
+        for body in (
+            {"messages": [_user()], "tools": tools, "tool_choice": "none"},
+            {"messages": [_user()], "tools": [], "tool_choice": "auto"},
+        ):
+            off = recipe.pre_normalize(body)
+            self.assertNotIn("tools", off)
+            self.assertNotIn("tool_choice", off)
 
-    def test_continuation_tool_ids_and_host_fields(self):
-        body = bridge.pre_normalize(
+    def test_history_translation_and_host_fields(self):
+        body = recipe.pre_normalize(
             {
                 "messages": [
                     _user("weather?"),
@@ -110,36 +125,41 @@ class TestPreNormalize(CustomTestCase):
                         "content": None,
                         "tool_calls": [
                             {
+                                "id": "call_0",
                                 "type": "function",
                                 "function": {
                                     "name": "get_weather",
-                                    "arguments": {"location": "Paris"},
+                                    "arguments": {"location": "Paris", "days": 1.5},
                                 },
                             }
                         ],
                     },
-                    {"role": "tool", "content": "sunny"},
+                    {"role": "tool", "tool_call_id": "call_0", "content": "sunny"},
                     {"role": "assistant", "content": "It is"},
                 ],
                 "continue_final_message": True,
                 "n": 2,
-                "max_completion_tokens": 7,
                 "response_format": {"type": "structural_tag", "structures": []},
             }
         )
         call = body["messages"][1]["tool_calls"][0]
-        self.assertEqual(call["id"], "call_00_sglang")
-        self.assertEqual(call["function"]["arguments"], '{"location":"Paris"}')
-        self.assertEqual(body["messages"][2]["tool_call_id"], "call_00_sglang")
+        self.assertEqual(
+            call["function"]["arguments"], '{"location":"Paris","days":1.5}'
+        )
         self.assertTrue(body["messages"][3]["prefix"])
-        self.assertNotIn("n", body)
         self.assertNotIn("continue_final_message", body)
         self.assertNotIn("response_format", body)
-        self.assertEqual(body["max_tokens"], 7)
+        # recipe's own fields and validation stand: `n` passes through, and a tool
+        # message without tool_call_id is recipe's to reject.
+        self.assertEqual(body["n"], 2)
+        unpaired = recipe.pre_normalize(
+            {"messages": [_user(), {"role": "tool", "content": "sunny"}]}
+        )
+        self.assertNotIn("tool_call_id", unpaired["messages"][1])
 
     def test_input_is_not_mutated(self):
         original = {"messages": [{"role": "developer", "content": "x"}], "n": 3}
-        bridge.pre_normalize(original)
+        recipe.pre_normalize(original)
         self.assertEqual(original["messages"][0]["role"], "developer")
         self.assertEqual(original["n"], 3)
 
@@ -148,89 +168,28 @@ class TestApplySampling(CustomTestCase):
     def _render(self, **overrides):
         values = dict(
             prompt="",
-            special_ranges=[],
             prompt_ids=[0, 1, 2],
-            thinking_mode=True,
-            reasoning_effort="high",
             temperature=1.0,
             top_p=0.95,
-            max_tokens=None,
-            output_constraint=None,
-            starts_in_tool_calls=False,
             request=SimpleNamespace(resolve_max_tokens=lambda prompt, limit: 65536),
         )
         values.update(overrides)
-        return bridge.RecipeRender(**values)
+        return recipe.RecipeRender(**values)
 
     def test_recipe_sampling_and_default_max_tokens(self):
         params = {"temperature": 0.0, "top_p": 0.1, "max_new_tokens": None}
-        bridge.apply_sampling(
+        recipe.overlay_sampling(
             params, self._render(), prompt_tokens=100, context_length=1_000_000
         )
         self.assertEqual(params["temperature"], 1.0)
         self.assertEqual(params["top_p"], 0.95)
         self.assertEqual(params["max_new_tokens"], 65536)
         params = {"max_new_tokens": 5}
-        bridge.apply_sampling(
-            params,
-            self._render(thinking_mode=False),
-            prompt_tokens=1,
-            context_length=10,
+        recipe.overlay_sampling(
+            params, self._render(), prompt_tokens=1, context_length=10
         )
         self.assertEqual(params["max_new_tokens"], 5)
-        # Grammar is SGLang's: recipe's constraint never reaches the params.
-        params = {"max_new_tokens": 1}
-        bridge.apply_sampling(
-            params,
-            self._render(output_constraint=("json", '{"type": "object"}')),
-            prompt_tokens=1,
-            context_length=10,
-        )
         self.assertNotIn("json_schema", params)
-
-
-@unittest.skipUnless(bridge.is_available(), "deepseek-recipe is not installed")
-class TestRecipeFixtureParity(CustomTestCase):
-    """The bridge renders every recipe_parity fixture case as recorded."""
-
-    def test_fixtures(self):
-        from huggingface_hub import hf_hub_download
-
-        for path in sorted(FIXTURES.glob("*.json")):
-            fixture = json.loads(path.read_text(encoding="utf-8"))
-            try:
-                tokenizer_json = Path(
-                    hf_hub_download(
-                        fixture["model"],
-                        "tokenizer.json",
-                        revision=fixture["revision"],
-                        local_files_only=True,
-                    )
-                ).read_text(encoding="utf-8")
-            except Exception:  # noqa: BLE001 - tokenizer not cached: check text only
-                tokenizer_json = None
-            encoder = bridge.RecipeEncoder(fixture["model_version"], tokenizer_json)
-            for case in fixture["cases"]:
-                with self.subTest(fixture=path.name, case=case["name"]):
-                    if "error" in case:
-                        with self.assertRaises(bridge.RecipeRequestError):
-                            encoder.convert(
-                                case["request"], fixture.get("default_kwargs")
-                            )
-                        continue
-                    render = encoder.convert(
-                        case["request"], fixture.get("default_kwargs")
-                    )
-                    self.assertEqual(render.prompt, case["prompt"])
-                    self.assertEqual(
-                        [list(r) for r in render.special_ranges], case["special_ranges"]
-                    )
-                    if render.prompt_ids is not None:
-                        digest = hashlib.sha256()
-                        for token_id in render.prompt_ids:
-                            digest.update(struct.pack("<I", token_id))
-                        self.assertEqual(len(render.prompt_ids), case["token_count"])
-                        self.assertEqual(digest.hexdigest(), case["token_sha256"])
 
 
 class TestAdapterRegistry(CustomTestCase):
@@ -273,7 +232,17 @@ class TestAdapterRegistry(CustomTestCase):
         with self.assertRaises(ValueError):
             registry.build_chat_encoding_adapter(self._context("kimi_k3", "recipe"))
 
-    @unittest.skipUnless(bridge.is_available(), "deepseek-recipe is not installed")
+    def test_default_effort_must_be_a_recipe_effort(self):
+        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
+
+        with self.assertRaisesRegex(ValueError, "reasoning_effort=60"):
+            registry.build_chat_encoding_adapter(
+                self._context(
+                    "dsv41", "recipe", default_kwargs={"reasoning_effort": 60}
+                )
+            )
+
+    @unittest.skipUnless(recipe.is_available(), "deepseek-recipe is not installed")
     def test_recipe_adapter_encodes_like_the_fixture_and_overlays_sampling(self):
         from huggingface_hub import hf_hub_download
         from tokenizers import Tokenizer
@@ -281,9 +250,7 @@ class TestAdapterRegistry(CustomTestCase):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        fixture = json.loads(
-            (FIXTURES / "deepseek-v4.1-flash-1017.json").read_text(encoding="utf-8")
-        )
+        fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
         try:
             tokenizer_file = hf_hub_download(
                 fixture["model"],
@@ -302,11 +269,8 @@ class TestAdapterRegistry(CustomTestCase):
         self.assertFalse(adapter.strict_tool_call_arguments)
         self.assertIsNone(adapter.output)
         case = next(c for c in fixture["cases"] if c["name"] == "a1_empty_chat")
-        # The API's own `thinking` object reaches recipe through the request model.
-        request = ChatCompletionRequest(
-            messages=[{"role": "user", "content": ""}],
-            thinking={"type": "disabled"},
-        )
+        # The client's model name is SGLang's business; recipe sees its own.
+        request = ChatCompletionRequest(**{**case["request"], "model": "anything"})
         ids = adapter.encode_messages(messages=[], request=request, tools=None)
         digest = hashlib.sha256()
         for token_id in ids:

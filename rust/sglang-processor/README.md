@@ -74,7 +74,7 @@ native formatters.
 |---|---|
 | DeepSeek V4 | `models/deepseek_v4.rs` on Dynamo's V4 encoder |
 | DeepSeek V4.1 | `models/deepseek_v41.rs` on Dynamo's V4.1 encoder |
-| DeepSeek V4 / V4.1 with `ChatFormatterOptions::recipe_backend` (`recipe` feature) | `models/deepseek_recipe.rs` on deepseek-recipe, the encoder behind the official API; `render_recipe` adds the settings recipe resolved and, with the checkpoint's `tokenizer.json`, its token ids. `tests/recipe_parity.rs` pins it to the Python bridge |
+| DeepSeek V4 / V4.1 with `ChatFormatterOptions::recipe_backend` (`recipe` feature) | `models/deepseek_recipe.rs` on deepseek-recipe, the encoder behind the official API; `render_recipe` adds the settings recipe resolved and, with the checkpoint's `tokenizer.json`, its token ids. the `*-recipe.json` parity fixtures pin it to SGLang's serving path |
 | GLM-5.3, GLM-5.3-Flash | `models/glm53.rs` on the checkpoint's Jinja template, picked by the template |
 | Kimi K3 | `models/kimi_k3.rs` on Dynamo's K3 formatter |
 | Qwen3.8 (Max, 27B, Flash-Next) | `models/qwen38.rs` on the checkpoint's Jinja template, picked by the template |

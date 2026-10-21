@@ -95,9 +95,9 @@ class ChatEncodingAdapter(Protocol):
         prompt_tokens: int,
         context_length: int,
     ) -> None:
-        """Overlay what the encoding resolved for sampling (defaults, clamps, an
-        output constraint) on the params ``to_sampling_params`` built; most
-        encodings resolve nothing and leave them as they are."""
+        """Overlay what the encoding resolved for sampling (defaults and clamps)
+        on the params ``to_sampling_params`` built; most encodings resolve
+        nothing and leave them as they are."""
         ...
 
 

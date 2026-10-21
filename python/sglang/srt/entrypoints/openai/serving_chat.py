@@ -1302,11 +1302,7 @@ class OpenAIServingChat(OpenAIServingBase):
             self._encoding_adapter.apply_sampling(
                 request=request,
                 sampling_params=sampling_params,
-                prompt_tokens=(
-                    len(processed_messages.prompt_ids)
-                    if isinstance(processed_messages.prompt_ids, list)
-                    else 0
-                ),
+                prompt_tokens=len(processed_messages.prompt_ids),
                 context_length=self.tokenizer_manager.model_config.context_len,
             )
 
