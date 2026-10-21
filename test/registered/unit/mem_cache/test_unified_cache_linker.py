@@ -5,7 +5,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -1569,6 +1569,40 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+class TestOffloadReadyEvent(CustomTestCase):
+    def _record(self, forward_stream):
+        device = MagicMock(name="device_module")
+        order = MagicMock()
+        order.attach_mock(device.Event.return_value.record, "record")
+        if forward_stream is not None:
+            order.attach_mock(forward_stream.wait_stream, "wait_stream")
+        linker = _FakeLinker()
+        linker.forward_stream = forward_stream
+        with patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.get_device_module",
+            return_value=device,
+        ):
+            self.assertIs(linker.record_offload_ready(), device.Event.return_value)
+        return device, order
+
+    def test_offload_waits_on_the_forward_writing_the_pages(self):
+        # Prefill read-done lets the scheduler's stream run ahead of the forward
+        # that fills a stashed chunk, so its stream alone misses those writes.
+        forward_stream = MagicMock(name="forward_stream")
+        device, order = self._record(forward_stream)
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.wait_stream(device.current_stream.return_value),
+                call.record(forward_stream),
+            ],
+        )
+
+    def test_offload_without_a_forward_stream_waits_on_the_current_one(self):
+        _, order = self._record(None)
+        self.assertEqual(order.mock_calls, [call.record()])
 
 
 if __name__ == "__main__":

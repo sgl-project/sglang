@@ -55,7 +55,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         *,
         components,
         storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
@@ -384,8 +386,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready_event = self.record_offload_ready()
         self.offload_queue.put((expanded, tokens, ready_event))
         return True
 

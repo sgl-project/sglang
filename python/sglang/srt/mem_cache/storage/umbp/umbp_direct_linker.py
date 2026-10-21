@@ -152,7 +152,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         *,
         components,
         _storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
@@ -856,8 +858,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self._freeze_gc_once()
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready_event = self.record_offload_ready()
         self._offload_queue.put((expanded, ready_event))
         return True
 
