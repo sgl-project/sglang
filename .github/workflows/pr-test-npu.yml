@@ -560,9 +560,10 @@ jobs:
   # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
+    needs: pr-gate
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    if: ${{ !failure() && !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
     outputs:
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
       only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
@@ -657,7 +658,8 @@ jobs:
 
       # Bucket the recommended tests per suite. Downstream test jobs consume
       # two outputs per suite: should_run_<suite> ('false' -> skip the whole
-      # job, e.g. precision mode active with an empty bucket) and
+      # job, e.g. precision mode active with an empty bucket, or an empty
+      # recommendation with every PR change under python/sglang/) and
       # only_tests_<suite> (the bucketed file list, exported non-empty ONLY in
       # precision mode). Bucket contents are gated on PRECISION_MODE inside
       # the script, so callers need no guard expressions.
@@ -674,6 +676,7 @@ jobs:
           set -euo pipefail
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
             --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
+            --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --precision-mode "${PRECISION_MODE}" \
             --github-output "${GITHUB_OUTPUT}" \
@@ -964,9 +967,9 @@ jobs:
           set -euo pipefail
 
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          # Fixed publish dir with no RUN_DIR layer: other pipelines have a
-          # different GITHUB_RUN_ID and must be able to read the baseline.
-          # Must match PUBLISH_DIR in the recommend-tests-from-coverage job.
+          # Fixed-name copy on the shared disk for manual use. The baseline
+          # the recommend job consumes lives in OBS (coverage/), uploaded
+          # manually after each run — nothing reads this dir automatically.
           PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
 
           # Skip publish when no coverage data was collected this run (map
@@ -979,9 +982,9 @@ jobs:
 
           mkdir -p "${PUBLISH_DIR}"
 
-          # mv (rename) within the same shared filesystem is atomic, so a
-          # concurrent reader sees either the old or the new baseline,
-          # never a partial file.
+          # mv (rename) on the same filesystem is atomic per file, so the
+          # copy is never a partial file (the map/outputs pair from two
+          # concurrent publishes can still interleave).
           mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
           mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
 
