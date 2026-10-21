@@ -22,7 +22,7 @@ namespace sglang {
 
 namespace device::distributed {
 
-inline constexpr uint32_t kMaxWorldSize = 16;
+inline constexpr uint32_t kMaxWorldSize = 64;
 
 struct Counter {
  public:

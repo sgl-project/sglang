@@ -45,14 +45,26 @@ from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_global_num_tokens,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_swizzled_input,
+)
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.runtime_context import (
+    get_model,
+    get_parallel,
+    get_schedule,
+    get_serving,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -1055,6 +1067,60 @@ class Engram(nn.Module):
         )
         self.q_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
         self.k_weight = nn.Parameter(torch.ones(hc_mult, dim), requires_grad=False)
+        self.column_bounds = layout.column_bounds(self.layer_hash_index)
+        self.mega_table = None
+
+    def prepare_mega_engram(self) -> None:
+        """Bind this layer's table to the shared mega engram workspace when the
+        lookup runs under DP attention on per-rank shards (wkv's MXFP8 input is
+        checked at the first forward). Collective: every rank calls it after loading."""
+        embed = self.embed
+        parallel = get_parallel()
+        if not (
+            envs.SGLANG_OPT_DSV41_MEGA_ENGRAM.get()
+            and is_cuda()
+            and parallel.attn_dp_size == embed.tp_size > 1
+            and not embed._shared
+        ):
+            return
+        from sglang.srt.layers.communication.mega_engram import (
+            get_mega_engram_workspace,
+        )
+
+        max_tokens = envs.SGLANG_OPT_DSV41_MEGA_ENGRAM_NUM_MAX_TOKENS_PER_RANK.get()
+        if max_tokens is None:
+            # One rank's largest prefill: its chunk under DP attention (the chunk
+            # size is already per DP rank), else the prefill token budget.
+            max_tokens = (
+                max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+            )
+
+        workspace = get_mega_engram_workspace(
+            parallel.tp_group.device_group,
+            torch.device("cuda", torch.cuda.current_device()),
+            max_tokens=max_tokens,
+        )
+        self.mega_table = workspace.attach(self.column_bounds)
+        logger.info(
+            "mega engram on: table %d, R=%d, max %d tokens per rank",
+            self.layer_hash_index,
+            parallel.tp_size,
+            workspace.max_tokens,
+        )
+
+    @functools.cached_property
+    def _mega_wkv_ready(self) -> bool:
+        if not accepts_mxfp8_swizzled_input(self.wkv):
+            logger.warning("mega engram off: wkv takes no 128x4 MXFP8 input")
+            return False
+        return True
+
+    def _use_mega_engram(self, num_tokens: int, cp_all_tokens: bool) -> bool:
+        if self.mega_table is None or cp_all_tokens or not self._mega_wkv_ready:
+            return False
+        if not get_is_capture_mode():
+            num_tokens = max(get_dp_global_num_tokens(), default=num_tokens)
+        return num_tokens <= self.mega_table.workspace.max_tokens
 
     def forward(
         self,
@@ -1067,6 +1133,16 @@ class Engram(nn.Module):
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
+        if self._use_mega_engram(hash_ids.shape[0], cp_all_tokens):
+            ids = hash_ids.to(torch.int32, memory_format=torch.contiguous_format)
+            fp8, scales = self.mega_table.lookup(ids, *self.embed._table_ptrs())
+            if x.shape[0] == 0:
+                return x
+            # Same stream as the lookup: the next lookup reuses fp8 / scales.
+            kv, _ = self.wkv(Mxfp8SwizzledInput(fp8, scales))
+            return engram_gate(
+                x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            )
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an

@@ -82,7 +82,7 @@ def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
 
-def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+def allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
     from torch._C._distributed_c10d import _SymmetricMemory
 
     if torch.__version__ < "2.11.0":
@@ -267,7 +267,7 @@ class CustomAllReduceV2:
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
 
-        self._symm_tensor, symm_mem = _allocate_symmetric_memory(
+        self._symm_tensor, symm_mem = allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
         )
         slabs = [

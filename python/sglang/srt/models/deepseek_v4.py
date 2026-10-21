@@ -3670,9 +3670,9 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=add_prefix("layers", prefix),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
-            stage_facts=functools.partial(hc_boundary.stages, config)
-            if _is_cuda
-            else None,
+            stage_facts=(
+                functools.partial(hc_boundary.stages, config) if _is_cuda else None
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -5453,6 +5453,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")
+                    layer.engram.prepare_mega_engram()
             self._prewarm_mhc_kernels()
 
     def get_embed_and_head(self):

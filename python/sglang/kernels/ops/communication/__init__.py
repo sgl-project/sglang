@@ -93,3 +93,13 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+# DeepSeek-V4.1 Engram EP lookup: id push + MXFP8 row push.
+register_kernel(
+    KernelSpec(
+        op="communication.mega_engram_lookup",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.mega_engram:mega_engram_lookup",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)

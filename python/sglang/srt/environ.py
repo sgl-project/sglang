@@ -1716,6 +1716,13 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Engram lookup under DP attention as an id push plus an MXFP8 row push into
+    # wkv's input (kernels/jit/csrc/deepseek_v4/engram/mega.cuh), instead of the
+    # all-gather + gather + reduce-scatter. Steps whose largest DP rank has more
+    # tokens than the cap keep the old path; None caps at one rank's largest
+    # prefill (its chunk, else max_prefill_tokens).
+    SGLANG_OPT_DSV41_MEGA_ENGRAM = EnvBool(False)
+    SGLANG_OPT_DSV41_MEGA_ENGRAM_NUM_MAX_TOKENS_PER_RANK = EnvInt(None)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
