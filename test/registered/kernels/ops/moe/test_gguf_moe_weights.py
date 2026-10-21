@@ -77,6 +77,56 @@ class TestGgufMoeWeights(CustomTestCase):
                             self.assertEqual(int(torch.count_nonzero(outputs)), 0)
                             apply_weights(outputs[:0], weights[:0], ids[:0])
 
+    @unittest.skipIf(is_musa(), "CUDA fast-math regression")
+    def test_subnormal_operands_and_products(self):
+        """A tiny score can produce a normal result even in the SM90 fast-math build."""
+        native = resolve_gguf_moe_weights("cuda")
+        if native is None:
+            self.skipTest("Native GGUF weighting requires a rebuilt kernel provider")
+        for dtype in (torch.float32, torch.bfloat16):
+            for weight_dtype in (torch.float32, torch.bfloat16):
+                for strided in (False, True):
+                    with self.subTest(
+                        dtype=dtype, weight_dtype=weight_dtype, strided=strided
+                    ):
+                        outputs = (
+                            torch.tensor(
+                                [1e38, 1e38, float("nan"), 1e-40, 2.0**-126, -0.0],
+                                dtype=dtype,
+                                device="cuda",
+                            )
+                            .view(6, 1)
+                            .expand(6, 257)
+                            .clone()
+                        )
+                        weights = torch.tensor(
+                            [[1e-40, -1e-40, float("nan")], [1e38, 0.5, 1.0]],
+                            dtype=weight_dtype,
+                            device="cuda",
+                        )
+                        ids = torch.tensor(
+                            [[0, 1, -1], [2, 3, 4]],
+                            dtype=torch.int64 if strided else torch.int32,
+                            device="cuda",
+                        )
+                        if strided:
+                            weights = weights.t().contiguous().t()
+                            ids = ids.t().contiguous().t()
+                        # FP64 exactly represents products of FP32 operands;
+                        # round to FP32 before narrowing to the output dtype.
+                        expected = outputs.cpu().double().view(2, 3, 257)
+                        expected = expected * weights.cpu().double().unsqueeze(-1)
+                        expected[ids.cpu() < 0] = 0
+                        expected = expected.float().to(dtype).view_as(outputs).cuda()
+                        self.assertGreater(float(expected[0, 0]), 1e-3)
+                        self.assertGreater(float(expected[3, 0]), 1e-3)
+                        self.assertNotEqual(float(expected[4, 0]), 0.0)
+                        native(outputs, weights, ids)
+                        torch.testing.assert_close(outputs, expected, rtol=0, atol=0)
+                        self.assertTrue(
+                            torch.equal(outputs.signbit(), expected.signbit())
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,7 +28,15 @@ __global__ void apply_gguf_moe_weights_kernel(
     const float weight = static_cast<float>(weights[token * weight_stride0 + slot * weight_stride1]);
     for (int64_t column = first_column; column < hidden_size; column += column_step) {
       const int64_t index = row * hidden_size + column;
-      outputs[index] = static_cast<output_t>(static_cast<float>(outputs[index]) * weight);
+      const float value = static_cast<float>(outputs[index]);
+#ifdef USE_MUSA
+      const float product = value * weight;
+#else
+      // SM90 enables fast math; preserve subnormal operands and products here.
+      float product;
+      asm("mul.rn.f32 %0, %1, %2;" : "=f"(product) : "f"(value), "f"(weight));
+#endif
+      outputs[index] = static_cast<output_t>(product);
     }
   }
 }
