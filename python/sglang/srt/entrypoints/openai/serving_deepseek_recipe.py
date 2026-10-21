@@ -49,13 +49,11 @@ class DeepSeekRecipeChatEncodingAdapter:
             raise ValueError(
                 "--chat-encoding-backend recipe requires the deepseek-recipe package"
             )
-        model_version = (
-            bridge.model_version_for(ctx.hf_config)
-            or {"dsv4": "v4", "dsv41": "v41"}[ctx.chat_encoding_spec]
-        )
-        # The served tokenizer, so ids come from the checkpoint's vocabulary.
+        # The spec already names the checkpoint family (resolve_chat_encoding_spec);
+        # the served tokenizer makes the ids come from the checkpoint's vocabulary.
         encoder = bridge.RecipeEncoder.from_hf_tokenizer(
-            model_version, ctx.require("tokenizer")
+            {"dsv4": "v4", "dsv41": "v41"}[ctx.chat_encoding_spec],
+            ctx.require("tokenizer"),
         )
         return cls(encoder=encoder, default_kwargs=ctx.default_chat_template_kwargs)
 
@@ -126,9 +124,7 @@ def _without_unset(tool: dict[str, Any]) -> dict[str, Any]:
     """The handler dumps tool models with None for unset fields; a client omits
     those keys, and recipe renders a null description or parameters differently."""
     cleaned = {key: value for key, value in tool.items() if value is not None}
-    function = cleaned.get("function")
-    if isinstance(function, dict):
-        cleaned["function"] = {
-            key: value for key, value in function.items() if value is not None
-        }
+    cleaned["function"] = {
+        key: value for key, value in tool["function"].items() if value is not None
+    }
     return cleaned

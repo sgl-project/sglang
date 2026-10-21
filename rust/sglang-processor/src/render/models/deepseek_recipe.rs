@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
-/// The request `model` recipe sees; SGLang serves whatever name the client sent.
+/// The request `model` recipe sees. recipe resolves the model version by looking
+/// the name up in its alias table and rejects any other name, while SGLang serves
+/// whatever name the client sent; [`RecipeFormatter`] binds this alias to the
+/// checkpoint's version.
 pub const RECIPE_MODEL_ALIAS: &str = "sglang-deepseek";
 /// The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it `<｜image｜>`.
 pub const IMAGE_TOKEN: &str = "<｜deepseek_image｜>";
@@ -33,7 +36,7 @@ pub enum RecipeModel {
 impl RecipeModel {
     /// The encoding for a checkpoint, from `config.json`'s `model_type` and first
     /// `architectures` entry: V4.1 checkpoints may keep a `deepseek_v4` model type.
-    /// Mirrors `deepseek_recipe_bridge.model_version_for`.
+    /// The test `chat_encoding.resolve_chat_encoding_spec` applies for `dsv41` / `dsv4`.
     pub fn detect(model_type: Option<&str>, architecture: Option<&str>) -> Option<Self> {
         let architecture = architecture.unwrap_or_default();
         if model_type == Some("deepseek_v41") || architecture.contains("DeepseekV41") {
@@ -146,19 +149,16 @@ pub struct RecipeRender {
     pub starts_in_tool_calls: bool,
 }
 
-/// `deepseek_recipe_bridge._truthy`: strings are flags spelled out, anything
-/// else follows JSON truthiness.
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::String(text) => {
-            ["1", "true", "yes", "y", "on"].contains(&text.trim().to_lowercase().as_str())
-        }
-        other => minijinja::Value::from_serialize(other).is_true(),
-    }
+/// Python's `bool()`, which is how serving_chat reads a kwargs flag.
+fn is_true(value: &Value) -> bool {
+    minijinja::Value::from_serialize(value).is_true()
 }
 
 /// Rewrite an SGLang chat request body into what recipe's Chat Completions
-/// adapter accepts. Mirrors `deepseek_recipe_bridge.pre_normalize`.
+/// adapter accepts. Mirrors `deepseek_recipe_bridge.pre_normalize`: the hosts
+/// pass the wire body, so the thinking and effort rules repeat what
+/// `protocol.normalize_reasoning_inputs` and serving_chat do for the builtin
+/// DeepSeek encoders.
 pub(crate) fn pre_normalize(
     body: &mut Value,
     defaults: &HashMap<String, Value>,
@@ -169,36 +169,36 @@ pub(crate) fn pre_normalize(
     if request.get("task").is_some_and(|task| !task.is_null()) {
         return Err("task is not supported by the deepseek-recipe chat encoding backend".into());
     }
-    // SGLang serves whatever name the client sent.
     request.insert("model".into(), Value::String(RECIPE_MODEL_ALIAS.into()));
 
     let kwargs = request
-        .get("chat_template_kwargs")
-        .and_then(Value::as_object)
-        .cloned()
+        .remove("chat_template_kwargs")
+        .and_then(|kwargs| match kwargs {
+            Value::Object(kwargs) => Some(kwargs),
+            _ => None,
+        })
         .unwrap_or_default();
-    // What `render::reasoning` reads, without cloning the messages.
+    // What `render::reasoning` reads: `reasoning.effort`, then
+    // `reasoning.reasoning_effort`, then the request field, as the validator does.
     let reasoning_view = json!({
-        "reasoning": request.get("reasoning"),
+        "reasoning": request.remove("reasoning"),
         "reasoning_effort": request.get("reasoning_effort"),
     });
-    // An explicit `thinking` object (the API's own control) wins; otherwise the
-    // kwargs toggle, then the `reasoning` object, then the server default kwargs.
-    if !request
-        .get("thinking")
-        .is_some_and(|thinking| thinking.is_object())
-    {
-        let kwargs_toggle = ["thinking", "enable_thinking"]
+    // The API's own `thinking` object wins. Otherwise the kwargs flag, which
+    // serving_chat reads for the DeepSeek encoders and the validator only fills
+    // with setdefault; then what the effort or `reasoning.enabled` implies; then
+    // the server defaults.
+    if request.get("thinking").is_none_or(Value::is_null) {
+        let toggle = ["thinking", "enable_thinking"]
             .iter()
             .find_map(|key| kwargs.get(*key).filter(|value| !value.is_null()))
-            .map(truthy);
-        let toggle = kwargs_toggle
+            .map(is_true)
             .or_else(|| requested_thinking(&reasoning_view))
             .or_else(|| {
                 defaults
                     .get("thinking")
                     .filter(|value| !value.is_null())
-                    .map(truthy)
+                    .map(is_true)
             });
         if let Some(enabled) = toggle {
             let kind = if enabled { "enabled" } else { "disabled" };
@@ -206,8 +206,8 @@ pub(crate) fn pre_normalize(
         }
     }
 
-    // Effort: kwargs effort replaces the request's, as serving_chat does; numeric
-    // budgets collapse onto recipe's tiers until recipe accepts 1-100 directly.
+    // serving_chat._convert_to_internal_request: the kwargs effort replaces the
+    // request's; _process_messages: the default fills in last.
     let effort = kwargs
         .get("reasoning_effort")
         .filter(|value| !value.is_null())
@@ -227,8 +227,6 @@ pub(crate) fn pre_normalize(
             request.remove("reasoning_effort");
         }
     }
-    request.remove("reasoning");
-    request.remove("chat_template_kwargs");
 
     if request.get("max_tokens").is_none_or(Value::is_null)
         && let Some(max_completion_tokens) = request
@@ -238,22 +236,20 @@ pub(crate) fn pre_normalize(
     {
         request.insert("max_tokens".into(), max_completion_tokens);
     }
-    // The host samples `n` completions from one prompt and enforces its own
-    // response formats (structural_tag) with its grammar.
+    // The host samples `n` completions from one prompt and enforces
+    // structural_tag, which recipe does not know, with its grammar.
     request.remove("n");
-    if request.get("response_format").is_some_and(|format| {
-        format.is_object()
-            && !format["type"].as_str().is_some_and(|kind| {
-                matches!(kind, "text" | "json_object" | "json_schema" | "regex")
-            })
-    }) {
+    if request
+        .get("response_format")
+        .is_some_and(|format| format["type"] == "structural_tag")
+    {
         request.remove("response_format");
     }
     normalize_tool_choice(request);
 
     let continue_final = request
         .remove("continue_final_message")
-        .is_some_and(|value| truthy(&value));
+        .is_some_and(|value| is_true(&value));
     let Some(Value::Array(messages)) = request.get_mut("messages") else {
         return Err("messages must be an array".into());
     };
@@ -434,14 +430,20 @@ fn python_float_repr(float: f64) -> String {
 }
 
 /// recipe's effort tiers (`deepseek_recipe_bridge._EFFORT_TIERS`).
+/// recipe's request-level efforts. It folds them onto four: minimal and low ->
+/// Low, medium and high -> High, xhigh -> Xhigh, ultra and max -> Max. V4.1
+/// renders Low as 50, High and Xhigh as 75, Max as 100; V4 renders Xhigh like High.
 const EFFORT_TIERS: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
 ];
 
-/// Map an effort value onto recipe's tiers. Integers 1-100 and floats 0-0.99 are
-/// SGLang's numeric budgets, collapsed onto low / high / max (the inverse of
-/// `encoding_dsv41.REASONING_EFFORT_MAPPINGS`); `None` for an unusable value,
-/// which recipe then treats as unset (its default is `high`).
+/// Map an SGLang effort onto recipe's tiers; `None` for an unusable value, which
+/// recipe treats as unset (high). Tier names pass through. SGLang's numeric
+/// budgets, an int in 1-100 from `chat_template_kwargs` or a float in 0-0.99 from
+/// the request field, collapse onto low / high / max at the thresholds of
+/// `encoding_dsv41.REASONING_EFFORT_MAPPINGS` (50 / 75 / 100): recipe 0.2.0 takes
+/// no number, and those three tiers are all the distinct renderings it has, so
+/// only the exact budget is lost (60 renders as 75 where the builtin writes 60).
 fn effort_tier(effort: &Value) -> Option<&'static str> {
     let budget = match effort {
         Value::String(text) => {

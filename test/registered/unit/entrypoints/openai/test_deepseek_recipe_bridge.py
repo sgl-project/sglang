@@ -178,28 +178,11 @@ class TestApplySampling(CustomTestCase):
             context_length=10,
         )
         self.assertEqual(params["max_new_tokens"], 5)
-
-    def test_json_and_regex_constraints_fill_grammar_fields(self):
+        # Grammar is SGLang's: recipe's constraint never reaches the params.
         params = {"max_new_tokens": 1}
         bridge.apply_sampling(
             params,
-            self._render(output_constraint=("json", "")),
-            prompt_tokens=1,
-            context_length=10,
-        )
-        self.assertEqual(params["json_schema"], '{"type": "object"}')
-        params = {"max_new_tokens": 1, "json_schema": '{"a": 1}'}
-        bridge.apply_sampling(
-            params,
-            self._render(output_constraint=("json", '{"b": 2}')),
-            prompt_tokens=1,
-            context_length=10,
-        )
-        self.assertEqual(params["json_schema"], '{"a": 1}')
-        params = {"max_new_tokens": 1}
-        bridge.apply_sampling(
-            params,
-            self._render(output_constraint=("tool_call_required", "[]")),
+            self._render(output_constraint=("json", '{"type": "object"}')),
             prompt_tokens=1,
             context_length=10,
         )
