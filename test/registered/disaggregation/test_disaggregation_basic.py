@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -16,18 +17,18 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.kits.spec_server_kits import SpecGrammarKit
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
     assert_process_healthy,
 )
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=1007, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=870, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -43,12 +44,11 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.62)
@@ -196,31 +196,30 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=f"http://{self.base_host}:{self.lb_port}",
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
+    def test_servers_survive_transfer_failures(self):
+        # Failures are injected on every poll, so nearly every request fails.
+        # Send them directly: an eval client retries each failure with backoff
+        # and spends minutes waiting without checking anything more.
+        def generate(i):
+            return requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": f"Request {i}: The capital of France is",
+                    "sampling_params": {"max_new_tokens": 32},
+                },
+                timeout=120,
+            )
 
-        # Expect lots of failure but the server cannot crash
-        try:
-            metrics = run_eval(args)
-            print(f"Evaluation metrics: {metrics}")
-        except Exception as e:
-            print(f"Test encountered expected errors: {e}")
-            # Check if servers are still healthy
-            try:
-                response = requests.get(self.prefill_url + "/health_generate")
-                assert response.status_code == 200
-                response = requests.get(self.decode_url + "/health_generate")
-                assert response.status_code == 200
-            except Exception as health_check_error:
-                # If health check fails, re-raise the original exception
-                raise e from health_check_error
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            statuses = [r.status_code for r in pool.map(generate, range(64))]
+        print(f"Response status counts: {Counter(statuses)}")
+
+        # Requests may fail, but neither server may crash or stop serving.
+        for name, process, url in [
+            ("prefill", self.process_prefill, self.prefill_url),
+            ("decode", self.process_decode, self.decode_url),
+        ]:
+            assert_process_healthy(self, name, process, url, "/health_generate")
 
 
 class TestDisaggregationMooncakeSpec(
@@ -252,6 +251,10 @@ class TestDisaggregationMooncakeSpec(
             *spec_args,
             "--disaggregation-decode-retraction-backup",
             "host_pool",
+            # Pin the ratio: auto-sizing floors the pool at one max-length request,
+            # which no single request can overflow.
+            "--hicache-ratio",
+            str(BACKUP_ONLY_HICACHE_RATIO),
         ]
         cls.extra_decode_env = {"SGLANG_TEST_RETRACT": "true"}
         cls.launch_all()
@@ -374,11 +377,10 @@ class TestDisaggregationMooncakeSpec(
         # correct afterwards — a leaked host slot or a damaged neighbour shows up as
         # a wrong answer rather than merely a 200.
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
-        metrics = run_eval(
+        metrics = run_sgl_eval(
             SimpleNamespace(
                 base_url=f"http://{self.base_host}:{self.lb_port}",
                 eval_name="gsm8k",
-                api="completion",
                 max_tokens=512,
                 num_examples=64,
                 num_threads=32,
@@ -393,12 +395,11 @@ class TestDisaggregationMooncakeSpec(
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
@@ -421,12 +422,11 @@ class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.62)
@@ -459,29 +459,11 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             self._run_pause_on_decode_running_batch("retract", weight_update=True)
         )
 
-    async def _get_decode_num_running_reqs(self, session):
-        """Query current decode running_batch size from /v1/loads."""
-        async with session.get(
-            self.decode_url + "/v1/loads?include=core",
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as resp:
-            resp.raise_for_status()
-            body = await resp.json()
-            return sum(load["num_running_reqs"] for load in body["loads"])
-
-    async def _wait_for_decode_running_batch(self, session, timeout):
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            if await self._get_decode_num_running_reqs(session) > 0:
-                return
-            await asyncio.sleep(0.2)
-
-        self.fail("Timed out waiting for decode running_batch to become non-empty")
-
     async def _run_pause_on_decode_running_batch(self, mode, weight_update=False):
         num_requests = 2
         max_new_tokens = 512
         prompt = "Write a detailed numbered explanation of distributed inference. " * 12
+        decode_started = [asyncio.Event() for _ in range(num_requests)]
 
         async def _post(session, url, json_data, timeout=30):
             async with session.post(
@@ -493,20 +475,37 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
                 return await resp.json()
 
         async def _generate(session, request_id):
-            return await _post(
-                session,
+            async with session.post(
                 self.lb_url + "/generate",
-                {
+                json={
                     "text": f"Request {request_id}: {prompt}",
                     "background": True,
+                    "stream": True,
                     "sampling_params": {
                         "temperature": 0,
                         "ignore_eos": True,
                         "max_new_tokens": max_new_tokens,
                     },
                 },
-                timeout=180,
-            )
+                timeout=aiohttp.ClientTimeout(total=180),
+            ) as resp:
+                resp.raise_for_status()
+                response = None
+                async for line in resp.content:
+                    line = line.strip()
+                    if not line.startswith(b"data: "):
+                        continue
+                    data = line[len(b"data: ") :]
+                    if data == b"[DONE]":
+                        break
+                    response = json.loads(data)
+                    self.assertNotIn("error", response)
+                    # Prefill produces the first token. A later token proves this
+                    # request has reached running_batch on the decode worker.
+                    if response["meta_info"]["completion_tokens"] > 1:
+                        decode_started[request_id].set()
+                self.assertIsNotNone(response, "Generation stream returned no output")
+                return response
 
         async with aiohttp.ClientSession() as session:
             tasks = [
@@ -515,12 +514,17 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             decode_paused = False
 
             try:
-                await self._wait_for_decode_running_batch(session, timeout=30)
-                await asyncio.sleep(0.1)
+                # /v1/loads can still report a previous batch. Wait for every
+                # current request to decode so none can arrive in the prealloc
+                # queue after the pause and prevent the weight-update flush.
+                await asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in decode_started)),
+                    timeout=30,
+                )
 
                 self.assertTrue(
-                    any(not task.done() for task in tasks),
-                    "All requests finished before decode retract pause was issued.",
+                    all(not task.done() for task in tasks),
+                    "A request finished before decode retract pause was issued.",
                 )
 
                 await _post(
@@ -580,6 +584,9 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             for response in responses:
                 self.assertIn("text", response)
                 self.assertGreater(len(response["text"]), 0)
+                self.assertEqual(
+                    response["meta_info"]["completion_tokens"], max_new_tokens
+                )
 
             self.assertGreater(
                 sum(

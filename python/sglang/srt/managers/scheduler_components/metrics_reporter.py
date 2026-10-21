@@ -9,11 +9,18 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
+import msgspec
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.observability.forward_pass_metrics import (
+    ScheduledRequestMetrics,
+    WelfordAccumulator,
+    wrap_forward_with_fpm,
+)
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     QueueCount,
@@ -34,6 +41,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     logs_expert_balancedness_to_server_log,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -49,6 +57,11 @@ logger = logging.getLogger(__name__)
 
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
+_SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
+    SpeculativeAlgorithm.EAGLE,
+    SpeculativeAlgorithm.EAGLE3,
+    SpeculativeAlgorithm.DSPARK,
+)
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
 # gen_throughput is computed only on decode-stats ticks; when decode is starved
@@ -86,6 +99,17 @@ def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
     if batch.seq_lens_cpu is not None:
         return int(batch.seq_lens_cpu.sum().item())
     return sum(req.seqlen for req in batch.reqs)
+
+
+def _prefill_attention_pairs(batch: ScheduleBatch) -> int:
+    """Causal query-key pairs: each chunk against its cached prefix, plus
+    the causal pairs within the chunk itself."""
+    return sum(
+        extend_len * prefix_len + extend_len * (extend_len + 1) // 2
+        for prefix_len, extend_len in zip(
+            batch.prefix_lens, batch.extend_lens, strict=True
+        )
+    )
 
 
 @dataclasses.dataclass
@@ -169,12 +193,38 @@ class _SchedulerTimeAccountingSnapshot:
         self.is_idle = is_idle
 
 
+class _ForwardOccupancyLogWindow(msgspec.Struct):
+    start_ns: int
+    gpu_seconds: float = 0.0
+    idle_ns: int = 0
+    batch_count: int = 0
+
+    def reset(self, now_ns: int) -> None:
+        self.start_ns = now_ns
+        self.gpu_seconds = 0.0
+        self.idle_ns = 0
+        self.batch_count = 0
+
+    def log_string(self, now_ns: int, ongoing_idle_ns: int = 0) -> str:
+        wall_ns = now_ns - self.start_ns
+        if wall_ns > 0:
+            # Both denominators include the entire window, including idle gaps.
+            gpu_ns = self.gpu_seconds * 1e9
+            idle_ns = self.idle_ns + ongoing_idle_ns
+            fwd_occupancy = min(gpu_ns / wall_ns * 100, 100.0)
+            fwd_idle_occupancy = min((gpu_ns + idle_ns) / wall_ns * 100, 100.0)
+        else:
+            fwd_occupancy = 0.0
+            fwd_idle_occupancy = 0.0
+        return (
+            f"fwd occupancy: {fwd_occupancy:.2f}%"
+            f", fwd+idle occupancy: {fwd_idle_occupancy:.2f}%"
+        )
+
+
 @dataclass(kw_only=True)
 class SchedulerMetricsReporter:
     scheduler: Scheduler
-    tp_rank: int
-    pp_rank: int
-    dp_rank: Optional[int]
     metrics_collector_context: SchedulerMetricsCollectorContext
     metrics_collector: Optional[SchedulerMetricsCollector]
     num_retracted_reqs: int = 0
@@ -191,7 +241,14 @@ class SchedulerMetricsReporter:
         self.enable_kv_cache_events = (
             self.metrics_collector_context.enable_kv_cache_events
         )
-        self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
+        parallel = get_parallel()
+        # The max/mean token ratio is engine-wide; one scheduler reports it.
+        self.reports_dp_token_imbalance_ratio = (
+            parallel.attn_dp_rank == 0
+            and parallel.attn_tp_rank == 0
+            and parallel.attn_cp_rank == 0
+        )
+        self._init_metrics()
         self._install_device_timer_on_runners()
         # Keep log history after the existing async result copy so reporting does
         # not synchronize the model stream once per generated token.
@@ -213,12 +270,7 @@ class SchedulerMetricsReporter:
             self.last_gen_throughput = 0.0
         return self.last_gen_throughput
 
-    def _init_metrics(
-        self,
-        tp_rank: int,
-        pp_rank: int,
-        dp_rank: Optional[int],
-    ):
+    def _init_metrics(self):
         # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -264,25 +316,40 @@ class SchedulerMetricsReporter:
         self._scheduler_time_accounting: Optional[_SchedulerTimeAccountingSnapshot] = (
             None
         )
-        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
-            enabled=self.enable_metrics
-        )
-
         self.forward_pass_device_timer: Optional[DeviceTimer] = None
+        self._forward_occupancy_log_window: Optional[_ForwardOccupancyLogWindow] = None
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
+            # Keep wall-time log accounting separate from the existing gauge.
+            self._forward_occupancy_log_window = _ForwardOccupancyLogWindow(
+                start_ns=time.monotonic_ns()
+            )
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
+                self._forward_occupancy_log_window.gpu_seconds += kwargs["t"]
                 if self.enable_metrics:
                     self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
+        # PDMux event polling across green-context streams is not validated;
+        # keep its overlap label at `none` without disabling forward timing.
+        self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
+            enabled=self.enable_metrics,
+            query_forward_active=(
+                self.forward_pass_device_timer.is_active
+                if self.enable_metrics
+                and self.forward_pass_device_timer is not None
+                and self.scheduler.device == "cuda"
+                and not get_disagg().enable_pdmux
+                else None
+            ),
+        )
 
         self._init_fpm()
 
@@ -308,7 +375,7 @@ class SchedulerMetricsReporter:
         self.scheduler.enable_fpm = False
         if (
             get_observability().enable_forward_pass_metrics
-            and self.scheduler.ps.attn_tp_rank == 0
+            and get_parallel().attn_tp_rank == 0
             and get_parallel().pp_rank == get_parallel().pp_size - 1
         ):
             from sglang.srt.observability.forward_pass_metrics import (
@@ -316,9 +383,7 @@ class SchedulerMetricsReporter:
             )
 
             self.scheduler._fpm_dp_rank = (
-                self.scheduler.ps.dp_rank
-                if self.scheduler.ps.dp_rank is not None
-                else 0
+                get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
             )
             self.scheduler._fpm_worker_id = (
                 get_observability().forward_pass_metrics_worker_id
@@ -337,31 +402,40 @@ class SchedulerMetricsReporter:
                 worker_id=self.scheduler._fpm_worker_id,
                 dp_rank=self.scheduler._fpm_dp_rank,
             )
-            self.scheduler._fpm_gpu_time_acc = 0.0
-
-            def _fpm_device_timer_reporter(t, **_kwargs):
-                self.scheduler._fpm_gpu_time_acc += t
-
-            if self.forward_pass_device_timer is not None:
-                self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
-            else:
-                self.forward_pass_device_timer = DeviceTimer(
-                    reporter=_fpm_device_timer_reporter,
-                )
-            self.scheduler._fpm_uses_device_timer = True
+            if self.forward_pass_device_timer is None:
+                self.forward_pass_device_timer = DeviceTimer()
             self.scheduler.enable_fpm = True
+            self.scheduler.run_batch = wrap_forward_with_fpm(
+                self.scheduler.run_batch, self.forward_pass_device_timer
+            )
             logger.info(
-                "FPM: ZMQ PUB bound on %s (dp_rank=%d, device_timer=%s)",
+                "FPM: ZMQ PUB bound on %s (dp_rank=%d)",
                 endpoint,
                 self.scheduler._fpm_dp_rank,
-                self.scheduler._fpm_uses_device_timer,
             )
 
-    def _build_scheduled_request_metrics(self, batch: ScheduleBatch):
-        from sglang.srt.observability.forward_pass_metrics import (
-            ScheduledRequestMetrics,
-            WelfordAccumulator,
+    def snapshot_spec_decode_metrics(self, batch, result):
+        if not self.scheduler.enable_fpm:
+            return
+
+        if batch.spec_algorithm not in _SPEC_DECODE_SNAPSHOT_ALGORITHMS:
+            return
+
+        # Before settling this result, token history includes one pending token
+        # outside KV. Unlike kv_committed_len, it survives in-flight retraction.
+        decode_kv = WelfordAccumulator()
+        for req in batch.reqs:
+            decode_kv.add(req.seqlen - 1)
+        result.fpm_scheduled_requests = ScheduledRequestMetrics(
+            num_decode_requests=decode_kv.count,
+            sum_decode_kv_tokens=decode_kv.total,
+            var_decode_kv_tokens=decode_kv.variance(),
         )
+
+    def _build_scheduled_request_metrics(self, batch: ScheduleBatch, result=None):
+        snapshot = getattr(result, "fpm_scheduled_requests", None)
+        if snapshot is not None:
+            return snapshot
 
         num_prefill_requests = 0
         sum_prefill_tokens = 0
@@ -382,7 +456,9 @@ class SchedulerMetricsReporter:
                 prefill_lengths.add(len(req.origin_input_ids))
             num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
             sum_prefill_tokens = stats.log_input_tokens if stats else 0
-            sum_prefill_kv_tokens = sum(len(req.prefix_indices) for req in prefill_reqs)
+            # Prefill reqs lead batch.reqs, so they own the head of prefix_lens;
+            # each req's own prefix was already advanced by result processing.
+            sum_prefill_kv_tokens = sum(batch.prefix_lens[: len(prefill_reqs)])
 
         decode_kv = WelfordAccumulator()
         if batch.forward_mode.is_mixed():
@@ -483,9 +559,9 @@ class SchedulerMetricsReporter:
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
-            model_config.get_num_attention_heads(self.scheduler.ps.tp_size)
+            model_config.get_num_attention_heads(get_parallel().tp_size)
         )
-        num_kv_heads = float(model_config.get_num_kv_heads(self.scheduler.ps.tp_size))
+        num_kv_heads = float(model_config.get_num_kv_heads(get_parallel().tp_size))
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
@@ -559,14 +635,6 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
-    @staticmethod
-    def _prefill_attention_pairs(batch) -> float:
-        """Causal query-key pairs: each chunk against its cached prefix, plus
-        the causal pairs within the chunk itself."""
-        prefix_pairs = sum(c * p for c, p in zip(batch.extend_lens, batch.prefix_lens))
-        within_chunk_pairs = sum(c * (c + 1) / 2.0 for c in batch.extend_lens)
-        return float(prefix_pairs + within_chunk_pairs)
-
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -574,7 +642,7 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        context_product = self._prefill_attention_pairs(batch)
+        context_product = float(_prefill_attention_pairs(batch))
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
@@ -726,7 +794,9 @@ class SchedulerMetricsReporter:
                 msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            # Poll completed forward events before formatting, without synchronizing.
+            self.forward_pass_device_timer._report()
+            msg += ", " + self.forward_occupancy_log_string()
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -814,12 +884,7 @@ class SchedulerMetricsReporter:
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
-                )
-                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
-                )
+                self._update_decode_queue_stats(priority_enabled)
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -952,9 +1017,12 @@ class SchedulerMetricsReporter:
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1:
+                msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
 
         if (
@@ -992,7 +1060,9 @@ class SchedulerMetricsReporter:
             self._mfu_log_write_bytes = 0.0
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            # Poll completed forward events before formatting, without synchronizing.
+            self.forward_pass_device_timer._report()
+            msg += ", " + self.forward_occupancy_log_string()
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -1038,13 +1108,6 @@ class SchedulerMetricsReporter:
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_prefill_inflight_queue, priority_enabled
                 )
-            elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
-                )
-                self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
-                )
 
             # Streaming session metrics
             self.stats.num_streaming_sessions = (
@@ -1083,6 +1146,16 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            self.current_scheduler_metrics_enabled
+            and (dp_balance_stats := batch.dp_balance_stats) is not None
+        ):
+            self.metrics_collector.observe_dp_balance(dp_balance_stats)
+            if self.reports_dp_token_imbalance_ratio:
+                self.metrics_collector.observe_dp_token_imbalance_ratio(
+                    dp_balance_stats
+                )
+
         if not isinstance(result, GenerationBatchResult):
             return
 
@@ -1123,38 +1196,29 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result=None,
     ):
-        """Emit per-iteration ForwardPassMetrics over ZMQ PUB.
-
-        Prefers GPU-accurate timing from DeviceTimer (which wraps
-        model_runner.forward / cuda_graph.replay via PR #24197).
-        Falls back to monotonic clock when DeviceTimer is not enabled.
-        """
+        """Snapshot request statistics and publish this result's instrumented GPU span."""
         if not self.scheduler.enable_fpm:
             return
 
         from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
 
-        if self.scheduler._fpm_uses_device_timer:
-            self.forward_pass_device_timer._report()
-            wall_time = self.scheduler._fpm_gpu_time_acc
-            self.scheduler._fpm_gpu_time_acc = 0.0
-            if wall_time == 0.0:
-                return
-        else:
-            wall_time = max(0.0, time.monotonic() - batch.fpm_start_time)
+        timing = result.fpm_timing
+        if timing is None or timing.num_intervals == 0:
+            return
 
         fpm = ForwardPassMetrics(
             worker_id=self.scheduler._fpm_worker_id,
             dp_rank=self.scheduler._fpm_dp_rank,
-            wall_time=wall_time,
-            scheduled_requests=self._build_scheduled_request_metrics(batch),
+            wall_time=0.0,
+            scheduled_requests=self._build_scheduled_request_metrics(batch, result),
             queued_requests=self._build_queued_request_metrics(),
         )
-        self.scheduler._fpm_publisher.publish(fpm)
+        timing.publish_when_ready(fpm, self.scheduler._fpm_publisher)
 
     def _shutdown_fpm(self):
         """Shut down the FPM publisher thread."""
         if self.scheduler.enable_fpm:
+            self.forward_pass_device_timer._report()
             self.scheduler._fpm_publisher.shutdown()
 
     def _log_hicache_stats(self):
@@ -1231,10 +1295,23 @@ class SchedulerMetricsReporter:
                     self.stats.token_usage / 0.9,
                 )
 
+    def forward_occupancy_log_string(self) -> str:
+        now_ns = time.monotonic_ns()
+        accounting = self._scheduler_time_accounting
+        ongoing_idle_ns = (
+            now_ns - accounting.last_sample_ns
+            if accounting is not None and accounting.is_idle
+            else 0
+        )
+        return self._forward_occupancy_log_window.log_string(
+            now_ns=now_ns, ongoing_idle_ns=ongoing_idle_ns
+        )
+
     def update_device_timer(self):
+        if self.forward_pass_device_timer is not None:
+            self.forward_pass_device_timer._report()
         if not ENABLE_METRICS_DEVICE_TIMER:
             return
-        self.forward_pass_device_timer._report()
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
             # Window start: keep the last published value instead of NaN-ing
@@ -1254,36 +1331,71 @@ class SchedulerMetricsReporter:
         if self._device_timer_window_batch_count >= self.decode_log_interval:
             self._device_timer_window_batch_count = 0
 
+        window = self._forward_occupancy_log_window
+        window.batch_count += 1
+        if window.batch_count >= self.decode_log_interval:
+            # Close the log window after this batch's log. The next window
+            # starts now, before its first forward.
+            window.reset(time.monotonic_ns())
+
     def start_scheduler_time_accounting(self) -> None:
-        if not self.enable_metrics:
+        if not (self.enable_metrics or ENABLE_METRICS_DEVICE_TIMER):
             return
         now_wall_ns = time.monotonic_ns()
         self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
-            now_wall_ns, time.process_time_ns(), True
+            now_wall_ns, time.process_time_ns() if self.enable_metrics else 0, True
         )
+        if ENABLE_METRICS_DEVICE_TIMER:
+            self.forward_pass_device_timer._report()
+            self._forward_occupancy_log_window.reset(now_wall_ns)
         self.scheduler_stage_metrics.start(now_wall_ns)
 
-    def record_scheduler_active(self) -> None:
-        self._record_scheduler_time(is_idle=False)
+    def record_scheduler_active(self, event_ns: int) -> None:
+        """End CPU-side idle at event_ns (monotonic nanoseconds)."""
+        if self.scheduler.enable_fpm:
+            self.scheduler._fpm_publisher.set_idle(False)
+        self._record_scheduler_time(is_idle=False, event_ns=event_ns)
 
     def record_scheduler_idle(self) -> None:
-        self._record_scheduler_time(is_idle=True)
+        """Start CPU-side idle at the current monotonic time."""
+        if self.scheduler.enable_fpm:
+            self.scheduler._fpm_publisher.set_idle(True)
+        self._record_scheduler_time(is_idle=True, event_ns=time.monotonic_ns())
 
-    def _record_scheduler_time(self, is_idle: bool) -> None:
-        if not self.enable_metrics:
+    def _record_scheduler_time(self, is_idle: bool, event_ns: int) -> None:
+        if not (self.enable_metrics or ENABLE_METRICS_DEVICE_TIMER):
             return
 
         now_wall_ns = time.monotonic_ns()
         accounting = self._scheduler_time_accounting
         if accounting is None:
             self._scheduler_time_accounting = _SchedulerTimeAccountingSnapshot.init(
-                now_wall_ns, time.process_time_ns(), is_idle
+                now_wall_ns,
+                time.process_time_ns() if self.enable_metrics else 0,
+                is_idle,
             )
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self._forward_occupancy_log_window.reset(now_wall_ns)
             self.scheduler_stage_metrics.start(now_wall_ns)
             return
 
+        # Clamp delayed events to the still-unaccounted wall-time range.
+        event_ns = max(accounting.last_sample_ns, min(event_ns, now_wall_ns))
+        if ENABLE_METRICS_DEVICE_TIMER and is_idle and not accounting.is_idle:
+            # Drain the completed burst once, then retain the new idle
+            # window across polls so the next request includes its idle gap.
+            self.forward_pass_device_timer._report()
+            self._forward_occupancy_log_window.reset(event_ns)
+
+        idle_ns_before = accounting.accumulate_idle_ns
+        accounting.sample(event_ns, is_idle)
+        # Reporting and stage drains stay at now, after any completed receive span.
         accounting.sample(now_wall_ns, is_idle)
-        if not accounting.should_record(now_wall_ns):
+        if ENABLE_METRICS_DEVICE_TIMER:
+            self._forward_occupancy_log_window.idle_ns += (
+                accounting.accumulate_idle_ns - idle_ns_before
+            )
+        if not self.enable_metrics or not accounting.should_record(now_wall_ns):
             return
 
         now_process_cpu_ns = time.process_time_ns()
@@ -1295,11 +1407,11 @@ class SchedulerMetricsReporter:
         self.metrics_collector.increment_scheduler_process_cpu_seconds(
             elapsed_process_cpu_ns / 1e9
         )
-        for stage, elapsed_wall_ns in self.scheduler_stage_metrics.drain(
+        for (stage, overlap), elapsed_wall_ns in self.scheduler_stage_metrics.drain(
             now_wall_ns
         ).items():
             self.metrics_collector.increment_scheduler_stage_seconds(
-                stage=stage, seconds=elapsed_wall_ns / 1e9
+                stage=stage, seconds=elapsed_wall_ns / 1e9, forward_overlap=overlap
             )
         accounting.reset(now_wall_ns, now_process_cpu_ns, is_idle)
 
@@ -1310,8 +1422,30 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _update_decode_queue_stats(self, priority_enabled: bool) -> None:
+        transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
+        self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
+        )
+        self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
+            transfer_queue, priority_enabled
+        )
+        self.stats.num_decode_deferred_kv_release_reqs = (
+            self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
+        )
+        host_reqs = (
+            [req for req in transfer_queue if req.host_staged]
+            if get_disagg().disaggregation_decode_host_receive_threshold < 1
+            else []
+        )
+        self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
+            host_reqs, priority_enabled
+        )
+
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
+        if self.scheduler.enable_fpm:
+            self.forward_pass_device_timer._report()
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
         is_fwd_occupancy_stale = ENABLE_METRICS_DEVICE_TIMER and not math.isnan(
             self.stats.fwd_occupancy
@@ -1360,10 +1494,5 @@ class SchedulerMetricsReporter:
                 self.scheduler.disagg_prefill_inflight_queue, priority_enabled
             )
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
-            )
-            self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
-            )
+            self._update_decode_queue_stats(priority_enabled)
         self.metrics_collector.log_stats(self.stats)

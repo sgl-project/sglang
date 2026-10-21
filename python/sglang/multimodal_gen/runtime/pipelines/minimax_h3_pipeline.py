@@ -49,7 +49,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         # scheduler intentionally absent: model_index carries scheduler=null;
         # per-modality sigma schedules are generated in TimestepPreparation
         # from the task profile, and the loop scheduler math lives in
-        # scheduling_minimax_h3_euler_ancestral (stages accept scheduler=None).
+        # minimax_h3/denoise_loop.py (stages accept scheduler=None).
         "transformer",
     ]
 
@@ -175,6 +175,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             MiniMaxH3TimestepPreparationStage(
                 sigma_shift_scales=sigma_shift_scales,
+                dmd_denoising_steps=(
+                    release_metadata.dmd_denoising_steps
+                    if release_metadata is not None
+                    else None
+                ),
             )
         )
         self.add_stage(
@@ -190,12 +195,21 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         )
 
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+            MiniMaxH3ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            MiniMaxH3ComfyUIStepStage(transformer=self.get_module("transformer"))
+        )
+
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
-    """FastH3: 4-step DMD2-distilled MiniMax-H3 (t2va only).
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only).
 
     The flat single-partition repo is materialized into the base-H3 layout by
-    the bundled model overlay (see model_overlays/), so every stage, loader,
+    its registered model overlay (see runtime/utils/model_overlay.py), so every stage, loader,
     and admission path below is exactly the MiniMax-H3 one. There is no
     FL2VA/Ref2VA partition layout to default into.
     """

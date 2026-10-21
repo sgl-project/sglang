@@ -1,12 +1,12 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 from torch import nn
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -17,6 +17,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+    forward_dsa_indexer_for_mha,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 
 from .dense_attention import (
@@ -318,11 +321,7 @@ class DSAMockModelRunner(ModelRunner):
         self.canary_manager = None
         self.page_size = case.page_size
         self.model_config = model_config
-        self.tp_size = 1
         self._kernel_warmed_up = True
-        self.dp_size = 1
-        self.pp_size = 1
-        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -346,7 +345,6 @@ class DSAMockModelRunner(ModelRunner):
             dsa_prefill_backend=dsa_prefill_backend,
             device=device,
             enable_deterministic_inference=False,
-            enable_dp_attention=False,
             enable_prefill_cp=False,
             enable_mis=False,
             is_embedding=False,
@@ -405,7 +403,6 @@ class DSAMockModelRunner(ModelRunner):
         )
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
         self.init_kv_index_translator()
-        self.attn_cp_size = 1
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -1216,6 +1213,13 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
             return False, f"aiter unavailable: {exc}"
         return True, ""
 
+    if impl == "triton_sparse_mla":
+        if is_hip():
+            return False, "triton_sparse_mla is a CUDA-only prefill backend"
+        if major < 9:
+            return False, f"{impl} requires SM>=9.0, got SM{major}.x"
+        return True, ""
+
     if impl == "flashmla_auto":
         # `flashmla_auto` resolves to flashmla_sparse / flashmla_kv at
         # forward time depending on `dsa_kv_cache_store_fp8`; both leaf
@@ -1234,6 +1238,7 @@ DSA_PREFILL_IMPL_VARIANTS: tuple[str, ...] = (
     "tilelang",
     "trtllm",
     "aiter",
+    "triton_sparse_mla",
 )
 DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
     "flashmla_sparse",
@@ -1250,7 +1255,7 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
 # flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto"}
+    {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
     {"flashmla_kv", "flashmla_auto"}
@@ -1389,7 +1394,7 @@ def run_dsa_sparse_fp8_prefill_case(
 ) -> None:
     """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty
     prefix, `get_topk_transform_method` returns `RAGGED` (the only path
-    that exercises `dequantize_k_cache_paged` + the
+    that exercises `dequantize_k_cache_paged_dsa` + the
     `topk_indices_offset` shift). With `flashmla_kv` or `flashmla_auto`
     it stays on `PAGED` topk; the auto resolver picks `flashmla_kv` for
     FP8 KV cache (`set_dsa_prefill_impl`), so `flashmla_auto` and
@@ -1433,6 +1438,141 @@ def run_dsa_sparse_fp8_decode_case(
         case,
         dsa_decode_backend=dsa_decode_backend,
         fp8_kv_cache=True,
+    )
+
+
+def _make_dsa_ragged_topk(
+    case: DSAAttentionCase, *, index_topk: int, device: str
+) -> tuple[torch.Tensor, list[list[int]]]:
+    """Synthesize the fused-top-k prefill output: causal random keys per query,
+    addressed as batch-global offsets into the concatenated KV. Returns the
+    tensor and, per request, the local positions its last query selected."""
+    rows = []
+    last_rows = []
+    kv_start = 0
+    for req_idx, input_len in enumerate(case.input_lens):
+        for offset in range(input_len):
+            key_count = case.prefix_lens[req_idx] + offset + 1
+            local = torch.randperm(key_count)[:index_topk].sort().values.tolist()
+            rows.append(
+                [kv_start + k for k in local] + [-1] * (index_topk - len(local))
+            )
+        last_rows.append(local + [-1] * (index_topk - len(local)))
+        kv_start += case.seq_lens[req_idx]
+    return torch.tensor(rows, dtype=torch.int32, device=device), last_rows
+
+
+def run_dsa_mtp_seed_handoff_case(
+    testcase,
+    case: DSAAttentionCase,
+    *,
+    seed_path: str,
+    index_topk: int = DSA_SPARSE_INDEX_TOPK,
+    device: str = DEFAULT_DEVICE,
+) -> None:
+    """The MTP seed a draft prefill exports must be the physical slots the first
+    draft decode reads. With `flashmla_sparse_q8` + fused top-k the prefill
+    top-k is RAGGED (batch-global logical offsets); both export paths (dense
+    MHA for short prefills, sparse MLA via `publish()` otherwise) must convert
+    it, or the decode gathers the wrong KV or reads past the pool."""
+    if torch.cuda.get_device_capability()[0] != 9:
+        testcase.skipTest("flashmla_sparse_q8 prefill is SM90-only")
+    if not case.forward_mode.is_extend_without_speculative():
+        raise ValueError("run_dsa_mtp_seed_handoff_case expects an EXTEND case.")
+    max_context_len = max(case.seq_lens) + case.page_size
+    fixture = build_dsa_sparse_attention_fixture(
+        testcase,
+        case,
+        max_context_len=max_context_len,
+        device=device,
+        dsa_prefill_backend="flashmla_sparse_q8",
+        dsa_decode_backend="flashmla_kv",
+        fp8_kv_cache=True,
+        index_topk=index_topk,
+        loc_layout="contiguous",
+    )
+    backend = fixture.backend
+    runner = fixture.runner
+    batch = fixture.forward_batch
+    testcase.assertTrue(backend.use_fused_topk)
+    logical, last_rows = _make_dsa_ragged_topk(
+        case, index_topk=index_topk, device=device
+    )
+    batch.spec_info = SimpleNamespace(
+        dsa_topk_indices=None,
+        dsa_seed_topk_capture=torch.full(
+            (case.batch_size, index_topk), -2, dtype=torch.int32, device=device
+        ),
+        dsa_seed_topk_select=torch.tensor(case.input_lens, device=device).cumsum(0) - 1,
+    )
+    with forward_context(ForwardContext(attn_backend=backend)):
+        backend.init_forward_metadata(batch)
+        testcase.assertEqual(backend.use_mha, seed_path == "mha")
+        if seed_path == "mha":
+            forward_dsa_indexer_for_mha(
+                lambda **_: logical,
+                hidden_states=fixture.input_hidden,
+                q_lora=fixture.input_hidden,
+                positions=batch.positions,
+                forward_batch=batch,
+                layer_id=0,
+            )
+        else:
+            state = IndexTopKShareState.from_mtp_carry(batch)
+            state.update(logical)
+            state.publish()
+    seed = batch.spec_info.dsa_seed_topk_capture
+
+    local_rows = torch.tensor(last_rows, device=device)
+    req_to_token = runner.req_to_token_pool.req_to_token[: case.batch_size]
+    expected_seed = torch.where(
+        local_rows >= 0, req_to_token.gather(1, local_rows.clamp(min=0).long()), -1
+    ).to(torch.int32)
+    torch.testing.assert_close(seed, expected_seed, rtol=0, atol=0)
+
+    # First draft decode after that prefill, carrying the seed.
+    decode_case = DSAAttentionCase(
+        name=f"{case.name}_decode",
+        backend=case.backend,
+        forward_mode=ForwardMode.DECODE,
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        page_size=case.page_size,
+        prefix_lens=case.seq_lens,
+    )
+    decode_batch = _make_forward_batch(
+        decode_case, runner, max_context_len=max_context_len, device=device
+    )
+    decode_batch.spec_info = SimpleNamespace(
+        dsa_topk_indices=seed, dsa_seed_topk_capture=None, dsa_seed_topk_select=None
+    )
+    input_parts = _split_by_lens(fixture.input_hidden, case.input_lens)
+    decode = replace(
+        fixture,
+        case=decode_case,
+        forward_batch=decode_batch,
+        prefix_hidden=[
+            torch.cat([prefix, part])
+            for prefix, part in zip(fixture.prefix_hidden, input_parts)
+        ],
+        input_hidden=torch.randn_like(fixture.input_hidden[: case.batch_size]),
+        topk_rows=last_rows,
+    )
+    _populate_dsa_sparse_prefix_kv(
+        fixture.actual_module,
+        decode_case,
+        runner,
+        decode.prefix_hidden,
+        max_context_len=max_context_len,
+    )
+    with IndexTopKShareState.mtp_iteration(decode_batch, keep_carry_seed=True) as state:
+        decode.topk_indices = state.topk_indices
+        actual = run_dsa_sparse_fixture_eager(decode, testcase)
+    torch.testing.assert_close(
+        actual,
+        expected_dsa_sparse_fixture_output(decode),
+        atol=DSA_SPARSE_FP8_ATOL,
+        rtol=DSA_SPARSE_FP8_RTOL,
     )
 
 
