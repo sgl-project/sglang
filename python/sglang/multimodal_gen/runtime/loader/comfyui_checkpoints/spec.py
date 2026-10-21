@@ -142,11 +142,7 @@ def _gguf_runtime_layout(tensor_meta: dict, mapping: dict) -> tuple[dict, dict]:
     for target, parts in fused.items():
         metas = [parts[i][1] for i in sorted(parts)]
         first = metas[0]
-        if any(
-            (m.ggml_type, m.is_packed, m.logical_shape[1:])
-            != (first.ggml_type, first.is_packed, first.logical_shape[1:])
-            for m in metas
-        ):
+        if len({(m.ggml_type, m.is_packed, m.logical_shape[1:]) for m in metas}) > 1:
             raise ValueError(f"GGUF shards of {target} differ in type or width")
         param_name = (
             f"{target.removesuffix('.weight')}.qweight" if first.is_packed else target

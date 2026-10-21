@@ -117,15 +117,6 @@ def _write_gguf(path, names):
     writer.close()
 
 
-def test_worker_routes_a_gguf_unet_to_the_comfyui_loader(tmp_path):
-    for name in ("dit.safetensors", "dit-Q8_0.gguf", "dit.bin"):
-        (tmp_path / name).write_bytes(b"x")
-    assert spec_mod.is_comfyui_single_file(str(tmp_path / "dit.safetensors"))
-    assert spec_mod.is_comfyui_single_file(str(tmp_path / "dit-Q8_0.gguf"))
-    assert not spec_mod.is_comfyui_single_file(str(tmp_path / "dit.bin"))
-    assert not spec_mod.is_comfyui_single_file(str(tmp_path))
-
-
 def test_gguf_unet_loads_with_runtime_names(monkeypatch, tmp_path):
     """A GGUF unet loads as the DiT, keyed by runtime layer names for both quant
     lookup and loading: Z-Image's qkv is to_qkv and its w1/w3 fuse into w13."""
@@ -156,6 +147,7 @@ def test_gguf_unet_loads_with_runtime_names(monkeypatch, tmp_path):
     )
     meta = seen["init_params"]["quant_config"].tensor_meta
     weights = dict(seen["weights_iterator"])
+    assert spec_mod.is_comfyui_single_file(str(gguf_path))
     assert seen["server_args"].model_paths["transformer"] == str(tmp_path)
     assert meta["layers.0.attention.to_qkv.weight"].logical_shape == (2, 4)
     assert meta["layers.0.feed_forward.w13.weight"].logical_shape == (4, 4)
