@@ -28,7 +28,11 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 _NPU_ACCURACY_TOLERANCE = 0.99
 _NPU_MAX_ACCURACY_ATTEMPTS = 3
 
-_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+# A PR-triggered nightly run must still do the full work, so exclude the nightly
+# workflow by ref instead of treating every non-nightly ref as a PR pipeline.
+_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
+    "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
+)
 
 # sgl_eval fetches benchmark archives (the MMLU data.tar among them) with its own
 # httpx client: it ignores HF_ENDPOINT, prints nothing while downloading and
@@ -36,7 +40,7 @@ _is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
 # CI prefetches the archive through HF_ENDPOINT into this directory, and the shim
 # below hands the local copy to sgl_eval after re-checking the sha256 it pins --
 # a stale copy falls back to the original download instead of grading other data.
-_SGL_EVAL_ARCHIVE_DIR_ENV = "SGL_EVAL_ARCHIVE_DIR"
+_SGL_EVAL_ARCHIVE_DIR_ENV = "SGLANG_EVAL_ARCHIVE_DIR"
 _SGL_EVAL_ARCHIVE_DIR_DEFAULT = Path.home() / ".cache" / "sgl_eval" / "archives"
 
 
