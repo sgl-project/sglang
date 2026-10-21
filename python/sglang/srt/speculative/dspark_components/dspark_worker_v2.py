@@ -174,6 +174,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if (
             get_parallel().attn_dp_enabled
+            and not _is_npu
             and self._draft_is_moe
             and get_parallel().attn_tp_size > 1
         ):
