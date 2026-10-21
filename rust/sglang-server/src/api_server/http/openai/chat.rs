@@ -212,14 +212,32 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
+    let force_reasoning = match reasoning_parser.as_deref() {
+        // Kimi K3's detector starts in reasoning unless told otherwise; Python
+        // passes the thinking flag.
+        Some("kimi_k3") => Some(
+            chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("thinking"))
+                != Some(&Value::Bool(false)),
+        ),
+        parser => starts_in_reasoning(parser, rendered.prompt.as_str()).then_some(true),
+    };
     // As Python, the continued text decides whether generation starts in reasoning.
     let reasoning_options = ReasoningOptions {
-        force_reasoning: starts_in_reasoning(reasoning_parser.as_deref(), &rendered.prompt)
-            .then_some(true),
+        force_reasoning,
         previous_content: Some(rendered.continuation.clone()),
         ..Default::default()
     };
-    let mut prompt = Some(rendered.into_text());
+    // Without a loaded tokenizer (tests), the pool encodes the joined text.
+    let (text, input_ids) = match &state.prompt_encoder {
+        Some(encoder) => match encoder.encode_blocking(rendered).await {
+            Ok(ids) => (None, Some(ids.into_iter().map(i64::from).collect())),
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        },
+        None => (Some(rendered.into_text()), None),
+    };
+    let mut prompt = Some((text, input_ids));
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
         let choice_prompt = if index + 1 == choices_per_prompt {
@@ -230,9 +248,11 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
+        let (text, input_ids) = choice_prompt;
         let native = GenerateRequest {
             rid: rid.clone(),
-            text: Some(choice_prompt),
+            text,
+            input_ids,
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -294,9 +314,7 @@ async fn chat_completions(
 }
 
 /// Render the chat template for an OpenAI request, mapping a missing
-/// formatter or a render failure to the standard 400. The rendered prompt is
-/// submitted as text — the tokenizer pool encodes it (with
-/// `skip_special_tokens`, since the template owns its special tokens).
+/// formatter or a render failure to the standard 400.
 pub(super) async fn prepare_chat_request(
     state: &AppState,
     body: &Value,
@@ -947,7 +965,10 @@ mod tests {
             "chat_template_kwargs": {"thinking": true}
         }));
         assert_eq!(rendered.continuation, "Let me compute: 17*20");
-        assert!(starts_in_reasoning(Some("deepseek-v41"), &rendered.prompt));
+        assert!(starts_in_reasoning(
+            Some("deepseek-v41"),
+            rendered.prompt.as_str()
+        ));
     }
 
     /// A DeepSeek-V4 continuation drops its leading BOS, as SGLang's separate
@@ -1180,6 +1201,34 @@ mod tests {
         assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
     }
 
+    /// Kimi K3 with thinking off generates content, though its detector defaults to reasoning.
+    #[tokio::test]
+    async fn kimi_k3_thinking_off_is_content() {
+        let args = crate::message::config::ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("kimi_k3".into()),
+            ..Default::default()
+        };
+        let state = super::super::test_utils::answering_app_state_with(
+            std::sync::Arc::new(args),
+            super::super::ChatFormatter::KimiK3,
+            "Hello!",
+        );
+        let response = super::super::test_utils::post_json(
+            super::routes().with_state(state),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "chat_template_kwargs": {"thinking": false}
+            }),
+        )
+        .await;
+        let value = super::super::test_utils::body_json(response).await;
+        assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
+        assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
+    }
+
     #[tokio::test]
     async fn unary_chat_separates_reasoning_content_with_parser_configured() {
         let (choice, tx) = chat_submitted(0, "r0");
@@ -1343,6 +1392,7 @@ mod tests {
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
                 chat_formatter: Some(super::super::ChatFormatter::KimiK3),
+                prompt_encoder: None,
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()

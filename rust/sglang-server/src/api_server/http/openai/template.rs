@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use serde_json::Value;
 use sglang_processor::dynamo_renderer::deepseek::common::tokens;
-use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
+use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, RenderedPrompt, TextInput};
+use sglang_processor::dynamo_tokenizers::Tokenizer;
 
 pub use sglang_processor::ChatFormatter;
 use sglang_processor::TemplateError;
@@ -20,14 +21,71 @@ pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 pub(super) struct RenderedChat {
     /// The template output, ending where generation would start without a
     /// continuation (e.g. an opening `<think>`).
-    pub(super) prompt: String,
+    pub(super) prompt: RenderedPrompt,
     pub(super) continuation: String,
 }
 
 impl RenderedChat {
-    /// The text the tokenizer pool encodes.
     pub(super) fn into_text(self) -> String {
-        self.prompt + &self.continuation
+        self.prompt.into_text() + &self.continuation
+    }
+}
+
+/// Encodes rendered chat prompts as Python's chat layer does.
+#[derive(Clone)]
+pub struct PromptEncoder {
+    tokenizer: Tokenizer,
+    /// Ids the tokenizer adds on its own (`encode("")`).
+    auto_specials: Vec<u32>,
+}
+
+impl PromptEncoder {
+    pub fn new(tokenizer: Tokenizer) -> Self {
+        let auto_specials = tokenizer
+            .encode("")
+            .map(|encoding| encoding.token_ids().to_vec())
+            .unwrap_or_default();
+        Self {
+            tokenizer,
+            auto_specials,
+        }
+    }
+
+    /// The template output without the tokenizer's own specials, its segments
+    /// keeping their special-token policy (Kimi K3), then the continuation
+    /// encoded on its own without its BOS.
+    pub(super) fn encode(&self, rendered: &RenderedChat) -> Result<Vec<u32>, String> {
+        let encode = |text: &str| match self.tokenizer.encode(text) {
+            Ok(encoding) => Ok(encoding.token_ids().to_vec()),
+            Err(error) => Err(error.to_string()),
+        };
+        let mut ids = match rendered.prompt.encode_segments() {
+            Some(segments) => self
+                .tokenizer
+                .encode_segments(&segments)
+                .map_err(|error| error.to_string())?
+                .token_ids()
+                .to_vec(),
+            None => encode(rendered.prompt.as_str())?,
+        };
+        if ids.starts_with(&self.auto_specials) {
+            ids.drain(..self.auto_specials.len());
+        }
+        if !rendered.continuation.is_empty() {
+            let suffix = encode(&rendered.continuation)?;
+            let bos = self.auto_specials.first();
+            let skip = usize::from(bos.is_some() && suffix.first() == bos);
+            ids.extend(&suffix[skip..]);
+        }
+        Ok(ids)
+    }
+
+    /// [`Self::encode`] off the async workers.
+    pub(super) async fn encode_blocking(&self, rendered: RenderedChat) -> Result<Vec<u32>, String> {
+        let encoder = self.clone();
+        tokio::task::spawn_blocking(move || encoder.encode(&rendered))
+            .await
+            .map_err(|error| error.to_string())?
     }
 }
 
@@ -59,14 +117,14 @@ pub(super) fn render_chat(
                 continuation = rest.to_owned();
             }
             Ok(RenderedChat {
-                prompt: prompt.into_text(),
+                prompt,
                 continuation,
             })
         }
         _ => formatter
             .render_prompt(&TemplateRequest { request, kwargs })
             .map(|prompt| RenderedChat {
-                prompt: prompt.into_text(),
+                prompt,
                 continuation: String::new(),
             }),
     }

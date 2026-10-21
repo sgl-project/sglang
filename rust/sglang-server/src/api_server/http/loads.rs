@@ -479,6 +479,7 @@ mod tests {
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
+            prompt_encoder: None,
         });
         let query = Query::try_from_uri(&format!("/v1/loads?{query}").parse().unwrap()).unwrap();
         let response = loads(State(state), query).await;
