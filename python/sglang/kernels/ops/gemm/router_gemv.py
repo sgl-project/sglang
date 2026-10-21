@@ -208,21 +208,23 @@ def split_fp32_to_bf16x3(
     Exact for |w| >= 2**-110: each part takes the next 8 significant bits, and the
     last residual then stays a normal number.
     """
+    n, k = w.shape
+    if not (w.is_cuda and w.dtype == torch.float32 and w.is_contiguous()):
+        raise ValueError("w must be a contiguous CUDA fp32 [N, K] tensor")
     if out is None:
-        out = torch.empty(
-            3 * w.shape[0], w.shape[1], dtype=torch.bfloat16, device=w.device
-        )
-    if w.is_cuda and w.is_contiguous():
-        block = 1024
-        _split_fp32_to_bf16x3_kernel[(triton.cdiv(w.numel(), block),)](
-            w, out, w.numel(), BLOCK=block
-        )
-        return out
-    hi = w.to(torch.bfloat16)
-    residual = w - hi.float()
-    mid = residual.to(torch.bfloat16)
-    lo = (residual - mid.float()).to(torch.bfloat16)
-    return torch.cat([hi, mid, lo], out=out)
+        out = torch.empty(3 * n, k, dtype=torch.bfloat16, device=w.device)
+    elif not (
+        out.shape == (3 * n, k)
+        and out.dtype == torch.bfloat16
+        and out.device == w.device
+        and out.is_contiguous()
+    ):
+        raise ValueError("out must be a contiguous bf16 [3N, K] tensor on w's device")
+    block = 1024
+    _split_fp32_to_bf16x3_kernel[(triton.cdiv(w.numel(), block),)](
+        w, out, w.numel(), BLOCK=block
+    )
+    return out
 
 
 def router_gemm_bf16x3_cublas(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

@@ -530,6 +530,7 @@ register_kernel(
         op="gemm.split_fp32_to_bf16x3",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.router_gemv:split_fp32_to_bf16x3",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
