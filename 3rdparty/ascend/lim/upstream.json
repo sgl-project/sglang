@@ -1,0 +1,121 @@
+{
+  "repository": "https://github.com/vllm-project/vllm-ascend",
+  "commit": "3326f350c0de30a5170b86ecfce851322e3216e6",
+  "reference_pr": 16640,
+  "archive_url": "https://codeload.github.com/vllm-project/vllm-ascend/tar.gz/3326f350c0de30a5170b86ecfce851322e3216e6",
+  "archive_sha256": "c71229fe5a1b38ee7c902b3871aab5678f71b6ee4c8633e58d0bbcb39423ae9c",
+  "operator": "_C_ascend::npu_fused_lightning_indexer_manage",
+  "abi_tensor_arguments": 19,
+  "historically_tested_probe_sha256": "5fabea4cb210d04e8c72c1e01f2b3fdc2866ab9bc2f35f56f07c5a775596be0a",
+  "historical_binary_note": "The 151/217 measurements used this previously built external probe. The new standalone build entry has not yet been compiled or executed on Ascend. Do not treat source delivery checks as a binary/model rerun.",
+  "files": {
+    "csrc/aclnn_torch_adapter/NPUBridge.cpp": {
+      "sha256": "0584211ae839e6b7524887b8c24ca1222d5dff3d7c4609af9548e55f22fd8cf6",
+      "bytes": 942
+    },
+    "csrc/aclnn_torch_adapter/NPUBridge.h": {
+      "sha256": "20afcbf147970f6779bbeeddcca3b1701f6b4087aa0b2b05954f5e0dbbbc691d",
+      "bytes": 838
+    },
+    "csrc/aclnn_torch_adapter/NPUStorageImpl.cpp": {
+      "sha256": "5adfaa3aff7f88342a6a01aa37104a9d6a9375ea6c93f795fc2d0afa6080a518",
+      "bytes": 1697
+    },
+    "csrc/aclnn_torch_adapter/NPUStorageImpl.h": {
+      "sha256": "efd9d47443a72074b774f2057923ea15144c76e12fb4f6bed98233fa3e5f30c4",
+      "bytes": 1804
+    },
+    "csrc/aclnn_torch_adapter/op_api_common.h": {
+      "sha256": "cbd891c9fd8cfb3ad7212f425637772d2da60c21f0db8e106ccd5e5e5f4daac4",
+      "bytes": 29754
+    },
+    "csrc/attention/fused_lightning_indexer_manage/CMakeLists.txt": {
+      "sha256": "faffe61ec4c0aff091cd25eb100680a42121d59835cb3e27da361f5231cbb221",
+      "bytes": 1198
+    },
+    "csrc/attention/fused_lightning_indexer_manage/README.md": {
+      "sha256": "97f9be11c048d4f53b7b242f2bd2b791840535f0f33c65d9dc8a6d2a790797c2",
+      "bytes": 15086
+    },
+    "csrc/attention/fused_lightning_indexer_manage/fused_lightning_indexer_manage_torch_adpt.h": {
+      "sha256": "2640ae5ebf5ce3e22927e5725e5f0473e2d9955b86e33fe923f706a45f8dc55f",
+      "bytes": 6714
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/CMakeLists.txt": {
+      "sha256": "0ffb43e20788ed30c3677165a678e329bcc35a95ed190a46b2070a707a3a512c",
+      "bytes": 685
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/fused_lightning_indexer_manage_def.cpp": {
+      "sha256": "648d282a379788bb48fa5464f220333cf91fb37f81bc3fa40a24399f9ecbf424",
+      "bytes": 4069
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/fused_lightning_indexer_manage_infershape.cpp": {
+      "sha256": "e8d735a187a14ee68d972d034ad6d08d60b93b16b430388ba886862fc88b3d9c",
+      "bytes": 3586
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/fused_lightning_indexer_manage_tiling.cpp": {
+      "sha256": "c3e3db0a13ba0aff01c6f3586f3e03c7bb8c4cf44f3e79cbe6426cae054c50ba",
+      "bytes": 27166
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/fused_lightning_indexer_manage_tiling.h": {
+      "sha256": "3bd7961cad87c79c34c09736a6a5f1a15cfb37a4249bc7c1a5f6244a31ffb936",
+      "bytes": 5567
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/op_api/aclnn_fused_lightning_indexer_manage.cpp": {
+      "sha256": "8b151a8e64b980c69359cd89246cbf31907cffba953bff1341bda84a894a6e14",
+      "bytes": 2271
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_host/op_api/aclnn_fused_lightning_indexer_manage.h": {
+      "sha256": "bdb8d7a2a58c8a9345e5338a8f2775f481f7da7a15363e94a042d0c360b19174",
+      "bytes": 1272
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage.cpp": {
+      "sha256": "c0cc0dad33d9bf6865aac3079a41cc6bc84ccb407283cffefbbacd75debc157c",
+      "bytes": 20883
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage_constants.h": {
+      "sha256": "78fb9724396690e27e9a9603193d67954d5245ac9210ebc2ea9080a687b8e65c",
+      "bytes": 1572
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage_template_tiling_key.h": {
+      "sha256": "69da138bc611d38bfa9529408c034b18830e84ae9991bfc7c15d03d03cff3c5a",
+      "bytes": 581
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage_union.h": {
+      "sha256": "d394140db6313559066e9b155a7b1f45b78d897520c3ee9ed265f9d1ce2e4ec2",
+      "bytes": 129336
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/fused_lightning_indexer_manage_workspace.h": {
+      "sha256": "354ce00b93d6c84a05eac8a6e81a20f3102951d259b6fa2b9ee293d50e86c4d9",
+      "bytes": 2621
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/lightning_indexer_common.h": {
+      "sha256": "ce8cc08d6228a7c3f49c32418767c331ab7559150e1d4af537d5163db640421d",
+      "bytes": 4682
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/lightning_indexer_kernel.h": {
+      "sha256": "dd480e52169e186fbcf0d8289569aa4ba1cdb43c5bb4b0564dc7bead426e6e68",
+      "bytes": 33086
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/lightning_indexer_service_cube.h": {
+      "sha256": "3119d14f6a9243a5453745bfcd7710032d0aba286afe9e808344d57bc67f312a",
+      "bytes": 20316
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/lightning_indexer_service_vector.h": {
+      "sha256": "6bf39b702e419a10e92be4540449f4826ae96e05ddc1adbaa2ffac0e10c4d0a1",
+      "bytes": 59536
+    },
+    "csrc/attention/fused_lightning_indexer_manage/op_kernel/lightning_indexer_vector.h": {
+      "sha256": "d6eee291976b3e29b66983ab43a0f031a2b5a6a85eee55b5e927a57281696bce",
+      "bytes": 20390
+    }
+  },
+  "license_provenance": {
+    "CANN-2.0": {
+      "url": "https://gitcode.com/api/v5/repos/cann/ops-transformer/contents/LICENSE?ref=master",
+      "sha": "be957a617506691ba865f3f00422a2cf9a1d493a",
+      "sha256": "89b1c114df62cfd183004f38d18d07f186436c3b37203dd69c3e84becf9d2282"
+    },
+    "torch_npu-BSD": "https://raw.githubusercontent.com/Ascend/pytorch/master/LICENSE"
+  }
+}

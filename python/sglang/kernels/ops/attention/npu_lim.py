@@ -3,6 +3,7 @@
 ABI: vllm-project/vllm-ascend#16640, 19 tensors, in-place output buffers.
 The extension must be installed/loaded before graph capture; importing this
 module neither imports torch_npu nor compiles or loads a native library.
+Native source and the manual build entry are under ``3rdparty/ascend/lim/``.
 """
 
 from __future__ import annotations

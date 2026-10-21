@@ -25,6 +25,10 @@ Current adapter limits: BF16 indexer/main KV, Q1, K=2048, page=128, PP=1,
 DCP disabled, speculative decoding disabled; C is a multiple of 128 in
 [2048,32640], and source capacity is at most 2**21. C8 is unsupported here.
 The native operator must already be installed; this change does not build it.
+Native source, a pinned upstream manifest and a standalone CANN/torch build
+entry are now provided in 3rdparty/ascend/lim/. See its README.md for setup
+and the separate validation status of that new build entry. SGLang startup
+does not compile the operator automatically.
 
 Selection semantics and accuracy status
 --------------------------------------
