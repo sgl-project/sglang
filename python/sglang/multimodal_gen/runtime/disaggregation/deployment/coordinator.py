@@ -2,13 +2,10 @@
 """Asynchronous dependency scheduling without routing tensors through the head."""
 
 import asyncio
-import base64
 import pickle
 import threading
 import time
 import uuid
-from pathlib import Path
-from urllib.parse import urlsplit
 
 import zmq
 import zmq.asyncio
@@ -19,11 +16,12 @@ from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     create_dispatch_policy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.utils.image_io import inline_local_image_paths
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 
 
 class DeploymentServer:
-    """Route ready groups concurrently; tensors move directly between their workers."""
+    """schedule ready roles; retain worker results until the last consumer releases them"""
 
     def __init__(self, plan, timeout=600, capacity=8, dispatch_policy="round_robin"):
         if timeout <= 0 or capacity < 1:
@@ -43,62 +41,39 @@ class DeploymentServer:
             name: [1] * len(role.endpoints) for name, role in plan.roles.items()
         }
         self.available = asyncio.Condition()
+        self.admission = asyncio.Semaphore(capacity)
+        # running jobs own tasks; completed client jobs retain admission through a lease
         self.leases = {}
         self.jobs = {}
 
-    async def execute(self, request, outputs=None, roles=None):
+    async def execute(self, request, outputs=None):
+        """return result descriptors and their lease; the caller owns final release"""
+        # 1. inline head-local uploads before dispatch; workers need no shared upload path
         if isinstance(request, Req) and request.image_path:
             request = fork_request(request)
-            paths = (
-                request.image_path
-                if isinstance(request.image_path, (list, tuple))
-                else [request.image_path]
-            )
-            request.image_path = [
-                "data:application/octet-stream;base64,"
-                + base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                if isinstance(path, str)
-                and urlsplit(path).scheme not in ("http", "https", "data")
-                and Path(path).is_file()
-                else path
-                for path in paths
-            ]
+            request.image_path = inline_local_image_paths(request.image_path)
         desired = (
             self.plan.outputs
             if outputs is None
             else {path: self.plan.outputs[path] for path in outputs}
         )
-        selected = set(roles or desired.values())
-        pending = list(selected)
-        while pending:
-            name = pending.pop()
-            for dependency in self.plan.roles[name].dependencies - selected:
-                selected.add(dependency)
-                pending.append(dependency)
-        if not selected <= self.plan.roles.keys():
-            raise ValueError("Unknown requested role")
-        for name in selected:
-            if not self.plan.roles[name].dependencies <= selected:
-                raise ValueError(f"Missing dependencies for role {name}")
-        for path, name in desired.items():
-            if name not in selected or path not in self.plan.roles[name].outputs:
-                raise ValueError(
-                    f"Output {path} is not exposed by selected role {name}"
-                )
+        # walk the validated DAG backwards so requested roles bring all their ancestors
+        selected = set(desired.values())
+        for name in reversed(self.plan.order):
+            if name in selected:
+                selected.update(self.plan.roles[name].dependencies)
         job = uuid.uuid4().hex
         tasks, assignments = {}, {}
 
         async def run_role(name):
             role = self.plan.roles[name]
-            for dependency in role.dependencies:
-                await tasks[dependency]
             sources = []
             for dependency in role.dependencies:
+                descriptor = await tasks[dependency]
                 fields = [
                     path for path, source in role.inputs.items() if source == dependency
                 ]
                 if fields:
-                    descriptor = await tasks[dependency]
                     sources.append(
                         {
                             **descriptor,
@@ -106,6 +81,7 @@ class DeploymentServer:
                             "fields": fields,
                         }
                     )
+            # 2. reserve compute capacity, not result lifetime; leases outlive execution
             async with self.available:
                 await self.available.wait_for(lambda: any(self.free_slots[name]))
                 index = self.policies[name].select_with_capacity(self.free_slots[name])
@@ -133,6 +109,7 @@ class DeploymentServer:
                     self.available.notify_all()
 
         try:
+            # tasks are created topologically; independent branches can run concurrently
             for name in self.plan.order:
                 if name in selected:
                     tasks[name] = asyncio.create_task(run_role(name))
@@ -158,6 +135,7 @@ class DeploymentServer:
                 ),
             }
         except BaseException:
+            # 3. cancellation is also a failure path: stop graph work before releasing buffers
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -178,8 +156,7 @@ class DeploymentServer:
             return_exceptions=True,
         )
 
-    async def _handle(self, socket, envelope, message, admission):
-        response = None
+    async def _handle(self, socket, envelope, message):
         try:
             if isinstance(message, dict):
                 if message["method"] == "ping":
@@ -190,19 +167,19 @@ class DeploymentServer:
                         raise ValueError("Duplicate encoding job ID")
                     self.jobs[job_id] = asyncio.current_task()
                     try:
-                        await admission.acquire()
+                        await self.admission.acquire()
                         try:
                             response = await self.execute(
                                 message["request"], message["outputs"]
                             )
+                            # returning descriptors does not release the client's admission permit
                             self.leases[job_id] = (
                                 response["lease"],
                                 time.monotonic(),
-                                admission,
                             )
                             response["lease"] = job_id
                         except BaseException:
-                            admission.release()
+                            self.admission.release()
                             raise
                     finally:
                         self.jobs.pop(job_id, None)
@@ -220,12 +197,13 @@ class DeploymentServer:
                 else:
                     raise ValueError("Unknown deployment server method")
             else:
+                # HTTP consumes final results on the head; tensor clients pull from workers
                 requests = message if isinstance(message, list) else [message]
                 if len(requests) != 1 or not isinstance(requests[0], Req):
                     raise ValueError(
                         "Deployment serving expects one generation request"
                     )
-                async with admission:
+                async with self.admission:
                     outputs = [
                         path for path in self.plan.outputs if path.startswith("result.")
                     ]
@@ -281,7 +259,6 @@ class DeploymentServer:
         socket.setsockopt(zmq.LINGER, 0)
         socket.setsockopt(zmq.RCVHWM, self.capacity * 2)
         socket.bind(endpoint)
-        admission = asyncio.Semaphore(self.capacity)
         tasks = set()
         work_tasks = set()
         self.ready.set()
@@ -289,7 +266,7 @@ class DeploymentServer:
             while not self.stopped.is_set():
                 expired = [
                     key
-                    for key, (_, started, _) in self.leases.items()
+                    for key, (_, started) in self.leases.items()
                     if time.monotonic() - started > self.timeout
                 ]
                 for key in expired:
@@ -311,9 +288,7 @@ class DeploymentServer:
                     )
                     await socket.send_multipart([*frames[:-1], pickle.dumps(reply)])
                     continue
-                task = asyncio.create_task(
-                    self._handle(socket, frames[:-1], message, admission)
-                )
+                task = asyncio.create_task(self._handle(socket, frames[:-1], message))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
                 if is_work:
@@ -330,13 +305,14 @@ class DeploymentServer:
             self.context.term()
 
     async def release_lease(self, key):
+        """release once, including cancellation/expiry racing with client cleanup"""
         lease = self.leases.pop(key, None)
         if lease is not None:
-            assignments, _, admission = lease
+            assignments, _ = lease
             try:
                 await self.release(assignments)
             finally:
-                admission.release()
+                self.admission.release()
 
     def start(self, endpoint):
         self.thread = threading.Thread(

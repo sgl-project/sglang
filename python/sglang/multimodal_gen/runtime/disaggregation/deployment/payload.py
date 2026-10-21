@@ -73,6 +73,8 @@ def fork_request(req):
 
 
 class _ContextPickler(pickle.Pickler):
+    """encode trusted Python state while keeping tensor storage out of control metadata"""
+
     def __init__(self, stream):
         super().__init__(stream, protocol=pickle.HIGHEST_PROTOCOL)
         self.tensors = {}
@@ -91,6 +93,7 @@ class _ContextPickler(pickle.Pickler):
         if isinstance(value, torch.Tensor):
             return "tensor", self._tensor(value), value.device.type
         if isinstance(value, torch.Generator):
+            # shared generators retain identity and consumed state, not just their seed
             identity = id(value)
             if identity not in self.generators:
                 self.generators[identity] = self._tensor(value.get_state())
@@ -103,6 +106,8 @@ class _ContextPickler(pickle.Pickler):
 
 
 class _ContextUnpickler(pickle.Unpickler):
+    """restore original CPU semantics and remap CUDA state to the receiving worker"""
+
     def __init__(self, stream, tensors, device):
         super().__init__(stream)
         self.tensors = tensors
@@ -130,6 +135,7 @@ class _ContextUnpickler(pickle.Unpickler):
 
 
 def capture_request(req):
+    """snapshot request-owned state, excluding worker-local instrumentation/modules"""
     # tensors, including those nested inside scheduler state, never enter pickle
     state = {
         name: value
@@ -142,6 +148,7 @@ def capture_request(req):
         if key not in ("_deployment_result", "_deployment_peak_memory_mb")
     }
     if "_deployment_result" in req.extra:
+        # preserve the result without migrating its process-local metrics
         result = copy.copy(req.extra["_deployment_result"])
         result.metrics = None
         result.metrics_list = None
@@ -171,20 +178,19 @@ def restore_request(req, context, device):
 
 def pack_fields(values):
     leaves, spec = tree_flatten(values)
-    tensors, metadata, empty = {}, [], {}
+    tensors, empty = {}, {}
     for index, leaf in enumerate(leaves):
-        if isinstance(leaf, torch.Tensor):
-            if leaf.numel():
-                tensors[str(index)] = leaf
-            else:
-                empty[str(index)] = (list(leaf.shape), dtype_to_str(leaf.dtype))
-            metadata.append(None)
+        if not isinstance(leaf, torch.Tensor):
+            continue
+        if leaf.numel():
+            tensors[str(index)] = leaf
         else:
-            metadata.append(leaf)
+            empty[str(index)] = (list(leaf.shape), dtype_to_str(leaf.dtype))
+        leaves[index] = None
     # required fields must never silently disappear on a transport boundary
     scalar = {
         "spec": treespec_dumps(spec),
-        "leaves": metadata,
+        "leaves": leaves,
         "tensors": list(tensors),
         "empty": empty,
     }

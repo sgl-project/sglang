@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 import zmq
 import zmq.asyncio
-from torch.utils._pytree import tree_flatten, tree_leaves, tree_map, tree_unflatten
+from torch.utils._pytree import tree_leaves, tree_map
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.deployment.payload import (
@@ -37,6 +37,7 @@ logger = init_logger(__name__)
 
 
 def run_partition(scheduler, req):
+    """collect every rank's status before the root advertises a result"""
     error = None
     torch.cuda.reset_peak_memory_stats()
     try:
@@ -59,38 +60,37 @@ def run_partition(scheduler, req):
 
 
 def broadcast_request(scheduler, req):
+    """broadcast one context within a TP/SP group, keeping rank-local tracing"""
     group = get_world_group()
+    device = f"cuda:{scheduler.worker.local_rank}"
     if req is not None:
-        state = {"context": capture_request(req), "metrics": req.metrics}
-        leaves, spec = tree_flatten(state)
-        tensors = [(i, x) for i, x in enumerate(leaves) if isinstance(x, torch.Tensor)]
-        metadata = [(i, tuple(t.shape), t.dtype) for i, t in tensors]
-        leaves = [None if isinstance(x, torch.Tensor) else x for x in leaves]
-        scheduler._broadcast_to_all_ranks((leaves, spec, metadata))
-    else:
-        leaves, spec, metadata = scheduler._broadcast_to_all_ranks(None)
-        tensors = [
-            (
-                i,
-                torch.empty(
-                    shape, dtype=dtype, device=f"cuda:{scheduler.worker.local_rank}"
-                ),
-            )
-            for i, shape, dtype in metadata
+        context = capture_request(req)
+        metadata = [
+            (key, tuple(t.shape), t.dtype) for key, t in context["tensors"].items()
         ]
-    for index, tensor in tensors:
-        if tensor.device.type != "cuda":
-            tensor = tensor.to(f"cuda:{scheduler.worker.local_rank}")
+        metrics = req.metrics
+        scheduler._broadcast_to_all_ranks((context["structure"], metadata, metrics))
+    else:
+        structure, metadata, metrics = scheduler._broadcast_to_all_ranks(None)
+        context = {
+            "structure": structure,
+            "tensors": {
+                key: torch.empty(shape, dtype=dtype, device=device)
+                for key, shape, dtype in metadata
+            },
+        }
+    # capture_request already supplies a flat tensor table; only metadata uses CPU RPC
+    for key, tensor in context["tensors"].items():
+        tensor = tensor.to(device)
         dist.broadcast(tensor, src=group.ranks[0], group=group.device_group)
-        leaves[index] = tensor
+        context["tensors"][key] = tensor
     restored = object.__new__(Req)
-    state = tree_unflatten(leaves, spec)
     vars(restored).update(
-        metrics=state["metrics"],
+        metrics=metrics,
         trace_ctx=req.trace_ctx if req is not None else TraceNullContext(),
         modules={},
     )
-    restore_request(restored, state["context"], f"cuda:{scheduler.worker.local_rank}")
+    restore_request(restored, context, device)
     return restored
 
 
@@ -103,17 +103,18 @@ def _field_size(value):
 
 
 class DeploymentWorker:
-    """One placement group; computation is serialized, transfers remain serviceable."""
+    """serialize compute separately from transfers so downstream reads cannot block on it"""
 
     def __init__(self, scheduler):
         self.scheduler = scheduler
         self.args = scheduler.server_args
-        self.pipeline = scheduler.worker.pipeline
         self.sampling_params_cls = resolve_sampling_params_cls(self.args)
-        self.plan = self.pipeline.deployment_plan
-        self.role = self.plan.roles[self.args.stage_role]
+        self.role = scheduler.worker.pipeline.deployment_plan.roles[
+            self.args.stage_role
+        ]
         self.device = torch.device(f"cuda:{scheduler.worker.local_rank}")
         self.results = {}
+        # cancellation tombstones prevent late compute from reviving released results
         self.expired = {}
         self.lock = threading.Lock()
         self.compute = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -154,13 +155,12 @@ class DeploymentWorker:
             if len(self.results) >= self.args.disagg_max_slots_per_instance:
                 raise RuntimeError("Stage worker result capacity exhausted")
         incoming = message["request"]
+        # 1. lower raw/base sampling parameters once; preserve already model-specific ones
+        params = None
         if isinstance(incoming, dict):
             params = self.sampling_params_cls()
             req = Req(sampling_params=params, **incoming)
             params._explicit_fields = set(incoming)
-            params._adjust(self.args)
-            params._validate()
-            req.validate()
         else:
             req = fork_request(incoming)
             if type(req.sampling_params) is SamplingParams:
@@ -169,19 +169,15 @@ class DeploymentWorker:
                 params._explicit_fields = vars(req.sampling_params).get(
                     "_explicit_fields", set()
                 )
-                params._adjust(self.args)
-                params._validate()
-                req.sampling_params = params
-                req.validate()
+        if params is not None:
+            req.sampling_params = params
+            params._adjust(self.args)
+            params._validate()
+            req.validate()
+        # 2. restore upstream state only after constructing a valid local request
         for source in message["sources"]:
-            fields = source["fields"]
             values = await self.transport.receive(
-                self.context,
-                source["endpoint"],
-                source["ticket"],
-                fields,
-                sum(source["sizes"][path] for path in fields),
-                self.args.disagg_timeout,
+                self.context, source, self.args.disagg_timeout
             )
             for path, value in values.items():
                 if path == REQUEST_CONTEXT:
@@ -196,6 +192,7 @@ class DeploymentWorker:
         values, ready, metrics, peak = await loop.run_in_executor(
             self.compute, self._execute, req
         )
+        # 3. publish owned tensor copies unless cancellation already retired this ticket
         with self.lock:
             if ticket in self.expired:
                 raise RuntimeError("Request cancelled before stage completion")

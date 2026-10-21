@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 
 class EncodingClient:
+    """pull named results onto the caller's device and release their remote leases"""
+
     def __init__(
         self,
         endpoint,
@@ -60,19 +62,12 @@ class EncodingClient:
             )
             values = {}
             for source in result["sources"]:
-                fields = source["fields"]
                 values.update(
-                    await self.transport.receive(
-                        self.context,
-                        source["endpoint"],
-                        source["ticket"],
-                        fields,
-                        sum(source["sizes"][field] for field in fields),
-                        self.timeout,
-                    )
+                    await self.transport.receive(self.context, source, self.timeout)
                 )
             return values
         finally:
+            # before a reply, cancel by job ID; afterwards, release the retained lease
             cleanup = (
                 {"method": "release", "lease": result["lease"]}
                 if result is not None
@@ -90,6 +85,7 @@ class EncodingClient:
         return self
 
     async def __aexit__(self, *exc):
+        # wait for each request's cleanup RPC before destroying its transport
         self.closing = True
         for task in self.pending:
             task.cancel()

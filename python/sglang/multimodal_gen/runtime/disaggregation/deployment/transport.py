@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 async def rpc(context, endpoint, message, timeout):
+    """one private socket per call so cancellation cannot disturb another request"""
     socket = context.socket(zmq.REQ)
     socket.setsockopt(zmq.LINGER, 0)
     socket.connect(endpoint)
@@ -43,6 +44,8 @@ async def rpc(context, endpoint, message, timeout):
 
 
 class TensorTransport:
+    """own registered staging/receive slots; release only after transfer acknowledgement"""
+
     def __init__(self, device, hostname, pool_size, ib_device=None):
         self.device = torch.device(device)
         if self.device.type == "cuda":
@@ -61,7 +64,7 @@ class TensorTransport:
         size = tensor_payload_size(tensors)
         if size > target["size"]:
             raise ValueError("Tensor payload exceeds the advertised receive allocation")
-        staged, event = self.manager.stage_tensors_async(key, tensors, scalar)
+        staged, event = self.manager.stage_tensors_async(key, tensors)
         if staged is None:
             raise RuntimeError(
                 "Transfer pool exhausted; reduce concurrency or increase pool size"
@@ -77,7 +80,10 @@ class TensorTransport:
         finally:
             self.manager.free_staged(key)
 
-    async def receive(self, context, endpoint, ticket, fields, size, timeout):
+    async def receive(self, context, source, timeout):
+        """pull selected descriptor fields into an exclusively owned receive slot"""
+        fields = source["fields"]
+        size = sum(source["sizes"][field] for field in fields)
         # each consumer owns a separate receive slot, including fan-out consumers
         key = uuid.uuid4().hex
         pending = self.manager.allocate_receive_slot(key, max(size, 1))
@@ -93,10 +99,10 @@ class TensorTransport:
         try:
             reply = await rpc(
                 context,
-                endpoint,
+                source["endpoint"],
                 {
                     "method": "push",
-                    "ticket": ticket,
+                    "ticket": source["ticket"],
                     "fields": fields,
                     "target": target,
                 },

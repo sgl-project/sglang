@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compile stage contracts and placement into a validated execution plan."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from graphlib import TopologicalSorter
 from pathlib import Path
 
@@ -11,6 +11,8 @@ REQUEST_CONTEXT = "__request_context__"
 
 
 class StageSpec(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
+    """stage-local data dependencies and components, independent of placement"""
+
     name: str
     inputs: tuple[str, ...] = ()
     outputs: tuple[str, ...] = ()
@@ -50,10 +52,11 @@ class RolePlan:
 
 @dataclass(frozen=True)
 class ExecutionPlan:
+    """resolved role graph shared by the coordinator and workers"""
+
     roles: dict[str, RolePlan]
     order: tuple[str, ...]
     outputs: dict[str, str]
-    specs: dict[str, StageSpec] = field(repr=False)
 
     @classmethod
     def compile(
@@ -68,6 +71,7 @@ class ExecutionPlan:
         ):
             raise ValueError("Stage contracts must have unique, nonempty names")
         specs = {stage.name: stage for stage in stages}
+        # 1. resolve selectors before filtering so indices always name the full pipeline
         owner = {}
         endpoints = set()
         for name, role in deployment.roles.items():
@@ -97,19 +101,17 @@ class ExecutionPlan:
         if not any(stage.inputs or stage.outputs for stage in stages):
             return cls._compile_context(deployment, stages, owner)
 
+        # 2. bind each read to its preceding writer and retain each role's final writer
         selected = set(owner)
         producers = {}
+        final_writers = {}
         stage_dependencies = {}
         bindings = {}
         for index, stage in enumerate(stages):
             if stage.name not in selected:
                 continue
             dependencies = set(
-                stage.after
-                if stage.after is not None
-                else names[index - 1 : index]
-                if index
-                else ()
+                stage.after if stage.after is not None else names[index - 1 : index]
             )
             inputs = {}
             for path in stage.inputs:
@@ -135,8 +137,11 @@ class ExecutionPlan:
                     # a mutation must be ordered after its previous writer
                     dependencies.add(producers[path])
                 producers[path] = stage.name
+                final_writers[owner[stage.name], path] = stage.name
 
+        # repeated output fields can add self-edges even after validating explicit edges
         tuple(TopologicalSorter(stage_dependencies).static_order())
+        # 3. export only fields crossing role boundaries; colocation must not create cycles
         dependencies = {name: set() for name in deployment.roles}
         role_inputs = {name: {} for name in deployment.roles}
         role_outputs = {name: set() for name in deployment.roles}
@@ -148,12 +153,7 @@ class ExecutionPlan:
             for path, producer in bindings[stage].items():
                 source = owner[producer]
                 if source != role:
-                    last_writer = next(
-                        name
-                        for name in reversed(names)
-                        if owner.get(name) == source and path in specs[name].outputs
-                    )
-                    if last_writer != producer:
+                    if final_writers[source, path] != producer:
                         raise ValueError(
                             f"Stage {stage} needs an overwritten version of {path}; split role {source}"
                         )
@@ -195,10 +195,11 @@ class ExecutionPlan:
             )
             for name, role in deployment.roles.items()
         }
-        return cls(roles, order, outputs, specs)
+        return cls(roles, order, outputs)
 
     @classmethod
     def _compile_context(cls, deployment, stages, owner):
+        """carry one mutable request through consecutive groups without merging branches"""
         names = [stage.name for stage in stages]
         if set(owner) != set(names):
             raise ValueError(
@@ -239,6 +240,4 @@ class ExecutionPlan:
                 dependencies=frozenset((previous,)) if previous else frozenset(),
                 endpoints=deployment.roles[name].endpoints,
             )
-        return cls(
-            roles, tuple(order), outputs, {stage.name: stage for stage in stages}
-        )
+        return cls(roles, tuple(order), outputs)

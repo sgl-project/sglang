@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
     RoleSpec,
     StageSpec,
 )
+from sglang.multimodal_gen.runtime.disaggregation.deployment.transport import rpc
 from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
     DeploymentWorker,
     run_partition,
@@ -302,6 +303,28 @@ def test_invalid_partition_rejected(roles):
         ExecutionPlan.compile(Deployment(roles), specs())
 
 
+@pytest.mark.parametrize("colocate_writes", [False, True])
+def test_exports_use_the_producing_roles_final_writer(colocate_writes):
+    stages = (
+        StageSpec("first", outputs=("extra.value",)),
+        StageSpec("consume", inputs=("extra.value",), outputs=("result.output",)),
+        StageSpec("last", outputs=("extra.value",)),
+    )
+    roles = {
+        "producer": RoleSpec(
+            ("first", "last") if colocate_writes else ("first",), ("tcp://localhost:1",)
+        ),
+        "consumer": RoleSpec(("consume",), ("tcp://localhost:2",)),
+    }
+    if colocate_writes:
+        with pytest.raises(ValueError, match="overwritten version"):
+            ExecutionPlan.compile(Deployment(roles), stages)
+    else:
+        roles["later"] = RoleSpec(("last",), ("tcp://localhost:3",))
+        plan = ExecutionPlan.compile(Deployment(roles), stages)
+        assert plan.roles["consumer"].inputs == {"extra.value": "producer"}
+
+
 def test_coordinator_parallel_join_and_cleanup():
     async def run():
         context = zmq.asyncio.Context()
@@ -343,7 +366,7 @@ def test_coordinator_parallel_join_and_cleanup():
             sockets.append(socket)
             roles[stage.name] = RoleSpec((stage.name,), (f"tcp://127.0.0.1:{port}",))
         plan = ExecutionPlan.compile(Deployment(roles), specs())
-        server = DeploymentServer(plan, timeout=5)
+        server = DeploymentServer(plan, timeout=5, capacity=1)
         server.context = context
         for name, socket in zip(roles, sockets):
             tasks.append(asyncio.create_task(peer(name, socket)))
@@ -355,6 +378,40 @@ def test_coordinator_parallel_join_and_cleanup():
             assert result["sources"][0]["fields"] == ["result.output"]
             await server.release(result["lease"])
             assert not live
+            control = context.socket(zmq.ROUTER)
+            sockets.append(control)
+            port = control.bind_to_random_port("tcp://127.0.0.1")
+            endpoint = f"tcp://127.0.0.1:{port}"
+
+            async def control_peer():
+                while True:
+                    frames = await control.recv_multipart()
+                    await server._handle(control, frames[:-1], pickle.loads(frames[-1]))
+
+            tasks.append(asyncio.create_task(control_peer()))
+            descriptor = await rpc(
+                context,
+                endpoint,
+                {
+                    "method": "encode",
+                    "job_id": "leased",
+                    "request": Req(),
+                    "outputs": None,
+                },
+                5,
+            )
+            assert server.admission.locked()
+            for _ in range(2):
+                await rpc(
+                    context,
+                    endpoint,
+                    {"method": "release", "lease": descriptor["lease"]},
+                    5,
+                )
+            assert not live and not server.admission.locked()
+            await server.admission.acquire()
+            assert server.admission.locked()
+            server.admission.release()
         finally:
             for task in tasks:
                 task.cancel()
