@@ -114,6 +114,7 @@ class TestNixlBackendInitialization(CustomTestCase):
             pp_rank=0,
             engine_rank=0,
             gpu_id=gpu_id,
+            ib_device=None,
             kv_data_ptrs=[],
             kv_item_lens=[],
             state_types=[],

@@ -639,6 +639,27 @@ def forward_layer_fused_boundary(
     )
 
 
+def fused_boundary_attn_input(layer, state: mhc.HcState) -> torch.Tensor:
+    """
+    Compute the previous layer's mHC post and this layer's attention input for every
+    row, with the kernel that starts forward_hc_pre_from_prev_fused_boundary.
+    """
+    if isinstance(state.streams, mhc.HcPending):
+        pending_post = tuple(state.streams)
+    else:
+        pending_post = (None, state.streams, None, None)
+    _, x, coefficients = make_amd_hc_boundary(
+        layer,
+        *pending_post,
+        state.pre,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+    )
+    x, _ = layer._input_norm(x, allow_aiter_quant=False, coefficients=coefficients)
+    return x
+
+
 def forward_hc_pre_from_prev_fused_boundary(
     layer,
     positions: torch.Tensor,
