@@ -328,7 +328,7 @@ def spec_tokens_details_from_meta_info(
         return None
 
     return SpecTokensDetails(
-        spec_accept_rate=details.get("spec_accept_rate") or 0.0,
+        spec_accept_rate=details.get("spec_accept_rate", 0.0),
         spec_accept_length=details.get("spec_accept_length") or 0.0,
         spec_cap_length=details.get("spec_cap_length") or 0.0,
         spec_block_accept_length=details.get("spec_block_accept_length") or 0.0,
