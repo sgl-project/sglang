@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -23,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry, base
+from sglang.srt.mem_cache.pool_host import mamba as mamba_pool_host
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
 )
@@ -610,14 +612,16 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool._slot_siblings = []
         (info,) = pool.get_device_pool_infos()
         info.buffer_info.validate(layer_ids=info.layer_ids)
-        host = MambaPoolHost(
-            info.buffer_info,
-            host_to_device_ratio=2,
-            host_size=0,
-            device_capacity=4,
-            layout="page_first",
-            pin_memory=False,
-        )
+        # CPU buffers: keep the XPU refusal off when this runs on an XPU host.
+        with unittest.mock.patch.object(mamba_pool_host, "_is_xpu", False):
+            host = MambaPoolHost(
+                info.buffer_info,
+                host_to_device_ratio=2,
+                host_size=0,
+                device_capacity=4,
+                layout="page_first",
+                pin_memory=False,
+            )
         try:
             self.assertEqual(info.layer_ids, ())
             self.assertEqual(host.num_mamba_layers, 0)
@@ -998,6 +1002,25 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         )
         self.assertEqual(packed._draft_host_layer(5), 2)
         self.assertEqual(packed.get_size_per_token(), 132 * 3)
+
+
+class TestMambaHostPoolOnXpu(CustomTestCase):
+    def test_refused_at_construction(self):
+        state = MambaStateBufferInfo(
+            temporal=torch.zeros(1, 4, 2, 2), conv=(torch.zeros(1, 4, 3, 2),)
+        )
+        with (
+            unittest.mock.patch.object(mamba_pool_host, "_is_xpu", True),
+            self.assertRaisesRegex(ValueError, "hybrid Mamba models on XPU"),
+        ):
+            MambaPoolHost(
+                state,
+                host_to_device_ratio=2,
+                host_size=0,
+                device_capacity=4,
+                layout="page_first",
+                pin_memory=False,
+            )
 
 
 if __name__ == "__main__":

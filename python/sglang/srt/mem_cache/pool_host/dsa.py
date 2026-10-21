@@ -12,6 +12,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
 from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -33,6 +37,16 @@ _is_xpu = is_xpu()
 _is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
@@ -81,6 +95,12 @@ class DSAIndexerPoolHost(HostKVCache):
         ):
             raise ValueError(
                 f"invalid index host geometry: target_device_layer_num={target_device_layer_num}, num_host_pages={num_host_pages}, layer_mapping={layer_mapping}"
+            )
+        if _is_xpu and not is_dummy:
+            require_kvcacheio_ops(
+                pool=type(self).__name__,
+                layout=layout,
+                ops=self._kvcacheio_ops,
             )
         self._is_dummy = is_dummy
         self._destroyed = False
@@ -276,6 +296,11 @@ class DSAIndexerPoolHost(HostKVCache):
             device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
         )
         return host_page_indices, device_page_indices
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
 
     def load_to_device_per_layer(
         self,
