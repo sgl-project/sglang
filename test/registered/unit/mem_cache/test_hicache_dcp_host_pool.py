@@ -16,8 +16,13 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -215,6 +220,105 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         pool = _make_host_pool(dcp_rank=0)
         with self.assertRaises(AssertionError):
             pool.get_data_page(0)
+
+
+def _dsa_device_pool(*, size: int, page_size: int, dcp_replicated: bool):
+    return DSATokenToKVPool(
+        size=size,
+        page_size=page_size,
+        kv_lora_rank=8,
+        dtype=torch.bfloat16,
+        qk_rope_head_dim=4,
+        layer_num=1,
+        device="cpu",
+        index_head_dim=128,
+        enable_memory_saver=False,
+        kv_cache_dim=12,
+        dcp_replicated=dcp_replicated,
+    )
+
+
+def _copy_rows(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+    for src, dst in zip(src_layers, dst_layers, strict=True):
+        dst[dst_indices] = src[src_indices]
+
+
+class TestDsaIndexerUnderDcp(CustomTestCase):
+    """DSA index-K stays replicated under DCP: every rank keeps the keys of all
+    widened virtual slots, unlike the per-rank latent KV shard."""
+
+    def setUp(self):
+        cm = get_parallel().override(attn_dcp_size=DCP_SIZE, dcp_enabled=True)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
+    def test_target_indexer_round_trips_the_top_logical_page(self):
+        # The DCP anchor stores 1/dcp_size of the logical slots. An indexer
+        # sized like the anchor has no host page for the upper logical pages.
+        device_pool = _dsa_device_pool(
+            size=256, page_size=PHYSICAL_PAGE, dcp_replicated=False
+        )
+        anchor = MLATokenToKVPoolHost(
+            device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=WIDENED_PAGE,
+            layout="layer_first",
+            pin_memory=False,
+            dcp_size=DCP_SIZE,
+            dcp_rank=3,
+            device_capacity_tokens=device_pool.size,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            target_layer_num=device_pool.layer_num,
+        )
+        self.addCleanup(anchor.destroy)
+        host = DSAIndexerPoolHost(
+            decl=make_dsa_indexer_pool_decl(device_pool),
+            anchor_host=anchor,
+            pin_memory=False,
+        )
+        self.addCleanup(host.destroy)
+
+        device_buffer = device_pool.index_k_with_scale_buffer[0]
+        source = torch.arange(2 * WIDENED_PAGE, 3 * WIDENED_PAGE)
+        destination = torch.arange(WIDENED_PAGE)
+        host_indices = torch.arange(
+            anchor.logical_size - WIDENED_PAGE, anchor.logical_size
+        )
+        expected = torch.randint(
+            0, 255, (DCP_SIZE, device_buffer.shape[1]), dtype=torch.uint8
+        )
+        source_rows = source[::PHYSICAL_PAGE] // PHYSICAL_PAGE
+        device_buffer[source_rows] = expected
+
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.dsa.transfer_kv_direct",
+            side_effect=_copy_rows,
+            create=True,
+        ):
+            host.backup_from_device_all_layer(
+                device_pool, host_indices, source, io_backend="direct"
+            )
+            device_buffer.zero_()
+            host.load_to_device_per_layer(
+                device_pool, host_indices, destination, 0, io_backend="direct"
+            )
+
+        torch.testing.assert_close(device_buffer[:DCP_SIZE], expected)
+
+    def test_replicated_draft_indexer_decl_covers_the_stored_row(self):
+        # A replicated draft pool pages the widened slots: one stored index-K
+        # row holds dcp_size kernel pages, and its host pool must copy all of it.
+        draft_pool = _dsa_device_pool(
+            size=4 * WIDENED_PAGE, page_size=WIDENED_PAGE, dcp_replicated=True
+        )
+        row = draft_pool.index_k_with_scale_buffer[0][0]
+        storage_info = make_dsa_indexer_pool_decl(draft_pool).storage_info
+        self.assertEqual(
+            storage_info.page_bytes(draft_pool.page_size),
+            row.numel() * row.element_size(),
+        )
 
 
 class TestLayerShardedHostTransfers(CustomTestCase):

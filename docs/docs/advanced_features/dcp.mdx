@@ -170,7 +170,9 @@ HiCache keeps one widened logical page space across L1 and L2. The controller se
 
 Before H2D or D2H, both index lists keep positions owned by this rank and map `i` to `floor(i / c)`. Transfers cover whole widened pages, and every rank moves its shard independently, with no DCP collective. For Kimi K3 this applies to MLA KV; KDA/Mamba state uses its own request-indexed host pool.
 
-The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, speculative decoding, and PD decode are not supported in this combination.
+With speculative decoding, the draft KV cache is replicated over the widened slots, so it cannot share the target's per-rank host rows. It gets its own host pool that mirrors every logical slot, without translation. This covers EAGLE and NEXTN (MTP) drafts with `--speculative-eagle-topk 1` and a single draft model runner, and DSpark.
+
+The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, other speculative algorithms, and PD decode are not supported in this combination.
 
 ### DCP × DSA (GLM-5.2, GLM-5.3)
 
@@ -180,8 +182,9 @@ DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keep
 2. Each layer maps the global top-k to rank-local rows with one Triton kernel; layers that share the previous layer's top-k reuse the mapping.
 3. The TRT-LLM sparse kernel returns the per-head LSE and the usual DCP merge combines the partial outputs.
 4. The MTP draft (nextn) layer keeps a replicated KV cache over the widened slots and attends without the DCP group, so MTP index share feeds the draft directly.
+5. With HiCache L2, the index-K host pool spans every widened logical slot like its device cache, while the latent KV host pool stores only this rank's shard.
 
-Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
+Requirements: CUDA SM100/SM103 with the `trtllm` DSA backends (selected automatically), an `fp8_e4m3` or `bf16` KV cache, `attn_tp_size % dcp_size == 0`, and, with speculative decoding, the checkpoint's own MTP draft as a single EAGLE chain (`--speculative-eagle-topk 1`, draft tokens equal to steps + 1). HiSparse, prefill CP, HiCache L3 storage, PD disaggregation, unified memory and `index_kpool > 1` are not supported in this combination.
 
 ```bash Command
 sglang serve \

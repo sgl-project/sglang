@@ -717,6 +717,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         enable_unified_cache_external_linker=linker_enabled,
                     ),
                 ),
+                patch.object(
+                    spec,
+                    "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
             ):
                 plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
                 self.assertEqual(

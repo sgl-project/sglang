@@ -121,11 +121,21 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
             "backup and the storage keys must become dcp_rank-aware "
             "first. Run HiCache+DCP with L1/L2 only."
         )
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    # Runs before the speculative hook, so NEXTN is not yet aliased to EAGLE.
+    spec_algorithm = (
+        cfg.speculative_algorithm.upper() if cfg.speculative_algorithm else None
+    )
+    is_eagle = spec_algorithm in ("EAGLE", "NEXTN")
+    if spec_algorithm not in (None, "DSPARK") and not is_eagle:
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports EAGLE/NEXTN (MTP) and "
+            "DSPARK speculative decoding: their replicated draft KV is backed "
+            f"up by a separate draft host pool; got {cfg.speculative_algorithm}."
+        )
+    if is_eagle and cfg.speculative_eagle_topk not in (None, 1):
+        raise NotImplementedError(
+            "HiCache with --dcp-size > 1 supports EAGLE/NEXTN (MTP) only with "
+            "--speculative-eagle-topk 1."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(

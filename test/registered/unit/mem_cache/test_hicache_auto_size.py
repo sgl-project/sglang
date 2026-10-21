@@ -7,11 +7,11 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.runtime_context import get_context, get_memory
+from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -20,6 +20,11 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestHiCacheAutoSize(CustomTestCase):
+    def setUp(self):
+        cm = get_parallel().override(attn_dcp_size=1)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
     def test_hybrid_target_draft_uses_its_sidecar_slot_capacity(self):
         # EAGLE3 can pair a hybrid target with a plain MHA draft. Full drafts
         # follow full target slots; SWA drafts follow the smaller SWA capacity.
@@ -61,6 +66,32 @@ class TestHiCacheAutoSize(CustomTestCase):
                     sizing._estimate_hicache_bytes(params, plan),
                     4096 + 1024 + expected_sidecar_bytes,
                 )
+
+    def test_dcp_draft_sidecar_mirrors_every_widened_target_slot(self):
+        # A DCP target pool counts physical rows; its replicated draft spans
+        # the widened ids, and the draft sidecar mirrors each logical slot.
+        dcp_size = 4
+        target = Mock(
+            spec=MLATokenToKVPool,
+            size=128,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=4096),
+        )
+        draft = Mock(
+            spec=MLATokenToKVPool,
+            size=128 * dcp_size,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=2048),
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=Mock(get_kvcache=Mock(return_value=target)),
+            page_size=2,
+        )
+        plan = Mock(mode="sidecar", device_pools=(draft,))
+        with get_parallel().override(attn_dcp_size=dcp_size, dcp_enabled=True):
+            self.assertEqual(sizing._estimate_hicache_bytes(params, plan), 4096 + 2048)
 
     def test_unified_views_are_sized_from_host_capacity(self):
         """Unified sub-pools answer get_kv_size_bytes with zero (UnifiedKVPool
