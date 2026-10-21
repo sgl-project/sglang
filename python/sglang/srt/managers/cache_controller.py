@@ -256,6 +256,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Monotonic; read by the scheduler thread in _drain_backup to time the
+        # enqueue-to-ack span of L2->L3 writes.
+        self.enqueue_time = time.perf_counter()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1

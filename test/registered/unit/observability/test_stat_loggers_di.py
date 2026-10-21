@@ -232,6 +232,24 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_backup_storage_duration_metrics(self):
+        # _drain_backup reads operation.enqueue_time on every L2->L3 ack; a
+        # StorageOperation without the field (renamed or dropped) would crash
+        # the scheduler drain path instead of merely missing one sample.
+        from sglang.srt.managers.cache_controller import StorageOperation
+
+        operation = StorageOperation(host_indices=None, token_ids=[1, 2, 3])
+        self.assertIsInstance(operation.enqueue_time, float)
+        self.assertGreater(operation.enqueue_time, 0)
+
+        labels = {"model_name": "test"}
+        collector = _RecordingStorageMetricsCollector(labels=labels)
+        collector.observe_backup_storage_duration(0.5)
+        self.assertEqual(
+            collector.backup_storage_duration_seconds.observations,
+            [(labels, 0.5)],
+        )
+
 
 class TestDeferredKVReleaseMetrics(CustomTestCase):
     def setUp(self):

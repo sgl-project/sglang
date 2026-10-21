@@ -2307,6 +2307,37 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             buckets=bucket_bandwidth,
         )
 
+        # Enqueue-to-ack spans include IO-thread queue wait, so like the D->H
+        # backup histogram the range runs to tens of seconds. Keep the
+        # boundaries to a coarse, widely supported set: downstream metrics
+        # gateways with a fixed bucket preset drop the series when a boundary
+        # is not in it.
+        bucket_backup_storage_duration = [
+            0.001,
+            0.005,
+            0.01,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            30.0,
+            60.0,
+        ]
+
+        self.backup_storage_duration_seconds = Histogram(
+            name="sglang:hicache_backup_storage_duration_seconds",
+            documentation="End-to-end time of a host (L2) to storage backend "
+            "(L3) backup, from write enqueue to completion ack, including "
+            "IO-thread queue wait. Distinct from the GPU-to-host "
+            "sglang:hicache_backup_duration_seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_backup_storage_duration,
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -2314,6 +2345,11 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def observe_backup_storage_duration(self, duration_seconds: float) -> None:
+        self.backup_storage_duration_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )
 
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:
