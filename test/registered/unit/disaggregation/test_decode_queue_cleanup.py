@@ -173,7 +173,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
             queue._record_transfer_failure = MagicMock()
-            scheduler = MagicMock()
+            scheduler = MagicMock(deferred_draft_prefill_pool=None)
             scheduler.enable_decode_hicache = True
             scheduler.enable_hisparse = False
             scheduler.metrics_reporter.enable_metrics = False

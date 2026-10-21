@@ -1265,6 +1265,20 @@ def append_state_component(
     kv_args.state_layer_ids.append(layer_ids or [])
 
 
+def append_deferred_draft_prefill_state(kv_args: KVArgs, pool) -> None:
+    """Keep a replicated hidden component in the same position on every PP rank."""
+    if pool is None:
+        return
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    append_state_component(
+        kv_args,
+        StateType.DRAFT_PREFILL_HIDDEN,
+        *pool.get_contiguous_buf_infos(),
+    )
+    kv_args.deferred_draft_prefill_layout = pool.wire_layout
+
+
 def get_dsa_tail_state_indices(pool, req_pool_idx: int, seq_len: int) -> List[int]:
     if getattr(pool, "use_dsa", False):
         pool = pool.full_kv_pool

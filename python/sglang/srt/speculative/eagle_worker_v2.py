@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import logging
 import time
 from typing import Callable, List, Optional
@@ -62,6 +63,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -1331,7 +1333,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
-        self._hosts_draft = get_parallel().pp_group.is_last_rank
+        self._hosts_draft = get_parallel().pp_group.is_last_rank and not (
+            get_disagg().disaggregation_defer_draft_prefill
+            and get_disagg().disaggregation_mode == "prefill"
+        )
         self._draft_worker = (
             EagleDraftWorker(
                 server_args,
@@ -1361,6 +1366,69 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def initialize_deferred_draft_prefill(
+        self, batch: ScheduleBatch, target_hidden_states: torch.Tensor
+    ) -> EagleDraftInput:
+        """Populate the complete draft prefix after a target-only PD handoff.
+
+        PREBUILT normally performs no model work. The caller invokes this only
+        after target KV/state and every prompt hidden row have arrived, before
+        building the first speculative decode input. Target KV and KDA/SSM
+        state are already complete and are neither replayed nor advanced here.
+        """
+        if (
+            not get_disagg().disaggregation_defer_draft_prefill
+            or get_disagg().disaggregation_mode != "decode"
+            or self._draft_worker is None
+        ):
+            raise RuntimeError("Deferred draft prefill requires a decode draft worker")
+        if any(batch.prefix_lens):
+            raise RuntimeError(
+                "Deferred draft prefill cannot reuse a cached draft prefix"
+            )
+        lengths = [len(req.origin_input_ids) for req in batch.reqs]
+        if target_hidden_states.ndim != 2 or target_hidden_states.shape[0] != sum(
+            lengths
+        ):
+            raise RuntimeError(
+                "Incomplete target hidden states for deferred draft prefill"
+            )
+
+        # A private scheduling view prevents the draft's shifted input IDs and
+        # temporary extend spec_info from replacing PREBUILT's relay state.
+        draft_batch = copy.copy(batch)
+        draft_batch.forward_mode = ForwardMode.EXTEND
+        draft_batch.input_ids = torch.tensor(
+            [token for req in batch.reqs for token in req.origin_input_ids],
+            dtype=torch.int64,
+            device=batch.device,
+        )
+        draft_batch.extend_lens = lengths
+        draft_batch.prefix_lens = [0] * len(lengths)
+        draft_batch.extend_num_tokens = sum(lengths)
+        draft_batch.extend_logprob_start_lens = [0] * len(lengths)
+        draft_batch.return_logprob = False
+        draft_batch.is_extend_in_batch = True
+        draft_batch.global_forward_mode = ForwardMode.EXTEND
+        draft_batch.can_run_decode_cuda_graph = False
+        draft_batch.can_run_dp_draft_cuda_graph = False
+        draft_batch.can_run_dp_prefill_cuda_graph = False
+        draft_batch.spec_info = None
+        last_tokens = torch.tensor(
+            [req.output_ids[-1] for req in batch.reqs],
+            dtype=torch.int64,
+            device=batch.device,
+        )
+        with (
+            draft_tp_context(self.draft_worker.parallel_layout),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            spec_stage_span("pd_draft_prefill"),
+        ):
+            return self.draft_worker._draft_extend_for_prefill(
+                draft_batch, target_hidden_states, last_tokens
+            )
 
     @property
     def last_shared_read_runner(self):
@@ -1560,6 +1628,29 @@ class EAGLEWorkerV2(BaseSpecWorker):
             capture_hidden_mode=target_capture_mode,
             return_kv_loc_plan=self._draft_worker is not None,
         )
+        if (
+            get_disagg().disaggregation_defer_draft_prefill
+            and get_disagg().disaggregation_mode == "prefill"
+            and get_parallel().pp_group.is_last_rank
+        ):
+            # PP's output ring relays only tokens and small draft metadata;
+            # preserve the full target rows locally before that reconstruction.
+            target_hidden = batch_output.logits_output.hidden_states
+            offset = 0
+            for req, start, length in zip(
+                batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+            ):
+                req.deferred_draft_prefill_pool.write_chunk(
+                    req,
+                    target_hidden[offset : offset + length],
+                    start,
+                    start + length,
+                )
+                offset += length
+            if offset != target_hidden.shape[0]:
+                raise RuntimeError(
+                    "Deferred prefill hidden rows do not match the chunk"
+                )
         kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
 
         # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.

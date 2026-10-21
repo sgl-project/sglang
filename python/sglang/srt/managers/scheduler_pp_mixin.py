@@ -361,7 +361,9 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
-                if len(self.disagg_prefill_inflight_queue) == 0:
+                if len(self.disagg_prefill_inflight_queue) == 0 and not bool(
+                    getattr(self, "deferred_draft_source_retirements", None)
+                ):
                     self.on_idle()
 
     @DynamicGradMode()
@@ -612,28 +614,39 @@ class SchedulerPPMixin:
         self.waiting_queue.extend(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
+        # Retired feature sources can outlive the normal inflight queue. Carry
+        # their ownership decisions around the existing PP transfer/release ring.
+        retirements = getattr(self, "deferred_draft_source_retirements", None)
+        current_states = retirements.snapshot() if retirements is not None else None
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
-        # if other ranks, do intersection with the previous rank's transferred rids
         else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
+            if retirements is not None:
+                from sglang.srt.disaggregation.deferred_draft_prefill import (
+                    merge_deferred_draft_prefill_retirements,
+                )
+
+                prev_transferred_rids, previous_states = prev_transferred_rids
+                current_states = merge_deferred_draft_prefill_retirements(
+                    previous_states, current_states
+                )
             curr_transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,
                 True,
                 [KVPoll.Success, KVPoll.Failed],
             )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
             )
+        if retirements is not None:
+            # A fixed-size tuple survives the generic empty-list wire fast path,
+            # even after the normal transfer RID list has drained.
+            return transferred_rids, current_states
         return transferred_rids
 
     def _pp_pd_send_consensus_bootstrapped_ids(
@@ -784,8 +797,7 @@ class SchedulerPPMixin:
         else:
             data = None
 
-        data = attn_cp_tp_broadcast_pyobj(data)
-        return data
+        return attn_cp_tp_broadcast_pyobj(data)
 
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch

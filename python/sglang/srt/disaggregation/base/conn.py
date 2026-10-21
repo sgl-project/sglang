@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 class StateType(str, enum.Enum):
+    # Full target prompt hidden states for decode-side draft initialization.
+    DRAFT_PREFILL_HIDDEN = "draft_prefill_hidden"
     MAMBA = "mamba"
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
@@ -55,6 +57,7 @@ class KVTransferDestination(str, enum.Enum):
 
 
 class KVArgs:
+    deferred_draft_prefill_layout: Optional[dict] = None
     engine_rank: int
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]

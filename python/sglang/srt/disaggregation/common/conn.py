@@ -128,6 +128,7 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    deferred_draft_prefill_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
@@ -324,6 +325,9 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
+        self.deferred_draft_prefill_layout = getattr(
+            args, "deferred_draft_prefill_layout", None
+        )
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -1342,6 +1346,13 @@ class CommonKVManager(BaseKVManager):
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
 
+        if self.deferred_draft_prefill_layout != info.deferred_draft_prefill_layout:
+            raise RuntimeError(
+                "Deferred draft-prefill layout mismatch: both P and D must enable "
+                "--disaggregation-defer-draft-prefill with matching target hidden "
+                "dtype/width, or both must disable it."
+            )
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1584,6 +1595,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "deferred_draft_prefill_layout": self.deferred_draft_prefill_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
@@ -2286,6 +2298,10 @@ class CommonKVSender(BaseKVSender):
 
         return kv_indices, index_slice, is_last_chunk, False
 
+    def _get_final_chunk_kwargs(self) -> dict:
+        """Backend-specific ownership metadata for the final queued chunk."""
+        return {}
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -2323,6 +2339,7 @@ class CommonKVSender(BaseKVSender):
             wait_event=wait_event,
             indices_event=indices_event,
             trace_ctx=self.trace_ctx.copy_for_thread(),
+            **(self._get_final_chunk_kwargs() if is_last_chunk else {}),
         )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -3017,6 +3034,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.deferred_draft_prefill_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3091,6 +3109,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        deferred_draft_prefill_layout = data.get("deferred_draft_prefill_layout")
+
+        if (
+            self._registered_count
+            and self.deferred_draft_prefill_layout != deferred_draft_prefill_layout
+        ):
+            return web.Response(
+                text="Deferred draft-prefill layout differs across prefill ranks",
+                status=400,
+            )
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
@@ -3103,6 +3131,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
+        self.deferred_draft_prefill_layout = deferred_draft_prefill_layout
         self.decode_allocation_policy = policy
 
         if self.attn_tp_size is None:
@@ -3205,6 +3234,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                deferred_draft_prefill_layout=self.deferred_draft_prefill_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3218,6 +3248,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.deferred_draft_prefill_layout is None:
+                payload.pop("deferred_draft_prefill_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
             return web.json_response(payload, status=200)

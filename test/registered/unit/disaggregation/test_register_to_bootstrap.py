@@ -213,6 +213,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.kv_args.rust_http_port = None
         # Resolved per-runner value threaded through KVArgs (the payload field).
         mgr.kv_cache_dtype_str = "auto"
+        mgr.deferred_draft_prefill_layout = None
 
         return mgr
 

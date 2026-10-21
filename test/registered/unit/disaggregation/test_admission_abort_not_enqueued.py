@@ -95,7 +95,10 @@ def _decode_queue(sched):
         ),
         _resolve_prefill_dp_rank=MagicMock(return_value=0),
     )
-    # Exercise the production initializer reached by the cache-hit fast path.
+    # Exercise the production resume gate and cache-hit initializer.
+    q.reject_deferred_draft_resume = MethodType(
+        DecodePreallocQueue.reject_deferred_draft_resume, q
+    )
     q._init_receiver = MethodType(DecodePreallocQueue._init_receiver, q)
     return q
 

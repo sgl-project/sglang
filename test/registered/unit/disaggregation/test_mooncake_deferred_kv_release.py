@@ -7,6 +7,7 @@ Only the transfer worker can send that ACK after its write has drained.
 import threading
 import unittest
 from collections import defaultdict
+from queue import Queue
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -20,7 +21,19 @@ from test_deferred_decode_kv_release import (
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
+from sglang.srt.disaggregation.deferred_draft_prefill import (
+    DeferredDraftPrefillRetirementState as State,
+)
+from sglang.srt.disaggregation.deferred_draft_prefill import (
+    DeferredDraftPrefillSourceFence,
+)
+from sglang.srt.disaggregation.mooncake.conn import (
+    MooncakeKVManager,
+    MooncakeKVSender,
+    TransferInfo,
+)
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -228,6 +241,60 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+    def test_deferred_final_chunk_keeps_async_events_and_source_fence(self):
+        manager = _manager()
+        self._prepare_worker(manager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.deferred_draft_prefill_layout = {"version": 1}
+        manager.sender_trace_module = manager.deferred_bootstrap = None
+        manager.is_dummy_cp_rank = manager.enable_all_cp_ranks_for_transfer = False
+        manager.kv_shard_size = 1
+        manager.transfer_queues = [Queue()]
+        peer = next(iter(manager.transfer_infos[ROOM].values()))
+        peer.dst_kv_indices = np.array([10, 11], dtype=np.int32)
+        manager.transfer_infos[ROOM] = {f"{DECODE_IP}:{DECODE_PORT}": peer}
+        with get_context().override_server_args(dp_size=1, enable_trace=False):
+            sender = MooncakeKVSender(manager, "unused", ROOM)
+        sender.init(2, aux_index=0)
+        source_ready, first_indices, final_indices = (
+            MagicMock(),
+            MagicMock(),
+            MagicMock(),
+        )
+        sender._early_send_wait_event = source_ready
+        sender.send(np.array([1], dtype=np.int32), indices_event=first_indices)
+        sender.send(
+            np.array([2], dtype=np.int32),
+            state_indices=[[1]],
+            indices_event=final_indices,
+        )
+        first, final = [manager.transfer_queues[0].get_nowait() for _ in range(2)]
+        self.assertIsNone(first.deferred_draft_source_fence)
+        fence = sender.deferred_draft_prefill_fence
+        self.assertIs(final.deferred_draft_source_fence, fence)
+        self.assertEqual(fence.seal(), State.HOLD)
+        queue = MagicMock()
+        queue.get.side_effect = [first, final, None]
+        manager.transfer_worker(queue, MagicMock())
+        for event in (source_ready, first_indices, final_indices):
+            event.synchronize.assert_called_once()
+        self.assertEqual(fence.retirement_state, State.FREE)
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Success)
+
+    def test_deferred_abort_with_unknown_drain_stays_quarantined(self):
+        manager = _manager()
+        self._prepare_worker(manager)
+        manager.maybe_send_extra.side_effect = self._abort_on_call(manager)
+        fence = DeferredDraftPrefillSourceFence()
+        fence.submit()
+        self.assertEqual(fence.seal(), State.HOLD)
+        chunk = _last_chunk()
+        chunk.deferred_draft_source_fence = fence
+        self._run_worker(manager, chunk)
+        self.assertEqual(fence.retirement_state, State.QUARANTINE)
+        self.assertEqual(fence.settled(), State.QUARANTINE)
+        self.assertEqual(manager._sent, [])
 
 
 if __name__ == "__main__":

@@ -74,6 +74,61 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Deferred draft prefill
+
+In Mooncake PD serving on Linux/NVIDIA CUDA, enable the experimental
+`--disaggregation-defer-draft-prefill` on **both workers** to run P without
+loading or executing the draft model. P sends every prompt token's target
+hidden states with target KV/state. D initializes only the complete draft
+prefix before normal MTP; it does not replay or advance the target model,
+target KV, or recurrent state.
+
+Add these arguments to both existing PD launch commands using
+`"${DEFERRED_DRAFT_ARGS[@]}"`, retaining their model-specific settings:
+
+```bash
+DEFERRED_DRAFT_ARGS=(
+  --speculative-algorithm NEXTN
+  --speculative-num-steps 4
+  --speculative-eagle-topk 1
+  --speculative-num-draft-tokens 5
+  --disaggregation-transfer-backend mooncake
+  --disaggregation-defer-draft-prefill
+  --disaggregation-draft-prefill-max-input-tokens 9216
+  --disaggregation-draft-prefill-slots 8
+  --disable-radix-cache
+  --max-running-requests 8
+  --skip-server-warmup
+)
+```
+
+Use the same revision and settings on both workers and keep MTP enabled (`EAGLE`
+or `NEXTN`). P requires TP1 and supports PP; D requires PP1 and may use a
+different TP size. DP/CP/EP must be 1. The initial path supports text-only,
+single-layer DSA NextN drafts with unexpanded target hidden states and the
+Python bootstrap registry.
+
+On D, also set `--max-prefill-tokens 9216` (at least the configured input
+limit): draft initialization processes the full prompt at once. The input
+limit bounds each hidden staging slot. D's slots bound concurrent transfers,
+not active decode requests; P reserves `2 * max-running-requests` source
+slots. These buffers consume additional GPU memory.
+
+Prefix reuse, HiCache/HiSparse, unified memory, KV checksum
+(`--disaggregation-enable-kv-checksum`), and host/offloaded KV paths are
+unsupported. Use ordinary early allocation, without optimistic prefill;
+role switching, PD multiplexing, encoder/gRPC serving, and decoupled or
+adaptive speculation are unsupported. Requests using embeddings, constrained
+decoding, sessions, LoRA, or custom logit processors are rejected.
+
+Keep `SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE` enabled. Connect the
+[PD router](/docs/advanced_features/sgl_model_gateway#prefill-decode-disaggregation)
+and send a complete PD warmup request before measuring. Retraction or
+rebootstrap aborts with error status 503 for client retry. For streaming,
+HTTP 200 may already be sent; inspect the abort finish reason. Hidden buffers
+are reused only after transfer and CUDA consumer completion; uncertain
+transfers quarantine the affected slots.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

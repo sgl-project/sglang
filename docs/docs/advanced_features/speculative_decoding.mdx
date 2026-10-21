@@ -451,6 +451,10 @@ python3 -m sglang.launch_server \
 
 For DSA-based MTP, draft workers default to the `sgl-kernel` top-k backend. Use `--speculative-dsa-topk-backend` to override the draft independently of `--dsa-topk-backend` for the target model.
 
+For PD serving, [deferred draft prefill](/docs/advanced_features/pd_disaggregation#deferred-draft-prefill)
+runs only the target on P and initializes the draft prefix on D. Both workers
+must enable it; the initial path requires a single-layer DSA NextN draft.
+
 **Send a request:**
 
 ```python Example

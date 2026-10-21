@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     _is_fake_transfer,
     all_reduce_flags,
+    append_deferred_draft_prefill_state,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -605,6 +606,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _init_kv_manager(self) -> CommonKVManager:
+        transfer_draft_pool = (
+            None
+            if get_disagg().disaggregation_defer_draft_prefill
+            else self.draft_token_to_kv_pool
+        )
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -642,11 +648,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None:
+        if transfer_draft_pool is not None:
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+                transfer_draft_pool.get_contiguous_buf_infos()
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
@@ -660,7 +666,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
             token_to_kv_pool=self.token_to_kv_pool,
-            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
+            draft_token_to_kv_pool=transfer_draft_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
@@ -675,9 +681,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         setup_state_kv_args(
             kv_args,
             self.token_to_kv_pool,
-            self.draft_token_to_kv_pool,
+            transfer_draft_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+        )
+        append_deferred_draft_prefill_state(
+            kv_args, getattr(self.scheduler, "deferred_draft_prefill_pool", None)
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -792,7 +801,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     kv_layer_ids=kv_args.kv_layer_ids,
                     num_draft_entries=num_draft_entries,
                     kv_pool=kv_pool,
-                    draft_kv_pool=self.draft_token_to_kv_pool,
+                    draft_kv_pool=transfer_draft_pool,
                 )
                 if staging_slots is not None:
                     k_buffers, v_buffers, slot_layer_ids = staging_slots
@@ -816,6 +825,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         dispatches ``/generate`` after ``send_metadata``; deferred allocation
         dispatches once the peer is resolved, before waiting for completion.
         """
+        if self.reject_deferred_draft_resume(
+            req, is_retracted=is_retracted, is_rebootstrap=is_rebootstrap
+        ):
+            return
         # See `PrefillBootstrapQueue.add`. A retracted or rebootstrapping
         # request owns a host KV backup that `retracted_queue` releases, and by
         # this point carries none of the markers `is_unadmitted_reject` reads,
@@ -855,6 +868,40 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return
 
             self.pending_reqs.append(decode_req)
+
+    def reject_deferred_draft_resume(
+        self, req: Req, *, is_retracted: bool = False, is_rebootstrap: bool = False
+    ) -> bool:
+        """Retire unsupported resumes after the caller has released device KV.
+
+        CPU-tensor backups preserve target KV/Mamba, but not the independent
+        NEXTN draft prefix. Rebootstrap also extends the generated history,
+        which this initial full-prompt hidden handoff does not implement.
+        Dropping only this request prevents stale draft KV reads or a failed
+        hidden-shape assertion from terminating the scheduler.
+        """
+        pool = getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        if pool is None or not (
+            is_retracted
+            or is_rebootstrap
+            or getattr(req, "is_retracted", False)
+            or getattr(req, "pd_rebootstrap_in_progress", False)
+        ):
+            return False
+        discard_kv_cache_backup(
+            req,
+            self.tree_cache,
+            get_disagg().disaggregation_decode_retraction_backup,
+        )
+        pool.free(req)
+        prepare_abort(
+            req,
+            "Deferred draft prefill cannot resume retracted or rebootstrapped "
+            "requests: the complete draft prefix state is unavailable",
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+        self.scheduler.retire_unadmitted_request(req)
+        return True
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         max_prefix_len = None
@@ -927,6 +974,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         enqueue it from ``enqueue_held_rebootstrap`` on resume, so its prefix KV
         is recomputed by the prefill worker under the updated weights.
         """
+        if self.reject_deferred_draft_resume(req, is_rebootstrap=True):
+            return
         self.held_rebootstrap_reqs.append(req)
 
     def enqueue_held_rebootstrap(self) -> None:
@@ -960,6 +1009,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         message = None
+        if get_disagg().disaggregation_defer_draft_prefill:
+            max_input = get_disagg().disaggregation_draft_prefill_max_input_tokens
+            if len(req.origin_input_ids) > max_input:
+                message = f"Deferred draft prefill prompt exceeds {max_input} tokens"
+            elif req.multimodal_inputs is not None or _is_fake_transfer(req):
+                message = (
+                    "Deferred draft prefill requires text prompts and real KV transfer"
+                )
+            if message is not None:
+                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
+                return True
         allocator = self.token_to_kv_pool_allocator
         full_required, swa_required = self._prealloc_required_tokens(req)
         if not self._uses_swa_tail_prealloc():
@@ -1442,6 +1503,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             running_loras.update(r.req.lora_id for r in self.transfer_queue.queue)
             running_loras.update(req.lora_id for req in self.scheduler.waiting_queue)
 
+        hidden_pool = getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        hidden_admission_budget = 0
+        if hidden_pool is not None and self.queue:
+            hidden_admission_budget = all_reduce_flags(
+                [hidden_pool.available_slots],
+                self.gloo_group,
+                op=torch.distributed.ReduceOp.MIN,
+            )[0]
+
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -1452,6 +1522,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if not decode_req.waiting_for_input:
                 continue
+
+            if hidden_pool is not None and hidden_admission_budget == 0:
+                break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
@@ -1607,6 +1680,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
                     total_prefix_len = prefix_match.decode_prefix_len
+            if hidden_pool is not None:
+                hidden_pool.alloc(decode_req.req)
+                decode_req.req.deferred_draft_prefill_pool = hidden_pool
+                hidden_admission_budget -= 1
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1755,6 +1832,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.DRAFT_PREFILL_HIDDEN: lambda: hidden_pool.transfer_indices(
+                    decode_req.req, seq_len
+                ),
             }
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -2714,7 +2794,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
         decode_req.req.mm_token_counts_ready = True
-        if not self.spec_algorithm.is_none():
+        hidden_pool = getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        if hidden_pool is not None:
+            hidden_pool.mark_received(
+                decode_req.req, len(decode_req.req.origin_input_ids)
+            )
+        elif not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
@@ -2795,7 +2880,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _release_request(self, decode_req: DecodeRequest) -> None:
+    def _release_request(
+        self, decode_req: DecodeRequest, *, hidden_transfer_drained: bool = True
+    ) -> None:
+        pool = getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        if pool is not None:
+            if hidden_transfer_drained:
+                pool.free(decode_req.req)
+            else:
+                # A timeout or incomplete metadata publication does not prove
+                # remote RDMA has stopped. Protect the new hidden destination;
+                # existing target-KV/metadata recovery keeps its prior behavior.
+                pool.quarantine(
+                    decode_req.req,
+                    reason="decode transfer was not proven drained",
+                )
         # HiSparse host pages are the transfer destination; free them with the KV.
         if self.scheduler.enable_hisparse:
             self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
@@ -2952,7 +3051,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
-                self._release_request(decode_req)
+                if getattr(self.scheduler, "deferred_draft_prefill_pool", None) is None:
+                    self._release_request(decode_req)
+                else:
+                    self._release_request(decode_req, hidden_transfer_drained=False)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
 
@@ -3001,12 +3103,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         )
 
-    def _do_release(self, decode_req: DecodeRequest, idx: int) -> None:
+    def _do_release(
+        self,
+        decode_req: DecodeRequest,
+        idx: int,
+        *,
+        hidden_transfer_drained: bool = True,
+    ) -> None:
         room = decode_req.req.bootstrap_room
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self._release_request(decode_req)
+        if getattr(self.scheduler, "deferred_draft_prefill_pool", None) is None:
+            self._release_request(decode_req)
+        else:
+            self._release_request(
+                decode_req, hidden_transfer_drained=hidden_transfer_drained
+            )
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -3083,7 +3196,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             outcome = "drained" if drained else "timeout"
             try:
-                self._do_release(decode_req, idx)
+                if getattr(self.scheduler, "deferred_draft_prefill_pool", None) is None:
+                    self._do_release(decode_req, idx)
+                else:
+                    self._do_release(decode_req, idx, hidden_transfer_drained=drained)
             except Exception:
                 # Isolate a failed release so the rest still run; entry already dropped.
                 logger.exception(f"Deferred KV release failed for room {room}")
@@ -3269,6 +3385,26 @@ class SchedulerDisaggregationDecodeMixin:
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )
+        pool = getattr(self, "deferred_draft_prefill_pool", None)
+        if pool is not None:
+            hidden_states = torch.cat([pool.get(req) for req in batch.reqs], dim=0)
+            draft_input = self.draft_worker.initialize_deferred_draft_prefill(
+                batch, hidden_states
+            )
+            # These tensors are produced locally; the existing input builder
+            # accepts device rows as well as normal transferred CPU metadata.
+            topk_p = draft_input.topk_p
+            topk_index = draft_input.topk_index
+            draft_hidden = draft_input.hidden_states
+            dsa_topk = draft_input.dsa_topk_indices
+            for i, req in enumerate(batch.reqs):
+                req.output_topk_p = topk_p[i].clone()
+                req.output_topk_index = topk_index[i].clone()
+                req.hidden_states_tensor = draft_hidden[i].clone()
+                req.output_dsa_topk_indices = (
+                    dsa_topk[i].clone() if dsa_topk is not None else None
+                )
+                pool.free(req)
         batch.process_prebuilt(self.future_map)
         return batch
 
@@ -3354,6 +3490,9 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
+        pool = getattr(self, "deferred_draft_prefill_pool", None)
+        if pool is not None:
+            pool.free(req)
         release_kv_cache(req, self.tree_cache, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
@@ -3378,6 +3517,11 @@ class SchedulerDisaggregationDecodeMixin:
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
+        if getattr(self, "deferred_draft_prefill_pool", None) is not None:
+            # Bound draft-prefill activations independently of the running
+            # decode batch. A burst must not create slots * prompt_len tokens
+            # of draft activations in one initialization forward.
+            num_not_used_batch = min(num_not_used_batch, 1)
 
         # pop req from waiting queue
         can_run_list: List[Req] = []

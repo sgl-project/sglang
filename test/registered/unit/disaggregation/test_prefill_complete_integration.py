@@ -769,6 +769,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(deferred_draft_prefill_pool=None)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.pending_reqs = []
         req = SimpleNamespace(
@@ -796,6 +797,7 @@ class TestAllocationIntegration(CustomTestCase):
 
     def test_rebootstrap_keeps_room_and_prefill_rank(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(deferred_draft_prefill_pool=None)
         queue._check_if_req_exceed_kv_capacity = Mock(return_value=False)
         queue.queue = []
         queue.pending_reqs = []

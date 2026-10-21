@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    append_deferred_draft_prefill_state,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -165,6 +166,15 @@ def maybe_release_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
+    pool = getattr(req, "deferred_draft_prefill_pool", None)
+    if pool is not None:
+        # Every exit, including bootstrap/waiting/chunk abort, uses one paired
+        # retirement. A Failed poll does not prove source RDMA has stopped.
+        retirements = getattr(allocator, "deferred_draft_source_retirements", None)
+        if retirements is None:
+            raise RuntimeError("Missing deferred draft source retirement owner")
+        retirements.register(req)
+        return
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
@@ -353,6 +363,9 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
+        append_deferred_draft_prefill_state(
+            kv_args, getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager_kwargs = (
@@ -411,6 +424,18 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        if (
+            backend == TransferBackend.FAKE
+            and getattr(self.scheduler, "deferred_draft_prefill_pool", None) is not None
+        ):
+            from sglang.srt.disaggregation.deferred_draft_prefill import (
+                DeferredDraftPrefillSourceFence,
+            )
+
+            # Health probes use FakeKVSender and publish no RDMA source.
+            req.disagg_kv_sender.deferred_draft_prefill_fence = (
+                DeferredDraftPrefillSourceFence()
+            )
         self._process_req(req)
         req.pending_bootstrap = True
         return True
@@ -421,6 +446,13 @@ class PrefillBootstrapQueue:
 
         if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
             return False
+        pool = getattr(self.scheduler, "deferred_draft_prefill_pool", None)
+        if pool is not None:
+            if not pool.try_alloc(req):
+                raise RuntimeError(
+                    "Prefill hidden ownership diverged from metadata admission"
+                )
+            req.deferred_draft_prefill_pool = pool
         req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
         assert req.metadata_buffer_index is not None
         return True
@@ -465,8 +497,14 @@ class PrefillBootstrapQueue:
             self.add(req, num_kv_heads)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
-        if len(req.origin_input_ids) > self.max_input_len:
-            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
+        max_input_len = self.max_input_len
+        if get_disagg().disaggregation_defer_draft_prefill:
+            max_input_len = min(
+                max_input_len,
+                get_disagg().disaggregation_draft_prefill_max_input_tokens,
+            )
+        if len(req.origin_input_ids) > max_input_len:
+            message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {max_input_len}"
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
@@ -1133,6 +1171,13 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        retirements = getattr(self, "deferred_draft_source_retirements", None)
+        if retirements is not None:
+            if get_parallel().pp_size == 1:
+                retirements.resolve()
+            elif rids_to_check is not None:
+                rids_to_check, states = rids_to_check
+                retirements.resolve(states)
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -1655,6 +1700,9 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.DRAFT_PREFILL_HIDDEN: lambda: getattr(
+                    self, "deferred_draft_prefill_pool", None
+                ).transfer_indices(req, transfer_input_len),
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),

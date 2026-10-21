@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from array import array
 from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -1535,6 +1536,31 @@ class Scheduler(
             else None
         )
 
+        self.deferred_draft_prefill_pool = None
+        if get_disagg().disaggregation_defer_draft_prefill:
+            from sglang.srt.disaggregation.deferred_draft_prefill import (
+                DeferredDraftPrefillPool,
+            )
+
+            self.deferred_draft_prefill_pool = DeferredDraftPrefillPool(
+                # Source ownership follows the existing metadata allocator.
+                # Adding a smaller, independently exhausted source allocator
+                # would let PP0 admit a request before a later PP rank can.
+                num_slots=(
+                    self.max_running_requests * 2
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL
+                    else get_disagg().disaggregation_draft_prefill_slots
+                ),
+                max_input_tokens=get_disagg().disaggregation_draft_prefill_max_input_tokens,
+                hidden_size=self.model_config.hidden_size,
+                dtype=self.model_config.dtype,
+                device=self.device,
+                allocate_storage=(
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    or get_parallel().pp_group.is_last_rank
+                ),
+            )
+
         if self.spec_algorithm.carries_draft_hidden_states():
             # Derive the rank-uniform PD wire schema from config because only the
             # last prefill PP stage owns a draft runner.
@@ -1610,6 +1636,17 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
+            if self.deferred_draft_prefill_pool is not None:
+                from sglang.srt.disaggregation.deferred_draft_prefill import (
+                    DeferredDraftPrefillSourceRetirements,
+                )
+
+                self.deferred_draft_source_retirements = (
+                    DeferredDraftPrefillSourceRetirements(
+                        self.req_to_metadata_buffer_idx_allocator
+                    )
+                )
+                self.req_to_metadata_buffer_idx_allocator.deferred_draft_source_retirements = self.deferred_draft_source_retirements
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=disagg_hidden_size,
@@ -3107,6 +3144,31 @@ class Scheduler(
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
+
+        if get_disagg().disaggregation_defer_draft_prefill:
+            from sglang.srt.disaggregation.deferred_draft_prefill import (
+                validate_deferred_draft_prefill_request,
+            )
+
+            error_msg = validate_deferred_draft_prefill_request(
+                req,
+                recv_req,
+                get_disagg().disaggregation_draft_prefill_max_input_tokens,
+            )
+            if error_msg is not None:
+                prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                self.retire_unadmitted_request(req)
+                return
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                generation = recv_req.pd_deferred_draft_source_generation
+                if generation is None:
+                    if get_parallel().pp_rank != 0:
+                        raise RuntimeError(
+                            "Missing P0 deferred draft source generation"
+                        )
+                    generation = uuid.uuid4().hex
+                    recv_req.pd_deferred_draft_source_generation = generation
+                req.pd_deferred_draft_source_generation = generation
 
         if recv_req.pp_prefetch_ticketed is True:
             self.tree_cache.bind_prefetch_ticket(req.rid)
@@ -5365,6 +5427,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= not bool(
+                    getattr(self, "deferred_draft_source_retirements", None)
+                )
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -5654,6 +5719,11 @@ class Scheduler(
                     self.hisparse_coordinator.request_finished(req)
                 if req.finished_reason is None:
                     req.finished_reason = FINISH_ABORT()
+                pool = getattr(self, "deferred_draft_prefill_pool", None)
+                if pool is not None:
+                    # Waiting requests have completed their peer transfer but
+                    # still own hidden staging until local draft initialization.
+                    pool.free(req)
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.release_aborted_prefill_waiting_req(req)
@@ -5846,6 +5916,16 @@ class Scheduler(
         self.running_batch.reqs = []
         for req in retract_reqs:
             if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # No resume path can reconstruct this feature's independent
+                # draft prefix yet. Reject before removing the boundary token
+                # so an abort retains every token already emitted to the client.
+                if (
+                    getattr(self, "deferred_draft_prefill_pool", None) is not None
+                    and self.disagg_decode_prealloc_queue.reject_deferred_draft_resume(
+                        req, is_rebootstrap=True
+                    )
+                ):
+                    continue
                 if req.output_ids:
                     req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
                 req.pd_rebootstrap_in_progress = True

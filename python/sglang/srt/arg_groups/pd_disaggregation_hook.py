@@ -195,6 +195,102 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
 
+    if cfg.disaggregation_defer_draft_prefill:
+        _validate_deferred_draft_prefill(cfg, model_config_of(server_args))
+
+
+def _validate_deferred_draft_prefill(cfg, model_config) -> None:
+    """Reject layouts whose hidden/state ownership is not implemented yet."""
+    unsupported = []
+    if cfg.disaggregation_mode not in ("prefill", "decode"):
+        unsupported.append("aggregated serving")
+    if cfg.disaggregation_transfer_backend != "mooncake":
+        unsupported.append("transfer backends other than Mooncake")
+    if not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get():
+        unsupported.append("disabled deferred decode KV release")
+    if cfg.disaggregation_enable_kv_checksum:
+        # The checksum computer applies target-state indices to every state
+        # buffer; hidden staging has a separate slot/token index space.
+        unsupported.append("KV checksum with deferred hidden staging")
+    if cfg.speculative_algorithm not in ("EAGLE", "NEXTN"):
+        unsupported.append("algorithms other than single-layer EAGLE/NEXTN")
+    if cfg.enable_multi_layer_eagle or cfg.speculative_adaptive:
+        unsupported.append("multi-layer or adaptive speculation")
+    # The first supported path has one ordinary NextN attention block. Draft
+    # recurrence and multi-layer hidden-capture schemas require their own plan.
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if (
+        not is_deepseek_dsa(model_config.hf_config)
+        or getattr(model_config.hf_text_config, "num_nextn_predict_layers", 0) != 1
+    ):
+        unsupported.append("models without one DSA NextN draft layer")
+    if model_config.spec_hidden_size != model_config.hidden_size:
+        unsupported.append("expanded speculative target hidden states")
+    if cfg.disaggregation_mode == "prefill" and cfg.tp_size != 1:
+        unsupported.append("prefill tensor parallelism greater than one")
+    if cfg.disaggregation_mode == "decode" and cfg.pp_size != 1:
+        unsupported.append("decode pipeline parallelism greater than one")
+    if cfg.dp_size != 1 or cfg.dcp_size != 1 or cfg.attn_cp_size != 1:
+        unsupported.append("data or context parallelism")
+    if cfg.enable_pd_role_switch or cfg.enable_pdmux:
+        unsupported.append("role switching or PD multiplexing")
+    if envs.SGLANG_RUST_SERVER.get():
+        unsupported.append("the Rust bootstrap registry")
+    if cfg.encoder_only or cfg.language_only or cfg.encoder_urls:
+        unsupported.append("encoder disaggregation")
+    if cfg.grpc_mode or cfg.smg_grpc_mode:
+        unsupported.append("gRPC serving")
+    if cfg.enable_lora or cfg.lora_paths:
+        unsupported.append("LoRA")
+    if cfg.ep_size != 1:
+        unsupported.append("expert parallelism")
+    if cfg.is_embedding:
+        unsupported.append("embedding serving")
+    if cfg.decoupled_spec_role != "null":
+        unsupported.append("decoupled speculation")
+    if not cfg.disable_radix_cache or cfg.disaggregation_decode_enable_radix_cache:
+        unsupported.append("prefix caching")
+    if (
+        cfg.enable_hierarchical_cache
+        or cfg.enable_hisparse
+        or cfg.enable_unified_memory
+    ):
+        unsupported.append("HiCache, HiSparse, or unified memory")
+    if cfg.disaggregation_decode_host_receive_threshold != 1:
+        unsupported.append("host KV receive")
+    if cfg.disaggregation_decode_enable_offload_kvcache:
+        unsupported.append("decode KV offload")
+    if cfg.optimistic_prefill_attempts:
+        unsupported.append("optimistic prefill")
+    if cfg.disaggregation_decode_allocation_policy != "early":
+        unsupported.append("prefill-complete allocation")
+    if unsupported:
+        raise ValueError(
+            "--disaggregation-defer-draft-prefill does not support "
+            + ", ".join(unsupported)
+        )
+    if (
+        cfg.disaggregation_draft_prefill_max_input_tokens is None
+        or cfg.disaggregation_draft_prefill_max_input_tokens <= 0
+        or cfg.disaggregation_draft_prefill_slots <= 0
+    ):
+        raise ValueError(
+            "Deferred draft prefill requires positive "
+            "--disaggregation-draft-prefill-max-input-tokens and "
+            "--disaggregation-draft-prefill-slots"
+        )
+
+    if cfg.disaggregation_mode == "decode" and (
+        cfg.max_prefill_tokens is None
+        or cfg.max_prefill_tokens < cfg.disaggregation_draft_prefill_max_input_tokens
+    ):
+        raise ValueError(
+            "Deferred draft prefill on decode requires --max-prefill-tokens "
+            ">= --disaggregation-draft-prefill-max-input-tokens so attention "
+            "scratch buffers cover the complete draft initialization"
+        )
+
 
 def _validate_prefill_complete(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)

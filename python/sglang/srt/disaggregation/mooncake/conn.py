@@ -44,6 +44,10 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.deferred_draft_prefill import (
+    DeferredDraftPrefillSourceFence,
+    build_deferred_draft_hidden_transfer_blocks,
+)
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
@@ -2039,6 +2043,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         or rc
                     )
+            elif st == StateType.DRAFT_PREFILL_HIDDEN:
+                # Hidden activations have no KV-head or PP-layer partitioning.
+                # Only the last P stage publishes a source; it sends the full
+                # prompt to every participating D TP rank.
+                try:
+                    blocks = build_deferred_draft_hidden_transfer_blocks(
+                        src_data_ptrs,
+                        src_item_lens,
+                        dst_data_ptrs,
+                        dst_item_lens,
+                        list(indices),
+                        list(dst_indices),
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Deferred draft hidden transfer: {exc}"
+                    ) from exc
+                rc = self._transfer_data(req.mooncake_session_id, blocks) or rc
             elif st == StateType.DSA_TAIL:
                 rc = (
                     self._send_slot_state(
@@ -2479,6 +2501,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            fence = None
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2486,6 +2509,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                fence = getattr(kv_chunk, "deferred_draft_source_fence", None)
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2533,6 +2557,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if fence is not None:
+                        # This queued generation was explicitly skipped before
+                        # any worker call could read its hidden/metadata source.
+                        fence.settled()
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2724,6 +2752,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         f"Session {req.mooncake_session_id} failed."
                                     )
                             self._poison_unsettled_send(kv_chunk.room)
+                            if fence is not None:
+                                fence.poison(
+                                    "KV transfer returned an unsettled failure"
+                                )
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
                                 failure_reason=(
@@ -2745,6 +2777,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # send also marks the room Failed.
                                 if state_rc != 0:
                                     self._poison_unsettled_send(kv_chunk.room)
+                                    if fence is not None:
+                                        fence.poison(
+                                            "State transfer returned an unsettled failure"
+                                        )
                                 if (
                                     self.request_status.get(
                                         kv_chunk.room, KVPoll.Failed
@@ -2780,6 +2816,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # The aux write targets decode's metadata
                                 # slot, which the deferred release also frees.
                                 self._poison_unsettled_send(req.room)
+                                if fence is not None:
+                                    fence.poison(
+                                        "Metadata transfer returned an unsettled failure"
+                                    )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
@@ -2851,11 +2891,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # acknowledge Success while this worker can still erase
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                if fence is not None:
+                    # All transfer futures were awaited and worker cleanup has
+                    # ended. A poisoned generation remains poisoned.
+                    fence.settled()
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
+                    if fence is not None:
+                        fence.poison(str(e))
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
@@ -3068,6 +3114,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        deferred_draft_source_fence: Optional[object] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -3097,20 +3144,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
+        # Submit before queue publication: a queued-but-not-dequeued chunk can
+        # still read hidden/metadata, even while the old outstanding count is zero.
+        if deferred_draft_source_fence is not None:
+            if not is_last_chunk:
+                raise RuntimeError(
+                    "A draft source fence belongs only to the final chunk"
+                )
+            if not deferred_draft_source_fence.submit():
+                return
+        try:
+            self.transfer_queues[shard_idx].put(
+                TransferKVChunk(
+                    room=bootstrap_room,
+                    prefill_kv_indices=kv_indices,
+                    index_slice=index_slice,
+                    is_last_chunk=is_last_chunk,
+                    prefill_aux_index=aux_index,
+                    state_indices=state_indices,
+                    num_kv_tokens=num_kv_tokens,
+                    trace_ctx=trace_ctx,
+                    wait_event=wait_event,
+                    indices_event=indices_event,
+                    deferred_draft_source_fence=deferred_draft_source_fence,
+                )
             )
-        )
+        except BaseException:
+            if deferred_draft_source_fence is not None:
+                deferred_draft_source_fence.poison(
+                    "Final chunk queue publication failed"
+                )
+            raise
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -3288,6 +3352,30 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
 
+    def __init__(
+        self,
+        mgr: MooncakeKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
+    ):
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            req_has_disagg_prefill_dp_rank,
+        )
+        if getattr(mgr, "deferred_draft_prefill_layout", None) is not None:
+            if not mgr.enable_deferred_decode_kv_release:
+                raise ValueError(
+                    "Deferred draft prefill requires transfer drain tracking"
+                )
+            self.deferred_draft_prefill_fence = DeferredDraftPrefillSourceFence()
+
+    def _get_final_chunk_kwargs(self) -> dict:
+        fence = getattr(self, "deferred_draft_prefill_fence", None)
+        return {"deferred_draft_source_fence": fence} if fence is not None else {}
+
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
@@ -3302,6 +3390,18 @@ class MooncakeKVSender(CommonKVSender):
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
         )
+
+    def clear(self):
+        fence = getattr(self, "deferred_draft_prefill_fence", None)
+        if fence is not None:
+            fence.seal()
+        super().clear()
+
+    def abort(self):
+        fence = getattr(self, "deferred_draft_prefill_fence", None)
+        if fence is not None:
+            fence.seal()
+        super().abort()
 
 
 class MooncakeKVReceiver(CommonKVReceiver):

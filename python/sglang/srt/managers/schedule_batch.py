@@ -1344,6 +1344,8 @@ class Req(ReqDllmMixin):
         )
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
+        self.deferred_draft_prefill_pool = None
+        self.pd_deferred_draft_source_generation = None
         self.output_topk_p = None
         self.output_topk_index = None
         self.output_dsa_topk_indices = None
