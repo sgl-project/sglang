@@ -1399,58 +1399,37 @@ class Scheduler(
     def _apply_aborts(
         self, new_reqs: list[tuple[bytes | None, Any]]
     ) -> list[tuple[bytes | None, Any]]:
+        """Drop queued and same-batch requests matched by each AbortReq; a running request finishes."""
         aborts = [(i, r) for i, r in new_reqs if isinstance(r, AbortReq)]
-        remaining = [(i, r) for i, r in new_reqs if not isinstance(r, AbortReq)]
-        # match aborts against this batch's generation requests too, so a
-        # generate and its abort arriving together cannot slip past each other
+        new_reqs = [(i, r) for i, r in new_reqs if not isinstance(r, AbortReq)]
         for identity, abort_req in aborts:
-            remaining = self._handle_abort(identity, abort_req, remaining)
-        return remaining
+            request_ids = set(abort_req.request_ids or [])
 
-    def _handle_abort(
-        self,
-        identity: bytes | None,
-        abort_req: AbortReq,
-        pending: list[tuple[bytes | None, Any]] | None = None,
-    ) -> list[tuple[bytes | None, Any]]:
-        """Drop matching queued or same-batch generation requests; a request already running finishes.
+            def matches(entry) -> bool:
+                req = get_first_generation_req(entry[1])
+                return (
+                    req is not None
+                    and not is_warmup_req(entry[1])
+                    and (abort_req.abort_all or req.request_id in request_ids)
+                )
 
-        Returns the entries of ``pending`` that were not aborted.
-        """
-        request_ids = set(abort_req.request_ids or [])
-
-        def matches(req_or_group) -> bool:
-            req = get_first_generation_req(req_or_group)
-            return (
-                req is not None
-                and not is_warmup_req(req_or_group)
-                and (abort_req.abort_all or req.request_id in request_ids)
-            )
-
-        kept, aborted = deque(), []
-        for entry in self.waiting_queue:
-            (aborted if matches(entry[1]) else kept).append(entry)
-        self.waiting_queue = kept
-
-        kept_pending = []
-        for item_identity, item_req in pending or []:
-            if matches(item_req):
-                aborted.append((item_identity, item_req, None))
-            else:
-                kept_pending.append((item_identity, item_req))
-
-        for item_identity, item_req, enqueued_at in aborted:
+            queued = [e for e in self.waiting_queue if matches(e)]
+            pending = [e for e in new_reqs if matches(e)]
+            self.waiting_queue = deque(e for e in self.waiting_queue if not matches(e))
+            new_reqs = [e for e in new_reqs if not matches(e)]
             # same-batch requests were never enqueued in metrics
-            if self.metrics is not None and enqueued_at is not None:
-                self.metrics.finish(id(item_req), error=True)
-            self.return_result(OutputBatch(error=ABORTED_ERROR), item_identity)
-        if aborted:
-            logger.info("Aborted %d queued request(s)", len(aborted))
-        self.return_result(
-            OutputBatch(output={"success": True, "num_aborted": len(aborted)}),
-            identity,
-        )
-        return kept_pending
+            if self.metrics is not None:
+                for _, req, _ in queued:
+                    self.metrics.finish(id(req), error=True)
+            for item_identity, *_ in queued + pending:
+                self.return_result(OutputBatch(error=ABORTED_ERROR), item_identity)
+            num_aborted = len(queued) + len(pending)
+            logger.info("Aborted %d queued request(s)", num_aborted)
+            self.return_result(
+                OutputBatch(output={"success": True, "num_aborted": num_aborted}),
+                identity,
+            )
+        return new_reqs
 
     def event_loop(self) -> None:
         """

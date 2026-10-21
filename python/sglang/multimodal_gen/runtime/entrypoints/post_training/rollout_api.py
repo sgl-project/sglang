@@ -360,11 +360,7 @@ async def rollout_generate(request: RolloutRequest):
 
 @router.post("/abort")
 async def rollout_abort(request: RolloutAbortRequest):
-    """Abort queued rollout requests by ``request_id``, or all of them.
-
-    Requests still waiting in the scheduler queue return 499; a request whose
-    denoising has started runs to completion.
-    """
+    """Abort queued rollout requests; a request already denoising runs to completion."""
     if not request.abort_all and not request.request_ids:
         raise HTTPException(status_code=400, detail="Pass request_ids or set abort_all")
     output_batch: OutputBatch = await async_scheduler_client.forward(

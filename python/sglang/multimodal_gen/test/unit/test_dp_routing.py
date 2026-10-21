@@ -7,6 +7,7 @@ and a realtime session always lands on the same replica it started on.
 import itertools
 
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    AbortReq,
     SetLoraReq,
     ShutdownReq,
 )
@@ -47,6 +48,8 @@ def test_session_requests_stick_to_one_replica():
 def test_control_reqs_are_recognized():
     assert isinstance(SetLoraReq(lora_nickname="x", lora_path="y"), _CONTROL_REQ_TYPES)
     assert isinstance(ShutdownReq(), _CONTROL_REQ_TYPES)
+    # the request to abort may be queued on any replica
+    assert isinstance(AbortReq(abort_all=True), _CONTROL_REQ_TYPES)
     assert not isinstance([_req()], _CONTROL_REQ_TYPES)
     assert not isinstance(_req(), _CONTROL_REQ_TYPES)
 
@@ -54,8 +57,14 @@ def test_control_reqs_are_recognized():
 def test_fanout_merge_surfaces_the_failing_replica():
     ok = OutputBatch(output=None)
     bad = OutputBatch(error="replica 1 exploded")
-    assert _merge_fanout_results([ok, bad]) is bad
-    assert _merge_fanout_results([ok, OutputBatch(output=None)]) is ok
+    assert _merge_fanout_results(ShutdownReq(), [ok, bad]) is bad
+    assert _merge_fanout_results(ShutdownReq(), [ok, OutputBatch(output=None)]) is ok
+
+
+def test_fanout_merge_sums_num_aborted():
+    results = [OutputBatch(output={"success": True, "num_aborted": n}) for n in (0, 2)]
+    merged = _merge_fanout_results(AbortReq(abort_all=True), results)
+    assert merged.output == {"success": True, "num_aborted": 2}
 
 
 def test_scheduler_endpoints_one_per_replica():
