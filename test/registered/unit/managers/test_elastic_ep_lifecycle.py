@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -20,8 +21,12 @@ from sglang.srt.elastic_ep.elastic_ep import (
     register_scale_cohort,
     register_scale_operation,
 )
+from sglang.srt.entrypoints.elastic_ep import (
+    observe_elastic_ep_membership as observe_elastic_ep_membership_endpoint,
+)
 from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 from sglang.srt.managers.communicator import FanOutCommunicator
+from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     ElasticScaleUpdateReq,
@@ -33,7 +38,10 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    MembershipObservationTimeout,
+    TokenizerManager,
+)
 from sglang.srt.runtime_context import get_parallel
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -669,6 +677,69 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(result.observation_key, "observation-key")
 
+    async def test_membership_observation_traverses_control_route(self):
+        manager = _manager()
+        manager.elastic_worker_count = 2
+        manager.elastic_active_rank_status = [True, True]
+
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.workers = [object(), object()]
+        controller.status = [True, True]
+        controller._active_workers = [0, 1]
+        controller.control_message_step = 1
+        controller.init_dispatcher()
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.flush_wrapper = MagicMock()
+        scheduler.weight_updater = MagicMock()
+        scheduler.profiler_manager = MagicMock()
+        scheduler.rust_server = None
+        send_to_tokenizer = MagicMock()
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=send_to_tokenizer)
+        scheduler.init_request_dispatcher()
+
+        manager._dispatch_to_scheduler = controller._request_dispatcher
+        with get_parallel().override(num_dp_ranks=2):
+            manager.init_request_dispatcher()
+
+        def return_to_tokenizer(output, _request):
+            manager._result_dispatcher(output)
+
+        send_to_tokenizer.send_output.side_effect = return_to_tokenizer
+
+        def deliver_to_scheduler(worker, request):
+            self.assertIs(worker, controller.workers[0])
+            output = scheduler._request_dispatcher(request)
+            scheduler.send_control_output(output, request)
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.sock_send",
+                side_effect=deliver_to_scheduler,
+            ),
+            patch(
+                "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership",
+                return_value="observation-key",
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(dp_rank=0),
+            ),
+        ):
+            result = await manager.observe_elastic_ep_membership(
+                ObserveElasticEPMembershipReqInput(
+                    runtime_instance_id="runtime-1",
+                    topology_generation=3,
+                    rank=1,
+                    failed_allocation_incarnation="pod-uid-5",
+                    membership_epoch=4,
+                )
+            )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.observation_key, "observation-key")
+        send_to_tokenizer.send_output.assert_called_once()
+
     async def test_membership_observation_times_out_without_survivor_reply(self):
         manager = _manager()
         manager.elastic_active_rank_status = [True, True]
@@ -679,7 +750,7 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
             correlation_attr="submission_id",
         )
 
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(MembershipObservationTimeout) as raised:
             await manager.observe_elastic_ep_membership(
                 ObserveElasticEPMembershipReqInput(
                     runtime_instance_id="runtime-1",
@@ -689,8 +760,64 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                     membership_epoch=4,
                 )
             )
+        self.assertEqual(raised.exception.expected_ranks, [0])
+        self.assertEqual(raised.exception.received_ranks, [])
+        self.assertEqual(raised.exception.missing_ranks, [0])
+        self.assertEqual(raised.exception.last_tokenizer_stage, "dispatched")
+        self.assertGreater(raised.exception.elapsed_seconds, 0)
         self.assertIsNone(
             manager.observe_elastic_ep_membership_communicator._result_event
+        )
+
+    async def test_membership_timeout_http_response_preserves_diagnostics(self):
+        request = SimpleNamespace(
+            json=AsyncMock(
+                return_value={
+                    "runtime_instance_id": "runtime-1",
+                    "topology_generation": 3,
+                    "rank": 1,
+                    "failed_allocation_incarnation": "pod-uid-5",
+                    "membership_epoch": 4,
+                }
+            )
+        )
+        tokenizer_manager = SimpleNamespace(
+            observe_elastic_ep_membership=AsyncMock(
+                side_effect=MembershipObservationTimeout(
+                    submission_id="submission-1",
+                    expected_ranks=[0],
+                    received_ranks=[],
+                    elapsed_seconds=30.001,
+                )
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.entrypoints.elastic_ep.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(elastic_ep_backend="nixl")
+                ),
+            ),
+            patch(
+                "sglang.srt.entrypoints.http_server._global_state",
+                SimpleNamespace(tokenizer_manager=tokenizer_manager),
+            ),
+        ):
+            response = await observe_elastic_ep_membership_endpoint(request)
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(
+            json.loads(response.body),
+            {
+                "error": "Timed out waiting for the membership survivor quorum.",
+                "submission_id": "submission-1",
+                "expected_ranks": [0],
+                "received_ranks": [],
+                "missing_ranks": [0],
+                "last_tokenizer_stage": "dispatched",
+                "elapsed_seconds": 30.001,
+            },
         )
 
     async def test_unknown_recovery_submission_is_reconciled(self):

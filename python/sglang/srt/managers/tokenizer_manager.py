@@ -76,6 +76,7 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.communicator import FanOutTimeoutError
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -218,6 +219,26 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 _ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS = 30
 
 logger = logging.getLogger(__name__)
+
+
+class MembershipObservationTimeout(TimeoutError):
+    """The tokenizer did not receive the complete survivor quorum in time."""
+
+    def __init__(
+        self,
+        *,
+        submission_id: str,
+        expected_ranks: List[int],
+        received_ranks: List[int],
+        elapsed_seconds: float,
+    ) -> None:
+        super().__init__("Timed out waiting for the membership survivor quorum.")
+        self.submission_id = submission_id
+        self.expected_ranks = expected_ranks
+        self.received_ranks = received_ranks
+        self.missing_ranks = sorted(set(expected_ranks) - set(received_ranks))
+        self.elapsed_seconds = elapsed_seconds
+        self.last_tokenizer_stage = "dispatched"
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
@@ -3921,18 +3942,61 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             membership_epoch=obj.membership_epoch,
             submission_id=submission_id,
         )
-        self.auto_create_handle_loop()
-        responses: List[ObserveElasticEPMembershipReqOutput] = await asyncio.wait_for(
-            self.observe_elastic_ep_membership_communicator(
-                scheduler_obj, fan_out=len(survivor_ranks)
-            ),
-            timeout=self.elastic_scheduler_response_timeout,
+        expected_ranks = sorted(survivor_ranks)
+        started_at = time.monotonic()
+        logger.info(
+            "[Elastic EP][membership] submission_started submission_id=%s "
+            "expected_ranks=%s",
+            submission_id,
+            expected_ranks,
         )
+        self.auto_create_handle_loop()
+        try:
+            responses: List[
+                ObserveElasticEPMembershipReqOutput
+            ] = await self.observe_elastic_ep_membership_communicator(
+                scheduler_obj,
+                fan_out=len(survivor_ranks),
+                timeout=self.elastic_scheduler_response_timeout,
+            )
+        except FanOutTimeoutError as exc:
+            received_ranks = sorted(
+                response.responder_rank
+                for response in exc.partial_results
+                if response.responder_rank is not None
+            )
+            elapsed_seconds = time.monotonic() - started_at
+            missing_ranks = sorted(survivor_ranks - set(received_ranks))
+            logger.warning(
+                "[Elastic EP][membership] timed_out submission_id=%s "
+                "expected_ranks=%s received_ranks=%s missing_ranks=%s "
+                "last_tokenizer_stage=dispatched elapsed_seconds=%.3f",
+                submission_id,
+                expected_ranks,
+                received_ranks,
+                missing_ranks,
+                elapsed_seconds,
+            )
+            raise MembershipObservationTimeout(
+                submission_id=submission_id,
+                expected_ranks=expected_ranks,
+                received_ranks=received_ranks,
+                elapsed_seconds=elapsed_seconds,
+            ) from exc
         if not responses:
             raise RuntimeError(
                 "Membership observation returned no scheduler responses."
             )
         responder_ranks = [response.responder_rank for response in responses]
+        for response in responses:
+            logger.info(
+                "[Elastic EP][membership] reply_%s submission_id=%s "
+                "responder_rank=%s elapsed_seconds=%.3f",
+                "received" if response.accepted else "rejected",
+                submission_id,
+                response.responder_rank,
+                time.monotonic() - started_at,
+            )
         if (
             len(set(responder_ranks)) != len(responder_ranks)
             or set(responder_ranks) != survivor_ranks
