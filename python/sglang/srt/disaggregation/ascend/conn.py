@@ -108,7 +108,9 @@ class AscendKVManager(MooncakeKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
     def _uses_page_interleaved_dcp(self) -> bool:
-        return getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3)
+        return getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3) or (
+            self.is_hybrid_mla_backend and bool(self._dcp_remote_decode_layout)
+        )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (

@@ -315,11 +315,13 @@ class PrefillBootstrapQueue:
         dcp_remote_decode_layout = []
         if self.transfer_backend == TransferBackend.ASCEND:
             for pool in (self.token_to_kv_pool, draft_kv_pool):
+                if pool is not None and pool is draft_kv_pool:
+                    dcp_remote_decode_layout.extend([True] * num_draft_entries)
+                    continue
+                pool = getattr(pool, "full_kv_pool", pool)
                 get_layout = getattr(pool, "get_dcp_remote_decode_layout", None)
                 if get_layout is not None:
                     dcp_remote_decode_layout.extend(get_layout())
-                elif pool is not None and pool is draft_kv_pool:
-                    dcp_remote_decode_layout.extend([True] * num_draft_entries)
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

@@ -623,22 +623,6 @@ class AscendAttnBackend(AttentionBackend):
                     effective_seq_lens = effective_seq_lens + int(
                         self.speculative_step_id + 1
                     )
-            local_seq_lens, metadata.block_tables = self._get_kv_lens_and_block_tables(
-                effective_seq_lens, forward_batch.req_pool_indices
-            )
-            metadata.seq_lens = local_seq_lens
-            if metadata.dcp_spec_seq_lens is not None:
-                # FIA checks S2 against the full paged capacity, not just valid KV.
-                required_mask_width = metadata.block_tables.shape[1] * self.page_size
-                metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
-                    forward_batch.seq_lens,
-                    query_len,
-                    self.dcp_size,
-                    self.dcp_rank,
-                    page_size=self.page_size,
-                    max_local_kv_len=required_mask_width,
-                    local_query_lens=metadata.dcp_spec_seq_lens,
-                )
             # Derive FIA's Host lengths from the CPU mirror without a device readback.
             effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
             if forward_batch.forward_mode.is_target_verify():
@@ -658,12 +642,30 @@ class AscendAttnBackend(AttentionBackend):
                 effective_seq_lens_cpu = effective_seq_lens_cpu + int(
                     self.speculative_step_id + 1
                 )
-            metadata.seq_lens_cpu_int = get_dcp_lens(
-                effective_seq_lens_cpu,
+            # Size the table from FIA's Host bound, which can lead device lengths.
+            metadata.seq_lens_cpu_int, metadata.block_tables = (
+                self._get_kv_lens_and_block_tables(
+                    effective_seq_lens_cpu, forward_batch.req_pool_indices
+                )
+            )
+            metadata.seq_lens = get_dcp_lens(
+                effective_seq_lens,
                 self.dcp_size,
                 self.dcp_rank,
                 interleave_size=self.page_size,
             ).int()
+            if metadata.dcp_spec_seq_lens is not None:
+                # FIA checks S2 against the full paged capacity, not just valid KV.
+                required_mask_width = metadata.block_tables.shape[1] * self.page_size
+                metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
+                    forward_batch.seq_lens,
+                    query_len,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    page_size=self.page_size,
+                    max_local_kv_len=required_mask_width,
+                    local_query_lens=metadata.dcp_spec_seq_lens,
+                )
         else:
             if self.needs_cpu_seq_lens:
                 seq_lens_max = forward_batch.seq_lens.max()
@@ -1876,7 +1878,11 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        if is_mla_preprocess_enabled() and self.use_mla:
+        if (
+            is_mla_preprocess_enabled()
+            and self.use_mla
+            and not self.dense_mla_dcp_deployment
+        ):
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
             if topk_indices is None:
