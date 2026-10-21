@@ -408,10 +408,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 # Reuse the live CPU mirror when available to avoid
                 # a blocking D2H copy.
                 if forward_batch.seq_lens_cpu is not None:
-                    seq_lens = (
-                        forward_batch.seq_lens_cpu[: self.raw_bs].tolist()
-                        + [0] * (self.bs - self.raw_bs)
-                    )
+                    seq_lens = forward_batch.seq_lens_cpu[: self.raw_bs].tolist() + [
+                        0
+                    ] * (self.bs - self.raw_bs)
                 else:
                     seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                         self.bs - self.raw_bs
