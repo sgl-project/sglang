@@ -1156,9 +1156,13 @@ class KVCacheConfigurator:
         # A fused draft stores its rows in the host's KV dtype. An explicit
         # draft dtype resolves here as the draft runner will; `auto` follows
         # the draft's quant config, which only the draft runner knows, so it
-        # is checked when the draft binds.
+        # is checked when the draft binds. DFLASH-family FA4 is already known:
+        # it always uses the draft's compute dtype, including with default/auto
+        # KV settings. Decline fusion now if that differs from the host.
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype not in (None, "auto"):
+        if draft_kv_cache_dtype not in (None, "auto") or (
+            self.spec_algorithm.is_dflash_family() and draft_backend == "fa4"
+        ):
             from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
             _, draft_kv_dtype = configure_kv_cache_dtype(

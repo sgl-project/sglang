@@ -2563,6 +2563,7 @@ class Scheduler(
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
     def init_output_streamer(self) -> None:
@@ -3832,8 +3833,6 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
-        if self.enable_fpm:
-            self._fpm_batch_t0 = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3958,8 +3957,6 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-            if self.enable_fpm:
-                ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
