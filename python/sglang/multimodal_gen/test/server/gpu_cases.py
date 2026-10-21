@@ -689,6 +689,7 @@ else:
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -698,6 +699,7 @@ else:
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "ideogram4_nvfp4_t2i",
@@ -707,6 +709,7 @@ else:
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "qwen_image_2512_modelopt_nvfp4_t2i",
@@ -716,6 +719,7 @@ else:
             extras=[],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
@@ -725,6 +729,7 @@ else:
             extras=[],
             env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
             run_consistency_check=True,
+            run_perf_check=True,
         ),
     ]
 
