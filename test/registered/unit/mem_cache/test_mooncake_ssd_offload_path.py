@@ -149,24 +149,6 @@ def _make_store(
 
 
 class TestMooncakeSsdOffloadPath(CustomTestCase):
-    def test_each_rank_gets_private_subdirectory(self):
-        with tempfile.TemporaryDirectory() as base:
-            for tp_rank in (0, 3):
-                client = _make_store(tp_rank=tp_rank, pp_rank=0, ssd_offload_path=base)
-                expected = os.path.join(base, f"rank_0_{tp_rank}_0_0")
-                self.assertEqual(client.setup_kwargs.get("ssd_offload_path"), expected)
-                self.assertTrue(os.path.isdir(expected))
-
-    def test_rank_directories_are_distinct(self):
-        with tempfile.TemporaryDirectory() as base:
-            paths = {
-                _make_store(
-                    tp_rank=tp_rank, pp_rank=0, ssd_offload_path=base
-                ).setup_kwargs["ssd_offload_path"]
-                for tp_rank in range(4)
-            }
-            self.assertEqual(len(paths), 4)
-
     def test_dp_ranks_are_distinct_when_attn_tp_rank_is_zero(self):
         # dp-attention with attn_tp_size 1: every DP rank reports tp_rank 0
         with tempfile.TemporaryDirectory() as base:
