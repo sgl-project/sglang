@@ -1,7 +1,6 @@
 import asyncio
 import re
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from typing import (
     Any,
     Dict,
@@ -56,9 +55,7 @@ _is_xpu = is_xpu()
 
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
-    video_preprocessing_device = None
     prefer_tokenized_input = False
-    precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -181,15 +178,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             # Generic attributes that could apply to multiple modalities
             # "precomputed_embeddings" - handled specially as it can be any modality
         }
-
-        # name of the feature filed
-        # TODO: pass from processors
-        self.FEATURE_NAMES = [
-            "pixel_values",
-            "pixel_values_videos",
-            "audio_features",
-            "input_features",
-        ]
 
         if self.use_cuda_ipc and not kwargs.get("skip_mm_pool", False):
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
@@ -538,24 +526,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return "npu"
         return None
 
-    @contextmanager
-    def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):
-        """Release fast-processor CUDA temporaries after CPU feature transport."""
-        can_release = (
-            device is not None
-            and torch.device(device).type == "cuda"
-            and not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
-        )
-        if not can_release:
-            yield
-            return
-
-        with torch.cuda.device(device):
-            pool = torch.cuda.MemPool()
-        with torch.cuda.use_mem_pool(pool, device=device):
-            yield
-
     def process_mm_data(
         self,
         input_text,
@@ -634,20 +604,6 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             self._move_processor_output_to_cpu(result)
 
         return result
-
-    def _move_processor_output_to_cpu(self, result):
-        # Deferred: the hash is computed on the GPU tensor first, and
-        # _precompute_hashes_before_cpu_transfer moves it down afterwards.
-        if (
-            not self.keep_mm_features_on_device
-            and not self.precompute_hash_before_cpu_transfer
-        ):
-            # move feature tensors to cpu
-            for feature_name in self.FEATURE_NAMES:
-                if feature_name in result and isinstance(
-                    result[feature_name], torch.Tensor
-                ):
-                    result[feature_name] = result[feature_name].to("cpu")
 
     @abstractmethod
     async def process_mm_data_async(
