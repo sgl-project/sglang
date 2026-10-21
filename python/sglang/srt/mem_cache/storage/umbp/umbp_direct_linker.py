@@ -58,6 +58,21 @@ def _storage_suffix(
     return "_".join(parts)
 
 
+def _pool_suffix_overrides(
+    entries, *, attn_cp_rank: int, pp_rank: int
+) -> dict[PoolName, str]:
+    return {
+        entry.name: _storage_suffix(
+            rank_replicated=False,
+            tp_rank=entry.shard,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+        )
+        for entry in entries
+        if entry.shard is not None
+    }
+
+
 def _ordered_layers(entry) -> list[int]:
     component_lengths = {len(component) for component in entry.components}
     if len(component_lengths) != 1:
@@ -275,10 +290,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         if _storage is None:
             from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
-            # per_rank_keyspace: every object key this class writes carries a
-            # tp{rank} suffix (set just below), so the store must not put the
-            # ranks into the shared-SSD leader/follower scheme meant for
-            # deduplicating replicated MLA KV.
+            # per_rank_keyspace: this class sets the rank suffix of every object
+            # key itself, so the store must not put the ranks into the
+            # shared-SSD leader/follower scheme meant for deduplicating
+            # replicated MLA KV.
             self.storage = UMBPStore(
                 storage_config, mem_pool_host=None, per_rank_keyspace=True
             )
@@ -332,6 +347,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
             self.storage.mla_suffix = rank_suffix
             self.storage.mha_suffix = rank_suffix
+            self._pool_suffix_overrides = _pool_suffix_overrides(
+                self.pool_group.entries,
+                attn_cp_rank=params.attn_cp_rank,
+                pp_rank=params.pp_rank,
+            )
             self._register_buffers()
             # Report the mode rather than asserting it in the text: the line is
             # what every acceptance check greps to prove the linker attached at
@@ -403,7 +423,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self, page_keys: list[str], transfer: PoolTransfer
     ) -> tuple[list[str], int]:
         component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
-            page_keys, transfer
+            page_keys,
+            transfer,
+            rank_suffix=self._pool_suffix_overrides.get(transfer.name),
         )
         entry = self.pools[transfer.name]
         # One key names one stored object, and a packed entry stores a whole
