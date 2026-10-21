@@ -576,6 +576,39 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
                 # Dense reaches the same boundary using metadata init's snapshot.
                 self.assertIs(shared_read_ends, SharedReadEnds.PRE_REPLAY)
 
+    def test_sparse_prefill_gate_admits_request_window_rows(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _LARGE_INDEXER_QUERY_THRESHOLD,
+        )
+
+        # Encoder SWA replay's request window takes the sparse path; only the
+        # decoder tail stays on paged attention.
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        for late_layer_tail, admitted in ((None, True), (object(), False)):
+            with self.subTest(late_layer_tail=late_layer_tail is not None):
+                backend = self._make_prefill_backend()
+                backend.trtllm_attn = False
+                backend.token_to_kv_pool = SimpleNamespace(request_window=object())
+                backend.forward_metadata.late_layer_tail = late_layer_tail
+                with (
+                    envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
+                    mock.patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.get_platform",
+                        return_value=SimpleNamespace(is_sm120=False),
+                    ),
+                    mock.patch(
+                        "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_active",
+                        return_value=False,
+                    ),
+                ):
+                    self.assertIs(
+                        backend._use_sparse_prefill(
+                            batch, num_qo_tokens=_LARGE_INDEXER_QUERY_THRESHOLD + 1
+                        ),
+                        admitted,
+                    )
+
     def test_prefill_snapshot_skips_layers_reading_live_tables(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
         from sglang.srt.layers.attention.deepseek_v4_backend import (
