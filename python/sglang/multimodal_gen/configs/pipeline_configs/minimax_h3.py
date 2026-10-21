@@ -60,8 +60,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
-    # Default VSA-H3 sparsity; --attention-backend-config VSA_sparsity overrides.
+    # Default VSA-H3 sparsity, tile size and reference-video keep rate;
+    # --attention-backend-config VSA_sparsity / vsa_tile_size /
+    # vsa_ref_keep_rate override them.
     vsa_sparsity: float = 0.9
+    vsa_tile_size: int = 64
+    vsa_ref_keep_rate: float | None = None
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )
