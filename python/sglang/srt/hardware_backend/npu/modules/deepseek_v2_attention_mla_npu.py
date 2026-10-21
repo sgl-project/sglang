@@ -311,10 +311,6 @@ def forward_mla_prepare_npu(
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
     if backend.uses_dcp_partial_attention(forward_batch):
         q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
-        # The common gather returns transposed views; Ascend kernels consume
-        # contiguous token-major queries.
-        q_nope_out = q_nope_out.contiguous()
-        q_pe = q_pe.contiguous()
 
     return (
         q_pe,
@@ -556,8 +552,6 @@ def forward_dsa_prepare_npu(
 
     if use_dcp:
         q_nope_out, q_pe = all_gather_q_for_mla_decode(q_nope_out, q_pe)
-        q_nope_out = q_nope_out.contiguous()
-        q_pe = q_pe.contiguous()
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
 
