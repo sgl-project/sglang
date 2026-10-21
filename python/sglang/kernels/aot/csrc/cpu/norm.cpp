@@ -499,12 +499,14 @@ float sum_squares(const scalar_t* __restrict__ input, int64_t size) {
 }
 
 template <NormMode M, typename scalar_t>
-void fused_norm_post_residual_kernel_impl(
+void fused_dual_residual_norm_kernel_impl(
+    scalar_t* __restrict__ output,
     scalar_t* __restrict__ mid,
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ residual,
     const NormParams& x_params,
-    const NormParams& r_params) {
+    const NormParams& r_params,
+    const NormParams& mid_params) {
   at::parallel_for(0, x_params.rows(), 0, [&](int64_t begin, int64_t end) {
     int64_t b{0}, h{0}, t{0};
     data_index_init(begin, b, x_params.B, h, x_params.H, t, x_params.T);
@@ -512,9 +514,11 @@ void fused_norm_post_residual_kernel_impl(
       const scalar_t* __restrict__ x_row = x + x_params.input_offset(b, h, t);
       const scalar_t* __restrict__ r_row = residual + r_params.input_offset(b, h, t);
       scalar_t* __restrict__ mid_row = mid + x_params.output_offset(b, h, t);
-
+      scalar_t* __restrict__ output_row = output + mid_params.output_offset(b, h, t);
+      // stage 1: mid = norm(x) + residual
       NormReduceGeneric<M, scalar_t, false, true>::apply(mid_row, x_row, nullptr, nullptr, x_params, x_params.D, r_row);
-
+      // stage 2: output = norm(mid)
+      NormReduceGeneric<M, scalar_t, false>::apply(output_row, mid_row, nullptr, nullptr, mid_params, mid_params.D);
       data_index_step(b, x_params.B, h, x_params.H, t, x_params.T);
     }
   });
@@ -879,9 +883,14 @@ std::tuple<at::Tensor, at::Tensor> fused_dual_residual_rmsnorm_cpu(
   mid_params.weight = weight2.data_ptr();
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_dual_residual_rmsnorm_kernel", [&] {
-    fused_norm_post_residual_kernel_impl<NormMode::RMSNorm, scalar_t>(
-        mid.data_ptr<scalar_t>(), x.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(), x_params, r_params);
-    norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(output.data_ptr<scalar_t>(), mid.data_ptr<scalar_t>(), mid_params);
+    fused_dual_residual_norm_kernel_impl<NormMode::RMSNorm, scalar_t>(
+        output.data_ptr<scalar_t>(),
+        mid.data_ptr<scalar_t>(),
+        x.data_ptr<scalar_t>(),
+        residual.data_ptr<scalar_t>(),
+        x_params,
+        r_params,
+        mid_params);
   });
   return std::make_tuple(output, mid);
 }
