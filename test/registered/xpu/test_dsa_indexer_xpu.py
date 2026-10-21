@@ -220,7 +220,7 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
                 "dsa_prefill_backend": "intel_xpu",
                 "dsa_decode_backend": "intel_xpu",
-                "dsa_topk_backend": "torch",  # XPU uses torch.topk fallback
+                "dsa_topk_backend": "sgl-kernel",
                 "dsa_paged_mqa_logits_backend": "auto",
                 "disaggregation_mode": "null",
                 "enable_two_batch_overlap": False,
@@ -236,10 +236,8 @@ class TestDSAIndexerXPU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         server_args.dsa_prefill_backend = "intel_xpu"
         server_args.dsa_decode_backend = "intel_xpu"
-        server_args.dsa_topk_backend = "torch"
         # Disable CUDA-only JIT topk-v2 (TileLang requires CUDA_HOME)
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
         set_global_server_args_for_scheduler(server_args)
@@ -390,7 +388,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — extend mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_extend_mode(self, mock_act_quant):
         """Indexer forward in EXTEND mode calls sgl_kernel.fp8_mqa_logits on XPU."""
 
@@ -446,7 +444,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — decode mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_decode_mode(self, mock_act_quant):
         """Indexer forward in DECODE mode calls sgl_kernel.fp8_paged_mqa_logits on XPU."""
 

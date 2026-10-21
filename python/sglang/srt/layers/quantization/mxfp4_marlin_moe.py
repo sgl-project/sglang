@@ -56,6 +56,9 @@ class Mxfp4MarlinMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
+
     def create_weights(
         self,
         layer: Module,
@@ -71,7 +74,13 @@ class Mxfp4MarlinMoEMethod:
 
         layer._dsv4_mxfp4_backend = None  # set in process_weights_after_loading
         fp4_block_k = 32
-        intermediate_size_per_partition = round_up(intermediate_size_per_partition, 128)
+        # Hopper repacking pads the loaded gate/up halves and down columns to
+        # the required tile sizes. Keep their logical widths until then: early
+        # padding to 128 turns a TP8 width of 288 into 384 instead of 320.
+        if not get_platform().is_sm90:
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 128
+            )
         hidden_size = round_up(hidden_size, 256)
         self.hidden_pad = hidden_size - layer.hidden_size
 

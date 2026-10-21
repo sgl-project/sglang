@@ -19,12 +19,14 @@
 
 use crate::policies::power_of_two::select_k_with_snapshot;
 use crate::policies::{CacheCandidate, CacheCandidateProposal, GuardHints, SelectionProposal};
+pub(crate) use crate::state::load_monitor::engine_ranking::{
+    compare_decode_engines, compare_prefill_engines, CandidateLoads,
+};
 use crate::state::load_monitor::engine_reported_load::{
-    EngineReportedLoadSnapshot, EngineReportedSchedulingLoad, EngineReportedWorkerLoad,
+    EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
 };
 use crate::workers::Worker;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A prefill candidate domain and its optional queue budget.
@@ -266,7 +268,7 @@ pub fn resolve_cache_candidates(
     // candidate missing native monitor data would otherwise break the
     // lookup's full-coverage check and silently downgrade every pressure
     // comparison (and `prefill_pressure_source`) to router-local.
-    let loads = FreshLoadLookup::new(
+    let loads = CandidateLoads::new(
         Some(snapshot),
         evaluated.iter().copied().map(|candidate| &candidate.worker),
     );
@@ -308,7 +310,7 @@ pub fn resolve_cache_candidates(
                 // comparison would fall back to router-local load — tie at
                 // zero for every owner, decided by worker id. The pin ranks
                 // the rejected owners, so it must see the rejected owners.
-                let pin_loads = FreshLoadLookup::new(
+                let pin_loads = CandidateLoads::new(
                     Some(snapshot),
                     queue_gate_rejected
                         .iter()
@@ -322,7 +324,7 @@ pub fn resolve_cache_candidates(
                     })
                     .min_by(|left, right| {
                         pin_loads
-                            .compare_prefill_pressure(&left.worker, &right.worker)
+                            .compare_prefill_engines(&left.worker, &right.worker)
                             .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
                     })
             })
@@ -510,7 +512,7 @@ pub fn resolve_decode(
         .is_some_and(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot));
     let (selected, reason) = match (primary_admitted, backup.as_ref(), backup_admitted) {
         (true, Some(backup), true) => {
-            if compare_decode_pressure(&proposal.primary, backup, Some(snapshot)).is_gt() {
+            if compare_decode_engines(&proposal.primary, backup, Some(snapshot)).is_gt() {
                 (Arc::clone(backup), DecisionReason::BackupPressureGuard)
             } else {
                 (Arc::clone(&proposal.primary), DecisionReason::Primary)
@@ -589,7 +591,7 @@ fn is_decode_admitted(
 fn is_cache_candidate_admitted(
     candidate: &CacheCandidate,
     request_input_tokens: u64,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> bool {
     let Some(load) = loads.get(&candidate.worker.id) else {
         return true;
@@ -606,7 +608,7 @@ fn compare_cache_candidates(
     left: &CacheCandidate,
     right: &CacheCandidate,
     proposal: &CacheCandidateProposal,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
     enable_pressure_guard: bool,
 ) -> Ordering {
     let work_delta = left.uncached_tokens.abs_diff(right.uncached_tokens);
@@ -614,7 +616,7 @@ fn compare_cache_candidates(
         return left
             .uncached_tokens
             .cmp(&right.uncached_tokens)
-            .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+            .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
             .then_with(|| left.worker.id.0.cmp(&right.worker.id.0));
     }
     if enable_pressure_guard {
@@ -641,14 +643,14 @@ fn compare_cache_candidates(
     }
     left.uncached_tokens
         .cmp(&right.uncached_tokens)
-        .then_with(|| loads.compare_prefill_pressure(&left.worker, &right.worker))
+        .then_with(|| loads.compare_prefill_engines(&left.worker, &right.worker))
         .then_with(|| left.worker.id.0.cmp(&right.worker.id.0))
 }
 
 fn cache_pressure_guard_comparable(
     left: &CacheCandidate,
     right: &CacheCandidate,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> bool {
     loads.comparable_get(&left.worker.id).is_some()
         && loads.comparable_get(&right.worker.id).is_some()
@@ -660,7 +662,7 @@ fn materially_more_pressured(
     absolute_threshold_tokens: u64,
     absolute_threshold_ms: Option<f64>,
     relative_threshold: f64,
-    loads: &FreshLoadLookup<'_>,
+    loads: &CandidateLoads<'_>,
 ) -> bool {
     let (Some(candidate_load), Some(other_load)) = (
         loads.comparable_get(&candidate.id),
@@ -687,176 +689,6 @@ fn materially_more_pressured(
         > absolute_threshold_tokens
         && candidate_load.num_waiting_uncached_tokens as f64
             > other_load.num_waiting_uncached_tokens as f64 * relative_threshold
-}
-
-/// Constant-time request view over one captured load snapshot.
-///
-/// External values are compared only when every candidate is present. Mixed
-/// candidate sets use Router-local active load to preserve ordering.
-pub(crate) struct FreshLoadLookup<'a> {
-    by_worker_id: HashMap<String, &'a EngineReportedSchedulingLoad>,
-    basic_by_worker_id: HashMap<String, &'a EngineReportedWorkerLoad>,
-    local_active_by_worker_id: HashMap<String, usize>,
-    compare_engine: bool,
-    compare_basic_engine: bool,
-}
-
-impl<'a> FreshLoadLookup<'a> {
-    pub(crate) fn new<'w>(
-        snapshot: Option<&'a EngineReportedLoadSnapshot>,
-        workers: impl IntoIterator<Item = &'w Arc<Worker>>,
-    ) -> Self {
-        let workers: Vec<&Arc<Worker>> = workers.into_iter().collect();
-        let local_active_by_worker_id: HashMap<String, usize> = workers
-            .iter()
-            .map(|worker| (worker.id.0.clone(), worker.router_inflight_load()))
-            .collect();
-        let by_worker_id = snapshot
-            .into_iter()
-            .flat_map(|snapshot| {
-                workers.iter().filter_map(move |worker| {
-                    snapshot
-                        .fresh_native_cache_load_for_url(&worker.url)
-                        .map(|load| (worker.id.0.clone(), load))
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        let basic_by_worker_id = snapshot
-            .into_iter()
-            .flat_map(|snapshot| {
-                workers.iter().filter_map(move |worker| {
-                    snapshot
-                        .fresh_load_for_url(&worker.url)
-                        .map(|load| (worker.id.0.clone(), load))
-                })
-            })
-            .collect::<HashMap<_, _>>();
-        let compare_engine = !local_active_by_worker_id.is_empty()
-            && by_worker_id.len() == local_active_by_worker_id.len();
-        let compare_basic_engine = !local_active_by_worker_id.is_empty()
-            && basic_by_worker_id.len() == local_active_by_worker_id.len();
-        Self {
-            by_worker_id,
-            basic_by_worker_id,
-            local_active_by_worker_id,
-            compare_engine,
-            compare_basic_engine,
-        }
-    }
-
-    pub(crate) fn get(
-        &self,
-        worker_id: &crate::discovery::WorkerId,
-    ) -> Option<&'a EngineReportedSchedulingLoad> {
-        self.by_worker_id.get(worker_id.0.as_str()).copied()
-    }
-
-    fn comparable_get(
-        &self,
-        worker_id: &crate::discovery::WorkerId,
-    ) -> Option<&'a EngineReportedSchedulingLoad> {
-        self.compare_engine.then(|| self.get(worker_id)).flatten()
-    }
-
-    fn pressure_key(&self, worker: &Arc<Worker>) -> PressureKey<'a> {
-        PressureKey {
-            load: self.comparable_get(&worker.id),
-            local_active: self
-                .local_active_by_worker_id
-                .get(worker.id.0.as_str())
-                .copied()
-                .unwrap_or(usize::MAX),
-        }
-    }
-
-    fn compare_prefill_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
-        match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => compare_prefill_load(left_load, right_load)
-                .then_with(|| left.local_active.cmp(&right.local_active)),
-            _ => left.local_active.cmp(&right.local_active),
-        }
-    }
-
-    fn compare_decode_keys(&self, left: &PressureKey<'a>, right: &PressureKey<'a>) -> Ordering {
-        match (left.load, right.load) {
-            (Some(left_load), Some(right_load)) => compare_decode_load(left_load, right_load)
-                .then_with(|| left.local_active.cmp(&right.local_active)),
-            _ => left.local_active.cmp(&right.local_active),
-        }
-    }
-
-    pub(crate) fn compare_prefill_pressure(
-        &self,
-        left: &Arc<Worker>,
-        right: &Arc<Worker>,
-    ) -> Ordering {
-        self.compare_prefill_keys(&self.pressure_key(left), &self.pressure_key(right))
-    }
-
-    pub(crate) fn prefill_pressure_source(&self) -> &'static str {
-        if self.compare_engine
-            && self
-                .by_worker_id
-                .values()
-                .all(|load| load.estimated_prefill_queue_ms.is_some())
-        {
-            "estimated_prefill_queue_ms"
-        } else if self.compare_engine {
-            "native_queue_tokens"
-        } else {
-            "router_local"
-        }
-    }
-
-    /// Returns a queue depth consistent with admission for this request.
-    ///
-    /// A fully covered candidate set uses `waiting + running`; otherwise the
-    /// whole set uses Router-local active load. Dispatches after the snapshot
-    /// are added to the reported value.
-    pub(crate) fn score_load(&self, worker: &Arc<Worker>) -> usize {
-        self.compare_basic_engine
-            .then(|| self.basic_by_worker_id.get(worker.id.0.as_str()).copied())
-            .flatten()
-            .map(|load| {
-                let recent_dispatches = worker
-                    .slots_acquired_since(load.captured_at)
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                load.num_waiting_reqs
-                    .saturating_add(load.num_running_reqs)
-                    .saturating_add(recent_dispatches)
-                    .try_into()
-                    .unwrap_or(usize::MAX)
-            })
-            .unwrap_or_else(|| {
-                self.local_active_by_worker_id
-                    .get(worker.id.0.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-            })
-    }
-    fn min_by_pressure_key(
-        &self,
-        candidates: Vec<Arc<Worker>>,
-        compare: impl Fn(&Self, &PressureKey<'a>, &PressureKey<'a>) -> Ordering,
-    ) -> Option<Arc<Worker>> {
-        let mut candidates = candidates.into_iter();
-        let mut best = candidates.next()?;
-        let mut best_key = self.pressure_key(&best);
-        for candidate in candidates {
-            let key = self.pressure_key(&candidate);
-            if compare(self, &key, &best_key).is_lt() {
-                best = candidate;
-                best_key = key;
-            }
-        }
-        Some(best)
-    }
-}
-
-struct PressureKey<'a> {
-    load: Option<&'a EngineReportedSchedulingLoad>,
-    local_active: usize,
 }
 
 fn range_fallback(
@@ -901,9 +733,9 @@ fn range_fallback(
     // Scoped to the pool actually ranked: an admitted-but-gated worker
     // missing native monitor data would otherwise downgrade the comparison
     // for the whole unqueued tier to router-local.
-    let loads = FreshLoadLookup::new(Some(snapshot), pool.iter());
+    let loads = CandidateLoads::new(Some(snapshot), pool.iter());
     loads
-        .min_by_pressure_key(pool, FreshLoadLookup::compare_prefill_keys)
+        .select_min_by_load_key(pool, CandidateLoads::compare_prefill_load_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
 }
 
@@ -932,98 +764,10 @@ fn decode_domain_fallback(
         .filter(|worker| is_decode_admitted(worker, request_kv_tokens, snapshot))
         .cloned()
         .collect::<Vec<_>>();
-    let loads = FreshLoadLookup::new(Some(snapshot), admitted.iter());
+    let loads = CandidateLoads::new(Some(snapshot), admitted.iter());
     loads
-        .min_by_pressure_key(admitted, FreshLoadLookup::compare_decode_keys)
+        .select_min_by_load_key(admitted, CandidateLoads::compare_decode_load_keys)
         .map(|worker| (worker, DecisionReason::RangeFallback))
-}
-
-/// Compares prefill pressure by queue time when available, then by the V3 load tuple.
-pub(crate) fn compare_prefill_pressure(
-    left: &Arc<Worker>,
-    right: &Arc<Worker>,
-    snapshot: Option<&EngineReportedLoadSnapshot>,
-) -> Ordering {
-    match snapshot.and_then(|snapshot| {
-        Some((
-            snapshot.fresh_native_cache_load_for_url(&left.url)?,
-            snapshot.fresh_native_cache_load_for_url(&right.url)?,
-        ))
-    }) {
-        Some((left_load, right_load)) => {
-            compare_prefill_load(left_load, right_load).then_with(|| {
-                left.router_inflight_load()
-                    .cmp(&right.router_inflight_load())
-            })
-        }
-        None => left
-            .router_inflight_load()
-            .cmp(&right.router_inflight_load()),
-    }
-}
-
-fn prefill_pressure_key(load: &EngineReportedSchedulingLoad) -> (u64, u64, u64) {
-    (
-        load.num_waiting_uncached_tokens,
-        load.num_waiting_reqs,
-        load.num_running_reqs,
-    )
-}
-
-fn compare_prefill_load(
-    left: &EngineReportedSchedulingLoad,
-    right: &EngineReportedSchedulingLoad,
-) -> Ordering {
-    match (
-        left.estimated_prefill_queue_ms,
-        right.estimated_prefill_queue_ms,
-    ) {
-        (Some(left_ms), Some(right_ms)) => left_ms
-            .total_cmp(&right_ms)
-            .then_with(|| prefill_pressure_key(left).cmp(&prefill_pressure_key(right))),
-        _ => prefill_pressure_key(left).cmp(&prefill_pressure_key(right)),
-    }
-}
-
-/// Compares decode pressure from LoadStat without treating unknown capacity as zero.
-pub(crate) fn compare_decode_pressure(
-    left: &Arc<Worker>,
-    right: &Arc<Worker>,
-    snapshot: Option<&EngineReportedLoadSnapshot>,
-) -> Ordering {
-    match snapshot.and_then(|snapshot| {
-        Some((
-            snapshot.fresh_native_cache_load_for_url(&left.url)?,
-            snapshot.fresh_native_cache_load_for_url(&right.url)?,
-        ))
-    }) {
-        Some((left_load, right_load)) => {
-            compare_decode_load(left_load, right_load).then_with(|| {
-                left.router_inflight_load()
-                    .cmp(&right.router_inflight_load())
-            })
-        }
-        None => left
-            .router_inflight_load()
-            .cmp(&right.router_inflight_load()),
-    }
-}
-
-fn compare_decode_load(
-    left: &EngineReportedSchedulingLoad,
-    right: &EngineReportedSchedulingLoad,
-) -> Ordering {
-    let kv_usage = match (left.max_total_num_tokens, right.max_total_num_tokens) {
-        (left_cap, right_cap) if left_cap > 0 && right_cap > 0 => u128::from(left.num_used_tokens)
-            .saturating_mul(u128::from(right_cap))
-            .cmp(&u128::from(right.num_used_tokens).saturating_mul(u128::from(left_cap))),
-        _ => Ordering::Equal,
-    };
-    left.num_waiting_reqs
-        .cmp(&right.num_waiting_reqs)
-        .then_with(|| left.num_running_reqs.cmp(&right.num_running_reqs))
-        .then(kv_usage)
-        .then_with(|| left.num_used_tokens.cmp(&right.num_used_tokens))
 }
 
 fn pressure_guard_prefers_backup(
@@ -1075,7 +819,7 @@ mod tests {
             url: format!("http://{id}:30000"),
             mode: WorkerMode::Plain,
             model_ids: vec![ModelId("model".into())],
-            bootstrap_port: None,
+            ..Default::default()
         }))
     }
 
@@ -1197,22 +941,6 @@ mod tests {
 
         assert_eq!(decision.selected.id, primary.id);
         assert_eq!(decision.load_snapshot_version, explicit.version);
-    }
-
-    #[test]
-    fn prefill_pressure_uses_waiting_then_running_requests() {
-        let busy = worker("busy");
-        let idle = worker("idle");
-        let loads = snapshot(&[(&busy, 1, 8, 10, 100), (&idle, 9, 2, 90, 100)]);
-        assert!(compare_prefill_pressure(&busy, &idle, Some(&loads)).is_gt());
-    }
-
-    #[test]
-    fn missing_snapshot_uses_local_active_load() {
-        let left = worker("left");
-        let right = worker("right");
-        let _guard = left.load_guard();
-        assert!(compare_prefill_pressure(&left, &right, None).is_gt());
     }
 
     #[test]

@@ -52,9 +52,8 @@ class TestReturnIndexerTopk(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-return-indexer-topk",
             # Cap KV pool so the indexer-topk host buffer (488 KB / token for
             # V3.2) stays bounded; with the default ~600k tokens × 8 procs the

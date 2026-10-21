@@ -70,3 +70,19 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
         super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.longlive2 import (
+        LongLive2SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
+        ],
+    )

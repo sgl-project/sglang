@@ -20,10 +20,10 @@ from sglang.kernels.ops.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -41,7 +41,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
     pass
@@ -136,7 +136,6 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
-    filter_expert: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -190,10 +189,8 @@ def fused_moe_kernel_gptq_awq(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if filter_expert and off_experts == -1:
-        # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
+    if off_experts == -1:
+        # Padding and nonlocal routes both use -1, including without EP.
         write_zeros_to_output(
             c_ptr,
             stride_cm,
@@ -377,12 +374,10 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
     c_sorted: tl.constexpr,
-    filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
     MASK_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
-    LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
@@ -450,16 +445,10 @@ def fused_moe_kernel(
     off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
     off_experts = off_experts_i32.to(tl.int64)
 
-    if filter_expert and off_experts == -1:
-        if FUSE_SWIGLU:
-            # C is the half-width post-activation buffer here. Rows owned by a
-            # filtered expert are never read (the down-GEMM CTA for this block
-            # early-exits before loading A), and an N-wide zero store would run
-            # past the row end into a neighboring token's data.
-            return
-        if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
-            # Write zeros only when this kernel owns the full output; the experimental LoRA
-            # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
+    if off_experts == -1:
+        # The down GEMM never reads inactive sorted or half-width intermediates.
+        # Add/reduce outputs already hold their initial value and must stay intact.
+        if not (c_sorted or FUSE_SWIGLU or FUSE_ADD_TO_OUTPUT or FUSE_SUM_ALL_REDUCE):
             write_zeros_to_output(
                 c_ptr,
                 stride_cm,
@@ -752,9 +741,11 @@ def clear_b_tma_desc_cache() -> None:
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
-    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    Keyed by tensor identity + storage ptr + shape/stride/dtype + tile shape.
     """
     key = (
+        # offload can rebind a Parameter while another tensor reuses its address
+        id(B),
         int(B.data_ptr()),
         tuple(B.shape),
         tuple(B.stride()),
@@ -820,6 +811,7 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
 ) -> None:
+    """Inactive expert IDs are always skipped, including with filter_expert=False."""
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -972,7 +964,6 @@ def invoke_fused_moe_kernel(
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
-            filter_expert=filter_expert,
             **config,
         )
 
@@ -1044,11 +1035,9 @@ def invoke_fused_moe_kernel(
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
             c_sorted=c_sorted,
-            filter_expert=filter_expert,
             swap_ab=swap_ab,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
-            LORA_PRESERVE_BASE=lora_preserve_base,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             FUSE_SWIGLU=fuse_swiglu,
@@ -1286,10 +1275,12 @@ def _fused_append_shared_experts_kernel(
     out_weights_ptr,
     N_BASE,  # runtime scalar
     scale_factor,  # runtime scalar
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1315,22 +1306,35 @@ def _fused_append_shared_experts_kernel(
     ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
     ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
-
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
+    if HAS_PADDING:
+        # Padded rows zero routed ids and all weights.
+        if pid >= tl.load(num_token_non_padded_ptr):
+            ids = tl.zeros([BLOCK_K], dtype=ids.dtype)
+            ws = tl.zeros([BLOCK_K], dtype=ws.dtype)
+            shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
-    topk_ids, topk_weights, num_fused_shared_experts, scale_factor, N=None
+    topk_ids,
+    topk_weights,
+    num_fused_shared_experts,
+    scale_factor,
+    N=None,
+    num_token_non_padded=None,
 ):
+    """Append shared experts and optionally materialize padded rows."""
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1342,6 +1346,8 @@ def fused_append_shared_experts(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_shared_experts_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1349,10 +1355,12 @@ def fused_append_shared_experts(
         out_weights,
         N_BASE=N,
         scale_factor=scale_factor,
+        num_token_non_padded_ptr=ntnp_ptr,
         K=k,
         S=s,
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1377,8 +1385,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
-    Equivalent to fused_append_shared_experts() immediately followed by
-    topk._remap_topk_for_deepep(), but the remap math runs on the rows already
+    Equivalent to topk.remap_topk_for_per_rank_shared_slots() on the same
+    routed columns, but the remap math runs on the rows already
     loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
@@ -1443,7 +1451,7 @@ def fused_append_remap_shared_experts_deepep(
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
-    Replaces the fused_append_shared_experts() + _remap_topk_for_deepep() pair on
+    Fused form of topk.remap_topk_for_per_rank_shared_slots() for
     the aiter/DeepEP-class path. Host computes the scalar remap params so the
     kernel stays branch-free.
     """

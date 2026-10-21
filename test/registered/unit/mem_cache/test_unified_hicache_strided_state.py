@@ -53,10 +53,6 @@ class TestStridedStateDetection(CustomTestCase):
             self.assertTrue(torch.all(dst_view[slot] == 0))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestMambaSlotWiringIsShared(CustomTestCase):
     """Both Mamba factories must install slot allocation and transfer translation.
 
@@ -113,3 +109,7 @@ class TestMambaSlotWiringIsShared(CustomTestCase):
             and node.func.id == "_wire_mamba_slot_allocator"
         }
         self.assertEqual(expected, expected & callers, f"missing: {expected - callers}")
+
+
+if __name__ == "__main__":
+    unittest.main()

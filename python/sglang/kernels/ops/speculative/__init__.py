@@ -6,12 +6,14 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
     ("cache_locs", "assign_extend_cache_locs_func"),
+    ("cache_locs", "assign_extend_cache_locs_uniform_func"),
     ("cache_locs", "generate_draft_decode_kv_indices"),
+    ("cache_locs", "generate_draft_decode_window_kv_indices"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
@@ -21,8 +23,11 @@ _TRITON_KERNELS = [
     ("topk1", "draft_topk1_postprocess"),
     ("ragged_verify_kernels", "pad_verify_lens_to_bucket"),
     ("ragged_verify_kernels", "build_qo_indptr"),
+    ("lilicorr", "lilicorr_topk_lse"),
+    ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
     ("row_argmax", "row_argmax"),
+    ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -33,5 +38,14 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="speculative.div_argmax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 __all__ = []

@@ -75,6 +75,7 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
 
     def test_efa_disables_post_capture_kv_sizing(self):
         cfg = SimpleNamespace(
+            enable_kv_cache_sharding=False,
             enable_unified_memory=False,
             device="cuda",
             dcp_size=1,

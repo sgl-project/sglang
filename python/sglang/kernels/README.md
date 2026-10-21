@@ -4,8 +4,8 @@ This package is the public in-tree import surface for callable kernels, per
 [RFC #29630](https://github.com/sgl-project/sglang/issues/29630).
 
 ```python
-from sglang.kernels.ops.layernorm import rmsnorm
 from sglang.kernels.ops.activation import silu_and_mul
+from sglang.kernels.ops.gemm import fp8_scaled_mm
 from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 ```
 
@@ -13,28 +13,119 @@ from sglang.kernels.ops.kvcache import reshape_and_cache_flash
 
 ```
 sglang/kernels/
-  spec.py        # KernelSpec, KernelBackend, FormatSignature,
-                 # CapabilityRequirement, PlatformInfo
+  spec.py        # KernelSpec, KernelBackend, CapabilityRequirement,
+                 # PlatformInfo
   registry.py    # process-wide KernelRegistry + register_kernel()
   selector.py    # heuristic select_kernel() and cached get_kernel()
   fused_op.py    # BaseFusedOp: per-operator multi-backend contract
+  kernel_api_logging.py  # kernel API crash-debugging decorator
+  numerics.py    # shared numerics helpers for bit-exact Triton kernels
   ops/
     <group>/     # one subpackage per operator group (see list below)
-  jit/           # shared JIT CUDA build/runtime infra: utils/, csrc/,
-                 # include/, __main__ (KERNEL_PATH resolves here)
+  jit/           # shared JIT build/runtime infra: utils/ (incl. the Helion
+                 # runtime helper), csrc/, include/, __main__ (KERNEL_PATH)
+  aot/           # source tree of the AOT `sgl_kernel` wheel (own API and
+                 # packaging; not shipped in the sglang wheel)
+  kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
+  cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
 `diffusion`, `elementwise`, `embeddings`, `gemm`, `grammar`, `kv_canary`,
-`kvcache`, `layernorm`, `lplb`, `mamba`, `memory`, `moe`, `quantization`,
-`sampling`, `speculative`.
+`kvcache`, `layernorm`, `lora`, `lplb`, `mamba`, `memory`, `mm`, `moe`,
+`quantization`, `sampling`, `speculative`.
+
+Place model-specific implementations and tuning data inside the corresponding
+logical operator group, rather than creating a model-specific top-level group
+under `ops/` (a model-named file or subpackage inside a group is fine).
+
+`lora` is its own group because it has a distinct responsibility: the adapter
+kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
+their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental
+TRT-LLM LoRA path whole as `dense/trtllm_lora_temp/` and
+`moe/trtllm_lora_temp/`; the latter includes the FlashInfer overlay and the
+flag-gated routing kernels that `srt/layers/moe/topk.py` reaches.
 
 As of the RFC #29630 finale (#32072) the legacy `sglang.jit_kernel` package has
 been **removed**: its shared build/runtime infra moved to `sglang.kernels.jit`
 and each JIT-backed operator into its group as
-`sglang.kernels.ops.<group>._jit_<op>`. Tests and benchmarks live under
+`sglang.kernels.ops.<group>.<op>` (the old `_jit_` filename prefix was removed
+in #32148). Tests and benchmarks live under
 `test/registered/kernels/` (`ops/<group>/` for tests, `benchmark/<group>/` for
-benchmarks); shared test helpers are in `sglang.test.kernels`.
+benchmarks); shared test helpers are in `sglang.test.kernels`. Standalone scripts
+that are not CI-registered belong in `test/manual/kernels/`, outside the shipped
+operator package. Keep vendored upstream trees under their existing maintenance
+policy.
+
+Classify an operator by its complete public computation, not by the model
+that first used it, and keep a fused operation intact:
+
+- **Collectives win.** Anything that performs a cross-rank collective or
+  reads/writes peer memory (all-reduce, all-gather, reduce-scatter, all-to-all,
+  multicast/NVLS) belongs in `communication`, whatever compute it fuses (GEMM,
+  norm, MoE finalize).
+- **Producer + quantization stays with the producer.** Norm + quant is
+  `layernorm`, activation + quant is `activation`, a GEMM with a quantizing
+  epilogue is `gemm`, MoE dispatch/permute + quant is `moe`. `quantization`
+  holds only pure format conversion: quant, dequant, scale-layout conversion,
+  repack. A quantized GEMM is still a GEMM.
+- **RoPE stays in `attention`**: standalone RoPE, position ids, and QK-norm +
+  RoPE fusions.
+- **`kvcache` owns KV-cache contents**: ops that read or write the cache
+  (store, gather, page copy/move, host transfer, quantize-into-cache, layout
+  conversion, clearing cache/state rows). **`attention` owns the metadata**:
+  page tables, `cu_seqlens`, `kv_indices`, split/schedule tables, and attention
+  index selection. A fused compute + store (e.g. norm + RoPE + quant + store)
+  stays with its compute group.
+- Otherwise: expert routing is `moe`, matrix multiplication (and its tuning
+  data) is `gemm`, normalization is `layernorm`.
+
+Runtime integration that owns process groups, symmetric buffers, workspace
+classes, or model dispatch stays in `srt`: the K3, Muse Spark and SP
+collective-GEMM communication adapters and workspaces live in
+`srt/layers/communication/`, while their callable kernels live in
+`kernels/ops/communication/` and take that state as arguments. Reference/test oracles belong in
+`sglang.test.kernels`, not in an operator module. Tests of runtime state belong
+with the runtime subsystem, even when they need a GPU. Kernel inventory/dispatch
+tests belong in `test/registered/unit/kernels/`.
+
+When moving an operator, update its callers, lazy `KernelSpec` targets and op
+ids, tests, benchmark imports, and tuning-data paths together. Preserve CI
+stage/runner registrations and test cases when splitting files. See the
+[kernel organization skill](../../../.claude/skills/kernel-organization/SKILL.md)
+for the review checklist.
+
+## Agent-generated kernel backends: `kda_kernels/` and `cake_kernels/`
+
+These two directories hold implementations produced by kernel-generating agents
+and will keep growing; they are implementation homes, not operator groups.
+
+- `kda_kernels/` — kernels produced or extended by the Kernel Design Agents
+  (Humanize2) workflow, in CUDA, Triton, or CuTe DSL, with their JIT sources in
+  `kda_kernels/csrc/`. `KernelBackend.KDA` records that provenance.
+- `cake_kernels/` — thin adapters to Cake-generated kernels that FlashInfer
+  distributes (generated sources and caches stay in FlashInfer).
+  `KernelBackend.CAKE` records that provenance.
+
+Their public ops are registered into the logical groups with
+`KernelSpec(op="<group>.<name>", backend=..., target="sglang.kernels.kda_kernels.<mod>:<fn>")`
+(or a `cake_kernels` target), and runtime code imports the `ops.<group>`
+facade, never these packages. Put a new agent-generated kernel in the matching
+directory and register it with that directory's backend (`KDA` or `CAKE`),
+whatever language it is written in (see `kda_kernels/README.md`);
+`test_kernels_namespace.py` enforces the pairing. List them from the registry
+by backend:
+
+```python
+import sglang.kernels.ops  # populate the registry
+from sglang.kernels import KernelBackend, registry
+
+agent_kernels = [
+    spec
+    for spec in registry.all_specs()
+    if spec.backend in (KernelBackend.KDA, KernelBackend.CAKE)
+]
+```
 
 ## How it works
 
@@ -60,7 +151,7 @@ explicitly, e.g.:
 
 ```python
 from sglang.kernels import select_kernel, KernelBackend
-jit_rmsnorm = select_kernel("layernorm.rmsnorm", backend=KernelBackend.JIT).load()
+jit_moe_align = select_kernel("moe.moe_align_block_size", backend=KernelBackend.JIT).load()
 ```
 
 ## `BaseFusedOp` — the unified operator contract
@@ -77,6 +168,7 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
+    `forward_helion` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared
@@ -93,8 +185,11 @@ Dispatch priority, highest first: explicit `forward(..., backend=...)` →
 global forced backend (`SGLANG_FORCE_FUSED_OP_BACKEND`) → OOT platform
 override → declared optimized kernel backends by `priority` (filtered by
 `backend_eligible()`, a `CapabilityRequirement`-vs-`PlatformInfo` check
-extensible with per-call shape/dtype gates) → platform-specific forward →
-`forward_native`. The static part of the decision is resolved once and cached
+extensible with per-call applicability gates) → platform-specific forward →
+`forward_native`. A gate only answers whether the kernel covers these operands,
+so that falling through is a correct way to compute the same result; operands
+that violate the op's contract (mismatched shapes or devices) are a caller bug
+that the backend's launcher must raise, not a reason to fall back. The static part of the decision is resolved once and cached
 on the instance, so the hot path stays a single indirect call.
 
 `BaseFusedOp` also owns the torch.compile mode protocol
@@ -108,12 +203,16 @@ module-level instances, so the import surface is unchanged; each instance also
 registers all of its backends as `KernelSpec`s so the registry inventory and
 `select_kernel(..., backend=...)` keep working.
 
+An op that is built per layer around the model's own modules (e.g. the Muse
+Spark norms) has no module-level instance; its group registers each backend
+method as `module:Class.forward_<backend>` for the inventory.
+
 What this buys (see the
 [RFC discussion](https://github.com/sgl-project/sglang/issues/29630#issuecomment-4920387930)):
 
 - **Unified correctness testing** — a generic harness enumerates
   `available_backends()` and asserts each one matches `forward_native`
-  (`test/registered/kernels/ops/layernorm/test_fused_op_gpu_parity.py`); new
+  (`test/registered/kernels/ops/activation/test_fused_op_gpu_parity.py`); new
   backends are picked up automatically.
 - **One-switch debugging** — `SGLANG_FORCE_FUSED_OP_BACKEND=torch` (or
   `set_fused_op_backend(KernelBackend.TORCH)`) flips *every* fused op to its

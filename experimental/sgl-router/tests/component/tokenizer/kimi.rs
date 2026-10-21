@@ -41,4 +41,11 @@ fn kimi_tokens_match_sglang() {
     }
     let request = json!({"messages":[{"role":"user","content":"hi"}], "chat_template_kwargs":{"thinking_effort":null}});
     assert!(formatter.encode(&tokenizer, &request).is_err());
+    // SGLang's `_validate_request` rejects a required tool_choice without tools.
+    let request = json!({"messages":[{"role":"user","content":"hi"}], "tool_choice":"required"});
+    assert!(formatter.encode(&tokenizer, &request).is_err());
+    // Media renders on the engine; the router never forwards ids for it.
+    let image = json!({"type":"image_url","image_url":{"url":"https://example.com/a.png"}});
+    let request = json!({"messages":[{"role":"user","content":[image]}]});
+    assert!(formatter.encode(&tokenizer, &request).is_err());
 }

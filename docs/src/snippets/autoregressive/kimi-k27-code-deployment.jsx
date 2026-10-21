@@ -137,7 +137,6 @@ export const KimiK27CodeDeployment = () => {
         'SGLANG_USE_AITER=1',
         'HIP_FORCE_DEV_KERNARG=1',
         'SGLANG_EXPERT_PARALLEL_SIZE=1',
-        'SGLANG_USE_DYNAMIC_MXFP4_LINEAR=0',
         'TORCH_BLAS_PREFER_HIPBLASLT=1',
         'TENSILE_STREAMK_DYNAMIC_GRID=6',
         'AITER_QUICK_REDUCE_QUANTIZATION=INT4',
@@ -179,7 +178,7 @@ export const KimiK27CodeDeployment = () => {
     cmd += ' \\\n  --trust-remote-code';
 
     if (dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
     }
 
     if (reasoning === 'enabled') {
@@ -190,13 +189,13 @@ export const KimiK27CodeDeployment = () => {
       cmd += ' \\\n  --tool-call-parser kimi_k2';
     }
 
-    const usesTokenspeedMla = hardware === 'b300' || hardware === 'gb300';
+    const usesCutedslMla = hardware === 'b300' || hardware === 'gb300';
 
-    if (usesTokenspeedMla) {
-      cmd += ' \\\n  --attention-backend tokenspeed_mla';
+    if (usesCutedslMla) {
+      cmd += ' \\\n  --attention-backend cutedsl_mla';
     }
 
-    if (isAMD || usesTokenspeedMla) {
+    if (isAMD || usesCutedslMla) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 

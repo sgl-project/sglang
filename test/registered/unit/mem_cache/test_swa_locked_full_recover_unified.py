@@ -24,7 +24,7 @@ The recovery must succeed rather than decline: the TreeCore insert walk counts
 the node in `prefix_len` regardless of component consumption, while the SWA
 match validator rejects a `value is None` node, so a declined recovery reports
 a prefix `match_prefix` cannot honor and trips
-`new_prefix_len <= len(new_indices)` in `cache_unfinished_req`.
+`new_prefix_len <= len(new_indices)` in `checkpoint`.
 """
 
 import unittest
@@ -35,7 +35,10 @@ from test_multi_ended_allocator import _FakeUnifiedSWAKVPool  # sibling fixture
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_cache.cache_action import RecoverSWAWithLockedFull
+from sglang.srt.mem_cache.unified_cache.cache_action import (
+    RecoverEvictedSWA,
+    RecoverSWAWithLockedFull,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
@@ -126,6 +129,9 @@ class _StaticAllocRecorder:
         # must apply it for the mapping asserts to observe anything.
         self.mapping_calls.append((full, swa))
         self.full_to_swa_index_mapping[full.to(torch.int64)] = swa.to(torch.int64)
+
+    def translate_swa_indices_for_transfer(self, full):
+        return self.translate_loc_from_full_to_swa(full)
 
     def clear_full_to_swa_mapping(self, full):
         self.clear_calls.append(full)
@@ -287,6 +293,66 @@ class TestStaticPoolPathUnchanged(unittest.TestCase):
         self.assertEqual(static.freed_via_inner, [])
         ((node_id, ct, _),) = probe.tree_core.set_calls
         self.assertEqual((node_id, ct), (3, _SWA))
+
+
+class TestRecoverEvictedSWAHandler(_RecoverTestBase):
+    """`RecoverEvictedSWA` is the mapping-only step of locked-full recovery:
+    the node's ids adopt the incoming swa pages, while the incoming FULL ids
+    and the node's device value stay with the caller. Folding either into the
+    shared step would double-free under a tree core that still owns them."""
+
+    def test_unified_pool_moves_ownership_and_frees_nothing(self):
+        probe, allocator = self._probe()
+        swa = allocator.swa_attn_allocator
+        kept, incoming = self._two_ranges(allocator)
+        allocator.free_swa(kept)  # what eviction does when it tombstones
+        swa_live = swa.allocated_count()
+        full_avail = allocator.full_attn_allocator.available_size()
+
+        probe.apply_component_action(
+            RecoverEvictedSWA(
+                component_type=_SWA, kept_full=kept, incoming_full=incoming
+            )
+        )
+
+        self.assertTrue(
+            bool((allocator.translate_loc_from_full_to_swa(kept) > 0).all()),
+            "the node's ids must address live swa pages after recovery",
+        )
+        self.assertTrue(
+            bool((swa.virtual_to_physical[incoming.to(torch.int64)] == -1).all()),
+            "the incoming ids' swa side must be tombstoned",
+        )
+        self.assertEqual(swa.allocated_count(), swa_live, "ownership only moved")
+        self.assertEqual(
+            allocator.full_attn_allocator.available_size(),
+            full_avail,
+            "the incoming FULL side belongs to the caller",
+        )
+        self.assertEqual(probe.tree_core.set_calls, [], "publication is the caller's")
+
+    def test_static_allocator_moves_the_mapping_and_frees_nothing(self):
+        static = _StaticAllocRecorder()
+        probe = _Probe.__new__(_Probe)
+        probe.cache = _Cache(static)
+        probe.tree_core = _StubTreeCore()
+
+        kept = torch.tensor([1, 2], dtype=torch.int64)
+        incoming = torch.tensor([5, 6], dtype=torch.int64)
+        donated = static.full_to_swa_index_mapping[incoming].clone()
+        probe.apply_component_action(
+            RecoverEvictedSWA(
+                component_type=_SWA, kept_full=kept, incoming_full=incoming
+            )
+        )
+
+        self.assertEqual(
+            static.full_to_swa_index_mapping[kept].tolist(), donated.tolist()
+        )
+        self.assertEqual(len(static.clear_calls), 1, "incoming must be tombstoned")
+        self.assertEqual(static.freed_full, [])
+        self.assertEqual(static.freed_via_inner, [])
+        self.assertEqual(probe.tree_core.set_calls, [])
 
 
 if __name__ == "__main__":

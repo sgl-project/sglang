@@ -8,8 +8,9 @@
 // multi-step-trained MTP head. Multimodal (text + image in, text out).
 //
 // Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
-// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node), NVFP4
-// runs on a single GPU, and the AMD cells run TP8. That fits because 6B active
+// four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node).
+// Both RadixArk and NVIDIA NVFP4 recipes use TP1. The AMD cells run TP8.
+// That fits because 6B active
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
 // checkpoint does not fit one 128 GB unified-memory box with the N-gram table
@@ -44,7 +45,7 @@ export const config = {
   // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
   // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
   // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
-  // one has recipes for the DGX Spark pair and the single RTX PRO 6000.
+  // one has recipes for B200/B300/GB300, DGX Spark and the single RTX PRO 6000.
   quantizations: [
     { id: "bf16",       label: "BF16"         },
     { id: "fp8",        label: "FP8"          },
@@ -102,16 +103,22 @@ export const config = {
           disableReason: (sel) => sel.hw === "rtx6000"
             ? "RTX PRO 6000 (96 GB) only fits this checkpoint with the 47.7 GiB FP8 N-gram table in pinned host RAM; the verified cells pass --ple-offload-embedding explicitly, so On is the only pick."
             : "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). The verified settings are Off for the two-node cells and On (NVMe file) for a single Spark.",
-          hints: ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
+          hints: (sel) => sel.hw === "gb300" && sel.quant === "nvfp4-nvda" && sel.strategy === "low-latency"
+            ? ["PLE Offload: enabled in the GB300 base recipe; reserve approximately 48 GiB of host RAM in addition to the 224 GiB HiCache pool."]
+            : ["PLE Offload: auto-enabled for BF16 on CUDA, off otherwise"] },
         { id: "on",   label: "On",
           disabled: (sel) => sel.hw === "dgx-spark",
           disableReason: "DGX Spark is unified memory: PLE offload to RAM frees nothing (the pinned table shares the 128 GB pool with the weights). The verified settings are Off for the two-node cells and On (NVMe file) for a single Spark.",
+          stripPrefixes: (sel) => sel.hw === "gb300" && sel.quant === "nvfp4-nvda" && sel.strategy === "low-latency"
+            ? ["--ple-offload-embedding"] : [],
           flags: ["--ple-offload-embedding"] },
         { id: "off",  label: "Off",
           disabled: (sel) => sel.hw === "rtx6000" || (sel.hw === "dgx-spark" && sel.nodes === "single"),
           disableReason: (sel) => sel.hw === "dgx-spark"
             ? "A single DGX Spark cannot hold the 126 GiB checkpoint in its 128 GB of unified memory; the verified single-Spark cells keep the 47.7 GiB FP8 N-gram table in a file on the local NVMe (On (NVMe file))."
             : "RTX PRO 6000 (96 GB) cannot hold the 47.7 GiB FP8 N-gram table alongside the other 78 GiB of the checkpoint; the table must be offloaded to pinned host RAM (On).",
+          stripPrefixes: (sel) => sel.hw === "gb300" && sel.quant === "nvfp4-nvda" && sel.strategy === "low-latency"
+            ? ["--ple-offload-embedding", "--ple-offload-backend"] : [],
           flags: ["--no-ple-offload-embedding"] },
         // File-backed table (sgl-project/sglang#37068, merged into qwen4-main-squashed):
         // a sparse 47.7 GiB file under $SGLANG_CACHE_DIR/ple/<model> (override
@@ -177,9 +184,10 @@ export const config = {
     ["mmmu_pro_pct", "MMMU-Pro", "%"],
   ],
 
-  // Launch images — this is a day-0 model with no release cut, so both tags are
-  // purpose-built rather than a version. The ROCm build targets CDNA4 (gfx950)
-  // and is not interchangeable with the CUDA one.
+  // Launch images — the CUDA datacenter cells run the v0.5.22 release (the first
+  // with --qsa-indexer-dtype); DGX Spark, RTX PRO 6000 and ROCm keep their
+  // purpose-built tags. The ROCm build targets CDNA4 (gfx950) and is not
+  // interchangeable with the CUDA one.
   // Prepended as `# ...` comments above multi-node commands.
   multiNodeHints: {
     "dgx-spark": [
@@ -192,16 +200,16 @@ export const config = {
   },
 
   dockerImages: {
-    h200:   "lmsysorg/sglang:qwen38flashnext",
+    h200:   "lmsysorg/sglang:latest",
     // DGX Spark and RTX PRO 6000 recipes need the qwen4-main-squashed build
     // (4ccff141db: #38121 mixed-precision loader, file-backed PLE table, and the
     // #36811/#38290 router PDL fix for the GB10 MTP collapse); none of them run
     // on the qwen38flashnext image.
     "dgx-spark": "lmsysorg/sglang:dev-qwen38-next-local",
     rtx6000: "lmsysorg/sglang:dev-qwen38-next-local",
-    b200:   "lmsysorg/sglang:qwen38flashnext",
-    b300:   "lmsysorg/sglang:qwen38flashnext",
-    gb300:  "lmsysorg/sglang:qwen38flashnext",
+    b200:   "lmsysorg/sglang:latest",
+    b300:   "lmsysorg/sglang:latest",
+    gb300:  "lmsysorg/sglang:latest",
     mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
     mi355x: "lmsysorg/sglang-rocm:qwen38flashnext",
   },
@@ -290,6 +298,8 @@ export const config = {
         "--linear-attn-decode-backend flashinfer",
         "--linear-attn-verify-backend triton",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -314,6 +324,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -331,6 +343,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -354,6 +368,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -371,6 +387,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -394,6 +412,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -412,6 +432,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -435,6 +457,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -459,6 +483,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -477,6 +503,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -495,6 +523,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -513,6 +543,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -532,6 +564,8 @@ export const config = {
         "--linear-attn-decode-backend flashinfer",
         "--linear-attn-verify-backend triton",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -554,6 +588,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -576,6 +612,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -598,6 +636,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -631,6 +671,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -650,6 +692,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -665,6 +709,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -684,6 +730,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -699,6 +747,8 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--speculative-algorithm NEXTN",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -718,6 +768,168 @@ export const config = {
         "--linear-attn-prefill-backend flashinfer",
         "--linear-attn-decode-backend flashinfer",
         "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export, and v0.5.22 or later for --qsa-indexer-dtype. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "b200", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export, and v0.5.22 or later for --qsa-indexer-dtype. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export, and v0.5.22 or later for --qsa-indexer-dtype. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "b300", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export, and v0.5.22 or later for --qsa-indexer-dtype. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
+        "--reasoning-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-nvda", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      verificationStatus: (sel) => sel.pleOffload === "off" ? "unverified" : "verified",
+      warn: "Long-context recipe: reserve 224 GiB of host RAM for HiCache, approximately 48 GiB for pinned PLE offload, and loading headroom. See the [Agentic Long-Context Deployment](#agentic-long-context-deployment) section for the qualified launch. The Docker wrapper is adapted from the qualified Slurm/Enroot launch, which ran v0.5.21 with a BF16 KV cache and BF16 QSA indexer; this recipe uses FP8 for both.",
+      env: [
+        "PYTHONNOUSERSITE=1",
+        "PYTHONUNBUFFERED=1",
+        "NO_COLOR=1",
+        "SGLANG_TIMEOUT_KEEP_ALIVE=1800",
+        "SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE=0",
+      ],
+      // Omit defaults: TP/PP/DP/EP=1,
+      // model-name and draft-MoE inheritance, full decode graphs, and
+      // the standard Mamba, HiCache, PLE, tokenizer and scheduler settings.
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--moe-runner-backend flashinfer_trtllm",
+        "--disable-shared-experts-fusion",
+        "--revision fc694b54fb0174e0913e6adf86691ef85a4ead47",
+        "--speculative-draft-model-revision fc694b54fb0174e0913e6adf86691ef85a4ead47",
+        "--trust-remote-code",
+        "--quantization modelopt_mixed",
+        "--context-length 262144",
+        "--attention-backend trtllm_mha",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--linear-attn-verify-backend triton",
+        "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
+        "--mamba-radix-cache-strategy extra_buffer_lazy",
+        "--max-mamba-cache-size 480",
+        "--mem-fraction-static 0.88",
+        "--max-running-requests 96",
+        "--page-size 64",
+        "--chunked-prefill-size 16384",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--enable-linear-replayssm-spec",
+        "--cuda-graph-backend-prefill disabled",
+        "--cuda-graph-max-bs-decode 96",
+        "--cuda-graph-bs-decode 1 2 4 8 16 24 32 40 48 56 64 72 80 88 96",
+        "--enable-hierarchical-cache",
+        "--hicache-size 224",
+        "--hicache-write-policy write_back",
+        "--ple-offload-embedding",
+        "--enable-metrics",
+        "--enable-cache-report",
+        "--reasoning-parser auto",
+        "--decode-log-interval 10",
+        "--stream-interval 20",
+        "--watchdog-timeout 1800",
+        "--random-seed 35",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4-nvda", strategy: "high-throughput", nodes: "single" },
+      verified: false,
+      warn: "Requires SGLang v0.5.20 or later for this NVIDIA ModelOpt MIXED_PRECISION export, and v0.5.22 or later for --qsa-indexer-dtype. Quantization and MoE backends are selected automatically from the checkpoint.",
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 1",
+        "--linear-attn-prefill-backend flashinfer",
+        "--linear-attn-decode-backend flashinfer",
+        "--mamba-ssm-dtype bfloat16",
+        "--kv-cache-dtype fp8_e4m3",
+        "--qsa-indexer-dtype fp8_e4m3",
         "--reasoning-parser auto",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
