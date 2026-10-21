@@ -25,7 +25,11 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 _NPU_ACCURACY_TOLERANCE = 0.99
 _NPU_MAX_ACCURACY_ATTEMPTS = 3
 
-_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
+# Nightly is also PR-triggered, so key on GITHUB_WORKFLOW_REF; empty locally = non-PR.
+_workflow_ref = os.environ.get("GITHUB_WORKFLOW_REF", "")
+_is_pr_pipeline = bool(_workflow_ref) and (
+    "/.github/workflows/nightly-test-npu.yml" not in _workflow_ref
+)
 
 
 def run_npu_pr_smoke(base_url):

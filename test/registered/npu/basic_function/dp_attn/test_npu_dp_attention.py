@@ -77,8 +77,10 @@ class TestDPAttentionMixedChunk(
 ):
     # Use full GSM8K dataset to avoid sampling variance.
     gsm8k_num_examples = 1319
-    # Moonlight bf16 GSM8K baseline is ~0.837.
+    # TODO: re-calibrate for sgl_eval (Moonlight bf16 baseline ~0.837).
     gsm8k_accuracy_thres = 0.83
+    gsm8k_backend = "sgl_eval"
+    gsm8k_max_tokens = 4096
 
     @classmethod
     def setUpClass(cls):
