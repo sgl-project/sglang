@@ -1071,8 +1071,8 @@ class BeamModel(nn.Module):
             if architecture == 9
             else (64, 64)
         )
-        # GB300 TP4 batch64 failed the trained-model decode consistency gate.
-        # Keep its original reduction/norm until the fused norm tree is aligned.
+        # On GB300 TP4 the fused norm's reduction order changed trained-model
+        # decode output at 64 tokens; cap it at 32 until the orders match.
         if capability == (10, 3) and parallel.tp_size == 4:
             attention_max_tokens = min(attention_max_tokens, 32)
             topk_max_tokens = min(topk_max_tokens, 32)
