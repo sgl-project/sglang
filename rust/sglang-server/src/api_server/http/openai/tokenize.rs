@@ -305,6 +305,7 @@ mod tests {
                 .unwrap(),
             ),
             generate_hook: None,
+            openai_chat: None,
         })
     }
 

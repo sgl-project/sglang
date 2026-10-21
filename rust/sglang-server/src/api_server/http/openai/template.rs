@@ -27,28 +27,37 @@ pub(super) fn render_chat(
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
     let args = TemplateArgs::new(&body, defaults);
-    let through_template = || {
-        formatter
+    match render_body(formatter, body, defaults) {
+        // Formatters without an SGLang request path render through their
+        // template, and so do the valid requests that path declines, which
+        // only the engine renders; one with no other path declines them again.
+        Some(Err(TemplateError::NeedsRenderFallback { .. })) | None => formatter
             .render_template(request, &args)
             .map(|prompt| RenderedChat {
                 prompt,
                 continuation: String::new(),
-            })
-    };
+            }),
+        Some(rendered) => rendered,
+    }
+}
+
+/// Render the raw body as SGLang does, retaining the continuation boundary.
+pub(super) fn render_body(
+    formatter: &ChatFormatter,
+    body: Value,
+    defaults: &ChatTemplateKwargs,
+) -> Option<Result<RenderedChat, TemplateError>> {
     if !formatter.renders_requests() {
-        return through_template();
+        return None;
     }
-    match formatter.render_request(body, defaults) {
-        Ok((prompt, continuation)) => Ok(RenderedChat {
-            prompt,
-            continuation,
-        }),
-        // The SGLang path declines some valid requests only the engine renders;
-        // with no engine here, the formatter's template renders them (one
-        // with no other path declines them again).
-        Err(TemplateError::NeedsRenderFallback { .. }) => through_template(),
-        Err(error) => Err(error),
-    }
+    Some(
+        formatter
+            .render_request(body, defaults)
+            .map(|(prompt, continuation)| RenderedChat {
+                prompt,
+                continuation,
+            }),
+    )
 }
 
 #[cfg(test)]

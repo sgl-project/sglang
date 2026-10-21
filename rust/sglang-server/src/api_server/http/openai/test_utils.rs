@@ -114,6 +114,7 @@ pub(super) fn app_state(core: CoreHandle) -> Arc<super::AppState> {
         server_args,
         chat_formatter: None,
         generate_hook: None,
+        openai_chat: None,
     })
 }
 
@@ -143,13 +144,14 @@ pub(super) fn frontend_closed() -> CoreHandle {
 /// `ok` chunk, with the ChatML template so chat can render.
 fn answering_app_state() -> Arc<super::AppState> {
     let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
-    answering_app_state_with(server_args(), formatter.unwrap(), "ok")
+    answering_app_state_with(server_args(), formatter.unwrap(), None, "ok")
 }
 
 /// App state whose core intake answers every generation with one finished `text` chunk.
 pub(super) fn answering_app_state_with(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     text: &'static str,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
@@ -173,9 +175,17 @@ pub(super) fn answering_app_state_with(
             metrics: None,
         },
     );
+    // The test tokenizers add no specials, so one handle serves both modes.
+    let tokenizer = tokenizer.map(|tokenizer| {
+        Arc::new(sglang_processor::DynamoTokenizer::new(
+            tokenizer.clone(),
+            tokenizer,
+        ))
+    });
     Arc::new(super::AppState {
         core,
         generation_policy: crate::message::request::GenerationPolicy::from(server_args.as_ref()),
+        openai_chat: tokenizer.map(|t| super::OpenAiChat::new(&server_args, &formatter, t)),
         server_args,
         chat_formatter: Some(formatter),
         generate_hook: None,

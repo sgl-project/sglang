@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -33,6 +34,7 @@ use sglang_processor::{
 };
 
 use super::completions::completion_usage;
+use super::lowered;
 use super::pd_routing::PDRoutingFields;
 use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
@@ -81,14 +83,18 @@ impl<'de> Deserialize<'de> for ChatBody {
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatBody>, JsonRejection>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    if let Some(response) = lowered::chat(&state, &headers, &body).await {
+        return response;
+    }
     let ChatBody {
         request: ChatRequest {
             request, routing, ..
         },
         raw,
-    } = match body {
+    } = match Json::from_bytes(&body) {
         Ok(Json(body)) => body,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -1104,6 +1110,7 @@ mod tests {
         let state = super::super::test_utils::answering_app_state_with(
             std::sync::Arc::new(args),
             super::super::ChatFormatter::DeepSeekV41,
+            None,
             " 391.",
         );
         let response = super::super::test_utils::post_json(
@@ -1136,6 +1143,7 @@ mod tests {
         let state = super::super::test_utils::answering_app_state_with(
             std::sync::Arc::new(args),
             super::super::ChatFormatter::KimiK3,
+            None,
             "Hello!",
         );
         let messages = serde_json::json!([{"role": "user", "content": "Hi"}]);
@@ -1323,6 +1331,7 @@ mod tests {
                 server_args: args,
                 chat_formatter: Some(super::super::ChatFormatter::KimiK3),
                 generate_hook: None,
+                openai_chat: None,
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
