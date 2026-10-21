@@ -11,6 +11,7 @@ import time
 import uuid
 from collections import Counter, deque
 from concurrent.futures import Future
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from queue import Empty, Queue
 
@@ -32,7 +33,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
 )
-from sglang.srt.runtime_context import get_memory, get_model, get_parallel
+from sglang.srt.runtime_context import get_memory, get_model, get_parallel, get_stream
 
 logger = logging.getLogger(__name__)
 
@@ -210,8 +211,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
     def _run(self):
         try:
             buffer = self.pool_group.entries[0].kv_buffer[0]
+            self._prepare_stream = None
             if buffer.is_cuda:
                 torch.cuda.set_device(buffer.device)
+                self._prepare_stream = get_stream("kvcr_offload_prepare")
             self._runtime = self._make_runtime()
             self._started.set_result(None)
         except BaseException as error:
@@ -522,7 +525,15 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return True
 
     def _prepare_offload(self, transfers):
-        prepared = self.layout.prepare(list(transfers), allow_partial=True)
+        # The producer event is ready, but later compute may already occupy its
+        # stream. Index readback must not stall the KVCR progress owner behind it.
+        context = (
+            torch.cuda.stream(self._prepare_stream)
+            if self._prepare_stream is not None
+            else nullcontext()
+        )
+        with context:
+            prepared = self.layout.prepare(list(transfers), allow_partial=True)
         return self.layout.mappings(prepared)
 
     def _fail_batch(self, batch, error, *, fatal=False):
