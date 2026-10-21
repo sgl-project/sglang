@@ -1874,6 +1874,12 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
             .map_err(node_access_error)
     }
 
+    /// The parent node's external handle, or None for the root.
+    fn parent_node_id(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<NodeId>> {
+        py.detach(|| self.core().parent_node_id(node_id))
+            .map_err(node_access_error)
+    }
+
     /// The node's last page hash, or None when it was never hashed.
     fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
         py.detach(|| self.core().get_last_hash_value(node_id))
@@ -2353,15 +2359,6 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
 impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
     fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> bool {
         py.detach(|| self.core().inspect_contains_node(node_id))
-    }
-
-    fn inspect_get_parent_node_id(
-        &self,
-        py: Python<'_>,
-        node_id: NodeId,
-    ) -> PyResult<Option<NodeId>> {
-        py.detach(|| self.core().inspect_get_parent_node_id(node_id))
-            .map_err(node_access_error)
     }
 
     fn inspect_get_child_node_ids(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Vec<NodeId>> {
@@ -3270,6 +3267,11 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.is_root(py, node_id))
             }
 
+            /// The parent node's external handle, or None for the root.
+            fn parent_node_id(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<NodeId>> {
+                catch_native_panic(|| self.inner.parent_node_id(py, node_id))
+            }
+
             /// The node's last page hash, or None when it was never hashed.
             fn get_last_hash_value(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<String>> {
                 catch_native_panic(|| self.inner.get_last_hash_value(py, node_id))
@@ -3618,15 +3620,6 @@ macro_rules! tree_core_binding {
             #[cfg(feature = "inspection")]
             fn inspect_contains_node(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.inspect_contains_node(py, node_id)))
-            }
-
-            #[cfg(feature = "inspection")]
-            fn inspect_get_parent_node_id(
-                &self,
-                py: Python<'_>,
-                node_id: NodeId,
-            ) -> PyResult<Option<NodeId>> {
-                catch_native_panic(|| self.inner.inspect_get_parent_node_id(py, node_id))
             }
 
             #[cfg(feature = "inspection")]
