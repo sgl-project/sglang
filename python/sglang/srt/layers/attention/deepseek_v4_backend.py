@@ -3272,6 +3272,12 @@ class DeepseekV4AttnBackend(
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
+        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
+            # DP attention pads an eager extend past the rows extend_seq_lens cover.
+            num_real = hoisted_pos.shape[0]
+            x, positions = x[:num_real], positions[:num_real]
+            if q_lora is not None:
+                q_lora = q_lora[:num_real]
         if (
             hoisted_req is not None
             and hoisted_pos is not None
@@ -3941,10 +3947,15 @@ class DeepseekV4AttnBackend(
         )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
-        """Idle always re-translates at store time: its metadata may be stale, and
-        translating the zero-padded out_cache_loc writes to the dummy slot."""
+        """Idle never trusts its metadata, which may be stale or unset: it writes
+        the request window's idle layout, or translates the zero-padded
+        out_cache_loc to the dummy slot."""
         metadata = self.forward_metadata
         if self.token_to_kv_pool.request_window is not None:
+            if forward_batch.forward_mode.is_idle():
+                return self.token_to_kv_pool.request_window.activate_idle(
+                    forward_batch.out_cache_loc.shape[0]
+                )
             layout = metadata.core_attn_metadata.request_window_layout
             self.token_to_kv_pool.request_window.activate(layout)
             return layout.write_loc
@@ -4644,6 +4655,7 @@ class DeepseekV4AttnBackend(
             request_layout = window_layout(
                 req_pool_indices_repeated[:live],
                 raw_positions[:live],
+                zero_row=self.token_to_kv_pool.request_window.zero_row,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,

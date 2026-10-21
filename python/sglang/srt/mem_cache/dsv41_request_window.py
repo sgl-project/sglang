@@ -29,6 +29,9 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_pos: torch.Tensor
     history_loc: torch.Tensor
     history_valid: torch.Tensor
+    # Window row each history slot copies from (zero_row when invalid); every
+    # layer reads the same rows, so the layout computes them once.
+    history_src: torch.Tensor
     commit_mask: torch.Tensor
     size: int
 
@@ -59,6 +62,7 @@ class WindowLayout(msgspec.Struct, frozen=True):
         self.history_pos.copy_(other.history_pos)
         self.history_loc.copy_(other.history_loc)
         self.history_valid.copy_(other.history_valid)
+        self.history_src.copy_(other.history_src)
         self.commit_mask.copy_(other.commit_mask)
 
 
@@ -83,6 +87,7 @@ def window_layout(
     req,
     pos,
     *,
+    zero_row: int,
     window: int = 128,
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
@@ -134,6 +139,9 @@ def window_layout(
         history_valid &= history_pos >= g_floor.repeat_interleave(window)
     history_req = g_req.repeat_interleave(window)
     history_loc = torch.arange(history_rows, device=device)
+    history_src = torch.where(
+        history_valid, history_req * capacity + history_pos % capacity, zero_row
+    )
 
     commit_mask = (group_last - offset) < capacity
     if padded_rows is not None and padded_rows > n:
@@ -166,6 +174,7 @@ def window_layout(
         history_pos,
         history_loc,
         history_valid,
+        history_src,
         commit_mask,
         history_rows + n,
     )
@@ -213,6 +222,7 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self._idle_layout = None
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -253,6 +263,24 @@ class RequestWindow:
                 f"for a layout of {layout.size}"
             )
 
+    def activate_idle(self, num_rows: int) -> torch.Tensor:
+        """Activate a layout for an idle forward, whose attention metadata is
+        stale or unset. Its rows write the workspace past an empty history, and
+        an idle forward never commits them."""
+        layout = self._idle_layout
+        if layout is None or layout.pos.numel() != num_rows:
+            zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
+            layout = window_layout(
+                zeros,
+                zeros,
+                zero_row=self.zero_row,
+                capacity=self.capacity,
+                num_groups=1,
+            )
+            self._idle_layout = layout
+        self.activate(layout)
+        return layout.write_loc
+
     def initialize_dummy_history(self):
         layout = self.layout
         self.tags.fill_(-1)
@@ -261,13 +289,6 @@ class RequestWindow:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
-
-    def _history_src(self, layout):
-        return torch.where(
-            layout.history_valid,
-            self.row_loc(layout.history_req, layout.history_pos),
-            self.zero_row,
-        )
 
     def buffer(self, layer):
         # The runner's capture scope includes eager warmups before CUDA capture
@@ -278,7 +299,7 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_src(layout)
+            src = layout.history_src
             # Signal-only: skip building the predicate when detection is off.
             if not in_capture and resolve_level() >= InvariantCheckLevel.WARN:
                 expect(

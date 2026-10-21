@@ -979,6 +979,9 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
+    # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
+    # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
+    SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
@@ -1169,8 +1172,8 @@ class Envs:
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
-    SGLANG_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
-    SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
+    SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
+    SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1475,8 +1478,8 @@ class Envs:
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
-    SGLANG_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
-    SGLANG_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
+    SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
+    SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
