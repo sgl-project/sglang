@@ -37,9 +37,7 @@ def _silu_mul_add_delta_kernel(
     if HAS_ROUTING:
         token = row // ROUTER_TOPK
         route = row % ROUTER_TOPK
-        if tl.load(topk_ids_ptr + token * stride_im + route * stride_ik) < 0:
-            # The down consumers skip this private activation row as well.
-            return
+        route_live = tl.load(topk_ids_ptr + token * stride_im + route * stride_ik) >= 0
         slot = tl.load(token_lora_mapping_ptr + token * stride_tm).to(tl.int64)
         enabled = (
             tl.load(
@@ -51,6 +49,9 @@ def _silu_mul_add_delta_kernel(
         )
     cols = block * BLOCK + tl.arange(0, BLOCK)
     mask = cols < N
+    if HAS_ROUTING:
+        # Keep every payload load and store behind the original route predicate.
+        mask = mask & route_live
     delta_mask = mask
     if HAS_ROUTING:
         delta_mask = delta_mask & enabled
