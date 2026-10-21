@@ -493,6 +493,42 @@ class TestUnifiedCacheLinkerPythonBackend(
         (kv_lookup,) = transfers
         self.assertEqual(kv_lookup.keys, kv_offload.keys[2:])
 
+    def test_prefetched_lookup_sends_the_keys_match_sends(self):
+        """The prefetch derives the device prefix and its hash anchor apart from
+        match; a drifted anchor page or namespace seed would make every
+        prefetched answer miss without failing anything."""
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored = list(range(1, 9))  # a single 4-page node
+        cases = {
+            "no device prefix": (list(range(50, 60)), None),
+            "node boundary": (stored + [70, 71, 72, 73], None),
+            "inside a node": (stored[:4] + [80, 81, 82, 83, 84, 85], None),
+            "namespaced node boundary": (stored + [70, 71, 72, 73], "ns"),
+        }
+        for name, (tokens, extra_key) in cases.items():
+            with self.subTest(name):
+                cache, allocator, req_pool = build_fixture(cfg)
+                linker = _InMemoryUnifiedCacheLinker()
+                linker.lookup_prefetch_refresh_s = 1.0
+                prefetched = []
+                linker.prefetch_lookup = lambda build: prefetched.append(build())
+                cache.init_cache_linker(linker)
+                cache.write_through_threshold = sys.maxsize
+                self._insert(cache, allocator, req_pool, stored, extra_key=extra_key)
+                req = self._make_req(req_pool)
+                key = RadixKey(array("q", tokens), extra_key=extra_key)
+
+                cache.prefetch_external_lookups([(req, key)])
+                cache.match_prefix(MatchPrefixParams(key=key, req=req))
+
+                (prefetch_transfers,) = prefetched
+                ((_, lookup_transfers),) = linker.lookup_calls
+                self.assertEqual(
+                    {t.name: t.keys for t in prefetch_transfers},
+                    {t.name: t.keys for t in lookup_transfers},
+                )
+
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
