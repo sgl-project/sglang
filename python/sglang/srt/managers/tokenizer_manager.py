@@ -1406,6 +1406,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Validate generation-specific fields
         if isinstance(obj, GenerateReqInput):
             self._validate_token_ids_logprob(obj)
+            top_logprobs_num = obj.top_logprobs_num
+            if top_logprobs_num is not None:
+                if not isinstance(top_logprobs_num, list):
+                    top_logprobs_num = [top_logprobs_num]
+                for value in top_logprobs_num:
+                    if not 0 <= value <= self.model_config.vocab_size:
+                        raise ValueError(
+                            f"top_logprobs_num must be in [0, vocab_size({self.model_config.vocab_size})], "
+                            f"got {value}."
+                        )
             requested_hidden_mode = get_request_return_hidden_states_mode(
                 obj.return_hidden_states
             )

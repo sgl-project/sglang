@@ -701,6 +701,41 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_at_limit_valid(self):
+        """Test that a single text request expands to 128 parallel samples."""
+        req = GenerateReqInput(text="Hello", sampling_params={"n": 128})
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.parallel_sample_num, 128)
+        self.assertEqual(req.text, ["Hello"] * 128)
+
+    def test_parallel_sampling_above_limit_raises(self):
+        """Test that n above 128 is rejected before expanding the request."""
+        req = GenerateReqInput(text="Hello", sampling_params={"n": 129})
+
+        with self.assertRaisesRegex(ValueError, r"n must be in \[1, 128\]"):
+            req.normalize_batch_and_arguments()
+
+    def test_parallel_sampling_zero_raises(self):
+        """Test that n=0 is rejected during normalization."""
+        req = GenerateReqInput(text="Hello", sampling_params={"n": 0})
+
+        with self.assertRaises(ValueError):
+            req.normalize_batch_and_arguments()
+
+    def test_beam_search_does_not_expand_parallel_samples(self):
+        """Test that beam search bypasses parallel sampling expansion for n=200."""
+        req = GenerateReqInput(
+            text="Hello", sampling_params={"beam_width": 4, "n": 200}
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req.parallel_sample_num, 1)
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.text, "Hello")
+
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
             text="Hello",

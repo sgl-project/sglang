@@ -545,6 +545,10 @@ class GenerateReqInput:
                     )
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
+        if not isinstance(self.parallel_sample_num, int) or not (
+            1 <= self.parallel_sample_num <= 128
+        ):
+            raise ValueError(f"n must be in [1, 128], got {self.parallel_sample_num}.")
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
