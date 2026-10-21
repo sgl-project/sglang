@@ -213,8 +213,8 @@ Cancelling a logical interest never authorizes freeing a buffer still accessed
 by a worker or another waiter. Serving integration must continue progress until
 those obligations end, even after a task's finish action completes.
 
-Multi-rank publication, storage/linker transfers, policies and event feeds remain
-pending. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
+Multi-rank publication, storage reads/linker transfers, policies and event feeds
+remain pending. File-backed storage writes are described below. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
 tests cover the explicitly described one-owner FULL profile. No serving
 performance or model-quality claim follows from these smoke tests.
 
@@ -230,8 +230,9 @@ python -m sglang.launch_server --model-path MODEL \
 The current executable profile requires TP=PP=CP=DP=1 on one node, the enabled
 built-in unified cache and ordinary text generation. Speculative decoding, PD
 disaggregation and alternate caches are rejected at startup. Persistent-host
-HiCache requires FULL-only state and `--disable-overlap-schedule`; storage,
-buffer-only and direct-linker control paths remain unsupported. Python backend
+HiCache requires FULL-only state and `--disable-overlap-schedule`; buffer-only
+and direct-linker control paths remain unsupported. File-backed native storage
+writes are available for one complete token prefix. Python backend
 fallback is deliberate.
 LoRA, multimodal and StreamingSession primitive execution returns unsupported;
 ordinary inference and opaque action consumers retain their existing behavior.
@@ -485,8 +486,9 @@ This adapter supports COPY GPU→host, COPY host→GPU, and MOVE GPU→host.
 Discovery lists these directions only when the actual cache/controller supports
 them. Transfers address whole page-aligned prefixes at existing radix boundaries
 using tokens, token-backed session snapshots or `request_cached`. Other ranges,
-descriptor-only transfers, hybrid state, storage/buffer/draft/sidecar paths,
-host→GPU MOVE and direct-linker publication are unsupported in this stage.
+descriptor-only transfers, hybrid state, buffer/draft/sidecar paths, host→GPU
+MOVE and direct-linker publication are unsupported in this stage. Storage reads
+are not exposed by this adapter yet.
 
 Approval counts each selected physical fragment once, including shared branch
 prefixes. It protects already-resident members and checks the complete reusable
@@ -589,3 +591,53 @@ weights validate the interface and execution path. A local tiny-Llama checkpoint
 attempt still fails before cache initialization at the existing DualGemm
 `cutlass.cute` import in this environment; that unsuccessful path is retained in
 the validation record. Neither fixture establishes model quality or throughput.
+
+
+## File storage writes
+
+With persistent FULL HiCache and the actual `file` storage backend, discovery
+adds COPY GPU→storage, COPY host→storage and MOVE GPU→storage. The optional
+`dst.backend` must be `file` or omitted. A storage write requires one complete
+page-aligned token prefix at an existing radix boundary, with at least two
+result slots for a possible short write. Multi-branch cold writes, other
+storage backends and storage reads return unsupported. Ordinary storage
+prefetch and backups retain their existing behavior.
+
+GPU-source writes first use the existing host copy path with whole-scope
+capacity approval. Explicit GPU→host COPY does not enqueue an additional cold
+write; a separate storage action owns that side effect. Identical storage jobs
+share staging and one write, while each caller can cancel independently. The
+last cancellation drains both DMA and storage worker access before releasing
+source/host holds. No public pin or persistent retention guarantee is added.
+
+The worker writes the immutable complete hash chain and verifies its contiguous
+existence before returning the final ACK. The owner checks the acknowledged
+token count against the required prefix; enqueue, an ACK alone, or successful
+individual batches cannot certify destination readiness. A short write reports
+actual verified prefix coverage and preserves the GPU source. MOVE releases
+its GPU hold only after full required storage publication, then uses normal
+eviction eligibility; another request's reference produces PARTIAL/source_busy.
+The intermediate persistent-host copy may remain after a GPU→storage MOVE.
+Cold pages remain independently evictable by the storage backend after this
+completion boundary. Cancellation never deletes shared cold data.
+
+Only active native writes retain storage ACK facts, bounded by active control
+limits. Ordinary ACKs do not accumulate native history. Source paths can split
+during writes without changing the captured worker buffers or logical coverage.
+Runtime storage attach/detach refuses active native operations; idle changes
+refresh adapter capabilities. Serving namespaces apply to the actual hash
+chain, including ordinary requests and parameter generations.
+
+On Linux/NVIDIA CUDA, with one visible GPU and TP=PP=CP=DP=1, the tiny manual
+probe uses real pools and a temporary file backend without model downloads or
+credentials:
+
+```bash
+PYTHONPATH=python CUDA_VISIBLE_DEVICES=1 python \
+  test/manual/entrypoints/programmable_kv_hicache_smoke.py --storage
+```
+
+The A100 FP16 direct-I/O fixture verifies nonzero file bytes, waits for storage
+completion before source reclaim, poisons free GPU rows and restores them from
+host, then checks locks/jobs/allocator balance. It does not measure serving
+throughput or model quality.

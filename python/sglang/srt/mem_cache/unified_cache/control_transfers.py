@@ -65,7 +65,7 @@ class HostCacheTransfers:
             j.started and j.work.payload.dst.tier == "gpu" for j in self.jobs.values()
         )
 
-    def _prefixes(self, work):
+    def _prefixes(self, work, *, validate_direction=True):
         self.executor._check(work.target)
         payload = work.payload
         if any(
@@ -77,8 +77,9 @@ class HostCacheTransfers:
                 "unsupported", "Transfer must address this owner's local tiers"
             )
         direction = payload.src.tier, payload.dst.tier
-        if direction not in (("gpu", "host"), ("host", "gpu")) or (
-            isinstance(payload, MoveTo) and direction != ("gpu", "host")
+        if validate_direction and (
+            direction not in (("gpu", "host"), ("host", "gpu"))
+            or (isinstance(payload, MoveTo) and direction != ("gpu", "host"))
         ):
             raise ControlError(
                 "unsupported",
@@ -294,7 +295,9 @@ class HostCacheTransfers:
                 return
             job.started = True  # Partial submission must retain holds on error.
             if src == "gpu":
-                self.cache._execute_and_commit_kv_backup(BackupKV(node_ids=list(nodes)))
+                self.cache._execute_and_commit_kv_backup(
+                    BackupKV(node_ids=list(nodes)), mirror_storage=False
+                )
                 self._host_hold(job, nodes.values())
                 if any(
                     n.component_data[FULL].host_value is None for n in nodes.values()

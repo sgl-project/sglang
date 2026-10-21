@@ -457,6 +457,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self._native_host_only_backups: set[int] = set()
+        # Only explicitly registered native writes retain an ACK result. The
+        # native owner removes it after observing worker quiescence.
+        self._native_storage_write_results: dict[int, Optional[int]] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
@@ -1682,7 +1686,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _execute_and_commit_kv_backup(
-        self, action: BackupKV, write_back: bool = False
+        self, action: BackupKV, write_back: bool = False, *, mirror_storage: bool = True
     ) -> int:
         """Run a backup action top-down, stopping at the first failed backup."""
         if self.buffer_pipeline is not None:
@@ -1714,6 +1718,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._track_write_through_node(
                 node_id, lock_params, publish_node_ids=publish_node_ids
             )
+            if not mirror_storage:
+                self._native_host_only_backups.add(node_id)
             written = len(host_indices)
         return written
 
@@ -1807,7 +1813,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.tree_core.finish_write_through(publish_node_ids, ack_id)
         if lock_params is not None:
             self.dec_lock_ref(lock_node_id, lock_params)
-        if self.enable_storage:
+        host_only = ack_id in self._native_host_only_backups
+        self._native_host_only_backups.discard(ack_id)
+        if self.enable_storage and not host_only:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node_id in publish_node_ids:
@@ -3229,6 +3237,10 @@ class UnifiedRadixCache(BasePrefixCache):
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
+                if operation.id in self._native_storage_write_results:
+                    self._native_storage_write_results[operation.id] = (
+                        operation.completed_tokens
+                    )
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)

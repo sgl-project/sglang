@@ -1384,6 +1384,17 @@ class HiCacheController:
     def _page_backup_or_log(self, operation):
         try:
             self._page_backup(operation)
+            if getattr(operation, "verify_backup_prefix", False):
+                # A bounded backend can evict an earlier batch while the tail
+                # is being written. Certify the jointly reusable prefix at the
+                # worker boundary, not the sum of successful batch receipts.
+                written = operation.completed_tokens
+                operation.completed_tokens = 0
+                present = self.storage_backend.batch_exists(
+                    operation.hash_value,
+                    HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys),
+                )
+                operation.completed_tokens = min(written, present * self.page_size)
         except Exception:
             logger.exception(
                 "HiCache backup failed after %d tokens", operation.completed_tokens

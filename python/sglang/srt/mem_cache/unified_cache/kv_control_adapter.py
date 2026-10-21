@@ -95,12 +95,33 @@ class UnifiedCacheExecutor:
         self.cache_salt_transform = None
         self.cache_available = None
         self.transfers = None
+        self.storage = None
         if self.core.enable_hicache and not self._transfer_unsupported_reason():
             from sglang.srt.mem_cache.unified_cache.control_transfers import (
                 HostCacheTransfers,
             )
 
             self.transfers = HostCacheTransfers(self)
+            self._refresh_storage_adapter()
+
+    def _refresh_storage_adapter(self):
+        enabled = (
+            self.transfers is not None
+            and self.cache.enable_storage
+            and self.cache.cache_controller.storage_backend_type == "file"
+        )
+        if enabled and self.storage is None:
+            from sglang.srt.mem_cache.unified_cache.control_storage import (
+                StorageCacheTransfers,
+            )
+
+            self.storage = StorageCacheTransfers(self)
+        elif not enabled and self.storage is not None:
+            if self.storage.jobs or self.storage.interests:
+                raise ControlError(
+                    "busy", "Storage control must drain before detaching"
+                )
+            self.storage = None
 
     def _transfer_unsupported_reason(self):
         if self.core.component_types != (ComponentType.FULL,):
@@ -110,8 +131,6 @@ class UnifiedCacheExecutor:
             or self.cache.sidecar_pool_specs
         ):
             return "Buffer/draft/sidecar transfers are not integrated"
-        if self.cache.enable_storage:
-            return "Storage-backed control transfers are not integrated"
         return ""
 
     def _check(self, target):
@@ -141,6 +160,7 @@ class UnifiedCacheExecutor:
             )
 
     def capabilities(self):
+        self._refresh_storage_adapter()
         reason = self.cache._kv_control_unsupported_reason
         if self.core.enable_hicache:
             reason = reason or self._transfer_unsupported_reason()
@@ -167,8 +187,18 @@ class UnifiedCacheExecutor:
             "tier": "gpu",
             "directions": (
                 {
-                    "copy_to": (("gpu", "host"), ("host", "gpu")),
-                    "move_to": (("gpu", "host"),),
+                    "copy_to": (("gpu", "host"), ("host", "gpu"))
+                    + (
+                        (("gpu", "storage"), ("host", "storage"))
+                        if self.storage is not None
+                        else ()
+                    ),
+                    "move_to": (("gpu", "host"),)
+                    + ((("gpu", "storage"),) if self.storage is not None else ()),
+                    "storage_backend": "file" if self.storage is not None else None,
+                    "storage_scope": "single_complete_token_prefix"
+                    if self.storage is not None
+                    else None,
                     "granularity": "whole_token_prefix_at_existing_radix_boundary",
                     "page_alignment": self.core.page_size,
                     "native_load_prefill_barrier": True,
@@ -614,12 +644,15 @@ class UnifiedCacheExecutor:
 
     def start(self, work: ExecutionRequest) -> ExecutionUpdate:
         try:
+            self._refresh_storage_adapter()
             if (
                 work.ref.context.engine_id != self.engine_id
                 or work.ref.context.engine_epoch != self.engine_epoch
             ):
                 raise ControlError("stale_epoch", "Executor owner identity differs")
             if not isinstance(work.payload, SetPriority) and self.transfers is not None:
+                if work.payload.dst.tier == "storage" and self.storage is not None:
+                    return self.storage.start(work)
                 return self.transfers.start(work)
             if not isinstance(work.payload, SetPriority):
                 raise ControlError(
@@ -704,13 +737,19 @@ class UnifiedCacheExecutor:
             )
 
     def poll(self, ref):
+        if self.storage is not None and ref.operation_id in self.storage.interests:
+            return self.storage.poll(ref)
         return self.transfers.poll(ref) if self.transfers is not None else None
 
     def begin_poll(self, *, limit=64):
         if self.transfers is not None:
             self.transfers.begin_poll(limit=limit)
+        if self.storage is not None:
+            self.storage.begin_poll(limit=limit)
 
     def cancel(self, ref):
+        if self.storage is not None and ref.operation_id in self.storage.interests:
+            return self.storage.cancel(ref)
         return (
             self.transfers.cancel(ref)
             if self.transfers is not None

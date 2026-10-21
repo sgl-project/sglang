@@ -401,3 +401,55 @@ isort/format and diff-whitespace checks pass. The real GPU parameter-isolation
 proof passed; the separate existing FP8 dependency failure remains recorded.
 Verdict: approve guarded parameter lifecycle for its local feature commit.
 Real storage execution and composable policy/admission work remain outstanding.
+
+## Unit 6a — Native persistent-host file storage writes
+
+Implemented real single-prefix COPY GPU/host→file storage and MOVE GPU→file
+storage. GPU staging uses existing host transfers and whole-scope approval;
+compatible storage jobs share one worker operation with independent interests.
+The worker receives an immutable complete hash chain and pinned real host
+indices. Owner ACK consumption retains facts only for bounded active native
+writes. Ordinary backup behavior remains enabled by default; explicit native
+host-only copies suppress automatic cold writes so the requested destination
+owns its side effect.
+
+Review identified that successful batch receipts do not certify joint prefix
+availability in an evicting backend. Native writes now request a worker-side
+contiguous-prefix verification before ACK. Short writes preserve the GPU source
+and report verified coverage with failure cause; full writes can reclaim GPU
+copies only through existing eligibility after releasing the native GPU hold.
+Another request's lock gives PARTIAL/source_busy. Cancellation drains worker
+access, never deletes shared cold objects, and never turns a failed result into
+successful cancellation. Existing radix splits preserve captured worker buffers
+and logical outcomes. Attach/detach refuses pending native work; idle changes
+refresh adapter capabilities.
+
+New CPU file-storage suite: 10 passed. Includes actual disk bytes, pending ACKs,
+one/all shared-waiter cancellation, cancel during DMA, short/evicted-prefix
+writes, failure ACK summaries/retry, external request refs and radix splitting.
+With existing priority/cache/HiCache lifecycle cases: 39 passed plus 18 subtests
+(/tmp/sglang-kv-storage-cpu-proof.log). Serving/namespace/weight/host regression
+suites: 61 passed (/tmp/sglang-kv-storage-regressions.log).
+
+Existing file path/LRU tests passed 37 cases. Four existing backfill tests were
+also attempted with GPUs hidden and failed at fixture get_device() before the
+feature path; these fixtures select an accelerator. Their failure is retained
+at /tmp/sglang-kv-storage-backend-proof.log and requires the GPU-specific rerun.
+
+The same four backfill tests subsequently passed on GPU 1 with their existing
+64-token fixture (/tmp/sglang-kv-storage-backfill-gpu-proof.log). The hidden-GPU
+attempt remains recorded rather than being counted as passing CPU coverage.
+
+Real GPU 1 A100 FP16 proof passed after the final prefix-verification change:
+/tmp/sglang-kv-gpu-file-storage-final-smoke.log. The --storage manual fixture
+writes nonzero 17/18 K/V through real direct DMA and file workers, reads exact
+file bytes, waits before GPU reclamation, poisons free GPU rows then restores
+from host, and checks allocator/lock/job retirement. Peak device allocation is
+9,728 bytes for the tiny fixture. The optional JIT reports unsupported 16-byte
+rows; the explicitly selected direct-I/O backend passes. No JIT or model-quality
+claim follows. Other GPU processes were untouched.
+
+Parent read the complete implementation and diff. New strict Ruff checks and
+existing-file finding deltas, isort, formatting and whitespace checks pass.
+Storage reads, multi-branch cold jobs, other backends/linkers and policy/admission
+work remain separate implementation units; discovery does not claim them.

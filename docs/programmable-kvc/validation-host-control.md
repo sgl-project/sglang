@@ -69,3 +69,33 @@ tiny Llama 的本地 checkpoint 路径仍未通过启动验证：环境中的 CU
 GPU 1 上的 OPT smoke test 实际修改了 attention LayerNorm bias 参数：修改前后 checksum 不同，namespace 和 epoch 更新；同一输入在新版本首次生成命中 0 个缓存 token，随后重复生成命中 3 个，输出 token 一致。修改的是随机权重 fixture 中的有限偏置参数；这不构成训练质量或完整训练更新结论。结果保存在 `/tmp/sglang-kv-opt-weights-smoke/result.json`。
 
 现有 `test_weight_checker.py` 按其单卡配置运行得到 63 项通过、1 项失败；失败的 FP8 路径缺少 `deep_gemm`。在隐藏 GPU 环境中误运行该套件的失败记录保留在 `/tmp/sglang-kv-weight-checker-cpu-env-failed.log`，单卡输出在 `/tmp/sglang-kv-weight-checker-gpu-proof.log`。未修改既有测试以掩盖依赖问题。
+
+## 文件存储写入
+
+实现 COPY GPU/Host→Storage、MOVE GPU→Storage，限单 owner、FULL、持久 Host
+与 `file` 后端的单个完整前缀。复用实际 HiCache DMA、文件写入线程及 ACK 队列。
+完整 hash 链与 Host indices 在提交时固定，普通 radix 分裂不会改变完成覆盖范围。
+
+写入线程会在 ACK 前核对连续前缀，避免文件缓存淘汰已写批次后仍报告完整成功。
+短写与核对失败保留 GPU 源副本，并返回实际确认的覆盖范围和失败原因。MOVE 仅在
+完整目标就绪后尝试正常回收；其他请求仍持有源引用时返回 PARTIAL/source_busy。
+取消须等待实际 worker 退出；一个调用方取消不会撤销其他调用方共享的写入。
+
+新增 CPU 用例 10 项通过；加既有 cache/HiCache 生命周期用例共 39 项、18 个子用例
+通过。Serving、命名空间、参数更新与 Host 回归 61 项通过。既有文件路径和 LRU
+测试 37 项通过。4 项既有 backfill 测试依赖自动选择 GPU：隐藏 GPU 的尝试在
+fixture 初始化失败，改用 1 号卡后全部通过；两次日志均保留。
+
+1 号卡 A100 的 FP16 小型验证通过：真实非零 K/V 经 GPU→Host→文件写入后逐字节
+读回一致，完整写入后才释放 GPU 副本；污染空闲 GPU 行再从 Host 恢复，验证数值、
+引用与 allocator 余额。微型 fixture 的 GPU 分配峰值为 9,728 字节，使用 direct
+I/O。可选 JIT 对该 fixture 的 16 字节行给出不支持提示，未据此宣称 JIT 通过。
+
+日志：`/tmp/sglang-kv-storage-cpu-proof.log`、
+`/tmp/sglang-kv-storage-regressions.log`、
+`/tmp/sglang-kv-storage-backend-proof.log`、
+`/tmp/sglang-kv-storage-backfill-gpu-proof.log`、
+`/tmp/sglang-kv-gpu-file-storage-final-smoke.log`。
+
+Storage 读取、跨分支冷存储操作、其他后端与策略/调度协作尚待实现，能力发现接口
+保留对应限制。

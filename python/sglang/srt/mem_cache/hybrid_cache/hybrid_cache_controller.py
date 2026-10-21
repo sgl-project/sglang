@@ -1354,6 +1354,8 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        verify_prefix: bool = False,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1362,6 +1364,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        operation.verify_backup_prefix = verify_prefix
         self.backup_queue.put(operation)
         return operation.id
 

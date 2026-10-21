@@ -2,6 +2,7 @@
 """Real CPU HiCache pools/controller; only DMA and its fence are controlled."""
 
 import atexit
+import json
 from unittest.mock import patch
 
 import msgspec
@@ -27,7 +28,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.l2_transfer import TransferCompletion
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_context, get_server_args
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -88,6 +89,15 @@ def owner(request):
     assert torch.cuda.device_count() == 0
     case = fixtures.TestKVControlCache()
     case.setUp()
+    storage = getattr(request, "param", None) == "file"
+    storage_args = {}
+    if storage:
+        storage_args = dict(
+            hicache_storage_backend="file",
+            hicache_storage_backend_extra_config=json.dumps(
+                {"file_storage_path": str(request.getfixturevalue("tmp_path"))}
+            ),
+        )
     scope = get_context().override_server_args(
         device="cpu",
         enable_hierarchical_cache=True,
@@ -95,12 +105,15 @@ def owner(request):
         hicache_write_policy="write_back",
         hicache_mem_layout="layer_first",
         disable_overlap_schedule=True,
+        **storage_args,
     )
     scope.install()
+    parallel = get_parallel().override(tp_rank=0, tp_size=1, pp_rank=0, pp_size=1)
+    parallel.__enter__()
     try:
-        config = getattr(request, "param", None) or ServiceConfig(
-            namespace="ns", engine_id="engine"
-        )
+        config = (
+            None if storage else getattr(request, "param", None)
+        ) or ServiceConfig(namespace="ns", engine_id="engine")
         cache, _ = case.make(
             session=False, config=config.cache_config(), limits=config.limits
         )
@@ -132,8 +145,11 @@ def owner(request):
             while dma.pending:
                 dma.finish()
             service.progress()
+            if storage:
+                cache._storage_attachment.shutdown()
             cache.release_host_resources()
     finally:
+        parallel.__exit__(None, None, None)
         scope.restore()
         case.doCleanups()
 
