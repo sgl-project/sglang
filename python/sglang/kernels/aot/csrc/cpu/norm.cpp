@@ -232,7 +232,12 @@ struct NormReduce {
 };
 #endif
 
-template <NormMode M, typename input_t, bool has_residual, typename param_t = input_t, bool has_bias = NormTraits<M>::has_bias>
+template <
+    NormMode M,
+    typename input_t,
+    bool has_residual,
+    typename param_t = input_t,
+    bool has_bias = NormTraits<M>::has_bias>
 struct NormReduceGeneric {
   static inline void apply(
       input_t* __restrict__ out,
@@ -390,7 +395,7 @@ struct NormReduceGeneric {
             apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, p)); \
     return
 
-      template <NormMode M, typename input_t, typename param_t = input_t, bool has_bias = NormTraits<M>::has_bias>
+template <NormMode M, typename input_t, typename param_t = input_t, bool has_bias = NormTraits<M>::has_bias>
 void norm4d_kernel_impl(
     input_t* __restrict__ out,
     const input_t* __restrict__ input,
@@ -416,7 +421,7 @@ void norm4d_kernel_impl(
           apply(out + p.output_offset(b, h, t), input + p.input_offset(b, h, t), gate_ptr, nullptr, p, p.D));
 }
 
-    template <NormMode M, typename scalar_t, bool has_bias = NormTraits<M>::has_bias>
+template <NormMode M, typename scalar_t, bool has_bias = NormTraits<M>::has_bias>
 void fused_add_norm4d_kernel_impl(
     scalar_t* __restrict__ out,
     const scalar_t* __restrict__ input,
@@ -426,7 +431,7 @@ void fused_add_norm4d_kernel_impl(
   LAUNCH_PARALLEL_LOOP(
       const int64_t out_offset = output_uses_input_stride ? p.input_offset(b, h, t) : p.output_offset(b, h, t);
       scalar_t* __restrict__ residual_ptr = residual + p.output_offset(b, h, t);
-        NormReduceGeneric<M, scalar_t, true, scalar_t, has_bias>::apply(
+      NormReduceGeneric<M, scalar_t, true, scalar_t, has_bias>::apply(
           out + out_offset, input + p.input_offset(b, h, t), nullptr, residual_ptr, p, p.D));
 }
 
