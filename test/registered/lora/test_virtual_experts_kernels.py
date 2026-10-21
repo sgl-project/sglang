@@ -82,29 +82,105 @@ class TestFusedVirtualTopkIdsPreservesSentinels(CustomTestCase):
         max_loras = 4
 
         original_ids = topk_ids.clone()
-        for shared_outer in (False, True):
-            with self.subTest(shared_outer=shared_outer):
-                virtual_ids, _, _ = _fused_virtual_topk_ids(
-                    topk_ids,
-                    token_lora_mapping,
-                    num_experts,
-                    shared_outer=shared_outer,
-                    max_loras=max_loras,
-                )
+        providers = {"base": _fused_virtual_topk_ids}
+        if is_cuda():
+            from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
+                _fused_virtual_topk_ids as trtllm_virtual_ids,
+            )
 
-                # Shared weights still follow each original route's validity,
-                # including a dropped first slot followed by a live slot.
-                for m in range(topk_ids.shape[0]):
-                    lora = max(token_lora_mapping[m].item(), 0)
-                    for k in range(topk_ids.shape[1]):
-                        base = topk_ids[m, k].item()
-                        expected = base
-                        if base >= 0:
-                            expected = (
-                                lora if shared_outer else base + lora * num_experts
-                            )
-                        self.assertEqual(virtual_ids[m, k].item(), expected)
-                torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
+            providers["trtllm"] = trtllm_virtual_ids
+        for provider, remap in providers.items():
+            for shared_outer in (False, True):
+                with self.subTest(provider=provider, shared_outer=shared_outer):
+                    virtual_ids, _, _ = remap(
+                        topk_ids,
+                        token_lora_mapping,
+                        num_experts,
+                        shared_outer=shared_outer,
+                        max_loras=max_loras,
+                    )
+
+                    # Shared weights still follow each original route's validity,
+                    # including a dropped first slot followed by a live slot.
+                    for m in range(topk_ids.shape[0]):
+                        slot = token_lora_mapping[m].item()
+                        lora = max(slot, 0)
+                        for k in range(topk_ids.shape[1]):
+                            base = topk_ids[m, k].item()
+                            expected = base
+                            if provider == "trtllm" and slot < 0:
+                                expected = -1
+                            elif base >= 0:
+                                expected = (
+                                    lora if shared_outer else base + lora * num_experts
+                                )
+                            self.assertEqual(virtual_ids[m, k].item(), expected)
+                    torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
+
+    @unittest.skipUnless(is_cuda(), "Merged LoRA alignment requires CUDA")
+    def test_shared_outer_merged_alignment_skips_original_negative_routes(self):
+        """Shared-outer blocks contain exactly live original slots after remapping."""
+        from sglang.kernels.ops.lora.moe.trtllm_lora_temp.moe_lora_merged_align import (
+            moe_lora_merged_align,
+        )
+
+        topk_ids = torch.tensor(
+            [[-1, 2, 0], [-1, -1, -1], [1, -3, 3]],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        live_ids = topk_ids.clone()
+        mapping = torch.tensor([0, 1, 2], device=self.device, dtype=torch.int32)
+        block_size = 16
+        for fuse_scatter in (False, True):
+            for state in ("mixed", "idle", "remapped"):
+                with self.subTest(fuse_scatter=fuse_scatter, state=state):
+                    topk_ids.copy_(live_ids)
+                    mapping.copy_(
+                        torch.tensor(
+                            [2, 0, 1] if state == "remapped" else [0, 1, 2],
+                            device=self.device,
+                            dtype=torch.int32,
+                        )
+                    )
+                    if state == "idle":
+                        topk_ids.fill_(-1)
+                    original_ids = topk_ids.clone()
+                    original_mapping = mapping.clone()
+                    sorted_ids, experts, count, _, _ = moe_lora_merged_align(
+                        topk_ids,
+                        mapping,
+                        num_experts=4,
+                        shared_outer=True,
+                        max_loras=3,
+                        block_size=block_size,
+                        do_skip=True,
+                        fuse_scatter=fuse_scatter,
+                    )
+                    used = int(count.item())
+                    self.assertGreaterEqual(used, 0)
+                    self.assertEqual(used % block_size, 0)
+                    self.assertLessEqual(used, sorted_ids.numel())
+                    blocks = sorted_ids[:used].view(-1, block_size)
+                    self.assertTrue(
+                        bool(((blocks >= 0) & (blocks <= topk_ids.numel())).all())
+                    )
+                    emitted = blocks[blocks < topk_ids.numel()]
+                    expected = torch.nonzero(topk_ids.flatten() >= 0).flatten()
+                    self.assertEqual(
+                        sorted(emitted.cpu().tolist()), expected.cpu().tolist()
+                    )
+                    for index, block in enumerate(blocks):
+                        flat_ids = block[block < topk_ids.numel()].long()
+                        tokens = flat_ids // topk_ids.shape[1]
+                        self.assertTrue(bool((topk_ids.flatten()[flat_ids] >= 0).all()))
+                        self.assertTrue(
+                            bool((original_mapping[tokens] == experts[index]).all())
+                        )
+                    torch.testing.assert_close(topk_ids, original_ids, rtol=0, atol=0)
+                    torch.testing.assert_close(
+                        mapping, original_mapping, rtol=0, atol=0
+                    )
 
     def test_positive_topk_remapped_correctly(self):
         """Sanity: valid (non-negative) IDs follow the
