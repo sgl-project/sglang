@@ -4,6 +4,7 @@ packaged tables, and pick the nearest token bucket; every shipped table loads.""
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,28 @@ def test_an_override_dir_without_the_file_inherits_the_packaged_one(
     table = _load(override)
     assert table is not None
     assert table.buckets[96] == {"token_width": 128}
+
+
+def test_every_shipped_table_loads() -> None:
+    shipped = sorted(
+        (Path(gemm_config_store._PACKAGE_CONFIG_DIR) / "base_gemm").glob("*.json")
+    )
+    assert shipped
+    pattern = re.compile(
+        r"provider=(\w+),E=(\d+),N1=(\d+),N2=(\d+),K=(\d+),device_name=(.+)\.json"
+    )
+    with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(None):
+        for path in shipped:
+            key, experts, n1, n2, k, device = pattern.fullmatch(path.name).groups()
+            table = load_config_table(
+                key,
+                num_local_experts=int(experts),
+                n_gemm1=int(n1),
+                n_gemm2=int(n2),
+                k=int(k),
+                device_name=device,
+            )
+            assert table is not None, path.name
 
 
 if __name__ == "__main__":
