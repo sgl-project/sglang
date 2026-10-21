@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -9,7 +9,24 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+from sglang.srt.model_executor.forward_batch_info import compute_position
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import is_pin_memory_available
+
+
+class PrefillPlacement(NamedTuple):
+    """Per-token placement of a prefill's target hidden in the draft pool."""
+
+    cache_loc: torch.Tensor
+    positions: torch.Tensor
+    state_slot: Optional[torch.Tensor]  # draft req slot, for a SWA ring
+    final_pos: Optional[torch.Tensor]  # the request's last position, for a ring
+    swa_loc: Optional[torch.Tensor]  # SWA rows, for a pool that takes them
+
+    def select(self, token_indices: torch.Tensor) -> "PrefillPlacement":
+        return PrefillPlacement(
+            *(None if t is None else t[token_indices] for t in self)
+        )
 
 
 class TargetHiddenKvInjector:
@@ -42,40 +59,107 @@ class TargetHiddenKvInjector:
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.kv_index_translator, cols=cols)
 
-    def prefill_swa_loc(
-        self,
-        *,
-        cache_loc: torch.Tensor,
-        positions: torch.Tensor,
-        state_slot: Optional[torch.Tensor],
-        final_pos: Optional[torch.Tensor],
-    ) -> Optional[torch.Tensor]:
-        """The SWA rows a prefill's target hidden lands in, for a draft pool
-        that takes them (None otherwise): `inject_target_hidden` reads them
-        instead of translating ``cache_loc`` itself."""
-        pool = self.draft_model_runner.token_to_kv_pool
-        if not hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
-            return None
+    def place_prefill(self, batch: ScheduleBatch) -> PrefillPlacement:
+        """Where a prefill's target hidden goes in the draft pool. It reads
+        scheduler-shared tables, so it runs before the target forward."""
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DSpark expected extend_lens / prefix_lens in extend mode, got None."
+            )
+        if batch.out_cache_loc is None:
+            raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
+
         device = self.model_runner.device
-        return self._mla_swa_loc(
-            pool=pool,
-            cache_loc=cache_loc.to(device=device, dtype=torch.int64),
-            positions=positions.to(device=device, dtype=torch.int64),
-            cache_loc_2d=None,
-            commit_lens=None,
-            state_slot=(
-                None
-                if state_slot is None
-                else state_slot.to(device=device, dtype=torch.int64)
-            ),
-            final_pos=(
-                None
-                if final_pos is None
-                else final_pos.to(device=device, dtype=torch.int64)
-            ),
+        pin_memory = is_pin_memory_available(device)
+        ctx_lens = torch.tensor(
+            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
+        draft_seq_lens = torch.tensor(
+            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+        ).to(device, non_blocking=True)
+        positions, _ = compute_position(
+            self.model_runner.prefill_attention_backend_str,
+            draft_seq_lens,
+            ctx_lens,
+            int(sum(batch.extend_lens)),
+        )
+        # A SWA ring is keyed by (draft req slot, position); thread the per-token
+        # state_slot + the req's final position so the injector keeps only the
+        # last SWA window (older prefill tokens share a ring slot and would race).
+        state_slot = final_pos = None
+        if self.swa_ring_size is not None:
+            repeats = ctx_lens.to(torch.int64)
+            num_tokens = sum(batch.extend_lens)
+            state_slot = torch.repeat_interleave(
+                batch.req_pool_indices.to(device=device, dtype=torch.int64),
+                repeats,
+                output_size=num_tokens,
+            )
+            final_pos = torch.repeat_interleave(
+                (draft_seq_lens + ctx_lens - 1).to(torch.int64),
+                repeats,
+                output_size=num_tokens,
+            )
+        # The draft KV goes to the slots the target prefill writes.
+        cache_loc = self.ids_for(self.model_runner.kv_index_translator.own_plan(batch))
+        pool = self.draft_model_runner.token_to_kv_pool
+        swa_loc = None
+        if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
+            swa_loc = self._mla_swa_loc(
+                pool=pool,
+                cache_loc=cache_loc.to(torch.int64),
+                positions=positions.to(torch.int64),
+                cache_loc_2d=None,
+                commit_lens=None,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+        return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
+
+    def inject_prefill(
+        self,
+        placement: PrefillPlacement,
+        *,
+        target_hidden: torch.Tensor,
+        token_indices: Optional[torch.Tensor],
+        target_hidden_is_projected: bool,
+    ) -> None:
+        if token_indices is not None:
+            placement = placement.select(token_indices)
+        self._inject(
+            target_hidden=target_hidden,
+            cache_loc=placement.cache_loc,
+            positions=placement.positions,
+            state_slot=placement.state_slot,
+            final_pos=placement.final_pos,
+            target_hidden_is_projected=target_hidden_is_projected,
+            swa_loc=placement.swa_loc,
         )
 
     def inject_target_hidden(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+        state_slot: Optional[torch.Tensor] = None,
+        final_pos: Optional[torch.Tensor] = None,
+        target_hidden_is_projected: bool = False,
+    ) -> None:
+        self._inject(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+            state_slot=state_slot,
+            final_pos=final_pos,
+            target_hidden_is_projected=target_hidden_is_projected,
+        )
+
+    def _inject(
         self,
         *,
         target_hidden: torch.Tensor,
@@ -135,7 +219,6 @@ class TargetHiddenKvInjector:
             )
             return
 
-        assert swa_loc is None, "only an MLA draft pool takes SWA rows"
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
