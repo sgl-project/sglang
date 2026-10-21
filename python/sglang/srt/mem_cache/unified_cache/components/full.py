@@ -470,9 +470,6 @@ class FullComponent(TreeComponent):
         allocator = self.cache.token_to_kv_pool_allocator
         return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
 
-    def enable_external_linker_generations(self) -> None:
-        self._full_allocator().enable_allocation_generations()
-
     def build_external_linker_transfer(
         self,
         phase: LinkerTransferPhase,
@@ -485,10 +482,15 @@ class FullComponent(TreeComponent):
             value = node.component_data[self.component_type].value
             if value is None:
                 return None
+            indices = value.to(torch.int64)
+            generations, ready = self._full_allocator().allocation_generation_snapshot(
+                indices
+            )
             return PoolTransfer(
                 name=PoolName.KV,
-                device_indices=value.to(torch.int64),
-                device_generations=self._full_allocator().allocation_generations(value),
+                device_indices=indices,
+                device_generations=generations,
+                device_generations_ready=ready,
                 keys=list(node.hash_value),
             )
 
@@ -508,10 +510,12 @@ class FullComponent(TreeComponent):
             if slots is None:
                 return None
 
+            generations, ready = allocator.allocation_generation_snapshot(slots)
             return PoolTransfer(
                 name=PoolName.KV,
                 device_indices=slots.to(torch.int64),
-                device_generations=allocator.allocation_generations(slots),
+                device_generations=generations,
+                device_generations_ready=ready,
                 keys=list(keys),
             )
 

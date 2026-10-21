@@ -159,6 +159,47 @@ def _cache_for_wrapper(**kwargs):
     return SimpleNamespace(**defaults)
 
 
+def test_generation_linker_enables_full_allocator_before_tree_linking():
+    enable_generations = MagicMock()
+    allocator = SimpleNamespace(
+        device="cpu", enable_allocation_generations=enable_generations
+    )
+    component = SimpleNamespace(component_type=ComponentType.FULL)
+    cache = _cache_for_wrapper(
+        _components_tuple=(component,), token_to_kv_pool_allocator=allocator
+    )
+    linker = _FakeLinker()
+    linker.requires_page_generations = True
+
+    UnifiedCacheLinkerWrapper(cache, linker)
+
+    enable_generations.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "tree_components,device,error",
+    [
+        ((ComponentType.FULL, ComponentType.MAMBA), "cpu", "Full/SWA only"),
+        ((ComponentType.FULL,), "meta", "CPU/CUDA allocators only"),
+    ],
+)
+def test_generation_linker_rejects_unsupported_components_and_devices(
+    tree_components, device, error
+):
+    allocator = MagicMock(device=device)
+    component = SimpleNamespace(component_type=ComponentType.FULL)
+    cache = _cache_for_wrapper(
+        tree_components=tree_components,
+        _components_tuple=(component,),
+        token_to_kv_pool_allocator=allocator,
+    )
+    linker = _FakeLinker()
+    linker.requires_page_generations = True
+
+    with pytest.raises(ValueError, match=error):
+        UnifiedCacheLinkerWrapper(cache, linker)
+
+
 def _swa_allocator(swa_req_ring):
     if swa_req_ring is None:
         return SimpleNamespace()

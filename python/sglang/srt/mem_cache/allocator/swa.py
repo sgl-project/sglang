@@ -695,6 +695,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc.size = int(sz)
             if self.page_size > 1:
                 alloc.num_pages = int(sz) // self.page_size
+            alloc._resize_allocation_generations()
         self.clear()
 
     def clear(self):

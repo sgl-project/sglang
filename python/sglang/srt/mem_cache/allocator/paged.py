@@ -192,8 +192,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         out_pages = self.free_pages[:num_pages]
-        self.free_pages = self.free_pages[num_pages:]
         self._issue_allocation_generations(out_pages)
+        self.free_pages = self.free_pages[num_pages:]
 
         out_indices = (
             out_pages[:, None] * self.page_size

@@ -1172,7 +1172,23 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         transfers = self._binding.build_external_linker_offload_transfers(node_id)
         if transfers is None:
             return None
-        return [_transfer_from_binding(transfer) for transfer in transfers]
+        transfers = [_transfer_from_binding(transfer) for transfer in transfers]
+        for transfer in transfers:
+            if transfer.device_indices is None or self._allocator is None:
+                continue
+            allocator = None
+            if transfer.name == PoolName.KV:
+                allocator = getattr(
+                    self._allocator, "full_attn_allocator", self._allocator
+                )
+            elif transfer.name == PoolName.SWA:
+                allocator = getattr(self._allocator, "swa_attn_allocator", None)
+            if allocator is not None:
+                (
+                    transfer.device_generations,
+                    transfer.device_generations_ready,
+                ) = allocator.allocation_generation_snapshot(transfer.device_indices)
+        return transfers
 
     def mark_external_cache_stored_path(
         self, from_node_id: NodeId, until_node_id: NodeId

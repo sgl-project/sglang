@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional, Set
 
@@ -117,14 +117,16 @@ class PoolTransfer:
     name: PoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
-    # One allocator-issued identity per complete physical device page.
-    # This fences stale control completion after reuse; it is not a physical
-    # DMA/RDMA/CUDA termination receipt.
-    device_generations: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # One allocator-issued identity per complete physical device page.
+    # This fences stale control completion after reuse; it is not a physical
+    # DMA/RDMA/CUDA termination receipt. A CUDA consumer on another stream
+    # waits device_generations_ready before reading the identity tensor.
+    device_generations: Optional[torch.Tensor] = field(default=None, kw_only=True)
+    device_generations_ready: Optional[Any] = field(default=None, kw_only=True)
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
