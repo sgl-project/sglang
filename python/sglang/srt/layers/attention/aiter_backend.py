@@ -6,6 +6,7 @@ from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 end to end attention solution with aiter kernels
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
@@ -60,6 +61,10 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
+    # Muse Spark's opt-in unified-attention tiles (3rdparty/amd/muse_spark aiter patch 05).
+    _unified_attention_has_muse_tiles = (
+        "verify_block_m" in inspect.signature(unified_attention).parameters
+    )
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,
@@ -68,6 +73,7 @@ try:
         unified_attention_3d_mtp_ragged_func,
     )
 except ImportError:
+    _unified_attention_has_muse_tiles = False
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
@@ -85,7 +91,13 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
 )
+from sglang.kernels.ops.attention.gqa_verify_splitkv import gqa_verify_splitkv
+from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
+    gqa_verify_splitkv_2kv,
+    pick_splits_v2,
+)
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
+from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -172,6 +184,104 @@ intra_batch_mode = True if _use_mla_ps_kernel else False
 # one-program-per-request launch.
 _KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
 
+# Muse Spark extend: FP8 Q on full layers from this many query tokens.
+_MUSE_EXTEND_FP8_MIN_Q = 256
+# Muse Spark long-prefill 2D tile config (BLOCK_M, num_warps, num_stages, TILE_SIZE,
+# waves_per_eu) for 256+ query tokens: 90K cached + 5K new 5.57 -> 4.08 ms.
+_MUSE_PREFILL_2D_CONFIG = (128, 4, 2, 128, 2)
+# Muse Spark 8-token verify on the unified 3D kernel: one 64-row tile per
+# (request, KV head) and 256 split-KV segments (C1-tuned).
+_MUSE_VERIFY_BLOCK_M = 64
+_MUSE_VERIFY_NUM_SEGMENTS = 256
+# Full-layer GQA-folded verify (when the two-KV-head kernel is off): batch
+# floor, splits, BN, warps. 12 x 20K-120K contexts: 166 us vs 238 us for the 3D path.
+_MUSE_VERIFY_FULL_GQA = (8, 64, 64, 4)
+_muse_verify_v2_logged: set = set()
+
+
+def _muse_verify_attention(
+    q,
+    k,
+    v,
+    out,
+    cu_seqlens_q,
+    max_seqlen_q,
+    seqused_k,
+    block_table,
+    softmax_scale,
+    window_size,
+    softcap,
+    k_descale,
+    v_descale,
+    sinks,
+    kernels,
+) -> bool:
+    """Muse Spark target verify (8 tokens x GQA 8, head_dim 64, FP8 KV in 16-token
+    pages) on the verify kernels; False leaves the call to unified_attention.
+
+    Sliding layers (2047-token window): split-KV up to 8 requests, GQA-folded
+    tiles beyond. Full layers: the two-KV-head kernel (16 Q / 2 KV heads per
+    rank, bitwise equal to the GQA-folded and 3D paths), else GQA-folded
+    split-KV from 8 requests. ``kernels`` holds the enabled kernel names.
+    """
+    num_tokens, num_query_heads, head_size = q.shape
+    _, block_size, num_kv_heads, _ = k.shape
+    num_seqs = len(seqused_k)
+    sliding_window = 1 + window_size[0]
+    if not (
+        num_seqs > 0
+        and block_size == 16
+        and head_size == 64
+        and num_query_heads == 8 * num_kv_heads
+        and int(max_seqlen_q) == 8
+        and num_tokens == num_seqs * 8
+        and q.dtype == torch.bfloat16
+        and k.dtype == v.dtype == fp8_dtype
+        and softcap == 0
+        and sinks is None
+    ):
+        return False
+    if sliding_window == 2047 and window_size[1] == 0:
+        if "swa_splitkv" in kernels and num_query_heads == 16 and 0 < num_seqs <= 8:
+            swa_verify_splitkv(
+                q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, None,
+                softmax_scale, True, window_size, block_table, softcap,
+                None, k_descale, v_descale, num_splits=16,
+            )  # fmt: skip
+            return True
+        if "swa_gqa" in kernels and num_seqs > 8:
+            gqa_verify_splitkv(
+                q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
+                sliding_window, k_descale, v_descale,
+                splits=16 if num_seqs <= 16 else 8, bn=64, num_warps=4, num_stages=2,
+            )  # fmt: skip
+            return True
+        return False
+    if sliding_window != 0:
+        return False
+    if "full_v2" in kernels and num_query_heads == 16 and k.stride() == v.stride():
+        splits = pick_splits_v2(num_seqs)
+        if num_seqs not in _muse_verify_v2_logged:
+            _muse_verify_v2_logged.add(num_seqs)
+            logger.info(
+                "Muse verify v2 full layers: num_seqs=%d mode=exact splits=%d",
+                num_seqs,
+                splits,
+            )
+        gqa_verify_splitkv_2kv(
+            q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+            splits=splits,
+        )  # fmt: skip
+        return True
+    min_seqs, splits, bn, warps = _MUSE_VERIFY_FULL_GQA
+    if "full_gqa" in kernels and num_seqs >= min_seqs:
+        gqa_verify_splitkv(
+            q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, 0,
+            k_descale, v_descale, splits=splits, bn=bn, num_warps=warps, num_stages=2,
+        )  # fmt: skip
+        return True
+    return False
+
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -237,6 +347,9 @@ class ForwardMetadata:
     cprr_kv_indices: Optional[torch.Tensor] = None
     cprr_kv_indptr: Optional[torch.Tensor] = None
     cprr_empty_rows: Optional[torch.Tensor] = None
+    # Unified target verify KV lengths (seq_lens + draft tokens), computed once
+    # per batch; graph replay refills preallocated storage.
+    verify_seqlen_k: Optional[torch.Tensor] = None
 
 
 def _build_paged_kv_view(
@@ -582,6 +695,67 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+
+        # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
+        # Triton attention. Extend and target verify take the Muse fast paths below
+        # (each behind its own SGLANG_MUSE_* switch); decode is unchanged.
+        self.use_muse_attention_paths = (
+            is_gfx95_supported()
+            and not self.use_mla
+            and self.use_triton_unified_attention
+            and self.use_sliding_window_kv_pool
+            and not self.kv_cache_is_vectorized_5d
+            and self.head_dim == 64
+            and self.num_head == 8 * self.num_kv_head
+        )
+        self.muse_reuse_extend_metadata = (
+            self.use_muse_attention_paths
+            and envs.SGLANG_MUSE_REUSE_EXTEND_METADATA.get()
+        )
+        self.muse_reuse_verify_lengths = (
+            self.use_muse_attention_paths
+            and self._use_unified_verify
+            and envs.SGLANG_MUSE_REUSE_VERIFY_LENGTHS.get()
+        )
+        self.muse_extend_fp8_q = (
+            self.use_muse_attention_paths and envs.SGLANG_MUSE_EXTEND_FP8_Q.get()
+        )
+        self._muse_extend_fp8_logged = False
+        self.muse_verify_kernels = frozenset(
+            name
+            for name, env in (
+                ("swa_splitkv", envs.SGLANG_MUSE_VERIFY_SWA_SPLITKV),
+                ("swa_gqa", envs.SGLANG_MUSE_VERIFY_SWA_GQA),
+                ("full_v2", envs.SGLANG_MUSE_VERIFY_FULL_V2),
+                ("full_gqa", envs.SGLANG_MUSE_VERIFY_FULL_GQA),
+            )
+            if self.use_muse_attention_paths and self._use_unified_verify and env.get()
+        )
+        # Extra unified_attention() arguments for Muse extend / verify calls.
+        self.muse_unified_attention_kwargs = {}
+        if self.use_muse_attention_paths and _unified_attention_has_muse_tiles:
+            if envs.SGLANG_MUSE_PREFILL_2D_TILES.get():
+                self.muse_unified_attention_kwargs["prefill_2d_config"] = (
+                    _MUSE_PREFILL_2D_CONFIG
+                )
+            if envs.SGLANG_MUSE_UNMASKED_INTERIOR.get():
+                self.muse_unified_attention_kwargs["unmasked_interior"] = True
+            if envs.SGLANG_MUSE_VERIFY_BM64.get():
+                self.muse_unified_attention_kwargs.update(
+                    verify_block_m=_MUSE_VERIFY_BLOCK_M,
+                    verify_num_segments=_MUSE_VERIFY_NUM_SEGMENTS,
+                )
+        if self.use_muse_attention_paths:
+            logger.info(
+                "Muse Spark attention paths: reuse_extend_metadata=%s "
+                "reuse_verify_lengths=%s extend_fp8_q=%s verify_kernels=%s "
+                "unified_attention_tiles=%s",
+                self.muse_reuse_extend_metadata,
+                self.muse_reuse_verify_lengths,
+                self.muse_extend_fp8_q,
+                sorted(self.muse_verify_kernels),
+                sorted(self.muse_unified_attention_kwargs),
+            )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -1240,19 +1414,28 @@ class AiterAttnBackend(AttentionBackend):
         dim to the next power of two and reads the same paged KV the decode path
         reads, so one kernel serves prefill and decode."""
         bs = forward_batch.batch_size
-        max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
-        page_table, swa_page_table = self._build_extend_unified_page_table(
-            bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
-        )
+        if self.muse_reuse_extend_metadata and self.page_size > 1:
+            # init_forward_metadata already built both block page tables, and the
+            # prefill updater wrote this batch's query offsets before any layer ran.
+            fm = self.forward_metadata
+            page_table = fm.kv_indices
+            swa_page_table = fm.swa_page_table
+            cu_seqlens_q = fm.qo_indptr
+            assert page_table.ndim == 2 and cu_seqlens_q is not None
+        else:
+            max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+            page_table, swa_page_table = self._build_extend_unified_page_table(
+                bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+            )
 
-        # Build cu_seqlens_q from this batch's extend lengths. The standard
-        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
-        # ForwardMetadata), so relying on it corrupts multi-sequence batches
-        # (only bs=1 happens to work).
-        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
-        cu_seqlens_q[1:] = torch.cumsum(
-            forward_batch.extend_seq_lens.to(torch.int32), dim=0
-        )
+            # Build cu_seqlens_q from this batch's extend lengths. The standard
+            # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
+            # ForwardMetadata), so relying on it corrupts multi-sequence batches
+            # (only bs=1 happens to work).
+            cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
+            cu_seqlens_q[1:] = torch.cumsum(
+                forward_batch.extend_seq_lens.to(torch.int32), dim=0
+            )
 
         # unified_attention uses (left, right) window = (window-1, 0), NOT the
         # CK convention (window, -1). Match the decode path (`de_window`).
@@ -1269,6 +1452,39 @@ class AiterAttnBackend(AttentionBackend):
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
         )
+        q_descale = None
+        if (
+            self.muse_extend_fp8_q
+            and uni_window == (-1, -1)
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch.spec_info is None
+            and q_u.shape[0] >= _MUSE_EXTEND_FP8_MIN_Q
+            and layer.qk_head_dim == layer.v_head_dim == 64
+            and not layer.is_cross_attention
+            and sinks is None
+            and layer.logit_cap == 0.0
+            and q_u.dtype == torch.bfloat16
+            and k_cache.dtype == v_cache.dtype == fp8_dtype
+            and k_descale is not None
+            and v_descale is not None
+            and k_descale.numel() == v_descale.numel() == 1
+            and layer.k_scale is None
+            and layer.v_scale is None
+            and k_descale is self.k_scale
+            and v_descale is self.v_scale
+        ):
+            # Muse Spark A8 extend: FP8 Q with a per-tensor scale computed on the
+            # device (no host sync) against the FP8 KV cache, as B200's trtllm_mha
+            # runs it when the KV cache is FP8.
+            q_descale = (q_u.abs().amax().float() / 448.0).clamp_min(1e-12).view(1)
+            q_u = (q_u.float() / q_descale).to(fp8_dtype)
+            if not self._muse_extend_fp8_logged:
+                self._muse_extend_fp8_logged = True
+                logger.info(
+                    "Muse extend FP8 (a8) for full layers, q=%d max_q=%d",
+                    q_u.shape[0],
+                    self.forward_metadata.max_q_len,
+                )
         unified_attention(
             q=q_u,
             k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
@@ -1283,10 +1499,11 @@ class AiterAttnBackend(AttentionBackend):
             window_size=uni_window,
             block_table=pt,
             softcap=layer.logit_cap,
-            q_descale=None,
+            q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=sinks,
+            **self.muse_unified_attention_kwargs,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -2499,6 +2716,12 @@ class AiterAttnBackend(AttentionBackend):
                         max_extend_len=max_q_len,
                         swa_page_table=swa_page_table,
                         swa_out_cache_loc=swa_out_cache_loc,
+                        # Same lengths forward_extend would add per layer.
+                        verify_seqlen_k=(
+                            forward_batch.seq_lens[:bs] + draft_num
+                            if self.muse_reuse_verify_lengths
+                            else None
+                        ),
                     )
                 else:
                     qo_indptr = torch.arange(
@@ -2649,7 +2872,12 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     kv_indices,
-                    None,
+                    # The prefill updater wrote this batch's query offsets.
+                    (
+                        self.qo_indptr[: bs + 1]
+                        if self.muse_reuse_extend_metadata
+                        else None
+                    ),
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
@@ -2982,6 +3210,12 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        if self.muse_reuse_verify_lengths:
+            # Verify KV lengths, refilled by replay preparation; every layer of the
+            # captured graph reads this storage.
+            self.cuda_graph_verify_seqlen_k = torch.empty(
+                max_bs, dtype=torch.int64, device=self.device
+            )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -3197,32 +3431,38 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_lens = seq_lens
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
-            if seq_lens_sum is not None:
-                kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+            if self.use_muse_attention_paths and self._use_unified_verify:
+                # Unified verify reads the block page table only; the token-level
+                # KV index build (cumsum + index kernel over the whole context)
+                # would be wasted replay preparation.
+                kv_indptr = kv_indices = None
+            else:
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
+                if seq_lens_sum is not None:
+                    kv_indices_used = seq_lens_sum + (
+                        self.num_draft_tokens * bs if self.use_mla else 0
+                    )
+                    assert_buffer_fits(
+                        kv_indices_used,
+                        kv_indices.numel(),
+                        "aiter target_verify kv_indices",
+                        bs=bs,
+                        seq_lens_sum=seq_lens_sum,
+                    )
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
-                assert_buffer_fits(
-                    kv_indices_used,
-                    kv_indices.numel(),
-                    "aiter target_verify kv_indices",
-                    bs=bs,
-                    seq_lens_sum=seq_lens_sum,
-                )
-            num_token_blocks = self._kv_index_blocks(bs)
-            create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-                TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
-            )
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
 
             if self.use_mla and self.dcp_world_size > 1:
@@ -3360,6 +3600,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     max_kv_len_unified = max_num_blocks_per_seq * self.page_size
+                    verify_seqlen_k = None
+                    if self.muse_reuse_verify_lengths:
+                        verify_seqlen_k = self.cuda_graph_verify_seqlen_k[:bs]
+                        torch.add(
+                            seq_lens[:bs], verify_tokens_per_req, out=verify_seqlen_k
+                        )
                     self.forward_metadata = ForwardMetadata(
                         None,
                         _page_table,
@@ -3369,6 +3615,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_kv_len_unified,
                         max_extend_len=_max_q_len,
                         swa_page_table=_swa_page_table,
+                        verify_seqlen_k=verify_seqlen_k,
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
@@ -4263,6 +4510,39 @@ class AiterAttnBackend(AttentionBackend):
                         )
                         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+                    # seq_lens + draft tokens: precomputed once per batch when
+                    # the Muse verify-length reuse is on, else added here, inside
+                    # the graph region (a host-side add would allocate a new
+                    # tensor each replay and break the captured pointer).
+                    seqused_k = self.forward_metadata.verify_seqlen_k
+                    if seqused_k is None:
+                        seqused_k = (
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        )
+                    if (
+                        self.muse_verify_kernels
+                        and not layer.is_cross_attention
+                        and layer.qk_head_dim == layer.v_head_dim == 64
+                        and _muse_verify_attention(
+                            q_unified,
+                            k_unified,
+                            v_unified,
+                            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            self.forward_metadata.qo_indptr,
+                            self.forward_metadata.max_q_len,
+                            seqused_k,
+                            page_table,
+                            layer.scaling,
+                            window_size,
+                            layer.logit_cap,
+                            k_descale,
+                            v_descale,
+                            sinks,
+                            self.muse_verify_kernels,
+                        )
+                    ):
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
                     # GQA-packing fix: do NOT expand the single KV head to
                     # tp_q_head_num. Passing K/V with the true kv-head count (exactly
                     # like forward_decode) lets unified_attention derive
@@ -4273,18 +4553,13 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
-                    # The seq_lens + draft_num add has to run INSIDE the graph
-                    # region; a host-side pre-add would allocate a new tensor
-                    # each replay and break the captured pointer.
                     unified_attention(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=seqused_k,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,
@@ -4296,6 +4571,7 @@ class AiterAttnBackend(AttentionBackend):
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
+                        **self.muse_unified_attention_kwargs,
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

@@ -1872,6 +1872,27 @@ class Envs:
     # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
     # short-window decode layers on gfx950.
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
+    # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
+    # variable is the off-switch of one optimization; the paths are shape-gated, so
+    # they only engage on the Muse Spark shapes they were measured on.
+    # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
+    # extend reuses the page tables / query offsets init_forward_metadata built.
+    SGLANG_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # target-verify KV lengths once per batch / per graph replay, not per layer.
+    SGLANG_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
+    # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.
+    SGLANG_MUSE_EXTEND_FP8_Q = EnvBool(True)
+    # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
+    # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
+    SGLANG_MUSE_PREFILL_2D_TILES = EnvBool(True)
+    SGLANG_MUSE_UNMASKED_INTERIOR = EnvBool(True)
+    SGLANG_MUSE_VERIFY_BM64 = EnvBool(True)
+    # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
+    # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
+    SGLANG_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
+    SGLANG_MUSE_VERIFY_SWA_GQA = EnvBool(True)
+    SGLANG_MUSE_VERIFY_FULL_V2 = EnvBool(True)
+    SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
