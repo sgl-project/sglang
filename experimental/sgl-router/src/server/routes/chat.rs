@@ -551,6 +551,7 @@ fn pick_prefill_worker(
         min_load_choices: affinity
             .map(|config| config.min_load_choices)
             .unwrap_or(DEFAULT_MIN_LOAD_CHOICES),
+        route_by_uncached_tokens: affinity.is_some_and(|config| config.route_by_uncached_tokens),
     })
     .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
 }

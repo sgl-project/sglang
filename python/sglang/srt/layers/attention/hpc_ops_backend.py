@@ -34,10 +34,10 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 import torch
 
-from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
+from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     update_trtllm_mha_graph_metadata,
 )
-from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
+from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend

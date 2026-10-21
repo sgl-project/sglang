@@ -234,8 +234,8 @@ class MambaComponent(TreeComponent):
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
-            self.tree_core.component_evictable_size_[self.component_type] += len(
-                params.mamba_value
+            self.tree_core.component_evictable_size_[self.component_type] += (
+                self.reclaimable_value_len(node)
             )
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
@@ -334,7 +334,7 @@ class MambaComponent(TreeComponent):
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
             device_frees[self.component_type].append(cd.value)
-            freed = len(cd.value)
+            freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             cd.value = None
 
@@ -465,7 +465,7 @@ class MambaComponent(TreeComponent):
             cd.host_lock_ref += 1
         else:
             if cd.lock_ref == 0 and value is not None:
-                vlen = len(value)
+                vlen = self.reclaimable_value_len(node)
                 self.tree_core.component_evictable_size_[ct] -= vlen
                 self.tree_core.component_protected_size_[ct] += vlen
             cd.lock_ref += 1
@@ -498,7 +498,7 @@ class MambaComponent(TreeComponent):
 
         assert cd.lock_ref > 0, f"Mamba release hit lock_ref=0 on node {node.id}"
         if cd.lock_ref == 1 and value is not None:
-            vlen = len(value)
+            vlen = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[ct] += vlen
             self.tree_core.component_protected_size_[ct] -= vlen
         cd.lock_ref -= 1
