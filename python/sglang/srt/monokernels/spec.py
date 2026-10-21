@@ -40,6 +40,12 @@ class Feature(enum.Enum):
     PARTITIONED_GPU = "partitioned GPUs"
 
 
+class StepMetadata(enum.Enum):
+    """Per-step attention metadata a backend can skip building."""
+
+    LOW_RATIO_DECODE_SCHEDULE = "the aiter decode schedule of each low-ratio indexer"
+
+
 class DeviceLimits(msgspec.Struct, frozen=True):
     """What a spec's kernels support on one ISA, e.g. gfx950."""
 
@@ -153,6 +159,8 @@ class MonoSpec(msgspec.Struct, frozen=True):
     ] = None
     # (model) -> tokens per request when different from the target, e.g. draft blocks
     tokens_per_request: Optional[Callable[[torch.nn.Module], int]] = None
+    # per-step metadata the forward never reads; backends skip it on routed steps
+    unread_metadata: frozenset[StepMetadata] = frozenset()
 
     def widths(self, isa: str) -> tuple[int, ...]:
         return self.devices[isa].widths

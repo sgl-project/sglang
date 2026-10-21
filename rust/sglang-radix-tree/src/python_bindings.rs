@@ -179,7 +179,7 @@ fn cache_action_tag(action: &CacheAction) -> &'static str {
         CacheAction::FreeDeviceKV(_) => "free_device_kv",
         CacheAction::FreeDeviceKVFullOnly(_) => "free_device_kv_full_only",
         CacheAction::BackupKV(_) => "backup_kv",
-        CacheAction::ReplaceWriteThroughOnNodeSplit { .. } => "replace_write_through_on_node_split",
+        CacheAction::UpdatePendingBackupOnNodeSplit { .. } => "update_pending_backup_on_node_split",
         CacheAction::MambaEvictExcessPathStates { .. } => "mamba_evict_excess_path_states",
         CacheAction::FreeComponentDeviceSlot { .. } => "free_component_device_slot",
         CacheAction::FreeComponentHostSlot { .. } => "free_component_host_slot",
@@ -202,7 +202,7 @@ fn cache_action_to_py(py: Python<'_>, action: CacheAction) -> PyResult<Py<PyAny>
             (tag, tensors).into_py_any(py)
         }
         CacheAction::BackupKV(backup) => (tag, backup.node_ids).into_py_any(py),
-        CacheAction::ReplaceWriteThroughOnNodeSplit {
+        CacheAction::UpdatePendingBackupOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,
@@ -1013,7 +1013,7 @@ impl HostEvictionResultBinding {
     }
 }
 
-type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>);
+type TreePathNodeInfoTuple = (NodeId, NodeId, usize, usize, Option<usize>, usize);
 
 /// The generic UnifiedTreeCore adapter the per-key-type pyclasses delegate to;
 /// the Mutex makes the Send-only core satisfy pyclass's Sync bound.
@@ -1419,6 +1419,7 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
                             node.path_start,
                             node.path_end,
                             node.full_value_len,
+                            node.num_children,
                         )
                     })
                     .collect()
@@ -1511,7 +1512,9 @@ impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<K> {
         let made_progress = node_id.is_some()
             || result.mamba_backup_node_id.is_some()
             || result.swa_backup_node_id.is_some()
-            || !result.tracker.is_empty();
+            || !result.tracker.is_empty()
+            || result.device_frees.values().any(|frees| !frees.is_empty())
+            || result.host_frees.values().any(|frees| !frees.is_empty());
         Ok(EvictDeviceNextNodeResultBinding {
             node_id,
             mamba_backup_node_id: result.mamba_backup_node_id,
@@ -4019,12 +4022,9 @@ fn get_hash_str(
                 "prior_hash must be a 64-character hexadecimal digest",
             ));
         }
-        if let Some(token_id) = raw
-            .iter()
-            .find(|token_id| u32::try_from(**token_id).is_err())
-        {
+        if let Some(token_id) = raw.iter().find(|token_id| **token_id < 0) {
             return Err(PyValueError::new_err(format!(
-                "token id {token_id} does not fit in uint32"
+                "token id {token_id} must be a non-negative int64"
             )));
         }
         Ok(py.detach(move || {
