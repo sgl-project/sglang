@@ -1,4 +1,4 @@
-"""Unit tests for MooncakeStoreConfig local_hostname resolution.
+"""Unit tests for MooncakeStoreConfig local_hostname and protocol resolution.
 
 Regression for sgl-project/sglang#23457: runtime attach must resolve
 per-node local_hostname from process environment instead of a shared default.
@@ -116,6 +116,46 @@ class TestMooncakeStoreConfigLocalHostname(CustomTestCase):
             self.assertEqual(cfg.local_hostname, "10.0.0.11")
         finally:
             os.unlink(config_path)
+
+
+class TestMooncakeStoreConfigProtocol(CustomTestCase):
+    _BASE_CONFIG = {"master_server_address": "127.0.0.1:50051"}
+
+    def _load_from_extra_config(self, extra_config=None):
+        config = {**self._BASE_CONFIG, **(extra_config or {})}
+        return MooncakeStoreConfig.load_from_extra_config(config)
+
+    def _load_from_file(self, extra_config=None):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fin:
+            json.dump({**self._BASE_CONFIG, **(extra_config or {})}, fin)
+            config_path = fin.name
+        try:
+            with temp_set_env(
+                allow_sglang=True, SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=config_path
+            ):
+                return MooncakeStoreConfig.from_file()
+        finally:
+            os.unlink(config_path)
+
+    def test_load_from_extra_config_uses_protocol_env_when_omitted(self):
+        with temp_set_env(MOONCAKE_PROTOCOL="efa"):
+            cfg = self._load_from_extra_config()
+        self.assertEqual(cfg.protocol, "efa")
+
+    def test_load_from_extra_config_prefers_explicit_protocol_over_env(self):
+        with temp_set_env(MOONCAKE_PROTOCOL="efa"):
+            cfg = self._load_from_extra_config({"protocol": "rdma"})
+        self.assertEqual(cfg.protocol, "rdma")
+
+    def test_from_file_uses_protocol_env_when_omitted(self):
+        with temp_set_env(MOONCAKE_PROTOCOL="efa"):
+            cfg = self._load_from_file()
+        self.assertEqual(cfg.protocol, "efa")
+
+    def test_from_file_prefers_explicit_protocol_over_env(self):
+        with temp_set_env(MOONCAKE_PROTOCOL="efa"):
+            cfg = self._load_from_file({"protocol": "rdma"})
+        self.assertEqual(cfg.protocol, "rdma")
 
 
 if __name__ == "__main__":

@@ -26,12 +26,14 @@ class TestOnIdleStallPublish(CustomTestCase):
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
         s.disaggregation_mode = DisaggregationMode.NULL
+        s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
         s.is_fully_idle = MagicMock(return_value=False)  # stalled, not idle
         s.publish_load_snapshot = MagicMock(return_value=None)
         s.load_publisher = MagicMock()
         s.load_inquirer = MagicMock()
         s.metrics_reporter = MagicMock()
+        s.dp_attn_adapter = MagicMock()
         s._last_stall_publish_ts = float("-inf")
         return s
 

@@ -196,10 +196,6 @@ class TensorcastStore(HiCacheStorage):
             return 0
         return self._publish_if_available(hit_pages, fallback=0)
 
-    def _build_page_fragments(self, keys: list[str]) -> tuple[PageFragment, ...]:
-        registered = self._require_registered()
-        return _expand_page_fragments(registered, keys)
-
     def _build_artifact_specs(self, keys: list[str]) -> tuple[ByteArtifactSpec, ...]:
         registered = self._require_registered()
         return _expand_artifact_specs(registered, keys)
@@ -493,7 +489,7 @@ def _validate_storage_config(
             "TensorCast FULL v1 supports only page_first and page_first_direct, "
             f"got layout={mem_pool_host.layout!r}"
         )
-    if mem_pool_host.mtp_draft_device_pools:
+    if mem_pool_host.layer_num != mem_pool_host.target_layer_num:
         raise NotImplementedError(
             "TensorCast FULL v1 does not support packed MTP draft pools"
         )

@@ -6,21 +6,24 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.selector import get_kernel
+from sglang.kernels.selector import _platform, get_kernel
 from sglang.kernels.spec import (
+    CUDA_ONLY,
     CapabilityRequirement,
-    FormatSignature,
     KernelBackend,
     KernelSpec,
+    capabilities_satisfied,
 )
 
 if TYPE_CHECKING:
     import torch
 
-_CUDA = frozenset({CapabilityRequirement.CUDA})
+    from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
 
@@ -77,20 +80,7 @@ class Fp8ScaledMMOp(BaseFusedOp):
 
     op = "gemm.fp8_scaled_mm"
     priority = (KernelBackend.AOT, KernelBackend.TORCH)
-    capabilities = {
-        KernelBackend.AOT: _CUDA,
-        KernelBackend.TORCH: _SM90,
-    }
-    format_signature = FormatSignature(
-        supported_dtypes=("float8_e4m3fn",),
-        description=(
-            "C[M,N] = (A_fp8[M,K] @ B_fp8[K,N]) * scale_a[M,1] * scale_b[1,N] (+ bias)"
-        ),
-    )
-    descriptions = {
-        KernelBackend.AOT: "Row/column-scaled FP8 matmul (sgl_kernel wheel).",
-        KernelBackend.TORCH: "Row/column-scaled FP8 matmul (Torch NVJet on SM90).",
-    }
+    capabilities = {KernelBackend.AOT: CUDA_ONLY}
 
     def backend_eligible(
         self,
@@ -102,17 +92,11 @@ class Fp8ScaledMMOp(BaseFusedOp):
         out_dtype: torch.dtype,
         bias: Optional[torch.Tensor] = None,
     ) -> bool:
+        # The torch path is a measured SM90 win for some shapes, not a
+        # capability limit; elsewhere the AOT kernel always runs.
         if (
             backend is KernelBackend.AOT
-            and super().backend_eligible(
-                KernelBackend.TORCH,
-                mat_a,
-                mat_b,
-                scales_a,
-                scales_b,
-                out_dtype,
-                bias,
-            )
+            and capabilities_satisfied(_SM90, _platform())
             and _prefer_torch_rowwise_fp8(
                 mat_a, mat_b, scales_a, scales_b, out_dtype, bias
             )
@@ -166,15 +150,37 @@ _FP8_SCALED_MM = register_fused_op(Fp8ScaledMMOp(), __name__, "_FP8_SCALED_MM")
 
 register_kernel(
     KernelSpec(
+        op="gemm.dual_gemm_swiglu",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.dual_gemm_swiglu_fp8",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_dual_gemm:dual_gemm_swiglu_fp8",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_gemm_swiglu_nvfp4_quant",
+        backend=KernelBackend.CUTE_DSL,
+        target=(
+            "sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant"
+            ":nvfp4_gemm_swiglu_nvfp4_quant"
+        ),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
-        target="sglang.srt.layers.quantization.fp8_utils:bmm_fp8",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            supported_dtypes=("float8_e4m3fn", "float8_e5m2"),
-            description="batched (3D) per-tensor-scale FP8 matmul: D = A_fp8 @ B_fp8 * A_scale * B_scale",
-        ),
-        description="Batched FP8 matmul (flashinfer cuBLAS backend, torch.compile-safe wrapper).",
+        target="sglang.kernels.ops.gemm.flashinfer_bmm_fp8:bmm_fp8",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -182,11 +188,6 @@ register_kernel(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.AOT,
         target="sgl_kernel:dsv3_fused_a_gemm",
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="DeepSeek-V3 fused QKV-A GEMM",
-        ),
-        description="DeepSeek-V3 fused-A GEMM (sgl_kernel wheel).",
     )
 )
 register_kernel(
@@ -194,12 +195,7 @@ register_kernel(
         op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="DeepSeek-V3 fused QKV-A GEMM (drop-in with AOT signature)",
-        ),
-        description="DeepSeek-V3 fused-A GEMM (sglang.kernels.jit).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -207,12 +203,7 @@ register_kernel(
         op="gemm.tiny_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="skinny [m, k] @ [n, k].T with m in [1, max_m]; serves MoE routers and gate projections",
-        ),
-        description="Tiny bf16 GEMM (sglang.kernels.jit, JIT-only).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -220,12 +211,7 @@ register_kernel(
         op="gemm.n128k512",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="[m, 512] @ [128, 512].T for decode batches m <= 32",
-        ),
-        description="bf16 GEMM specialised for N = 128, K = 512 (sglang.kernels.jit, JIT-only).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -233,12 +219,7 @@ register_kernel(
         op="gemm.n32k5120",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
-        capabilities=_CUDA,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16",),
-            description="[m, 5120] @ [32, 5120].T for decode batches m <= 32",
-        ),
-        description="bf16 GEMM specialised for N = 32, K = 5120 (sglang.kernels.jit, JIT-only).",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -247,14 +228,6 @@ register_kernel(
         backend=KernelBackend.KDA,
         target=f"{_KDA_PACKAGE}.qwen3x_nvfp4_gemm:try_qwen3x_nvfp4_gemm",
         capabilities=_SM120,
-        format_signature=FormatSignature(
-            supported_dtypes=("uint8", "float8_e4m3fn", "bfloat16"),
-            description="Qwen3.x ModelOpt NVFP4 decode GEMM on SM120",
-        ),
-        description=(
-            "Shape-specialized Qwen3.x NVFP4 GEMM generated by Kernel Design "
-            "Agents and implemented with CuTe DSL."
-        ),
     )
 )
 register_kernel(
@@ -263,13 +236,6 @@ register_kernel(
         backend=KernelBackend.KDA,
         target=f"{_KDA_PACKAGE}.sm120_fp8:try_sm120_fp8_linear",
         capabilities=_SM12X,
-        format_signature=FormatSignature(
-            supported_dtypes=("bfloat16", "float8_e4m3fn", "float32"),
-            description=(
-                "Adaptive static per-tensor FP8 linear for small batches on SM12x"
-            ),
-        ),
-        description=("SM12x streaming GEMV plus KDA CUTLASS skinny GEMM dispatch."),
     )
 )
 
@@ -286,6 +252,39 @@ def fp8_scaled_mm(
     return _FP8_SCALED_MM(mat_a, mat_b, scales_a, scales_b, out_dtype, bias)
 
 
+def dual_gemm_swiglu_fp8(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    gate_up_weight_scale: torch.Tensor,
+    output_scale: Optional[torch.Tensor] = None,
+    quant_mode: Optional["DualGemmQuantMode"] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
+    if quant_mode is None:
+        from .cutedsl_dual_gemm import DualGemmQuantMode
+
+        quant_mode = DualGemmQuantMode.DYNAMIC_PER_TOKEN
+    return get_kernel("gemm.dual_gemm_swiglu_fp8", KernelBackend.CUTE_DSL)(
+        x,
+        gate_up_weight,
+        x_scale,
+        gate_up_weight_scale,
+        output_scale,
+        quant_mode,
+    )
+
+
+def dual_gemm_swiglu(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse BF16/FP16 gate/up projections followed by SwiGLU."""
+    return get_kernel("gemm.dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
+        x, gate_up_weight
+    )
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -298,50 +297,6 @@ def bmm_fp8(
     return get_kernel("gemm.bmm_fp8", KernelBackend.FLASHINFER)(
         A, B, A_scale, B_scale, dtype, out
     )
-
-
-def dsv3_fused_a_gemm(
-    mat_a: torch.Tensor,
-    mat_b: torch.Tensor,
-    output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """DeepSeek-V3 fused QKV-A GEMM."""
-    return get_kernel("gemm.dsv3_fused_a_gemm", KernelBackend.AOT)(mat_a, mat_b, output)
-
-
-# NOTE: named after the kernel entry, not the op -- a bare `tiny_gemm` here would
-# be shadowed by the submodule of the same name as soon as it is imported.
-def tiny_gemm_bf16(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    *,
-    out_dtype: Optional[torch.dtype] = None,
-    max_m: int = 16,
-) -> torch.Tensor:
-    """Tiny bf16 GEMM ``x[m, k] @ w[n, k].T``, support bf16/fp32 out"""
-    impl = get_kernel("gemm.tiny_gemm", KernelBackend.JIT)
-    return impl(x, w, out, out_dtype=out_dtype, max_m=max_m)
-
-
-def n128k512_gemm_bf16(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """bf16 GEMM ``x[m, 512] @ w[128, 512].T`` for decode batches (m <= 32)."""
-    impl = get_kernel("gemm.n128k512", KernelBackend.JIT)
-    return impl(x, w, out)
-
-
-def n32k5120_gemm_bf16(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """bf16 GEMM ``x[m, 5120] @ w[32, 5120].T`` for decode batches (m <= 32)."""
-    impl = get_kernel("gemm.n32k5120", KernelBackend.JIT)
-    return impl(x, w, out)
 
 
 def try_qwen3x_nvfp4_gemm(
@@ -376,41 +331,197 @@ def try_sm120_fp8_linear(
     )
 
 
+def kimi_k3_tiny_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Shape-tuned tiny GEMM for Kimi-K3, with the existing torch fallback."""
+    from .kimi_k3 import kimi_k3_tiny_gemm as impl
+
+    return impl(x, w)
+
+
 __all__ = [
     "Fp8ScaledMMOp",
     "bmm_fp8",
-    "dsv3_fused_a_gemm",
+    "dual_gemm_swiglu",
+    "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
-    "n128k512_gemm_bf16",
-    "n32k5120_gemm_bf16",
-    "tiny_gemm_bf16",
+    "kimi_k3_tiny_gemm",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",
 ]
 
 
-# LoRA SGMV Triton kernels migrated into this group (from lora/triton_ops);
-# registered for inventory. Import them from their modules.
-_TRITON_KERNELS = [
-    ("chunked_embedding_lora_a", "chunked_embedding_lora_a_forward"),
-    ("chunked_sgmv_expand", "chunked_sgmv_lora_expand_forward"),
-    ("chunked_sgmv_shrink", "chunked_sgmv_lora_shrink_forward"),
-    ("embedding_lora_a", "embedding_lora_a_fwd"),
-    ("gate_up_lora_b", "gate_up_lora_b_fwd"),
-    ("qkv_lora_b", "qkv_lora_b_fwd"),
-    ("sgemm_lora_a", "sgemm_lora_a_fwd"),
-    ("sgemm_lora_b", "sgemm_lora_b_fwd"),
-    ("kv_b_lora_absorbed", "step_a_q_fwd"),
-    ("kv_b_lora_absorbed", "step_b_q_fwd"),
-    ("kv_b_lora_absorbed", "step_a_v_fwd"),
-    ("kv_b_lora_absorbed", "step_b_v_fwd"),
-]
-for _mod, _fn in _TRITON_KERNELS:
-    register_kernel(
-        KernelSpec(
-            op=f"gemm.{_fn}",
-            backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
-        )
+# Public entry points inventoried by logical operator group (RFC #29630).
+register_kernel(
+    KernelSpec(
+        op="gemm.linear_bf16_fp32",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.bf16_fp32:_linear_bf16_fp32_cublas",
     )
-del _mod, _fn
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_bf16_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_gemv",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_bf16_small_batch",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_small_batch",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.wo_a_bf16_small_batch_mxfp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_small_batch_mxfp8",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
+        capabilities=_SM90 | _SM12X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.fp8_blockwise_scaled_mm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.fp8_blockwise_gemm:fp8_blockwise_scaled_mm",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
+        ),
+    )
+)
+# Mirrors SUPPORTED_CAPABILITIES in ops.gemm.convrot_int8 (pinned by a test).
+_CONVROT_INT8 = frozenset(
+    CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
+    for sm in ((9, 0), (10, 0), (12, 0), (12, 1))
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_rotate_quantize_activation",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_rotate_quantize_activation",
+        capabilities=_CONVROT_INT8,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_int8_fused_linear",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_int8_fused_linear",
+        capabilities=_CONVROT_INT8,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.convrot_int8_linear_prequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.convrot_int8:convrot_int8_linear_prequant",
+        capabilities=_CONVROT_INT8,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_fp8_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_fp8_gemv:sm120_fp8_gemv",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_moe_mtp_mma",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:nvfp4_moe_mtp_mma",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_nvfp4_moe",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:try_nvfp4_moe",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.gptq_marlin_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.gptq_marlin:gptq_marlin_gemm",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.rel_proj_small_t",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.inkling_rel_proj:rel_proj_small_t",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.fused_hc_mix",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.hc_mix:fused_hc_mix",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_fp8_matmul_triton",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul_triton",
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_fp8_matmul_deepgemm",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul_deepgemm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_mxfp8_matmul_deepgemm",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_mxfp8_matmul_deepgemm",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.triton_scaled_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.fp8_kernel:triton_scaled_mm",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.w8a8_block_int8_matmul",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.muse_spark_router_gemm",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
+        capabilities=CUDA_ONLY,
+    )
+)

@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from contextlib import nullcontext
 from types import ModuleType
 from unittest.mock import Mock, patch
 
@@ -8,6 +9,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     _cached_get_attn_backend,
+    component_attn_backend_context_manager,
+    get_attn_backend,
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
@@ -18,6 +21,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -64,6 +68,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         FakeCudaPlatform.supports_flash_attention = True
         FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
         _cached_get_attn_backend.cache_clear()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
 
     def resolve(
         self,
@@ -199,6 +204,73 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
 
+    def test_sage_attention_head_sizes(self):
+        sage_cls_str = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "sage_attn.SageAttentionBackend"
+        )
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        with patch.dict(sys.modules, {"sageattention": sageattention}):
+            for head_size in (32, 64, 72, 96, 128):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
+                        ),
+                        sage_cls_str,
+                    )
+            for head_size in (0, 160, 256):
+                with self.subTest(head_size=head_size):
+                    with self.assertRaisesRegex(ValueError, f"head size {head_size}"):
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
+                        )
+
+    def test_sage_head_size_fallback_respects_component_policy(self):
+        selector = "sglang.multimodal_gen.runtime.layers.attention.selector"
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.attention_backend = "sage_attn"
+        server_args._explicit_arg_names = {"attention_backend"}
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        sage = AttentionBackendEnum.SAGE_ATTN
+        sdpa = AttentionBackendEnum.TORCH_SDPA
+        with (
+            patch.dict(sys.modules, {"sageattention": sageattention}),
+            patch(f"{selector}.get_global_server_args", return_value=server_args),
+            patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch.object(
+                FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
+            ),
+        ):
+            for component, override, head_size, expected in (
+                ("text_encoder", None, 256, sdpa),
+                ("text_encoder", sage, 256, None),
+                ("transformer", None, 256, None),
+                ("text_encoder", sdpa, 72, sdpa),
+                ("transformer", None, 72, sage),
+            ):
+                with self.subTest(
+                    component=component, override=override, size=head_size
+                ):
+                    with (
+                        self.assertRaisesRegex(ValueError, "head size 256")
+                        if expected is None
+                        else nullcontext(),
+                        component_attn_backend_context_manager(
+                            override,
+                            component_name=component,
+                            allow_global_backend_fallback=component == "text_encoder",
+                        ),
+                    ):
+                        backend = get_attn_backend(head_size, torch.float16)
+                        self.assertEqual(backend.get_enum(), expected)
+
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True
         sageattention = types.ModuleType("sageattention")
@@ -274,6 +346,35 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             )
 
         self.assertEqual(backend.get_enum(), AttentionBackendEnum.AITER)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestTrtllmGenSageMetadata(unittest.TestCase):
+    def test_metadata_builds_inside_cuda_graph_capture(self):
+        """The DiT prepares this metadata inside its forward, which breakable
+        CUDA graphs capture; a host-to-device copy there failed the capture."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            ForwardContext,
+        )
+
+        context = ForwardContext(current_timestep=0, attn_metadata=None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qo, kv, seq_lens = context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(qo.tolist(), [0, 3, 6])
+        self.assertEqual(kv.tolist(), [0, 5, 10])
+        self.assertEqual(seq_lens.tolist(), [5, 5])
+        self.assertEqual({t.dtype for t in (qo, kv, seq_lens)}, {torch.int32})
+        self.assertIs(
+            context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )[0],
+            qo,
+        )
 
 
 if __name__ == "__main__":

@@ -80,7 +80,6 @@ class HpcOpsMoeQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     block_quant: bool
     global_num_experts: int
-    moe_ep_rank: int
     # Blockwise path
     w13_weight_scale_inv: Optional[torch.Tensor] = None
     w2_weight_scale_inv: Optional[torch.Tensor] = None
@@ -183,7 +182,7 @@ def fused_experts_none_to_hpc_ops(
             quant_info.w2_weight_scale_inv,
             topk_ids,
             topk_weights,
-            quant_info.moe_ep_rank,
+            runner_config.moe_ep_rank,
             quant_info.global_num_experts,
         )
     else:
@@ -198,7 +197,7 @@ def fused_experts_none_to_hpc_ops(
             act_and_mul_scale,
             topk_ids,
             topk_weights,
-            quant_info.moe_ep_rank,
+            runner_config.moe_ep_rank,
             quant_info.global_num_experts,
         )
 

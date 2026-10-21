@@ -23,6 +23,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
+_ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
 
 
 def _attn(**overrides):
@@ -32,21 +33,13 @@ def _attn(**overrides):
         rotary_emb=object(),
         current_attention_backend="dsa",
         use_deep_gemm_bmm=False,
+        dcp_size=1,
         kv_b_proj=SimpleNamespace(set_lora=False),
         _skip_rope_for_dsa_tilelang_fused=lambda: True,
     )
     for k, v in overrides.items():
         setattr(attn, k, v)
     return attn
-
-
-def _patch_dcp(case, *, dcp_enabled: bool):
-    """Give the gate a parallel context; the real one needs an initialized runtime."""
-    parallel = SimpleNamespace(dcp_enabled=dcp_enabled)
-    saved = forward_mla_rocm.get_parallel
-    forward_mla_rocm.get_parallel = lambda: parallel
-    case.addCleanup(setattr, forward_mla_rocm, "get_parallel", saved)
-    return parallel
 
 
 class TestFusedAbsorbGate(CustomTestCase):
@@ -56,7 +49,6 @@ class TestFusedAbsorbGate(CustomTestCase):
         self._saved = forward_mla_rocm._use_aiter_gfx95
         forward_mla_rocm._use_aiter_gfx95 = True
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
-        self._parallel = _patch_dcp(self, dcp_enabled=False)
 
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
@@ -64,8 +56,7 @@ class TestFusedAbsorbGate(CustomTestCase):
         Without this term the fused branch sets q_nope_out to None and
         all_gather_q_for_mla_decode dereferences it.
         """
-        self._parallel.dcp_enabled = True
-        self.assertFalse(_CAN_FUSE(_attn()))
+        self.assertFalse(_CAN_FUSE(_attn(dcp_size=2)))
 
     def test_takes_the_fused_path_when_every_term_holds(self):
         self.assertTrue(_CAN_FUSE(_attn()))
@@ -88,6 +79,40 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+
+
+class TestAbsorbBmmConfig(CustomTestCase):
+    def setUp(self):
+        self._saved = forward_mla_rocm._absorb_bmm_num_cu
+        forward_mla_rocm._absorb_bmm_num_cu = 256
+        self.addCleanup(
+            setattr,
+            forward_mla_rocm,
+            "_absorb_bmm_num_cu",
+            self._saved,
+        )
+
+    def test_decode_tiles(self):
+        cases = (
+            ((16, 1, 512), (16, 32, 1)),
+            ((16, 48, 512), (16, 128, 1)),
+            ((16, 200, 512), (32, 128, 2)),
+        )
+        for args, expected in cases:
+            with self.subTest(args=args):
+                config = _ABSORB_CONFIG(*args)
+                self.assertEqual(
+                    (
+                        config["BLOCK_SIZE_M"],
+                        config["BLOCK_SIZE_N"],
+                        config["waves_per_eu"],
+                    ),
+                    expected,
+                )
+
+    def test_large_row_count_falls_back(self):
+        self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
+        self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
 
 
 if __name__ == "__main__":
