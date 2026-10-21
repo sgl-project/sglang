@@ -165,7 +165,6 @@ def native(args, requests):
         "0.65",
         "--attention-backend",
         "fa3",
-        "--disable-overlap-schedule",
     ]
     (args.output_dir / "server-command.json").write_text(json.dumps(command, indent=2))
     log = (args.output_dir / "server.log").open("w")
