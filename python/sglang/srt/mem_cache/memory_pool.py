@@ -1085,6 +1085,13 @@ class MambaPool:
                 buffer_info=MambaStateBufferInfo(
                     temporal=self.mamba_cache.temporal,
                     conv=tuple(self.mamba_cache.conv),
+                    extra_checkpoint_names=tuple(
+                        f"{name}_{i}"
+                        for sibling in self._slot_siblings
+                        for i, (name, _, _, _) in enumerate(
+                            sibling.iter_transfer_state_entries()
+                        )
+                    ),
                     extra_checkpoint_buffers=tuple(
                         buffer
                         for sibling in self._slot_siblings

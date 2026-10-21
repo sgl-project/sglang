@@ -73,6 +73,8 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             "page-a_model_7_8_swa_v",
             "page-a_model_7_8_mamba_temporal",
             "page-a_model_7_8_mamba_conv_0",
+            "page-a_model_7_8_mamba_ple_short_conv_0",
+            "page-a_model_7_8_mamba_ple_ngram_0",
             "page-a_model_7_8_indexer_2",
             "page-a_model_7_8_draft_swa",
             "page-a_model_deepseek_v4_c4_indexer_state_2",

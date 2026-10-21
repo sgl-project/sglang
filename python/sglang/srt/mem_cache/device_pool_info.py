@@ -25,6 +25,7 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     temporal: torch.Tensor
     conv: tuple[torch.Tensor, ...]
     extra_checkpoint_buffers: tuple[torch.Tensor, ...] = ()
+    extra_checkpoint_names: tuple[str, ...] = ()
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         shape = tuple(self.temporal.shape)
@@ -47,6 +48,8 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 raise ValueError(
                     f"Mamba conv[{index}].dtype={buffer.dtype}, expected {self.conv[0].dtype}"
                 )
+        if len(self.extra_checkpoint_names) != len(self.extra_checkpoint_buffers):
+            raise ValueError("Mamba extra checkpoint names must match the buffer count")
         for index, buffer in enumerate(self.extra_checkpoint_buffers):
             if buffer.ndim < 1 or buffer.shape[0] != shape[1]:
                 raise ValueError(

@@ -19,7 +19,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,6 +72,7 @@ def _make_pools(with_side_state: bool):
     device_pool = SimpleNamespace(
         mamba_cache=SimpleNamespace(conv=conv, temporal=temporal),
         num_mamba_layers=NUM_LAYERS,
+        mamba_layer_ids=list(range(NUM_LAYERS)),
         size=NUM_DEVICE_SLOTS,
         device="cpu",
         _slot_siblings=siblings,
@@ -79,10 +80,8 @@ def _make_pools(with_side_state: bool):
 
     host = MambaPoolHost.__new__(MambaPoolHost)
     host.device_pool = device_pool
-    host.buffer_info = MambaStateBufferInfo(
-        temporal=device_pool.mamba_cache.temporal,
-        conv=tuple(device_pool.mamba_cache.conv),
-    )
+    host.buffer_info = MambaPool.get_device_pool_infos(device_pool)[0].buffer_info
+    host.buffer_info.validate()
     host.page_size = 1
     host.layout = "page_first"
     host.device = "cpu"
@@ -96,11 +95,8 @@ def _make_pools(with_side_state: bool):
     host.conv_dtype = conv[0].dtype
     host.temporal_dtype = temporal.dtype
     host.dtype = host.conv_dtype
-    host.slot_state_device_tensors = [
-        state
-        for sibling in device_pool._slot_siblings
-        for _, state, _, _ in sibling.iter_transfer_state_entries()
-    ]
+    host.slot_state_device_tensors = list(host.buffer_info.extra_checkpoint_buffers)
+    host.slot_state_names = list(host.buffer_info.extra_checkpoint_names)
     host.slot_state_buffers = [
         torch.zeros((NUM_HOST_SLOTS,) + tuple(state.shape[1:]), dtype=state.dtype)
         for state in host.slot_state_device_tensors
@@ -135,6 +131,30 @@ def _stub_conv_and_temporal_copies():
 
 
 class TestHiCacheMambaSlotSideStates(CustomTestCase):
+    def test_zero_copy_meta_carries_side_state_rows(self):
+        host, _ = _make_pools(True)
+        names = host.get_page_component_names()
+        self.assertEqual(
+            names, ["temporal", "conv_0", "ple_short_conv_0", "ple_ngram_0"]
+        )
+        indices = torch.tensor([2, 3])
+        ptrs, sizes = host.get_page_buffer_meta(indices)
+        self.assertEqual(len(ptrs), len(names) * len(indices))
+        self.assertEqual(len(sizes), len(ptrs))
+        for page, index in enumerate(indices.tolist()):
+            for offset, buf in enumerate(host.slot_state_buffers, start=2):
+                k = page * len(names) + offset
+                self.assertEqual(ptrs[k], buf[index].data_ptr())
+                self.assertEqual(sizes[k], buf[index].nbytes)
+
+    def test_zero_copy_meta_unchanged_without_side_state(self):
+        host, _ = _make_pools(False)
+        self.assertEqual(host.get_page_component_names(), ["temporal", "conv_0"])
+        ptrs, sizes = host.get_page_buffer_meta(torch.tensor([1]))
+        self.assertEqual(ptrs[0], host.temporal_buffer[1].data_ptr())
+        self.assertEqual(ptrs[1], host.conv_buffer[0][1].data_ptr())
+        self.assertEqual(len(sizes), 2)
+
     def test_size_per_token_accounts_for_side_state(self):
         with_side, _ = _make_pools(True)
         without_side, _ = _make_pools(False)

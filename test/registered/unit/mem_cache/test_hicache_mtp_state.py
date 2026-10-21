@@ -144,6 +144,7 @@ def test_ascend_packed_state_roundtrip_uses_buffer_descriptors(
             + 100 * i,
             conv=(torch.arange(layers * 8 * 4).reshape(layers, 8, 4) + 100 * i,),
             extra_checkpoint_buffers=(torch.arange(16).reshape(8, 2) + 100 * i,),
+            extra_checkpoint_names=(f"draft_state_{i}",),
         )
         for i, layers in enumerate((2, 1, 1, 1))
     )

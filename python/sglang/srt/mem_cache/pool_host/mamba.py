@@ -78,6 +78,7 @@ class MambaPoolHost(HostKVCache):
     # Class-level defaults so a model without side state, and the test stubs that
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
+    slot_state_names: tuple = ()
     slot_state_buffers: tuple = ()
 
     def __init__(
@@ -159,6 +160,9 @@ class MambaPoolHost(HostKVCache):
         # so a host round trip that skips them leaves the previous occupant's rows.
         self.slot_state_device_tensors = [
             buf for info in buffer_infos for buf in info.extra_checkpoint_buffers
+        ]
+        self.slot_state_names = [
+            name for info in buffer_infos for name in info.extra_checkpoint_names
         ]
         self.slot_state_buffers = []
         self.size_per_token = self.get_size_per_token()
@@ -905,17 +909,19 @@ class MambaPoolHost(HostKVCache):
             restored = tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape)
             tensor.copy_(restored)
 
+    def get_page_component_names(self) -> list[str]:
+        """Storage object names of one page, in get_page_buffer_meta() order."""
+        # Conv-only models have no SSM state, and a 0-byte object cannot be stored.
+        names = ["temporal"] if self.temporal_state_elem_size > 0 else []
+        names += [f"conv_{i}" for i in range(len(self.conv_buffer))]
+        return names + list(self.slot_state_names)
+
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O.
 
         Only page-first layouts are supported for mamba storage zero-copy because
         each page slot in temporal/conv buffers is directly addressable.
         """
-        if self.slot_state_device_tensors:
-            raise NotImplementedError(
-                "Mamba storage zero-copy does not carry registered slot side "
-                "states; use a whole-page storage backend."
-            )
         assert len(indices) % self.page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(
@@ -970,6 +976,11 @@ class MambaPoolHost(HostKVCache):
                 )
                 ptr_list.append(conv_ptr)
                 element_size_list.append(conv_element_sizes[j])
+            # Side-state buffers keep their own slot axis, one row per slot.
+            for state_buf in self.slot_state_buffers:
+                row_bytes = state_buf[0].nbytes
+                ptr_list.append(state_buf.data_ptr() + indices[i] * row_bytes)
+                element_size_list.append(self.page_size * row_bytes)
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:

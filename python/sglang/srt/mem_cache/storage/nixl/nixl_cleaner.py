@@ -26,7 +26,7 @@ _POOL_NAME_PATTERN = "|".join(
     sorted((re.escape(pool.value) for pool in PoolName), key=len, reverse=True)
 )
 _HYBRID_COMPONENT_SUFFIX_RE = re.compile(
-    rf"_(?:{_POOL_NAME_PATTERN})(?:_(?:temporal|conv_\d+|[kv]|\d+))?$"
+    rf"_(?:{_POOL_NAME_PATTERN})(?:_(?:temporal|[a-z][a-z_]*_\d+|[kv]|\d+))?$"
 )
 _BUCKET_NAME_RE = re.compile(rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
