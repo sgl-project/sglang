@@ -23,6 +23,13 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.linker_load_mode not in ("layer_wise", "prefetch"):
+        raise ValueError("--linker-load-mode must be 'layer_wise' or 'prefetch'.")
+    if cfg.linker_load_mode == "prefetch" and (
+        not cfg.enable_unified_cache_external_linker
+        or cfg.unified_cache_external_linker_backend != "mooncake"
+    ):
+        raise ValueError("--linker-load-mode=prefetch requires the Mooncake linker.")
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"

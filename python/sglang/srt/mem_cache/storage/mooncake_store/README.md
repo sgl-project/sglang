@@ -33,12 +33,16 @@ This integration is particularly valuable for production deployments involving l
 
 ### Direct linker prefetch
 
-Mooncake's external linker defaults to `layer_wise`. To enable full-layer
-prefetch, add this entry to your existing storage backend configuration:
+Mooncake's external linker defaults to `--linker-load-mode layer_wise`. To
+enable full-layer prefetch, use these flags alongside your Mooncake storage
+configuration:
 
 ```bash
---hicache-storage-backend-extra-config '{"linker_load_mode": "prefetch"}'
+--enable-unified-cache-external-linker \
+--linker-load-mode prefetch
 ```
+
+Keep Mooncake connection settings in `--hicache-storage-backend-extra-config`.
 
 Prefetch starts when the scheduler enqueues a request through
 `_prefetch_kvcache()`. It reads into private GPU slots, then inserts complete KV

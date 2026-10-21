@@ -7,7 +7,6 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
-
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
@@ -79,13 +78,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
-        load_mode = extra_config.pop("linker_load_mode", "layer_wise")
-        if load_mode not in ("layer_wise", "prefetch"):
-            raise ValueError(
-                f"Unsupported linker_load_mode={load_mode!r}; "
-                "expected 'layer_wise' or 'prefetch'."
-            )
-        self.load_mode = load_mode
+        self.load_mode = get_memory().linker_load_mode
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -135,7 +128,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.tp_group = tp_group
         self.broadcast_loads = {}
         if (
-            load_mode == "layer_wise"
+            self.load_mode == "layer_wise"
             and server_args.enable_linker_mla_dedup
             and rank_replicated
             and tp_size > 1

@@ -217,6 +217,13 @@ class Memory(msgspec.Struct):
             choices=["mooncake", "mori"],
         ),
     ] = "mooncake"
+    linker_load_mode: A[
+        str,
+        Arg(
+            help="KV load mode for the Mooncake external linker: layer_wise overlaps loading with execution; prefetch loads all layers before admission.",
+            choices=["layer_wise", "prefetch"],
+        ),
+    ] = "layer_wise"
     enable_linker_mla_dedup: A[
         bool,
         "Load replicated MLA KV on rank 0 and broadcast each layer with the Mooncake linker.",
