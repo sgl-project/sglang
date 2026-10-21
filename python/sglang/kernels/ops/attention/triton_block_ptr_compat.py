@@ -74,7 +74,7 @@ if not hasattr(tl, "advance"):
         if isinstance(pointer, _BlockPtr):
             pointer, mask = _materialize(pointer, boundary_check, _semantic)
             padding = core._unwrap_if_constexpr(padding_option)
-            other = {"zero": 0, "nan": float("nan")}.get(padding)
+            other = {"zero": 0.0, "nan": float("nan")}.get(padding)
         return _load(pointer, mask, other, _semantic=_semantic, **kwargs)
 
     @core.builtin
