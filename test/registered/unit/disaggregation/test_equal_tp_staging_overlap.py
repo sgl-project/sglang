@@ -276,5 +276,111 @@ class TestSchedulerSendRange(CustomTestCase):
         )
 
 
+    def test_finite_dcp_pack_limit_is_retained_when_splitting(self):
+        # A DCP pack-buffer cap (sender.get_max_transfer_tokens) smaller than
+        # the staging grid must survive equal-TP splitting: segments stay within
+        # the cap instead of growing back to one full grid slot.
+        tree = ast.parse((ROOT / "prefill.py").read_text())
+        node = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_send_kv_chunk"
+        )
+        node.decorator_list = []
+        node.returns = None
+        for arg in node.args.args:
+            arg.annotation = None
+        grid_tree = ast.parse((ROOT / "common/staging_buffer.py").read_text())
+        grid_nodes = [
+            n
+            for n in grid_tree.body
+            if isinstance(n, ast.FunctionDef)
+            and n.name in ("compute_grid_segments", "staging_grid_tokens")
+        ]
+        env = dict(
+            Optional=__import__("typing").Optional,
+            List=list,
+            Tuple=__import__("typing").Tuple,
+            get_schedule=lambda: NS(chunked_prefill_size=16),
+            kv_to_page_indices=lambda indices, page_size: indices[::page_size]
+            // page_size,
+            logger=NS(debug=lambda *args: None),
+            envs=NS(SGLANG_DISAGG_STAGING_MIN_GROUPS=NS(get=lambda: 4)),
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(
+                    ast.Module(body=grid_nodes + [node], type_ignores=[])
+                ),
+                "scheduler_send",
+                "exec",
+            ),
+            env,
+        )
+        split = method("mooncake/conn.py", "should_split_staging")
+        gate = method("mooncake/conn.py", "_is_first_staging_piece")
+        groups = method("mooncake/conn.py", "_fragmented_groups")
+        groups.__globals__["np"] = np
+        mgr = NS(
+            transfer_infos={
+                7: {"s": NS(is_dummy=False, dst_kv_indices=np.arange(80)[::2])}
+            },
+            _fragmented_groups=lambda src, dst: groups(None, src, dst),
+        )
+        sends = []
+        sender = NS(
+            curr_idx=0,
+            kv_mgr=mgr,
+            bootstrap_room=7,
+            requires_staging_grid_alignment=lambda: False,
+            should_send_kv_chunk=lambda *args: True,
+            # DCP pack buffer bound, smaller than the 16-token staging grid.
+            get_max_transfer_tokens=lambda: 8,
+        )
+        sender.should_split_staging = lambda *args: split(sender, *args)
+
+        def send(pages, state, **kwargs):
+            sends.append((sender.curr_idx, pages.copy(), state, kwargs))
+            sender.curr_idx += len(pages)
+
+        sender.send = send
+        translate = Mock(side_effect=lambda x: x)
+        req = NS(
+            kv=NS(req_pool_idx=0),
+            start_send_idx=0,
+            origin_input_ids=list(range(32)),
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+            rid="r",
+        )
+        scheduler = NS(
+            enable_staging=True,
+            token_to_kv_pool_allocator=NS(
+                page_size=1, translate_kv_indices_for_transfer=translate
+            ),
+            req_to_token_pool=NS(req_to_token=np.arange(32).reshape(1, 32)),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        env["_send_kv_chunk"](scheduler, req, end_idx=31)
+        # cap=8 -> four pieces; the last one is the partial tail (7 pages).
+        self.assertEqual([len(x[1]) for x in sends], [8, 8, 8, 7])
+        self.assertEqual(translate.call_count, 1)
+        self.assertEqual(req.start_send_idx, 31)
+        env["_send_kv_chunk"](scheduler, req, end_idx=32)
+        # Only the 1-page tail was left after the first call (start_send_idx=31).
+        self.assertEqual([len(x[1]) for x in sends], [8, 8, 8, 7, 1])
+        self.assertEqual(req.start_send_idx, 32)
+        self.assertEqual(
+            [
+                gate(NS(full_chunk_pages=16), start, len(pages))
+                for start, pages, *_ in sends
+            ],
+            [True, False, True, False, False],
+        )
+        self.assertEqual(
+            np.concatenate([x[1] for x in sends]).tolist(), list(range(32))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1703,12 +1703,6 @@ class SchedulerDisaggregationPrefillMixin:
                 if transfer_chunk_tokens is None
                 else min(transfer_chunk_tokens, grid_tokens)
             )
-            # One sender.send per grid slot; the sender's cumulative page
-            # counter marks only the final sub-send of the final chunk as
-            # is_last, routing aux/state correctly.
-            transfer_chunk_tokens = staging_grid_tokens(
-                get_schedule().chunked_prefill_size, page_size
-            )
         if transfer_chunk_tokens is not None:
             # Prefill cache hits can leave more KV to transfer than the DCP pack buffer holds.
             segments = compute_grid_segments(

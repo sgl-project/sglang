@@ -3414,14 +3414,17 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
             return True
         # Leave direct sends intact unless a grid-aligned piece, including
         # a partial final piece, can stage for at least one destination.
-        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        # Snapshot: decode ranks register concurrently on the bootstrap thread,
+        # so iterating the live dict can raise "dictionary changed size during
+        # iteration" on this scheduler thread.
+        infos = list(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values())
         end = self.curr_idx + len(page_indices)
         first = ((self.curr_idx + grid_pages - 1) // grid_pages) * grid_pages
         for start in range(first, end, grid_pages):
             src = page_indices[
                 start - self.curr_idx : start - self.curr_idx + grid_pages
             ]
-            for info in infos.values():
+            for info in infos:
                 if info.is_dummy:
                     continue
                 dst = info.dst_kv_indices[start : start + len(src)]
@@ -3434,8 +3437,8 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
     def requires_staging_grid_alignment(self):
         if self.kv_mgr.pp_size != 1:
             return True
-        infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
-        active = [info for info in infos.values() if not info.is_dummy]
+        infos = list(self.kv_mgr.transfer_infos.get(self.bootstrap_room, {}).values())
+        active = [info for info in infos if not info.is_dummy]
         if not active:
             return True
         for info in active:

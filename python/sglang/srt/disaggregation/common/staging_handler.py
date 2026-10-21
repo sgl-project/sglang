@@ -564,20 +564,23 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
 
 @dataclasses.dataclass
 class StagingTransferInfo:
-    """Per-chunk staging allocation info attached to a TransferInfo."""
+    """Per-chunk staging allocation info attached to a TransferInfo.
 
-    offsets: List[int] = dataclasses.field(default_factory=lambda: [-1])
-    rounds: List[int] = dataclasses.field(default_factory=lambda: [0])
-    ends: List[int] = dataclasses.field(default_factory=lambda: [-1])
+    Each chunk is published as one immutable (offset, round, end) tuple. The
+    prefill bootstrap thread writes these while transfer workers read them; a
+    tuple store is atomic, so readers never observe an offset paired with a
+    stale round/end (which could skip the staging-ring watermark wait).
+    """
+
+    entries: List[Tuple[int, int, int]] = dataclasses.field(
+        default_factory=lambda: [(-1, 0, -1)]
+    )
 
     def set_chunk(self, idx: int, offset: int, rnd: int, end: int):
-        while len(self.offsets) <= idx:
-            self.offsets.append(-1)
-            self.rounds.append(0)
-            self.ends.append(-1)
-        self.offsets[idx] = offset
-        self.rounds[idx] = rnd
-        self.ends[idx] = end
+        entries = self.entries
+        while len(entries) <= idx:
+            entries.append((-1, 0, -1))
+        entries[idx] = (offset, rnd, end)
 
 
 @dataclasses.dataclass
@@ -667,17 +670,15 @@ class PrefillStagingStrategy:
         )
 
         stg = req.staging
-        if stg is None or chunk_idx >= len(stg.offsets):
+        if stg is None or chunk_idx >= len(stg.entries):
             return (False, chunk_idx, -1, 0, -1)
 
-        c_offset = stg.offsets[chunk_idx]
+        # Single atomic tuple read: no torn (offset, round, end) combinations.
+        c_offset, c_round, c_end = stg.entries[chunk_idx]
         if c_offset == StagingAllocator.ALLOC_OVERSIZED:
             return (False, chunk_idx, StagingAllocator.ALLOC_OVERSIZED, 0, -1)
         if c_offset < 0:
             return (False, chunk_idx, -1, 0, -1)
-
-        c_round = stg.rounds[chunk_idx]
-        c_end = stg.ends[chunk_idx]
 
         if session_id is None:
             session_id = req.mooncake_session_id
