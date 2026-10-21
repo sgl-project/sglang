@@ -1350,26 +1350,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     max_len,
                     clean_logits=clean_logits,
                 )
-            logits_chunks = []
+            # Keep only one chunk alive beside the output. Retaining all chunks
+            # for torch.cat doubles the dense logits allocation at long context.
+            logits = torch.empty(
+                (batch_size * chunk_next_n, max_len),
+                dtype=torch.float32,
+                device=q.device,
+            )
             for start in range(0, batch_size, self.sm_count):
                 end = min(start + self.sm_count, batch_size)
                 chunk_context_lens = context_lens[start:end]
                 chunk_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     chunk_context_lens, blocksize, self.sm_count
                 )
-                logits_chunks.append(
-                    resolve_fp8_paged_mqa_logits_fn()(
-                        q[start:end],
-                        kv_cache,
-                        w[start * chunk_next_n : end * chunk_next_n],
-                        chunk_context_lens,
-                        block_table[start:end],
-                        chunk_schedule_metadata,
-                        max_len,
-                        clean_logits=clean_logits,
-                    )
+                chunk_logits = resolve_fp8_paged_mqa_logits_fn()(
+                    q[start:end],
+                    kv_cache,
+                    w[start * chunk_next_n : end * chunk_next_n],
+                    chunk_context_lens,
+                    block_table[start:end],
+                    chunk_schedule_metadata,
+                    max_len,
+                    clean_logits=clean_logits,
                 )
-            return torch.cat(logits_chunks, dim=0)
+                logits[start * chunk_next_n : end * chunk_next_n].copy_(chunk_logits)
+                del chunk_logits
+            return logits
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
