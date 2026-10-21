@@ -92,42 +92,6 @@ def init_mla_dcp_metadata(
     return local_seq_lens
 
 
-def init_mla_dcp_graph_state(
-    max_bs: int,
-    graph_context_len: int,
-    page_size: int,
-    speculative_num_draft_tokens: int | None,
-    device: torch.device,
-    *,
-    dcp_size: int,
-    dcp_rank: int,
-) -> dict[str, torch.Tensor]:
-    """Allocate local FIA page tables, lengths and mask at fixed graph addresses."""
-    cycle_size = page_size * dcp_size
-    max_local_context_len = graph_context_len // cycle_size * page_size + min(
-        page_size, max(0, graph_context_len % cycle_size - dcp_rank * page_size)
-    )
-    graph_num_pages = max(1, (max_local_context_len + page_size - 1) // page_size)
-    buffers = {
-        "block_tables": torch.empty(
-            (max_bs, graph_num_pages), dtype=torch.int32, device=device
-        ),
-        "dcp_seq_lens": torch.zeros(max_bs, dtype=torch.int32, device=device),
-    }
-    if speculative_num_draft_tokens is not None:
-        buffers["dcp_spec_seq_lens"] = torch.zeros(
-            max_bs * speculative_num_draft_tokens,
-            dtype=torch.int32,
-            device=device,
-        )
-        buffers["dcp_mtp_attn_mask"] = torch.ones(
-            (max_bs, speculative_num_draft_tokens, graph_num_pages * page_size),
-            dtype=torch.bool,
-            device=device,
-        )
-    return buffers
-
-
 def update_mla_dcp_graph_metadata(
     metadata: ForwardMetadata,
     req_to_token: torch.Tensor,

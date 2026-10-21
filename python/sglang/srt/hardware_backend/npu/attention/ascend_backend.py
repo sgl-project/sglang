@@ -21,7 +21,6 @@ from sglang.srt.hardware_backend.npu.attention.dcp import (
 )
 from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
     build_mla_dcp_local_block_tables,
-    init_mla_dcp_graph_state,
     init_mla_dcp_metadata,
     update_mla_dcp_graph_metadata,
 )
@@ -782,15 +781,43 @@ class AscendAttnBackend(AttentionBackend):
         total_context_len = graph_context_len + self.page_size - 1
         dense_mla_dcp_graph = self._use_dense_mla_dcp_target()
         if dense_mla_dcp_graph:
-            self.graph_metadata = init_mla_dcp_graph_state(
-                max_bs,
-                graph_context_len,
-                self.page_size,
-                self.speculative_num_draft_tokens,
-                self.device,
-                dcp_size=self.dcp_size,
-                dcp_rank=self.dcp_rank,
+            cycle_size = self.page_size * self.dcp_size
+            max_local_context_len = (
+                graph_context_len // cycle_size * self.page_size
+                + min(
+                    self.page_size,
+                    max(
+                        0,
+                        graph_context_len % cycle_size - self.dcp_rank * self.page_size,
+                    ),
+                )
             )
+            graph_num_pages = max(
+                1, (max_local_context_len + self.page_size - 1) // self.page_size
+            )
+            self.graph_metadata = {
+                "block_tables": torch.empty(
+                    (max_bs, graph_num_pages), dtype=torch.int32, device=self.device
+                ),
+                "dcp_seq_lens": torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                ),
+            }
+            if self.speculative_num_draft_tokens is not None:
+                self.graph_metadata["dcp_spec_seq_lens"] = torch.zeros(
+                    max_bs * self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
+                    (
+                        max_bs,
+                        self.speculative_num_draft_tokens,
+                        graph_num_pages * self.page_size,
+                    ),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
         else:
             graph_num_pages = max(
                 1, (graph_context_len + self.page_size - 1) // self.page_size
