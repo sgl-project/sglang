@@ -51,6 +51,7 @@ def make_host_pool(dtype, layout="page_first"):
     host.page_size = PAGE_SIZE
     host.page_num = TOTAL_ITEMS // PAGE_SIZE
     host.layer_num = NUM_LAYERS
+    host.target_layer_num = NUM_LAYERS
     host.head_num = HEAD_NUM
     host.head_dim = K_HEAD_DIM
     host.v_head_dim = V_HEAD_DIM
