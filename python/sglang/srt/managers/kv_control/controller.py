@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -37,7 +38,7 @@ from sglang.srt.managers.kv_control.contracts import (
 )
 from sglang.srt.managers.kv_control.index import LogicalIndex, ResolvedTarget
 from sglang.srt.managers.kv_control.registry import OperationRegistry, snapshot_envelope
-from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 
 
 class ExecutionRequest(Value):
@@ -86,6 +87,7 @@ class _Pending:
     cancel_sent: bool = False
     # Keep a bounded cause, never an exception/traceback retaining worker state.
     failure: tuple[str, str] | None = None
+    origin: Literal["explicit", "policy"] = "explicit"
 
 
 class KVControl:
@@ -126,6 +128,93 @@ class KVControl:
                 binding_id=binding_id,
             )
         )
+
+    def _reserve_policy_operations(self, proposals):
+        """Owner-only reservation of a complete plan before any physical effect.
+
+        Each (action_id, primitive) is validated and resolved at this boundary.
+        The composer cannot assert history or residency by supplying a snapshot.
+        Registered children remain queued until the runtime explicitly starts
+        them after dependency/admission checks. Public submit never uses this
+        authority, even with the same caller name.
+        """
+        if not self.enabled or self.executor is None:
+            raise ControlError(
+                "unsupported", "Policy execution requires a native owner"
+            )
+        kinds = {SetPriority: "set_priority", CopyTo: "copy_to", MoveTo: "move_to"}
+        if not proposals or len(proposals) > self.limits.max_actions:
+            raise ControlError("capacity", "Policy operation batch exceeds limit")
+        actions = []
+        for action_id, payload in proposals:
+            if type(payload) not in kinds:
+                raise ControlError(
+                    "invalid_payload", "Policy children must be primitives"
+                )
+            actions.append(
+                KvHintAction(
+                    action_id=action_id,
+                    action_type="sglang." + kinds[type(payload)],
+                    action_version="1.0",
+                    payload=msgspec.json.decode(msgspec.json.encode(payload)),
+                )
+            )
+        envelope = KvHintsEnvelope(
+            protocol_version=PROTOCOL_VERSION,
+            message_id="policy-" + uuid.uuid4().hex,
+            actions=actions,
+        )
+        batch, _ = snapshot_envelope(envelope, self.limits)
+        prepared = []
+        for frozen in batch.actions:
+            payload = parse_action(frozen.thaw())
+            if payload.target == "request_cached":
+                raise ControlError(
+                    "invalid_payload", "Policy children require logical targets"
+                )
+            locations = (
+                (payload.location,)
+                if isinstance(payload, SetPriority)
+                else (payload.src, payload.dst)
+            )
+            if any(
+                location.engine_id not in (None, self.registry.engine_id)
+                for location in locations
+            ):
+                raise ControlError(
+                    "unsupported", "Remote owners approve their own resources"
+                )
+            if not isinstance(payload, SetPriority) and payload.src == payload.dst:
+                raise ControlError(
+                    "invalid_payload", "Source and destination must differ"
+                )
+            prepared.append((payload, self.index.resolve(payload.target)))
+        submission = self.registry.reserve(batch, self.context("local-policy"))
+        for result, (payload, scope) in zip(submission.results, prepared, strict=True):
+            self._pending[result.ref.operation_id] = _Pending(
+                result.ref, payload, scope, origin="policy"
+            )
+            self.registry.update(
+                result.ref,
+                ExecutionUpdate(
+                    status=Status.QUEUED, quiescent=True, code="policy_dependency"
+                ),
+            )
+        return tuple(result.ref for result in submission.results)
+
+    def _start_policy_operation(self, ref):
+        result = self.registry.get(ref)
+        if result.status.terminal:
+            return result
+        pending = self._pending[ref.operation_id]
+        if pending.origin != "policy":
+            raise ControlError("invalid_payload", "Operation has explicit authority")
+        if not pending.started:
+            try:
+                self._start(pending)
+            except ControlError as error:
+                self._error(ref, error)
+        return self.registry.get(ref)
 
     def submit(self, envelope: KvHintsEnvelope, context: ControlContext) -> Submission:
         batch, unhandled = snapshot_envelope(envelope, self.limits)
@@ -353,6 +442,7 @@ class KVControl:
                     payload=pending.payload,
                     target=pending.target,
                     max_result_targets=self.limits.max_scope_spans,
+                    origin=pending.origin,
                 )
             )
             self._execution_update(pending, update)
@@ -435,9 +525,10 @@ class KVControl:
 
     @staticmethod
     def _validate_execution(pending, update):
-        if update.logical_change is not None:
+        if update.logical_change is not None or update.derived_operations:
             raise ControlError(
-                "invalid_completion", "Executors cannot report logical index mutations"
+                "invalid_completion",
+                "Executors cannot report logical mutations or create child operations",
             )
         payload = pending.payload
         location = payload.location if isinstance(payload, SetPriority) else payload.dst

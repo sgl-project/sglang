@@ -563,3 +563,28 @@ this module alone. Fifteen new CPU contract cases and 78 existing control cases
 pass together (93), /tmp/sglang-kv-policy-composer-final-cpu-proof.log. Strict
 Ruff/isort/format/whitespace checks pass. Parent reviewed the whole module;
 approve this composition feature unit. Runtime/admission integration is pending.
+
+## Unit 7c — Bounded registration and execution of private policy children
+
+Added owner-only whole-plan reservation and staged dispatch through the existing
+core. Native payloads are validated and logical scopes resolved together before
+registry reservation or physical effects. Queued policy children do not start
+on ordinary progress; the future runtime starts them after dependencies/admission
+conditions. Their private origin flows through actual executor requests. The
+existing core owns result validation, failure causes, bounded records, task
+cancellation and physical draining; no parallel bookkeeping path substitutes
+for those contracts.
+
+ExecutionUpdate now carries bounded unique registered child references supplied
+by the owner. Physical executors cannot emit those references. Parent ACK and
+child cancellation/results are independent. Five new pure-core tests exercise
+staged dispatch and draining, atomic batch refusal, frozen history/finish-task
+cancellation, public caller spoofing, and typed child references/parent ACK.
+A new real CPU-cache test verifies registered policy priority changes only on
+dispatch and remains subordinate to explicit priority even with the same caller
+and claim strings and a newer private revision. Test source placement initially
+moved a pre-existing spoof assertion into the new case; corrected the placement
+and reran the complete relevant set. Final result: 135 passed plus 18 subtests,
+/tmp/sglang-kv-policy-children-final-cpu-proof.log. Ruff/isort/format/whitespace
+checks pass. Parent reviewed the full diff; approve local policy registration
+unit. Configured policy runtime and actual admission preparation remain pending.

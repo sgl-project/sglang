@@ -728,3 +728,22 @@ is advisory: the scheduling/cache owner must resolve snapshots, check current
 resources, execute dependencies only after successful publication, and transfer
 preparation holds to actual admission. This module alone does not enable a
 serving policy or certify capacity/readiness.
+
+### Registered policy children
+
+The owner can reserve a whole policy batch with private
+`_reserve_policy_operations`, which validates native primitives and resolves
+all history before reserving any record or starting physical work. The core
+supplies private policy provenance; public caller names cannot select it.
+Children start only through `_start_policy_operation` after their dependencies
+and admission conditions pass. Idle polling does not dispatch queued children.
+They use the same finite registry, frozen targets, query/ACK results, task
+cleanup, cancellation and worker-drain rules as explicit operations.
+
+Owner results can report `derived_operations` as bounded, unique references to
+registered children. A parent acknowledgement does not cancel or acknowledge
+its children. Read child results or save their references before compacting the
+parent result; acknowledgement retains a terminal summary rather than detailed
+child metadata. Physical executors cannot create child references in completion
+updates. The serving policy runtime still needs to connect this mechanism to
+signals and configured policies.

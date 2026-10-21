@@ -354,6 +354,7 @@ class TestKVControlCache(CustomTestCase):
         self.assertEqual(
             [x.effective_priority for x in self.inspect(control).items], [-1]
         )
+
         spoof = self.submit(
             control,
             "set_priority",
@@ -370,6 +371,30 @@ class TestKVControlCache(CustomTestCase):
         self.assertEqual(spoof.status, Status.REJECTED)
         self.assertEqual(
             [x.effective_priority for x in self.inspect(control).items], [-1]
+        )
+
+    def test_registered_policy_priority_uses_actual_copy_and_private_origin(self):
+        cache, control = self.make()
+        insert(cache, [1, 2, 3, 4])
+        payload = SetPriority(
+            target=target(),
+            location=Location(tier="gpu"),
+            claim_id="c",
+            revision=100,
+            value=90,
+            ttl_seconds=30,
+        )
+        (ref,) = control._reserve_policy_operations((("retention", payload),))
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [0]
+        )
+        self.assertEqual(control._start_policy_operation(ref).status, Status.COMPLETED)
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [90]
+        )
+        self.priority(control, caller="local-policy", value=-7, revision=1)
+        self.assertEqual(
+            [x.effective_priority for x in self.inspect(control).items], [-7]
         )
 
     def test_disabled_has_no_claim_state_and_rust_fallback_is_explicit(self):

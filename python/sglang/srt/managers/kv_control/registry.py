@@ -363,6 +363,14 @@ class OperationRegistry:
         return result
 
     def _validate_update(self, update):
+        if len(update.derived_operations) > self.limits.max_actions or len(
+            {ref.operation_id for ref in update.derived_operations}
+        ) != len(update.derived_operations):
+            raise ControlError(
+                "capacity", "Derived operations must be bounded and unique"
+            )
+        for ref in update.derived_operations:
+            self.get(ref)  # Only this owner's registered operation incarnations.
         if len(update.reason) > 4096 or len(update.code) > 256:
             raise ControlError("capacity", "Result reason/code exceeds limit")
         if len(update.completed_steps) > 32 or len(set(update.completed_steps)) != len(

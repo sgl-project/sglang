@@ -280,6 +280,8 @@ class ExecutionUpdate(Value):
     completed_steps: tuple[Identifier, ...] = ()
     target_outcomes: tuple[TargetOutcome, ...] = ()
     logical_change: LogicalChange | None = None
+    # Owner-created children have independent results/cancellation lifetimes.
+    derived_operations: tuple[OperationRef, ...] = ()
 
 
 class OperationResult(Value):
