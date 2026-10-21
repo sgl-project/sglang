@@ -62,17 +62,21 @@ async def _generate(
         return body
 
 
-def test_native_prefill_cadence_is_rejected_at_startup(tmp_path, monkeypatch, capfd):
-    with pytest.raises(RuntimeError, match="server exited during startup"):
-        _start_server(
-            tmp_path / "unsupported-cadence",
-            monkeypatch,
-            extra_args=["--prefill-decode-interval", "1"],
-        )
-    captured = capfd.readouterr()
-    assert "coordinator does not support prefill_decode_interval" in (
-        captured.out + captured.err
+@pytest.mark.parametrize("interval", [1, 192])
+def test_native_prefill_cadence_preserves_http_fork_join(
+    tmp_path, monkeypatch, interval
+):
+    runner, endpoint = _start_server(
+        tmp_path / f"cadence-{interval}",
+        monkeypatch,
+        extra_args=["--prefill-decode-interval", str(interval)],
     )
+    try:
+        # The same deadlines and fork/join results must hold while native
+        # cadence passes repeatedly defer pending prefills without a forward.
+        asyncio.run(_fork_join(runner.base_url, endpoint, 0))
+    finally:
+        runner.shutdown()
 
 
 async def _fork_join(base_url, endpoint, delay):

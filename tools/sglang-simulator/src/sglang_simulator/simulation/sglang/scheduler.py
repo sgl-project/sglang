@@ -27,9 +27,8 @@ from sglang_simulator.simulation.utils import (
     calc_iteration_metrics,
     calc_metrics,
 )
-from sglang_simulator.time_predictor import InferTimePredictor
+from sglang_simulator.time_predictor import InferTimePredictor, ScheduleRequest
 from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleBatch
-from sglang_simulator.time_predictor import ScheduleRequest
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
@@ -301,6 +300,11 @@ class C_SchedulerHook(BaseHook):
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
         original_on_idle = target.on_idle
+        from sglang_simulator.simulation.sglang.coordinated import (
+            install_prefill_cadence_hooks,
+        )
+
+        install_prefill_cadence_hooks(target, lambda: C_SchedulerHook.COORDINATOR)
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.

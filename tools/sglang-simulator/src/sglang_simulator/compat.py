@@ -60,11 +60,14 @@ def _validate_coordinator_server_args(args, endpoint: str) -> None:
         "enable_lora",
         "enable_dp_attention",
         "speculative_algorithm",
-        # A cadence-only scheduling pass is not a virtual-time idle boundary.
-        "prefill_decode_interval",
     ):
         if getattr(args, name, None):
             raise ValueError(f"coordinator does not support {name}")
+    interval = getattr(args, "prefill_decode_interval", None)
+    if interval is not None and (type(interval) is not int or interval < 0):
+        raise ValueError(
+            "coordinator requires a nonnegative integer prefill_decode_interval"
+        )
     if getattr(args, "disaggregation_mode", "null") != "null":
         raise ValueError("coordinator does not support disaggregation")
     if not getattr(args, "skip_server_warmup", False):

@@ -1,11 +1,14 @@
 """A causal boundary around the existing, non-overlapping SGLang scheduler."""
 
+import inspect
 import math
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from functools import wraps
 
 import zmq
+
 from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     Cancel,
@@ -22,6 +25,88 @@ from sglang_simulator.simulation.sglang.timing_metadata import attach_timing_out
 from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder
 
 
+def install_prefill_cadence_hooks(target, coordinator_getter) -> None:
+    """Observe native cadence decisions without changing their counter or result."""
+    next_batch = getattr(target, "get_next_batch_to_run", None)
+    should_defer = getattr(target, "_should_defer_prefill", None)
+    if not callable(next_batch) or not callable(should_defer):
+        return  # A resolved positive interval is rejected by the runtime check.
+
+    @wraps(next_batch)
+    def wrapped_next_batch(self, *args, **kwargs):
+        bridge = coordinator_getter()
+        if bridge is None:
+            return next_batch(self, *args, **kwargs)
+        bridge._cadence_only_pass = False
+        bridge._cadence_deferred = None
+        bridge._in_scheduler_pass = True
+        try:
+            result = next_batch(self, *args, **kwargs)
+            bridge._cadence_only_pass = (
+                bridge._cadence_deferred
+                and getattr(result, "batch_to_run", result) is None
+            )
+            return result
+        finally:
+            bridge._in_scheduler_pass = False
+
+    @wraps(should_defer)
+    def wrapped_should_defer(self, *args, **kwargs):
+        bridge = coordinator_getter()
+        if bridge is None:
+            return should_defer(self, *args, **kwargs)
+        before = getattr(self, "_prefill_decode_interval_remaining", None)
+        result = should_defer(self, *args, **kwargs)
+        after = getattr(self, "_prefill_decode_interval_remaining", None)
+        if (
+            not bridge._in_scheduler_pass
+            or bridge._cadence_deferred is not None
+            or type(result) is not bool
+            or type(before) is not int
+            or type(after) is not int
+            or before < 0
+            or before > self.prefill_decode_interval
+            or after != (before - 1 if result else 0)
+            or (result and before == 0)
+            or (not result and before != 0)
+        ):
+            raise ProtocolError("unsupported native prefill cadence decision")
+        bridge._cadence_deferred = result
+        return result
+
+    wrapped_next_batch._simulator_cadence_hook = True
+    wrapped_should_defer._simulator_cadence_hook = True
+    target.get_next_batch_to_run = wrapped_next_batch
+    target._should_defer_prefill = wrapped_should_defer
+
+
+def _validate_prefill_cadence_runtime(scheduler) -> None:
+    interval = getattr(scheduler, "prefill_decode_interval", 0)
+    if type(interval) is not int or interval < 0:
+        raise ValueError("unsupported resolved prefill_decode_interval")
+    if interval == 0:
+        return
+    expected = {
+        "get_next_batch_to_run": ("running_batch", "last_batch"),
+        "_should_defer_prefill": (),
+        "_arm_prefill_decode_interval": ("batch",),
+    }
+    for name, parameters in expected.items():
+        method = getattr(scheduler, name, None)
+        if (
+            not callable(method)
+            or tuple(inspect.signature(method).parameters) != parameters
+        ):
+            raise ValueError(f"prefill_decode_interval requires native {name} surface")
+        if name != "_arm_prefill_decode_interval" and not getattr(
+            method, "_simulator_cadence_hook", False
+        ):
+            raise ValueError(f"prefill_decode_interval requires observed native {name}")
+    remaining = getattr(scheduler, "_prefill_decode_interval_remaining", None)
+    if type(remaining) is not int or not 0 <= remaining <= interval:
+        raise ValueError("prefill_decode_interval requires a valid native counter")
+
+
 class CoordinatedScheduler:
     """Receive payloads while time is stopped; commit results at their due time.
 
@@ -31,9 +116,8 @@ class CoordinatedScheduler:
 
     def __init__(self, *, scheduler, endpoint: str, timeout_s: float = 30.0):
         endpoint = validate_coordinator_endpoint(endpoint)
-        # Model defaults can resolve a cadence absent from the launch arguments.
-        if getattr(scheduler, "prefill_decode_interval", 0):
-            raise ValueError("coordinator does not support prefill_decode_interval")
+        # Model defaults can resolve cadence absent from the raw launch arguments.
+        _validate_prefill_cadence_runtime(scheduler)
         self.scheduler = scheduler
         self.clock = Coordinator()
         self.timeout_s = timeout_s
@@ -65,6 +149,9 @@ class CoordinatedScheduler:
         self._cancel_cleanup = set()
         self._zero_time_rounds = 0
         self._rid_length = None
+        self._in_scheduler_pass = False
+        self._cadence_deferred = False
+        self._cadence_only_pass = False
         for name in ("watchdog", "soft_watchdog"):
             watchdog = getattr(scheduler, name, None)
             if watchdog is not None:
@@ -350,7 +437,12 @@ class CoordinatedScheduler:
 
     def on_idle(self) -> None:
         with self._guard():
+            cadence_only, self._cadence_only_pass = self._cadence_only_pass, False
             if self._finished or self.clock.awaiting_ready:
+                return
+            if cadence_only and self._has_native_work():
+                # Native countdown passes consume no modeled forward time. Let
+                # the next receive/schedule pass run before any driver timer.
                 return
             if self.clock.next_wakeup_ns is not None:
                 self._advance(self.clock.next_wakeup_ns)

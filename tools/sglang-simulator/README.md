@@ -216,8 +216,14 @@ exchange must not be retried on the same run.
 The initial scope is one local driver and scheduler, text generation with
 ordinary radix cache, and completion-triggered workflows. HiCache, PD, explicit
 sessions, LoRA, speculative decoding, and asynchronous grammar are rejected.
-Coordinated runs also require `--prefill-decode-interval 0`, so native scheduling
-does not defer ready prefill work across otherwise idle iterations.
+Coordinated runs preserve native `--prefill-decode-interval` countdowns when the
+runtime exposes the validated cadence helper and schedule-pass surfaces. A
+cadence-only pass with pending native work consumes no modeled forward time:
+it neither advances the clock nor grants a future client timer. Unsupported
+native cadence surfaces fail before coordinator binding. Other compatibility
+guards, including speculative decoding, DP attention and overlapping execution,
+remain unchanged.
+
 Phase deadlines are driver-owned virtual timers; native wall-time waiting/running
 timeouts must be disabled. HTTP/SSE transport and predictor execution time do not
 contribute to virtual CPU overhead. Unmodeled frontend/CPU costs are zero.

@@ -59,8 +59,8 @@ def test_coordinator_server_args_are_opt_in(monkeypatch, coordinated, as_dict):
     [
         ({"SGLANG_SIMULATOR_OUTPUT_MODE": "BLOCKING"}, {}, "requires OFFLINE"),
         ({}, {"enable_hierarchical_cache": True}, "enable_hierarchical_cache"),
-        ({}, {"prefill_decode_interval": 1}, "prefill_decode_interval"),
-        ({}, {"prefill_decode_interval": 22}, "prefill_decode_interval"),
+        ({}, {"prefill_decode_interval": -1}, "prefill_decode_interval"),
+        ({}, {"prefill_decode_interval": True}, "prefill_decode_interval"),
         ({}, {"skip_server_warmup": False}, "requires skip_server_warmup"),
         ({"SGLANG_REQ_WAITING_TIMEOUT": "1"}, {}, "virtual deadline"),
         ({"SGLANG_REQ_RUNNING_TIMEOUT": "1"}, {}, "virtual deadline"),
@@ -311,6 +311,175 @@ def test_resolved_prefill_cadence_is_rejected_before_binding(harness, interval):
         CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
 
 
+@pytest.mark.parametrize("interval", [0, 1, 192])
+def test_positive_cadence_arguments_wait_for_runtime_surface_validation(
+    monkeypatch, interval
+):
+    monkeypatch.setenv("SGLANG_SIMULATOR_COORDINATOR", "tcp://127.0.0.1:12345")
+    monkeypatch.setenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE")
+    args = SimpleNamespace(prefill_decode_interval=interval)
+    apply_simulator_server_args(args)
+    validate_simulator_server_args(args)
+
+
+def cadence_scheduler(harness, interval):
+    class NativeCadence(FakeScheduler):
+        def __init__(self):
+            super().__init__()
+            self.prefill_decode_interval = interval
+            self._prefill_decode_interval_remaining = 0
+            self.next_batch = None
+            self.next_error = None
+
+        def _should_defer_prefill(self):
+            if self._prefill_decode_interval_remaining == 0:
+                return False
+            self._prefill_decode_interval_remaining -= 1
+            return True
+
+        def _arm_prefill_decode_interval(self, batch):
+            if self.prefill_decode_interval and batch is not None:
+                self._prefill_decode_interval_remaining = self.prefill_decode_interval
+
+        def get_next_batch_to_run(self, running_batch, last_batch):
+            if self.next_error is not None:
+                raise self.next_error
+            batch = None if self._should_defer_prefill() else self.next_batch
+            return SimpleNamespace(batch_to_run=batch, running_batch=running_batch)
+
+    coordinated.install_prefill_cadence_hooks(NativeCadence, lambda: harness.bridge)
+    harness.close()
+    harness.scheduler = NativeCadence()
+    harness.bridge = CoordinatedScheduler(
+        scheduler=harness.scheduler, endpoint=harness.endpoint
+    )
+    return harness.scheduler
+
+
+def test_cadence_hooks_without_a_coordinator_only_delegate():
+    calls = []
+
+    class Native:
+        @property
+        def _prefill_decode_interval_remaining(self):
+            pytest.fail("non-coordinated hooks must not inspect the native counter")
+
+        def _should_defer_prefill(self):
+            calls.append("defer")
+            return True
+
+        def get_next_batch_to_run(self, running_batch, last_batch):
+            calls.append("next")
+            return self._should_defer_prefill()
+
+    coordinated.install_prefill_cadence_hooks(Native, lambda: None)
+    assert Native().get_next_batch_to_run(None, None) is True
+    assert calls == ["next", "defer"]
+
+
+@pytest.mark.parametrize("interval", [1, 2, 192])
+def test_cadence_only_passes_keep_pending_work_at_the_same_virtual_time(
+    harness, monkeypatch, interval
+):
+    scheduler = cadence_scheduler(harness, interval)
+    harness.bridge.clock.accept_ready(
+        Ready("run", 0, [Submit(rid(1))], next_wakeup_ns=100)
+    )
+    harness.send_payload(rid(1))
+    assert [req.rid for req in harness.receive()] == [rid(1)]
+    scheduler.waiting_queue.append(NativeRequest(rid(1)))
+    scheduler._arm_prefill_decode_interval(object())
+    monkeypatch.setattr(
+        harness.bridge, "_grant", lambda **kwargs: pytest.fail("cadence must not Grant")
+    )
+    monkeypatch.setattr(
+        harness.bridge, "_advance", lambda now: pytest.fail("cadence must not advance")
+    )
+    iteration = StateManager.get_iteration()
+    for remaining in reversed(range(interval)):
+        plan = scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+        assert plan.batch_to_run is None
+        assert scheduler._prefill_decode_interval_remaining == remaining
+        harness.bridge.on_idle()
+        assert harness.bridge.clock.now_ns == 0
+        assert StateManager.get_iteration() == iteration
+        assert harness.receive() == []
+    scheduler.next_batch = object()
+    plan = scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    assert plan.batch_to_run is scheduler.next_batch
+    assert not harness.bridge._cadence_only_pass
+
+
+def test_last_cadence_pass_does_not_mask_a_subsequent_native_stall(harness):
+    scheduler = cadence_scheduler(harness, 1)
+    harness.bridge.clock.accept_ready(Ready("run", 0, [Submit(rid(1))]))
+    scheduler.waiting_queue.append(NativeRequest(rid(1)))
+    scheduler._arm_prefill_decode_interval(object())
+    scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    harness.bridge.on_idle()  # The final 1->0 cadence pass is still not idle.
+    scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    with pytest.raises(ProtocolError, match="scheduler stalled with requests"):
+        harness.bridge.on_idle()
+
+
+def test_cadence_without_native_work_keeps_normal_driver_timer(harness, monkeypatch):
+    scheduler = cadence_scheduler(harness, 1)
+    harness.bridge.clock.accept_ready(Ready("run", 0, [], next_wakeup_ns=10))
+    scheduler._arm_prefill_decode_interval(object())
+    scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    events = []
+    monkeypatch.setattr(
+        harness.bridge, "_advance", lambda now: events.append(("advance", now))
+    )
+    monkeypatch.setattr(harness.bridge, "_grant", lambda: events.append(("grant",)))
+    harness.bridge.on_idle()
+    assert events == [("advance", 10), ("grant",)]
+
+
+def test_schedule_failure_preserves_original_error_and_clears_cadence_marker(harness):
+    scheduler = cadence_scheduler(harness, 1)
+    scheduler._arm_prefill_decode_interval(object())
+    scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    error = RuntimeError("native scheduling failed")
+    scheduler.next_error = error
+    with pytest.raises(RuntimeError) as caught:
+        scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    assert caught.value is error
+    assert not harness.bridge._cadence_only_pass
+    assert not harness.bridge._in_scheduler_pass
+
+
+@pytest.mark.parametrize("counter", [True, -1, 193])
+def test_positive_cadence_rejects_unrepresented_resolved_counter(harness, counter):
+    scheduler = cadence_scheduler(harness, 192)
+    harness.close()
+    scheduler._prefill_decode_interval_remaining = counter
+    with pytest.raises(ValueError, match="valid native counter"):
+        CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["_arm_prefill_decode_interval", "_should_defer_prefill", "get_next_batch_to_run"],
+)
+def test_positive_cadence_rejects_an_unknown_native_signature(harness, method):
+    scheduler = cadence_scheduler(harness, 192)
+    harness.close()
+    setattr(scheduler, method, lambda *args: None)
+    with pytest.raises(ValueError, match="prefill_decode_interval requires native"):
+        CoordinatedScheduler(scheduler=scheduler, endpoint=harness.endpoint)
+
+
+@pytest.mark.parametrize("counter", [True, -1, 193])
+def test_native_cadence_counter_drift_fails_closed_during_the_pass(harness, counter):
+    scheduler = cadence_scheduler(harness, 192)
+    scheduler._prefill_decode_interval_remaining = counter
+    with pytest.raises(ProtocolError, match="unsupported native prefill cadence"):
+        scheduler.get_next_batch_to_run(scheduler.running_batch, None)
+    assert not harness.bridge._cadence_only_pass
+    assert not harness.bridge._in_scheduler_pass
+
+
 def test_close_restores_watchdogs_and_releases_endpoint(harness):
     harness.close()
     active = lambda: True
@@ -442,7 +611,11 @@ def test_missing_payload_cannot_release_input_barrier(harness, send_admin):
     assert harness.bridge.clock.pending_rids == (rid(2),)
 
 
-def test_running_cancellation_does_not_shorten_batch(harness):
+@pytest.mark.parametrize("interval", [0, 192])
+def test_running_cancellation_does_not_shorten_batch(harness, interval):
+    if interval:
+        cadence_scheduler(harness, interval)
+
     def driver(control):
         control.send(
             encode_message(Ready("run", 0, [Submit(rid(1))], next_wakeup_ns=12))
@@ -462,6 +635,19 @@ def test_running_cancellation_does_not_shorten_batch(harness):
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(harness.run_driver, driver)
         assert [payload.rid for payload in harness.receive()] == [rid(1)]
+        if interval:
+            harness.scheduler.waiting_queue.append(request)
+            harness.scheduler._arm_prefill_decode_interval(object())
+            for _ in range(interval):
+                plan = harness.scheduler.get_next_batch_to_run(
+                    harness.scheduler.running_batch, None
+                )
+                assert plan.batch_to_run is None
+                harness.bridge.on_idle()
+                assert harness.bridge.clock.now_ns == 0
+                assert not future.done()
+                assert harness.receive() == []
+            harness.scheduler.waiting_queue.clear()
         harness.process([request], 20, events)
         assert harness.receive() == []
         final = future.result(timeout=3)
