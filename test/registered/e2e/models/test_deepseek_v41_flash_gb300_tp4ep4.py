@@ -10,7 +10,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.dsv41_flash_common import TP4_EP4_ARGS, DSV41FlashAccuracyMixin
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(
+    est_time=600,
+    stage="base-c",
+    runner_config="4-gpu-gb300",
+    disabled="4-gpu-gb300 suite removed; pending 2-gpu-gb300 runners",
+)
 
 
 class TestDSV41FlashTP4EP4DSpark(DSV41FlashAccuracyMixin, CustomTestCase):
