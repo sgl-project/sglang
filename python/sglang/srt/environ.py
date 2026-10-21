@@ -1479,7 +1479,7 @@ class Envs:
     # Experimental: capture the EAGLE verify's sampling, acceptance and state commit
     # in CUDA graphs (speculative/eagle_post_verify_graphs.py).
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(False)
-    # Q35RT: runtime switches of the Qwen3.5 2.2 tree, names kept; all off by default.
+    # Runtime switches named as on SGLang branch nvidia/qwen35-agentx-gb300; all off by default.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_Q35MF_BK_VEC_COPY = EnvBool(False)
     # Verify input staging, bit-identical: reuse last round's mamba track indices while their
