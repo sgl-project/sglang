@@ -444,13 +444,25 @@ def test_f_b_api_rejects_invalid_projection_inputs() -> None:
         _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
 
 
-def test_fused_kda_backend_is_opt_in(monkeypatch):
+def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+    from sglang.srt.environ import envs
 
-    monkeypatch.delenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", raising=False)
-    assert not kda_fused_decode_aiter_hip.enabled()
-    monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
-    assert kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override(""):
+        assert not kda_fused_decode_aiter_hip.enabled()
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override("aiter"):
+        assert kda_fused_decode_aiter_hip.enabled()
+
+
+def test_fused_kda_backend_deprecated_alias(monkeypatch):
+    from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+    from sglang.srt.environ import envs
+
+    with envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.override(None):
+        envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.clear()
+        monkeypatch.setenv("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "aiter")
+        with pytest.warns(DeprecationWarning):
+            assert kda_fused_decode_aiter_hip.enabled()
 
 
 if __name__ == "__main__":

@@ -976,8 +976,26 @@ class Envs:
     # Fold the KDA [f_a|b] tail into the wide [q,k,v,g] projection so the whole
     # in-proj is one GEMM. Decode is bandwidth bound there, so the 144 extra
     # output columns ride along nearly free.
-    SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
-    SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ = EnvBoolWithAlias(
+        True, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ"
+    )
+    SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvIntWithAlias(
+        256, deprecated_name="SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS"
+    )
+    # Set to "aiter" to run the fused ROCm KDA decode boundary (f_b projection,
+    # gate and recurrent update in one AITER call). Unset keeps the split path.
+    SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
+    # Which FlyDSL implementation backs the Kimi-K3 KDA kernels: "auto" prefers
+    # SGLang's vendored copy and falls back to AITER, "sglang" or "aiter" pin one.
+    SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
+    # Use the ROCm radix-4 router for covered K3 top-k workloads.
+    SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
+    )
     # Kimi-K3 AITER path: keep the checkpoint's MoE intermediate width instead of
     # padding it for the generic AITER kernels. Needs SGLANG_USE_AITER.
     SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
@@ -1972,8 +1990,6 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
-    # Use the ROCm radix-4 router for covered K3 top-k workloads.
-    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
