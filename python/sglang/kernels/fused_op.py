@@ -106,6 +106,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.JIT: "forward_jit",
     KernelBackend.AOT: "forward_aot",
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
+    KernelBackend.CUTILE: "forward_cutile",
     KernelBackend.FLYDSL: "forward_flydsl",
     KernelBackend.HELION: "forward_helion",
     KernelBackend.KDA: "forward_kda",
@@ -420,6 +421,9 @@ class BaseFusedOp(nn.Module, ABC):
 
     def forward_cute_dsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no cute_dsl backend")
+
+    def forward_cutile(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no cutile backend")
 
     def forward_flydsl(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no flydsl backend")
