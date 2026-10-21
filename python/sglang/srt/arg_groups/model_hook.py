@@ -999,17 +999,43 @@ def handle_model_capability_adjustments(server_args: Any):
             declare_resolution(
                 server_args, "_handle_model_capability_adjustments", **{key: value}
             )
-        for phase in (Phase.DECODE, Phase.PREFILL):
+        # Clef serves one whole prompt as a single extend and never decodes, so
+        # the decode phase has nothing to capture. The prefill body is still
+        # graph-eligible (BCG captures the transformer stack and replays the
+        # outer tail -- here the joint schema head -- eagerly), and on a short
+        # prompt the eager launch train costs more than the GPU work itself.
+        # BCG is CUDA-only and is not the mode this encoder-style prefill was
+        # validated with, so only an explicit prefill backend selection
+        # (e.g. --cuda-graph-backend-prefill breakable) opts the phase in.
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        # Unit-level capability tests may invoke this hook without running the
+        # full CUDA-graph configuration parser, which is where this internal
+        # lock set is normally initialized.
+        cuda_graph_config_locked = getattr(
+            server_args, "_cuda_graph_config_locked", set()
+        )
+        prefill_graph_selected = (
+            (Phase.PREFILL, "backend") in cuda_graph_config_locked
+        ) and get_platform().is_cuda
+        if not prefill_graph_selected:
             declare_resolution(
                 server_args,
                 "_handle_model_capability_adjustments",
                 cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, phase, backend=Backend.DISABLED
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                 ),
             )
         logger.info(
             "Clef joint schema head detected: serving /v1/systemone decisions in "
-            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+            "embedding mode without radix cache or chunked prefill; decode CUDA "
+            "graph disabled, prefill CUDA graph %s.",
+            "left as explicitly selected" if prefill_graph_selected else "disabled",
         )
 
     if (
