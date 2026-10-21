@@ -24,7 +24,7 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
-from typing import List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -32,6 +32,10 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+
+if TYPE_CHECKING:
+    from sglang.srt.beam_search.paged_kv import GRPagedKVState
+
 
 class BeamGroupState(enum.Enum):
     DECODING = enum.auto()
@@ -102,6 +106,8 @@ class BeamGroup:
         # Scheduler wiring, filled in from outside the search core. Members have
         # no Req, so their seq len and KV lengths are implied by the leader's.
         self.leader = None
+        # Optional request-owned compact beam arena. Context stays on Req.kv.
+        self.gr_paged_kv: Optional[GRPagedKVState] = None
         # Immutable catalog storage is shared by groups; frontier nodes belong
         # to this group and advance in the launch half alongside the KV map.
         self.catalog = None
@@ -127,6 +133,8 @@ class BeamGroup:
     def extra_uncached_tokens(self) -> int:
         """Uncached KV the group holds beyond the leader's own window, which the
         generic per-req sum already counts."""
+        if self.gr_paged_kv is not None:
+            return self.gr_paged_kv.reserved_slots
         if self.all_rows is None:
             return 0
         end = self.leader.kv.kv_allocated_len

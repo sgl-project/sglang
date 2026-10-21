@@ -84,12 +84,16 @@ def free_member_rows(group, storage) -> None:
     """Release the decode-suffix KV plus the member row slots through the KV
     storage. Idempotent; must run while the leader's kv info still carries the
     lockstep allocated length."""
+    paged_state = getattr(group, "gr_paged_kv", None)
+    if paged_state is not None:
+        # Reservation precedes prefill/member spawn, including D=1 and errors.
+        paged_state.release(storage.free_tokens)
     if group.member_rows is None:
         return
     leader = group.leader
     start = group.prompt_len
     end = leader.kv.kv_allocated_len
-    if end > start:
+    if paged_state is None and end > start:
         # The rewind below is required: without it the leader's own per-Req
         # release frees this decode region a second time.
         slots = storage.requests.req_to_token[group.all_rows, start:end]

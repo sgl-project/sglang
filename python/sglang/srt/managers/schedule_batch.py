@@ -2140,6 +2140,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
+    gr_paged_metadata: Optional[object] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
@@ -2407,6 +2408,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
+        self._reserve_gr_paged_arena()
 
         # Set fields
         input_embeds = []
@@ -2894,6 +2896,39 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.decoding_reqs = self.reqs
         self.is_prefill_only = False
 
+    def _reserve_gr_paged_arena(self):
+        states = [
+            r.beam_group.gr_paged_kv
+            for r in self.reqs
+            if r.beam_group is not None and r.beam_group.gr_paged_kv is not None
+        ]
+        if not states:
+            return
+        assert len(states) == len(self.reqs) == 1
+        state = states[0]
+        # Context ownership is complete; preparation failure can release it normally.
+        succeeded = True
+        try:
+            evict_from_tree_cache(self.tree_cache, state.arena_slots)
+            state.reserve(self.token_to_kv_pool_allocator)
+        except Exception:
+            # Every rank reaches this pre-forward agreement even if metadata
+            # preparation fails after its allocator returned a lease.
+            succeeded = False
+        if torch.distributed.is_initialized():
+            from sglang.srt.distributed import get_tp_group
+
+            group = get_tp_group()
+            if group.world_size > 1:
+                ok = torch.tensor([int(succeeded)], dtype=torch.int32)
+                torch.distributed.all_reduce(
+                    ok, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+                )
+                succeeded = bool(ok.item())
+        if not succeeded:
+            state.release(self.token_to_kv_pool_allocator.free)
+            raise MemoryError("Unable to reserve the GR beam arena on every TP rank.")
+
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
@@ -2905,6 +2940,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
+            requests = [
+                r
+                for r in requests
+                if r.beam_group is None or r.beam_group.gr_paged_kv is None
+            ]
             new_pages = sum(
                 1 for r in requests if r.kv.kv_committed_len % page_size == 0
             )
@@ -3271,7 +3311,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.gr_paged_metadata = None
+        group = self.reqs[0].beam_group if self.reqs else None
+        if group is not None and group.gr_paged_kv is not None:
+            assert len(self.reqs) == 1
+            context_locs = self.req_to_token_pool.req_to_token[
+                group.leader.kv.req_pool_idx, : group.prompt_len
+            ]
+            self.gr_paged_metadata = group.gr_paged_kv.prepare_decode(context_locs)
+            self.out_cache_loc = self.gr_paged_metadata.out_cache_loc
+        else:
+            self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         for req in self.reqs:
             req.decode_batch_idx += 1
@@ -3504,6 +3554,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            gr_paged_metadata=self.gr_paged_metadata,
             return_logprob=self.return_logprob,
             has_grammar=self.has_grammar,
             return_hidden_states=self.return_hidden_states,

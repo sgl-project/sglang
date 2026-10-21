@@ -1556,6 +1556,27 @@ class PrefillAdder:
         """whether running work must finish before another admission attempt"""
         return bool(self.can_run_list) or not self.running_batch.is_empty()
 
+    def _add_gr_paged_req(self, req: Req):
+        """Admit one group with its complete generated-KV budget."""
+        if self.can_run_list or (
+            self.running_batch is not None
+            and any(not r.finished() for r in self.running_batch.reqs)
+        ):
+            return AddReqResult.OTHER
+        state = req.beam_group.gr_paged_kv
+        extend_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        needed = self.ceil_paged_tokens(extend_len) + state.arena_slots
+        with self._lock_node(req.last_node):
+            if needed > self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+            if extend_len > self.rem_input_tokens:
+                return AddReqResult.OTHER
+            admission = _PrefillAdmission(
+                req.prefix_len, extend_len, state.arena_slots, False, replay_len=0
+            )
+            self._commit_prefill_admission(req, admission, state_slots=0)
+        return AddReqResult.OTHER
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -1565,6 +1586,8 @@ class PrefillAdder:
         if self.chunked_req_waits:
             return AddReqResult.NO_TOKEN
 
+        if req.beam_group is not None and req.beam_group.gr_paged_kv is not None:
+            return self._add_gr_paged_req(req)
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 

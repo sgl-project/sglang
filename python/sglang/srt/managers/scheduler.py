@@ -2890,6 +2890,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
+            gr_paged_enabled=get_exec().kernel.attention_backend == "gr_paged",
         )
 
     def init_request_retirer(self) -> None:
@@ -3312,6 +3313,14 @@ class Scheduler(
                     recv_req.session_id
                 )
 
+            if get_exec().kernel.attention_backend == "gr_paged" and not is_beam:
+                prepare_abort(
+                    req,
+                    "gr_paged requires a GR beam-search request (beam_width > 1).",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+                self.request_retirer.retire_unadmitted(req)
+                return
             if is_beam:
                 error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
                 if error_msg:
@@ -4706,7 +4715,22 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except MemoryError as exc:
+            if not all(
+                r.beam_group is not None and r.beam_group.gr_paged_kv is not None
+                for r in can_run_list
+            ):
+                raise
+            for req in can_run_list:
+                req.request_finish(
+                    FINISH_ABORT(str(exc), status_code=HTTPStatus.SERVICE_UNAVAILABLE)
+                )
+                self.beam_coordinator._abort_group(req.beam_group)
+                self.request_retirer.release(req, checkpoint=False)
+                self.output_streamer.stream_output([req], req.return_logprob)
+            return None, running_batch
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:

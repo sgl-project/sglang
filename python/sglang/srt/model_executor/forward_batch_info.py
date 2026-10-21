@@ -427,6 +427,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Allocator-global output slots before NPU DCP localizes ``out_cache_loc``.
     # DSA's replicated indexer cache uses the global slot identity.
     origin_out_cache_loc: Optional[torch.Tensor] = None
+    gr_paged_metadata: Optional[object] = None
 
     # === Borrowed from ScheduleBatch: GPU tensors (cross-stream; clone targets for stream isolation) ===
     # FIXME(lsyin): these are currently aliased by reference from ScheduleBatch. Once
@@ -985,6 +986,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            gr_paged_metadata=getattr(batch, "gr_paged_metadata", None),
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,

@@ -70,6 +70,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
     "torch_native",
+    "gr_paged",
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"

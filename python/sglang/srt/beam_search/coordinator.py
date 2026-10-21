@@ -55,6 +55,7 @@ from sglang.srt.beam_search.fork import (
     remap_kv_mapping,
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
+from sglang.srt.beam_search.paged_kv import GRPagedKVState
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.req_types import (
@@ -110,6 +111,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
+    # Set by the scheduler from the explicitly selected attention backend.
+    gr_paged_enabled: bool = False
+
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
     _catalogs: dict = msgspec.field(default_factory=dict)
@@ -129,6 +133,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         user_params = req.sampling_params
         beam_width = user_params.beam_width
         enable_gr = get_serving().enable_gr
+        gr_paged = enable_gr and self.gr_paged_enabled
         if enable_gr:
             # Also enforce policy for requests delivered directly to the scheduler.
             try:
@@ -141,8 +146,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search is not supported with speculative decoding."
         if get_disagg().disaggregation_mode != "null":
             return "Beam search is not supported with PD disaggregation."
-        if get_schedule().page_size > 1:
-            return "Beam search currently requires --page-size 1."
+        if get_schedule().page_size > 1 and not gr_paged:
+            return (
+                "Beam search currently requires --page-size 1 unless GR uses gr_paged."
+            )
         if self.dllm_enabled:
             return "Beam search is not supported with diffusion LLM."
         if get_memory().enable_hisparse:
@@ -231,6 +238,24 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             beam_width = min(beam_width, catalog.root_width)
             num_candidates = beam_width
 
+        paged_state = None
+        if gr_paged:
+            page_size = get_schedule().page_size
+            paged_state = GRPagedKVState(
+                prompt_len, beam_width, max_new_tokens, page_size
+            )
+            context_slots = (prompt_len + page_size - 1) // page_size * page_size
+            capacity = self.token_to_kv_pool_allocator.size // page_size * page_size
+            required = context_slots + paged_state.arena_slots
+            if required > capacity:
+                return (
+                    f"GR paged beam request needs {required} KV slots "
+                    f"(context {context_slots}, beam arena {paged_state.arena_slots}) "
+                    f"but the pool holds {capacity}."
+                )
+            if prompt_len > get_schedule().max_prefill_tokens:
+                return "GR paged attention requires the full prompt to fit --max-prefill-tokens."
+
         group = BeamGroup(
             beam_width=beam_width,
             # Fixed-length GR returns the cumulative SID log-probability.
@@ -245,6 +270,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
         group.leader = req
         group.prompt_len = prompt_len
+        group.gr_paged_kv = paged_state
         if catalog is not None:
             name = user_params.gr_catalog
             if name not in self._catalogs:
@@ -262,9 +288,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         neutral.no_stop_trim = user_params.no_stop_trim
         req.sampling_params = neutral
         req.beam_group = group
-        # The leader's decode suffix is a beam path, never a tree entry; this
-        # also skips the prefill-time unfinished insert.
-        req.skip_radix_cache_insert = True
+        # Ordinary beams publish no tree entry. The paged path keeps Req.kv
+        # context-only, so its prompt can use normal checkpoint/prefix reuse.
+        req.skip_radix_cache_insert = not gr_paged
         self._num_live_groups += 1
         return None
 
@@ -510,16 +536,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if parent_idx is not None:
             # Final steps skip this: their KV is never read again. Orphans are
             # staged, not freed here -- the set difference must not block launch.
-            old_map, new_map = remap_kv_mapping(
-                self.req_to_token_pool.req_to_token,
-                rows=rows,
-                parent_idx=parent_idx,
-                prefix_len=group.prompt_len,
-                # All rows are synchronized; the leader's committed length
-                # covers the KV computed through this step.
-                seq_len=group.leader.kv.kv_committed_len,
-            )
-            group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
+            if group.gr_paged_kv is not None:
+                group.gr_paged_kv.advance(parent_idx)
+            else:
+                old_map, new_map = remap_kv_mapping(
+                    self.req_to_token_pool.req_to_token,
+                    rows=rows,
+                    parent_idx=parent_idx,
+                    prefix_len=group.prompt_len,
+                    # Ordinary beams keep their history in the request map.
+                    seq_len=group.leader.kv.kv_committed_len,
+                )
+                group.pending_orphans.append(StagedOrphans(tick, old_map, new_map))
             # Length placeholder only; the DAG owns history and member rows
             # have no host state.
             group.leader.output_ids.append(0)
@@ -599,6 +627,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             # Staged orphans are referenced by no row, so the retract-abort
             # path's direct fork.free_member_rows cannot see them.
             self._reclaim_orphans(group)
+            paged_state = getattr(group, "gr_paged_kv", None)
+            if paged_state is not None:
+                paged_state.release(self._storage().free_tokens)
             group.retired = True
             # Drops overshoot selections staged after the terminal commit.
             group._pending_steps.clear()
