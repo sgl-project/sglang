@@ -814,6 +814,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             trtllm_prefill_c4_indices=None,
             trtllm_prefill_c4_lens=None,
             trtllm_prefill_c128=None,
+            request_window_layout=None,
         )
         backend = object.__new__(DeepseekV4TrtllmAttnBackend)
         backend.device = torch.device("cpu")
