@@ -34,6 +34,9 @@ class TransferKVChunk:
     staging_counted: bool = False
     # Early-send: GPU event to synchronize before reading KV (optional).
     wait_event: Optional[object] = None
+    # Set when prefill_kv_indices is a pinned host tensor filled by a non-blocking
+    # device-to-host copy: the worker waits on this event, then converts to NumPy.
+    indices_event: Optional[object] = None
 
 
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
