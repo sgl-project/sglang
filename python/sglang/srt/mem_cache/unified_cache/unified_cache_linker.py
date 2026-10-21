@@ -263,6 +263,17 @@ class UnifiedCacheLinkerWrapper:
         key, _ = key.maybe_to_bigram_view(cache.tree_core.is_eagle)
         page = cache.page_size
         device_hit_len = result.device_prefix_len
+        self.hit_markers.pop(req.rid, None)
+
+        known_hit_len = req.external_cache_hit_length if cache.pp_size > 1 else None
+        if known_hit_len is not None:
+            # PP0's absolute boundary also survives later local L1 rematches.
+            key = key[:known_hit_len]
+        elif cache.pp_size > 1:
+            req.external_cache_hit_length = 0
+            if cache.pp_rank != 0:
+                return result
+
         if device_hit_len >= len(key):
             return result
 
@@ -281,11 +292,16 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
+        if known_hit_len is None:
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            if cache.pp_size > 1 and hit_pages:
+                req.external_cache_hit_length = device_hit_len + hit_pages * page
+        else:
+            hit_pages = len(tail_hashes)
         if hit_pages == 0:
             return result
         hit_tokens = hit_pages * page
@@ -436,6 +452,14 @@ class UnifiedCacheLinkerWrapper:
             req.swa_branching_seqlen = None
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
+        if cache.pp_size > 1 and req.kv is not None and req.kv.holds_kv:
+            # A later PP chunk already owns a row; the extend allocator reads
+            # its prefix from that row instead of private_load_indices.
+            # Allocation settles the KV watermarks after consuming this row.
+            cache.req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(device_hit_len, prefix_len)),
+                full_transfer.device_indices,
+            )
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
