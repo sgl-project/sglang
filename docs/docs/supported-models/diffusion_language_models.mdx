@@ -29,6 +29,28 @@ python3 -m sglang.launch_server \
   --port 30000
 ```
 
+## TP-local vocabulary state
+
+When you use tensor parallelism with the `LowConfidence` algorithm, you can avoid gathering full-vocabulary logits on every rank. Enable the TP-local vocabulary-state path with the following environment variables:
+
+```bash TP-local vocabulary state
+SGLANG_DLLM_TP_LOCAL_VOCAB=1 \
+SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER=1 \
+python3 -m sglang.launch_server \
+  --model-path inclusionAI/LLaDA2.0-mini \
+  --trust-remote-code \
+  --tp-size 4 \
+  --dllm-algorithm LowConfidence \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+`SGLANG_DLLM_TP_LOCAL_VOCAB` defaults to `0`. The optimized path requires GPU execution, `LowConfidence`, and a standard TP-sharded vocabulary-parallel LM head. SGLang retains the dense-logits path for other algorithms, CPU and NPU execution, DP-attention or attention-TP LM heads, LM heads without shard metadata, and models with added vocabulary embeddings.
+
+`SGLANG_DLLM_TP_LOCAL_VOCAB_PACKED_GATHER` defaults to `1`. It gathers the maximum value, max-shifted exponential sum, and token ID in one FP32 collective when every vocabulary ID is exactly representable in FP32. SGLang automatically uses separate typed collectives when the maximum vocabulary ID exceeds `2^24`.
+
+To inspect the materialized tensors and collective buffers, set `SGLANG_CONSUMER_STATE_TRACE_JSONL` to an output file path. Each TP rank records the actual collective buffer shape, dtype, and byte size.
+
 ## Example Configuration File
 
 Depending on the algorithm selected, the configuration parameters vary.
