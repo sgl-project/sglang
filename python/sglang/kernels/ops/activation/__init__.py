@@ -112,7 +112,7 @@ def situ_and_mul(
     beta: float,
     linear_beta: Optional[float],
 ) -> torch.Tensor:
-    from ._jit_situ_and_mul import situ_and_mul as impl
+    from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
     return impl(input, out, beta, linear_beta)
 
@@ -150,7 +150,31 @@ register_kernel(
     KernelSpec(
         op="activation.situ_and_mul",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.activation._jit_situ_and_mul:situ_and_mul",
+        target="sglang.kernels.ops.activation.kimi_k3_situ_and_mul:situ_and_mul",
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# MXFP8-quantizing SwiGLU-OAI producers; registered for inventory.
+for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:{_fn}",
+        )
+    )
+del _fn
+for _fn in ("silu_and_mul_clamp", "silu_and_mul_contig_post_quant"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.silu_and_mul_clamp:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+            ),
+        )
+    )
+del _fn

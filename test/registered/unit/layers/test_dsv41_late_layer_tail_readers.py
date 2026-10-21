@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
+from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
 from sglang.srt.layers.attention import deepseek_v4_backend

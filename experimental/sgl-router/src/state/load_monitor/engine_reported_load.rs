@@ -99,12 +99,25 @@ pub struct EngineReportedSchedulingLoad {
 pub struct EngineReportedLoadSnapshot {
     pub version: u64,
     workers: HashMap<String, EngineReportedWorkerLoad>,
+    /// Least pending prefill work on any one DP rank, for the workers in `workers`.
+    min_rank_pending: HashMap<String, u64>,
     native_cache_workers: HashMap<String, EngineReportedSchedulingLoad>,
 }
 
 impl EngineReportedLoadSnapshot {
     pub fn fresh_load_for_url(&self, worker_url: &str) -> Option<&EngineReportedWorkerLoad> {
         self.workers.get(worker_url)
+    }
+
+    /// Least pending prefill work on any one DP rank of the worker: queued
+    /// requests plus uncached tokens still to prefill, including a chunked
+    /// prefill's remainder. Zero means that rank is idle. A snapshot built from
+    /// aggregates treats the worker as one rank.
+    pub fn fresh_min_rank_pending_for_url(&self, worker_url: &str) -> Option<u64> {
+        self.min_rank_pending.get(worker_url).copied().or_else(|| {
+            self.fresh_load_for_url(worker_url)
+                .map(|load| load.num_waiting_reqs)
+        })
     }
 
     /// True when some worker in `fleet_urls` has a fresh queue reading
@@ -148,6 +161,7 @@ impl EngineReportedLoadSnapshot {
         Self {
             version,
             workers,
+            min_rank_pending: HashMap::new(),
             native_cache_workers: HashMap::new(),
         }
     }
@@ -176,6 +190,7 @@ impl EngineReportedLoadSnapshot {
         Self {
             version,
             workers: basic,
+            min_rank_pending: HashMap::new(),
             native_cache_workers: workers,
         }
     }
@@ -366,7 +381,12 @@ impl EngineReportedLoadTable {
     /// look misleadingly idle and draw *more* traffic.) Callers that never
     /// registered expected ranks retain the all-known-ranks rule. The oldest
     /// timestamp represents the freshness of the complete aggregate.
-    fn fresh_worker_loads(&self, now: Instant) -> HashMap<String, EngineReportedWorkerLoad> {
+    /// Also records each such worker's least pending prefill work on any one rank.
+    fn fresh_worker_loads(
+        &self,
+        now: Instant,
+        min_rank_pending: &mut HashMap<String, u64>,
+    ) -> HashMap<String, EngineReportedWorkerLoad> {
         // url -> rank -> (reported load, fresh, timestamp).
         let mut observed: HashMap<String, HashMap<u32, (LoadStat, bool, Instant)>> = HashMap::new();
         for entry in self.by_rank.iter() {
@@ -398,6 +418,7 @@ impl EngineReportedLoadTable {
                 let mut num_waiting_reqs = 0u64;
                 let mut num_tokens = 0u64;
                 let mut max_total_num_tokens = 0u64;
+                let mut min_pending = u64::MAX;
                 let mut oldest_at = None;
                 for rank in required {
                     let (load, fresh, at) = ranks.get(&rank)?;
@@ -409,9 +430,13 @@ impl EngineReportedLoadTable {
                     num_tokens = num_tokens.saturating_add(load.num_tokens);
                     max_total_num_tokens =
                         max_total_num_tokens.saturating_add(load.max_total_num_tokens);
+                    let uncached = load.native_cache.as_ref();
+                    let uncached = uncached.map_or(0, |n| n.num_waiting_uncached_tokens);
+                    min_pending = min_pending.min(load.num_waiting_reqs.saturating_add(uncached));
                     oldest_at = Some(oldest_at.map_or(*at, |oldest: Instant| oldest.min(*at)));
                 }
                 oldest_at.map(|captured_at| {
+                    min_rank_pending.insert(url.clone(), min_pending);
                     (
                         url,
                         EngineReportedWorkerLoad {
@@ -543,9 +568,11 @@ impl EngineReportedLoadTable {
 
     /// Captures one immutable view for all routing decisions in a request.
     pub fn capture_snapshot(&self, now: Instant) -> EngineReportedLoadSnapshot {
+        let mut min_rank_pending = HashMap::new();
         EngineReportedLoadSnapshot {
             version: self.version.load(Ordering::Acquire),
-            workers: self.fresh_worker_loads(now),
+            workers: self.fresh_worker_loads(now, &mut min_rank_pending),
+            min_rank_pending,
             native_cache_workers: self.fresh_native_cache_worker_loads(now),
         }
     }
