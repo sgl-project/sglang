@@ -14,12 +14,26 @@
 """Kimi-K3 ROCm weight preparation for Quark checkpoints.
 
 Quark serializes K3 as per-output-channel FP8, which is not the layout the
-AITER kernels want. The conversions live here; ``kimi_k3.py`` calls every entry
-point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
+AITER kernels want, and keeps the shared experts in MXFP4, which the merged MoE
+front cannot concatenate. The conversions live here; ``kimi_k3.py`` calls every
+entry point behind ``_is_hip`` and keeps the checkpoint's own layout otherwise.
 """
 
 import torch
 from torch import nn
+
+from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFP4
+
+
+def densify_quark_mxfp4_shared_experts(shared_experts: nn.Module) -> None:
+    """Dequantize the shared experts' MXFP4 linears to BF16 in place, so the merged
+    MoE front can concatenate the gate-up and the fused path run a dense down GEMM."""
+    for linear in (shared_experts.gate_up_proj, shared_experts.down_proj):
+        if isinstance(linear.quant_method, QuarkLinearMethod) and isinstance(
+            linear.scheme, QuarkW4A4MXFP4
+        ):
+            linear.scheme.dequantize_to_bf16(linear)
 
 
 def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Tensor:
