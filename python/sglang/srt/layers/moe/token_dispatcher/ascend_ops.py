@@ -51,6 +51,15 @@ _DISPATCH_COMM_ALG = "fullmesh_v1"
 _COMBINE_COMM_ALG = ""
 
 
+def _debug_rank0() -> bool:
+    """True on global rank 0 while SGLANG_ASCEND_OPS_DEBUG is enabled."""
+    if not envs.SGLANG_ASCEND_OPS_DEBUG.get():
+        return False
+    import torch.distributed as dist
+
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
 class AscendOpsDispatchOutput(NamedTuple):
     """Metadata passed from Ascend Ops dispatch to the MoE runner."""
 
@@ -302,6 +311,20 @@ class AscendOpsDispatcher(BaseDispatcher):
         # A3 returns an uninitialised ``(a,)`` one, so never forward it.
         expand_scales = None
 
+        if _debug_rank0():
+            print(
+                f"[ascend_ops dispatch] path={prefill_mode or self._dispatch_path} "
+                f"tokens={num_tokens} padded={padded_bs} qmode={quant_mode} "
+                f"expand_x={tuple(expand_x.shape)}:{expand_x.dtype} "
+                f"absmax={expand_x.abs().max().item():.4f} "
+                f"etoks_sum={int(expert_token_nums.sum())} "
+                f"etoks={expert_token_nums[:8].tolist()} "
+                f"scales={tuple(dynamic_scales.shape)} "
+                f"[{dynamic_scales.min().item():.4g}, "
+                f"{dynamic_scales.max().item():.4g}]",
+                flush=True,
+            )
+
         self._ds_state = _DSv2State(
             num_tokens=num_tokens,
             expert_ids=topk_ids,
@@ -350,6 +373,17 @@ class AscendOpsDispatcher(BaseDispatcher):
             comm_quant_mode=0,
             comm_alg=_COMBINE_COMM_ALG,
         )
+        if _debug_rank0():
+            expert_x = combine_input.hidden_states.float()
+            print(
+                f"[ascend_ops combine] expert_x={tuple(expert_x.shape)} "
+                f"absmax={expert_x.abs().max().item():.4f} "
+                f"nan={int(torch.isnan(expert_x).sum())} "
+                f"wsum={float(state.expert_scales.sum()):.4f} "
+                f"out_absmax={combined.float().abs().max().item():.4f}",
+                flush=True,
+            )
+
         self._ds_state = None
         self._dispatch_output = None
         return combined[: state.num_tokens]

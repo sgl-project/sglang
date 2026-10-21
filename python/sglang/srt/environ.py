@@ -1337,6 +1337,8 @@ class Envs:
     # Pad the ascend_ops decode batch to this size (0 disables padding, which is
     # correct while every EP rank steps with the same batch size).
     SGLANG_ASCEND_OPS_DECODE_PAD_BS = EnvInt(0)
+    # Print the DS v2 dispatch/combine tensor stats from EP rank 0.
+    SGLANG_ASCEND_OPS_DEBUG = EnvBool(False)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
