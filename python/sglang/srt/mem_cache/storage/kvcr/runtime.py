@@ -61,6 +61,7 @@ class KVCRRuntime:
             "nixl_port": 20500,
             "operation_timeout_ms": 1000,
             "abandon_timeout_ms": 5000,
+            "startup_timeout_seconds": None,
             "enable_telemetry": False,
             "trailing_capacity_divisor": 1,
         }
@@ -171,6 +172,7 @@ class KVCRRuntime:
                 nixl_listen_port=config["nixl_port"],
                 operation_timeout_ms=config["operation_timeout_ms"],
                 abandon_timeout_ms=config["abandon_timeout_ms"],
+                startup_timeout_seconds=config["startup_timeout_seconds"],
                 enable_telemetry=self._telemetry_enabled,
             )
             bindings = KVCRBindings(
