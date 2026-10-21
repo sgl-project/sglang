@@ -150,6 +150,15 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     # No `secrets: inherit`: this hosted CPU job has no secret consumer.
 
+  simulator-test-gpu:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/_pr-test-simulator-gpu.yml
+    with:
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+
   # =============================================== extra-a / extra-b ===============================================
   # `name:` keeps the job names wait-for-jobs and check-pr-test-health match on.
   extra-test:
@@ -191,6 +200,7 @@ jobs:
         sgl-kernel-build-wheels,
         rust-ext-build,
         simulator-test-cpu,
+        simulator-test-gpu,
         extra-test,
       ]
     if: always()

@@ -224,6 +224,7 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("text_experts", prefix),
             )
+            self.text_experts_topk.bind_runner_backend(self.text_experts.runner_backend)
 
         assert vision_moe_layer_start_index <= vision_moe_layer_end_index
         if (
@@ -255,6 +256,9 @@ class Ernie4_5_VLMoeMoE(nn.Module):
                 layer_id=self.layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("vision_experts", prefix),
+            )
+            self.vision_experts_topk.bind_runner_backend(
+                self.vision_experts.runner_backend
             )
 
         if self.moe_num_shared_experts > 0:

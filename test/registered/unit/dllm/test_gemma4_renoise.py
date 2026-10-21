@@ -46,6 +46,7 @@ def _batch(rids, block_size, *, sampling_seeds=None, encoder=False, empty=False)
         forward_mode=(ForwardMode.EXTEND if encoder else ForwardMode.DLLM_EXTEND),
         input_embeds=None,
         dllm_input_preparation_state=None,
+        dllm_prompt_mask=None,
     )
 
 

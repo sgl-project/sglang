@@ -16,6 +16,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.entrypoints import http_server
+from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -501,7 +502,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
             ],
         )
 
-    def test_return_path_groups_noncontiguous_owners(self):
+    def test_return_path_batching_preserves_owner_order(self):
         output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
         output.rids = ["rid-0", "rid-1", "rid-2"]
         output.output_strs = ["first", "second", "third"]
@@ -515,22 +516,32 @@ class TestMultiTokenizerMixin(CustomTestCase):
             )
         )
 
-        _send_output_to_tokenizer_workers(output, ipcs, mapping)
-
-        self.assertEqual(
-            sent,
-            [
-                (
-                    "worker-b",
-                    ["rid-0", "rid-2"],
-                    ["first", "third"],
-                    ["worker-b", "worker-b"],
-                    True,
-                ),
-                ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
-            ],
-        )
-        self.assertEqual(pickle.dumps(output), original)
+        expected_grouped = [
+            (
+                "worker-b",
+                ["rid-0", "rid-2"],
+                ["first", "third"],
+                ["worker-b", "worker-b"],
+                True,
+            ),
+            ("worker-a", ["rid-1"], ["second"], ["worker-a"], True),
+        ]
+        expected_individual = [
+            ("worker-b", ["rid-0"], ["first"], None, True),
+            ("worker-a", ["rid-1"], ["second"], None, True),
+            ("worker-b", ["rid-2"], ["third"], None, True),
+        ]
+        for batching in (True, False):
+            sent.clear()
+            with (
+                self.subTest(batching=batching),
+                envs.SGLANG_BATCH_TOKENIZER_OUTPUTS.override(batching),
+            ):
+                _send_output_to_tokenizer_workers(output, ipcs, mapping)
+            self.assertEqual(
+                sent, expected_grouped if batching else expected_individual
+            )
+            self.assertEqual(pickle.dumps(output), original)
 
     def test_return_path_falls_back_before_sending_any_group(self):
         output = _make_batch_embedding_output()
