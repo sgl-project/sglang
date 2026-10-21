@@ -17,6 +17,16 @@ Pipeline:
 Usage:
   python analyze_failure_report.py --log-dir LOG_DIR --recommendations-file RECOMMENDED.txt \
     [--diffusion-dir DIFFUSION_DIR] [--output report.md]
+
+Example from the repository root, with downloaded diffusion artifacts and no
+coverage recommendations (keep each artifact in its own subdirectory):
+  mkdir -p /tmp/npu-failure-analysis/logs
+  touch /tmp/npu-failure-analysis/recommended.txt
+  python3 scripts/ci/npu/precise-test/analyze_failure_report.py \
+    --log-dir /tmp/npu-failure-analysis/logs \
+    --diffusion-dir ./diffusion-failures \
+    --recommendations-file /tmp/npu-failure-analysis/recommended.txt \
+    --output /tmp/npu-failure-analysis/failure_report.md
 """
 
 import argparse
@@ -73,25 +83,31 @@ TIMINGS_END_PATTERN = re.compile(r"^=+\s*TIMINGS\s+END\s*=+")
 
 
 def _extract_from_timings(lines):
-    """Extract failed test file paths from the TIMINGS JSON block (ci_utils.py)."""
-    failed = []
+    """Return final TIMINGS failures, or None when no complete block exists."""
+    outcomes = {}
+    block = {}
+    found = False
     in_timings = False
     for line in lines:
         text = clean_line(line)
         if TIMINGS_BEGIN_PATTERN.search(text):
             in_timings = True
+            block = {}
             continue
         if not in_timings:
             continue
         if TIMINGS_END_PATTERN.search(text):
-            break
+            outcomes.update(block)
+            found = True
+            in_timings = False
+            continue
         try:
             entry = json.loads(text)
-            if not entry.get("passed", True) and entry.get("file"):
-                failed.append(entry["file"])
+            if isinstance(entry, dict) and entry.get("file"):
+                block[entry["file"]] = entry.get("passed", True)
         except (json.JSONDecodeError, ValueError):
             continue
-    return failed
+    return [path for path, passed in outcomes.items() if not passed] if found else None
 
 
 def _extract_from_ci_utils_summary(lines):
@@ -137,7 +153,7 @@ def extract_failed_from_log(log_path):
 
     # Method 1: TIMINGS block (most reliable, machine-readable).
     failed = _extract_from_timings(lines)
-    if failed:
+    if failed is not None:
         return failed
 
     # Method 2: ci_utils.py summary section.
@@ -177,7 +193,7 @@ def is_cpu_log(log_path):
     return any(CPU_LOG_PATH_PATTERN.search(part) for part in log_path.parent.parts)
 
 
-def extract_failed_from_logs(log_dir):
+def extract_failed_from_logs(log_dir, test_results=None):
     """
     Scan CPU logs first and represent all CPU failures as one ``cpu-ut`` item.
     Scan all remaining logs with the existing pytest node-ID behavior.
@@ -205,6 +221,9 @@ def extract_failed_from_logs(log_dir):
 
     all_failed = []
     seen = set()
+    reported_tests = {
+        (record["artifact"], record["testcase"]) for record in test_results or []
+    }
 
     cpu_failed = False
     for candidate in cpu_candidates:
@@ -217,6 +236,9 @@ def extract_failed_from_logs(log_dir):
 
     for candidate in regular_candidates:
         for test_path in extract_failed_from_log(candidate):
+            # Structured outcomes supersede historical retry summaries in this artifact.
+            if (candidate.parent.name, test_path) in reported_tests:
+                continue
             if test_path not in seen:
                 seen.add(test_path)
                 all_failed.append(test_path)
@@ -299,9 +321,17 @@ def extract_diffusion_test_results(diffusion_dir):
         except (OSError, ValueError) as exc:
             print(f"::warning:: Cannot read {path}: {exc}")
             continue
+        final_results = {}
         for entry in entries:
             if isinstance(entry, dict) and entry.get("testcase"):
-                records.append({**entry, "artifact": path.parent.name})
+                testcase = entry["testcase"]
+                # A new setup/call replaces earlier attempts; teardown can fail too.
+                if entry.get("phase") != "teardown":
+                    final_results[testcase] = []
+                final_results.setdefault(testcase, []).append(
+                    {**entry, "artifact": path.parent.name}
+                )
+        records.extend(record for phases in final_results.values() for record in phases)
     return records
 
 
@@ -420,6 +450,8 @@ def generate_report(
     hit = matched["hit"]
     miss = matched["miss"]
     untested = matched["untested"]
+    if not recommended:
+        hit, miss, untested = [], [], []
     diffusion_records = diffusion_records or []
 
     out = []
@@ -503,6 +535,8 @@ def generate_report(
                 if t in hit
                 else " **[Not Matched Recommendation]**"
             )
+            if not recommended:
+                tag = ""
             out.append(f"{i}. `{t}`{tag}")
         out.append("")
     else:
@@ -521,8 +555,7 @@ def generate_report(
         out.append("")
         out.append(
             "> From `diffusion-failures-*` artifacts (sglang/multimodal_gen "
-            "consistency checks). These cases are outside the coverage "
-            "recommendation scope."
+            "consistency checks)."
         )
         out.append("")
         out.append(
@@ -573,7 +606,11 @@ def generate_report(
     out.append("")
     out.append("## Core Conclusion")
     out.append("")
-    if not failed:
+    if not recommended:
+        out.append(
+            "> **Coverage comparison unavailable:** no recommended test cases were provided."
+        )
+    elif not failed:
         out.append(
             "> No failed cases in this CI run; no need to compare against the recommendation list."
         )
@@ -589,12 +626,13 @@ def generate_report(
     # ================================================================
     #  Section 4: Detail table
     # ================================================================
-    out.append("| Category | Count |")
-    out.append("|---|---|")
-    out.append(f"| Failed & Matched Recommendation | {len(hit)} |")
-    out.append(f"| Failed but Not Matched Recommendation | {len(miss)} |")
-    out.append(f"| Recommended but Not Failed | {len(untested)} |")
-    out.append("")
+    if recommended:
+        out.append("| Category | Count |")
+        out.append("|---|---|")
+        out.append(f"| Failed & Matched Recommendation | {len(hit)} |")
+        out.append(f"| Failed but Not Matched Recommendation | {len(miss)} |")
+        out.append(f"| Recommended but Not Failed | {len(untested)} |")
+        out.append("")
 
     if hit:
         out.append("## Failed & Matched Recommendation")
@@ -627,7 +665,7 @@ def generate_report(
             out.append(f"- `{t}`")
         out.append("")
 
-    if not hit and not miss:
+    if not failed:
         out.append("## No failed cases")
         out.append("")
 
@@ -694,7 +732,7 @@ def main():
         for record in diffusion_results:
             if record.get("status") == "failed" and record["testcase"] not in failed:
                 failed.append(record["testcase"])
-        for test in extract_failed_from_logs(args.diffusion_dir):
+        for test in extract_failed_from_logs(args.diffusion_dir, diffusion_results):
             if test not in failed:
                 failed.append(test)
         print()
@@ -702,8 +740,23 @@ def main():
         print("Step 1b: Extract diffusion consistency failures")
         print("=" * 50)
         diffusion_records = extract_diffusion_failures(args.diffusion_dir)
+        current_consistency = []
+        for record in diffusion_records:
+            matching_results = [
+                result
+                for result in diffusion_results
+                if result["artifact"] == record["artifact"]
+                and result["testcase"].endswith(f"[{record['case_id']}]")
+            ]
+            if not matching_results or any(
+                result.get("status") == "failed" for result in matching_results
+            ):
+                current_consistency.append(record)
+        diffusion_records = current_consistency
         print(f"Diffusion consistency failures: {len(diffusion_records)}")
     for record in diffusion_records:
+        if any(test.endswith(f"[{record['case_id']}]") for test in failed):
+            continue
         failure_id = diffusion_failure_id(record)
         if failure_id not in failed:
             failed.append(failure_id)
@@ -742,7 +795,11 @@ def main():
     print("=" * 50)
     print("Step 3: Match")
     print("=" * 50)
-    matched = match_failed_vs_recommended(failed, recommended)
+    matched = (
+        match_failed_vs_recommended(failed, recommended)
+        if recommended
+        else {"hit": [], "miss": [], "untested": []}
+    )
     print(f"Hit (failed + recommended): {len(matched['hit'])}")
     print(f"Miss (failed, not recommended): {len(matched['miss'])}")
     print(f"Untested (recommended, no failure): {len(matched['untested'])}")
