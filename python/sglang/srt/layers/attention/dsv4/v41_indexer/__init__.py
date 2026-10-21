@@ -94,7 +94,8 @@ def make_candidate_indexer(
     candidate_topk_blocks: int,
     candidate_block_size: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_parallel, get_platform
 
     from .dense_blocks import DenseBlocksBackend
 
@@ -105,6 +106,9 @@ def make_candidate_indexer(
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
+        use_triton_candidates=(
+            get_platform().is_sm90 and envs.SGLANG_OPT_USE_DSV41_SM90_CANDIDATES.get()
+        ),
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     if not is_sm100_or_newer() or candidate_topk_blocks <= 0:

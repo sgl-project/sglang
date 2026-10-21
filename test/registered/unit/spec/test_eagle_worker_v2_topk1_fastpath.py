@@ -231,7 +231,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
                 worker.target_worker = SimpleNamespace(
                     model_runner=SimpleNamespace(
-                        attn_backend=attn_backend, kv_index_translator=None
+                        attn_backend=attn_backend,
+                        get_decode_attn_backend=lambda: attn_backend,
+                        kv_index_translator=None,
                     )
                 )
                 draft_input = SimpleNamespace(

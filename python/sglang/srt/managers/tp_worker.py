@@ -756,11 +756,21 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+    def forward_batch_split_prefill(
+        self,
+        batch: ScheduleBatch,
+        *,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        return_kv_loc_plan: bool = False,
+    ):
+        # Decode resets the consumer between slices; restore load-back fences.
+        self.set_hicache_consumer(batch.hicache_consumer_index)
+
         if batch.split_index == 0:
             forward_batch = ForwardBatch.init_new(
                 batch,
                 self.model_runner,
+                capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
             )
             batch.split_forward_batch = forward_batch
@@ -780,6 +790,11 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,
             expert_distribution_metrics=out.expert_distribution_metrics,
+            kv_loc_plan=(
+                batch.split_forward_batch.kv_loc_plan
+                if return_kv_loc_plan and logits_output is not None
+                else None
+            ),
         )
         batch_result.next_token_ids = next_token_ids
         return batch_result

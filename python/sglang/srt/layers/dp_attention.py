@@ -426,6 +426,14 @@ def compute_dp_attention_world_info(
 
 def initialize_dp_attention_flags(server_args: ServerArgs):
     """Initialize DP runtime flags without changing the worker's placement."""
+    global _USE_DP_GATHERV
+    # Keep prefill gather/combine on the same NCCL communicator under PDMux.
+    # Mixing custom all-reduce gather with NCCL combine can stall overlapping
+    # lanes. The existing layout and SUM_LEN guards preserve decode fast paths.
+    _USE_DP_GATHERV = get_bool_env_var(
+        "SGLANG_DP_USE_GATHERV",
+        default="true" if getattr(server_args, "enable_pdmux", False) else "false",
+    )
     dp = get_flags().dp
     dp.enabled = get_parallel().attn_dp_enabled
 
@@ -860,7 +868,7 @@ def _dp_gather_via_all_gatherv_fp8(
 def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
     enabled and applicable to the CURRENT forward. Requires:
-      - env SGLANG_DP_USE_GATHERV (default off),
+      - SGLANG_DP_USE_GATHERV (defaults on for PDMux, otherwise off),
       - supported layout (attn_tp_size==1, tp_size==attn_dp_size),
       - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
         only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the

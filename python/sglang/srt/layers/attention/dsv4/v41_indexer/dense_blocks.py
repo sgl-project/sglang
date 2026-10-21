@@ -23,6 +23,7 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     score_tiles,
+    select_compact_prefill,
     select_decode,
     topk_ragged,
     write_decode,
@@ -45,7 +46,7 @@ class BlockIds(CandidateMetadata, msgspec.Struct):
     blocks: torch.Tensor
     # prefill: query rows of each request in row order, for the late-layer tail
     rows_per_request: Optional[List[int]] = None
-    # Hopper decode materializes this once at the source and reuses it in consumers.
+    # Dense Hopper decode reuses this mask; compact consumers only need blocks.
     decode_mask: Optional[torch.Tensor] = None
 
     def tail(self, rows_per_request: List[int]) -> BlockIds:
@@ -67,12 +68,14 @@ class DenseBlocksBackend:
         candidate_topk_blocks: int,
         candidate_block_size: int,
         use_deep_gemm_prefill: bool,
+        use_triton_candidates: bool = False,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_triton_candidates = use_triton_candidates and candidate_block_size == 8
 
     def publish_prefill(self, inputs: PrefillInputs):
         if self.use_deep_gemm_prefill:
@@ -104,7 +107,11 @@ class DenseBlocksBackend:
             )
             published = BlockIds(
                 blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, d.lmax, self.block_size),
+                decode_mask=(
+                    None
+                    if self.use_triton_candidates
+                    else candidate_block_mask(blocks, d.lmax, self.block_size)
+                ),
             )
         else:
             published = BlockIds(
@@ -127,13 +134,22 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            candidate_mask=published.decode_mask if published is not None else None,
+            candidate_mask=(
+                published.decode_mask
+                if published is not None and not self.use_triton_candidates
+                else None
+            ),
+            candidate_blocks=(
+                published.blocks
+                if published is not None and self.use_triton_candidates
+                else None
+            ),
         )
         if d is None:
             return
         assert published is not None and published.blocks.shape[0] == d.bs
         if isinstance(d, PagedDecodeScores):
-            assert published.decode_mask is not None
+            assert d.candidate_blocks is not None or published.decode_mask is not None
             select_decode(inputs, d, inputs.indexer.index_topk)
             return
         k = min(inputs.indexer.index_topk, d.lmax)
@@ -226,8 +242,15 @@ class DenseBlocksBackend:
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
+            candidate_blocks=published.blocks if self.use_triton_candidates else None,
+            block_size=self.block_size,
         ):
             for chunk in chunks:
+                if chunk.candidate_blocks is not None:
+                    select_compact_prefill(
+                        inputs, request, chunk, self.req_to_token
+                    )
+                    continue
                 idx = topk_among_blocks(
                     chunk.scores,
                     chunk.lens,

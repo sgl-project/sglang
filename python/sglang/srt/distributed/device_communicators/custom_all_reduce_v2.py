@@ -223,6 +223,37 @@ class CustomAllReduceV2:
         self._capture_started = False
         self.disabled = False
 
+    def limit_sm_count(self, sm_count: int) -> None:
+        """Size polling grids for a PDMux lane before warmup/graph capture.
+
+        Push kernels need their peer CTAs to become resident. A whole-device
+        grid can deadlock on a smaller Green Context. Rebuild the workspace
+        here because the push grid is also the phase-counter array's width;
+        changing only the launch width would corrupt the protocol.
+        """
+        if sm_count <= 0:
+            raise ValueError("custom all-reduce SM limit must be positive")
+        if self.disabled:
+            return
+        limited = self.config._replace(
+            num_push_blocks=min(self.config.num_push_blocks, sm_count),
+            num_pull_blocks=min(self.config.num_pull_blocks, sm_count),
+            num_mc_blocks=(
+                min(self.config.num_mc_blocks, sm_count)
+                if self.config.num_mc_blocks is not None
+                else None
+            ),
+        )
+        if limited == self.config:
+            return
+        if self._capture_started or self._graph_mode_allowed:
+            raise RuntimeError("custom all-reduce SM limit must be set before capture")
+        self.config = limited
+        self._eager_plans.clear()
+        self._init_workspace()
+        if self.rank == 0:
+            logger.info("PDMux custom all-reduce grids limited to %d SMs", sm_count)
+
     def reserve_push_capacity(self, nbytes: int) -> None:
         """Grow shared storage without changing AR dispatch or counter capacity.
 

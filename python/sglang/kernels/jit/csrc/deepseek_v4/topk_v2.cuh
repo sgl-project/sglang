@@ -1155,11 +1155,12 @@ struct TopKKernel {
   }
 
   template <TopKMode kMode>
-  static void launch(const TopKPagedParams& params, const uint32_t max_seq_len, const DLDevice device) {
+  static void launch(
+      const TopKPagedParams& params, const uint32_t max_seq_len, const DLDevice device, const bool enable_cluster = true) {
     using namespace host;
     const auto batch_size = params.batch_size;
 #if SUPPORT_CLUSTER
-    const bool use_cluster = (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
+    const bool use_cluster = enable_cluster && (max_seq_len > params.static_cluster_floor) && (batch_size <= kClusterMaxBatch);
     if (use_cluster) {
       if constexpr (kMaxCluster16BatchSize > 0) {
         if (batch_size <= kMaxCluster16BatchSize) {
@@ -1233,7 +1234,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const bool enable_cluster) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
@@ -1332,7 +1334,7 @@ struct TopKKernel {
           Panic("Invalid mode, this path should be unreachable");
       }
     };
-    dispatch([&]<TopKMode kMode>() { launch<kMode>(params, max_seq_len, device); });
+    dispatch([&]<TopKMode kMode>() { launch<kMode>(params, max_seq_len, device, enable_cluster); });
   }
 
   /**

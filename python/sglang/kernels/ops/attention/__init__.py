@@ -189,6 +189,10 @@ for _mod, _fn in [
     ("dsa.transform_index", "prepare_trtllm_nope_sparse_metadata"),
     ("dsa.transform_index", "transform_index_page_table_dcp"),
     ("dsa.cp_split", "dsa_cp_interleave_q_seqs"),
+    ("dsv4.fp4_indexer", "quantize_fp4_indexer_tensor"),
+    ("dsv4.fp4_indexer", "store_fp4_index_k_cache"),
+    ("dsv4.fp4_indexer_prefill", "fused_index_scores"),
+    ("dsv4.candidate_bf16_mqa", "candidate_bf16_mqa_logits"),
 ]:
     register_kernel(
         KernelSpec(
@@ -335,6 +339,16 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.fp4_index_logits_grouped_sm90",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.sm90_fp4_grouped_indexer:fp4_index_logits_grouped_sm90",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.fused_k_indexer_norm_rope",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.indexer_k:fused_k_indexer_norm_rope",
@@ -395,7 +409,11 @@ register_kernel(
     )
 )
 
-for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
+for _fn in (
+    "fp4_index_logits_paged",
+    "fp4_index_logits_candidates",
+    "finish_paged_indexer_topk",
+):
     register_kernel(
         KernelSpec(
             op=f"attention.{_fn}",

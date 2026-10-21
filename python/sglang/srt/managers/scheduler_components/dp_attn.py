@@ -40,6 +40,7 @@ from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_memory,
     get_parallel,
@@ -308,6 +309,16 @@ def _update_gather_batch(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     skip_global_metadata=False,
 ):
+    # Preserve the raw scheduler gather independently of the representation
+    # consumed by the model forward below. PDMux uses this rank-invariant view
+    # to keep layer-split control flow aligned even on backends that do not
+    # require an MLP TP gather and therefore keep `global_num_tokens` local.
+    batch.scheduler_global_num_tokens = (
+        list(mlp_sync_info.global_num_tokens)
+        if mlp_sync_info.global_num_tokens is not None
+        else [mlp_sync_info.num_tokens]
+    )
+
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
@@ -359,10 +370,14 @@ def should_skip_scheduler_all_gather(num_dp_ranks: int) -> bool:
     TP schedulers consume the same broadcast request stream, so gathering the
     identical batch mode, graph eligibility, and token counts only adds a
     device collective plus host synchronization.  Preserve the environment
-    override for deployments that explicitly guarantee this invariant beyond
-    DP1.
+    override for ordinary deployments that explicitly guarantee this invariant
+    beyond DP1. PDMux DP always gathers both lanes' participant metadata.
     """
 
+    if num_dp_ranks > 1 and get_disagg().enable_pdmux:
+        # PDMux requires real/IDLE participants and identical slice decisions
+        # on both lanes; a local fallback cannot establish that contract.
+        return False
     return num_dp_ranks == 1 or envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
 
 
@@ -600,7 +615,15 @@ def prepare_mlp_sync_batch_raw(
 
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
-    if use_world_group:
+    if num_dp_ranks > 1 and get_disagg().enable_pdmux:
+        # Control metadata must not wait for the model lane's GPU work. Using
+        # Gloo also avoids interleaving torch NCCL metadata with PyNCCL model
+        # communication, which may load different NCCL libraries.
+        group = (
+            parallel.world_group.cpu_group if use_world_group else tp_group.cpu_group
+        )
+        device = "cpu"
+    elif use_world_group:
         world = parallel.world_group
         group = torch.distributed.group.WORLD
         device = world.device

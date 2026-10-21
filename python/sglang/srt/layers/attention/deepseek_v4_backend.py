@@ -1184,6 +1184,9 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+    # Compressor plans encode ragged token ids as uint16.
+    max_prefill_plan_tokens = (1 << 16) - 1
+
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = True
     supports_prefill_cuda_graph_max_context_size: bool = True
     supports_ragged_verify_graph: bool = True
@@ -1325,6 +1328,9 @@ class DeepseekV4AttnBackend(
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
+        self.is_dspark_target = (
+            not model_runner.is_draft_worker and spec_alg.is_dspark()
+        )
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
@@ -2703,10 +2709,16 @@ class DeepseekV4AttnBackend(
                 else None
             )
 
+    def clear_forward_metadata_for_idle(self) -> None:
+        self.online_c128_mtp.clear()
+        self.forward_metadata = None
+        self.tail_forward_metadata = None
+        self.encoder_replay = False
+
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         logical_forward_mode = _get_logical_forward_mode(forward_batch)
-        if self.mtp_enabled and logical_forward_mode.is_idle():
-            self.online_c128_mtp.clear()
+        if logical_forward_mode.is_idle():
+            self.clear_forward_metadata_for_idle()
             return
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)
@@ -3682,7 +3694,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, forward_batch
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -3737,7 +3749,9 @@ class DeepseekV4AttnBackend(
             ), f"prefill graph indexer width {width} exceeds the candidate window"
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, forward_batch
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -3745,6 +3759,20 @@ class DeepseekV4AttnBackend(
             else self.forward_metadata.c2_indexer_metadata
         )
         assert metadata is not None, f"no decode indexer metadata for {ratio = }"
+        mode = forward_batch.forward_mode
+        group_size = 1
+        if (
+            envs.SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER.get()
+            and self.is_dspark_target
+            and mode.is_target_verify()
+            and read_ragged_verify_mode() is not RaggedVerifyMode.COMPACT
+            and get_parallel().attn_cp_size == 1
+            and self.speculative_num_draft_tokens is not None
+            and 2 <= self.speculative_num_draft_tokens <= 6
+            and x.shape[0]
+            == forward_batch.batch_size * self.speculative_num_draft_tokens
+        ):
+            group_size = self.speculative_num_draft_tokens
         return DecodeInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -3759,6 +3787,7 @@ class DeepseekV4AttnBackend(
             out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
                 ratio
             ),
+            verify_group_size=group_size,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(
@@ -3797,6 +3826,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
+            req_pool_indices_cpu=_as_int_list(forward_batch.req_pool_indices_cpu),
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)
@@ -3945,7 +3975,7 @@ class DeepseekV4AttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.mtp_enabled and forward_batch.forward_mode.is_idle():
+        if _get_logical_forward_mode(forward_batch).is_idle():
             return q.new_empty(
                 (q.shape[0], q.shape[1], layer.v_head_dim),
                 dtype=torch.bfloat16 if self.trtllm_attn else q.dtype,

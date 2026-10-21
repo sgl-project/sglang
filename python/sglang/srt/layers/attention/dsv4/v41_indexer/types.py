@@ -55,6 +55,7 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     seq_lens_cpu: Optional[List[int]]
     rows_per_request: Optional[List[int]]
     rows_per_request_device: Optional[torch.Tensor]
+    req_pool_indices_cpu: Optional[List[int]] = None
 
     # The selection, unordered, -1 padded: [rows, topk] int32 request-local
     # compressed positions, and the same picks as index-K pool slots, which is
@@ -81,6 +82,9 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     req_rows: torch.Tensor  # [rows] req_to_token row of each query row
     paged_metadata: PagedIndexerMetadata
     is_verify: bool
+    # CPU scheduling contract, never inferred from CUDA request IDs/lengths.
+    # >1 only for fixed-width request-major DSPARK target verification.
+    verify_group_size: int = 1
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor

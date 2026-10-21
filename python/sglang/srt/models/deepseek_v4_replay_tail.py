@@ -129,6 +129,25 @@ def _flatten_state(state: HcState):
     return leaves, has_pre, rebuild
 
 
+@contextmanager
+def _tail_capture_mode(batch: ForwardBatch):
+    """Capture padded rows through prefill breaks; keep their live batch's mode.
+
+    A decode rank can join another DP rank's prefill tail graph. The graph
+    computes a full bucket, but its eager breaks must read the decode rank's
+    actual rows and metadata. Only the distinct capture batch uses EXTEND.
+    """
+    if batch is get_tc_piecewise_forward_context().forward_batch:
+        yield
+        return
+    saved_mode = batch.forward_mode
+    batch.forward_mode = ForwardMode.EXTEND
+    try:
+        yield
+    finally:
+        batch.forward_mode = saved_mode
+
+
 class DecoderReplayTail:
     def __init__(
         self,
@@ -364,19 +383,24 @@ class DecoderReplayTail:
             finally:
                 exit_late_layer_dp(batch, saved)
 
+        @contextmanager
+        def graph_batch_scope(batch: ForwardBatch, inputs: List[torch.Tensor]):
+            with _tail_capture_mode(batch), dp_layout(batch, inputs):
+                yield
+
         residual, pre, *aux = self.runner.run(
             key=(capture_dspark, has_pre, layout, gather_ids),
             live=live,
             forward_batch=forward_batch,
             body=body,
             context=self._break_context,
-            batch_scope=dp_layout,
+            batch_scope=graph_batch_scope,
             bucket_from=None if dp_rows is None else max(dp_rows),
             out_rows=out_rows,
         )
         return residual, pre, aux
 
-    def run_idle(
+    def run_without_tail(
         self,
         *,
         state: HcState,
@@ -387,13 +411,19 @@ class DecoderReplayTail:
         capture_dspark: bool,
         dp_rows: List[int],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """An idle DP rank replays the shared bucket with no rows of its own."""
+        """Ranks without a prefill tail still contribute their live decode rows.
+
+        Only an IDLE rank contributes zero rows to the shared DP bucket.
+        """
+        idle = forward_batch.forward_mode.is_idle()
         return self.run(
-            state=state.take_rows(lambda t: t[:0]),
-            positions=positions[:0],
-            input_ids=input_ids[:0],
+            state=state.take_rows(lambda t: t[:0]) if idle else state,
+            positions=positions[:0] if idle else positions,
+            input_ids=input_ids[:0] if idle else input_ids,
             input_ids_global=(
-                None if input_ids_global is None else input_ids_global[:0]
+                input_ids_global[:0]
+                if idle and input_ids_global is not None
+                else input_ids_global
             ),
             forward_batch=forward_batch,
             capture_dspark=capture_dspark,

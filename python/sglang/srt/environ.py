@@ -648,6 +648,8 @@ class Envs:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Host-only lane submission diagnostics; never reads device tensor values.
+    SGLANG_PDMUX_TRACE = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
@@ -1735,6 +1737,20 @@ class Envs:
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
+    # Score the torch prefill indexer with one Triton kernel instead of the
+    # einsum/relu/weight/sum chain; False, or SGLANG_DSV41_TORCH_PREFILL_INDEXER,
+    # restores the torch scoring. Opt in until the SM90 PDMux GPU regression
+    # has passed; unsupported devices/dtypes keep the existing scorer.
+    SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES = EnvBool(False)
+    # Opt into the fused low-ratio compressor on Hopper. Read at model load:
+    # changing the ratio-2 weight layout requires restarting the server.
+    SGLANG_OPT_USE_FUSED_DSV41_COMPRESS_SM90 = EnvBool(False)
+    # Compact candidate scoring on Hopper; set before graph capture. This does
+    # not enable extra attention-length graphs or change DSPARK block widths.
+    SGLANG_OPT_USE_DSV41_SM90_CANDIDATES = EnvBool(False)
+    # Group fixed-width DSPARK target-verify rows on SM90 to reuse index-K
+    # tiles through FP8 WGMMA. Set before graph capture; H32/H64 only.
+    SGLANG_OPT_USE_DSV41_SM90_GROUPED_INDEXER = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
