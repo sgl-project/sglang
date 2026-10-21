@@ -131,18 +131,21 @@ class TestDefaultModelLoader(CustomTestCase):
 
     def test_kv_cache_scale_dropped_on_mismatch(self):
         cases = [
-            # (checkpoint_bits, runtime_kv_dtype, expect_scales_dropped)
-            (8, "nvfp4", True),
-            (8, "bfloat16", True),
-            (8, "fp8", False),
-            (4, "nvfp4", False),
-            (4, "fp8", True),
+            # (checkpoint_bits, runtime_kv_dtype, expect_scales_dropped, kv_cache_quant_algo)
+            (8, "nvfp4", True, None),
+            (8, "bfloat16", True, None),
+            (8, "fp8", False, None),
+            (8, "auto", False, "FP8"),
+            (4, "nvfp4", False, None),
+            (4, "fp8", True, None),
         ]
-        for checkpoint_bits, runtime_dtype, expect_dropped in cases:
+        for checkpoint_bits, runtime_dtype, expect_dropped, *extra in cases:
+            quant_algo = extra[0] if extra else None
             with self.subTest(ckpt=checkpoint_bits, runtime=runtime_dtype):
                 model = Mock()
                 model.quant_config = SimpleNamespace(
                     kv_cache_scheme={"num_bits": checkpoint_bits},
+                    kv_cache_quant_algo=quant_algo,
                     is_nvfp4_online=False,
                     get_name=lambda: "dummy",
                 )

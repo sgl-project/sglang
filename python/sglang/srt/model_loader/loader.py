@@ -1074,7 +1074,12 @@ class DefaultModelLoader(BaseModelLoader):
             if isinstance(kv_scheme, dict):
                 checkpoint_bits = kv_scheme.get("num_bits")
                 expected_bits = None
-                if runtime_kv_dtype:
+                if runtime_kv_dtype == "auto":
+                    # configure_kv_cache_dtype resolves auto to an FP8 pool here.
+                    algo = getattr(quant_config, "kv_cache_quant_algo", None)
+                    if isinstance(algo, str) and algo.upper() == "FP8":
+                        expected_bits = 8
+                elif runtime_kv_dtype:
                     if "fp8" in runtime_kv_dtype or "int8" in runtime_kv_dtype:
                         expected_bits = 8
                     elif "fp4" in runtime_kv_dtype:
