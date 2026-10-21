@@ -16,7 +16,7 @@ use futures::future::try_join_all;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::chat::ChatRequest;
+use super::chat::{ChatBody, ChatRequest};
 use super::template::{RenderedChat, render_chat};
 use super::{AppState, contains_media};
 use crate::api_server::core::CoreError;
@@ -158,12 +158,16 @@ fn render_chat_prompt(
     fields
         .entry("model")
         .or_insert_with(|| Value::from("default"));
-    let body = Value::Object(fields);
-    let ChatRequest {
-        request,
-        chat_template_kwargs,
-        ..
-    } = serde_json::from_value(body.clone()).map_err(|error| (INVALID_BODY, error.to_string()))?;
+    let ChatBody {
+        request:
+            ChatRequest {
+                request,
+                chat_template_kwargs,
+                ..
+            },
+        raw: body,
+    } = ChatBody::deserialize(Value::Object(fields))
+        .map_err(|error| (INVALID_BODY, error.to_string()))?;
     if request.messages.is_empty() {
         return Err((BAD_REQUEST, "messages cannot be empty".into()));
     }
