@@ -104,16 +104,18 @@ void apply_gguf_moe_weights(torch::Tensor& outputs, const torch::Tensor& weights
     return;
   }
 #ifdef USE_MUSA
-  const at::musa::OptionalMUSAGuard device_guard(device_of(outputs));
-  const musaStream_t stream = at::musa::getCurrentMUSAStream();
+  const c10::musa::OptionalMUSAGuard device_guard(device_of(outputs));
+  const musaStream_t stream = c10::musa::getCurrentMUSAStream();
 #else
   const at::cuda::OptionalCUDAGuard device_guard(device_of(outputs));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 #endif
   constexpr int threads = 256;
+  // Reuse each route's ID and score across four coalesced column groups.
+  constexpr int columns_per_block = threads * 4;
   const dim3 blocks(
       static_cast<unsigned int>(std::min<int64_t>(outputs.size(0), 65535)),
-      static_cast<unsigned int>(std::min<int64_t>((outputs.size(1) - 1) / threads + 1, 65535)));
+      static_cast<unsigned int>(std::min<int64_t>((outputs.size(1) - 1) / columns_per_block + 1, 65535)));
   DISPATCH_FLOAT_TYPES(outputs.scalar_type(), "apply_gguf_moe_weights_output", [&] {
     using output_t = scalar_t;
     DISPATCH_FLOAT_TYPES(weights.scalar_type(), "apply_gguf_moe_weights_weight", [&] {

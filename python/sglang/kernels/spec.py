@@ -102,6 +102,9 @@ class PlatformInfo(msgspec.Struct, frozen=True):
             npu = getattr(torch, "npu", None)
             if npu is not None and npu.is_available():
                 return cls(device_type="npu")
+            musa = getattr(torch, "musa", None)
+            if musa is not None and musa.is_available():
+                return cls(device_type="musa")
             if (
                 getattr(torch.version, "musa", None) is not None
                 and torch.cuda.is_available()
