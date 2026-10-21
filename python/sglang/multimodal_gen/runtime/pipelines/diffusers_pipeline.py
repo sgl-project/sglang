@@ -163,8 +163,7 @@ class DiffusersExecutionStage(PipelineStage):
             tensor = torch.from_numpy(data).float()
             if tensor.max() > 1.0:
                 tensor = tensor / 255.0
-            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, T, C, H, W),
-            # the layout _fix_output_shape expects for videos.
+            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, T, C, H, W)
             if tensor.ndim == 4:
                 tensor = tensor.permute(0, 3, 1, 2)
             elif tensor.ndim == 5:
@@ -183,12 +182,13 @@ class DiffusersExecutionStage(PipelineStage):
         """Convert a list of items to a tensor."""
         first = data[0]
 
-        # A nested list (e.g., [[frame1, frame2, ...]]) is one video; a flat
-        # list is a batch of images.
-        is_video = isinstance(first, list) and len(first) > 0
-        if is_video:
-            data = first
-            first = data[0]
+        # A nested list (e.g., [[frame1, frame2, ...], ...]) is a batch of
+        # videos, stacked to (B, T, C, H, W); a flat list is a batch of images.
+        if isinstance(first, list):
+            videos = [self._convert_to_tensor(video) for video in data]
+            if any(video is None for video in videos):
+                return None
+            return torch.stack(videos)
 
         if isinstance(first, Image.Image):
             stacked = torch.stack([T.ToTensor()(img) for img in data])
@@ -204,8 +204,7 @@ class DiffusersExecutionStage(PipelineStage):
         else:
             return None
 
-        # (T, C, H, W) -> (1, T, C, H, W) for a video, else (N, C, H, W)
-        return stacked.unsqueeze(0) if is_video else stacked
+        return stacked
 
     def _postprocess_output(self, output: torch.Tensor) -> torch.Tensor:
         """Post-process output tensor to ensure valid values and correct shape."""
@@ -372,6 +371,7 @@ class DiffusersPipeline(ComposedPipelineBase):
                 "Diffusers backend"
             )
         self.server_args = server_args
+        self._disagg_role = server_args.disagg_role
         self.model_path = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
@@ -728,23 +728,10 @@ class DiffusersPipeline(ComposedPipelineBase):
         stage: PipelineStage | str,
         stage_name: str | PipelineStage | None = None,
     ) -> "DiffusersPipeline":
-        """Add a stage to the pipeline.
-
-        Accepts the base-class order ``add_stage(stage, stage_name=None)`` and,
-        for backward compatibility, the legacy ``add_stage(stage_name, stage)``.
-        """
+        # Also accept the legacy add_stage(stage_name, stage) order.
         if isinstance(stage, str) and isinstance(stage_name, PipelineStage):
             stage, stage_name = stage_name, stage
-        if stage_name is None:
-            stage_name = self._infer_stage_name(stage)
-        if stage_name in self._stage_name_mapping:
-            raise ValueError(f"Duplicate stage name detected: {stage_name}")
-
-        stage.set_registered_stage_name(stage_name)
-        stage.set_profile_stage_name(self._profile_stage_name(stage, stage_name))
-        self._stages.append(stage)
-        self._stage_name_mapping[stage_name] = stage
-        return self
+        return super().add_stage(stage, stage_name)
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

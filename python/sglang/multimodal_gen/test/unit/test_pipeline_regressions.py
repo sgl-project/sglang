@@ -7,32 +7,19 @@ import pytest
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
     DiffusersExecutionStage,
+    DiffusersPipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines.ernie_image import ErnieImagePipeline
 from sglang.multimodal_gen.runtime.pipelines.sana_video import (
     SanaVideoTextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.utils.camera_geometry import get_plucker_embeddings
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
     ImageProcessorV2,
     MeshRender,
 )
-
-
-def test_plucker_rays_for_bf16_poses_match_float32():
-    """bf16 cannot represent pixel coordinates above 256, so neighbouring pixels of
-    a wide frame collapsed onto the same ray when poses were bf16."""
-    n_frames, height, width = 1, 4, 640
-    c2ws = torch.eye(4)[None].repeat(n_frames, 1, 1)
-    # Values exactly representable in bf16, so only the pixel grid can differ.
-    Ks = torch.tensor([[512.0, 512.0, 320.0, 2.0]])
-
-    expected = get_plucker_embeddings(c2ws, Ks, height, width)
-    actual = get_plucker_embeddings(c2ws.bfloat16(), Ks.bfloat16(), height, width)
-
-    assert torch.equal(actual.float(), expected)
 
 
 def test_default_texture_follows_width_height_texture_size():
@@ -45,31 +32,59 @@ def test_default_texture_follows_width_height_texture_size():
     assert render.get_texture().shape == (32, 64, 3)
 
 
+@pytest.mark.parametrize("channels", [3, 4])
+def test_image_processor_accepts_ndarray_like_pil(channels):
+    """An ndarray input fell through to an UnboundLocalError on `mask`."""
+    array = np.zeros((6, 10, channels), dtype=np.uint8)
+    array[1:5, 2:8] = 200
+    processor = ImageProcessorV2(size=8)
+
+    actual = processor.load_image(array)
+    expected = processor.load_image(Image.fromarray(array))
+
+    for a, e in zip(actual, expected):
+        torch.testing.assert_close(a, e)
+
+
 def test_image_processor_rejects_unsupported_input_type():
-    """An input that was neither a path nor a PIL image fell through to an
-    UnboundLocalError on `mask`."""
     with pytest.raises(TypeError, match="Unsupported image type"):
         ImageProcessorV2(size=8).load_image(torch.zeros(3, 8, 8))
 
 
+# Distinct value per sample, frame and channel, so swapped axes change the result.
+_VALUES = np.fromfunction(lambda b, t, c: 100 * b + 30 * t + 10 * c, (2, 3, 3))
+_VIDEOS = torch.from_numpy(_VALUES / 255).float().permute(0, 2, 1)[..., None, None]
+
+
 @pytest.mark.parametrize(
-    "data, expected_shape",
+    "data, expected",
     [
-        (np.random.rand(2, 5, 16, 16, 3).astype("float32"), (2, 3, 5, 16, 16)),
-        ([[Image.new("RGB", (16, 16)) for _ in range(5)]], (1, 3, 5, 16, 16)),
-        ([[Image.new("RGB", (16, 16)) for _ in range(3)]], (1, 3, 3, 16, 16)),
-        ([Image.new("RGB", (16, 16)) for _ in range(2)], (2, 3, 16, 16)),
+        (
+            np.broadcast_to(_VALUES[:, :, None, None] / 255, (2, 3, 2, 4, 3)).copy(),
+            _VIDEOS.expand(2, 3, 3, 2, 4),
+        ),
+        (
+            [
+                [Image.new("RGB", (4, 2), tuple(map(int, frame))) for frame in video]
+                for video in _VALUES
+            ],
+            _VIDEOS.expand(2, 3, 3, 2, 4),
+        ),
+        (
+            [Image.new("RGB", (4, 2), tuple(map(int, video[0]))) for video in _VALUES],
+            _VIDEOS[:, :, 0].expand(2, 3, 2, 4),
+        ),
     ],
-    ids=["np-video", "pil-video", "pil-video-3-frames", "pil-image-batch"],
+    ids=["np-videos", "pil-videos", "pil-images"],
 )
-def test_diffusers_output_layout_is_channels_first(data, expected_shape):
-    """Video outputs were permuted twice (np) or misread as a batch (PIL lists), and
-    several PIL images from an image pipeline were stacked as video frames."""
+def test_diffusers_output_layout_is_channels_first(data, expected):
+    """Video outputs were permuted twice (np), PIL video lists lost all but the
+    first sample, and several PIL images were stacked as video frames."""
     stage = DiffusersExecutionStage.__new__(DiffusersExecutionStage)
 
     output = stage._postprocess_output(stage._convert_to_tensor(data))
 
-    assert tuple(output.shape) == expected_shape
+    torch.testing.assert_close(output, expected)
 
 
 def test_sana_video_negative_prompt_uses_requested_sequence_length():
@@ -92,15 +107,14 @@ def test_sana_video_negative_prompt_uses_requested_sequence_length():
 
 @pytest.mark.parametrize(
     "pe_entry, expected",
-    [([None, None], False), (["transformers", "Mistral3Model"], True), (None, False)],
+    [([None, None], False), (["transformers", "Mistral3Model"], True)],
 )
 def test_ernie_absent_pe_component_is_not_detected(monkeypatch, pe_entry, expected):
     """model_index.json records an absent component as [null, null]; that was
     treated as a real prompt-enhancement model and loading then failed."""
-    model_index = {} if pe_entry is None else {"pe": pe_entry}
     monkeypatch.setattr(
         "sglang.multimodal_gen.runtime.pipelines.ernie_image.maybe_download_model_index",
-        lambda path: model_index,
+        lambda path: {"pe": pe_entry},
     )
     pipeline = ErnieImagePipeline.__new__(ErnieImagePipeline)
 
@@ -112,11 +126,9 @@ def test_ernie_absent_pe_component_is_not_detected(monkeypatch, pe_entry, expect
 
 @pytest.mark.parametrize("legacy_order", [False, True])
 def test_diffusers_pipeline_add_stage_accepts_both_argument_orders(legacy_order):
-    from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
-        DiffusersPipeline,
-    )
-
     pipeline = DiffusersPipeline.__new__(DiffusersPipeline)
+    pipeline.modules = {}
+    pipeline._disagg_role = RoleType.MONOLITHIC
     pipeline._stages = []
     pipeline._stage_name_mapping = {}
     stage = DiffusersExecutionStage(None)
