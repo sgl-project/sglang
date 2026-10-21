@@ -37,12 +37,12 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import (
     get_context,
