@@ -33,7 +33,7 @@ def _patch_kill_process_tree():
     original = common.kill_process_tree
 
     graceful_timeout = float(
-        os.environ.get("SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT", "20")
+        os.environ.get("SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT", "5")
     )
 
     def kill_process_tree_graceful(
