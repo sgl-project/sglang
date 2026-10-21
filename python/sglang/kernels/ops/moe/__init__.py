@@ -80,6 +80,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="moe.compute_cutlass_w4a8_moe_input_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.ep_moe_kernels:compute_cutlass_w4a8_moe_input_scale",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     num_experts: int,

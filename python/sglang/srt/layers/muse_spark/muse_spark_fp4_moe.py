@@ -381,7 +381,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         hidden_states: torch.Tensor,
         topk_scores: torch.Tensor,
         topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project local routes; finalization skips undefined inactive slots."""
         from sgl_kernel.scalar_type import scalar_types
 
         from sglang.kernels.ops.activation.activation import silu_and_mul
@@ -427,19 +428,21 @@ class MuseSpark1xFp4Experts(nn.Module):
                 local_topk_ids, block_size_m, align_num_experts
             )
 
+        # Both aligners emit ascending block IDs with inactive blocks first;
+        # no expert remapping occurs after this ordering is established.
         workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
         cache2 = torch.empty(
             (num_tokens * topk, size_n),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        cache13 = torch.zeros(
-            (num_tokens * topk * (gemm1_n + size_k),),
+        cache13 = torch.empty(
+            (num_tokens * topk * max(gemm1_n, size_k),),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
         cache1 = cache13[: num_tokens * topk * gemm1_n].view(-1, gemm1_n)
-        cache3 = cache13[num_tokens * topk * gemm1_n :].view(-1, size_k)
+        cache3 = cache13[: num_tokens * topk * size_k].view(-1, size_k)
 
         cache1 = moe_wna16_marlin_gemm(
             hidden_states,
@@ -468,6 +471,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
+            expert_ids_are_sorted=True,
         )
         silu_and_mul(
             cache1.view(-1, gemm1_n),
@@ -502,6 +506,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             use_atomic_add=False,
             use_fp32_reduce=True,
             is_zp_float=False,
+            expert_ids_are_sorted=True,
         ).view(num_tokens, topk, size_k), local_topk_ids
 
     def _forward_marlin(
@@ -528,7 +533,6 @@ class MuseSpark1xFp4Experts(nn.Module):
         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
             hidden_states, topk_scores, topk_ids
         )
-        topk_scores = topk_scores.masked_fill(local_topk_ids < 0, 0.0)
         if self._post_expert_norm is not post_expert_norm:
             self.set_post_expert_norm(post_expert_norm)
         if self._post_expert_norm_weight is not None:
@@ -545,6 +549,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             topk_scores=topk_scores,
             post_expert_norm=post_expert_norm,
             out_dtype=hidden_states.dtype,
+            slot_expert_ids=local_topk_ids,
         )
 
     def prepare_input(
@@ -749,10 +754,20 @@ def finalize_identity_with_post_expert_norm(
     topk_scores: torch.Tensor,
     post_expert_norm: nn.Module,
     out_dtype: torch.dtype,
+    slot_expert_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Apply row-local expert normalization before combining live routes."""
     num_tokens, top_k = expert_outputs.shape[0], expert_outputs.shape[1]
     normed = post_expert_norm(expert_outputs)
     weights = topk_scores.reshape(num_tokens, top_k).to(normed.dtype)
+    if slot_expert_ids is not None:
+        return fused_post_expert_norm_weighted_sum(
+            normed,
+            weights,
+            apply_norm=False,
+            slot_expert_ids=slot_expert_ids,
+            round_product=True,
+        ).to(out_dtype)
     return (normed * weights.unsqueeze(-1)).sum(dim=1).to(out_dtype)
 
 

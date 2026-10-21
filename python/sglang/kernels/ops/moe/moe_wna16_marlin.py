@@ -17,9 +17,9 @@ _MAX_THREAD_N = 256
 
 @cache_once
 def _jit_moe_wna16_marlin_module(
-    dtype: torch.dtype, is_ep: bool, has_bias: bool
+    dtype: torch.dtype, is_ep: bool, has_bias: bool, expert_ids_are_sorted: bool = False
 ) -> Module:
-    args = make_cpp_args(dtype, is_ep, has_bias)
+    args = make_cpp_args(dtype, is_ep, has_bias, expert_ids_are_sorted)
     return load_jit(
         "moe_wna16_marlin",
         *args,
@@ -67,10 +67,15 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    expert_ids_are_sorted: bool = False,
 ) -> torch.Tensor:
     """Project routes, preserving inactive rows in a caller-provided output.
 
     Inactive rows are zero when this function allocates the output.
+    ``expert_ids_are_sorted`` certifies ascending block expert IDs within the
+    padded token count, with any -1 blocks first. Unused tail entries are ignored.
+    Leave it false after remapping that can produce scattered inactive blocks.
+    The sorted specialization is only used without expert parallelism.
     """
     device = a.device
 
@@ -140,7 +145,9 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
+    module = _jit_moe_wna16_marlin_module(
+        a.dtype, is_ep, has_bias, expert_ids_are_sorted and not is_ep
+    )
     module.moe_wna16_marlin_gemm(
         a,
         c,
