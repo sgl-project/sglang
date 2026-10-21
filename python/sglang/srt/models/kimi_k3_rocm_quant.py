@@ -43,3 +43,23 @@ def _k3_channel_fp8_to_bf16(module: nn.Module, weight: torch.Tensor) -> torch.Te
     return (weight.to(torch.float32) * weight_scale.to(torch.float32)).to(
         torch.bfloat16
     )
+
+
+def k3_fused_decode_f_b_weight(f_b_proj: nn.Module) -> torch.Tensor:
+    """Dense f_b for the fused KDA decode, which takes no weight scale.
+
+    Quark serializes f_b as per-channel FP8; the BF16 copy feeds only the fused
+    kernel, while the FP8 layer keeps serving the unfused path. Must run before
+    ``process_weights_after_loading`` transposes the Quark weight.
+    """
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+    from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+
+    weight = f_b_proj.weight.data
+    if (
+        isinstance(f_b_proj.quant_method, QuarkLinearMethod)
+        and isinstance(f_b_proj.scheme, QuarkW8A8Fp8)
+        and f_b_proj.scheme.weight_qscheme == "per_channel"
+    ):
+        return _k3_channel_fp8_to_bf16(f_b_proj, weight)
+    return weight
