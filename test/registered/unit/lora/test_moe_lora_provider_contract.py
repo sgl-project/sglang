@@ -33,6 +33,32 @@ def _function(source: str, name: str) -> str:
     raise AssertionError(f"function {name!r} not found")
 
 
+class TestNvFp4PreparedQuantInfo(CustomTestCase):
+    def test_non_bf16_activations_fail_without_mutation(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+        # FP16 is the silent case: Marlin accepts half activations while the
+        # runner allocates BF16 stage buffers; FP32 fails loudly in the JIT.
+        layer = SimpleNamespace(
+            params_dtype=torch.float16,
+            w13_weight=torch.zeros((2, 4, 512), dtype=torch.int32),
+            w2_weight=torch.zeros((2, 8, 128), dtype=torch.int32),
+            w13_weight_scale=torch.zeros((2, 4, 256), dtype=torch.float8_e4m3fn),
+            w2_weight_scale=torch.zeros((2, 8, 64), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_2=torch.ones(2, dtype=torch.float16),
+            w2_weight_scale_2=torch.zeros(2, dtype=torch.float16),
+            moe_runner_config=SimpleNamespace(is_gated=True),
+            num_local_experts=2,
+            intermediate_size_per_partition=128,
+            hidden_size=64,
+        )
+        original = vars(layer).copy()
+        with self.assertRaisesRegex(NotImplementedError, "BF16 activations"):
+            MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
+        for name, value in original.items():
+            self.assertIs(getattr(layer, name), value)
+
+
 class TestProviderGeometry(CustomTestCase):
     def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
         source = _function((PROVIDER / "triton_bf16.py").read_text(), "_config_for")
