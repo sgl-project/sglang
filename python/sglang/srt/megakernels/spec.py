@@ -122,6 +122,16 @@ class BuiltMegakernel(Protocol):
     sizes. A draft's begin_draft_round is called as it is. The entries a built object
     offers must agree on every rank. megakernels/eagle_binding.py holds the binding
     of the Qwen3.5 architectures and the structs these entries get.
+
+    A built object may also offer graph_variants: absent or None, or a mapping from a
+    graph runner GRAPH_VARIANT_RUNNERS names to an AttentionGraphVariants
+    (layers/attention/graph_variants.py), with the same runners and capture labels
+    on every rank. At each batch size whose graph runs the megakernel, that runner
+    then captures one graph per label, in order, the label readable through
+    capture_mode.get_capture_attention_variant() during the capture, and replays the
+    one select picks. select reads host state only, such as
+    ForwardBatch.attention_kv_len_lower_bound, and picks alike on every rank. Other
+    runners and batch sizes capture as they would without these variants.
     """
 
     widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
@@ -148,6 +158,9 @@ ENTRIES = (
     "draft_extend",
     "begin_draft_round",
 )
+# The graph runners a built object's graph_variants may key: the target's verify
+# graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
+GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
 
 
 class MegakernelSpec(msgspec.Struct, frozen=True):

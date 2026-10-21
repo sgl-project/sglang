@@ -18,9 +18,16 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.megakernels import eagle_binding as eb
 from sglang.srt.megakernels import runtime
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -193,6 +200,55 @@ def _batch(*rids):
     return SimpleNamespace(reqs=reqs, seq_lens=torch.zeros(len(rids)))
 
 
+def _decode_forward_batch(committed, seq_lens):
+    """ForwardBatch.init_new of a decode batch whose requests committed these KV
+    lengths, on a CPU stand-in of a runner."""
+    n = len(committed)
+    batch = ScheduleBatch(
+        reqs=[
+            SimpleNamespace(
+                rid=str(i),
+                lora_id=None,
+                token_type_ids=None,
+                kv=SimpleNamespace(kv_committed_len=length),
+            )
+            for i, length in enumerate(committed)
+        ],
+        device="cpu",
+        forward_mode=ForwardMode.DECODE,
+        input_ids=torch.zeros(n, dtype=torch.int64),
+        req_pool_indices=torch.arange(n),
+        seq_lens=torch.tensor(seq_lens),
+        seq_lens_cpu=torch.tensor(seq_lens),
+        out_cache_loc=torch.zeros(n, dtype=torch.int64),
+    )
+    runner = SimpleNamespace(
+        device="cpu",
+        is_draft_worker=True,
+        model_config=SimpleNamespace(
+            requires_mm_token_modalities=False, model_is_mrope=False
+        ),
+        kv_index_translator=SimpleNamespace(
+            own_plan=lambda batch: SimpleNamespace(
+                bind=lambda batch, reader, cols=None: None
+            )
+        ),
+        prefill_attention_backend_str="torch_native",
+        ngram_embedding_manager=SimpleNamespace(enabled=False),
+        lora_manager=None,
+        attn_backend=SimpleNamespace(
+            get_cpu_graph_seq_len_fill_value=lambda: 1,
+            get_cuda_graph_seq_len_fill_value=lambda: 1,
+        ),
+    )
+    return ForwardBatch.init_new(
+        batch,
+        runner,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+        return_hidden_states_before_norm=False,
+    )
+
+
 def _leaves(hint):
     args = typing.get_args(hint)
     if not args:
@@ -244,6 +300,23 @@ class TestEagleBinding(CustomTestCase):
             backend.token_to_kv_pool.k[3] = torch.zeros(4, 2)
             with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
                 binding.assert_live()
+
+    def test_a_graph_variant_selects_on_a_lone_requests_committed_kv_length(self):
+        """select picks a captured graph from host state alone: init_new hands it a
+        one-request batch's committed KV length, which the KV its step reads never
+        falls below (seq_lens may run a verify ahead), and nothing for several."""
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+        override = get_context().override_server_args(device="cpu")
+        override.install()
+        self.addCleanup(override.restore)
+        for committed, seq_lens, bound in (
+            ([70000], [70007], 70000),
+            ([70000, 5], [70007, 12], None),
+        ):
+            with self.subTest(committed=committed):
+                forward_batch = _decode_forward_batch(committed, seq_lens)
+                self.assertEqual(forward_batch.attention_kv_len_lower_bound, bound)
 
     def test_entry_structs_carry_data_only(self):
         structs = {

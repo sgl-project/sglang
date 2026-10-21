@@ -50,16 +50,20 @@ TOLERATED_CALLABLES = (
 )
 # Written into SGLang's objects beyond the pools and the entries' outputs.
 TOLERATED_WRITES = ()
-# Read, tolerated: configuration, and the covered forward's own arguments.
+# Read, tolerated: configuration, the covered forward's own arguments, and the host
+# state a graph variant's select (spec.BuiltMegakernel) picks on.
 TOLERATED_READS = (
     "runtime_context getters (get_parallel, get_exec, get_spec, get_platform)",
-    "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
+    "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph, "
+    "get_capture_attention_variant)",
     "ForwardBatch.batch_size",
     "ForwardBatch.forward_mode",
     "ForwardBatch.out_cache_loc",
     "ForwardBatch.req_pool_indices",
     "ForwardBatch.seq_lens",
     "ForwardBatch.mrope_positions",
+    "ForwardBatch.seq_lens_cpu",
+    "ForwardBatch.attention_kv_len_lower_bound",
 )
 
 

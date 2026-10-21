@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.megakernels.runtime import megakernel_graph_variants
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -143,7 +144,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []  # disables patch_model torch.compile wrapping
         self.enable_pdmux = False
         self.record_nolora_graph = False
-        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -277,13 +277,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
-        # the batch sizes whose graphs run the draft megakernel's draft_loop
+        # the batch sizes whose graphs run the draft megakernel's draft_loop, captured
+        # once per label of the graph variants it offers this runner
         self.megakernel = eagle_worker.megakernel
         self.megakernel_served = (
             frozenset()
             if self.megakernel is None
             else self.megakernel.bind_draft_graphs(self)
         )
+        self.attention_graph_variants = megakernel_graph_variants(
+            model_runner.model, "draft_loop", batch_sizes=self.megakernel_served
+        )
+        self.attention_variant_sizes = self.megakernel_served
 
         self.backend = resolve_decode_backend(self)
 
@@ -316,9 +321,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, attention_variant=None
+    ):
         # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
-        return ShapeKey(size=bs, variant_label=variant_label)
+        return ShapeKey(
+            size=bs, variant_label=variant_label, attention_variant=attention_variant
+        )
 
     def _sampling_variant(self, forward_batch: ForwardBatch) -> Optional[str]:
         # Under rejection sampling an all-greedy batch replays the graph that
@@ -358,6 +367,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 self._make_graph_key(
                     cuda_graph_bs,
                     variant_label=self._sampling_variant(forward_batch),
+                    attention_variant=self._resolve_attention_variant(
+                        forward_batch, cuda_graph_bs
+                    ),
                 ),
             )
             if self.disable_padding
@@ -552,7 +564,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             for variant in variants:
                 sampling_info.is_all_greedy = variant == _GREEDY_VARIANT
                 self.backend.capture_one(
-                    self._make_graph_key(num_seqs, variant_label=variant),
+                    self._make_graph_key(
+                        num_seqs,
+                        variant_label=variant,
+                        attention_variant=attention_variant,
+                    ),
                     run_once,
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
@@ -739,7 +755,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Replay via backend
         shape_key = self._make_graph_key(
-            bs, variant_label=self._sampling_variant(forward_batch)
+            bs,
+            variant_label=self._sampling_variant(forward_batch),
+            attention_variant=self._resolve_attention_variant(forward_batch, bs),
         )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft"):
             out = self._replay_graph(shape_key, forward_batch)

@@ -15,6 +15,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.megakernels.runtime import megakernel_graph_variants
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -138,7 +139,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.compile_bs = []
         self.enable_pdmux = False
         self.record_nolora_graph = False
-        self.attention_graph_variants = None
         self.is_dllm = False
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -295,13 +295,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # shape [max_bs]. Sharing by field name and shape would alias those
         # width-specific indices and can make a narrower graph gather OOB.
         self.buffers.share_buffers(exclude={"select_index"})
-        # the batch sizes whose graphs run the draft megakernel's draft_extend
+        # the batch sizes whose graphs run the draft megakernel's draft_extend,
+        # captured once per label of the graph variants it offers this runner
         self.megakernel = self.eagle_worker.megakernel
         self.megakernel_served = (
             frozenset()
             if self.megakernel is None
             else self.megakernel.bind_extend_graphs(self)
         )
+        self.attention_graph_variants = megakernel_graph_variants(
+            model_runner.model, "draft_extend", batch_sizes=self.megakernel_served
+        )
+        self.attention_variant_sizes = self.megakernel_served
 
         self.backend = resolve_decode_backend(self)
 
@@ -320,8 +325,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
-        return ShapeKey(size=bs)
+    def _make_graph_key(
+        self, bs, stream_idx=None, variant_label=None, attention_variant=None
+    ):
+        return ShapeKey(size=bs, attention_variant=attention_variant)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -342,7 +349,15 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             cuda_graph_bs = forward_batch.seq_lens.numel()
 
         is_bs_supported = (
-            self.backend.can_run(forward_batch, self._make_graph_key(cuda_graph_bs))
+            self.backend.can_run(
+                forward_batch,
+                self._make_graph_key(
+                    cuda_graph_bs,
+                    attention_variant=self._resolve_attention_variant(
+                        forward_batch, cuda_graph_bs
+                    ),
+                ),
+            )
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
@@ -507,7 +522,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 else contextlib.nullcontext()
             )
             with canary_ctx:
-                shape_key = self._make_graph_key(bs)
+                shape_key = self._make_graph_key(
+                    bs, attention_variant=attention_variant
+                )
                 post_warmup_hook = getattr(
                     self.draft_extend_attn_backend,
                     "on_after_cuda_graph_warmup",
@@ -683,7 +700,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.raw_bs = raw_bs
         self.bs = bs
-        shape_key = self._make_graph_key(bs)
+        shape_key = self._make_graph_key(
+            bs, attention_variant=self._resolve_attention_variant(forward_batch, bs)
+        )
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 

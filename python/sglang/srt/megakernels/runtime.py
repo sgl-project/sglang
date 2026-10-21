@@ -7,7 +7,7 @@ import functools
 import importlib
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
 
 import msgspec
 import torch
@@ -19,6 +19,7 @@ from sglang.srt.megakernels.guards import deadline_s, device_isa
 from sglang.srt.megakernels.spec import (
     ENTRIES,
     FLAG,
+    GRAPH_VARIANT_RUNNERS,
     BuildContext,
     BuiltMegakernel,
     Feature,
@@ -39,6 +40,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
@@ -104,6 +106,20 @@ def install_megakernel(
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
     entries = _offered_entries(built)
     megakernel_agree(entries, what=f"entries {spec.name} offers")
+    # a runner captures one graph per label, so ranks offering others would hang
+    variants = _offered_graph_variants(built)
+    megakernel_agree(
+        sorted((runner, tuple(v.capture_labels)) for runner, v in variants.items()),
+        what=f"graph variants {spec.name} offers",
+    )
+    _refuse(
+        [
+            f"graph_variants names {runner!r}, not a runner of "
+            f"{list(GRAPH_VARIANT_RUNNERS)}"
+            for runner in sorted(variants)
+            if runner not in GRAPH_VARIANT_RUNNERS
+        ]
+    )
     if spec.max_rows > 0 and not built.widths:
         _refuse([f"{spec.name} built no width of {list(context.widths)}"])
     # Captured kernels keep state derived from the weights that updates cannot refresh.
@@ -170,8 +186,51 @@ def megakernel_entry(model: torch.nn.Module, name: str) -> Optional[Callable]:
     return None if built is None else getattr(built, name, None)
 
 
+def megakernel_graph_variants(
+    model: torch.nn.Module, runner: str, *, batch_sizes: Collection[int]
+) -> Optional[AttentionGraphVariants]:
+    """The attention graph variants the model's built megakernel offers the graph runner
+    (spec.GRAPH_VARIANT_RUNNERS) for its graphs of batch_sizes, the ones that run the
+    megakernel; None when it offers none or batch_sizes is empty."""
+    assert runner in GRAPH_VARIANT_RUNNERS, runner
+    variants = _offered_graph_variants(built_megakernel(model)).get(runner)
+    if variants is None or not batch_sizes:
+        return None
+    logger.info(
+        "NVIDIA megakernel: the %s graphs of batch sizes %s capture the attention "
+        "variants %s",
+        runner,
+        sorted(batch_sizes),
+        list(variants.capture_labels),
+    )
+    return variants
+
+
+def megakernel_verify_variants(
+    model: torch.nn.Module, *, capture_bs: Collection[int], tokens_per_request: int
+) -> tuple[Optional[AttentionGraphVariants], Optional[frozenset[int]]]:
+    """A target's verify graph variants and the batch sizes that capture them, the ones
+    whose rows its megakernel built (plan covers no other); (None, None) if none."""
+    built = built_megakernel(model)
+    if built is None:
+        return None, None
+    sizes = frozenset(
+        bs for bs in capture_bs if bs * tokens_per_request in built.widths
+    )
+    variants = megakernel_graph_variants(model, "target_verify", batch_sizes=sizes)
+    return (None, None) if variants is None else (variants, sizes)
+
+
 def _offered_entries(built: BuiltMegakernel) -> tuple[str, ...]:
     return tuple(name for name in ENTRIES if getattr(built, name, None) is not None)
+
+
+def _offered_graph_variants(
+    built: Optional[BuiltMegakernel],
+) -> Mapping[str, AttentionGraphVariants]:
+    # an optional member, as the entries are
+    offered = None if built is None else getattr(built, "graph_variants", None)
+    return offered or {}
 
 
 def _binding_class(architectures: Optional[list[str]]) -> type:

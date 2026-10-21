@@ -236,7 +236,14 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
         override.install()
         self.addCleanup(override.restore)
         batch = ScheduleBatch(
-            reqs=[SimpleNamespace(rid="one", lora_id=None, token_type_ids=None)],
+            reqs=[
+                SimpleNamespace(
+                    rid="one",
+                    lora_id=None,
+                    token_type_ids=None,
+                    kv=SimpleNamespace(kv_committed_len=64),
+                )
+            ],
             device="cpu",
             forward_mode=ForwardMode.EXTEND,
             input_ids=torch.tensor([3]),
