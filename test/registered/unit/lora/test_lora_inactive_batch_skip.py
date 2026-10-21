@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.lora.layers import BaseLayerWithLoRA
+from sglang.srt.lora.utils import kv_b_lora_correction
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -36,6 +37,10 @@ def _layer(active, *, skip_dense, set_lora=True, batch=True, backend_name="trito
     return _Layer(set_lora=set_lora, lora_backend=backend)
 
 
+def _attn(layer):
+    return SimpleNamespace(kv_b_proj=layer)
+
+
 @pytest.fixture
 def capture(monkeypatch):
     def set_state(capturing, variant=None):
@@ -61,6 +66,23 @@ def test_capture_keeps_lora_except_for_the_nolora_variant(capture, variant, expe
     capture(True, variant)
     layer = _layer(False, skip_dense=True)
     assert layer.lora_active is expected
+    # The kv_b correction shares the capture boundary.
+    assert kv_b_lora_correction(_attn(layer)) == ("v2" if expected else None)
+
+
+def test_kv_b_correction_runs_v2_legacy_or_nothing(capture):
+    capture(False)
+    assert kv_b_lora_correction(_attn(_layer(True, skip_dense=True))) == "v2"
+    # An inactive triton_v2 batch runs neither correction: the legacy one
+    # cannot read the v2 batch info.
+    assert kv_b_lora_correction(_attn(_layer(False, skip_dense=True))) is None
+    legacy = dict(skip_dense=False, backend_name="triton")
+    assert kv_b_lora_correction(_attn(_layer(True, **legacy))) == "legacy"
+    assert kv_b_lora_correction(_attn(_layer(False, **legacy))) == "legacy"
+    assert (
+        kv_b_lora_correction(_attn(_layer(True, skip_dense=True, set_lora=False)))
+        is None
+    )
 
 
 if __name__ == "__main__":
