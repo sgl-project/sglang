@@ -99,7 +99,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             side_effect=lambda **_: physical_available
         )
 
-        def pre_alloc(_req):
+        def pre_alloc(_req, **_kwargs):
             nonlocal physical_available
             self.assertGreaterEqual(physical_available, physical_tokens_per_req)
             physical_available -= physical_tokens_per_req
