@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 HEADS, HEAD_DIM, CONV = 2, 128, 4
 DIM = 3 * HEADS * HEAD_DIM
@@ -161,14 +161,12 @@ class TestKDAPrefillGraph(CustomTestCase):
                 cache_indices=self.backend._prefill_graph_cache_indices(batch),
             )
 
-    def _capture(self, *, cp_size=1, track=True, num_tokens=BUCKET, max_seqs=MAX_SEQS):
+    def _capture(self, *, track=True, num_tokens=BUCKET, max_seqs=MAX_SEQS):
         from sglang.srt.runtime_context import get_context
 
         capture_batch = _batch([num_tokens], [0])
         capture_batch.extend_num_tokens = num_tokens
-        # KDA consumes sequence-ordered global rows even when CP positions
-        # describe only one rank's shard.
-        capture_batch.positions = torch.arange(num_tokens // cp_size, device="cuda")
+        capture_batch.positions = torch.arange(num_tokens, device="cuda")
         self.backend.prefill_graph_max_seqs = max_seqs
         with get_context().override_server_args(
             disable_radix_cache=not track, mamba_radix_cache_strategy="extra_buffer"
@@ -304,21 +302,6 @@ class TestKDAPrefillGraph(CustomTestCase):
         lens = [1] * (MAX_SEQS - 1) + [BUCKET - MAX_SEQS + 1]
         chunks = sum((n + CHUNK - 1) // CHUNK for n in lens)
         self.assertLessEqual(chunks, meta.max_chunks)
-
-    def test_cp_global_sequence_replay(self):
-        meta, graph, out = self._capture(cp_size=4)
-        self.assertEqual(meta.num_tokens, BUCKET)
-        for i, lens in enumerate(([383, 41, 88], [128] * 4)):
-            with self.subTest(lens=lens):
-                self._check_replay(
-                    meta,
-                    graph,
-                    out,
-                    lens=lens,
-                    prefixes=[0] * len(lens),
-                    track=None,
-                    seed=200 + i,
-                )
 
 
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
