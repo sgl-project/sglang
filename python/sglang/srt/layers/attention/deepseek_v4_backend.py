@@ -3282,7 +3282,9 @@ class DeepseekV4AttnBackend(
         if (
             forward_batch.forward_mode.is_extend()
             and not in_prefill_graph
-            and getattr(meta, "late_layer_tail", None) is None
+            and not (
+                isinstance(meta, DSV4Metadata) and meta.late_layer_tail is not None
+            )
             and forward_batch.extend_seq_lens_cpu is not None
             and x.shape[0] == positions.shape[0]
         ):
