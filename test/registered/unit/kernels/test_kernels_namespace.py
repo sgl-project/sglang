@@ -109,19 +109,27 @@ def test_capability_is_satisfied_by(req, plat, ok):
 
 
 @pytest.mark.parametrize(
-    "musa_version, available, expected_device",
-    [("4.0", True, "musa"), (None, True, "cuda"), ("4.0", False, "cpu")],
+    "musa_version, cuda_available, musa_available, expected_device",
+    [
+        ("4.0", True, None, "musa"),
+        (None, True, None, "cuda"),
+        ("4.0", False, None, "cpu"),
+        ("4.0", False, True, "musa"),
+    ],
 )
 def test_platform_detection_distinguishes_musa_cuda_alias(
-    monkeypatch, musa_version, available, expected_device
+    monkeypatch, musa_version, cuda_available, musa_available, expected_device
 ):
+    """Native MUSA remains eligible before the CUDA compatibility alias is ready."""
     torch = SimpleNamespace(
         version=SimpleNamespace(hip=None, musa=musa_version),
         cuda=SimpleNamespace(
-            is_available=lambda: available,
+            is_available=lambda: cuda_available,
             get_device_capability=lambda: (9, 0),
         ),
     )
+    if musa_available is not None:
+        torch.musa = SimpleNamespace(is_available=lambda: musa_available)
     monkeypatch.setitem(sys.modules, "torch", torch)
     assert PlatformInfo.detect().device_type == expected_device
 
