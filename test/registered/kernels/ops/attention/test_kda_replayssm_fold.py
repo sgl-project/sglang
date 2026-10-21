@@ -111,10 +111,10 @@ class TestKDAReplaySSMFoldParity(CustomTestCase):
         ckpt = torch.zeros(num_slots, HV, V, K, device=dev, dtype=torch.float32)
         for j in range(B):
             s = slots[j].item()
-            rawv[s, :, :T] = v[j].transpose(0, 1)
-            rawk[s, :, :T] = k[j].transpose(0, 1)
-            gkr[s, :, :T] = gk[j].transpose(0, 1)
-            betar[s, :, :T] = beta[j].transpose(0, 1)
+            rawv[j, :, :T] = v[j].transpose(0, 1)
+            rawk[j, :, :T] = k[j].transpose(0, 1)
+            gkr[j, :, :T] = gk[j].transpose(0, 1)
+            betar[j, :, :T] = beta[j].transpose(0, 1)
             ckpt[s] = h0[j]
         acc = torch.full((B,), accept, device=dev, dtype=torch.int32)
         commit_kda_replayssm_spec(

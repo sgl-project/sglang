@@ -1547,7 +1547,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool = self.linear_attn_backend.req_to_token_pool
         mamba_caches = req_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
+        # ReplaySSM-KDA: the accepted drafts live in the per-request ring (written
         # during verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
         # dspark/dflash call this method directly; the generic spec_utils commit

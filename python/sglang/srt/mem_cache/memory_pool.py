@@ -761,12 +761,10 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                # GDN speculative replay is request-lifetime scratch. Size it by
+                # Speculative replay is request-lifetime scratch. Size it by
                 # active requests instead of every persistent radix-cache slot.
                 num_slots = (
-                    spec_state_size + 1
-                    if enable_linear_replayssm_spec and not cache_params.is_kda
-                    else size + 1
+                    spec_state_size + 1 if enable_linear_replayssm_spec else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
                 # records follow the activation dtype; g stays fp32.

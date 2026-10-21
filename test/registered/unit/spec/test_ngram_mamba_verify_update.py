@@ -182,7 +182,7 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         for commit, module, fold_name in cases:
             with (
                 self.subTest(module=module),
-                patch(f"{module}.{fold_name}"),
+                patch(f"{module}.{fold_name}") as fold,
                 patch(
                     "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                     "fused_conv_window_scatter_with_mask"
@@ -199,6 +199,8 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
                 scatter.assert_called_once()
                 torch.testing.assert_close(scatter.call_args.args[4], source_rows)
+                if "kda" in module:
+                    self.assertIs(fold.call_args.kwargs["ring_indices"], source_rows)
 
     def test_circular_commit_reads_pp_request_rows(self):
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
