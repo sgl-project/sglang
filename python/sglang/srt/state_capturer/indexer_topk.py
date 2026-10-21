@@ -77,6 +77,22 @@ def maybe_capture_indexer_topk(
     return topk_indices
 
 
+def maybe_capture_shared_indexer_topk(
+    layer_id: int, topk_indices: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Reuse captured token positions; pass attention's KV-cache indices through."""
+    if topk_indices is None:
+        return None
+    if (cap := get_global_indexer_capturer()) is not None:
+        cap.capture(
+            layer_id=layer_id,
+            topk_indices=cap.device_cache.buffer[
+                : topk_indices.shape[0], layer_id - 1, :
+            ],
+        )
+    return topk_indices
+
+
 def extract_indexer_topk_from_meta_info(data):
     # Mirrors extract_routed_experts_from_meta_info: indices are returned as
     # base64-encoded int32 bytes. Caller reshapes to (seqlen-1, num_indexer_layers,

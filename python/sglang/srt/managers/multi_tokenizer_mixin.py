@@ -426,6 +426,8 @@ def _extract_field_by_indices(
     output: Any, field_name: str, indices: List[int], check_length: bool = True
 ) -> Any:
     field = object.__getattribute__(output, field_name)
+    if field_name == "indexer_topk_num_layers":
+        return field
     if field is None:
         return None
 

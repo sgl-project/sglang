@@ -63,7 +63,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
-    maybe_capture_indexer_topk,
+    maybe_capture_shared_indexer_topk,
 )
 from sglang.srt.utils import (
     BumpAllocator,
@@ -621,9 +621,7 @@ class DeepseekMLARocmForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    # skip_topk reuses prev layer's indices; mirror into this
-                    # layer's slot so the captured buffer matches what's used.
-                    topk_indices = maybe_capture_indexer_topk(
+                    topk_indices = maybe_capture_shared_indexer_topk(
                         self.layer_id, prev_topk_indices
                     )
                 current_stream.wait_stream(self.alt_stream)
@@ -648,7 +646,7 @@ class DeepseekMLARocmForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
-                        topk_indices = maybe_capture_indexer_topk(
+                        topk_indices = maybe_capture_shared_indexer_topk(
                             self.layer_id, prev_topk_indices
                         )
         else:
