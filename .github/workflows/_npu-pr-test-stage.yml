@@ -230,6 +230,23 @@ jobs:
             pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
             pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
 
+            # sgl_eval fetches the MMLU archive with its own httpx client: it
+            # ignores HF_ENDPOINT, has no progress output and no retries, so a
+            # blocked or slow mirror looks like a hang. Stage the pinned archive
+            # here through HF_ENDPOINT instead; the tests read it from
+            # SGL_EVAL_ARCHIVE_DIR, re-check the sha256 sgl_eval expects, and
+            # fall back to sgl_eval's own download when it is missing or stale.
+            SGL_EVAL_ARCHIVE_DIR=/tmp/sgl_eval_archives
+            mkdir -p "${SGL_EVAL_ARCHIVE_DIR}"
+            if hf download cais/mmlu --repo-type dataset --include data.tar \
+                 --local-dir "${SGL_EVAL_ARCHIVE_DIR}"; then
+              ls -lh "${SGL_EVAL_ARCHIVE_DIR}/data.tar"
+              sha256sum "${SGL_EVAL_ARCHIVE_DIR}/data.tar"
+            else
+              echo "::warning::MMLU archive prefetch failed; sgl_eval will download it itself"
+            fi
+            echo "SGL_EVAL_ARCHIVE_DIR=${SGL_EVAL_ARCHIVE_DIR}" >> "${GITHUB_ENV}"
+
             hf download MMMU/MMMU --repo-type dataset
           fi
 
