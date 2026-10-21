@@ -108,15 +108,6 @@ class BeamAttentionGateOp(BaseFusedOp):
         # Native compilation can remove the required intermediate rounding.
         return None
 
-    def forward_torch_compile(self, *args, **kwargs):
-        if self._compiled_native is None:
-            # Register and warm the opaque op before tracing its dispatch wrapper.
-            self.forward_triton(*args, **kwargs)
-            self._compiled_native = torch.compile(
-                self.forward_triton, options={"emulate_precision_casts": True}
-            )
-        return self._compiled_native(*args, **kwargs)
-
     def forward_native(
         self,
         attention_output: torch.Tensor,
@@ -139,9 +130,4 @@ class BeamAttentionGateOp(BaseFusedOp):
         gate_bias: torch.Tensor,
         head_dim: int,
     ) -> torch.Tensor:
-        if not attention_output.is_cuda or attention_output.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-        ):
-            return self.forward_native(attention_output, gate, gate_bias, head_dim)
         return fused_attention_gate(attention_output, gate, gate_bias, head_dim)
