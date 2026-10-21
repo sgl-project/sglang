@@ -93,8 +93,8 @@ class TestROPE(CustomTestCase):
                     is_neox_style,
                 )
                 atol = rtol = precision[q_ref.dtype]
-                torch.testing.assert_close(q_ref, q_clone, atol=atol, rtol=rtol)
-                torch.testing.assert_close(k_ref, k_clone, atol=atol, rtol=rtol)
+                torch.testing.assert_close(q_ref, q_sgl, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_ref, k_sgl, atol=atol, rtol=rtol)
 
     def test_deepseek_v2_rope(self):
         num_head = 16
