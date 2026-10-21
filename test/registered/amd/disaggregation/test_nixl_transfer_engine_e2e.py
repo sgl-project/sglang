@@ -8,6 +8,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    configure_nixl_pd_backend,
 )
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -68,15 +69,10 @@ class NixlTransferEngineBase(PDDisaggregationServerBase):
         os.environ["SGLANG_USE_AITER"] = "1"
 
         # The shared fixture defaults to Mooncake in CI; pin NIXL explicitly here.
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-
-        rdma_env = os.environ.get("SGLANG_TEST_RDMA_DEVICE")
-        if rdma_env:
-            cls.rdma_devices = ["--disaggregation-ib-device", rdma_env]
-            print(f"Found RDMA devices in env: {rdma_env}")
-        else:
-            print("SGLANG_TEST_RDMA_DEVICE is not set! Running without RDMA.")
-            cls.rdma_devices = []
+        # Don't pass --disaggregation-ib-device: NIXL turns it into a UCX
+        # NET_DEVICES list that replaces the fixture's UCX_NET_DEVICES and drops
+        # lo, and on these RoCE NICs NIXL's self-endpoint can only use tcp.
+        configure_nixl_pd_backend(cls)
 
         cls._shift_ports()
         cls.model = try_cached_model(
