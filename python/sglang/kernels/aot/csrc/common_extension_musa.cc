@@ -125,7 +125,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def(
       "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
-      "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, Tensor draft_probs, "
+      "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, "
       "float threshold_single, float threshold_acc, "
       "bool deterministic) -> ()");
   m.impl("tree_speculative_sampling_target_only", torch::kMUSA, &tree_speculative_sampling_target_only);
