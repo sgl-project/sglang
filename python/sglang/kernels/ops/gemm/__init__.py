@@ -387,9 +387,7 @@ register_kernel(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
-        capabilities=frozenset(
-            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
-        ),
+        capabilities=_SM90 | _SM12X,
     )
 )
 register_kernel(
@@ -439,6 +437,22 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))}
         ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_moe_mtp_mma",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:nvfp4_moe_mtp_mma",
+        capabilities=_SM120,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm120_nvfp4_moe",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.sm120_nvfp4_moe:try_nvfp4_moe",
+        capabilities=_SM120,
     )
 )
 register_kernel(

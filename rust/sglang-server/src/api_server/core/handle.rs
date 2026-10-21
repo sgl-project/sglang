@@ -986,7 +986,10 @@ mod tests {
     use crate::message::io_struct::GetInternalStateReq;
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
-    use crate::message::response::ChunkEvent;
+    use crate::message::response::{ChunkEvent, frame_health_ack};
+    use crate::runtime::Runnable;
+    use crate::tokenizer_manager::from_scheduler::Dispatcher;
+    use crate::tokenizer_manager::wiring::Senders;
 
     struct Harness {
         handle: CoreHandle,
@@ -1346,20 +1349,31 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
+    /// A busy scheduler skips the probe and acknowledges it after its next step.
+    /// The dispatcher counts the acknowledgement as scheduler output, so the
+    /// probe passes without any batch frame.
     #[tokio::test]
-    async fn healthy_probe_uses_shared_activity_and_cleans_up() {
+    async fn skipped_probe_passes_on_health_ack_and_cleans_up() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let activity: ActivityCounter = Default::default();
-        let handle = configured_handle(
-            intake_tx,
-            abort_tx,
-            8,
+        let (from_scheduler_tx, from_scheduler_rx) =
+            crate::tokenizer_manager::channel::from_scheduler(8);
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (_shutdown_tx, shutdown_rx) = flume::bounded(1);
+        let dispatcher = Dispatcher::new(
+            from_scheduler_rx,
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![detok_tx],
+            },
             activity.clone(),
-            true,
-            false,
-            Vec::new(),
+            shutdown_rx,
         );
+        let dispatcher = std::thread::spawn(move || dispatcher.run());
+        let handle = configured_handle(intake_tx, abort_tx, 8, activity, true, false, Vec::new());
         let probe_handle = handle.clone();
         let probe =
             tokio::spawn(async move { probe_handle.probe_health(Duration::from_secs(1)).await });
@@ -1371,7 +1385,7 @@ mod tests {
             !handle.abort(None),
             "internal probes must not enter the public abort-all registry"
         );
-        activity.fetch_add(1, Ordering::Relaxed);
+        assert!(from_scheduler_tx.push(frame_health_ack()));
 
         assert_eq!(probe.await.unwrap().unwrap(), HealthStatus::Healthy);
         assert!(matches!(
@@ -1379,6 +1393,12 @@ mod tests {
             AbortSource::Guard(aborted) if aborted == rid
         ));
         assert!(abort_rx.try_recv().is_err());
+        drop(from_scheduler_tx);
+        dispatcher.join().unwrap();
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "an acknowledgement routes nothing"
+        );
     }
 
     #[tokio::test]

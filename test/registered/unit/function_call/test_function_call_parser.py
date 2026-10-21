@@ -4049,6 +4049,33 @@ class TestJsonArrayParser(unittest.TestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
 
+    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
+        """Calls that arrive whole in the last chunk still stream their
+        arguments at stream end, exactly once."""
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
+            '{"name": "search", "parameters": {"query": "restaurants"}}]'
+        )
+        calls = self.detector.parse_streaming_increment(text, self.tools).calls
+        calls += self.detector.finish(self.tools).calls
+
+        streamed = {}
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {"name": "", "arguments": ""})
+            entry["name"] += call.name or ""
+            entry["arguments"] += call.parameters or ""
+        self.assertEqual(
+            [
+                (e["name"], json.loads(e["arguments"]))
+                for _, e in sorted(streamed.items())
+            ],
+            [
+                ("get_weather", {"location": "Tokyo"}),
+                ("search", {"query": "restaurants"}),
+            ],
+        )
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
+
     def test_braces_in_strings(self):
         """Test that JSON with } characters inside strings works correctly"""
         # Test case: JSON array with } inside string values - streamed across chunks
@@ -5212,7 +5239,7 @@ function call<|role_sep|>
         self.assertEqual(params["id"], "prefs")
 
 
-class TestGetStructureConstraint(unittest.TestCase):
+class TestGetStructureConstraint(CustomTestCase):
     """Tests for FunctionCallParser.get_structure_constraint() logic.
 
     Verifies that detectors supporting structural_tag use it for required/named
@@ -5243,6 +5270,26 @@ class TestGetStructureConstraint(unittest.TestCase):
 
     def _constraint_json(self, result):
         return result[1].model_dump_json()
+
+    def test_parallel_tool_call_defaults(self):
+        """Null must preserve the detector's default multi-call constraint."""
+        parser = self._make_parser("kimi_k3")
+        for choice in ("auto", "required"):
+            with self.subTest(choice=choice):
+                default = parser.get_structure_constraint(choice)
+                self.assertIsNotNone(default)
+                for value in (None, True):
+                    self.assertEqual(
+                        parser.get_structure_constraint(
+                            choice, parallel_tool_calls=value
+                        ),
+                        default,
+                    )
+                single = parser.get_structure_constraint(
+                    choice, parallel_tool_calls=False
+                )
+                self.assertIsNotNone(single)
+                self.assertNotEqual(single, default)
 
     # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
 
