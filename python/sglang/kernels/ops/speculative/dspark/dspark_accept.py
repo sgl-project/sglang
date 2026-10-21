@@ -431,7 +431,14 @@ def softmax_temp_flashinfer(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     ).contiguous()
     logits_2d = logits.to(torch.float32).contiguous()
-    return _flashinfer_softmax(logits=logits_2d, temperature=temp_per_row)
+    probs = _flashinfer_softmax(logits=logits_2d, temperature=temp_per_row)
+    # FlashInfer's softmax can slightly overshoot 1.0 (up to ~7e-6) on
+    # near-one-hot rows due to floating-point rounding in sum_exp.
+    # The reject-sampling accept kernel treats q > 1.0 as invalid and
+    # unconditionally rejects the drafted token, which collapses the
+    # spec-decode accept length for certain temperatures. Clamp back
+    # to the valid probability range.
+    return probs.clamp_(max=1.0)
 
 
 class MixedAcceptSelectResult(msgspec.Struct):
