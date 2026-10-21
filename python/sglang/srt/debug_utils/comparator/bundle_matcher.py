@@ -90,4 +90,3 @@ def _rows_to_tensor_infos(rows: list[dict[str, Any]]) -> list[TensorFileInfo]:
         TensorFileInfo(**{k: v for k, v in row.items() if k in tensor_info_fields})
         for row in rows
     ]
-
