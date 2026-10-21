@@ -571,8 +571,7 @@ For evaluation methods and datasets, see
 For benchmark methods and metric definitions, see
 [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing).
 
-The [GLM-5.3-Flash benchmark command](/docs/hardware-platforms/ascend-npus/best_practice/glm5_3_flash#benchmark)
-uses a generated shared-prefix workload with approximately 128K input tokens and 1K output tokens.
+For a generated shared-prefix benchmark workload, use approximately 128K input tokens and 1K output tokens.
 For mixed deployment, use the worker host and port 8810. For PD disaggregation, use the router host and port 8000.
 Set both `--model` and `--tokenizer` to the checkpoint path and use `--served-model-name GLM-5.3-Flash`.
 
@@ -580,9 +579,7 @@ Set both `--model` and `--tokenizer` to the checkpoint path and use `--served-mo
 
 ### Best practice configuration reference
 
-See [GLM-5.3-Flash Best Practices](/docs/hardware-platforms/ascend-npus/best_practice/glm5_3_flash)
-for the A3 W8A8 and A5 W8A8_MXFP8 PD disaggregation configurations, router startup, and benchmark command.
-The [Online service deployment](#online-service-deployment) section above also contains complete scripts for
+The [Online service deployment](#online-service-deployment) section above contains complete scripts for
 single-node mixed deployment and PD disaggregation.
 
 For the optimization feature catalog and compatibility details, see
