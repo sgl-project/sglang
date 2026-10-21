@@ -10,11 +10,12 @@ def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading
     cpu_seconds_total = Counter(
         name="sglang:process_cpu_seconds_total",
         documentation="Total CPU time consumed by this process (user + system)",
-        labelnames=["component"],
+        labelnames=["component", "pid"],
     )
 
     def monitor():
         process = psutil.Process()
+        cpu_seconds = cpu_seconds_total.labels(component=component, pid=process.pid)
         last_times = process.cpu_times()
 
         while True:
@@ -23,7 +24,7 @@ def start_cpu_monitor_thread(component: str, interval: float = 5.0) -> threading
             delta = (curr_times.user - last_times.user) + (
                 curr_times.system - last_times.system
             )
-            cpu_seconds_total.labels(component=component).inc(delta)
+            cpu_seconds.inc(delta)
             last_times = curr_times
 
     t = threading.Thread(target=monitor, daemon=True)

@@ -1,3 +1,7 @@
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -5,11 +9,12 @@ from collections import namedtuple
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=60, suite="base-a-test-cpu", nightly=True)
 
 
-class TestCpuMonitor(unittest.TestCase):
+class TestCpuMonitor(CustomTestCase):
     def test_cpu_monitor(self):
         from prometheus_client import REGISTRY
 
@@ -30,6 +35,7 @@ class TestCpuMonitor(unittest.TestCase):
                 if (
                     sample.name == "sglang:process_cpu_seconds_total"
                     and sample.labels.get("component") == "test"
+                    and sample.labels.get("pid") == str(os.getpid())
                 ):
                     value = sample.value
         print(f"sglang:process_cpu_seconds_total = {value}")
@@ -37,7 +43,80 @@ class TestCpuMonitor(unittest.TestCase):
         self.assertGreater(value, 0)
 
 
-class TestCpuMonitorMocked(unittest.TestCase):
+class TestCpuMonitorMultiprocess(CustomTestCase):
+    def test_workers_with_same_component_have_separate_cpu_totals(self):
+        from prometheus_client import CollectorRegistry, multiprocess
+
+        worker = """
+import os
+import time
+
+from prometheus_client import REGISTRY
+
+from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+
+def cpu_total():
+    for metric in REGISTRY.collect():
+        for sample in metric.samples:
+            if (sample.name == "sglang:process_cpu_seconds_total"
+                    and sample.labels.get("component") == "tokenizer"):
+                return sample.value
+    return None
+
+start_cpu_monitor_thread("tokenizer", interval=0.01)
+deadline = time.monotonic() + 10
+while cpu_total() is None:
+    assert time.monotonic() < deadline, "CPU monitor did not initialize"
+    time.sleep(0.01)
+target_cpu_time = time.process_time() + 0.1
+while time.process_time() < target_cpu_time:
+    sum(i * i for i in range(1000))
+deadline = time.monotonic() + 10
+while cpu_total() <= 0:
+    assert time.monotonic() < deadline, "CPU monitor did not sample CPU usage"
+    time.sleep(0.01)
+print(os.getpid())
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**os.environ, "PROMETHEUS_MULTIPROC_DIR": directory}
+            workers = [
+                subprocess.Popen(
+                    [sys.executable, "-c", worker],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            pids = set()
+            try:
+                for process in workers:
+                    stdout, stderr = process.communicate(timeout=60)
+                    self.assertEqual(process.returncode, 0, stderr)
+                    pids.add(stdout.strip().splitlines()[-1])
+
+                registry = CollectorRegistry()
+                multiprocess.MultiProcessCollector(registry, path=directory)
+                samples = [
+                    sample
+                    for metric in registry.collect()
+                    for sample in metric.samples
+                    if sample.name == "sglang:process_cpu_seconds_total"
+                    and sample.labels.get("component") == "tokenizer"
+                ]
+                self.assertEqual(len(samples), 2)
+                self.assertEqual({sample.labels["pid"] for sample in samples}, pids)
+                for sample in samples:
+                    self.assertGreater(sample.value, 0)
+            finally:
+                for process in workers:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
+
+
+class TestCpuMonitorMocked(CustomTestCase):
     """Fast, deterministic tests for start_cpu_monitor_thread using mocks."""
 
     @patch("prometheus_client.Counter")
@@ -51,6 +130,7 @@ class TestCpuMonitorMocked(unittest.TestCase):
 
         CpuTimes = namedtuple("CpuTimes", ["user", "system"])
         mock_process = MockProcess.return_value
+        mock_process.pid = 12345
         mock_process.cpu_times.side_effect = [
             CpuTimes(user=1.0, system=0.5),  # initial (L18)
             CpuTimes(user=2.5, system=1.0),  # iteration 1 (L22)
@@ -84,8 +164,10 @@ class TestCpuMonitorMocked(unittest.TestCase):
         # Sleep called with correct interval (L21)
         mock_sleep.assert_called_with(3.0)
 
-        # Counter labeled with component (L26)
-        MockCounter.return_value.labels.assert_called_with(component="my_component")
+        # Counter identifies the component and the monitored process.
+        MockCounter.return_value.labels.assert_called_once_with(
+            component="my_component", pid=12345
+        )
 
         # Delta calculation (L23-24) and counter increment (L26)
         inc_calls = mock_labeled.inc.call_args_list
