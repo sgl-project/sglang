@@ -1588,8 +1588,6 @@ class TestOffloadReadyEvents(CustomTestCase):
             return linker.record_offload_ready()
 
     def test_offload_waits_on_the_forward_writing_the_pages(self):
-        # Prefill read-done lets the scheduler's stream run ahead of the forward
-        # that fills a stashed chunk, so the offload waits on both streams.
         forward_stream = MagicMock(name="forward_stream")
         indices_ready, kv_written = self._record(forward_stream)
         indices_ready.record.assert_called_once_with()

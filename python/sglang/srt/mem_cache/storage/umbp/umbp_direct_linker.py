@@ -91,7 +91,7 @@ class _PoolRangePlan:
     entries_per_page: int
 
 
-# One queued offload: the pools it resolved to, and the events guarding its KV.
+# One queued offload: the pools it resolved to, and the events gating the read.
 _OffloadTask = tuple[list[PoolTransfer], list[object]]
 
 
