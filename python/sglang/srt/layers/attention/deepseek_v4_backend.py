@@ -4216,6 +4216,21 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
+            elif token_to_kv_pool.get_swa_key_layout().interleaved:
+                from sglang.kernels.ops.attention.dsv4 import flashmla_v41
+
+                o, _ = flashmla_v41.sparse_decode(
+                    q,
+                    swa_k_cache,
+                    swa_page_indices,
+                    self.softmax_scale,
+                    head_dim_v=self.head_dim_v,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_kv=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache

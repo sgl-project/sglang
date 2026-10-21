@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
@@ -78,7 +79,12 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
+        if swa_k_cache.shape[-1] == KVLayout.V41.bytes_per_token:
+            from sglang.kernels.ops.attention.dsv4.flashmla_v41 import (
+                mega_decode as flash_mla_mega_decode,
+            )
+        else:
+            from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
         data, scale, _ = flash_mla_mega_decode(
             q,

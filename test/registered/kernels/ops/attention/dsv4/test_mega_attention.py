@@ -3,8 +3,13 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from sgl_kernel.flash_mla_mega import flash_mla_mega_decode
 
+from sglang.kernels.ops.attention.dsv4.flashmla_v41 import (
+    is_available as flash_mla_v41_available,
+)
+from sglang.kernels.ops.attention.dsv4.flashmla_v41 import (
+    mega_decode as flash_mla_mega_decode,
+)
 from sglang.srt.layers.attention.deepseek_v4_mega_backend import (
     interleave_output_columns,
     interleave_query_rows,
@@ -41,8 +46,10 @@ def paged_view(raw, page_size, bytes_per_token):
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
-    "MegaAttention requires SM100/SM103",
+    torch.cuda.is_available()
+    and torch.cuda.get_device_capability()[0] == 10
+    and flash_mla_v41_available(),
+    "MegaAttention requires SM100/SM103 and the flashmla_v41 library",
 )
 class TestMegaAttention(CustomTestCase):
     def test_wq_b_permutation_matches_gemm_then_pack(self):

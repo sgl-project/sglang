@@ -16,8 +16,7 @@
 #endif
 
 // Paged fp8 / fp4 KV cache layouts read by the d_qk = 512 sparse MLA decode
-// kernels. A page block is `page_size` data rows followed by `page_size` scale
-// rows, so the scale region starts at byte `page_size * kDataBytes`:
+// kernels:
 //
 //   V4       584 B/token: 448 e4m3 + 64 bf16 (RoPE) data, 7 ue8m0 scales + 1 pad,
 //            one scale per 64 e4m3 values.
@@ -47,6 +46,7 @@ struct KVLayoutTraits<KVLayout::V4> {
   static constexpr int64_t kTileSize = 64;
   static constexpr int64_t kPageAlign = 576;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
+  static constexpr bool kInterleaved = false;
 };
 
 template <>
@@ -54,8 +54,9 @@ struct KVLayoutTraits<KVLayout::V41> {
   static constexpr int64_t kDataBytes = 512;
   static constexpr int64_t kScaleBytes = 16;
   static constexpr int64_t kTileSize = 32;
-  static constexpr int64_t kPageAlign = 512;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
+  static constexpr int64_t kPageAlign = kBytesPerToken;
+  static constexpr bool kInterleaved = true;
 };
 
 template <>
@@ -63,8 +64,9 @@ struct KVLayoutTraits<KVLayout::V41_FP4> {
   static constexpr int64_t kDataBytes = 256;
   static constexpr int64_t kScaleBytes = 32;
   static constexpr int64_t kTileSize = 16;
-  static constexpr int64_t kPageAlign = 256;
   static constexpr int64_t kBytesPerToken = kDataBytes + kScaleBytes;
+  static constexpr int64_t kPageAlign = kBytesPerToken;
+  static constexpr bool kInterleaved = true;
 };
 
 template <>
@@ -74,6 +76,7 @@ struct KVLayoutTraits<KVLayout::UNIFORM_FP8> {
   static constexpr int64_t kTileSize = 512;
   static constexpr int64_t kPageAlign = 512;
   static constexpr int64_t kBytesPerToken = kDataBytes;
+  static constexpr bool kInterleaved = false;
 };
 
 /// Bytes of one page block: `page_size` tokens, padded up to the reader's row stride.
@@ -83,14 +86,15 @@ constexpr int64_t kv_page_bytes(int64_t page_size) {
   return (page_size * Traits::kBytesPerToken + Traits::kPageAlign - 1) / Traits::kPageAlign * Traits::kPageAlign;
 }
 
-/// Addressing of a paged cache: `1 << kPageBits` data rows then as many scale rows, padded to kPageAlign.
 template <KVLayout kLayout, uint32_t kPageBits>
 struct PagedKV {
   using Traits = KVLayoutTraits<kLayout>;
   static constexpr int64_t kPageSize = int64_t{1} << kPageBits;
   static constexpr int64_t kPageBytes = kv_page_bytes<kLayout>(kPageSize);
+  static constexpr bool kInterleaved = Traits::kInterleaved;
   /// Byte offset of the scale rows inside a page.
   static constexpr int64_t kScaleBase = Traits::kDataBytes << kPageBits;
+  static_assert(!kInterleaved || kPageBytes == kPageSize * Traits::kBytesPerToken);
 
   template <typename LocT>
   static constexpr LocT page_of(LocT loc) {
@@ -103,11 +107,19 @@ struct PagedKV {
   /// Byte offsets of token `loc`'s data row and scale row from the cache base.
   template <typename LocT>
   static constexpr int64_t data_offset(LocT loc) {
-    return page_of(loc) * kPageBytes + slot_of(loc) * Traits::kDataBytes;
+    if constexpr (kInterleaved) {
+      return page_of(loc) * kPageBytes + slot_of(loc) * Traits::kBytesPerToken;
+    } else {
+      return page_of(loc) * kPageBytes + slot_of(loc) * Traits::kDataBytes;
+    }
   }
   template <typename LocT>
   static constexpr int64_t scale_offset(LocT loc) {
-    return page_of(loc) * kPageBytes + kScaleBase + slot_of(loc) * Traits::kScaleBytes;
+    if constexpr (kInterleaved) {
+      return data_offset(loc) + Traits::kDataBytes;
+    } else {
+      return page_of(loc) * kPageBytes + kScaleBase + slot_of(loc) * Traits::kScaleBytes;
+    }
   }
 
   struct Row {
@@ -118,7 +130,12 @@ struct PagedKV {
   template <typename LocT>
   SGL_DEVICE static Row row(uint8_t* cache, LocT loc) {
     uint8_t* page = cache + page_of(loc) * kPageBytes;
-    return {page + slot_of(loc) * Traits::kDataBytes, page + kScaleBase + slot_of(loc) * Traits::kScaleBytes};
+    if constexpr (kInterleaved) {
+      uint8_t* token = page + slot_of(loc) * Traits::kBytesPerToken;
+      return {token, token + Traits::kDataBytes};
+    } else {
+      return {page + slot_of(loc) * Traits::kDataBytes, page + kScaleBase + slot_of(loc) * Traits::kScaleBytes};
+    }
   }
 };
 

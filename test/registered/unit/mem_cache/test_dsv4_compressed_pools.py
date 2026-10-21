@@ -357,8 +357,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
         )
         for ratio in (4, 128):
             self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
-        # The 2-token c128 page is the only production page that pads.
-        self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
+        self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1056)
 
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's

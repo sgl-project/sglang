@@ -1,6 +1,5 @@
 """Paged fp8 / fp4 KV cache layouts of the DeepSeek-V4 family sparse MLA decode kernels.
 
-A page block stores ``page_size`` data rows followed by ``page_size`` scale rows.
 The reader selects the format from the bytes per token (the last dim of the
 ``(num_pages, page_size, 1, bytes_per_token)`` view) and requires the page
 stride to be a multiple of its TMA row stride, which :meth:`KVLayout.page_bytes`
@@ -56,12 +55,16 @@ class KVLayout(str, enum.Enum):
         return self.data_bytes + self.scale_bytes
 
     @property
+    def interleaved(self) -> bool:
+        return self in (KVLayout.V41, KVLayout.V41_FP4)
+
+    @property
     def page_align(self) -> int:
         """Unit the page stride is padded to: the reader's TMA row stride."""
         return {
             KVLayout.V4: 576,
-            KVLayout.V41: 512,
-            KVLayout.V41_FP4: 256,
+            KVLayout.V41: 528,
+            KVLayout.V41_FP4: 288,
             KVLayout.UNIFORM_FP8: 512,
         }[self]
 
@@ -75,7 +78,18 @@ class KVLayout(str, enum.Enum):
 
     def scale_offset(self, page_size: int) -> int:
         """Byte offset of the scale rows inside a page."""
+        assert not self.interleaved, f"{self} has no page scale region"
         return page_size * self.data_bytes
+
+    def token_data_offset(self, slot, page_size: int):
+        if self.interleaved:
+            return slot * self.bytes_per_token
+        return slot * self.data_bytes
+
+    def token_scale_offset(self, slot, page_size: int):
+        if self.interleaved:
+            return slot * self.bytes_per_token + self.data_bytes
+        return page_size * self.data_bytes + slot * self.scale_bytes
 
     @property
     def cpp_name(self) -> str:

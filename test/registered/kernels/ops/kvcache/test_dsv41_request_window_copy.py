@@ -20,11 +20,15 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 def reference(src, dst, source, target, page, layout):
     # Independent scalar row slicing also checks every untouched padding byte.
     result = dst.clone()
-    for s, d in zip(source.tolist(), target.tolist()):
-        for width, base in (
+    if layout.interleaved:
+        rows = ((layout.bytes_per_token, 0),)
+    else:
+        rows = (
             (layout.data_bytes, 0),
             (layout.scale_bytes, page * layout.data_bytes),
-        ):
+        )
+    for s, d in zip(source.tolist(), target.tolist()):
+        for width, base in rows:
             result[
                 d // page, base + d % page * width : base + (d % page + 1) * width
             ] = src[s // page, base + s % page * width : base + (s % page + 1) * width]

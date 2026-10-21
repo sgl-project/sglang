@@ -71,12 +71,10 @@ def token_rows(
     page, offset = locs // page_size, locs % page_size
     data_cols = torch.arange(layout.data_bytes, device=pages.device)
     scale_cols = torch.arange(layout.scale_bytes, device=pages.device)
-    data = pages[page[:, None], offset[:, None] * layout.data_bytes + data_cols]
+    slot = offset[:, None]
+    data = pages[page[:, None], layout.token_data_offset(slot, page_size) + data_cols]
     scale = pages[
-        page[:, None],
-        layout.scale_offset(page_size)
-        + offset[:, None] * layout.scale_bytes
-        + scale_cols,
+        page[:, None], layout.token_scale_offset(slot, page_size) + scale_cols
     ]
     return data, scale
 
@@ -484,7 +482,15 @@ def bits(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int16)
 
 
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
+@unittest.skipUnless(
+    (is_hip() and is_gfx95_supported())
+    or (
+        not is_hip()
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] >= 10
+    ),
+    "requires gfx950 or SM100+",
+)
 class TestV41KVDequant(CustomTestCase):
     def _gather_ref(self, dequant, pages, page_size, ids):
         return dequant(pages, page_size).view(-1, 512)[ids.long()].unsqueeze(1)
@@ -558,12 +564,13 @@ class TestV41KVDequant(CustomTestCase):
                     device="cuda",
                 )
                 if layout is KVLayout.V41:
-                    lo = layout.scale_offset(page_size)
-                    hi = lo + page_size * layout.scale_bytes
-                    pages[:, lo:hi] = torch.randint(
+                    tokens = pages[:, : page_size * layout.bytes_per_token].view(
+                        num_pages, page_size, layout.bytes_per_token
+                    )
+                    tokens[..., layout.data_bytes :] = torch.randint(
                         100,
                         140,
-                        (num_pages, hi - lo),
+                        (num_pages, page_size, layout.scale_bytes),
                         generator=g,
                         dtype=torch.uint8,
                         device="cuda",
