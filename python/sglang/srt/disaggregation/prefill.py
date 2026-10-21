@@ -1446,6 +1446,14 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             else:
+                if get_parallel().pp_size > 1:
+                    # Under PP this chunk's forward may still be running here, and
+                    # with SGLANG_PP_COMM_OVERLAP, --pp-async-batch-depth > 0 or
+                    # SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM nothing orders the KV
+                    # read after it. The transfer worker waits on this event first.
+                    ev = self.device_module.Event()
+                    ev.record(self.forward_stream)
+                    req.disagg_kv_sender._early_send_wait_event = ev
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
