@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
+    FailedSessionProbe,
     KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVSender,
@@ -160,6 +161,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.failure_lock = threading.Lock()
                     manager.failed_sessions = set()
                     manager.session_failures = defaultdict(int)
+                    manager.failed_session_probes = {}
                     manager.state_layout_rejections = {}
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
@@ -369,6 +371,11 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 2})
+        manager.failed_session_probes = {
+            "decode": FailedSessionProbe(
+                last_requested=0.0, next_probe_at=0.0, interval=300.0
+            )
+        }
         manager.state_layout_rejections = {}
         manager.state_strides_validated = set()
         manager.decode_kv_args_table = {}
@@ -391,6 +398,7 @@ class TestDisaggregationWire(unittest.TestCase):
         # A transport blacklist is cleared by registering, as before.
         self.assertFalse(manager.failed_sessions)
         self.assertFalse(manager.session_failures)
+        self.assertFalse(manager.failed_session_probes)
 
         bad, mismatch = register(64)
         self.assertIn("item length mismatch", mismatch)
@@ -476,6 +484,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.failure_lock = threading.Lock()
         manager.failed_sessions = set()
         manager.session_failures = defaultdict(int)
+        manager.failed_session_probes = {}
         manager.failure_records = {}
         manager._staging_outstanding = defaultdict(int)
         manager.request_status = {42: KVPoll.Transferring}
@@ -526,8 +535,12 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 1})
+        manager.failed_session_probes = {}
         reason = f"{StateType.SWA} item length mismatch for positional entry 0"
         manager.state_layout_rejections = {"decode": reason}
+        manager.failed_session_probe_interval = 30.0
+        manager.failed_session_probe_max_interval = 300.0
+        manager.failed_session_idle_timeout = 600.0
         manager.engine = SimpleNamespace(send_probe=Mock(return_value=0))
 
         manager._run_one_probe_pass()
