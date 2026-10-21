@@ -35,10 +35,10 @@ MOONCAKE_ENV = {
 
 
 class TestBeam10B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
-    gsm8k_accuracy_thres = 0.93
-    gsm8k_accept_length_thres = 3.0
-    accept_length_thres = 3.0
-    bs_1_speed_thres = 200
+    gsm8k_accuracy_thres = 0.94
+    gsm8k_accept_length_thres = 4.0
+    accept_length_thres = 4.4
+    bs_1_speed_thres = 600
     prefill_tp_size = 4
     decode_tp_size = 4
     # CUDA_VISIBLE_DEVICES remaps decode GPUs 4-7 to local ordinals 0-3.
