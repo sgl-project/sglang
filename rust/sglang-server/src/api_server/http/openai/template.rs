@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use serde_json::Value;
-use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, RenderedPrompt, TextInput};
+use sglang_processor::dynamo_renderer::deepseek::common::tokens;
+use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
 
 pub use sglang_processor::ChatFormatter;
 use sglang_processor::TemplateError;
@@ -15,15 +16,31 @@ use sglang_processor::TemplateError;
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
-/// Render a chat request to the prompt text the tokenizer pool encodes.
-/// Formatters with an SGLang request path render the raw `body`, joining the
-/// `continue_final_message` prefix onto the prompt; the rest render `request`.
+/// A rendered chat prompt and the `continue_final_message` text after it.
+pub(super) struct RenderedChat {
+    /// The template output, ending where generation would start without a
+    /// continuation (e.g. an opening `<think>`).
+    pub(super) prompt: String,
+    pub(super) continuation: String,
+}
+
+impl RenderedChat {
+    /// The text the tokenizer pool encodes.
+    pub(super) fn into_text(self) -> String {
+        self.prompt + &self.continuation
+    }
+}
+
+/// Render a chat request for the tokenizer pool.
+/// Formatters with an SGLang request path render the raw `body` and return the
+/// `continue_final_message` prefix separately; the rest render `request`, and
+/// their templates fold any continuation into the prompt.
 pub(super) fn render_chat(
     formatter: &ChatFormatter,
     body: &Value,
     request: &CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
-) -> Result<String, TemplateError> {
+) -> Result<RenderedChat, TemplateError> {
     match formatter {
         ChatFormatter::DeepSeekV4(_)
         | ChatFormatter::DeepSeekV41
@@ -31,12 +48,27 @@ pub(super) fn render_chat(
         | ChatFormatter::KimiK3
         | ChatFormatter::Qwen38 { .. } => {
             // The server has no `--default-chat-template-kwargs`.
-            let (prompt, prefix) = formatter.render_request(body.clone(), &HashMap::new())?;
-            Ok(prompt.into_text() + &prefix)
+            let (prompt, mut continuation) =
+                formatter.render_request(body.clone(), &HashMap::new())?;
+            // SGLang tokenizes the DeepSeek-V4 prefix on its own and drops its leading BOS.
+            if matches!(
+                formatter,
+                ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41
+            ) && let Some(rest) = continuation.strip_prefix(tokens::BOS)
+            {
+                continuation = rest.to_owned();
+            }
+            Ok(RenderedChat {
+                prompt: prompt.into_text(),
+                continuation,
+            })
         }
         _ => formatter
             .render_prompt(&TemplateRequest { request, kwargs })
-            .map(RenderedPrompt::into_text),
+            .map(|prompt| RenderedChat {
+                prompt: prompt.into_text(),
+                continuation: String::new(),
+            }),
     }
 }
 

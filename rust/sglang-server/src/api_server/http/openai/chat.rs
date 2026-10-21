@@ -33,7 +33,7 @@ use sglang_processor::{
 
 use super::completions::completion_usage;
 use super::pd_routing::PDRoutingFields;
-use super::template::render_chat;
+use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
@@ -151,7 +151,7 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) =
+    let (request, rendered) =
         match prepare_chat_request(&state, &body, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
@@ -197,8 +197,9 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &prompt);
-    let mut prompt = Some(prompt);
+    // A continuation inside an open think block is still reasoning.
+    let starts_in_reasoning = starts_in_reasoning(reasoning_parser.as_deref(), &rendered.prompt);
+    let mut prompt = Some(rendered.into_text());
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
         let choice_prompt = if index + 1 == choices_per_prompt {
@@ -281,7 +282,7 @@ pub(super) async fn prepare_chat_request(
     body: &Value,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
+) -> Result<(CreateChatCompletionRequest, RenderedChat), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -294,14 +295,14 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = render_chat(&formatter, body, &request, kwargs).map_err(|error| {
+    let rendered = render_chat(&formatter, body, &request, kwargs).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
             false,
         )
     })?;
-    Ok((request, prompt))
+    Ok((request, rendered))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
@@ -905,6 +906,52 @@ mod tests {
             "<｜Assistant｜><think>"
         ));
         assert!(!starts_in_reasoning(None, "<think>\n"));
+    }
+
+    fn render_dsv41(body: serde_json::Value) -> super::super::template::RenderedChat {
+        let request = serde_json::from_value(body.clone()).unwrap();
+        super::super::template::render_chat(
+            &super::super::ChatFormatter::DeepSeekV41,
+            &body,
+            &request,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Continuing an assistant turn inside an open think block still starts in
+    /// reasoning, as on Python, whose split follows the request's thinking flag.
+    #[test]
+    fn continuation_inside_think_starts_in_reasoning() {
+        let rendered = render_dsv41(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "What is 17*23?"},
+                {"role": "assistant", "content": "Let me compute: 17*20"}
+            ],
+            "continue_final_message": true,
+            "chat_template_kwargs": {"thinking": true}
+        }));
+        assert_eq!(rendered.continuation, "Let me compute: 17*20");
+        assert!(starts_in_reasoning(Some("deepseek-v41"), &rendered.prompt));
+    }
+
+    /// A DeepSeek-V4 continuation drops its leading BOS, as SGLang's separate
+    /// prefix tokenization does.
+    #[test]
+    fn deepseek_v4_continuation_drops_leading_bos() {
+        let rendered = render_dsv41(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "<｜begin▁of▁sentence｜>abc"}
+            ],
+            "continue_final_message": true
+        }));
+        assert_eq!(
+            rendered.into_text(),
+            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>abc"
+        );
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

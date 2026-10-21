@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use super::chat::ChatRequest;
-use super::template::render_chat;
+use super::template::{RenderedChat, render_chat};
 use super::{AppState, contains_media};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -177,6 +177,7 @@ fn render_chat_prompt(
         return Err((BAD_REQUEST, "this model has no usable chat template".into()));
     };
     render_chat(formatter, &body, &request, chat_template_kwargs.as_ref())
+        .map(RenderedChat::into_text)
         .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))
 }
 
