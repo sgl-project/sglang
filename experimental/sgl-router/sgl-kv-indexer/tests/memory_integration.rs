@@ -611,6 +611,52 @@ fn report(worker: &str, addr: &str, seq: u64, hs: &[i64]) -> ApplyExternalKvBatc
     )
 }
 
+/// A revoke batch that names a child before its parent must not leave the child
+/// marked prefix-complete under an incomplete parent: the fast path would then
+/// hand the Router a prefix the worker cannot serve. The default path is the
+/// reference for what it can. Blocks 1 and 2 stay held on DRAM, 3 is HBM-only,
+/// 4 is held on both; revoking HBM child-first (4 before 3) is the trigger.
+#[tokio::test]
+async fn prefix_fast_path_recomputes_children_after_parents_on_revoke() {
+    let (backend, reference) = shared_state_pair();
+    backend
+        .apply_external_kv_batch(report("w0", "http://w0", 1, &[1, 2, 3, 4]))
+        .await
+        .unwrap();
+    backend
+        .apply_external_kv_batch(apply_req(
+            "w0",
+            "http://w0",
+            2,
+            vec![
+                action(ExternalKvActionType::ActionReport, dram(), &[1, 2]),
+                action_with_parent(ExternalKvActionType::ActionReport, dram(), Some(3), &[4]),
+            ],
+        ))
+        .await
+        .unwrap();
+    backend
+        .apply_external_kv_batch(apply_req(
+            "w0",
+            "http://w0",
+            3,
+            vec![action(ExternalKvActionType::ActionRevoke, hbm(), &[4, 3])],
+        ))
+        .await
+        .unwrap();
+
+    let fast = backend
+        .match_external_kv_prefix(prefix_req(&[1, 2, 3, 4]))
+        .await
+        .unwrap();
+    let default = reference
+        .match_external_kv_prefix(prefix_req(&[1, 2, 3, 4]))
+        .await
+        .unwrap();
+    assert_eq!(prefix_pairs(&default), vec![("w0".to_string(), 2)]);
+    assert_eq!(prefix_pairs(&fast), prefix_pairs(&default));
+}
+
 #[tokio::test]
 async fn prefix_fast_path_matches_default_impl() {
     let (fast, reference) = shared_state_pair();
