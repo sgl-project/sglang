@@ -1036,6 +1036,7 @@ class MqaAttentionBase(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
@@ -3006,6 +3007,10 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False),
         )
+
+        if _use_aiter:
+            # V4.1 runs its FP4 routed experts on MXFP8 activations
+            self.mlp.experts.fp8_activations = config.model_type == "deepseek_v41"
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
