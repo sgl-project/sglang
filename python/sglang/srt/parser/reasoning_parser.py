@@ -1124,15 +1124,8 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
 
 
 class _LlamaNemotronDetector(Nemotron3Detector):
-    """Llama-Nemotron (nvidia/Llama-3_3-Nemotron-Super-49B-v1,
-    Llama-3_1-Nemotron-Ultra-253B-v1) reuses the Nemotron <think> tokens, but
-    thinking is selected by a "detailed thinking on"/"off" system prompt and the
-    chat template never reads enable_thinking. Reasoning is therefore never
-    forced, not even when a request passes enable_thinking=True: that kwarg
-    cannot change what the model emits, so honoring it would file a
-    "detailed thinking off" answer as reasoning_content and return empty
-    content. Detection rests solely on the model opening <think> itself.
-    """
+    """Thinking follows the system prompt, so enable_thinking never forces
+    reasoning; detection rests on the model opening <think> itself."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
