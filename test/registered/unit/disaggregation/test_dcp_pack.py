@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -6,6 +7,10 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.common.dcp_pack import (
+    dcp_pack_buffer_bytes,
+    init_dcp_pack_buffers,
+)
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context
@@ -46,7 +51,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             return SimpleNamespace(get_ptr=lambda: 0x1000, get_size=lambda: size)
 
         with (
-            get_context().override_server_args(chunked_prefill_size=250),
+            get_context().override_server_args(chunked_prefill_size=250, device="cuda"),
             patch(
                 "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
                 return_value=(None, None),
@@ -121,6 +126,116 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 )
                 self.assertTrue(all(c.args[6] is None for c in calls[:-1]))
                 self.assertEqual(int(calls[-1].args[6][0][0]), 17)
+
+
+class TestDcpPackBufferBytes(CustomTestCase):
+    def test_sizes_fixed_regions_for_each_dcp_rank(self):
+        self.assertEqual(
+            dcp_pack_buffer_bytes(
+                [64 * 16, 64 * 16],
+                page_size=64,
+                max_tokens=10,
+                dcp_size=4,
+            ),
+            4 * 3 * (16 + 16),
+        )
+
+    def test_rejects_invalid_item_lens(self):
+        with self.assertRaisesRegex(ValueError, "at least one page"):
+            dcp_pack_buffer_bytes([0], page_size=64, max_tokens=8)
+        with self.assertRaisesRegex(ValueError, "page-aligned"):
+            dcp_pack_buffer_bytes([100], page_size=64, max_tokens=8)
+
+
+class TestInitDcpPackBuffers(CustomTestCase):
+    """The pack kernel is Triton-only: a non-CUDA device must get no buffers
+    (per-token fallback) rather than crash, and an indexed "cuda:N" device must
+    still get them, not silently fall back."""
+
+    _KV_ARGS = SimpleNamespace(
+        kv_item_lens=[64 * 16], page_size=64, num_draft_entries=0, gpu_id=3
+    )
+
+    def test_non_triton_device_gets_no_buffers(self):
+        register_fn = Mock()
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer"
+        ) as staging_buffer:
+            buffers = init_dcp_pack_buffers(
+                register_fn, self._KV_ARGS, 2, 4, 64, device_type="xpu"
+            )
+
+        self.assertEqual(buffers, [])
+        staging_buffer.assert_not_called()
+        register_fn.assert_not_called()
+
+    def test_cuda_buffers_use_the_bare_device_type_and_gpu_id(self):
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer"
+            ) as staging_buffer,
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
+                return_value=(None, None),
+            ),
+        ):
+            buffers = init_dcp_pack_buffers(
+                Mock(), self._KV_ARGS, 2, 4, 64, device_type="cuda:0"
+            )
+
+        self.assertEqual(len(buffers), 2)
+        self.assertEqual(staging_buffer.call_args.args[1], "cuda:3")
+
+
+class TestTryDcpPack(CustomTestCase):
+    def test_try_pack_uses_requested_region_and_dense_indices(self):
+        """A gather must fit its rank region even when the total buffer has space."""
+        dim = 4
+        kv = torch.arange(16 * dim, dtype=torch.float32).view(16, 1, dim)
+        item_len = int(kv[0].nbytes)
+        pack = torch.zeros(8 * item_len, dtype=torch.uint8)
+        gather_stream = Mock()
+        buf = type(
+            "Buf",
+            (),
+            {
+                "buffer": pack,
+                "fits": lambda self, n: n <= pack.numel(),
+                "get_ptr": lambda self: 0x1000,
+                "get_size": lambda self: pack.numel(),
+                "get_gather_stream": lambda self: gather_stream,
+                "producer_stream": lambda self: Mock(),
+            },
+        )()
+        src = np.array([1, 5, 9, 13], dtype=np.int64)
+        pack_offset = 4 * item_len
+        mgr = object.__new__(NixlKVManager)
+        mgr.kv_args = SimpleNamespace(kv_data_ptrs=[kv.data_ptr()], num_draft_entries=0)
+        dst = SimpleNamespace(
+            dst_dcp_rank=1, dst_dcp_size=2, dcp_token_item_lens=[item_len]
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.copy_mla_rows_into_pack"
+            ) as copy_mock,
+        ):
+            packed = mgr._pack_dcp_rank_once(buf, dst, src, {})
+            dst.dst_dcp_size = 4
+            overflow = mgr._pack_dcp_rank_once(buf, dst, src, {})
+
+        self.assertIsNone(overflow)
+        gather_stream.synchronize.assert_called_once_with()
+        self.assertIsNotNone(packed)
+        ptrs, indices = packed
+        self.assertEqual(ptrs, [0x1000 + pack_offset])
+        np.testing.assert_array_equal(indices, np.arange(4))
+        pack_view = copy_mock.call_args.args[2]
+        self.assertEqual(pack_view.storage_offset(), pack_offset)
+        self.assertEqual(pack_view.numel(), src.size * item_len)
 
 
 if __name__ == "__main__":
