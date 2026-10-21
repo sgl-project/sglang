@@ -87,6 +87,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.request_headers import apply_session_id_header
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -557,6 +558,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
                     )
+                    if raw_request is not None:
+                        apply_session_id_header(adapted_request, raw_request.headers)
 
                     generator = self._generate_with_builtin_tools(
                         request.request_id,

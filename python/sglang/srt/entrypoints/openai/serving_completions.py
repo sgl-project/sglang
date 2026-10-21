@@ -31,6 +31,7 @@ from sglang.srt.entrypoints.openai.utils import (
     spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
+from sglang.srt.entrypoints.request_headers import apply_session_id_header
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
@@ -142,6 +143,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             images_config=getattr(request, "images_config", None),
             mm_processor_kwargs=request.mm_processor_kwargs,
         )
+        if raw_request is not None:
+            apply_session_id_header(adapted_request, raw_request.headers)
 
         return adapted_request, request
 
