@@ -124,6 +124,21 @@ class TestResolveComponents(CustomTestCase):
 
 
 class TestCoreAndCpuTiming(CustomTestCase):
+    def test_cost_feedback_requires_consecutive_matching_geometry(self):
+        samples = []
+        dumper, clock = make_dumper(
+            set(),
+            on_step=lambda obs, seconds: samples.append((obs.forward_ct, seconds)),
+        )
+        for step, bs in ((1, 4), (2, 4), (3, 3), (4, 3)):
+            dumper.observe_decode_step(make_obs(forward_ct=step, bs=bs))
+            clock.advance(0.02)
+        dumper.note_non_decode_step()
+        dumper.observe_decode_step(make_obs(forward_ct=6, bs=3))
+        self.assertEqual([step for step, _ in samples], [2, 4])
+        self.assertTrue(all(abs(seconds - 0.02) < 1e-6 for _, seconds in samples))
+        self.assertEqual(dumper.dump()["records"], [])
+
     def test_disabled_dumper_records_nothing(self):
         dumper, clock = make_dumper(set())
         dumper.begin_step()

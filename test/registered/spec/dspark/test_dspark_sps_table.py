@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.speculative.dspark_components.dspark_sps import (
+    OnlineCostCorrection,
     SpsAdditiveCostTable,
     SpsCostTable,
     build_uninitialized_sps_table,
@@ -14,6 +15,30 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestOnlineCostCorrection(CustomTestCase):
+    def test_cold_start_outliers_and_recovery(self):
+        correction = OnlineCostCorrection()
+        for _ in range(7):
+            correction.observe(
+                batch_tokens=10, baseline_seconds=0.01, actual_seconds=0.02
+            )
+        self.assertEqual(correction.seconds_per_token, 0.0)
+        correction.observe(batch_tokens=10, baseline_seconds=0.01, actual_seconds=0.02)
+        self.assertAlmostEqual(correction.seconds_per_token, 0.001)
+        correction.observe(batch_tokens=10, baseline_seconds=0.01, actual_seconds=0.9)
+        self.assertAlmostEqual(correction.seconds_per_token, 0.001)
+        for actual in (float("nan"), float("inf"), -1.0, 0.0, 2.0):
+            correction.observe(
+                batch_tokens=10, baseline_seconds=0.01, actual_seconds=actual
+            )
+        self.assertAlmostEqual(correction.seconds_per_token, 0.001)
+        for _ in range(64):
+            correction.observe(
+                batch_tokens=10, baseline_seconds=0.01, actual_seconds=0.005
+            )
+        self.assertEqual(correction.seconds_per_token, 0.0)
 
 
 def _make_table() -> SpsCostTable:

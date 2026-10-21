@@ -1,9 +1,37 @@
 from __future__ import annotations
 
 import bisect
+import math
+import statistics
+from collections import deque
 from typing import Optional
 
 import msgspec
+
+
+class OnlineCostCorrection:
+    """Bounded, robust residual against the immutable whole-step SPS table."""
+
+    def __init__(self) -> None:
+        self._residuals: deque[float] = deque(maxlen=64)
+        self.seconds_per_token = 0.0
+
+    def observe(
+        self, *, batch_tokens: int, baseline_seconds: float, actual_seconds: float
+    ) -> None:
+        if not (
+            batch_tokens > 0
+            and math.isfinite(baseline_seconds)
+            and baseline_seconds > 0
+            and math.isfinite(actual_seconds)
+            and 0 < actual_seconds <= 1.0
+        ):
+            return
+        self._residuals.append((actual_seconds - baseline_seconds) / batch_tokens)
+        if len(self._residuals) >= 8:
+            # ponytail: median scans 64 samples; use order statistics only if
+            # a measured scheduling bottleneck calls for a larger window.
+            self.seconds_per_token = max(0.0, statistics.median(self._residuals))
 
 
 def floor_probe_index(edges: list[int], batch_tokens: int) -> int:

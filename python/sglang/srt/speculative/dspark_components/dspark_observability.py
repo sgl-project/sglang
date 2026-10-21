@@ -167,6 +167,7 @@ class DsparkInfoDumper:
         max_records: int = INFO_DUMP_MAX_RECORDS,
         max_step_cpu_seconds: float = INFO_DUMP_MAX_STEP_CPU_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        on_step: Optional[Callable[[DecodeStepObservation, float], None]] = None,
     ) -> None:
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = int(verify_num_draft_tokens)
@@ -174,6 +175,7 @@ class DsparkInfoDumper:
         self.device = device
         self.mode_value = mode_value
         self._clock = clock
+        self._on_step = on_step
         self._max_step_cpu_seconds = max_step_cpu_seconds
 
         self._components: set[InfoComponent] = {
@@ -185,7 +187,7 @@ class DsparkInfoDumper:
         # Dedup within an attention-TP group only: records describe the
         # DP-rank-local batch, so under dp-attention every DP rank must keep
         # dumping (the SPS profiler reads one payload per DP rank).
-        self.enabled = bool(self._components) and self.attn_tp_rank == 0
+        self.enabled = bool(self._components or on_step) and self.attn_tp_rank == 0
         self._sps_window: list[tuple[float, float]] = []
         self._sps_mismatched = 0
 
@@ -235,6 +237,18 @@ class DsparkInfoDumper:
 
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
+        prev = self._pending
+        if (
+            self._on_step is not None
+            and step_cpu_ms is not None
+            and prev is not None
+            and obs.forward_ct == prev.forward_ct + 1
+            and (obs.bs, obs.num_verify_tokens, obs.verify_tokens_dp_synced)
+            == (prev.bs, prev.num_verify_tokens, prev.verify_tokens_dp_synced)
+        ):
+            # Match the SPS profiler's whole-step CPU boundary. Requiring
+            # stable geometry avoids assigning transition time to a new shape.
+            self._on_step(obs, step_cpu_ms * 1e-3)
         self._drain_pending()
 
         future = (
@@ -336,6 +350,8 @@ class DsparkInfoDumper:
         pending = self._pending
         self._pending = None
         if pending is None:
+            return
+        if not self._components:
             return
 
         record = DecodeStepRecord(forward_ct=pending.forward_ct)
@@ -757,6 +773,9 @@ class DsparkStepObservers:
             device=device,
             mode_value=planner.mode_value,
             sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
+            on_step=(
+                planner.observe_step_cost if planner.online_cost_enabled else None
+            ),
         )
         self._block_accept_recorder = create_block_accept_estimate_recorder(
             gamma=gamma, device=device, tp_rank=tp_rank
