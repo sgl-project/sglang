@@ -142,7 +142,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(deferred_draft_prefill_pool=None)
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
@@ -202,7 +202,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(deferred_draft_prefill_pool=None)
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
@@ -272,7 +272,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(deferred_draft_prefill_pool=None)
         scheduler.running_batch.reqs = []
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
@@ -391,7 +391,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.spec_algorithm.is_none.return_value = True
         queue._clean_hicache_prefetch_resources = MagicMock()
 
-        scheduler = MagicMock()
+        scheduler = MagicMock(deferred_draft_prefill_pool=None)
         scheduler.enable_decode_hicache = False
         scheduler.enable_hisparse = False
         scheduler.output_streamer = MagicMock()
@@ -506,7 +506,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.spec_algorithm = MagicMock()
         queue.spec_algorithm.is_none.return_value = True
         queue._clean_hicache_prefetch_resources = MagicMock()
-        queue.scheduler = MagicMock(enable_decode_hicache=False, enable_hisparse=False)
+        queue.scheduler = MagicMock(
+            enable_decode_hicache=False,
+            enable_hisparse=False,
+            deferred_draft_prefill_pool=None,
+        )
         queue.scheduler.metrics_reporter.enable_metrics = False
         mock_poll.return_value = [KVPoll.Failed]
 
@@ -643,7 +647,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
             queue._record_transfer_failure = MagicMock()
-            scheduler = MagicMock()
+            scheduler = MagicMock(deferred_draft_prefill_pool=None)
             scheduler.enable_decode_hicache = True
             scheduler.enable_hisparse = False
             scheduler.metrics_reporter.enable_metrics = False
