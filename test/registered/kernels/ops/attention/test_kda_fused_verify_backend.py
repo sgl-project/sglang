@@ -74,13 +74,13 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             ),
             intermediate_ssm=None,
             intermediate_conv_window=[randn(num_layers, batch_size, steps, 3, dim)],
-            replayssm_rawv=randn(num_layers, num_slots, v_heads, 16, head_dim),
-            replayssm_rawk=randn(num_layers, num_slots, heads, 16, head_dim),
+            replayssm_rawv=randn(num_layers, batch_size, v_heads, 16, head_dim),
+            replayssm_rawk=randn(num_layers, batch_size, heads, 16, head_dim),
             replayssm_g=randn(
-                num_layers, num_slots, v_heads, 16, head_dim, dtype=torch.float32
+                num_layers, batch_size, v_heads, 16, head_dim, dtype=torch.float32
             ),
             replayssm_beta=randn(
-                num_layers, num_slots, v_heads, 16, dtype=torch.float32
+                num_layers, batch_size, v_heads, 16, dtype=torch.float32
             ),
         )
         # Physical slots differ from scratch rows; reverse them to catch callers

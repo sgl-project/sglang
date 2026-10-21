@@ -447,6 +447,11 @@ def handle_linear_attn_backend(server_args: Any):
     # --linear-replayssm-cache-len window and folds via its own fused
     # verify ring-write + commit_kda_replayssm_after_verify.
     if cfg.enable_linear_replayssm_spec:
+        if cfg.speculative_algorithm is None:
+            raise ValueError(
+                "--enable-linear-replayssm-spec requires speculative decoding "
+                "(--speculative-algorithm): the ring is spec-verify-only scratch."
+            )
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires a linear draft chain "

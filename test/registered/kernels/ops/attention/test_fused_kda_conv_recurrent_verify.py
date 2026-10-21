@@ -176,6 +176,7 @@ def _run_reference(inp, B, T, H, HV, K, V, lower_bound, rings=None):
         replayssm_rawk=rings["rawk"] if rings is not None else None,
         replayssm_g=rings["g"] if rings is not None else None,
         replayssm_beta=rings["beta"] if rings is not None else None,
+        ring_indices=inp["inter_indices"] if rings is not None else None,
     )
     return o, conv, win, ic
 
@@ -247,7 +248,7 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
     if use_ring:
         # Full-tensor bitwise: ring values are elementwise (conv FMA chain,
         # gate, sigmoid), upstream of every tl.sum, so they are exact at any
-        # num_warps; the shared garbage init makes any out-of-slot or
+        # num_warps; the shared garbage init makes any out-of-row or
         # negative-slot scribble a mismatch.
         for name in ("rawv", "rawk", "g", "beta"):
             assert torch.equal(rings_ref[name], rings_fus[name]), name

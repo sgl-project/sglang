@@ -214,6 +214,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            ring_indices=intermediate_state_indices,
         )
 
     def extend(

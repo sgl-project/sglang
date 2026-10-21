@@ -73,6 +73,7 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
     if pad and bs > 1:
         slots[-1] = -1
     num_slots = bs + 1
+    ring_rows = torch.arange(bs - 1, -1, -1, device=DEV, dtype=torch.int32)
 
     h0_src = torch.zeros(num_slots, HV, V, K, device=DEV, dtype=torch.float32)
     for j in range(bs):
@@ -112,6 +113,7 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         replayssm_rawk=rawk,
         replayssm_g=gring,
         replayssm_beta=betar,
+        ring_indices=ring_rows,
     )
 
     acc = torch.full((bs,), T, device=DEV, dtype=torch.int32)
@@ -128,6 +130,7 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         num_k_heads=H,
         use_qk_l2norm_in_kernel=True,
         null_block_id=-1,
+        ring_indices=ring_rows,
     )
 
     for j in range(bs):

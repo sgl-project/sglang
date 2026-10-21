@@ -3058,8 +3058,8 @@ class KVCacheConfigurator:
         # no longer reserves the (1 + D/ratio) intermediate factor -- the whole
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
-        # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
-        # request scratch; KDA replay remains attached to each mamba slot.
+        # The ring is not part of mamba_cache_per_req. Replay is fixed-size
+        # request scratch.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
@@ -3073,18 +3073,14 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and self.hybrid_kda_config is None:
+        if replayssm_active:
             replay_req_slots = (
                 max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
             )
             replayssm_fixed_bytes = replayssm_ring_per_req * replay_req_slots
-            replayssm_ring_per_slot = 0
         else:
             replayssm_fixed_bytes = 0
-            replayssm_ring_per_slot = replayssm_ring_per_req
-        extra_per_slot = replayssm_ring_per_slot + int(
-            self.extra_mamba_cache_bytes_per_req * pp_layer_scale
-        )
+        extra_per_slot = int(self.extra_mamba_cache_bytes_per_req * pp_layer_scale)
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active

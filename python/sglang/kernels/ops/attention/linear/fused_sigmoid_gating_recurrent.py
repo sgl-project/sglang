@@ -189,6 +189,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     replayssm_rawk=None,
     replayssm_g=None,
     replayssm_beta=None,
+    ring_indices=None,
     stride_rawv_slot: tl.constexpr = 0,
     stride_rawk_slot: tl.constexpr = 0,
     stride_g_slot: tl.constexpr = 0,
@@ -361,16 +362,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
-        # into the per-slot ring for the commit fold to replay. Must sit here --
+        # into the ring for the commit fold to replay. Must sit here --
         # b_k is still pre-l2norm, b_v still pre-delta, b_g/b_beta are formed,
         # so the fold's replay is bit-identical to the update below. rawk uses
         # the k-head i_h (shared across a GQA group); rawv/g/beta use the v-head
         # i_hv. step_idx < MAX_CACHE_LEN: absorb-inflated rows can exceed the
         # ring; the overflow steps are past the committable prefix, so drop them
-        # (writing them would smash the next slot's ring).
+        # (writing them would smash the next row's ring).
         if CACHE_RING:
-            ring_slot = tl.load(h0_indices + i_n).to(tl.int64)
-            if ring_slot >= 0 and step_idx < MAX_CACHE_LEN:
+            ring_slot = tl.load(ring_indices + i_n).to(tl.int64)
+            if tl.load(h0_indices + i_n) >= 0 and step_idx < MAX_CACHE_LEN:
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -552,13 +553,15 @@ def fused_sigmoid_gating_delta_rule_update(
     cache_steps: Optional[int] = None,
     retrieve_parent_token: Optional[torch.Tensor] = None,
     # fused ReplaySSM ring-write (spec verify). When cache_ring, each draft step
-    # stores pre-norm k / raw v / gate / beta into these per-slot rings,
-    # replacing the eager ring-write. Off by default -> decode unchanged.
+    # stores pre-norm k / raw v / gate / beta into row ring_indices[i] of these
+    # rings (default initial_state_indices), replacing the eager ring-write.
+    # Off by default -> decode unchanged.
     cache_ring: bool = False,
     replayssm_rawv: Optional[torch.Tensor] = None,
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    ring_indices: Optional[torch.Tensor] = None,
     # Reproduce FlashInfer's `recurrent_kda` CuTe DSL decode kernel step for
     # step: `b` is then the already-sigmoided FP32 beta, the gate is formed in
     # base 2 with ex2/lg2.approx, Q/K norms reduce lane-striped, the state
@@ -741,6 +744,9 @@ def fused_sigmoid_gating_delta_rule_update(
         replayssm_rawk=replayssm_rawk,
         replayssm_g=replayssm_g,
         replayssm_beta=replayssm_beta,
+        ring_indices=(
+            ring_indices if ring_indices is not None else initial_state_indices
+        ),
         stride_rawv_slot=stride_rawv_slot,
         stride_rawk_slot=stride_rawk_slot,
         stride_g_slot=stride_g_slot,

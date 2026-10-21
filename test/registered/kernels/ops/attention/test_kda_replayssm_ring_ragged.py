@@ -91,6 +91,7 @@ def _run_case(bs, gamma, HV, H, K, V, lens, acc, L, pad_last=False):
         replayssm_rawk=rawk,
         replayssm_g=gring,
         replayssm_beta=betar,
+        ring_indices=torch.arange(bs, device=DEV, dtype=torch.int32),
     )
 
     ckpt = h0_src.clone()

@@ -19,7 +19,7 @@ the commit scatter advances them from the selected intermediate window.
 
 ReplaySSM (``cache_ring``): instead of per-step [HV, V, K] fp32 state
 snapshots, stash each step's raw inputs (pre-l2norm k, pre-delta v, gate,
-beta) into the per-slot rings the commit-time exact fold replays
+beta) into the per-request rings the commit-time exact fold replays
 (kda_replayssm_spec_decode.py) -- same CACHE_RING contract as the unfused
 fused_sigmoid_gating_delta_rule_update, so the two paths fill identical rings.
 
@@ -112,12 +112,12 @@ def fused_kda_conv_gating_verify_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     ROUND_CONV_PRODUCTS: tl.constexpr,
     USE_GDC: tl.constexpr = False,
-    # ReplaySSM fused ring-write (spec verify): per-slot rings consumed by the
+    # ReplaySSM fused ring-write (spec verify): per-request rings consumed by the
     # commit-time exact fold (kda_replayssm_spec_decode.py). Off -> dead code.
-    replayssm_rawv=None,  # [slots, HV, L, V] activation dtype
-    replayssm_rawk=None,  # [slots, H,  L, K] activation dtype
-    replayssm_g=None,  # [slots, HV, L, K] fp32
-    replayssm_beta=None,  # [slots, HV, L]    fp32
+    replayssm_rawv=None,  # [rows, HV, L, V] activation dtype
+    replayssm_rawk=None,  # [rows, H,  L, K] activation dtype
+    replayssm_g=None,  # [rows, HV, L, K] fp32
+    replayssm_beta=None,  # [rows, HV, L]    fp32
     stride_rawv_slot: tl.constexpr = 0,
     stride_rawk_slot: tl.constexpr = 0,
     stride_g_slot: tl.constexpr = 0,
@@ -212,7 +212,7 @@ def fused_kda_conv_gating_verify_kernel(
     if CACHE_INTERMEDIATE_STATES:
         cache_idx = tl.load(inter_state_indices + i_n)
     iw_idx = tl.zeros([], dtype=tl.int64)
-    if SAVE_INTERMEDIATE_WINDOW:
+    if SAVE_INTERMEDIATE_WINDOW or CACHE_RING:
         iw_idx = tl.load(inter_state_indices + i_n).to(tl.int64)
 
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
@@ -336,10 +336,10 @@ def fused_kda_conv_gating_verify_kernel(
         # fused_sigmoid_gating_recurrent.py). rawk dedups via is_qk_owner
         # (per k-head); g/beta write once per v-head at i_v == 0. The
         # t < MAX_CACHE_LEN guard drops absorb-overflow steps instead of
-        # smashing the next slot's ring.
+        # smashing the next row's ring.
         if CACHE_RING:
             if h0_idx >= 0 and t < MAX_CACHE_LEN:
-                ring_slot = h0_idx.to(tl.int64)
+                ring_slot = iw_idx
                 tl.store(
                     replayssm_rawv
                     + ring_slot * stride_rawv_slot
@@ -522,7 +522,7 @@ def fused_kda_conv_gating_verify(
 
     if cache_ring:
         # Per-layer ring views (memory_pool.py KDA spec rings). The kernel uses
-        # stride(0) as the slot pitch and packs within a slot from
+        # stride(0) as the row pitch and packs within a row from
         # MAX_CACHE_LEN and the head/dim extents, so inner dims must be packed.
         assert (
             replayssm_rawv is not None
@@ -530,6 +530,7 @@ def fused_kda_conv_gating_verify(
             and replayssm_g is not None
             and replayssm_beta is not None
         ), "cache_ring requires all four replayssm_* rings"
+        assert intermediate_state_indices is not None
         max_cache_len = replayssm_rawv.shape[-2]
         assert tuple(replayssm_rawv.shape[1:]) == (HV, max_cache_len, V)
         assert tuple(replayssm_rawk.shape[1:]) == (H, max_cache_len, K)

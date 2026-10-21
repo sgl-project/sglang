@@ -124,7 +124,7 @@ ratio = (S + D) x state_bytes / (L x (mla_kv_bytes / DCP + draft_kv_bytes))
 ```
 
 - `S` — KDA state slots per request: `extra_buffer=5`, `extra_buffer_lazy=4`, `no_buffer=3`, disabled radix cache `=1`. `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK` frees one slot on the extra-buffer strategies; with the overlap scheduler off (or `pp > 1`, which disables it) the track buffer costs one slot instead of two.
-- `D` — verify intermediate states under speculative decoding: `0` when disabled, otherwise DSPARK block size + 1 (`8` at the default 7). ReplaySSM (`--enable-linear-replayssm-spec`) folds them into a per-slot ring, returning `D` to `0`.
+- `D` — verify intermediate states under speculative decoding: `0` when disabled, otherwise DSPARK block size + 1 (`8` at the default 7). ReplaySSM (`--enable-linear-replayssm-spec`) folds them into a per-request ring, returning `D` to `0`.
 - `state_bytes` — one state slot's bytes, from K3's fixed geometry, the attention-TP width, and the SSM dtype.
 - `mla_kv_bytes` — one token's MLA latent KV bytes (KV-dtype dependent); DCP shards it across its ranks. The DSPARK draft model's KV (~1.4 KB per token) is replicated on every rank, so it enters flat — negligible without DCP, the same order as the sharded MLA share under DCP8.
 - `L` — average total request length in tokens: input + output.

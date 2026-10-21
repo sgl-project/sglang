@@ -469,7 +469,9 @@ def kda_decode_mtp_kernel(
                     if cutlass.const_expr(CACHE_RING):
                         for i in range(VEC_SIZE):
                             k_idx = i * WARP_SIZE + in_warp_tid
-                            ring_rawk[slot, i_hv, i_t, k_idx] = cutlass.BFloat16(r_k[i])
+                            ring_rawk[scratch_row, i_hv, i_t, k_idx] = cutlass.BFloat16(
+                                r_k[i]
+                            )
                     sum_k = 0.0
                     for i in range(VEC_SIZE):
                         sum_k += r_k[i] * r_k[i]
@@ -496,7 +498,7 @@ def kda_decode_mtp_kernel(
                             + cute.math.exp(-r_b_raw, fastmath=True)
                         )
                         if cutlass.const_expr(CACHE_RING):
-                            ring_beta[slot, i_hv, i_t] = sBeta[i_t]
+                            ring_beta[scratch_row, i_hv, i_t] = sBeta[i_t]
                 else:
                     # Issue the independent channel loads before any ring store.
                     # Gate warps do not otherwise use r_q in this phase.
@@ -522,7 +524,7 @@ def kda_decode_mtp_kernel(
                             qk_j % 4,
                         ] = cute.math.exp(r_gk, fastmath=True)
                         if cutlass.const_expr(CACHE_RING):
-                            ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                            ring_g[scratch_row, i_hv, i_t, k_idx] = r_gk
                 if p1_job == 0:
                     for i in range(VEC_SIZE):
                         k_idx = i * 32 + in_warp_tid
@@ -610,7 +612,7 @@ def kda_decode_mtp_kernel(
                         cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                     )
                 if cutlass.const_expr(CACHE_RING):
-                    ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
+                    ring_rawv[scratch_row, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                     intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
                         cutlass.BFloat16(_win[_t + 1 + _w])
@@ -1088,8 +1090,8 @@ def fused_kda_decode_mtp_dspark(
             or replayssm_beta.shape[1:] != (H, ring_len)
         ):
             raise ValueError(
-                f"expected ReplaySSM ring layouts [slots, H={H}, L>={1 + num_spec}, "
-                f"{TILE_K}] / [slots, H, L]"
+                f"expected ReplaySSM ring layouts [rows, H={H}, L>={1 + num_spec}, "
+                f"{TILE_K}] / [rows, H, L]"
             )
         if (
             replayssm_rawv.dtype != torch.bfloat16

@@ -1256,7 +1256,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # snapshots. ring_kwargs stays empty for non-triton verify kernels,
         # which never see replayssm. Ragged layouts work natively on the
         # unfused path -- step_idx is the within-row step under varlen, so
-        # row i writes ring[slot][0..verify_lens[i]) and commit folds at most
+        # row i writes ring positions [0..verify_lens[i]) and commit folds at most
         # commit_lens of them (absorb overflow is bounded in-kernel).
         replayssm_rawk = replayssm_g = replayssm_beta = None
         ring_kwargs = {}
@@ -1666,10 +1666,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> bool:
         """Whether the per-layer ReplaySSM rings fit the fused ring-write.
 
-        Layouts follow memory_pool.py's KDA spec rings: rawv [slots, HV, L, V]
-        and rawk [slots, H, L, K] in the activation dtype, g [slots, HV, L, K]
-        fp32 (per-K KDA gate), beta [slots, HV, L] fp32. The kernel uses
-        stride(0) as the slot pitch and assumes packed inner dims; anything
+        Layouts follow memory_pool.py's KDA spec rings: rawv [rows, HV, L, V]
+        and rawk [rows, H, L, K] in the activation dtype, g [rows, HV, L, K]
+        fp32 (per-K KDA gate), beta [rows, HV, L] fp32. The kernel uses
+        stride(0) as the row pitch and assumes packed inner dims; anything
         else falls back to the unfused path, which handles it.
         """
         if replayssm_rawk is None or replayssm_g is None or replayssm_beta is None:
