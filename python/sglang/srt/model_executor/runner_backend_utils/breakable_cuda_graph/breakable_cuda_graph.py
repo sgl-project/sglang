@@ -42,6 +42,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.capture
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
+from sglang.srt.model_executor.runner_backend_utils.cublas_workspace import (
+    prepare_cublas_for_graph_capture,
+)
 from sglang.srt.utils import get_device_module, is_hip, is_musa, is_npu, is_xpu
 
 if TYPE_CHECKING:
@@ -478,6 +481,8 @@ class BreakableCUDAGraphCapture:
         return _weak_ref_if_tensor(value)
 
     def _begin_new_segment(self) -> None:
+        if not _is_xpu:
+            prepare_cublas_for_graph_capture(get_device_module())
         graph_cls = _device_graph_cls()
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
