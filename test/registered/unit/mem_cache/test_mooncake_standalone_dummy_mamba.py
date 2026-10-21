@@ -32,7 +32,18 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
     def test_dfs_only_dummy_warmup_forwards_replica_config(self):
         self._check_dummy_setup(replica_num=0, dfs_replica_num=1)
 
-    def _check_dummy_setup(self, replica_num=1, dfs_replica_num=0):
+    def test_dummy_uses_configured_local_buffer_size(self):
+        self._check_dummy_setup(
+            local_buffer_size="1gb", expected_local_buffer_bytes=1024**3
+        )
+
+    def _check_dummy_setup(
+        self,
+        replica_num=1,
+        dfs_replica_num=0,
+        local_buffer_size=16 * 1024 * 1024,
+        expected_local_buffer_bytes=16 * 1024 * 1024,
+    ):
         """Standalone(dummy) must size shared mapping for KV + Mamba buffers."""
         import torch
 
@@ -143,6 +154,7 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
                     "client_server_address": "127.0.0.1:50052",
                     "replica_num": replica_num,
                     "dfs_replica_num": dfs_replica_num,
+                    "local_buffer_size": local_buffer_size,
                 },
             )
 
@@ -157,6 +169,9 @@ class TestMooncakeStandaloneDummyMamba(CustomTestCase):
                 * mem_pool.mamba.conv_buffer[0].element_size()
             )
             self.assertEqual(captured["required_bytes"], expected)
+            self.assertEqual(
+                captured["local_buffer_bytes"], expected_local_buffer_bytes
+            )
             if dfs_replica_num:
                 self.assertEqual(captured["put_args"][0].replica_num, replica_num)
                 self.assertEqual(

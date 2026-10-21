@@ -15,6 +15,9 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+_UNSET = object()
+
+
 class ReplicateConfigWithGroupIds:
     def __init__(self):
         self.group_ids = None
@@ -89,11 +92,13 @@ def _fake_store_class():
             self.batch_put_calls = []
             self.put_calls = []
             self.has_memory_segment = True
+            self.setup_calls = []
             self.existing_keys = set()
             self.objects = {}
             type(self).instances.append(self)
 
         def setup(self, *args, **kwargs):
+            self.setup_calls.append((args, kwargs))
             self.has_memory_segment = args[2] > 0
             return 0
 
@@ -283,6 +288,7 @@ def _make_store(
     tp_size=1,
     tp_lcm_size=None,
     global_segment_size=1024 * 1024,
+    local_buffer_size=_UNSET,
 ):
     fake_store_cls = _fake_store_class()
     cfg = _make_config(
@@ -302,6 +308,8 @@ def _make_store(
     )
 
     cfg.extra_config["global_segment_size"] = global_segment_size
+    if local_buffer_size is not _UNSET:
+        cfg.extra_config["local_buffer_size"] = local_buffer_size
 
     with patch.dict(
         "os.environ",
@@ -361,6 +369,26 @@ class TestMooncakeGroupSemantics(CustomTestCase):
             fake_store.batch_put_calls[0]["keys"], ["page0_0_k", "page0_0_v"]
         )
         self.assertEqual(fake_store.batch_put_calls[0]["args"], ())
+
+    def test_default_local_buffer_size_is_preserved(self):
+        _, fake_store = _make_store()
+        self.assertEqual(fake_store.setup_calls[0][0][3], 16 * 1024 * 1024)
+
+    def test_local_buffer_size_is_forwarded_without_rank_division(self):
+        for value, expected in (
+            (64 * 1024 * 1024, 64 * 1024 * 1024),
+            ("67108864", 64 * 1024 * 1024),
+            (" 2GB ", 2 * 1024**3),
+        ):
+            with self.subTest(value=value):
+                _, fake_store = _make_store(local_buffer_size=value, tp_size=2)
+                self.assertEqual(fake_store.setup_calls[0][0][3], expected)
+
+    def test_invalid_local_buffer_size_fails_before_setup(self):
+        for value in (0, -1, True, 1.5, None, "0gb", "1.5gb", "invalid"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "local_buffer_size"):
+                    _make_store(local_buffer_size=value)
 
     def test_default_warmup_uses_two_arg_put(self):
         _, fake_store = _make_store()

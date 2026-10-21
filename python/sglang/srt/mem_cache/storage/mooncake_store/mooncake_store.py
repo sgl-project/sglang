@@ -83,6 +83,21 @@ def _parse_global_segment_size(value) -> int:
     return int(value)
 
 
+def _parse_local_buffer_size(value: Any) -> int:
+    message = (
+        "Mooncake local_buffer_size must be a positive integer in bytes or a GB string"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(message)
+    try:
+        size = _parse_global_segment_size(value)
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    if size <= 0:
+        raise ValueError(message)
+    return size
+
+
 def _normalize_tenant_id(value) -> str:
     if value is None:
         return DEFAULT_TENANT_ID
@@ -400,6 +415,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
+            self.local_buffer_size = _parse_local_buffer_size(
+                extra_config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
+                if extra_config
+                else DEFAULT_LOCAL_BUFFER_SIZE
+            )
             self.replica_num = _parse_replica_count(
                 "replica_num",
                 extra_config.get("replica_num", 1) if extra_config else 1,
@@ -542,7 +562,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
                     required_bytes,
-                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.local_buffer_size,
                     self.config.client_server_address,
                 )
             else:
@@ -592,7 +612,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                             client_hostname,
                             self.config.metadata_server,
                             per_rank_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.local_buffer_size,
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,
