@@ -6,7 +6,6 @@ from torch import nn
 from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -26,7 +25,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, make_pp_layers
 
 
 @torch.jit.script
@@ -51,7 +50,6 @@ def gegelu(input, limit: Optional[float] = None):
 
 
 class Phi3SmallMLP(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -60,9 +58,9 @@ class Phi3SmallMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        assert (
-            self.config.hidden_act == "gegelu"
-        ), "Only `gegelu` is supported for the 4.7 series of models .."
+        assert self.config.hidden_act == "gegelu", (
+            "Only `gegelu` is supported for the 4.7 series of models .."
+        )
         self.hidden_size = config.hidden_size
         self.gegelu_limit = config.gegelu_limit
         self.intermediate_size = config.intermediate_size
@@ -90,7 +88,6 @@ class Phi3SmallMLP(nn.Module):
 
 
 class Phi3SmallSelfAttention(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -233,7 +230,6 @@ class Phi3SmallSelfAttention(nn.Module):
 
 
 class Phi3SmallDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -286,7 +282,6 @@ class Phi3SmallDecoderLayer(nn.Module):
 
 
 class Phi3SmallModel(nn.Module):
-
     def __init__(
         self,
         config: Phi3Config,
@@ -297,7 +292,7 @@ class Phi3SmallModel(nn.Module):
 
         self.config = config
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -313,7 +308,7 @@ class Phi3SmallModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
         self.mup_embedding_multiplier = config.mup_embedding_multiplier
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Phi3SmallDecoderLayer(
                 config,
@@ -321,8 +316,6 @@ class Phi3SmallModel(nn.Module):
                 quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
 

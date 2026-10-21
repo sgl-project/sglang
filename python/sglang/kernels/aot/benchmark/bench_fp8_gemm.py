@@ -8,9 +8,7 @@ import torch
 import triton
 from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 
-from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
-    per_tensor_quant_fp8,
-)
+from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.utils import is_in_ci
 
 # Optional vLLM import
@@ -106,7 +104,7 @@ def sglang_scaled_fp8_quant(
 if IS_CI:
     batch_sizes = [1]  # Single batch size for CI
 else:
-    batch_sizes = [1, 16, 64, 128, 256, 512, 1024, 2048]
+    batch_sizes = [1, 2, 8, 16, 64, 128, 256, 512, 1024, 2048]
 
 # Filter line_vals based on vLLM availability
 if VLLM_AVAILABLE:
@@ -115,24 +113,39 @@ if VLLM_AVAILABLE:
         "vllm-fp8-bf16",
         "sglang-fp8-fp16",
         "sglang-fp8-bf16",
+        "sglang-scalar-a-fp8-fp16",
+        "sglang-scalar-a-fp8-bf16",
     ]
     line_names = [
         "vllm-fp8-fp16",
         "vllm-fp8-bf16",
         "sglang-fp8-fp16",
         "sglang-fp8-bf16",
+        "sglang-scalar-a-fp8-fp16",
+        "sglang-scalar-a-fp8-bf16",
     ]
-    styles = [("green", "-"), ("green", "--"), ("blue", "-"), ("blue", "--")]
+    styles = [
+        ("green", "-"),
+        ("green", "--"),
+        ("blue", "-"),
+        ("blue", "--"),
+        ("red", "-"),
+        ("red", "--"),
+    ]
 else:
     line_vals = [
         "sglang-fp8-fp16",
         "sglang-fp8-bf16",
+        "sglang-scalar-a-fp8-fp16",
+        "sglang-scalar-a-fp8-bf16",
     ]
     line_names = [
         "sglang-fp8-fp16",
         "sglang-fp8-bf16",
+        "sglang-scalar-a-fp8-fp16",
+        "sglang-scalar-a-fp8-bf16",
     ]
-    styles = [("blue", "-"), ("blue", "--")]
+    styles = [("blue", "-"), ("blue", "--"), ("red", "-"), ("red", "--")]
 
 
 @triton.testing.perf_report(
@@ -174,8 +187,9 @@ def benchmark(batch_size, provider, N, K):
             lambda: vllm_scaled_mm(a_fp8, b_fp8, scale_a_fp8, scale_b_fp8, dtype),
             quantiles=quantiles,
         )
-    elif "sglang-fp8" in provider:
-        a_fp8, scale_a_fp8 = sglang_scaled_fp8_quant(a, scale_a)
+    elif "sglang" in provider:
+        a_scale = scale_a_scalar if "scalar-a" in provider else scale_a
+        a_fp8, scale_a_fp8 = sglang_scaled_fp8_quant(a, a_scale)
         b_fp8, scale_b_fp8 = sglang_scaled_fp8_quant(b, scale_b)
         b_fp8 = b_fp8.t()
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(

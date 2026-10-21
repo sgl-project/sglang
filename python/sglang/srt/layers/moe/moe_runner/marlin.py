@@ -43,7 +43,7 @@ def _fused_unpack_packed_topk(packed: torch.Tensor):
 
     Returns (topk_ids int32, topk_weights float32). Collapses the ~5 elementwise
     ops (shift / mask / int16 / bitcast / cast) the torch reference emits per call
-    into one Triton launch. Mirrors _pack_topk_kernel (trtllm_lora_temp/topk_pack).
+    into one Triton launch. Mirrors _pack_topk_kernel (ops/lora/moe/trtllm_lora_temp/topk_pack).
     """
     packed = packed.contiguous()
     ids = torch.empty_like(packed, dtype=torch.int32)
@@ -140,11 +140,19 @@ def fused_experts_none_to_marlin(
         )
 
     if runner_config.is_gated:
-        assert runner_config.activation == "silu", "Only gated SiLU is supported."
+        assert runner_config.activation in {
+            "silu",
+            "situ",
+        }, f"Only gated SiLU/SiTU is supported, got {runner_config.activation}."
     elif runner_config.activation not in {"silu", "relu2"}:
         raise ValueError(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
         )
+
+    # Marlin always applies the router weight inside its down GEMM.
+    assert (
+        not runner_config.no_combine or runner_config.no_combine_keep_router_weight
+    ), "Marlin MoE supports no_combine only with no_combine_keep_router_weight"
 
     # Use a per-call workspace so captured graphs cannot alias Marlin's
     # inter-block reduction locks and deadlock during capture.
@@ -202,6 +210,7 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
+        no_combine=runner_config.no_combine,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

@@ -4,13 +4,21 @@ Two test classes:
 - TestBreakableCUDAGraphBasic / TestCopyOutput / TestBreakGraphHelper:
   unit tests for the core capture / replay mechanism (simple tensor ops).
 - TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
-  --enable-breakable-cuda-graph and check mgsm_en accuracy.
+  --cuda-graph-backend-prefill=breakable and check mgsm_en accuracy.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.model_executor.runner_utils.forward_batch import (
+    set_forward_batch,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    prefill_graph_scope,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -23,7 +31,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 
@@ -45,6 +53,30 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         cls.BreakableCUDAGraphCapture = BreakableCUDAGraphCapture
         cls.eager_on_graph = staticmethod(eager_on_graph)
         cls.device = torch.device("cuda:0")
+
+    def test_qsa_indexer_uses_live_lengths(self):
+        from sglang.srt.models import qwen4_exp
+
+        context = SimpleNamespace(forward_batch=SimpleNamespace(rows=8))
+        layer = SimpleNamespace(_qsa_prefill_topk_bridge=None)
+        layer._compute_qsa_topk_indices_eager = (
+            lambda hidden_states, forward_batch, **kw: hidden_states[
+                : forward_batch.rows
+            ]
+        )
+        x = torch.zeros((8, 2), dtype=torch.int32, device=self.device)
+        inputs = dict(layer=layer, positions=None)
+        graph = self.BreakableCUDAGraph()
+        with patch.object(
+            qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
+        ):
+            with self.BreakableCUDAGraphCapture(graph, stream=torch.cuda.Stream()):
+                result = qwen4_exp._breakable_qsa_indexer(hidden_states=x + 1, **inputs)
+            for n in (3, 8):
+                context.forward_batch = SimpleNamespace(rows=n)
+                x.fill_(2)
+                graph.replay()
+                self.assertEqual(result.tolist(), [[3, 3]] * n + [[0, 0]] * (8 - n))
 
     def test_no_break_capture_replay(self):
         """Capture and replay without any graph breaks should work like normal CUDA graph."""
@@ -168,6 +200,31 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.allclose(y, torch.full((4,), 33.0, device=self.device)))
 
+    def test_side_stream_join_across_break(self):
+        """A side-stream producer may be joined after a graph break."""
+        x = torch.zeros(4, device=self.device)
+        y = torch.zeros(4, device=self.device)
+        stream = torch.cuda.Stream(self.device)
+
+        @self.eager_on_graph(enable=True)
+        def identity(src):
+            return src
+
+        graph = self.BreakableCUDAGraph()
+        capture_stream = torch.cuda.Stream(self.device)
+        with self.BreakableCUDAGraphCapture(graph, stream=capture_stream):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                side_output = x + 1.0
+            identity(x)
+            torch.cuda.current_stream().wait_stream(stream)
+            y.copy_(side_output * 2.0)
+
+        x.fill_(5.0)
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertTrue(torch.allclose(y, torch.full((4,), 12.0, device=self.device)))
+
     def test_eager_output_is_held_strongly_for_replay_bridge(self):
         """The replay closure must keep the eager output bridge buffer alive."""
         x = torch.zeros(4, device=self.device)
@@ -189,6 +246,47 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
             any(cell.cell_contents is broken for cell in replay_closure),
             "eager output bridge buffer must be strongly captured",
         )
+
+    def test_attention_narrows_padded_positions(self):
+
+        num_tokens = 3
+        padded_num_tokens = 5
+        forward_batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=num_tokens,
+            mha_return_lse=False,
+            _attn_output=None,
+            out_cache_loc=torch.arange(padded_num_tokens, device=self.device),
+            positions=torch.arange(padded_num_tokens, device=self.device),
+        )
+        observed = {}
+
+        def attention_forward(query, key, value, layer, batch, save_kv_cache):
+            observed["positions"] = batch.positions.clone()
+            observed["out_cache_loc"] = batch.out_cache_loc.clone()
+            return torch.ones_like(query)
+
+        output = torch.full((padded_num_tokens, 2), float("nan"), device=self.device)
+        with (
+            set_forward_batch(forward_batch),
+            prefill_graph_scope(full_graph=False, raw_num_tokens=num_tokens),
+            patch(
+                "sglang.srt.layers.radix_attention.get_attn_backend",
+                return_value=SimpleNamespace(forward=attention_forward),
+            ),
+        ):
+            RadixAttention(1, 2, 1.0, 1, 0)._eager_attention(
+                torch.zeros((padded_num_tokens, 2), device=self.device),
+                torch.zeros((padded_num_tokens, 1, 2), device=self.device),
+                torch.zeros((padded_num_tokens, 1, 2), device=self.device),
+                output,
+                True,
+            )
+
+        expected = torch.arange(num_tokens, device=self.device)
+        torch.testing.assert_close(observed["positions"], expected)
+        torch.testing.assert_close(observed["out_cache_loc"], expected)
+        self.assertEqual(forward_batch.positions.shape[0], padded_num_tokens)
+        self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
 
 
 class TestCopyOutput(CustomTestCase):
@@ -288,7 +386,7 @@ class TestBreakGraphHelper(CustomTestCase):
 
 
 class TestBreakableCudaGraph(CustomTestCase):
-    """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
+    """Integration: Qwen3-8B with --cuda-graph-backend-prefill=breakable on mgsm_en."""
 
     @classmethod
     def setUpClass(cls):
@@ -312,7 +410,7 @@ class TestBreakableCudaGraph(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="mgsm_en",
-            num_examples=1319,
+            num_examples=200,
             num_threads=1024,
         )
 

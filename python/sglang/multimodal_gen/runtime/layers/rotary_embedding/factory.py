@@ -10,7 +10,6 @@ from .mrope import NDRotaryEmbedding, _to_tuple
 
 _ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 _ND_ROPE_CACHE: "OrderedDict[tuple, NDRotaryEmbedding]" = OrderedDict()
-_ROPE_3D_CACHE: "OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]]" = OrderedDict()
 
 
 def get_rope(
@@ -118,9 +117,9 @@ def get_rotary_pos_embed(
     if rope_dim_list is None:
         rope_dim_list = [head_dim // target_ndim for _ in range(target_ndim)]
 
-    assert (
-        sum(rope_dim_list) == head_dim
-    ), "sum(rope_dim_list) should equal to head_dim of attention layer"
+    assert sum(rope_dim_list) == head_dim, (
+        "sum(rope_dim_list) should equal to head_dim of attention layer"
+    )
 
     # Get SP info - now handled within NDRotaryEmbedding
     # sp_group = get_sp_group()

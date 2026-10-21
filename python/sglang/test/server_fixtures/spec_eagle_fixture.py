@@ -58,14 +58,22 @@ class SpecEagleServerBase(CustomTestCase):
     attention_backend = "flashinfer"
     # Primary axis: False -> overlap scheduler; True -> synchronous (non-overlap).
     disable_overlap = False
-    mem_fraction_static = 0.85
-    max_running_requests = 8
+    # Leaves ~3.3GB on a 32GB card for the verify logits and activations at a
+    # cap of 64; higher OOMs, lower starves the KV pool into capping the batch.
+    mem_fraction_static = 0.80
+    # The eval kits drive 128 client threads, so a small cap just serializes them.
+    # Capture follows: capture_bs is clipped to req_to_token_pool.size (cap + 1).
+    max_running_requests = 64
     chunked_prefill_size = 128
     # bf16 rather than fp16: fp16 activations can overflow (-> Inf -> NaN) on
     # degenerate draft branches in verify and trip the CI NaN asserts.
     dtype = "bfloat16"
     cuda_graph_max_bs_decode = None
     trust_remote_code = True
+    # Seconds to wait for the spec server to report healthy. Overridable per
+    # subclass: EAGLE3 + full CUDA-graph decode capture on XPU can exceed the
+    # 600s default, so the XPU parity test bumps this.
+    server_launch_timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     # Launch with --enable-return-hidden-states so SpecHiddenStatesKit can probe
     # per-request hidden states; per-request gated, so other requests don't pay.
     enable_return_hidden_states = False
@@ -140,7 +148,7 @@ class SpecEagleServerBase(CustomTestCase):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                timeout=cls.server_launch_timeout,
                 other_args=cls._launch_args(),
             )
 

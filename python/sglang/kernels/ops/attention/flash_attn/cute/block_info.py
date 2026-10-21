@@ -22,6 +22,7 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    batch_invariant: cutlass.Constexpr[bool] = False
 
     @cute.jit
     def get_n_idx_left_right(
@@ -159,6 +160,11 @@ class BlockInfo:
         n_block_min: Int32,
     ) -> Int32:
         """If we have separate iterations with causal or local masking at the start, where do we stop"""
+        # The boundary carries -seqlen_q and the two paths round differently, so a
+        # row's bits depend on how many queries share the pass. Masking every
+        # block is identity below the diagonal.
+        if const_expr(self.batch_invariant):
+            return n_block_min
         m_idx_min = m_block * self.tile_m
         if const_expr(self.qhead_per_kvhead_packgqa > 1):
             m_idx_min = m_idx_min // self.qhead_per_kvhead_packgqa

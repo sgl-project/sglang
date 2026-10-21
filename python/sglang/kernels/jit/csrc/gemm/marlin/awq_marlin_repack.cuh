@@ -6,6 +6,8 @@
 
 #include "marlin.cuh"
 
+namespace sglang {
+
 namespace device::marlin {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
@@ -249,3 +251,5 @@ void awq_marlin_repack(
     RuntimeCheck(false, "Unsupported repack config: num_bits = ", num_bits);
   }
 }
+
+}  // namespace sglang

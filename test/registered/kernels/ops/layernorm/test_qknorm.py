@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=148, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=130, stage="nightly", runner_config="1-gpu-large")
 
 
 def sglang_aot_qknorm(
@@ -49,22 +49,6 @@ def flashinfer_qknorm(
 
     rmsnorm(q, q_weight, out=q)
     rmsnorm(k, k_weight, out=k)
-
-
-@torch.compile()
-def torch_impl_qknorm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    eps: float = 1e-6,
-) -> None:
-    q_mean = q.float().pow(2).mean(dim=-1, keepdim=True)
-    k_mean = k.float().pow(2).mean(dim=-1, keepdim=True)
-    q_norm = (q_mean + eps).rsqrt()
-    k_norm = (k_mean + eps).rsqrt()
-    q.copy_(q.float() * q_norm * q_weight.float())
-    k.copy_(k.float() * k_norm * k_weight.float())
 
 
 BS_LIST = [2**n for n in range(0, 14)]

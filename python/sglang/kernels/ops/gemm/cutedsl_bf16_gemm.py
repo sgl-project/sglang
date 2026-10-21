@@ -7,7 +7,7 @@
 # You may obtain a copy of the License at
 #
 #   http://www.apache.org/licenses/LICENSE-2.0
-"""CuTe DSL TGV BF16 GEMM (low-latency Blackwell GEMM, SM100/SM103 only).
+"""CuTe DSL TGV BF16 GEMM (low-latency SM10x GEMM).
 
 Computes ``out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N])`` for bf16 inputs,
 fp32 accumulation, bf16 output. The kernel writes M-contiguous output, so the
@@ -38,8 +38,8 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import get_device_sm
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils import get_device_core_count, is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -82,14 +82,6 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
 ]
 
 
-def get_tgv_cute_ext_tactic_num() -> int:
-    return len(_TGV_CUTE_EXT_TACTIC_CONFIGS)
-
-
-def get_tgv_cute_ext_default_tactic() -> int:
-    return _TGV_CUTE_EXT_DEFAULT_TACTIC
-
-
 class WorkTileInfo(NamedTuple):
     """Which output tile this CTA processes. Mirrors the original WorkTileInfo."""
 
@@ -119,8 +111,10 @@ class TgvGemmCuteExtKernel:
         pdl_launch: Optional[bool] = None,
         pdl_count: int = -1,
         has_bias: bool = False,
+        out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
         self.acc_dtype = acc_dtype
+        self.out_dtype = out_dtype
         self.cta_m = cta_m
         self.cta_n = cta_n
         self.cta_k = cta_k
@@ -164,6 +158,7 @@ class TgvGemmCuteExtKernel:
             f"TgvGemmCuteExtKernel_cta{self.cta_m}x{self.cta_n}x{self.cta_k}"
             f"_2cta{int(self.use_2cta)}_pdl{int(self.use_pdl)}"
             f"_bias{int(self.has_bias)}"
+            f"_out{self.out_dtype.__name__.lower()}"
         )
 
     @cute.experimental.jit
@@ -489,6 +484,21 @@ class TgvGemmCuteExtKernel:
                 c_dtype,
                 d_layout,
             )
+
+        if cutlass.const_expr(self.use_2cta):
+            # Cluster-wide exit barrier (sgl-project/sglang#32907): cluster
+            # sync previously existed only at kernel entry, so one CTA could
+            # retire while its peer still had in-flight peer-redirected
+            # mbarrier arrives / multicast tcgen05.commit / TMEM dealloc
+            # targeting it -> CUDBG_EXCEPTION_CLUSTER_BLOCK_NOT_PRESENT
+            # (Xid 13 "CTA Not Present"). All 8 warps (256 threads) of both
+            # cluster CTAs arrive here after their dispatch branch returns,
+            # so no CTA can exit until the peer's tail work has landed.
+            # relaxed arrive (matches the entry barrier at L378): this fence is
+            # only about CTA lifetime, not inter-CTA smem visibility -- every
+            # cross-CTA datum above already flows through mbarrier phases.
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
@@ -995,6 +1005,11 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
 }
 
+_TORCH_TO_CUTLASS_OUT_DTYPE = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
 # Per-process cache mapping (dtype, config…) → compiled cute_ext callable.
 # We need to construct concrete cute.Tensors once and reuse the resulting
 # compiled function across all live calls; a fresh build per call would
@@ -1029,7 +1044,12 @@ def _make_layout_tensor(
 
 
 def _make_compile_repr_tensors(
-    dtype: torch.dtype, has_bias: bool, a_leading: int, b_leading: int, c_leading: int
+    dtype: torch.dtype,
+    c_dtype: torch.dtype,
+    has_bias: bool,
+    a_leading: int,
+    b_leading: int,
+    c_leading: int,
 ):
     """Build representative tensors with strides matching the requested
     leading-dim pattern. After the A↔B swap, the cute_ext kernel sees:
@@ -1051,7 +1071,7 @@ def _make_compile_repr_tensors(
         (L, K, M), dtype, b_leading
     )  # kernel B shape (L, K, M_pt)
     C_t = _make_layout_tensor(
-        (L, N, M), dtype, c_leading
+        (L, N, M), c_dtype, c_leading
     )  # kernel C shape (L, N_pt, M_pt)
 
     a_ = from_dlpack(A_t, assumed_align=32).mark_layout_dynamic(leading_dim=a_leading)
@@ -1071,6 +1091,7 @@ def _make_compile_repr_tensors(
 
 def _get_compiled_cute_ext_kernel(
     dtype: torch.dtype,
+    c_dtype: torch.dtype,
     cta_m: int,
     cta_n: int,
     cta_k: int,
@@ -1091,6 +1112,7 @@ def _get_compiled_cute_ext_kernel(
     """
     key = (
         dtype,
+        c_dtype,
         cta_m,
         cta_n,
         cta_k,
@@ -1110,6 +1132,11 @@ def _get_compiled_cute_ext_kernel(
         raise ValueError(
             f"TGV cute_ext backend supports {list(_TORCH_TO_CUTLASS_DTYPE)}; got {dtype}."
         )
+    if c_dtype not in _TORCH_TO_CUTLASS_OUT_DTYPE:
+        raise ValueError(
+            f"TGV cute_ext output supports {list(_TORCH_TO_CUTLASS_OUT_DTYPE)}; "
+            f"got {c_dtype}."
+        )
 
     gemm = TgvGemmCuteExtKernel(
         acc_dtype=cutlass.Float32,
@@ -1120,10 +1147,12 @@ def _get_compiled_cute_ext_kernel(
         use_2cta=use_2cta,
         use_pdl=use_pdl,
         has_bias=has_bias,
+        out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
         dtype,
+        c_dtype,
         has_bias,
         a_leading,
         b_leading,
@@ -1205,7 +1234,9 @@ def _to_cute_swap(
     M_ce = c_swap.shape[1]  # == PyTorch N
     N_ce = c_swap.shape[2]  # == PyTorch M
     bias_3d = bias_pt.as_strided(size=(L, M_ce, N_ce), stride=(0, 1, 0))
-    bias_ = from_dlpack(bias_3d, assumed_align=2).mark_layout_dynamic(leading_dim=1)
+    bias_ = from_dlpack(bias_3d.detach(), assumed_align=2).mark_layout_dynamic(
+        leading_dim=1
+    )
     return a_, b_, c_, bias_, layout
 
 
@@ -1241,6 +1272,7 @@ def _run_tgv(
 
     compiled = _get_compiled_cute_ext_kernel(
         dtype=a.dtype,
+        c_dtype=out.dtype,
         cta_m=cta_m,
         cta_n=cta_n,
         cta_k=_TGV_CUTE_EXT_CTA_K,
@@ -1262,8 +1294,6 @@ def _run_tgv(
     return out
 
 
-_TGV_NUM_SMS = 148
-
 # (tactic, cta_m, cta_n, num_mma_ctas), smallest cta_n first.
 _TGV_TACTIC_LADDER = (
     (18, 64, 16, 2),
@@ -1284,10 +1314,11 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 
 def _pick_tactic(m: int, n: int, k: int) -> int:
     """Pick the first ladder tactic whose grid fits one wave of the SMs."""
+    num_sms = get_device_core_count(torch.cuda.current_device())
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
-        if ctas <= _TGV_NUM_SMS:
+        if ctas <= num_sms:
             return tactic
         if best_ctas is None or ctas < best_ctas:
             best, best_ctas = tactic, ctas
@@ -1314,6 +1345,21 @@ _K3_TGV_WIN_SHAPES = frozenset(
 )
 
 
+# MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
+_MUSE_SPARK_TGV_M_RANGES = {
+    (4096, 8192): (1, 16),  # replicated pooler
+    (8192, 4096): (1, 128),  # replicated unpooler
+    (4608, 8192): (1, 256),  # TP4 qkvg
+    (8192, 2048): (1, 128),  # TP4 o_proj
+    (1024, 8192): (1, 256),  # TP4 pooler slice
+    (2048, 4096): (1, 256),  # TP4 unpooler slice
+    (2304, 8192): (40, 512),  # TP8 qkvg
+    (8192, 1024): (1, 64),  # TP8 o_proj
+    (512, 8192): (256, 512),  # TP8 pooler slice
+    (1024, 4096): (1, 512),  # TP8 unpooler slice
+}
+
+
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
     graph capture (cold L2). Conservative: ties and unmeasured regions fall
@@ -1325,6 +1371,9 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
+    m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
+    if m_range is not None:
+        return m_range[0] <= m <= m_range[1]
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
     if n < 1024 or k < 2048 or k > 6144:
@@ -1352,8 +1401,8 @@ def _tgv_bf16_gemm_run(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    if get_device_sm() not in (100, 103):
-        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"
@@ -1380,10 +1429,10 @@ def _tgv_bf16_gemm_out_run(
     out: torch.Tensor,
     bias: Optional[torch.Tensor],
 ) -> None:
-    if get_device_sm() not in (100, 103):
-        raise RuntimeError("cutedsl_bf16_gemm requires SM100/SM103 (Blackwell)")
+    if not is_sm100_supported():
+        raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
     assert x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    assert out.dtype == torch.bfloat16 and out.device == x.device
+    assert out.dtype in (torch.bfloat16, torch.float32) and out.device == x.device
     assert x.ndim == 2 and weight.ndim == 2 and out.ndim == 2
     assert x.stride(-1) == 1, "x must be K-major [M, K]"
     assert weight.stride(-1) == 1, "weight must be K-major [N, K]"

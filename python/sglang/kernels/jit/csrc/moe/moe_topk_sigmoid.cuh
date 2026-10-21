@@ -27,13 +27,13 @@ using MinReduceOp = cub::Min;
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 using tvm::ffi::TensorView;
 
 #ifndef MOE_TOPK_SIGMOID_WARP_SIZE
 #define MOE_TOPK_SIGMOID_WARP_SIZE 32
 #endif
-
-namespace {
 
 static constexpr int WARP_SIZE = MOE_TOPK_SIGMOID_WARP_SIZE;
 
@@ -477,8 +477,6 @@ void topkGatingSigmoidKernelLauncher(
 
 #undef LAUNCH_SIGMOID
 
-}  // namespace
-
 // ---------------------------------------------------------------------------
 // Host launcher (tvm-ffi interface)
 // ---------------------------------------------------------------------------
@@ -542,3 +540,5 @@ void topk_sigmoid(
       num_fused_shared_experts,
       stream);
 }
+
+}  // namespace sglang

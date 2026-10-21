@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 struct SamAnchor {
@@ -64,3 +66,5 @@ class SuffixAutomaton {
 };
 
 }  // namespace ngram
+
+}  // namespace sglang

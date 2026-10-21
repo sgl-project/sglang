@@ -66,6 +66,14 @@ class GSM8KAscendMixin(ABC):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        from sglang.test.ascend.npu_eval_accuracy_kit import (
+            _is_pr_pipeline,
+            run_npu_pr_smoke,
+        )
+
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         accuracy_threshold = getattr(self, "accuracy", 0.00)
         output_throughput_threshold = getattr(self, "output_throughput", 0.00)
 
@@ -94,12 +102,12 @@ class GSM8KAscendMixin(ABC):
             self.assertGreaterEqual(
                 metrics["score"],
                 accuracy_threshold,
-                f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {accuracy_threshold}',
+                f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {accuracy_threshold}",
             )
             self.assertGreaterEqual(
                 metrics["output_throughput"],
                 output_throughput_threshold,
-                f'Output throughput of {self.model} is {str(metrics["output_throughput"])}, is lower than {output_throughput_threshold}',
+                f"Output throughput of {self.model} is {str(metrics['output_throughput'])}, is lower than {output_throughput_threshold}",
             )
         except Exception as e:
             model_metrics["error"] = e

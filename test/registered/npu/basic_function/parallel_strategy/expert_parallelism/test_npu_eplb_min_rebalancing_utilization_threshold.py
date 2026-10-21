@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
@@ -13,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="stage-b-test-8-npu-a3", nightly=False)
+register_npu_ci(est_time=400, suite="base-b-test-8-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
@@ -50,7 +51,8 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         50,
         "--expert-distribution-recorder-buffer-size",
         50,
-        "--enable-expert-distribution-metrics",
+        "--expert-balancedness-report-mode",
+        "server_log",
         "--eplb-rebalance-layers-per-chunk",
         "1",
     ]
@@ -78,9 +80,11 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
                 **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )
@@ -94,6 +98,9 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         os.remove("./rebalance_err_log.txt")
 
     def test_gsm8k(self):
+        if _is_pr_pipeline:
+            run_npu_pr_smoke(self.base_url)
+            return
         args = SimpleNamespace(
             max_tokens=512,
             base_url=DEFAULT_URL_FOR_TEST,
@@ -108,7 +115,7 @@ class TestEplbMinRebalancingUtilizationThresholdBase(CustomTestCase):
         self.assertGreaterEqual(
             metrics["score"],
             self.accuracy,
-            f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {self.accuracy}',
+            f"Accuracy of {self.model} is {str(metrics['score'])}, is lower than {self.accuracy}",
         )
 
         """
@@ -150,9 +157,11 @@ class TestEplbMinRebalancingUtilizationThreshold095(
                 "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",
+                "DEEPEP_HYBRID_DEPLOYMENT": "1",
                 "TRANSFORMERS_VERBOSITY": "error",
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
                 **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
             },
             return_stdout_stderr=(cls.out_file, cls.err_file),
         )
