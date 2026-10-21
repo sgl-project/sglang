@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam BF16 all-reduce with FP32 sandwich normalization and rounded residuals."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 
+if TYPE_CHECKING:
+    from sglang.kernels.ops.communication.all_reduce import Communicator
+
 
 @cache_once
-def _module(world_size: int, hidden_size: int, cluster: int = 1, topk: int = 1):
+def _module(world_size: int, hidden_size: int, cluster: int, topk: int):
     return load_jit(
         "beam_all_reduce_norm",
         str(world_size),
@@ -35,8 +42,16 @@ def _cluster_size(world_size: int, rows: int, topk: int) -> int:
 
 
 def beam_all_reduce_norm(
-    comm, branch, residual, post_weight, next_weight, eps, scales, *, routed_scale=1.0
-):
+    comm: Communicator,
+    branch: torch.Tensor,
+    residual: torch.Tensor,
+    post_weight: torch.Tensor,
+    next_weight: Optional[torch.Tensor],
+    eps: float,
+    scales: tuple[float, float],
+    *,
+    routed_scale: float = 1.0,
+) -> tuple[Optional[torch.Tensor], torch.Tensor]:
     """Return `(normalized, combined)` using a caller-owned V2 communicator.
 
     All ranks must call with identical shapes/epilogue and serialize use of the

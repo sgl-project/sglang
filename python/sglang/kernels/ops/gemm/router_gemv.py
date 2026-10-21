@@ -41,7 +41,7 @@ def _configs(w_dtype: torch.dtype):
     return _CUDA_FP32_CONFIGS if w_dtype == torch.float32 else _CONFIGS
 
 
-def _config(m: int, w_dtype: torch.dtype = torch.bfloat16):
+def _config(m: int, w_dtype: torch.dtype):
     configs = _configs(w_dtype)
     for max_m, cfg in configs:
         if m <= max_m:

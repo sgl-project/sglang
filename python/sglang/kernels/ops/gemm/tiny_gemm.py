@@ -48,7 +48,7 @@ def _jit_tiny_gemm_module(
     max_m: int,
     n_split: int,
     out_dtype: torch.dtype,
-    weight_dtype: torch.dtype = torch.bfloat16,
+    weight_dtype: torch.dtype,
 ) -> Module:
     use_k_variant = _prefer_k_variant(n, k)
     if weight_dtype not in (torch.bfloat16, torch.float32):
