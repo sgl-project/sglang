@@ -32,7 +32,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
@@ -490,7 +493,7 @@ class AscendAttnBackend(AttentionBackend):
             return False
         mode = forward_batch.forward_mode
         if self.use_dsa:
-            return not mode.is_idle()
+            return not dsa_use_prefill_cp(forward_batch) and not mode.is_idle()
         return self.use_mla and (mode.is_decode() or mode.is_target_verify())
 
     def get_mla_dcp_graph_replay_lengths(
