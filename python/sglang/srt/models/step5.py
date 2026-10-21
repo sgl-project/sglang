@@ -1369,7 +1369,8 @@ class Step5DecoderLayer(nn.Module):
                 if deferred is not None:
                     return deferred
             combined = routed + shared
-        # Stage boundaries own completion of the BF16 TP partials.
+        # Stage boundaries complete or carry the routed + shared TP sum,
+        # including under LoRA and at the terminal layer. Return partials here.
         return combined
 
     def forward(
