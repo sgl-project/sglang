@@ -1443,9 +1443,7 @@ class TestEpBufferState(_IsolatedServerArgs):
             num_experts=64,
         )
 
-        self.assertIsNot(
-            reg.by_key[target_key].buffer, reg.by_key[draft_key].buffer
-        )
+        self.assertIsNot(reg.by_key[target_key].buffer, reg.by_key[draft_key].buffer)
         DeepEPBuffer.set_dispatch_mode_as_normal()
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         self.assertEqual(

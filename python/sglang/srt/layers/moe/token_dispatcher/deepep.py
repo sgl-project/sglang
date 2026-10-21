@@ -205,7 +205,7 @@ class DeepEPBuffer:
             int(hidden_size),
             int(num_max_dispatch_tokens_per_rank),
         )
- 
+
     @classmethod
     def get_deepep_buffer(
         cls,
