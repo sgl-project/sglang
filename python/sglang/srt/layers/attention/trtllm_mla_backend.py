@@ -1017,8 +1017,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             raise NotImplementedError(
                 "trtllm_mla cannot forward a global causal bound to its decode "
                 "kernel, which is required for DCP with q_len > 1 (speculative "
-                "target-verify / draft-extend); select cutedsl_mla or "
-                "tokenspeed_mla for a DCP speculative run"
+                "target-verify / draft-extend); select cutedsl_mla "
+                "for a DCP speculative run"
             )
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
@@ -1073,10 +1073,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         o_sf_scale: float = 1.0,
     ):
         """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
-        in model-native dtype; subclasses do any kernel-specific quantization.
+        in model-native dtype, or already FP8 from a model-side prefill hook;
+        subclasses do any kernel-specific quantization.
         Returns the output tensor or (output, lse) if return_lse."""
         q_scale = k_scale = v_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn:
+        if self.data_type == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,

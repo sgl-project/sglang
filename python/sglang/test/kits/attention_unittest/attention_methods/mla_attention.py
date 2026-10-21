@@ -228,8 +228,8 @@ class MockMLAModelRunner(ModelRunner):
         self.device = device
         self.dtype = dtype
         # `kv_cache_dtype` is the dtype the *storage* uses. For FP8 KV
-        # cache (the production deployment dtype for tokenspeed_mla and
-        # some trtllm_mla configs), the pool stores quantized bytes
+        # cache (the production deployment dtype for some trtllm_mla
+        # configs), the pool stores quantized bytes
         # while the model still projects K/V in bf16; `set_mla_kv_buffer`
         # does the BF16->FP8 cast on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
