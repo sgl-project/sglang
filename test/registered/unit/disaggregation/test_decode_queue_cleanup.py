@@ -45,6 +45,9 @@ class FakeReceiver:
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def setUp(self):
+        world_size = patch("torch.distributed.get_world_size", return_value=1)
+        world_size.start()
+        self.addCleanup(world_size.stop)
         # The code under test reads its config from the bags.
         reset_context()
         self.addCleanup(reset_context)
@@ -86,6 +89,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
+            enable_overlap=False,
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
@@ -571,6 +575,12 @@ def _gated_decode_req(poll, restore_status):
 
 
 class TestDecodeHiCacheRestoreGate(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        world_size = patch("torch.distributed.get_world_size", return_value=1)
+        world_size.start()
+        self.addCleanup(world_size.stop)
+
     def test_gate_folds_restore_outcome_into_terminal_poll_only(self):
         cases = [
             (KVPoll.Success, HiCacheRestoreResult.READY, KVPoll.Success),

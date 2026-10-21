@@ -11,16 +11,17 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-    _ceil_ue8m0_exp,
-    quantize_fp4_indexer_row,
-    quantize_fp4_indexer_tensor,
-)
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     FP4_AMAX_FLOOR,
     rope_tail_fake_quant_fp4_row,
 )
-from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import (
+    _reduce_scale_bf16_block,
+)
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    _ceil_ue8m0_exp,
+    quantize_fp4_indexer_row,
+)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -811,94 +812,6 @@ def aiter_k_indexer_fp4_cache_write(
     )
 
 
-# FlyDSL split payload / scale layout; bytes equal AITER's fp4 writer up to the sign of zero
-@triton.jit
-def _store_fp4_index_k_split_kernel(
-    k_fp4,
-    k_sf,
-    payload,
-    scale,
-    loc,
-    page_size: tl.constexpr,
-    BLOCK: tl.constexpr,
-    PAGE8: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    cache_loc = tl.load(loc + token_id)
-    page = cache_loc // page_size
-    page_offset = cache_loc - page * page_size
-
-    # payload [page, 1, 4 chunks, page_size, 16 bytes]: chunk c holds dims [32c, 32c + 32).
-    offsets = tl.arange(0, BLOCK)
-    chunk = offsets // 16
-    byte = offsets - chunk * 16
-    k = tl.load(k_fp4 + token_id * BLOCK + offsets)
-    sf = tl.load(k_sf + token_id)
-    sf_offsets = tl.arange(0, 4)
-    sf_bytes = ((sf >> (sf_offsets * 8)) & 0xFF).to(tl.uint8)
-    if PAGE8:
-        # aiter's row-group 8-slot page: payload [t % 4][chunk][t // 4][16 B], scales [chunk][t]
-        page8 = cache_loc // 8
-        t = cache_loc % 8
-        tl.store(
-            payload
-            + page8 * (8 * BLOCK)
-            + ((t % 4) * 4 + chunk) * 32
-            + (t // 4) * 16
-            + byte,
-            k,
-        )
-        tl.store(scale + page8 * 32 + sf_offsets * 8 + t, sf_bytes)
-        return
-    tl.store(
-        payload
-        + page * (4 * page_size * 16)
-        + chunk * (page_size * 16)
-        + page_offset * 16
-        + byte,
-        k,
-    )
-    # scale [page, 1, 4, page_size]: the slot axis is a 16 x 4 tile transposed (the FlyDSL K ABI)
-    shuffled = (page_offset % 16) * 4 + page_offset // 16
-    tl.store(
-        scale + page * (4 * page_size) + sf_offsets * page_size + shuffled, sf_bytes
-    )
-
-
-def store_fp4_index_k_cache_split(
-    input: torch.Tensor,
-    payload: torch.Tensor,
-    scale: torch.Tensor,
-    loc: torch.Tensor,
-    *,
-    page_size: int,
-    rne: bool = False,
-    page8: bool = False,
-) -> None:
-    """Quantize input [n, 128] to fp4 (per-32 ue8m0) and scatter row i to slot
-    loc[i] of the split FlyDSL K layout (payload [pages, 1, 4, page_size, 16],
-    scale [pages, 1, 4, page_size] with the slot axis 16 x 4 transposed); with page8
-    each page holds eight 8-slot pages of aiter's row-group layout (pack_kv_cache)."""
-    assert input.shape[-1] == _HEAD_DIM
-    assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
-    assert payload.shape[1:] == (1, 4, page_size, 16), payload.shape
-    assert scale.shape[1:] == (1, 4, page_size), scale.shape
-    k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
-    n_tokens = k_fp4.shape[0]
-    if n_tokens == 0:
-        return
-    _store_fp4_index_k_split_kernel[(n_tokens,)](
-        k_fp4.view(torch.uint8),
-        k_sf,
-        payload.view(torch.uint8),
-        scale,
-        loc,
-        page_size,
-        BLOCK=64,
-        PAGE8=page8,
-    )
-
-
 def index_k_page8_views(
     payload: torch.Tensor, scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -909,36 +822,6 @@ def index_k_page8_views(
         payload.view(torch.uint8).view(pages8, 8 * _HEAD_DIM // 2),
         scale.view(pages8, 8 * _HEAD_DIM // 32),
     )
-
-
-def read_fp4_index_k_split(
-    payload: torch.Tensor,
-    scale: torch.Tensor,
-    slots: torch.Tensor,
-    *,
-    page_size: int,
-    page8: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of store_fp4_index_k_cache_split: (payload int8 [n, 64], scales
-    int32 [n] with chunk c's e8m0 byte at bits 8c..8c+7), the layout of
-    quantize_fp4_indexer_tensor."""
-    assert page_size == _KV_BLOCK_SIZE, "the 16 x 4 slot transpose spans a 64-slot page"
-    slots = slots.to(torch.int64)
-    if page8:
-        kv8, ks8 = index_k_page8_views(payload, scale)
-        page, t = slots // 8, slots % 8
-        kv8 = kv8.view(-1, 4, 4, 2, 16)  # [page8, t % 4, chunk, t // 4, 16]
-        rows = kv8[page, t % 4, :, t // 4, :].reshape(-1, 64).view(torch.int8)
-        sf = ks8.view(-1, 4, 8)[page, :, t].to(torch.int32)  # [n, 4]
-        packed = sf[:, 0] | (sf[:, 1] << 8) | (sf[:, 2] << 16) | (sf[:, 3] << 24)
-        return rows, packed
-    page, off = slots // page_size, slots % page_size
-    rows = payload.view(torch.uint8)[page, 0, :, off, :]  # [n, 4, 16]
-    rows = rows.reshape(-1, 64).view(torch.int8)
-    shuffled = (off % 16) * 4 + off // 16
-    sf = scale[page, 0, :, shuffled].to(torch.int32)  # [n, 4]
-    packed = sf[:, 0] | (sf[:, 1] << 8) | (sf[:, 2] << 16) | (sf[:, 3] << 24)
-    return rows, packed
 
 
 @triton.jit
@@ -995,63 +878,6 @@ def pack_fp4_query_flydsl(q: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             GROUP_N=_GROUP_SIZE,
         )
     return q_fp4, q_scale
-
-
-@triton.jit
-def _reduce_scale_bf16_block(
-    block,
-    part_ptr,
-    out_ptr,
-    M,
-    stride_ps,
-    stride_pm,
-    stride_om,
-    scale,
-    N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """One BLOCK of _reduce_scale_bf16_kernel (shared with the fused index-Q launch)."""
-    offs = block * BLOCK + tl.arange(0, BLOCK)
-    m = offs // N
-    n = offs % N
-    mask = m < M
-    acc = tl.load(part_ptr + m * stride_pm + n, mask=mask, other=0.0)
-    for s in tl.static_range(1, SPLIT_K):
-        acc += tl.load(
-            part_ptr + s * stride_ps + m * stride_pm + n, mask=mask, other=0.0
-        )
-    # bf16(bf16(sum) * scale): the linear's bf16 output, then the aten multiply rounded to bf16
-    w = acc.to(tl.bfloat16).to(tl.float32) * scale
-    tl.store(out_ptr + m * stride_om + n, w.to(tl.bfloat16), mask=mask)
-
-
-@triton.jit
-def _reduce_scale_bf16_kernel(
-    part_ptr,
-    out_ptr,
-    M,
-    stride_ps,
-    stride_pm,
-    stride_om,
-    scale,
-    N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    _reduce_scale_bf16_block(
-        tl.program_id(0),
-        part_ptr,
-        out_ptr,
-        M,
-        stride_ps,
-        stride_pm,
-        stride_om,
-        scale,
-        N=N,
-        SPLIT_K=SPLIT_K,
-        BLOCK=BLOCK,
-    )
 
 
 @triton.jit
@@ -1347,29 +1173,3 @@ def index_q_rope_pack_weights_flydsl(
         num_warps=4,
     )
     return q_fp4, q_scale, weights
-
-
-def indexer_head_weights(
-    x: torch.Tensor, weight: torch.Tensor, scale: float
-) -> torch.Tensor:
-    """bf16(bf16(x @ weight.T) * scale) as a contiguous bf16 [M, N], the layout the
-    FlyDSL logits kernels take. x bf16 [M, K] and weight bf16 [N, K], with
-    M <= rocm_gemv_split_k_max_tokens(n=N, k=K, weight_dtype=torch.bfloat16)."""
-    partials = rocm_router_gemv_split_k(x, weight)
-    split_k, M, N = partials.shape
-    out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-    block = triton.next_power_of_2(M * N)
-    _reduce_scale_bf16_kernel[(triton.cdiv(M * N, block),)](
-        partials,
-        out,
-        M,
-        partials.stride(0),
-        partials.stride(1),
-        out.stride(0),
-        float(scale),
-        N=N,
-        SPLIT_K=split_k,
-        BLOCK=block,
-        num_warps=4,
-    )
-    return out

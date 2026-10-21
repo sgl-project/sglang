@@ -37,10 +37,13 @@ from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     filter_kv_indices_for_cp_rank,
+    filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
 )
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_parallel,
     get_schedule,
@@ -116,6 +119,8 @@ class PrefillServerInfo:
     dsv41_spec_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
+    # Each prefill shard-group rank owns a subset of logical KV pages.
+    enable_kv_cache_sharding: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -282,6 +287,11 @@ class CommonKVManager(BaseKVManager):
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
 
+    # Logical-page KV sharding (PD prefill only): this rank's slot in the
+    # shard group. Each rank owns a subset of logical KV pages.
+    kv_shard_rank: int = 0
+    kv_shard_size: int = 1
+
     # Used by decode when the prefill reported Failed without a reason frame.
     DEFAULT_PREFILL_FAILURE_REASON = (
         "Failed to get kvcache from prefill instance, it might be dead"
@@ -340,6 +350,10 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = get_parallel().pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        if get_parallel().enable_kv_cache_sharding:
+            kv_shard_group = get_kv_shard_group(is_mla_backend)
+            self.kv_shard_rank = kv_shard_group.rank_in_group
+            self.kv_shard_size = kv_shard_group.world_size
         cp_sharded_prefill = self.attn_cp_size > 1 and (
             self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
         )
@@ -356,6 +370,8 @@ class CommonKVManager(BaseKVManager):
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
+            # No sharded rank holds a full page, so every CP rank sends.
+            or self.kv_shard_size > 1
         )
 
         # bind zmq socket
@@ -560,6 +576,7 @@ class CommonKVManager(BaseKVManager):
             len(self.transfer_queues),
             dcp_size,
             max_tokens,
+            device_type=get_device().device,
             include_draft=include_draft,
         )
         self._dcp_pack_max_tokens = max_tokens
@@ -1286,6 +1303,11 @@ class CommonKVManager(BaseKVManager):
                     "PD decode DCP currently requires prefill attention CP=1, "
                     f"got {info.attn_cp_size}."
                 )
+            if info.enable_kv_cache_sharding:
+                raise RuntimeError(
+                    "PD decode DCP does not support a prefill with "
+                    "--enable-kv-cache-sharding."
+                )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -1296,7 +1318,23 @@ class CommonKVManager(BaseKVManager):
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
         # TP rank mapping
-        if self.attn_tp_size == info.attn_tp_size:
+        # Only MLA shards across attn-TP, so non-MLA never reads the sharding flag.
+        if (
+            self.is_mla_backend
+            and info.enable_kv_cache_sharding
+            and info.attn_cp_size == 1
+        ):
+            # MLA KV sharded across prefill attn-TP: every decode rank pulls
+            # from all prefill TP ranks (None marks them all as real senders).
+            assert self.attn_tp_size == info.attn_tp_size, (
+                "MLA KV cache sharding requires equal prefill/decode attn TP "
+                f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
+            )
+            target_tp_rank = None
+            target_tp_ranks = list(range(info.attn_tp_size))
+            required_dst_info_num = self.attn_tp_size
+            required_prefill_response_num = info.attn_tp_size
+        elif self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
             required_dst_info_num = 1
             required_prefill_response_num = 1
@@ -1350,6 +1388,7 @@ class CommonKVManager(BaseKVManager):
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
                 or info.enable_dsa_cache_layer_split
+                or info.enable_kv_cache_sharding
             )
             if not pull_from_all_cp_ranks:
                 # Only retrieve from prefill CP rank 0 when not using all ranks
@@ -1446,6 +1485,7 @@ class CommonKVManager(BaseKVManager):
             "dsv41_spec_layout": self.dsv41_spec_layout,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -2098,7 +2138,17 @@ class CommonKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices
 
-        if (
+        if self.kv_mgr.kv_shard_size > 1:
+            kv_indices, index_slice = filter_kv_indices_for_shard_rank(
+                kv_indices=kv_indices,
+                index_slice=index_slice,
+                shard_rank=self.kv_mgr.kv_shard_rank,
+                shard_size=self.kv_mgr.kv_shard_size,
+            )
+            # Like the scheduler, skip a non-final chunk with nothing to send.
+            if len(kv_indices) == 0 and not is_last_chunk:
+                return kv_indices, index_slice, is_last_chunk, True
+        elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
             and not get_parallel().enable_dsa_cache_layer_split
         ):
@@ -2664,6 +2714,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.enable_kv_cache_sharding: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -2784,6 +2835,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
+        if self.enable_kv_cache_sharding is None:
+            self.enable_kv_cache_sharding = bool(
+                data.get("enable_kv_cache_sharding", False)
+            )
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -2850,6 +2906,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
