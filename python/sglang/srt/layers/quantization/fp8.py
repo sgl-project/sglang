@@ -3413,6 +3413,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             swiglu_limit=self.moe_runner_config.swiglu_limit or 0.0,
             hidden_pad=getattr(layer, "hidden_pad", 0),
             intermediate_pad=getattr(layer, "intermediate_pad", 0),
+            fp8_activations=(
+                self.is_fp4_expert and getattr(layer, "fp8_activations", False)
+            ),
             fused_moe_kwargs=fused_moe_kwargs,
         )
 
