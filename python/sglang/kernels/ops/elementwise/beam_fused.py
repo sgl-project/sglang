@@ -145,6 +145,3 @@ class BeamAttentionGateOp(BaseFusedOp):
         ):
             return self.forward_native(attention_output, gate, gate_bias, head_dim)
         return fused_attention_gate(attention_output, gate, gate_bias, head_dim)
-
-
-_BEAM_ATTENTION_GATE = BeamAttentionGateOp()

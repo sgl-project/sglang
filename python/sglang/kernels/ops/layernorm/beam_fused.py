@@ -253,6 +253,3 @@ class BeamSandwichResidualRMSNormOp(BaseFusedOp):
             *scales,
             enable_pdl=is_arch_support_pdl(),
         )
-
-
-_BEAM_SANDWICH_RESIDUAL_RMSNORM = BeamSandwichResidualRMSNormOp()
