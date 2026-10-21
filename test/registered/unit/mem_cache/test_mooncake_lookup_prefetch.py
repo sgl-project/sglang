@@ -90,6 +90,9 @@ class TestResetDrainsPrefetch(CustomTestCase):
         linker.layer_done_counter = type("Counter", (), {"reset": lambda self: None})()
 
         fetch_started, release_fetch = threading.Event(), threading.Event()
+        # Cleanups run last-in first-out: unblock the job before the shutdown
+        # above waits for it, even when an assertion fails first.
+        self.addCleanup(release_fetch.set)
 
         def blocked_fetch(keys):
             fetch_started.set()
