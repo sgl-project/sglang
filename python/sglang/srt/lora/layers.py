@@ -26,7 +26,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+from sglang.srt.lora.dense.plan import DenseLoraKind
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    capturing_lora_graph,
+    get_lm_head_lora_b_shard_size,
+)
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward, get_parallel
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -63,19 +68,22 @@ class BaseLayerWithLoRA(nn.Module):
 
     @property
     def lora_active(self) -> bool:
-        """True when this layer has LoRA buffers set AND the current forward
-        has LoRA batch metadata. batch_info is None on DP-attention idle
-        forwards (see LoRAManager.prepare_lora_batch), so idle forwards take
-        the base path."""
+        """Whether this forward must execute LoRA kernels.
+
+        DP-attention idle forwards have no batch metadata. Inactive batches
+        may still need LoRA kernels when capturing an adapter-capable graph.
+        """
         batch_info = self.lora_backend.get_batch_info()
-        return (
-            self.set_lora
-            and batch_info is not None
-            and (
-                not self.lora_backend.skip_inactive_lora_batches
-                or batch_info.has_active_lora
-            )
-        )
+        if not self.set_lora or batch_info is None:
+            return False
+        backend = self.lora_backend
+        if not (backend.skip_inactive_lora_batches or backend.skip_inactive_dense_lora):
+            return True
+        if batch_info.has_active_lora:
+            return True
+        if backend.skip_inactive_lora_batches:
+            return False
+        return capturing_lora_graph()
 
     def set_lora_info(self, *args):
         pass
@@ -124,6 +132,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
                 "VocabParallelEmbeddingWithLoRA with TP > 1 under input_scattered mode (e.g., DeepSeek-v2 MLA with --enable-attn-tp-input-scattered) is not fully supported and may produce incorrect results. Consider disabling input_scattered or removing embed_tokens from LoRA target modules."
             )
         offsets = [0, self.embed_dim]
+        self.lora_offsets = tuple(offsets)
         self.output_offset = torch.tensor(
             offsets,
             dtype=torch.int32,
@@ -149,7 +158,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.embedding_B_buffer = embedding_B_buffer  # (num_loras, embed_dim, rank)
 
     def apply_lora(
-        self, base_output: torch.Tensor, input_: torch.Tensor, batch_info
+        self, base_output: torch.Tensor, input_: torch.Tensor, batch_info=None
     ) -> torch.Tensor:
         """
         Apply LoRA to base embedding output.
@@ -170,7 +179,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def run_lora_a_embedding(
-        self, input_: torch.Tensor, batch_info: LoRABatchInfo
+        self, input_: torch.Tensor, batch_info: LoRABatchInfo | None = None
     ) -> torch.Tensor:
         """
         Apply LoRA A weights using efficient embedding lookup with CUDA graph support.
@@ -218,37 +227,28 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         )
 
     def forward(self, input_: torch.Tensor):
-        """
-        Forward pass with LoRA support and CUDA graph compatibility.
+        def base_fn():
+            # Mask only the base lookup; LoRA still sees the original token IDs.
+            base = self.base_layer.forward(
+                input_.masked_fill(input_ >= self.vocab_size, 0)
+            )
+            if getattr(self, "new_embeddings_buffer", None) is not None:
+                base = self.extra_token_embedding(input_, base)
+            return base
 
-        Extra tokens (tokens >= vocab_size) are now handled efficiently
-        in the backend's run_lora_a_embedding method.
-        """
-        batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.DP_LOCAL)
-
-        # Get base embedding output
-        # For tokens >= vocab_size, base_layer will clamp or handle them
-        # We mask them to 0 to avoid out-of-bounds access
-        added_tokens_mask = input_ > self.vocab_size - 1
-        base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
-
-        # [TODO] SGLang did not support extra/added token process; thus, self.extra_token_embedding only return original input_ now
-        # Extra tokens - It will replace extra token embedding with self.new_embeddings_buffer's emb (Default is 0)
-        if (
-            hasattr(self, "new_embeddings_buffer")
-            and self.new_embeddings_buffer is not None
-        ):
-            base_output = self.extra_token_embedding(input_, base_output)
-
-        # Apply LoRA if configured; DP-attention idle forwards take the base
-        # path (see lora_active).
         with get_forward().scoped(lora_batch_layout=LoRABatchLayout.DP_LOCAL):
             if self.lora_active:
-                # The backend's run_lora_a_embedding now handles both regular
-                # and extra tokens efficiently with CUDA graph support
-                base_output = self.apply_lora(base_output, input_, batch_info)
-
-        return base_output
+                return self.lora_backend.forward_with_base(
+                    self,
+                    input_,
+                    base_fn,
+                    self.embedding_A_buffer,
+                    self.embedding_B_buffer,
+                    self.output_offset,
+                    self.lora_offsets,
+                    kind=DenseLoraKind.EMBEDDING,
+                )
+            return base_fn()
 
     def slice_lora_a_weights(self, A: torch.Tensor):
         # LoRA A weights (rank, vocab_size) are kept unsharded.
@@ -311,6 +311,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             )
             offsets = [0, self.shard_vocab_size]
 
+        self.lora_offsets = tuple(offsets)
         self.output_offset = torch.tensor(
             offsets,
             dtype=torch.int32,
@@ -354,9 +355,8 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         if batch_info is not None:
             if batch_info.use_cuda_graph:
                 raise RuntimeError(
-                    "lm_head LoRA with pruned batch info is not supported "
-                    "under CUDA graph. lm_head pruning should only occur "
-                    "during extend, which does not use CUDA graph."
+                    "Pruned lm_head LoRA metadata is eager-only and must run "
+                    "outside the captured model graph."
                 )
             if num_tokens != batch_info.expected_tokens:
                 raise RuntimeError(
@@ -403,15 +403,24 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
     def forward(self, hidden_states: torch.Tensor):
-        # Apply base linear transformation
-        base_output = F.linear(
-            hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
-        )
+        def base_fn():
+            return F.linear(
+                hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
+            )
 
         if self.lora_active:
-            base_output = self.apply_lora(base_output, hidden_states)
-
-        return base_output
+            return self.lora_backend.forward_with_base(
+                self,
+                hidden_states,
+                base_fn,
+                self.lm_head_A_buffer,
+                self.lm_head_B_buffer,
+                self.output_offset,
+                self.lora_offsets,
+                kind=DenseLoraKind.LM_HEAD,
+                pruned_batch_info=self._get_lm_head_batch_info(hidden_states.shape[0]),
+            )
+        return base_fn()
 
     # ------------------------------------------------------------------
     # Multi-pass lm_head support (chunked logprobs)
@@ -478,6 +487,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
+        self.lora_a, self.lora_b = A_buffer, B_buffer
+        self.lora_offsets = tuple(self.output_offset_cpu.tolist())
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
@@ -501,12 +512,22 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.start_lora_a_overlap(input_)
 
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_, bias
-        )
+
+        def base_fn():
+            return self.base_layer.quant_method.apply(self.base_layer, input_, bias)
 
         if lora_active:
-            output_parallel = self.apply_lora(output_parallel, input_)
+            output_parallel = self.lora_backend.forward_with_base(
+                self,
+                input_,
+                base_fn,
+                self.lora_a,
+                self.lora_b,
+                self.output_offset,
+                self.lora_offsets,
+            )
+        else:
+            output_parallel = base_fn()
 
         if self.base_layer.gather_output:
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -575,6 +596,8 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.use_gate_up_lora = (
             lora_n_slices == 2 and partition_sizes[0] == partition_sizes[1]
         )
+        self.lora_a, self.lora_b = A_buffer, B_buffer
+        self.lora_offsets = tuple(offsets)
 
     def _get_lora_n_slices(self) -> int:
         """Actual number of LoRA slices from the buffer shapes.
@@ -711,6 +734,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.set_lora = True
         self.A_buffer_qkv = A_buffer_qkv
         self.B_buffer_qkv = B_buffer_qkv
+        self.lora_a, self.lora_b = A_buffer_qkv, B_buffer_qkv
+        self.lora_offsets = tuple(self.output_offset_cpu.tolist())
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_output = self.lora_backend.run_qkv_lora(
@@ -788,6 +813,8 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             device="cpu",
             pin_memory=True,
         )
+        self.lora_a, self.lora_b = A_buffer, B_buffer
+        self.lora_offsets = tuple(offsets)
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
@@ -821,9 +848,11 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             if (tp_rank > 0 or self.base_layer.skip_bias_add)
             else self.base_layer.bias
         )
-        output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel, bias=bias_
-        )
+
+        def base_fn():
+            return self.base_layer.quant_method.apply(
+                self.base_layer, input_parallel, bias=bias_
+            )
 
         should_reduce = (
             self.base_layer.reduce_results
@@ -839,26 +868,21 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             all_reduce = get_parallel().attn_tp_group.all_reduce
         else:
             all_reduce = tensor_model_parallel_all_reduce
-        if lora_active and should_reduce:
-            lora_a_output = self.lora_backend.run_lora_a_sgemm(
-                input_parallel, self.A_buffer
+        if lora_active:
+            output_ = self.lora_backend.forward_with_base(
+                self,
+                input_parallel,
+                base_fn,
+                self.lora_a,
+                self.lora_b,
+                self.output_offset,
+                self.lora_offsets,
+                all_reduce=all_reduce if should_reduce else None,
             )
-            output_ = all_reduce(output_parallel)
-            lora_a_output = all_reduce(lora_a_output)
-            output_ = self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output,
-                weights=self.B_buffer,
-                output_offset=self.output_offset,
-                output_offset_cpu=self.output_offset_cpu,
-                base_output=output_,
-            )
+        elif should_reduce:
+            output_ = all_reduce(base_fn())
         else:
-            if lora_active:
-                output_parallel = self.apply_lora(output_parallel, input_parallel)
-            if should_reduce:
-                output_ = all_reduce(output_parallel)
-            else:
-                output_ = output_parallel
+            output_ = base_fn()
 
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output_, output_bias
@@ -920,6 +944,8 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
                 dtype=torch.int32,
                 device=B_buffer.device,
             )
+        self.lora_a, self.lora_b = A_buffer, B_buffer
+        self.lora_offsets = tuple(self._output_offset.tolist())
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         first_dim = self.first_output_dim
@@ -952,9 +978,22 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
 
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
-        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
+        def base_fn():
+            return self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
         if self.lora_active:
-            output = self.apply_lora(output, x)
+            output = self.lora_backend.forward_with_base(
+                self,
+                x,
+                base_fn,
+                self.lora_a,
+                self.lora_b,
+                self._output_offset,
+                self.lora_offsets,
+            )
+        else:
+            output = base_fn()
         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
         return output, output_bias
 
@@ -1012,7 +1051,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             base_layer.moe_runner_config.gemm1_alpha is not None
         )
 
-        # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -1038,8 +1076,13 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             if isinstance(base_layer.quant_method, UnquantizedFusedMoEMethod):
                 runner_backend = MoeRunnerBackend.TRITON
 
-        # ===== TO BE REFACTORED ====
         self._lora_runner_backend = runner_backend
+        if (lora_backend.name == "triton_v2") != runner_backend.is_lora():
+            raise ValueError(
+                "Routed MoE LoRA must pair --lora-backend triton_v2 with "
+                "--moe-runner-backend lora_cutedsl, lora_triton, or lora_marlin; "
+                "mixing new and legacy LoRA backends is unsupported"
+            )
         if runner_backend.is_experimental_sgl_trtllm():
             from sglang.srt.lora.trtllm_lora_temp.lora_layer import (
                 init_experimental_sgl_trtllm_lora,
@@ -1102,7 +1145,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = down_lora_b_weights
 
     def _get_lora_info(self):
-        """Build LoRAInfo for the current batch."""
+        """Build the legacy engine's batch payload."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
 
         batch_info = self.lora_backend.get_batch_info(LoRABatchLayout.TP_GLOBAL)
