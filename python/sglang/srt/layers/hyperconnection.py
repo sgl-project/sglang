@@ -5,13 +5,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -185,8 +187,10 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hc_count * self.hidden_size) % 2048 == 0
             )
             vecs = self.hc_count * self.hidden_size // 8
+            # Off on ROCm/HIP: on gfx950 Qwen decode both halves of the split pair
+            # sit at the ~4.2us launch floor, slower than the single fused kernel.
             self._split_combine_ok = (
-                envs.SGLANG_HC_COMBINE_SPLIT.get()
+                not _is_hip
                 and self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0

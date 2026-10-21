@@ -854,16 +854,6 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
-    # Use gfx950 BF16 Qwen HC mix when AITER FlyDSL hc_mix is available.
-    SGLANG_AITER_HC_MIX = EnvBool(True)
-    # Split hc_combine into a gate + apply pair. The split buys small-M rows more
-    # CTAs than the one-CTA-per-row fused kernel, at the price of a second
-    # dispatch. Default OFF for ROCm/HIP, where that dispatch is the whole cost:
-    # profiling Qwen decode on gfx950 put both halves at the ~4.2us floor every
-    # launch-bound kernel in the trace sits at, so the pair spent 8.3us on work
-    # one CTA streams well inside a single launch. Default ON elsewhere, where
-    # launches are cheaper and the split was tuned.
-    SGLANG_HC_COMBINE_SPLIT = EnvBool(lambda: not _default_hip())
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom

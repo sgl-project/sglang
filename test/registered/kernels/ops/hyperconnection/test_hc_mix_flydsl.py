@@ -4,7 +4,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -19,13 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_disabled_does_not_require_gpu():
-    with envs.SGLANG_AITER_HC_MIX.override(False):
-        assert not flydsl_hc_mix_weights_supported(None, None, 4)
-
-
-def test_gated_residual_dispatch(monkeypatch):
-    monkeypatch.delenv("SGLANG_AITER_HC_MIX", raising=False)
+def test_gated_residual_dispatch():
     if torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx950":
         pytest.skip("Requires gfx950")
     from aiter.ops.flydsl.hc_mix import hc_mix
@@ -74,9 +67,8 @@ def test_gated_residual_dispatch(monkeypatch):
 
 
 @pytest.mark.parametrize("rows", [32, 96, 128])
-def test_gated_residual_dispatch_many_rows(monkeypatch, rows):
+def test_gated_residual_dispatch_many_rows(rows):
     # Speculative verify passes carry requests x draft tokens rows.
-    monkeypatch.delenv("SGLANG_AITER_HC_MIX", raising=False)
     if torch.cuda.get_device_properties().gcnArchName.split(":")[0] != "gfx950":
         pytest.skip("Requires gfx950")
     from aiter.ops.flydsl.hc_mix import hc_mix

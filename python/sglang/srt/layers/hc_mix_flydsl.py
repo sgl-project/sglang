@@ -5,8 +5,6 @@ from importlib.util import find_spec
 
 import torch
 
-from sglang.srt.environ import envs
-
 # AITER's kernel limit; it stays ahead of the torch.compile fallback up to it
 # (K=10240, R=320, cold weights: 26 vs 42 us at 128 rows).
 _MAX_ROWS = 128
@@ -25,13 +23,13 @@ def _aiter_hc_mix_available():
 
 
 def flydsl_hc_mix_weights_supported(down, up, hc):
-    """Environment, device and weight-shape half of the check.
+    """Device and weight-shape half of the check.
 
     None of it changes after the weights are loaded, so callers evaluate it
     once per layer and pass the result to ``flydsl_hc_mix_supported``.
     """
-    # Keep FlyDSL/AITER imports off the NVIDIA and disabled paths.
-    if not envs.SGLANG_AITER_HC_MIX.get() or torch.version.hip is None:
+    # Keep FlyDSL/AITER imports off the NVIDIA path.
+    if torch.version.hip is None:
         return False
     r, k = down.shape
     # pack_hc_weights tiles K by 64 and R by 32, and makes its own contiguous
