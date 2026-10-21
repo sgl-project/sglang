@@ -14,6 +14,10 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
+from sglang.kernels.ops.attention.fla.chunk_kda_chain_gfx950 import (
+    can_use_kda_chain_prefill,
+    chunk_kda_chain_fwd,
+)
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -1158,6 +1162,32 @@ def chunk_kda_fwd(
         fuse_diagonal=_small_grid,
         fuse_recompute=_small_grid,
     )
+
+    if can_use_kda_chain_prefill(
+        q=q,
+        k=kg,
+        v=u,
+        w=w,
+        gk=g,
+        A=Aqk,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens,
+        output_intermediate_states=output_intermediate_states,
+    ):
+        o = chunk_kda_chain_fwd(
+            q=q,
+            k=kg,
+            v=u,
+            w=w,
+            gk=g,
+            A=Aqk,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+        )
+        del w, u, kg, Aqk
+        return o
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
