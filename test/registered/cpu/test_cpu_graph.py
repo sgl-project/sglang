@@ -64,7 +64,7 @@ class TestCPUGraph(CustomTestCase):
                 "--cuda-graph-bs-decode",
                 "2",
                 "--tp",
-                f"{n_numa_node}",
+                "6",
             ],
             env={"SGLANG_CPU_OMP_THREADS_BIND": bind if bind is not None else "all"},
         )
