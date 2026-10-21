@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.kvcache.cache_ops import absorbed_bmm_concat_cast_q_fp8
+from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -942,8 +942,7 @@ class DeepseekMLAForwardMixin:
 
         return (
             self.rotary_emb is not None
-            and self.current_attention_backend
-            in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
+            and self.current_attention_backend in ("trtllm_mla", "cutedsl_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
