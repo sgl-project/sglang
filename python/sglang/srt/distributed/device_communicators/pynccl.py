@@ -414,6 +414,8 @@ class PyNcclCommunicator:
         if enable is None:
             # guess a default value when not specified
             enable = self.available
+        else:
+            enable = enable and self.available
 
         old_disable = self.disabled
         self.disabled = not enable
