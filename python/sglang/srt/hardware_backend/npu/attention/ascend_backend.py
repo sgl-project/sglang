@@ -350,7 +350,6 @@ class AscendAttnBackend(AttentionBackend):
         # Draft KV remains replicated even when the target uses DCP.
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
         self.dcp_rank = 0 if self.is_draft_worker else parallel.attn_dcp_rank
-        self.dcp_interleave_size = self.page_size
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
@@ -518,7 +517,7 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens_cpu,
             self.dcp_size,
             self.dcp_rank,
-            interleave_size=self.dcp_interleave_size,
+            interleave_size=self.page_size,
         )
         return local_seq_lens.tolist() + [0] * (bs - local_seq_lens.numel())
 
@@ -529,13 +528,13 @@ class AscendAttnBackend(AttentionBackend):
         is_spec: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build rank-local paged KV metadata for NPU DSA DCP."""
-        page_stride = self.dcp_interleave_size * self.dcp_size
+        page_stride = self.page_size * self.dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
         block_tables, local_kv_lens = build_mla_dcp_local_block_tables(
             self.req_to_token,
             req_pool_indices,
             kv_lens_cpu,
-            self.dcp_interleave_size,
+            self.page_size,
             self.dcp_size,
             self.dcp_rank,
             num_pages=(max_len + page_stride - 1) // page_stride,
@@ -819,9 +818,7 @@ class AscendAttnBackend(AttentionBackend):
                     device=self.device,
                 )
         else:
-            graph_num_pages = max(
-                1, (graph_context_len + self.page_size - 1) // self.page_size
-            )
+            graph_num_pages = max(1, total_context_len // self.page_size)
             self.graph_metadata = {
                 "block_tables": torch.empty(
                     (max_bs, graph_num_pages),
@@ -831,7 +828,7 @@ class AscendAttnBackend(AttentionBackend):
             }
         # DCP decode needs its own block_table (different stride: dcp_page_size).
         if self._use_dsa_dcp():
-            dcp_page_size = self.dcp_interleave_size * self.dcp_size
+            dcp_page_size = self.page_size * self.dcp_size
             max_dcp_seq_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
             # The captured DSA indexer cache-write operation reads from this fixed
             # buffer. Replay refreshes its allocator-global slot ids before execution.
@@ -880,9 +877,7 @@ class AscendAttnBackend(AttentionBackend):
             # Pre-allocated index buffer for mask generation during replay,
             # avoids torch.arange allocation on every replay step.
             self.graph_metadata["swa_indices"] = torch.arange(
-                total_context_len,
-                device=self.device,
-                dtype=torch.int32,
+                total_context_len, device=self.device, dtype=torch.int32
             )
         if self.use_sliding_window_kv_pool:
             # refilled in place at replay; the captured graph reads this storage
@@ -1746,7 +1741,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_cached,
                 k_rope_cached,
                 prefix_lens_cpu,
-                interleave_size=self.dcp_interleave_size,
+                interleave_size=self.page_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
 

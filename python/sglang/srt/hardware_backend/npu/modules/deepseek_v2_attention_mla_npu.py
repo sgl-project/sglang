@@ -517,7 +517,7 @@ def forward_dsa_prepare_npu(
                 topk_indices,
                 backend.dcp_size,
                 backend.dcp_rank,
-                interleave_size=backend.dcp_interleave_size,
+                interleave_size=backend.page_size,
             )
     else:
         topk_indices = prev_topk_indices
