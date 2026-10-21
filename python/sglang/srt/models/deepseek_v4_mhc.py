@@ -219,11 +219,6 @@ def is_deferred_finalize(routed) -> bool:
     return isinstance(routed, FlashInferTrtllmDeferredFinalizeOutput)
 
 
-def accepts_mxfp8_deepgemm_input(attn) -> bool:
-    method = getattr(attn, "accepts_mxfp8_deepgemm_input", None)
-    return bool(method is not None and method())
-
-
 def make_boundary(
     norm: RMSNorm,
     *,

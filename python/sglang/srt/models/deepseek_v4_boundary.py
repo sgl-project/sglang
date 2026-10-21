@@ -187,7 +187,7 @@ class HcReadCall(HcRead):
             and self.layer.self_attn.accepts_mxfp8_swizzled_input(),
             hc=hc,
             accepts_mxfp8_deepgemm=self.attention
-            and mhc.accepts_mxfp8_deepgemm_input(self.layer.self_attn),
+            and self.layer.self_attn.fused_mxfp8_wqkv_a,
         )
 
     def _after_post(self, residual, norm):

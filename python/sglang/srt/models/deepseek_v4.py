@@ -1398,14 +1398,8 @@ class MQALayer(MqaAttentionBase):
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
         self.mega_wq_b_permuted = False
-        self._fused_mxfp8 = None
-        if (
-            self.use_mega_attention
-            and envs.SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS.get()
-        ):
-            self.wo_b.prepare_deepgemm_mxfp8_input = True
-            if self.fuse_wqa_wkv:
-                self.wqkv_a.prepare_deepgemm_mxfp8_input = True
+        self.fused_mxfp8_wqkv_a = False
+        self.fused_mxfp8_wo_b = False
 
         self.use_fused_qk_norm_rope = _is_hip and _hip.use_fused_qk_norm_rope(self)
         # Static eligibility; token count and wo_b's output format are checked
@@ -1471,30 +1465,27 @@ class MQALayer(MqaAttentionBase):
                 method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
-
-    def _fused_mxfp8_producers(self) -> Tuple[bool, bool]:
-        if self._fused_mxfp8 is None:
-            wqkv_a = bool(
-                self.fuse_wqa_wkv
-                and hasattr(self.wqkv_a, "weight_scale_inv_deepgemm_input")
-                and self.accepts_mxfp8_swizzled_input()
+        if envs.SGLANG_OPT_DSV41_FUSED_MXFP8_PRODUCERS.get():
+            self.fused_mxfp8_wqkv_a = (
+                self.fuse_wqa_wkv and self._prepare_deepgemm_mxfp8_input(self.wqkv_a)
             )
-            wo_b = bool(
-                self.mega_wo_a is not None
-                and hasattr(self.wo_b, "weight_scale_inv_deepgemm_input")
-                and self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+            self.fused_mxfp8_wo_b = (
+                self.n_local_groups * self.o_lora_rank == self.wo_b.weight.shape[-1]
+                and self._prepare_deepgemm_mxfp8_input(self.wo_b)
             )
-            self._fused_mxfp8 = (wqkv_a, wo_b)
-            if self.layer_id == 0 and (
-                getattr(self.wo_b, "prepare_deepgemm_mxfp8_input", False)
-            ):
+            if self.layer_id == 0:
                 logger.info(
-                    "DSv4.1 fused MXFP8 producers: wqkv_a=%s wo_b=%s", wqkv_a, wo_b
+                    "DSv4.1 fused MXFP8 producers: wqkv_a=%s wo_b=%s",
+                    self.fused_mxfp8_wqkv_a,
+                    self.fused_mxfp8_wo_b,
                 )
-        return self._fused_mxfp8
 
-    def accepts_mxfp8_deepgemm_input(self) -> bool:
-        return self._fused_mxfp8_producers()[0]
+    @staticmethod
+    def _prepare_deepgemm_mxfp8_input(linear) -> bool:
+        method = linear.quant_method
+        return isinstance(
+            method, Fp8LinearMethod
+        ) and method.prepare_deepgemm_mxfp8_input(linear)
 
     def _wq_b_uses_flashinfer_mxfp8(self) -> bool:
         method = self.wq_b.quant_method
@@ -1554,7 +1545,7 @@ class MQALayer(MqaAttentionBase):
         if (
             allow_mxfp8_output
             and 0 < rows <= mhc.FUSED_MXFP8_PRODUCER_MAX_ROWS
-            and self._fused_mxfp8_producers()[1]
+            and self.fused_mxfp8_wo_b
             and not get_forward().is_extend_in_batch
             and not get_forward().sp_active
         ):

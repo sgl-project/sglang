@@ -70,7 +70,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
-    prepare_deepgemm_mxfp8_input_path,
     prepare_xpu_block_scale_for_scaled_mm,
     requant_block_scale_ue8m0_for_deepgemm,
     resolve_block_fp8_mxfp8_backend,
@@ -789,8 +788,6 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.requires_grad_(False)
             layer.weight_scale_inv.format_ue8m0 = True
             self._process_mxfp8_linear_weight_scale(layer)
-            if getattr(layer, "prepare_deepgemm_mxfp8_input", False):
-                prepare_deepgemm_mxfp8_input_path(layer)
             return
         elif _is_npu and is_npu_arch35():
             from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
@@ -974,8 +971,47 @@ class Fp8LinearMethod(LinearMethodBase):
         # the swizzled copy is stored separately.
         self._process_mxfp8_linear_weight_scale(layer, scale_u8=scale_u8)
         layer.block_fp8_mxfp8_ready = True
-        if getattr(layer, "prepare_deepgemm_mxfp8_input", False):
-            prepare_deepgemm_mxfp8_input_path(layer)
+
+    def prepare_deepgemm_mxfp8_input(self, layer: Module) -> bool:
+        """Pack the DeepGEMM-side weight scale for Mxfp8DeepGemmInput."""
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        backend = self.mxfp8_dense_backend
+        if not (
+            _is_cuda
+            and get_platform().is_blackwell
+            and backend is not None
+            and (backend.is_flashinfer_cutedsl() or backend.is_flashinfer_cutlass())
+            and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ):
+            return False
+        n, k = layer.weight.shape
+        if n % 64 != 0 or k % 128 != 0:
+            return False
+        if self.use_mxfp8:
+            scale_u8 = layer.weight_scale_inv.data.view(torch.uint8).reshape(n, k // 32)
+        elif self.block_fp8_as_mxfp8 and layer.block_fp8_mxfp8_ready:
+            scale_u8 = block_fp8_scale_to_mxfp8_e8m0(
+                layer.weight_scale_inv.data, (n, k), self.weight_block_size
+            )
+        else:
+            return False
+        import deep_gemm.utils.layout
+
+        scale_fp32 = (
+            (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+            .view(torch.float32)
+            .view(n, k // 32)
+        )
+        copy_or_rebind_param(
+            layer,
+            "weight_scale_inv_deepgemm_input",
+            deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                scale_fp32
+            ),
+        )
+        return True
 
     def _process_mxfp8_linear_weight_scale(
         self, layer: Module, scale_u8: Optional[torch.Tensor] = None
