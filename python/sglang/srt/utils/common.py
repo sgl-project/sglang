@@ -4508,7 +4508,6 @@ def get_cpu_ids_by_node():
     return [
         ",".join(map(str, sorted(cpus)))
         for _, cpus in sorted(node_to_cpus.items())
-        if cpus
     ]
 
 
