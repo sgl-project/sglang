@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
     from sglang.srt.mem_cache.unified_radix_cache import (
         NodeId,
@@ -367,10 +368,11 @@ class TreeComponent(ABC):
         return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
+        """Length of the stored device indices, including entries without backing."""
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
-    def reclaimable_tokens(self, node: UnifiedTreeNode) -> int:
+    def reclaimable_value_len(self, node: UnifiedTreeNode) -> int:
         """Pool tokens the allocator gets back when this node's device value
         is evicted. The evictable/protected ledgers count these (prefill
         admission adds the evictable ledger to the allocator's free space, and
@@ -779,16 +781,18 @@ class TreeComponent(ABC):
     def create_buffer_pipeline(
         self,
         *,
-        swa_window_pages: int,
+        swa_component: Optional[SWAComponent],
         write_backlog_cap: int,
         max_context_len: int = 0,
+        auxiliary_swa_component: Optional[SWAComponent] = None,
     ) -> BufferModePipeline:
         """Called on the FULL component to construct the buffer-mode pipeline."""
         from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 
         return BufferModePipeline(
             cache=self.cache,
-            swa_window_pages=swa_window_pages,
+            swa_component=swa_component,
+            auxiliary_swa_component=auxiliary_swa_component,
             write_backlog_cap=write_backlog_cap,
             max_context_len=max_context_len,
         )

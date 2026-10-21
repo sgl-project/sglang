@@ -22,12 +22,10 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
-    get_bool_env_var,
-    is_cpu,
     is_cuda,
-    is_gfx1250_supported,
     is_hip,
     is_musa,
     is_xpu,
@@ -36,11 +34,9 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_cpu = is_cpu()
 _is_musa = is_musa()
-_is_gfx1250 = is_gfx1250_supported()
 _is_xpu = is_xpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
     from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
@@ -347,112 +343,6 @@ def _per_token_group_quant_8bit_raw(
     return x_q, x_s
 
 
-def _per_token_group_quant_8bit_fuse_silu_and_mul(
-    x: torch.Tensor,
-    group_size: int,
-    dst_dtype: torch.dtype,
-    column_major_scales: bool,
-    scale_tma_aligned: bool,
-    scale_ue8m0: bool,
-    masked_m: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # Another way to implement (can be used in e.g. comparison tests)
-    # from sgl_kernel import silu_and_mul
-    # x_after_silu_and_mul = silu_and_mul(x)
-    # return per_token_group_quant_fp8(
-    #     x_after_silu_and_mul,
-    #     group_size=group_size,
-    #     eps=eps,
-    #     column_major_scales=column_major_scales,
-    #     scale_tma_aligned=scale_tma_aligned,
-    #     scale_ue8m0=scale_ue8m0,
-    # )
-
-    from deep_gemm import transform_sf_into_required_layout
-
-    from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_post_quant_fwd
-
-    assert column_major_scales
-    assert scale_tma_aligned
-    assert scale_ue8m0
-
-    needs_unsqueeze = x.dim() == 2
-    if needs_unsqueeze:
-        num_tokens, _ = x.shape
-        x = x.unsqueeze(0)
-        assert masked_m is None
-        masked_m = torch.tensor([num_tokens], device=x.device, dtype=torch.int32)
-
-    # Use `zeros` for easier testing
-    output = torch.zeros(
-        (*x.shape[:-1], x.shape[-1] // 2),
-        device=x.device,
-        dtype=dst_dtype,
-    )
-    # Use `zeros` for easier testing
-    output_scale_for_kernel = torch.zeros(
-        (*x.shape[:-1], x.shape[-1] // 2 // group_size),
-        device=x.device,
-        dtype=torch.float32,
-    )
-    silu_and_mul_masked_post_quant_fwd(
-        input=x,
-        output=output,
-        output_scale=output_scale_for_kernel,
-        quant_group_size=group_size,
-        masked_m=masked_m,
-        scale_ue8m0=scale_ue8m0,
-    )
-
-    output_scale = transform_sf_into_required_layout(
-        output_scale_for_kernel,
-        num_groups=output.shape[0],
-        mn=output.shape[-2],
-        k=output.shape[-1],
-        recipe=(1, group_size, group_size),
-        is_sfa=True,
-    )
-
-    if needs_unsqueeze:
-        output = output.squeeze(0)
-        output_scale = output_scale.squeeze(0)
-
-    return output, output_scale
-
-
-def per_token_group_quant_8bit(
-    x: torch.Tensor,
-    group_size: int,
-    dst_dtype: torch.dtype,
-    eps: float = 1e-10,
-    column_major_scales: bool = False,
-    scale_tma_aligned: bool = False,
-    scale_ue8m0: bool = False,
-    fuse_silu_and_mul: bool = False,
-    masked_m: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if fuse_silu_and_mul:
-        return _per_token_group_quant_8bit_fuse_silu_and_mul(
-            x=x,
-            group_size=group_size,
-            dst_dtype=dst_dtype,
-            column_major_scales=column_major_scales,
-            scale_tma_aligned=scale_tma_aligned,
-            scale_ue8m0=scale_ue8m0,
-            masked_m=masked_m,
-        )
-    else:
-        return _per_token_group_quant_8bit_raw(
-            x=x,
-            group_size=group_size,
-            eps=eps,
-            column_major_scales=column_major_scales,
-            scale_tma_aligned=scale_tma_aligned,
-            scale_ue8m0=scale_ue8m0,
-            dtype=dst_dtype,
-        )
-
-
 def create_per_token_group_quant_fp8_output_scale(
     x_shape,
     device,
@@ -730,86 +620,6 @@ def sglang_per_token_group_quant_fp8_row_padded(
         x_q[m:].zero_()
         x_s[m:].zero_()
     return x_q, x_s
-
-
-def sglang_per_token_group_quant_fp8_ue8m0(
-    x: torch.Tensor,
-    group_size: int,
-    eps: float = 1e-10,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert x.shape[-1] % group_size == 0, (
-        f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
-    )
-    assert x.is_contiguous(), "x must be contiguous"
-
-    *x_batch, x_q_mn, x_q_k = x.shape
-    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
-
-    x_s_mn = x_q_mn
-    x_s_k = x_q_k // group_size
-    aligned_mn = ceil_align(x_s_mn, 4)
-    aligned_k = ceil_align(x_s_k, 4)
-    x_s = torch.empty(
-        (*x_batch, aligned_k // 4, aligned_mn),
-        device=x.device,
-        dtype=torch.int,
-    ).transpose(-1, -2)[..., :x_s_mn, :]
-
-    if x.shape[0] > 0:
-        _run_per_token_group_quant_8bit_kernel(
-            x,
-            x_q,
-            x_s,
-            group_size,
-            eps,
-            fp8_min,
-            fp8_max,
-            scale_ue8m0=True,
-            fuse_silu_and_mul=False,
-            masked_m=None,
-        )
-
-    return x_q, x_s
-
-
-# TODO maybe unify int8 and fp8 code later
-def sglang_per_token_group_quant_8bit(
-    x: torch.Tensor,
-    group_size: int,
-    dst_dtype: torch.dtype,
-    eps: float = 1e-10,
-    column_major_scales: bool = False,
-    scale_tma_aligned: bool = False,
-    scale_ue8m0: bool = False,
-    fuse_silu_and_mul: bool = False,
-    masked_m: Optional[torch.Tensor] = None,
-):
-    from sglang.kernels.ops.quantization.int8_kernel import (
-        sglang_per_token_group_quant_int8,
-    )
-
-    if dst_dtype == torch.int8:
-        assert not column_major_scales
-        assert not scale_tma_aligned
-        assert not fuse_silu_and_mul
-        assert masked_m is None
-        return sglang_per_token_group_quant_int8(
-            x=x,
-            group_size=group_size,
-            eps=eps,
-            dtype=dst_dtype,
-        )
-
-    return sglang_per_token_group_quant_fp8(
-        x=x,
-        group_size=group_size,
-        eps=eps,
-        column_major_scales=column_major_scales,
-        scale_tma_aligned=scale_tma_aligned,
-        scale_ue8m0=scale_ue8m0,
-        fuse_silu_and_mul=fuse_silu_and_mul,
-        masked_m=masked_m,
-    )
 
 
 def sglang_per_token_quant_fp8(
@@ -1295,160 +1105,6 @@ else:
             )  # True for static
 
         return output, scale
-
-
-fp8_autotune = triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps)
-        for block_m in [16, 32, 64, 128]
-        for num_warps in [2, 4, 8]
-    ],
-    key=["K", "BLOCK_K", "M_ALIGNMENT"],
-)
-
-
-@triton.jit
-def _per_token_group_quant_fp8_hopper_moe_mn_major(
-    a,  # (M, K):(K, 1)
-    expert_offsets,  # (num_experts,)
-    problem_sizes,  # (num_experts, 3)
-    a_fp8,  # (M, K):(K, 1)
-    sfa,  # (M, k)
-    K: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    M_ALIGNMENT: tl.constexpr,
-    FP8_DTYPE: tl.constexpr,
-    BLOCK_M: tl.constexpr,  # tune
-):
-    k_offset = tl.program_id(0)
-    expert_id = tl.program_id(1)
-
-    m = tl.load(problem_sizes + expert_id * 3)
-    current_expert_offset = tl.load(expert_offsets + expert_id).to(tl.int64)
-    tl.multiple_of(m, M_ALIGNMENT)
-    tl.multiple_of(current_expert_offset, M_ALIGNMENT)
-
-    coord_k = k_offset * BLOCK_K + tl.arange(0, BLOCK_K)
-    for i in tl.range(tl.cdiv(m, BLOCK_M)):
-        coord_m = i * BLOCK_M + tl.arange(0, BLOCK_M)
-        a_ptrs = a + current_expert_offset * K + coord_m[:, None] * K + coord_k[None, :]
-        a_mask = (coord_m < m)[:, None] & (coord_k < K)[None, :]
-
-        inp = tl.load(a_ptrs, mask=a_mask).to(tl.float32)  # [BLOCK_M, BLOCK_K]
-        inp_amax = tl.max(tl.abs(inp), axis=1)  # [BLOCK_M,]
-        inp_amax = tl.clamp(inp_amax, min=1e-4, max=float("inf"))
-        inp_fp8 = (inp * (448.0 / inp_amax[:, None])).to(FP8_DTYPE)
-
-        # Store fp8
-        a_fp8_ptrs = (
-            a_fp8 + current_expert_offset * K + coord_m[:, None] * K + coord_k[None, :]
-        )
-        tl.store(a_fp8_ptrs, inp_fp8.to(tl.uint8, bitcast=True), mask=a_mask)
-
-        # Store sfa
-        k = tl.cdiv(K, BLOCK_K)
-        sfa_ptrs = (
-            sfa + current_expert_offset * k + k_offset * m + coord_m
-        )  # MN-Major with sfa
-        tl.store(sfa_ptrs, inp_amax / 448.0, mask=coord_m < m)
-
-
-if not _is_cpu:
-    _per_token_group_quant_fp8_hopper_moe_mn_major = fp8_autotune(
-        _per_token_group_quant_fp8_hopper_moe_mn_major
-    )
-
-
-def per_token_group_quant_fp8_hopper_moe_mn_major(
-    A: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    problem_sizes: torch.Tensor,
-    group_size: int,
-    expert_tokens_alignment: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert A.dim() == 2
-    assert A.is_contiguous(), "`A` is not contiguous"
-    assert A.shape[-1] % group_size == 0, (
-        "the last dimension of `A` cannot be divisible by `group_size`"
-    )
-
-    a_q = torch.empty_like(A, device=A.device, dtype=fp8_dtype)
-    M, K = A.shape[0], A.shape[1]
-    k = K // group_size
-    sfa = torch.empty((M, k), device=A.device, dtype=torch.float32)
-    num_experts = problem_sizes.shape[0]
-    grid = (k, num_experts)
-    _per_token_group_quant_fp8_hopper_moe_mn_major[grid](
-        A,
-        expert_offsets,
-        problem_sizes,
-        a_q.view(torch.uint8),
-        sfa,
-        K,
-        group_size,
-        expert_tokens_alignment,
-        fp8_dtype_to_triton(fp8_dtype),
-    )
-    return a_q, sfa
-
-
-@triton.jit
-def _per_group_transpose(
-    data_ptr: torch.Tensor,
-    trans_data_ptr: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    k: int,
-    M_ALIGNMENT: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    expert_id = tl.program_id(0)
-    m_id = tl.program_id(1)
-    k_id = tl.program_id(2)
-
-    curr_expert_offset = tl.load(expert_offsets + expert_id)
-    next_expert_offset = tl.load(expert_offsets + expert_id + 1)
-    num_tokens_of_expert = next_expert_offset - curr_expert_offset
-    tl.multiple_of(curr_expert_offset, M_ALIGNMENT)
-    tl.multiple_of(next_expert_offset, M_ALIGNMENT)
-
-    data_start_ptr = data_ptr + curr_expert_offset * k
-    trans_data_start_ptr = trans_data_ptr + curr_expert_offset * k
-
-    k_coord = k_id * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-    k_mask = k_coord < k
-    for start_m in tl.range(0, num_tokens_of_expert, BLOCK_SIZE_M * tl.num_programs(1)):
-        m_coord = start_m + m_id * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        m_mask = m_coord < num_tokens_of_expert
-        off = m_coord[:, None] * k + k_coord[None, :]
-        trans_off = m_coord[:, None] + k_coord[None, :] * num_tokens_of_expert
-        mask = m_mask[:, None] & k_mask[None, :]
-
-        data = tl.load(data_start_ptr + off, mask=mask)
-        tl.store(trans_data_start_ptr + trans_off, data, mask=mask)
-
-
-def per_group_transpose(
-    a: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    M_ALIGNMENT: int = 1,
-) -> torch.Tensor:
-    assert a.dim() == 2
-    assert a.is_contiguous(), "`a` is not contiguous"
-
-    m, k = a.size()
-    trans_a = torch.empty_like(a)
-    num_experts = expert_offsets.size(0) - 1
-
-    grid = lambda META: (
-        num_experts,
-        triton.cdiv((m + num_experts - 1) // num_experts, META["BLOCK_SIZE_M"]),
-        triton.cdiv(k, META["BLOCK_SIZE_K"]),
-    )
-    _per_group_transpose[grid](
-        a, trans_a, expert_offsets, k, M_ALIGNMENT, BLOCK_SIZE_M=16, BLOCK_SIZE_K=8
-    )
-    return trans_a
 
 
 @triton.jit

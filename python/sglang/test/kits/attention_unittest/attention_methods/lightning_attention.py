@@ -34,7 +34,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 _parallel_override = get_parallel().override(attn_tp_size=1, attn_tp_rank=0)
 _parallel_override.__enter__()
 
-# seg_la kernel constraints (see seg_la.py:683-694):
+# seg_la kernel constraints (see `seg_la_fwd` in seg_la.py):
 #   - decode (`seg_la_d_kernel`): K_SPLIT_DIM = 128, so head_dim must be >= 128
 #     for `k_dim_block = head_dim // K_SPLIT_DIM` to be at least 1.
 #   - prefill with bs > 2 (`seg_la_p_kernel`): V_SPLIT_DIM = 64, so head_dim must

@@ -443,11 +443,6 @@ def _precompute_rope_cache(
 
 
 class MiniMaxH3DenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
-
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
             transformer=transformer,

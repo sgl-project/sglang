@@ -2,7 +2,7 @@ import dataclasses
 import types
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -11,6 +11,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import schedule_batch  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     ScheduleBatch,
     split_cached_prefix_by_tier,
@@ -212,7 +213,11 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         extend_snapshot = _snapshot_mutable_fields(extend_batch)
         running_snapshot = _snapshot_mutable_fields(running_batch)
 
-        extend_batch.mix_with_running(running_batch)
+        settings = types.SimpleNamespace(
+            mamba=types.SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+        )
+        with patch.object(schedule_batch, "get_exec", return_value=settings):
+            extend_batch.mix_with_running(running_batch)
 
         self.assertEqual(extend_batch.forward_mode, ForwardMode.MIXED)
         self.assertIs(extend_batch.mix_running_indices, running_batch.req_pool_indices)
