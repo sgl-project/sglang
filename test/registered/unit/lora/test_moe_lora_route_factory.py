@@ -142,5 +142,45 @@ def test_route_cache_keys_match_mapping_and_options():
         build.assert_called_once_with()
 
 
+def test_moe_route_bundle_passes_each_route_its_view_groups_and_prefix(monkeypatch):
+    from sglang.srt.lora.moe import routing as moe_routing
+    from sglang.srt.lora.moe.plan import RouteBuilderFamily, RouteRequirement
+
+    slots = torch.tensor([0, 1, -1], dtype=torch.int32)
+    topk = torch.tensor([[0, 2], [1, 0], [-1, 2]], dtype=torch.int32)
+    built = {}
+
+    def build(mapping, **kwargs):
+        route = object()
+        built[route] = mapping, kwargs
+        return route
+
+    monkeypatch.setattr(moe_routing, "build_route", build)
+    plan = SimpleNamespace(
+        route_requirements=lambda: set(RouteRequirement),
+        route_builder=RouteBuilderFamily.STANDARD,
+    )
+    routes = moe_routing.build_moe_routes(
+        plan,
+        topk_ids=topk,
+        token_lora_mapping=slots,
+        num_local_experts=3,
+        max_loras=2,
+        block_size=16,
+        workspace=Workspace(),
+    )
+    for requirement in RouteRequirement:
+        name = requirement.name
+        field = name.lower().removesuffix("_plan")
+        _, args = built[getattr(routes, field)]
+        assert args["view"].value == ("raw" if name.startswith("RAW_") else "aligned")
+        assert args.get("group_ids") is (None if name == "SHARED_TOKEN_PLAN" else topk)
+        assert args.get("groups_per_slot", 1) == (
+            3 if name.endswith("PER_EXPERT") else 1
+        )
+        if name.startswith("ALIGNED_"):
+            assert args["tensor_prefix"] == f"route:{field}"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
