@@ -62,13 +62,11 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import (
-    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
     is_npu,
     is_xpu,
-    next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import fast_topk
@@ -79,7 +77,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -87,10 +84,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-
-
-if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
 
 
 logger = logging.getLogger(__name__)
@@ -817,31 +810,25 @@ def move_accept_tokens_to_target_kvcache(
         "spec v2 move_accept_tokens accept_index",
     )
 
-    tgt_cache_loc = torch.zeros(
-        size,
-        dtype=torch.int64,
-        device=device,
-    )
+    # The targets lead each request's verify window. Take them from out_cache_loc,
+    # not req_to_token: after verify's read-done the scheduler may hand a finished
+    # request's row to a new request.
+    window = batch.out_cache_loc.size(0) // bs
+    cols = torch.arange(accept_index.shape[1], device=device)
+    front_index = torch.where(
+        cols < (num_correct_drafts + 1).unsqueeze(1),
+        torch.arange(bs, device=device).unsqueeze(1) * window + cols,
+        -1,
+    ).to(accept_index.dtype)
+
+    tgt_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    if _is_cpu:
-        assign_extend_cache_locs_cpu(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-        )
-    else:
-        assign_extend_cache_locs[(bs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            batch.seq_lens + num_correct_drafts + 1,
-            tgt_cache_loc,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            next_power_of_2(bs),
-        )
+    fill_accept_out_cache_loc_func(
+        front_index,
+        batch.out_cache_loc,
+        tgt_cache_loc,
+        size,
+    )
     fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
