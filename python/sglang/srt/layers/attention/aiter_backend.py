@@ -540,6 +540,14 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
 
+        # Decode metadata format. unified_attention and pa_decode_gluon (the
+        # SHUFFLE 5D decode kernel) both read kv_indices as a 2-D
+        # (bs, max_num_blocks_per_seq) page table; the remaining decode kernels
+        # read flat per-token kv_indices addressed through kv_indptr.
+        self.decode_uses_page_table = (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        )
+
         # When topk == 1 the EAGLE draft chain is linear, so target_verify's
         # mask reduces to pure causal and can go through unified_attention
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
@@ -1201,10 +1209,6 @@ class AiterAttnBackend(AttentionBackend):
             bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
         )
 
-        # Build cu_seqlens_q from this batch's extend lengths. The standard
-        # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
-        # ForwardMetadata), so relying on it corrupts multi-sequence batches
-        # (only bs=1 happens to work).
         cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32, device=q.device)
         cu_seqlens_q[1:] = torch.cumsum(
             forward_batch.extend_seq_lens.to(torch.int32), dim=0
@@ -2052,7 +2056,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
 
-                if not self.use_triton_unified_attention:
+                if not self.decode_uses_page_table:
                     kv_indices = self._get_kv_indices_scratch(
                         forward_batch.seq_lens_sum, forward_batch.seq_lens.device
                     )
@@ -2117,7 +2121,7 @@ class AiterAttnBackend(AttentionBackend):
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
             else:
-                if self.use_triton_unified_attention and not self.use_mla:
+                if self.decode_uses_page_table and not self.use_mla:
                     bs = spec_info.kv_indptr.shape[0] - 1
                     kv_indices, swa_page_table = (
                         self._build_unified_page_table_from_spec(spec_info, bs)
@@ -2590,7 +2594,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata = ForwardMetadata(
                     self.indices_updater_prefill.kv_indptr,
                     self.indices_updater_prefill.kv_indices,
-                    None,
+                    self.indices_updater_prefill.qo_indptr[: bs + 1],
                     None,
                     max(forward_batch.extend_seq_lens_cpu),
                     forward_batch.seq_lens_cpu.max().item(),
@@ -2817,9 +2821,9 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if self.use_triton_unified_attention:
-            # Keep a distinct page-table buffer for unified attention.  Sharing
-            # cuda_graph_kv_indices with non-unified token indices makes
+        if self.decode_uses_page_table:
+            # Keep a distinct page-table buffer for page-table decode.  Sharing
+            # cuda_graph_kv_indices with flat per-token indices makes
             # page-table width ambiguous after the token buffer is expanded.
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
@@ -2964,14 +2968,12 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = None
             max_q_len = None
 
-            if spec_info is None or (
-                self.use_triton_unified_attention and not self.use_mla
-            ):
+            if spec_info is None or (self.decode_uses_page_table and not self.use_mla):
                 max_num_blocks_per_seq = (
                     self.max_context_len + self.page_size - 1
                 ) // self.page_size
 
-                if not self.use_triton_unified_attention:
+                if not self.decode_uses_page_table:
                     kv_indptr = self.kv_indptr
                     kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
                     kv_indptr = kv_indptr[: bs + 1]
@@ -4417,7 +4419,7 @@ class AiterAttnBackend(AttentionBackend):
                         self.k_scale.reshape(1),  # Q is cast at unit scale.
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4493,7 +4495,7 @@ class AiterAttnBackend(AttentionBackend):
                         fp8_q_descale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
-                        self.qo_indptr[:bs0],
+                        self.forward_metadata.qo_indptr[:bs0],
                         cu_k,
                         self.forward_metadata.max_q_len,
                         int(self.forward_metadata.max_kv_len),
@@ -4532,8 +4534,8 @@ class AiterAttnBackend(AttentionBackend):
                     fp8_q_descale.reshape(1),
                     k_descale.reshape(1),
                     v_descale.reshape(1),
-                    self.qo_indptr[:bs0],
-                    self.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
+                    self.forward_metadata.qo_indptr[:bs0],
                     self.forward_metadata.max_q_len,
                     self.forward_metadata.max_q_len,
                     softmax_scale=layer.scaling,
@@ -4622,7 +4624,7 @@ class AiterAttnBackend(AttentionBackend):
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
                 v_cache,
-                self.qo_indptr[:bs0],
+                self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
                 self.forward_metadata.max_q_len,
