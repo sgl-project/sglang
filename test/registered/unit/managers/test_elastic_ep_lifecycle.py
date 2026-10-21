@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unittest
 import uuid
 from dataclasses import replace
@@ -92,6 +93,8 @@ def _manager() -> TokenizerManager:
     manager.elastic_runtime_health = "healthy"
     manager.elastic_runtime_error = None
     manager.elastic_scheduler_response_timeout = 30
+    manager.elastic_membership_observation_timeout = 60
+    manager.elastic_membership_observation_reply_grace = 5
     manager.elastic_joining_rank_offset = None
     manager.elastic_joining_rank_count = 0
     manager.elastic_ready_rank_count = 0
@@ -687,6 +690,9 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
         manager = _manager()
         manager.elastic_worker_count = 2
         manager.elastic_active_rank_status = [True, True]
+        manager.elastic_scheduler_response_timeout = 0.01
+        manager.elastic_membership_observation_timeout = 0.2
+        manager.elastic_membership_observation_reply_grace = 0.05
 
         context = zmq.Context()
 
@@ -759,6 +765,8 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(
                     scheduler_request, ObserveElasticEPMembershipReqInput
                 )
+                self.assertIsNotNone(scheduler_request.deadline_unix_seconds)
+                await asyncio.sleep(0.02)
                 scheduler_output = scheduler._request_dispatcher(scheduler_request)
                 scheduler.send_control_output(scheduler_output, scheduler_request)
 
@@ -800,10 +808,83 @@ class TestElasticEPLifecycle(CustomTestCase, unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    def test_expired_membership_observation_rejects_without_mutation(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.rust_server = None
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+        request = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            rank=1,
+            failed_allocation_incarnation="pod-uid-5",
+            membership_epoch=4,
+            submission_id="submission-1",
+            deadline_unix_seconds=time.time() - 1,
+        )
+
+        with (
+            patch(
+                "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership"
+            ) as observe,
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(dp_rank=0),
+            ),
+        ):
+            result = scheduler.handle_observe_elastic_ep_membership(request)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("no state was changed", result.message)
+        observe.assert_not_called()
+        progress = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[
+            0
+        ]
+        self.assertEqual(progress.completed_stage, "scheduler_deadline_rejected")
+
+    def test_membership_observation_expiring_under_store_lock_is_rejected(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.rust_server = None
+        scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+        request = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            rank=1,
+            failed_allocation_incarnation="pod-uid-5",
+            membership_epoch=4,
+            submission_id="submission-1",
+            deadline_unix_seconds=time.time() + 30,
+        )
+
+        with (
+            patch(
+                "sglang.srt.elastic_ep.elastic_ep.observe_recovery_membership",
+                side_effect=TimeoutError(
+                    "Membership observation expired before publication; "
+                    "no state was changed."
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=SimpleNamespace(dp_rank=0),
+            ),
+        ):
+            result = scheduler.handle_observe_elastic_ep_membership(request)
+
+        self.assertFalse(result.accepted)
+        self.assertIn("no state was changed", result.message)
+        progress_calls = (
+            scheduler.ipc_channels.send_to_tokenizer.send_output.call_args_list
+        )
+        self.assertEqual(
+            progress_calls[-1].args[0].completed_stage,
+            "scheduler_deadline_rejected",
+        )
+
     async def test_membership_timeout_reports_cross_path_completed_stage(self):
         manager = _manager()
         manager.elastic_active_rank_status = [True, True]
-        manager.elastic_scheduler_response_timeout = 0.01
+        manager.elastic_membership_observation_timeout = 0.01
+        manager.elastic_membership_observation_reply_grace = 0.001
         sent = []
         manager.observe_elastic_ep_membership_communicator = FanOutCommunicator(
             send=sent.append,

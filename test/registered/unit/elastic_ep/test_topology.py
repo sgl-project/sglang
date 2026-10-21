@@ -236,6 +236,41 @@ def test_membership_observation_accepts_replay_and_rejects_stale_aba_epochs():
             )
 
 
+def test_expired_membership_observation_does_not_publish_state():
+    store = _MembershipStore()
+    topology = RuntimeTopology(
+        runtime_instance_id="runtime-1",
+        initial_ep_size=2,
+        allocation_width=1,
+        effective_ep_size=2,
+        max_committed_ep_size=2,
+        topology_generation=4,
+    )
+    observation = MembershipObservation(
+        runtime_instance_id="runtime-1",
+        topology_generation=4,
+        rank=1,
+        failed_allocation_incarnation="allocation-7",
+        membership_epoch=9,
+    )
+    with (
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_global_tcp_store",
+            return_value=store,
+        ),
+        patch(
+            "sglang.srt.elastic_ep.runtime_topology.get_runtime_topology",
+            return_value=topology,
+        ),
+        pytest.raises(TimeoutError, match="no state was changed"),
+    ):
+        publish_membership_observation(
+            observation, deadline_unix_seconds=time.time() - 1
+        )
+
+    assert store.values == {}
+
+
 def test_membership_publication_serializes_duplicate_interleavings():
     store = _MembershipStore()
     topology = RuntimeTopology(
@@ -283,6 +318,8 @@ def test_membership_publication_serializes_duplicate_interleavings():
 
 
 def test_membership_endpoint_only_publishes_until_scheduler_safe_boundary():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._send_membership_observation_progress = MagicMock()
     request = ObserveElasticEPMembershipReqInput(
         runtime_instance_id="runtime-1",
         topology_generation=0,
@@ -302,12 +339,13 @@ def test_membership_endpoint_only_publishes_until_scheduler_safe_boundary():
             return_value=SimpleNamespace(dp_rank=0),
         ),
     ):
-        result = Scheduler.handle_observe_elastic_ep_membership(object(), request)
+        result = scheduler.handle_observe_elastic_ep_membership(request)
 
     assert result.accepted
     assert result.observation_key == "observation-key"
     assert result.submission_id == "submission-1"
     assert result.responder_rank == 0
+    assert scheduler._send_membership_observation_progress.call_count == 3
     poll.assert_not_called()
 
 

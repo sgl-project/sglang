@@ -979,6 +979,7 @@ def observe_recovery_membership(
     rank: int,
     failed_allocation_incarnation: str,
     membership_epoch: int,
+    deadline_unix_seconds: Optional[float] = None,
 ) -> str:
     """Publish a CPU-only membership observation without touching device state."""
     if not _fixed_slot_recovery_enabled():
@@ -1002,7 +1003,9 @@ def observe_recovery_membership(
         )
         if not is_replay:
             raise ValueError("Recovery membership observation is awaiting recovery.")
-    return publish_membership_observation(observation)
+    return publish_membership_observation(
+        observation, deadline_unix_seconds=deadline_unix_seconds
+    )
 
 
 def consume_recovery_membership_observation(
