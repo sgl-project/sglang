@@ -19,7 +19,6 @@ from pydantic import BaseModel
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
-    check_local_model_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
@@ -234,13 +233,17 @@ _MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
 
 
 def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
-    """Early HTTP 400 for URL model paths; SamplingParams._validate enforces the
-    same rule for every other entry point."""
+    """Reject URL model paths so a client cannot make the server fetch them (SSRF).
+
+    Only network entry points call this; the CLI and Python API still accept URLs.
+    """
     for name in _MODEL_PATH_FIELDS:
-        try:
-            check_local_model_path(name, kwargs.get(name))
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        value = kwargs.get(name)
+        if isinstance(value, str) and "://" in value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a local path or a HuggingFace repo id, not a URL",
+            )
 
 
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
@@ -440,22 +443,24 @@ async def _maybe_url_image(
 _MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
 
-async def _read_capped_body(response: httpx.Response) -> bytes:
+async def _download_capped_to_temp_file(response: httpx.Response) -> str:
+    too_large = f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
     declared = response.headers.get("content-length")
     if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
-        raise ValueError(
-            f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
-        )
-    chunks: list[bytes] = []
-    total = 0
-    async for chunk in response.aiter_bytes():
-        total += len(chunk)
-        if total > _MAX_IMAGE_DOWNLOAD_BYTES:
-            raise ValueError(
-                f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
-            )
-        chunks.append(chunk)
-    return b"".join(chunks)
+        raise ValueError(too_large)
+    fd, part_path = tempfile.mkstemp()
+    try:
+        with os.fdopen(fd, "wb") as f:
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError(too_large)
+                f.write(chunk)
+    except BaseException:
+        os.remove(part_path)
+        raise
+    return part_path
 
 
 async def _save_url_image_to_path(
@@ -487,12 +492,13 @@ async def _save_url_image_to_path(
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for attempt in range(1, max_attempts + 1):
+                part_path = None
                 try:
                     async with client.stream(
                         "GET", image_url, timeout=10.0
                     ) as response:
                         response.raise_for_status()
-                        body = await _read_capped_body(response)
+                        part_path = await _download_capped_to_temp_file(response)
 
                     # Determine file extension from content type or URL after downloading
                     if not os.path.splitext(target_path)[1]:
@@ -531,11 +537,12 @@ async def _save_url_image_to_path(
 
                     if uploads_root is not None:
                         target_path = ensure_path_within_root(target_path, uploads_root)
-                    with open(target_path, "wb") as f:
-                        f.write(body)
+                    shutil.move(part_path, target_path)
 
                     return target_path
                 except Exception as e:
+                    if part_path is not None and os.path.exists(part_path):
+                        os.remove(part_path)
                     last_error = e
                     if attempt == max_attempts or not _is_retryable_download_error(e):
                         raise

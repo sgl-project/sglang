@@ -226,9 +226,7 @@ def _build_image_response_kwargs(
         if len(data) != len(save_file_path_list):
             if cloud_storage.is_enabled():
                 raise HTTPException(
-                    status_code=502,
-                    detail="Cloud storage upload failed; the generated image is "
-                    "kept on the server.",
+                    status_code=502, detail="Cloud storage upload failed."
                 )
             raise HTTPException(
                 status_code=400,

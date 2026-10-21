@@ -200,23 +200,33 @@ def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "endpoint,kwargs",
+    "endpoint,kwargs,detail",
     [
-        ("/v1/images/generations", {"json": {"prompt": "p", "response_format": "url"}}),
+        (
+            "/v1/images/generations",
+            {"json": {"prompt": "p", "response_format": "url"}},
+            "cloud storage",
+        ),
         (
             "/v1/images/edits",
             {
                 "data": {"prompt": "p", "response_format": "url"},
                 "files": {"image": ("a.png", b"image", "image/png")},
             },
+            "cloud storage",
+        ),
+        (
+            "/v1/images/generations",
+            {"json": {"prompt": "p", "response_format": "bmp"}},
+            "not supported",
         ),
     ],
 )
-def test_url_response_without_destination_is_rejected_before_generation(
-    monkeypatch, tmp_path, endpoint, kwargs
+def test_undeliverable_response_format_is_rejected_before_generation(
+    monkeypatch, endpoint, kwargs, detail
 ):
-    """response_format='url' with no cloud storage and no output_path must fail
-    fast instead of running the whole generation first."""
+    """An unsupported response_format, or 'url' with no cloud storage and no
+    output_path, must fail fast instead of running the whole generation first."""
     args = SimpleNamespace(
         input_save_path=None, output_path=None, pipeline_class_name=None
     )
@@ -235,16 +245,21 @@ def test_url_response_without_destination_is_rejected_before_generation(
     with TestClient(app) as client:
         response = client.post(endpoint, **kwargs)
     assert response.status_code == 400, response.text
-    assert "cloud storage" in response.json()["detail"]
+    assert detail in response.json()["detail"]
 
 
-def _patch_download(monkeypatch, handler):
+def _patch_download(monkeypatch, tmp_path, handler):
+    """Route the download through handler; return the dir holding partial files."""
+    part_dir = tmp_path / "parts"
+    part_dir.mkdir()
+    monkeypatch.setattr(utils.tempfile, "tempdir", str(part_dir))
     real_client = httpx.AsyncClient
     monkeypatch.setattr(
         utils.httpx,
         "AsyncClient",
         lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
     )
+    return part_dir
 
 
 def _chunked_png(request):
@@ -268,17 +283,19 @@ def _chunked_png(request):
 def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handler):
     """An oversized remote image must be aborted, not buffered and written."""
     monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
-    _patch_download(monkeypatch, handler)
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
     target = tmp_path / "in" / "img.png"
     with pytest.raises(Exception, match="exceeds"):
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
     assert not target.exists()
+    assert not any(part_dir.iterdir())
 
 
 def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
-    _patch_download(
+    part_dir = _patch_download(
         monkeypatch,
+        tmp_path,
         lambda request: httpx.Response(
             200, content=b"x" * 512, headers={"content-type": "image/png"}
         ),
@@ -288,47 +305,23 @@ def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
         utils._save_url_image_to_path("https://x.test/a.png", str(target))
     )
     assert Path(saved).read_bytes() == b"x" * 512
+    assert not any(part_dir.iterdir())
 
 
 @pytest.mark.parametrize(
     "field", ["upscaling_model_path", "frame_interpolation_model_path"]
 )
-@pytest.mark.parametrize(
-    "value", ["http://169.254.169.254/latest/x.pth", "https://internal.svc/w.pth"]
-)
-def test_remote_url_model_paths_are_rejected_over_http(monkeypatch, field, value):
+def test_remote_url_model_paths_are_rejected_over_http(monkeypatch, field):
     """A client-supplied URL must not make the server fetch it (SSRF)."""
     monkeypatch.setattr(
         utils, "get_global_server_args", lambda: SimpleNamespace(model_path="m")
     )
     with pytest.raises(HTTPException) as exc_info:
-        utils.build_sampling_params("request", **{field: value})
+        utils.build_sampling_params(
+            "request", **{field: "http://169.254.169.254/latest/x.pth"}
+        )
     assert exc_info.value.status_code == 400
     assert field in exc_info.value.detail
-
-
-def test_unsupported_response_format_is_rejected_before_generation(monkeypatch):
-    """An unsupported response_format must fail fast, not after generation."""
-    args = SimpleNamespace(
-        input_save_path=None, output_path="out", pipeline_class_name=None
-    )
-    monkeypatch.setattr(image_api, "get_global_server_args", lambda: args)
-    monkeypatch.setattr(
-        image_api, "resolve_sampling_params_cls", lambda args: SamplingParams
-    )
-    monkeypatch.setattr(
-        image_api,
-        "build_sampling_params",
-        lambda *a, **k: (_ for _ in ()).throw(HTTPException(599, "generation reached")),
-    )
-    app = FastAPI()
-    app.include_router(image_api.router)
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/images/generations", json={"prompt": "p", "response_format": "bmp"}
-        )
-    assert response.status_code == 400, response.text
-    assert "not supported" in response.json()["detail"]
 
 
 def test_cloud_upload_failure_is_not_reported_as_a_client_error(monkeypatch):

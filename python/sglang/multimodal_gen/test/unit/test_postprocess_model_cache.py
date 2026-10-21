@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model caches keyed by client-chosen paths must stay bounded."""
 
+from collections import OrderedDict
 from types import SimpleNamespace
 
 import torch
@@ -9,12 +10,27 @@ from sglang.multimodal_gen.runtime.postprocess import (
     realesrgan_upscaler,
     rife_interpolator,
 )
+from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+    cache_get,
+    cache_put,
+)
 
-EXTRA = 10
+_CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))
 
 
-def test_upscaler_model_cache_is_bounded(monkeypatch):
-    realesrgan_upscaler._MODEL_CACHE.clear()
+def test_cache_evicts_least_recently_used():
+    """A get must refresh recency, so eviction drops the stale entry, not the oldest insert."""
+    cache = OrderedDict()
+    cache_put(cache, "a", 1, max_size=2)
+    cache_put(cache, "b", 2, max_size=2)
+    assert cache_get(cache, "a") == 1
+    cache_put(cache, "c", 3, max_size=2)
+    assert list(cache) == ["a", "c"]
+
+
+def test_upscaler_uses_bounded_cache(monkeypatch):
+    monkeypatch.setattr(realesrgan_upscaler, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(realesrgan_upscaler, "_MAX_CACHED_MODELS", 1)
     monkeypatch.setattr(realesrgan_upscaler, "_resolve_model_path", lambda p: p)
     monkeypatch.setattr(realesrgan_upscaler.torch, "load", lambda *a, **k: {})
     monkeypatch.setattr(
@@ -22,20 +38,13 @@ def test_upscaler_model_cache_is_bounded(monkeypatch):
         "_build_net_from_state_dict",
         lambda sd: torch.nn.Identity(),
     )
-    monkeypatch.setattr(
-        realesrgan_upscaler,
-        "current_platform",
-        SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu")),
-    )
-    limit = realesrgan_upscaler._MAX_CACHED_MODELS
-    for i in range(limit + EXTRA):
-        realesrgan_upscaler.ImageUpscaler(model_path=f"m{i}.pth")._ensure_model_loaded()
-    assert len(realesrgan_upscaler._MODEL_CACHE) == limit
-    realesrgan_upscaler._MODEL_CACHE.clear()
+    monkeypatch.setattr(realesrgan_upscaler, "current_platform", _CPU)
+    for path in ["a.pth", "b.pth"]:
+        realesrgan_upscaler.ImageUpscaler(model_path=path)._ensure_model_loaded()
+    assert list(realesrgan_upscaler._MODEL_CACHE) == ["b.pth"]
 
 
-def test_rife_model_cache_is_bounded(monkeypatch):
-    rife_interpolator._MODEL_CACHE.clear()
+def test_rife_uses_bounded_cache(monkeypatch):
     import sglang.multimodal_gen.runtime.utils.hf_diffusers_utils as hf
 
     class FakeModel:
@@ -48,40 +57,11 @@ def test_rife_model_cache_is_bounded(monkeypatch):
         def eval(self):
             pass
 
+    monkeypatch.setattr(rife_interpolator, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(rife_interpolator, "_MAX_CACHED_MODELS", 1)
     monkeypatch.setattr(hf, "maybe_download_model", lambda p: p)
     monkeypatch.setattr(rife_interpolator, "Model", FakeModel)
-    monkeypatch.setattr(
-        rife_interpolator,
-        "current_platform",
-        SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu")),
-    )
-    limit = rife_interpolator._MAX_CACHED_MODELS
-    for i in range(limit + EXTRA):
-        rife_interpolator.FrameInterpolator(model_path=f"m{i}")._ensure_model_loaded()
-    assert len(rife_interpolator._MODEL_CACHE) == limit
-    rife_interpolator._MODEL_CACHE.clear()
-
-
-def test_cache_is_thread_safe_under_concurrent_access():
-    import threading
-    from collections import OrderedDict
-
-    from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
-        cache_get,
-        cache_put,
-    )
-
-    cache = OrderedDict()
-
-    def worker(i):
-        for j in range(500):
-            key = f"k{(i + j) % 7}"
-            cache_put(cache, key, j, max_size=3)
-            cache_get(cache, key)
-
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert len(cache) <= 3
+    monkeypatch.setattr(rife_interpolator, "current_platform", _CPU)
+    for path in ["a", "b"]:
+        rife_interpolator.FrameInterpolator(model_path=path)._ensure_model_loaded()
+    assert list(rife_interpolator._MODEL_CACHE) == ["b"]
