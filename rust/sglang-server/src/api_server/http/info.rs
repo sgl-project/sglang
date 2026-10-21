@@ -313,6 +313,7 @@ mod tests {
                 ),
                 server_args,
                 chat_formatter: None,
+                openai_chat: None,
             }),
             intake_rx,
             abort_rx,

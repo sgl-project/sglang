@@ -28,6 +28,8 @@ pub(super) struct AppState {
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) generation_policy: GenerationPolicy,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
+    /// The processor's chat layer, tried before the Dynamo-typed chat handler.
+    pub(super) openai_chat: Option<openai::OpenAiChat>,
 }
 
 /// Every listener warms its own rank; health stays 503 until it succeeds,
@@ -70,14 +72,20 @@ pub async fn serve(
     // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
     hicache_manager: Arc<HiCacheManager>,
+    tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
+    let openai_chat = chat_formatter
+        .as_ref()
+        .zip(tokenizer)
+        .map(|(formatter, tokenizer)| openai::OpenAiChat::new(&server_args, formatter, tokenizer));
     let generation_policy = GenerationPolicy::from(server_args.as_ref());
     let state = Arc::new(AppState {
         core,
         server_args: server_args.clone(),
         generation_policy,
         chat_formatter,
+        openai_chat,
     });
     // Cancelled with the api runtime on shutdown.
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));

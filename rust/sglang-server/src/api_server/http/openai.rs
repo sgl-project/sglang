@@ -11,12 +11,14 @@ use std::sync::Arc;
 
 mod chat;
 mod completions;
+mod lowered;
 mod models;
 mod pd_routing;
 mod template;
 mod tokenize;
 mod tools;
 
+pub(super) use lowered::OpenAiChat;
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;

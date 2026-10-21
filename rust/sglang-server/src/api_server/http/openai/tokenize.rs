@@ -309,6 +309,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            openai_chat: None,
         })
     }
 

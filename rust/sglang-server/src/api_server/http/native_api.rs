@@ -45,7 +45,7 @@ use sglang_api_types::api::v1 as api;
 /// `/generate` currently exposes only `e2e_latency`; this avoids putting
 /// API-only timestamps onto scheduler messages.
 #[derive(Clone, Debug)]
-struct RequestTiming {
+pub(super) struct RequestTiming {
     // TODO: Move request lifecycle timing into a dedicated tracing/metrics
     // module and align its design with Python's APIServerReqTimeStats.
     created_at: Instant,
@@ -54,7 +54,7 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             created_at: Instant::now(),
             time_to_first_token: None,
@@ -196,41 +196,11 @@ async fn generate(
     {
         return native_error(StatusCode::BAD_REQUEST, &error, false);
     }
-    // Read before the fills below: only a `max_new_tokens` the client sent is
-    // checked against the context window.
-    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
-    // Launch-time preferred sampling params fill in beneath the request's own
-    // keys before decoding, so an explicit request value (even a default or
-    // null) wins: Python TokenizerManager's precedence.
-    if let Some(preferred) = &state.server_args.preferred_sampling_params
-        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
-    {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
-    let default_max_new_tokens = serde_json::json!({
-        "max_new_tokens": state.server_args.default_max_new_tokens,
-    });
-    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
-        return native_error(StatusCode::INTERNAL_SERVER_ERROR, &error, false);
-    }
-    // The schema (sglang_api_types) is the contract: decode errors carry
-    // serde's field-level text, as Python's 400s do.
-    let body: api::GenerateRequest = match serde_json::from_value(body) {
-        Ok(body) => body,
-        Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+    let (payloads, is_batch) = match generate_requests(&state, body) {
+        Ok(requests) => requests,
+        Err((code, message, stream)) => return native_error(code, &message, stream),
     };
-    let stream = body.stream.unwrap_or(false);
-    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
-    // payloads. `is_batch` = list form -> the response is a JSON array.
-    let (mut payloads, is_batch) = match into_requests(body, &state.generation_policy) {
-        Ok(v) => v,
-        // Request normalization only returns validation failures.
-        Err(e) => {
-            return native_error(StatusCode::BAD_REQUEST, &e.to_string(), stream);
-        }
-    };
-    client_max_new_tokens.mark(&mut payloads);
+    let stream = payloads.first().is_some_and(|request| request.stream);
     // Python starts APIServerReqTimeStats after request normalization and before
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
@@ -248,6 +218,47 @@ async fn generate(
     } else {
         generate_batch(&state, payloads, stream, timing).await
     }
+}
+
+/// Decode a `/generate` body beneath the launch-time sampling defaults into
+/// its requests, and whether it was a batch. An error carries the body's
+/// `stream` flag once it is known.
+pub(super) fn generate_requests(
+    state: &AppState,
+    mut body: serde_json::Value,
+) -> Result<(Vec<GenerateRequest>, bool), (StatusCode, String, bool)> {
+    // Read before the fills below: only a `max_new_tokens` the client sent is
+    // checked against the context window.
+    let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
+    // Launch-time preferred sampling params fill in beneath the request's own
+    // keys before decoding, so an explicit request value (even a default or
+    // null) wins: Python TokenizerManager's precedence.
+    if let Some(preferred) = &state.server_args.preferred_sampling_params
+        && let Err(error) = merge_preferred_sampling(&mut body, &preferred.0)
+    {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
+    }
+    // Beneath both, the launch-time default for an omitted `max_new_tokens`.
+    let default_max_new_tokens = serde_json::json!({
+        "max_new_tokens": state.server_args.default_max_new_tokens,
+    });
+    if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
+    }
+    // The schema (sglang_api_types) is the contract: decode errors carry
+    // serde's field-level text, as Python's 400s do.
+    let body: api::GenerateRequest = match serde_json::from_value(body) {
+        Ok(body) => body,
+        Err(error) => return Err((StatusCode::BAD_REQUEST, error.to_string(), false)),
+    };
+    let stream = body.stream.unwrap_or(false);
+    // Fan `text`/`input_ids`/`sampling_params` (scalar or list) into per-request
+    // payloads. `is_batch` = list form -> the response is a JSON array.
+    // Request normalization only returns validation failures.
+    let (mut requests, is_batch) = into_requests(body, &state.generation_policy)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string(), stream))?;
+    client_max_new_tokens.mark(&mut requests);
+    Ok((requests, is_batch))
 }
 
 /// A single (non-batched) `/generate`: submit one request, then either stream its
@@ -287,7 +298,7 @@ async fn generate_single(
 /// failed batch item is its own `{ "error": ... }` entry in the array).
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
-enum GenerateItem {
+pub(super) enum GenerateItem {
     // Boxed: a frame is ~300 bytes against the error's ~40, and a batch
     // array holds one per item.
     Frame(Box<api::GenerateResponse>),
@@ -295,7 +306,7 @@ enum GenerateItem {
 }
 
 /// Fold a unary request to its terminal HTTP result. Shared by single + batch.
-async fn drain_unary(
+pub(super) async fn drain_unary(
     call: &mut CoreCall,
     rid_str: &str,
     mut timing: RequestTiming,
@@ -382,7 +393,7 @@ async fn generate_batch(
 /// Multiplex calls into SSE `data` strings + a final `[DONE]`; `with_index` tags
 /// each frame (batch only), `incremental` = delta vs cumulative. Each call
 /// aborts itself if the stream is dropped while it is unfinished.
-fn generation_event_stream(
+pub(super) fn generation_event_stream(
     calls: Vec<(CoreCall, RequestTiming)>,
     incremental: bool,
     with_index: bool,
@@ -586,6 +597,7 @@ mod tests {
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
+            openai_chat: None,
         });
 
         let response = health_generate(State(state), Duration::ZERO, true).await;
@@ -626,6 +638,7 @@ mod tests {
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
+            openai_chat: None,
         });
         // Each probe that reaches intake counts as scheduler output.
         tokio::spawn(async move {
@@ -665,6 +678,7 @@ mod tests {
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
             generation_policy: GenerationPolicy::default(),
             chat_formatter: None,
+            openai_chat: None,
         });
 
         let responder = tokio::spawn(async move {
@@ -743,6 +757,7 @@ mod tests {
             generation_policy: GenerationPolicy::from(&server_args),
             server_args: Arc::new(server_args),
             chat_formatter: None,
+            openai_chat: None,
         });
         let responder = tokio::spawn(async move {
             let mut submitted = Vec::new();

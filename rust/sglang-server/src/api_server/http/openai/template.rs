@@ -30,23 +30,35 @@ pub(super) fn render_chat(
     kwargs: Option<&ChatTemplateKwargs>,
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
-    if !formatter.renders_requests() {
-        return render_template(formatter, request, kwargs, defaults);
-    }
-    // The continuation's leading BOS is dropped once its ids are encoded.
-    match formatter.render_request(body, defaults) {
-        Ok((prompt, continuation)) => Ok(RenderedChat {
-            prompt,
-            continuation,
-        }),
+    match render_body(formatter, body, defaults) {
         // There is no engine to hand a request the SGLang path declines to, so
         // the formatter's own template renders it, as it did before that path
         // existed; a formatter with no other path declines it again.
-        Err(TemplateError::EngineOnly { .. }) => {
+        Some(Err(TemplateError::EngineOnly { .. })) | None => {
             render_template(formatter, request, kwargs, defaults)
         }
-        Err(error) => Err(error),
+        Some(rendered) => rendered,
     }
+}
+
+/// Render the raw body as SGLang does, retaining the continuation boundary.
+pub(super) fn render_body(
+    formatter: &ChatFormatter,
+    body: Value,
+    defaults: &ChatTemplateKwargs,
+) -> Option<Result<RenderedChat, TemplateError>> {
+    if !formatter.renders_requests() {
+        return None;
+    }
+    // The continuation's leading BOS is dropped once its ids are encoded.
+    Some(
+        formatter
+            .render_request(body, defaults)
+            .map(|(prompt, continuation)| RenderedChat {
+                prompt,
+                continuation,
+            }),
+    )
 }
 
 /// Render `request` through the formatter's template (Jinja, Dynamo's
