@@ -114,6 +114,7 @@ class _DSv2State:
     ep_send_counts: torch.Tensor
     x_active_mask: Optional[torch.Tensor]
     expand_scales: Optional[torch.Tensor]
+    expert_token_nums: torch.Tensor
 
 
 class AscendOpsDispatcher(BaseDispatcher):
@@ -327,16 +328,17 @@ class AscendOpsDispatcher(BaseDispatcher):
         expand_scales = None
 
         if _debug_rank0():
+            valid = int(expert_token_nums.sum())
+            row_amax = expand_x.float().abs().amax(dim=1)
             print(
-                f"[ascend_ops dispatch] path={prefill_mode or self._dispatch_path} "
+                f"[ascend_ops dispatch] {self._dispatch_path} "
                 f"tokens={num_tokens} padded={padded_bs} qmode={quant_mode} "
+                f"valid={valid} in_row_amax="
+                f"{hidden_states.float().abs().amax(dim=1)[:8].tolist()} "
+                f"etoks={expert_token_nums.tolist()} "
                 f"expand_x={tuple(expand_x.shape)}:{expand_x.dtype} "
-                f"absmax={expand_x.abs().max().item():.4f} "
-                f"etoks_sum={int(expert_token_nums.sum())} "
-                f"etoks={expert_token_nums[:8].tolist()} "
-                f"scales={tuple(dynamic_scales.shape)} "
-                f"[{dynamic_scales.min().item():.4g}, "
-                f"{dynamic_scales.max().item():.4g}]",
+                f"row_amax={row_amax[:24].tolist()} "
+                f"scales={dynamic_scales[:24].tolist()}",
                 flush=True,
             )
 
@@ -348,6 +350,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             ep_send_counts=ep_recv_counts,
             x_active_mask=x_active_mask,
             expand_scales=expand_scales,
+            expert_token_nums=expert_token_nums,
         )
         self._dispatch_output = AscendOpsDispatchOutput(
             hidden_states=expand_x,
@@ -390,12 +393,16 @@ class AscendOpsDispatcher(BaseDispatcher):
         )
         if _debug_rank0():
             expert_x = combine_input.hidden_states.float()
+            valid = int(state.expert_token_nums.sum())
             print(
                 f"[ascend_ops combine] expert_x={tuple(expert_x.shape)} "
-                f"absmax={expert_x.abs().max().item():.4f} "
+                f"valid={valid} "
+                f"row_amax={expert_x.abs().amax(dim=1)[:24].tolist()} "
                 f"nan={int(torch.isnan(expert_x).sum())} "
                 f"wsum={float(state.expert_scales.sum()):.4f} "
-                f"out_absmax={combined.float().abs().max().item():.4f}",
+                f"out={tuple(combined.shape)} "
+                f"out_row_amax="
+                f"{combined.float().abs().amax(dim=1)[: state.num_tokens].tolist()}",
                 flush=True,
             )
 
