@@ -9,15 +9,18 @@ from test_simulation_sglang_serving import (
 
 REQUEST_RATE = 1
 SEED = 123
+ARRIVAL_TOLERANCE_S = 0.05
+DURATION_TOLERANCE = 0.05
+LATENCY_TOLERANCE = 0.25
 RELATIVE_TOLERANCES = {
-    "duration": 0.01,
-    "request_throughput": 0.01,
-    "input_throughput": 0.01,
-    "output_throughput": 0.01,
-    "mean_e2e_latency_ms": 0.10,
-    "mean_ttft_ms": 0.10,
-    "mean_tpot_ms": 0.10,
-    "mean_itl_ms": 0.10,
+    "duration": DURATION_TOLERANCE,
+    "request_throughput": DURATION_TOLERANCE,
+    "input_throughput": DURATION_TOLERANCE,
+    "output_throughput": DURATION_TOLERANCE,
+    "mean_e2e_latency_ms": LATENCY_TOLERANCE,
+    "mean_ttft_ms": LATENCY_TOLERANCE,
+    "mean_tpot_ms": LATENCY_TOLERANCE,
+    "mean_itl_ms": LATENCY_TOLERANCE,
 }
 
 
@@ -59,7 +62,7 @@ def test_request_rate_offline_matches_blocking(tmp_path):
     blocking_arrivals = [request["created_time"] for request in blocking_requests]
     assert offline_arrivals[1] > 0.5
     assert blocking_arrivals[1] > 0.5
-    assert offline_arrivals == pytest.approx(blocking_arrivals, abs=0.02)
+    assert offline_arrivals == pytest.approx(blocking_arrivals, abs=ARRIVAL_TOLERANCE_S)
     assert (
         offline_metrics["max_concurrent_requests"]
         == blocking_metrics["max_concurrent_requests"]

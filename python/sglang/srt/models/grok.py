@@ -22,10 +22,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.elementwise.elementwise import (
+from sglang.kernels.ops.activation.gelu_and_mul_triton import gelu_and_mul_triton
+from sglang.kernels.ops.layernorm.fused_rmsnorm import (
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
-    gelu_and_mul_triton,
 )
 from sglang.kernels.ops.moe.router import fused_moe_router_shim
 from sglang.srt.distributed import (
@@ -118,7 +118,6 @@ class Grok1MoE(nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        tp_size: Optional[int] = None,
         reduce_results: bool = True,
         use_presharded_weights: bool = False,
         inplace: bool = True,
@@ -162,6 +161,7 @@ class Grok1MoE(nn.Module):
             inplace=inplace,
             no_combine=no_combine,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not _is_npu:
@@ -332,21 +332,20 @@ class Grok1Attention(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        attn_tp_rank = get_parallel().tp_rank
-        attn_tp_size = get_parallel().tp_size
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= attn_tp_size:
+        if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % attn_tp_size == 0
+            assert self.total_num_kv_heads % tp_size == 0
         else:
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = getattr(config, "head_dim", 128)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -363,8 +362,6 @@ class Grok1Attention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
             load_presharded_attn=self.load_presharded_attn,
             prefix=add_prefix("qkv_proj", prefix),
         )
@@ -374,8 +371,6 @@ class Grok1Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
             use_presharded_weights=self.load_presharded_attn,
             prefix=add_prefix("o_proj", prefix),
         )
@@ -945,13 +940,23 @@ old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
 
 
 def _prepare_presharded_weights(
-    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
+    self,
+    model_name_or_path: str,
+    revision: Optional[str],
+    fall_back_to_pt: bool,
+    allow_patterns_overrides: Optional[list[str]] = None,
 ) -> Tuple[str, list[str], bool]:
     import glob
     import os
 
-    if get_parallel().tp_size == 1:
-        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+    if get_parallel().tp_size == 1 or allow_patterns_overrides is not None:
+        return old_prepare_weights(
+            self,
+            model_name_or_path,
+            revision,
+            fall_back_to_pt,
+            allow_patterns_overrides,
+        )
 
     if not os.path.isdir(model_name_or_path):
         from sglang.srt.model_loader.weight_utils import download_weights_from_hf

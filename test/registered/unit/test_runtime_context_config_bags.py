@@ -9,6 +9,9 @@ import dataclasses
 import unittest
 from unittest import mock
 
+import msgspec
+import msgspec.structs
+
 from sglang.srt import runtime_context as rc
 from sglang.srt.arg_groups.arg_utils import NS, A
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -83,7 +86,7 @@ class TestConfigBags(CustomTestCase):
         import dataclasses
 
         sa, reference = self._resolve_published_and_sibling()
-        defaults = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+        defaults = {f.name: f.default for f in msgspec.structs.fields(ServerArgs)}
         # Leaves resolution writes on this input on both CI device shapes
         # (CUDA host and CPU-only runner): each starts at a None default.
         sampled = (

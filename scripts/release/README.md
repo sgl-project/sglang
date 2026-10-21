@@ -89,7 +89,7 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `python/sglang/version.py`
 
 ### `bump_docs_install_version.py`
-Bumps the release version pinned in the Mintlify install docs — both the `git clone -b v<version> ...sglang.git` "install from source" line and the version-pinned `lmsysorg/sglang:v<version>` Docker example. Mutable tags (`latest`, `dev`) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
+Bumps the release version pinned in the Mintlify install docs' `git clone -b v<version> ...sglang.git` "install from source" line. Docker image tags (`latest`, and the historical last CUDA 12 tag) are intentionally left untouched. Driven automatically on release-tag push by [`.github/workflows/bot-bump-docs-version.yml`](../../.github/workflows/bot-bump-docs-version.yml), which opens a PR with the change.
 
 **Usage:**
 ```bash
@@ -97,7 +97,7 @@ python scripts/release/bump_docs_install_version.py 0.5.13
 ```
 
 **Files updated:**
-- `docs/docs/get-started/install.mdx` (Method 2: From source; Method 3: pinned Docker image)
+- `docs/docs/get-started/install.mdx` (Get the source)
 - `docs/docs/hardware-platforms/amd_gpu.mdx` (Install from Source)
 
 ### `bump_kernel_version.py`

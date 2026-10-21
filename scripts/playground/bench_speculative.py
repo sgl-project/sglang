@@ -188,7 +188,7 @@ def main(args, server_args):
 
         other_args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 batch_size,
                 "--mem-fraction-static",
                 server_args.mem_fraction_static,

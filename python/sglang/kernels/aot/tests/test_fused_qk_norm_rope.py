@@ -6,24 +6,11 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.server_args import (
     ServerArgs,
-    get_global_server_args,
     set_global_server_args_for_scheduler,
 )
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-)
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_npu = is_npu()
-_is_xpu = is_xpu()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

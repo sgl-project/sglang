@@ -10,6 +10,7 @@ export const Qwen36Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
         { id: 'xeon', label: 'XEON', default: false },
+        { id: 'rtx-spark', label: 'RTX Spark', default: false },
         { id: 'a3', label: 'A3 (NPU)', default: false },
       ],
     },
@@ -26,9 +27,11 @@ export const Qwen36Deployment = () => {
     modelSize: {
       name: 'modelSize',
       title: 'Model Size',
-      items: [
+      // RTX Spark only has a validated recipe for 35B-A3B NVFP4.
+      getDynamicItems: (values) => [
         { id: '35b-a3b', label: '35B-A3B (MoE)', default: true },
-        { id: '27b', label: '27B (Dense)', default: false },
+        { id: '27b', label: '27B (Dense)', default: false, disabled: values.hardware === 'rtx-spark',
+          disabledReason: values.hardware === 'rtx-spark' ? 'Only 35B-A3B NVFP4 is validated on RTX Spark' : '' },
       ],
     },
     quantization: {
@@ -37,6 +40,7 @@ export const Qwen36Deployment = () => {
       // NVFP4 checkpoints are available for both model sizes on Blackwell (B200/B300).
       // On Ascend NPU the verified options are BF16 for both sizes and W8A8
       // (modelslim) for the 27B dense variant.
+      // RTX Spark only has a validated NVFP4 recipe (35B-A3B).
       getDynamicItems: (values) => {
         if (values.hardware === 'a3') {
           const items = [{ id: 'bf16', label: 'BF16', default: true }];
@@ -44,6 +48,9 @@ export const Qwen36Deployment = () => {
             items.push({ id: 'w8a8', label: 'W8A8', default: false });
           }
           return items;
+        }
+        if (values.hardware === 'rtx-spark') {
+          return [{ id: 'nvfp4', label: 'NVFP4', default: true }];
         }
         const items = [
           { id: 'fp8', label: 'FP8', default: true },
@@ -79,10 +86,12 @@ export const Qwen36Deployment = () => {
       title: 'Speculative Decoding (MTP)',
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
+        const isSpark = values.hardware === 'rtx-spark';
+        const noSpec = isXeon || isSpark;
         return [
-          { id: 'disabled', label: 'Disabled', default: isXeon },
-          { id: 'enabled', label: 'Enabled', default: !isXeon, disabled: isXeon,
-            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : '' },
+          { id: 'disabled', label: 'Disabled', default: noSpec },
+          { id: 'enabled', label: 'Enabled', default: !noSpec, disabled: noSpec,
+            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : isSpark ? 'Speculative decoding is not validated on RTX Spark' : '' },
         ];
       },
       commandRule: (value, values) => {
@@ -98,6 +107,13 @@ export const Qwen36Deployment = () => {
       condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3',
       getDynamicItems: (values) => {
         const mtpEnabled = values.speculative === 'enabled';
+        if (values.hardware === 'rtx-spark') {
+          return [
+            { id: 'v1', label: 'V1', default: false, disabled: true,
+              disabledReason: 'The validated RTX Spark recipe uses extra_buffer (V2)' },
+            { id: 'v2', label: 'V2', default: true },
+          ];
+        }
         if (mtpEnabled) {
           return [
             { id: 'v1', label: 'V1', default: false, disabled: true },
@@ -121,6 +137,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
+      'rtx-spark': { nvfp4: { tp: 1, mem: 0.8 } },
     },
     '27b': {
       baseName: '27B',
@@ -227,6 +244,20 @@ export const Qwen36Deployment = () => {
       ...values,
       mambaCache: speculative === 'enabled' ? 'v2' : values.mambaCache,
     };
+
+    // RTX Spark (35B-A3B NVFP4 only): user-tested recipe; single GPU, no --attention-backend,
+    // flashinfer_cutlass MoE runner, --mem-fraction-static 0.8, no speculative decoding.
+    if (hardware === 'rtx-spark') {
+      let cmd = `sglang serve --model-path nvidia/Qwen3.6-${sizeConfig.baseName}-NVFP4`;
+      const reasoningRule = options.reasoning.commandRule(values.reasoning);
+      if (reasoningRule) cmd += ` \\\n  ${reasoningRule}`;
+      const toolcallRule = options.toolcall.commandRule(values.toolcall);
+      if (toolcallRule) cmd += ` \\\n  ${toolcallRule}`;
+      cmd += ` \\\n  --mamba-radix-cache-strategy extra_buffer`;
+      cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;
+      cmd += ` \\\n  --moe-runner-backend flashinfer_cutlass`;
+      return cmd;
+    }
 
     // NVFP4: nvidia/Qwen3.6-{35B-A3B,27B}-NVFP4 on Blackwell (B200/B300). Follows the exact command
     // shape from the checkpoint's docs — explicit --tp-size 1, --attention-backend trtllm_mha,
