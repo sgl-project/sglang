@@ -5,9 +5,8 @@ Eager prefill steps replay them directly. A prefill-graph shape of at least
 eager break, through bridge buffers; smaller shapes keep the tail captured.
 
 Under DP attention every rank replays the largest rank's bucket. In an eager step
-MegaMoE agrees on it through a host gather, so that path needs the prefill graph
-off; the prefill-graph break reads every rank's rows from the pre-forward
-exchange instead, under any MoE.
+MegaMoE agrees on it through a host gather; the prefill-graph break reads every
+rank's rows from the pre-forward exchange.
 """
 
 from __future__ import annotations
