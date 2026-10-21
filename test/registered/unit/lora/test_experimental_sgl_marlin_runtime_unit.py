@@ -338,7 +338,9 @@ def _run_marlin_flow(
         *,
         block_m,
         block_k,
+        topk_ids,
     ):
+        assert topk_ids is dispatch_output.topk_output.topk_ids
         calls.fused_tails += 1
         calls.schedule.append(
             ("fused_tail", stream_state["current"].name, block_m, block_k)
