@@ -1176,6 +1176,8 @@ def build_speculative_verify_target_probs(
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
 ) -> torch.Tensor:
+    from sglang.srt.utils import is_cuda
+
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
