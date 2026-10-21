@@ -35,7 +35,7 @@ export const agentx = {
    },
    "4303": {
     "run": null,
-    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
+    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
     "status": "in-progress"
    }
   }
@@ -1104,10 +1104,6 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [
     {
-     "script": "Validation",
-     "reason": "In progress: the exact image/configuration still needs an end-to-end sweep and native evaluation, including BF16 index logits. No runtime source patches."
-    },
-    {
      "script": "Placement",
      "reason": "2 four-GPU prefill nodes, four four-GPU decode nodes, plus a host for etcd, Mooncake master and the frontend. The GPU count above counts active engine GPUs; reserve whole worker nodes when planning capacity."
     }
@@ -1121,7 +1117,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
+    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -1138,7 +1134,7 @@ export const agentx = {
    ],
    "routers": {
     "dynamo": {
-     "install": ["# Bundled ai-dynamo 1.6.0.dev20261019; SGLang 0.0.0.dev1+gc1c287a42."],
+     "install": [],
      "files": [],
      "blocks": [
       {
@@ -1371,10 +1367,6 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [
     {
-     "script": "Validation",
-     "reason": "In progress: the exact image/configuration still needs an end-to-end sweep and native evaluation, including BF16 index logits. No runtime source patches."
-    },
-    {
      "script": "Placement",
      "reason": "3 four-GPU prefill nodes, four four-GPU decode nodes, plus a host for etcd, Mooncake master and the frontend. The GPU count above counts active engine GPUs; reserve whole worker nodes when planning capacity."
     }
@@ -1388,7 +1380,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
+    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -1405,7 +1397,7 @@ export const agentx = {
    ],
    "routers": {
     "dynamo": {
-     "install": ["# Bundled ai-dynamo 1.6.0.dev20261019; SGLang 0.0.0.dev1+gc1c287a42."],
+     "install": [],
      "files": [],
      "blocks": [
       {
@@ -4584,10 +4576,6 @@ export const agentx = {
    "submitted": "dynamo",
    "setup": [
     {
-     "script": "Validation",
-     "reason": "In progress: the exact image/configuration still needs an end-to-end sweep and native evaluation, including BF16 index logits. No runtime source patches."
-    },
-    {
      "script": "Placement",
      "reason": "4 four-GPU prefill nodes, four four-GPU decode nodes, plus a host for etcd, Mooncake master and the frontend. The GPU count above counts active engine GPUs; reserve whole worker nodes when planning capacity."
     }
@@ -4601,7 +4589,7 @@ export const agentx = {
     }
    },
    "prov": {
-    "sha": "12d8b3c73f1b88fe9ebb0c884f8099d2c9ee6722",
+    "sha": "4ff6426fa42a34285e2d05739852cf5e64677275",
     "recipe": "inferencex-e2e/benchmarks/multi_node/srt-slurm-recipes/dsv41flash/sglang/gb300-fp4/agentx/disagg-variants.yaml",
     "run": null,
     "pr": "4303",
@@ -4618,7 +4606,7 @@ export const agentx = {
    ],
    "routers": {
     "dynamo": {
-     "install": ["# Bundled ai-dynamo 1.6.0.dev20261019; SGLang 0.0.0.dev1+gc1c287a42."],
+     "install": [],
      "files": [],
      "blocks": [
       {
