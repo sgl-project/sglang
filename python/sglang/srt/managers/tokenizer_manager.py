@@ -98,6 +98,7 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    ObserveElasticEPMembershipProgressOutput,
     ObserveElasticEPMembershipReqInput,
     ObserveElasticEPMembershipReqOutput,
     OpenSessionReqOutput,
@@ -217,6 +218,18 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 _ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS = 30
+_MEMBERSHIP_OBSERVATION_STAGE_ORDER = {
+    stage: index
+    for index, stage in enumerate(
+        (
+            "tokenizer_dispatched",
+            "scheduler_handler_entered",
+            "scheduler_store_started",
+            "scheduler_store_completed",
+            "tokenizer_acknowledgement_received",
+        )
+    )
+}
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +243,7 @@ class MembershipObservationTimeout(TimeoutError):
         submission_id: str,
         expected_ranks: List[int],
         received_ranks: List[int],
+        last_completed_stage: str,
         elapsed_seconds: float,
     ) -> None:
         super().__init__("Timed out waiting for the membership survivor quorum.")
@@ -237,8 +251,8 @@ class MembershipObservationTimeout(TimeoutError):
         self.expected_ranks = expected_ranks
         self.received_ranks = received_ranks
         self.missing_ranks = sorted(set(expected_ranks) - set(received_ranks))
+        self.last_completed_stage = last_completed_stage
         self.elapsed_seconds = elapsed_seconds
-        self.last_tokenizer_stage = "dispatched"
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
@@ -976,6 +990,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (
+                    ObserveElasticEPMembershipProgressOutput,
+                    self._record_membership_observation_progress,
+                ),
             ]
         )
         self.init_communicators()
@@ -3950,6 +3968,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             submission_id,
             expected_ranks,
         )
+        if not hasattr(self, "_membership_observation_progress"):
+            self._membership_observation_progress = {}
+        self._membership_observation_progress[submission_id] = {
+            rank: "tokenizer_dispatched" for rank in expected_ranks
+        }
         self.auto_create_handle_loop()
         try:
             responses: List[
@@ -3967,22 +3990,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             elapsed_seconds = time.monotonic() - started_at
             missing_ranks = sorted(survivor_ranks - set(received_ranks))
+            progress_by_rank = self._membership_observation_progress.pop(
+                submission_id,
+                {rank: "tokenizer_dispatched" for rank in expected_ranks},
+            )
+            for rank in received_ranks:
+                progress_by_rank[rank] = "tokenizer_acknowledgement_received"
+            last_completed_stage = min(
+                progress_by_rank.values(),
+                key=_MEMBERSHIP_OBSERVATION_STAGE_ORDER.__getitem__,
+            )
             logger.warning(
                 "[Elastic EP][membership] timed_out submission_id=%s "
                 "expected_ranks=%s received_ranks=%s missing_ranks=%s "
-                "last_tokenizer_stage=dispatched elapsed_seconds=%.3f",
+                "last_completed_stage=%s elapsed_seconds=%.3f",
                 submission_id,
                 expected_ranks,
                 received_ranks,
                 missing_ranks,
+                last_completed_stage,
                 elapsed_seconds,
             )
             raise MembershipObservationTimeout(
                 submission_id=submission_id,
                 expected_ranks=expected_ranks,
                 received_ranks=received_ranks,
+                last_completed_stage=last_completed_stage,
                 elapsed_seconds=elapsed_seconds,
             ) from exc
+        except BaseException:
+            self._membership_observation_progress.pop(submission_id, None)
+            raise
+        self._membership_observation_progress.pop(submission_id, None)
         if not responses:
             raise RuntimeError(
                 "Membership observation returned no scheduler responses."
@@ -4023,6 +4062,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 submission_id=submission_id,
             )
         return responses[0]
+
+    def _record_membership_observation_progress(
+        self, progress: ObserveElasticEPMembershipProgressOutput
+    ) -> None:
+        submissions = getattr(self, "_membership_observation_progress", {})
+        progress_by_rank = submissions.get(progress.submission_id)
+        if progress_by_rank is None or progress.responder_rank not in progress_by_rank:
+            return
+        if progress.completed_stage not in _MEMBERSHIP_OBSERVATION_STAGE_ORDER:
+            logger.warning(
+                "[Elastic EP][membership] progress_rejected submission_id=%s "
+                "responder_rank=%s completed_stage=%s",
+                progress.submission_id,
+                progress.responder_rank,
+                progress.completed_stage,
+            )
+            return
+        previous_stage = progress_by_rank[progress.responder_rank]
+        if (
+            _MEMBERSHIP_OBSERVATION_STAGE_ORDER[progress.completed_stage]
+            > _MEMBERSHIP_OBSERVATION_STAGE_ORDER[previous_stage]
+        ):
+            progress_by_rank[progress.responder_rank] = progress.completed_stage
+        logger.info(
+            "[Elastic EP][membership] progress_received submission_id=%s "
+            "responder_rank=%s completed_stage=%s",
+            progress.submission_id,
+            progress.responder_rank,
+            progress.completed_stage,
+        )
 
     def _current_elastic_recovery_output(
         self, operation_id: str

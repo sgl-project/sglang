@@ -2421,6 +2421,12 @@ class ObserveElasticEPMembershipReqOutput(BaseReq, kw_only=True):
     responder_rank: Optional[int] = None
 
 
+class ObserveElasticEPMembershipProgressOutput(BaseReq, kw_only=True):
+    submission_id: str
+    responder_rank: int
+    completed_stage: str
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 
