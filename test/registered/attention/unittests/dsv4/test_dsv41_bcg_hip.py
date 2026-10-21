@@ -148,13 +148,17 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             live.out_cache_loc, (0, self.BUCKET - num_tokens), value=0
         )
 
+        # capture and replay build at the graph's context width: the override, else
+        # the backend's default graph limit; the page table stops at req_to_token
+        graph_width = backend._graph_metadata_max_seq_len(capture_batch)
+
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
             backend.init_forward_metadata(live)
             eager = backend.forward_metadata
             eager_out = attention(live)
-            if max_context_size is not None:
+            if graph_width is not None:
                 eager = backend._prefill_metadata_for_batch(
-                    live, max_seq_len_override=max_context_size
+                    live, max_seq_len_override=graph_width
                 )
                 backend.forward_metadata = eager
                 backend.init_forward_metadata_in_graph(live)
@@ -167,7 +171,11 @@ class TestHipBreakableGraphCaptureReplay(CustomTestCase):
             self.assertEqual(tuple(pinned.shape), (self.BUCKET,))
             self.assertEqual(
                 captured.core_attn_metadata.page_table.shape[1],
-                ((max_context_size or self.BUCKET) + DSV4_PAGE_SIZE - 1)
+                (
+                    min(graph_width or self.BUCKET, backend.req_to_token.shape[1])
+                    + DSV4_PAGE_SIZE
+                    - 1
+                )
                 // DSV4_PAGE_SIZE,
             )
 
