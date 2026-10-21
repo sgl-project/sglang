@@ -363,6 +363,15 @@ def prefill_requests(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
+    if req is None and pool.request_window is not None:
+        # CP query counts exclude padding and may be zero for a request on
+        # this rank. Reuse those counts for both full and compact replay rows.
+        assert inputs.rows_per_request_device is not None
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices.to(torch.int64),
+            inputs.rows_per_request_device.to(torch.int64),
+            output_size=pos.numel(),
+        )
     assert req is not None, "the torch indexer needs the batch's rows"
     assert inputs.seq_lens_cpu is not None
     # First flattened-K column of each request row, as inputs.k_slots lays them out.

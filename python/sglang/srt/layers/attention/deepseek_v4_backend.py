@@ -4729,7 +4729,9 @@ class DeepseekV4AttnBackend(
                 swa_replay_start = _pad_rows(
                     self.encoder_row_floor, num_rows=raw_positions.shape[0]
                 )
-            live = request_window_live_rows
+            # CP gathers KV in logical sequence order. Its window writes and
+            # history stay global; only the attention queries are reindexed.
+            live = num_tokens if num_tokens is not None else request_window_live_rows
             request_layout = window_layout(
                 req_pool_indices_repeated[:live],
                 raw_positions[:live],
@@ -4737,10 +4739,23 @@ class DeepseekV4AttnBackend(
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,
-                padded_rows=None if live is None else raw_positions.numel(),
+                padded_rows=(
+                    raw_positions.numel()
+                    if request_window_live_rows is not None
+                    else None
+                ),
             )
-            swa_page_indices = _pad_last_dim(request_layout.indices)
+            padding = raw_positions.numel() - request_layout.pos.numel()
+            window_indices = request_layout.indices
             swa_topk_lengths = request_layout.lengths
+            if padding:
+                window_indices = torch.nn.functional.pad(
+                    window_indices, (0, 0, 0, padding), value=-1
+                )
+                swa_topk_lengths = torch.nn.functional.pad(
+                    swa_topk_lengths, (0, padding), value=0
+                )
+            swa_page_indices = _pad_last_dim(window_indices)
             swa_out_cache_loc = request_layout.write_loc
         elif dspark_block_size is not None:
             assert (

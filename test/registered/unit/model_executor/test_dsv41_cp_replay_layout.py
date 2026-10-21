@@ -17,7 +17,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[4]
 
 
-def definitions(path, names, env=None, *, klass=None):
+def definitions(path, names, env=None, *, klass=None, strip_imports=False):
     tree = ast.parse((ROOT / "python/sglang" / path).read_text())
     scope = tree.body
     if klass is not None:
@@ -30,6 +30,15 @@ def definitions(path, names, env=None, *, klass=None):
         if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names
     ]
     assert {n.name for n in selected} == set(names)
+    if strip_imports:
+
+        class RuntimeImports(ast.NodeTransformer):
+            def visit_ImportFrom(self, node):
+                return (
+                    None if node.module and node.module.startswith("sglang.") else node
+                )
+
+        selected = [RuntimeImports().visit(n) for n in selected]
     namespace = dict(
         torch=torch, msgspec=msgspec, Any=Any, Optional=Optional, copy=copy
     )
@@ -151,3 +160,133 @@ def test_compact_input_ids_keep_original_owners():
     expected = torch.tensor([108, 120, 0, 0, 109, 0, 0, 0, 105, 113, 0, 0])
     assert torch.equal(packed, expected)
     assert torch.equal(functions["cp_interleave_to_sequence_order"](packed, fb), ids)
+
+
+@pytest.mark.parametrize("cp", [2, 4, 8])
+def test_window_writes_are_global_and_padding_never_commits(cp):
+    original, folded, _ = folded_fixture()
+    window = definitions(
+        "srt/mem_cache/dsv41_request_window.py",
+        ["WindowLayout", "_first_row_offsets", "window_layout"],
+    )
+    fb = folded.batch
+    req = torch.repeat_interleave(fb.req_pool_indices, torch.tensor(fb.extend_lens))
+    pos = torch.cat(
+        [torch.arange(p, p + n) for p, n in zip(fb.prefix_lens, fb.extend_lens)]
+    )
+    real = folded.num_rows
+    physical = (real + 63) // 64 * 64
+    raw_req = torch.nn.functional.pad(req, (0, physical - real))
+    raw_pos = torch.nn.functional.pad(pos, (0, physical - real))
+    prep = NS(
+        seq_lens_casual=raw_pos.to(torch.int32) + 1,
+        positions_casual=raw_pos,
+        page_table=torch.empty((physical, 0), dtype=torch.int32),
+    )
+    helpers = definitions(
+        "srt/layers/attention/deepseek_v4_backend.py",
+        ["_pad_rows", "_pad_last_dim"],
+        {
+            "PAGE_INDEX_ALIGNED_SIZE": 64,
+            "ceil_align": lambda n, a: (n + a - 1) // a * a,
+            "F": torch.nn.functional,
+        },
+    )
+    env = definitions(
+        "srt/layers/attention/deepseek_v4_backend.py",
+        ["make_core_attn_metadata"],
+        {
+            **window,
+            **helpers,
+            "SWA_WINDOW": 128,
+            "BuildPageTablePositions": NS(execute=lambda **kwargs: prep),
+            "DSV4AttnMetadata": NS,
+            "_create_flashmla_metadata": lambda: None,
+        },
+        klass="DeepseekV4AttnBackend",
+        strip_imports=True,
+    )
+    backend = NS(
+        encoder_replay=False,
+        encoder_row_floor=folded.row_floor,
+        page_size=256,
+        index_topk=512,
+        present_ratios=(0,),
+        low_ratios=(),
+        cuda_int32_kwargs={},
+        trtllm_attn=False,
+        token_to_kv_pool=NS(request_window=NS(capacity=256)),
+    )
+    core = env["make_core_attn_metadata"](
+        backend,
+        req_to_token=None,
+        req_pool_indices_repeated=raw_req,
+        seq_lens_casual=prep.seq_lens_casual,
+        max_seq_len=512,
+        out_loc=fb.out_cache_loc,
+        is_prefill=True,
+        need_compress=False,
+        num_tokens=real,
+        num_groups=3,
+    )
+    layout = core.request_window_layout
+    assert torch.equal(layout.req, req)
+    assert torch.equal(layout.pos, pos)
+    assert layout.write_loc.numel() == layout.commit_mask.numel() == real
+    assert (core.swa_page_indices[real:] == -1).all()
+    assert (core.swa_topk_lengths[real:] == 0).all()
+    assert core.swa_out_cache_loc.numel() == real
+    for rank in range(cp):
+        # Rank-local queries select the global layout; window writes retain it.
+        for row in range(rank, real, cp):
+            expected = min(128, int(pos[row] - folded.row_floor[row]) + 1)
+            assert int(core.swa_topk_lengths[row]) == expected
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_torch_indexer_uses_rank_local_request_counts(rank):
+    lengths, starts, slots = [129, 3, 1], [3968, 0, 64], [2, 7, 9]
+    owners, positions, counts = [], [], []
+    offset = 0
+    for length, start, slot in zip(lengths, starts, slots):
+        local = 0
+        for i in range(length):
+            if (offset + i) % 8 == rank:
+                owners.append(slot)
+                positions.append(start + i)
+                local += 1
+        counts.append(local)
+        offset += length
+    pos = torch.tensor(positions, dtype=torch.int64)
+    functions = definitions(
+        "srt/layers/attention/dsv4/v41_indexer/scoring.py",
+        ["RequestScores", "prefill_requests"],
+        {"_score_chunks": lambda **kwargs: iter(())},
+    )
+    indexer = NS(queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=4)
+    inputs = NS(
+        compress_ratio=2,
+        indexer=indexer,
+        req_rows=None,
+        positions=pos,
+        rows_per_request_device=torch.tensor(counts),
+        req_pool_indices=torch.tensor(slots),
+        reset_outputs=lambda: None,
+        q_lora=torch.zeros((len(pos), 1)),
+        freqs_cis=torch.zeros((8192, 1)),
+        x=torch.ones((len(pos), 1)),
+        layer_id=0,
+    )
+    table = torch.arange(8192).repeat(10, 1) + torch.arange(10)[:, None] * 20000
+    pool = NS(get_low_ratio_index_k_dequant=lambda layer, loc: loc)
+    requests = list(
+        functions["prefill_requests"](
+            inputs=inputs, token_to_kv_pool=pool, req_to_token=table
+        )
+    )
+    for request, _ in requests:
+        request_owners = {owners[i] for i in request.tok.tolist()}
+        assert len(request_owners) == 1
+        owner = request_owners.pop()
+        assert int(request.slots[0]) == owner * 10000
+        assert torch.equal(request.lens, (pos[request.tok] + 1) // 2)
