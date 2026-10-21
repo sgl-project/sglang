@@ -188,6 +188,21 @@ class UnifiedCacheExecutor:
             ):
                 lease.release()
 
+    def revalidate_preparations(self):
+        if not self.preparations or self.gpu_copy_capacity is None:
+            return 0
+        remaining = self.gpu_copy_capacity()
+        revoked = 0
+        for lease in tuple(self.preparations.values()):
+            if type(remaining) is int and remaining >= 0:
+                break
+            if lease.ready:
+                lease.release()
+                lease.code = "preparation_revoked"
+                revoked += 1
+                remaining = self.gpu_copy_capacity()
+        return revoked
+
     def _transfer_unsupported_reason(self):
         if self.core.component_types != (ComponentType.FULL,):
             return "Host control transfers require the built-in FULL component"

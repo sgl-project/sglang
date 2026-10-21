@@ -751,3 +751,85 @@ quality. Owned process-group cleanup only. Strict Ruff/new Scheduler finding
 delta, isort, formatting and whitespace pass; parent reviewed all changes.
 Approve local quota feature. Tool-wait movement and configured preparation
 selection/expiry/revocation through actual admission remain ongoing.
+
+## Unit 9 — Tool coordination with asynchronous plans and actual admission
+
+Added typed tool_wait policy options and a bounded async execution owner. The
+policy uses immutable capacity facts, known pause estimates, configurable
+initial transfer-cost estimates and observed control-to-ready feedback; it
+suppresses fit/short/unknown cases. The owner retains historical paused scopes,
+so a resume never silently expands to later associations or substitutes a
+branch. The initial movement profile is one FULL token prefix on persistent
+host/file HiCache, with explicit unsupported cases.
+
+Plans reserve all native children before effects and retain independent
+cancellation/result lifetimes. Same-plan publication dependencies run before
+priority; priority waits safely for unrelated token transfer fences too. New
+observations cancel obsolete saves and queued predictions, while compatible
+in-flight COPY interests can join. Cancelled physical work/snapshots stay owned
+until the core certifies quiescence. Result feedback is consumed before ACK
+compaction. Logical task cleanup preserves shared cold data and other owners.
+
+Request task bindings drive preparation only for a matching actual consumer.
+The owner checks complete request incremental/protection demand, waits for an
+existing inference cold prefetch instead of duplicating it, and starts loads
+before PrefillAdder construction. Starts return to a later fresh-budget pass.
+After actual GPU publication the lease remains until the native adder takes
+req.lock. Admission releases only the preparation reference. Expiry, abort,
+finished task, explicit override, reset and negative signed decode headroom
+release/revoke unused references; starvation escape still requires native
+physical feasibility. Existing GPU-ready data can skip a new COPY with an
+honest DEFERRED/gpu_already_ready child and a separate ready owner lease.
+
+Bound generation saves wait for successful checkpoint and explicit request
+completion commands before starting, then acquire transfer refs before the
+request refs end. Valid explicit intent cancels competing advice; live explicit
+priorities veto an automatic MOVE. Reset/weight boundaries cancel soft plans
+and still wait for actual IO/model quiescence. Work, action-per-step, prediction
+horizon, snapshot tokens, contexts, observations and preparation maps are all
+bounded. Policies never obtain live request/allocator/queue objects.
+
+Review removed an incorrect cross-plan dependency: cancelling an old queued
+prediction must not poison the replacement resume's new priority dependency.
+A dedicated regression now completes both children after the replacement COPY.
+Also covered an inference prefetch already in progress, verified no duplicate
+cold query, and ACK of a completed COPY while its separate preparation remains.
+One test patch initially displaced reset cleanup into the following case;
+corrected the test placement before final proof.
+
+CPU evidence includes 6 pure tool-policy cases, 17 actual-cache lifecycle/
+coordination cases (host + real file), and 7 extra startup-option cases. The
+latest grouped acceptance output is /tmp/sglang-kv-tool-acceptance-cpu-proof.log;
+final lifecycle proof is /tmp/sglang-kv-tool-lifecycle-cpu-proof.log. Existing
+core/policy/configuration/preparation/service/weights regressions passed 182
+cases; native prefill/budget and movement passed 107 cases plus 61 subtests.
+A consolidated final run is /tmp/sglang-kv-final-cpu-acceptance.log. Final strict
+Ruff, no-added Scheduler findings, isort, formatting and whitespace are checked
+before the local feature commit.
+
+GPU 1 actual OPT dummy-weight combined retention/quota/tool/file serving proof
+passed at /tmp/sglang-kv-opt-tool-coordination-smoke/{server.log,result.json}.
+Policy save COMPLETED and source GPU absence are verified. Different-salt
+recomputation has cached_tokens=0; the resumed real model request has 5 cached
+prefix tokens and equal output IDs. Policy statistics record one preparation
+consumed and five prefix tokens consumed. A final rerun is retained separately
+at /tmp/sglang-kv-opt-tool-final-smoke. Actual nonzero CUDA KV byte/fence/ref
+proofs complement dummy-weight interface checks; there is no quality or
+performance claim. Only owned process groups are terminated.
+
+Final combined acceptance: 355 CPU cases passed plus 79 subtests in 28.27 s
+(/tmp/sglang-kv-final-cpu-acceptance.log), including all programmable-control,
+policy, serving, namespace, weight and movement tests plus native prefill/budget
+regressions. Final GPU rerun also passed; its five-token prepared reuse equals
+the different-salt recomputation output. Fourteen changed Python files pass
+isort and formatting; strict new/changed small-file Ruff, no-added Scheduler
+findings and whitespace checks pass. Per-policy paused contexts are bounded as
+well as global scope/work limits; all nonprepared advisory work has a bounded
+retry horizon after any generation-completion wait.
+
+Verdict: approve the initial executable single-owner programmable-KV profile
+with typed unsupported cases for the later RFC stages. It includes explicit
+control, lifecycle/indexing, copy priority, real persistent-host/file movement,
+weight isolation, composed retention/quota/tool policies and actual admission
+handoff. Multi-owner publication, direct linker, broader movement representations
+and serving/training performance evaluation are not claimed by this acceptance.

@@ -35,6 +35,10 @@ from sglang.srt.managers.kv_control.policy import (
     PolicySignal,
     RequestGuidance,
 )
+from sglang.srt.managers.kv_control.tool_wait_policy import (
+    ToolWaitOptions,
+    ToolWaitPolicy,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 
@@ -68,7 +72,12 @@ class QuotaDefinition(Value, tag="quota", tag_field="implementation"):
     options: QuotaOptions = QuotaOptions()
 
 
-PolicyConfig: TypeAlias = PolicyDefinition | QuotaDefinition
+class ToolWaitDefinition(Value, tag="tool_wait", tag_field="implementation"):
+    name: Identifier
+    options: ToolWaitOptions = ToolWaitOptions()
+
+
+PolicyConfig: TypeAlias = PolicyDefinition | QuotaDefinition | ToolWaitDefinition
 
 
 def validate_definitions(definitions):
@@ -78,6 +87,13 @@ def validate_definitions(definitions):
         values = (
             (definition.options.ttl_seconds,)
             if isinstance(definition, PolicyDefinition)
+            else (
+                definition.options.min_pressure,
+                definition.options.min_pause_seconds,
+                definition.options.initial_estimated_transfer_seconds,
+                definition.options.lead_seconds,
+            )
+            if isinstance(definition, ToolWaitDefinition)
             else (
                 definition.options.max_wait_seconds,
                 definition.options.aging_seconds,
@@ -270,6 +286,8 @@ class KVPolicyRuntime:
             p.name: (
                 RetentionPolicy(p.options)
                 if isinstance(p, PolicyDefinition)
+                else ToolWaitPolicy(p.options)
+                if isinstance(p, ToolWaitDefinition)
                 else QuotaPolicy(p.options)
             )
             for p in definitions
@@ -281,11 +299,30 @@ class KVPolicyRuntime:
             raise ValueError(
                 "Quota guidance currently requires the built-in FULL cache"
             )
+        for definition in definitions:
+            if isinstance(definition, ToolWaitDefinition):
+                executor = self.control.executor
+                if executor.transfers is None:
+                    raise ValueError(
+                        "Tool coordination requires native FULL persistent HiCache"
+                    )
+                if definition.options.tier == "storage" and executor.storage is None:
+                    raise ValueError(
+                        "Tool coordination storage tier requires the native file backend"
+                    )
         self._binding_tasks = {}
         self._arrival_sequence = 0
         self._guidance = {}
         self._view = None
         self.composer = KVPlanComposer(self.control.limits)
+        self.errors = {}
+        from sglang.srt.managers.kv_control.policy_execution import PolicyExecution
+
+        self.execution = PolicyExecution(self)
+
+    @staticmethod
+    def action_id(ref):
+        return _digest((ref.policy, ref.proposal))
 
     def consumes(self, signal):
         return any(policy.consumes(signal) for policy in self.policies.values())
@@ -331,19 +368,42 @@ class KVPolicyRuntime:
             self.control.registry.namespace,
             self.control.registry.engine_epoch,
         )
+        if any("capacity" in policy.observation_categories for _, policy in consumers):
+            from sglang.srt.managers.kv_control.policy import PoolObservation
+
+            allocator = self.service.cache.token_to_kv_pool_allocator
+            free = int(allocator.available_size())
+            evictable = int(self.service.cache.tree_core.full_evictable_size())
+            total = int(allocator.size)
+            view = replace(
+                view,
+                pools=(
+                    PoolObservation(
+                        "full", "gpu", total, free, total - free - evictable, evictable
+                    ),
+                ),
+            )
         offered = []
         for name, policy in consumers:
-            for proposal in policy.on_signal(signal, view) or ():
-                if not isinstance(proposal.action, SetPriority):
-                    raise ControlError(
-                        "unsupported",
-                        "This runtime profile executes priority proposals only",
+            previous = self.execution.previous_scope(name, signal.owner_key)
+            specific = replace(signal, previous_scope=previous)
+            decision = policy.on_signal(specific, view)
+            if policy.movement_policy and payload.signal == "tool_wait":
+                self.execution.remember_pause(name, signal)
+            for proposal in decision or ():
+                action = (
+                    msgspec.structs.replace(
+                        proposal.action, claim_id=_claim(name, signal.owner_key)
                     )
-                action = msgspec.structs.replace(
-                    proposal.action, claim_id=_claim(name, signal.owner_key)
+                    if isinstance(proposal.action, SetPriority)
+                    else proposal.action
                 )
                 authoritative = (
-                    scope
+                    previous
+                    if policy.movement_policy
+                    and previous is not None
+                    and proposal.scope is previous
+                    else scope
                     if action.target == payload.target
                     else self.control.index.resolve(action.target)
                 )
@@ -375,78 +435,20 @@ class KVPolicyRuntime:
             if offered
             else ()
         )
-        refs = ()
-        try:
-            if plan:
-                refs = self.control._reserve_policy_operations(
-                    tuple(
-                        (_digest((p.ref.policy, p.ref.proposal)), p.proposal.action)
-                        for p in plan
-                    ),
-                    resolutions=tuple(p.proposal.scope for p in plan),
-                )
-            outcomes = {}
-            remaining = list(zip(plan, refs, strict=True))
-            while remaining:
-                ready = [
-                    (entry, child)
-                    for entry, child in remaining
-                    if all(d in outcomes for d in entry.dependencies)
-                ]
-                if not ready:
-                    raise ControlError(
-                        "invalid_payload", "Unresolved policy dependency graph"
-                    )
-                for entry, child in ready:
-                    if not entry.accepted:
-                        result = self.control._finish(
-                            child,
-                            ExecutionUpdate(
-                                status=Status.DEFERRED, quiescent=True, code=entry.code
-                            ),
-                        )
-                    elif any(
-                        outcomes[d].status != Status.COMPLETED
-                        for d in entry.dependencies
-                    ):
-                        result = self.control._finish(
-                            child,
-                            ExecutionUpdate(
-                                status=Status.DEFERRED,
-                                quiescent=True,
-                                code="dependency_failed",
-                            ),
-                        )
-                    else:
-                        result = self.control._start_policy_operation(child)
-                    outcomes[entry.ref] = result
-                    remaining.remove((entry, child))
-            self.control.registry.update(
-                ref,
-                ExecutionUpdate(
-                    status=Status.COMPLETED,
-                    quiescent=True,
-                    code="policy_context_updated",
-                    completed_steps=("policy_context_updated",),
-                    derived_operations=refs,
-                ),
-            )
-        except Exception as error:
-            for child in refs:
-                if not self.control.registry.get(child).status.terminal:
-                    self.control.cancel(child)
-            if not refs and isinstance(error, ControlError):
-                raise
-            self.control.registry.update(
-                ref,
-                ExecutionUpdate(
-                    status=Status.FAILED,
-                    quiescent=True,
-                    code=getattr(error, "code", "policy_error"),
-                    reason=str(error)[:4096],
-                    derived_operations=refs,
-                ),
-            )
+        refs = self.execution.reserve(
+            ref, signal, plan, {name for name, _ in consumers}
+        )
+        self.control.registry.update(
+            ref,
+            ExecutionUpdate(
+                status=Status.COMPLETED,
+                quiescent=True,
+                code="policy_context_updated",
+                completed_steps=("policy_context_updated",),
+                derived_operations=refs,
+            ),
+        )
+        self.execution.progress()
         return True
 
     def cleanup(self, tasks):
@@ -455,6 +457,7 @@ class KVPolicyRuntime:
             for task in tasks
             for name in self.policies
         )
+        self.execution.cleanup(tasks)
         if identities:
             self.claims.drop_policy_claims(identities)
         for policy in self.policies.values():
@@ -481,10 +484,23 @@ class KVPolicyRuntime:
                 req.kv_control_policy_identity = context.binding_id
                 req.kv_control_policy_tasks = tasks
 
-    def finish_request(self, req):
-        context = getattr(req, "kv_control_context", None)
+    def finish_request(self, req, context=None):
+        context = context or getattr(req, "kv_control_context", None)
         if context is not None:
             self._binding_tasks.pop((context.caller_id, context.binding_id), None)
+
+    def progress(self):
+        self.execution.progress()
+
+    def before_explicit(self, action, scope):
+        self.execution.before_explicit(action, scope)
+
+    @property
+    def prepares_requests(self):
+        return any(
+            w.entry.proposal.prepare_for_admission and not w.cancelled
+            for w in self.execution.works.values()
+        )
 
     def observe_scheduler(self, scheduler, running_batch):
         from sglang.srt.managers.kv_control.policy_observer import observe_scheduler

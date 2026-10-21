@@ -267,6 +267,24 @@ class CopyPriorityClaims:
                 (explicit if origin == "explicit" else policy).append(claim.value)
         return max(explicit or policy, default=None)
 
+    def explicit_priority(self, node, component):
+        record = self._record(node, component)
+        now = self.clock()
+        return (
+            max(
+                (
+                    claim.value
+                    for (origin, _, _), claim in record.claims.items()
+                    if origin == "explicit"
+                    and claim.value is not None
+                    and claim.expires_at > now
+                ),
+                default=None,
+            )
+            if record is not None
+            else None
+        )
+
     def eviction_key(self, node, component):
         """Account for every component the structural eviction would reclaim."""
         core = self.tree_core

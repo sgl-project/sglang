@@ -88,3 +88,27 @@ def test_invalid_quota_options_fail_before_scheduler_use(options):
                 ],
             }
         )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"tier": "unavailable"},
+        {"min_pressure": -1},
+        {"min_pressure": float("nan")},
+        {"initial_estimated_transfer_seconds": 0},
+        {"lead_seconds": float("inf")},
+        {"max_contexts": 0},
+        {"force_pin": True},
+    ],
+)
+def test_invalid_tool_options_fail_before_execution(options):
+    with pytest.raises(ValueError):
+        parse_config(
+            {
+                "namespace": "ns",
+                "policies": [
+                    {"name": "tools", "implementation": "tool_wait", "options": options}
+                ],
+            }
+        )

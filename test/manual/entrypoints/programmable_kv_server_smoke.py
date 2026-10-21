@@ -27,6 +27,11 @@ def main():
     parser.add_argument("--load-format", default="auto")
     parser.add_argument("--hicache", action="store_true")
     parser.add_argument(
+        "--tool-wait",
+        action="store_true",
+        help="Force a small policy save/resume/admission correctness probe",
+    )
+    parser.add_argument(
         "--quota",
         action="store_true",
         help="Verify configured task guidance in the real scheduler",
@@ -48,7 +53,7 @@ def main():
     )
     parser.add_argument("--output-dir")
     args = parser.parse_args()
-    if args.storage or args.retention:
+    if args.storage or args.retention or args.tool_wait:
         args.hicache = True
     root = Path(__file__).resolve().parents[3]
     output = Path(args.output_dir or tempfile.mkdtemp(prefix="sglang-kv-server-smoke-"))
@@ -68,6 +73,21 @@ def main():
     if args.quota:
         control_config.setdefault("policies", []).append(
             {"name": "quota", "implementation": "quota"}
+        )
+    if args.tool_wait:
+        control_config["policy_max_wait_seconds"] = 5
+        control_config.setdefault("policies", []).append(
+            {
+                "name": "tools",
+                "implementation": "tool_wait",
+                "options": {
+                    "tier": "storage" if args.storage else "host",
+                    "min_pressure": 0,
+                    "min_pause_seconds": 0.001,
+                    "initial_estimated_transfer_seconds": 0.001,
+                    "lead_seconds": 0.001,
+                },
+            }
         )
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -283,6 +303,7 @@ def main():
             ref = results[0]["ref"]
             movements = []
             policy_validation = []
+            tool_validation = None
             if args.hicache:
                 end = max(
                     o["coverage"]["end_token"]
@@ -389,54 +410,226 @@ def main():
                         }
                     )
 
-                if args.retention:
-                    assert "retain" in owner["policies"]
-                    retention("retain-before-move", 200, 90)
-                movements.append(
-                    movement(
-                        "move_to", "gpu", "storage" if args.storage else "host", "save"
+                def tool_scenario():
+                    def submit_action(message, kind, payload, *, caller="router"):
+                        return control(
+                            {
+                                "kind": "submit",
+                                "context": dict(router, caller_id=caller),
+                                "envelope": {
+                                    "protocol_version": "0.1",
+                                    "message_id": message,
+                                    "actions": [
+                                        {
+                                            "action_id": "a",
+                                            "action_type": "sglang." + kind,
+                                            "action_version": "1.0",
+                                            "payload": payload,
+                                        }
+                                    ],
+                                },
+                            }
+                        )["results"][0]
+
+                    # The task records committed reusable history, not the yet
+                    # uncomputed tool result appended to the next model call.
+                    revision = (
+                        registration["results"][0]["update"]["logical_change"][
+                            "continuation_revision"
+                        ]
+                        if args.quota
+                        else 0
                     )
-                )
-                if args.storage:
-                    flushed = requests.post(base + "/flush_cache", timeout=15)
-                    flushed.raise_for_status()
-                    before_epoch = owner["engine_epoch"]
-                    owner = get_capabilities()
-                    assert owner["engine_epoch"] != before_epoch
-                    router = dict(router, engine_epoch=owner["engine_epoch"])
-                absent = control(
-                    {"kind": "residency", "context": router, "target": target}
-                )
-                assert not absent["items"] and absent["missing"], absent
-                host = control(
-                    {
-                        "kind": "residency",
-                        "context": router,
-                        "target": target,
-                        "location": {"tier": "host"},
+                    associated = submit_action(
+                        "tool-history",
+                        "associate",
+                        {
+                            "session_id": "smoke-task",
+                            "continuation_id": "prompt",
+                            "expected_revision": revision,
+                            "target": target,
+                        },
+                    )
+                    assert associated["update"]["status"] == "completed", associated
+                    cleared = submit_action(
+                        "clear-before-tool",
+                        "set_priority",
+                        {
+                            "target": target,
+                            "location": {"tier": "gpu"},
+                            "claim_id": "smoke",
+                            "revision": 2,
+                            "value": None,
+                        },
+                        caller="request",
+                    )
+                    assert cleared["update"]["status"] == "completed", cleared
+                    paused = submit_action(
+                        "tool-paused",
+                        "signal",
+                        {
+                            "target": {
+                                "kind": "session",
+                                "namespace": namespace,
+                                "session_id": "smoke-task",
+                            },
+                            "signal": "tool_wait",
+                            "resume_after_seconds": 10,
+                        },
+                    )
+                    assert paused["update"]["status"] == "completed", paused
+                    (save_ref,) = paused["update"]["derived_operations"]
+                    deadline = time.monotonic() + 30
+                    while True:
+                        saved = control(
+                            {
+                                "kind": "query",
+                                "context": save_ref["context"],
+                                "message_id": save_ref["message_id"],
+                            }
+                        )["results"][0]
+                        if saved["update"]["status"] not in (
+                            "received",
+                            "queued",
+                            "accepted",
+                            "running",
+                            "cancelling",
+                        ):
+                            break
+                        assert time.monotonic() < deadline, saved
+                        time.sleep(0.01)
+                    assert saved["update"]["status"] == "completed", saved
+                    absent = control(
+                        {"kind": "residency", "context": router, "target": target}
+                    )
+                    assert not absent["items"] and absent["missing"], absent
+                    resume_ids = body["input_ids"] + generated["output_ids"] + [37]
+                    sampling = body["sampling_params"]
+                    baseline_response = requests.post(
+                        base + "/generate",
+                        json={
+                            "input_ids": resume_ids,
+                            "cache_salt": "recompute-" + identity,
+                            "sampling_params": sampling,
+                        },
+                        timeout=60,
+                    )
+                    baseline_response.raise_for_status()
+                    baseline = baseline_response.json()
+                    assert baseline["meta_info"]["cached_tokens"] == 0, baseline
+                    resumed_response = requests.post(
+                        base + "/generate",
+                        json={
+                            "input_ids": resume_ids,
+                            "sampling_params": sampling,
+                            "kv_hints": {
+                                "protocol_version": "0.1",
+                                "message_id": "tool-resume",
+                                "actions": [
+                                    {
+                                        "action_id": "resume",
+                                        "action_type": "sglang.signal",
+                                        "action_version": "1.0",
+                                        "payload": {
+                                            "target": {
+                                                "kind": "session",
+                                                "namespace": namespace,
+                                                "session_id": "smoke-task",
+                                            },
+                                            "signal": "resume",
+                                        },
+                                    }
+                                ],
+                            },
+                        },
+                        timeout=60,
+                    )
+                    resumed_response.raise_for_status()
+                    resumed = resumed_response.json()
+                    assert resumed["output_ids"] == baseline["output_ids"], (
+                        resumed,
+                        baseline,
+                    )
+                    assert resumed["meta_info"]["cached_tokens"] >= end, resumed
+                    interpretation = control(
+                        {
+                            "kind": "lookup",
+                            "context": context,
+                            "message_id": "tool-resume",
+                        }
+                    )
+                    statistics = control({"kind": "capacity", "context": router})
+                    assert statistics["policies"]["preparations_consumed"] >= 1, (
+                        statistics
+                    )
+                    assert statistics["policies"]["consumed_prefix_tokens"] >= end, (
+                        statistics
+                    )
+                    return {
+                        "paused": paused,
+                        "saved": saved,
+                        "source_gpu_absent": absent,
+                        "baseline": baseline,
+                        "resumed": resumed,
+                        "interpretation": interpretation,
+                        "statistics": statistics,
+                        "forced_movement_fixture": True,
                     }
-                )
-                if args.storage:
-                    assert not host["items"] and host["missing"], host
+
+                if args.tool_wait:
+                    tool_validation = tool_scenario()
                 else:
-                    assert host["items"] and not host["missing"], host
-                movements.append(
-                    movement(
-                        "copy_to",
-                        "storage" if args.storage else "host",
-                        "gpu",
-                        "restore",
+                    if args.retention:
+                        assert "retain" in owner["policies"]
+                        retention("retain-before-move", 200, 90)
+                    movements.append(
+                        movement(
+                            "move_to",
+                            "gpu",
+                            "storage" if args.storage else "host",
+                            "save",
+                        )
                     )
-                )
-                loaded = control(
-                    {"kind": "residency", "context": router, "target": target}
-                )
-                assert loaded["items"] and not loaded["missing"], loaded
-                assert all(i["effective_priority"] == 0 for i in loaded["items"]), (
-                    loaded
-                )
-                if args.retention:
-                    retention("retain-after-load", 55, 55)
+                    if args.storage:
+                        flushed = requests.post(base + "/flush_cache", timeout=15)
+                        flushed.raise_for_status()
+                        before_epoch = owner["engine_epoch"]
+                        owner = get_capabilities()
+                        assert owner["engine_epoch"] != before_epoch
+                        router = dict(router, engine_epoch=owner["engine_epoch"])
+                    absent = control(
+                        {"kind": "residency", "context": router, "target": target}
+                    )
+                    assert not absent["items"] and absent["missing"], absent
+                    host = control(
+                        {
+                            "kind": "residency",
+                            "context": router,
+                            "target": target,
+                            "location": {"tier": "host"},
+                        }
+                    )
+                    if args.storage:
+                        assert not host["items"] and host["missing"], host
+                    else:
+                        assert host["items"] and not host["missing"], host
+                    movements.append(
+                        movement(
+                            "copy_to",
+                            "storage" if args.storage else "host",
+                            "gpu",
+                            "restore",
+                        )
+                    )
+                    loaded = control(
+                        {"kind": "residency", "context": router, "target": target}
+                    )
+                    assert loaded["items"] and not loaded["missing"], loaded
+                    assert all(i["effective_priority"] == 0 for i in loaded["items"]), (
+                        loaded
+                    )
+                    if args.retention:
+                        retention("retain-after-load", 55, 55)
             repeated = requests.post(
                 base + "/generate",
                 json={k: v for k, v in body.items() if k != "kv_hints"},
@@ -547,6 +740,7 @@ def main():
                 "weights_validation": weights_validation,
                 "policy_validation": policy_validation,
                 "quota_binding": quota_binding,
+                "tool_validation": tool_validation,
             }
             (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             print(

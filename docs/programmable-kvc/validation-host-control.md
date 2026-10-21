@@ -147,3 +147,47 @@ admission 的保留行为仍需策略层实现。
 `/tmp/sglang-kv-retention-movement-regressions.log`；服务结果在
 `/tmp/sglang-kv-opt-retention-storage-smoke/`。
 Tool-wait 成本判断、quota 调度指导和保留至实际 admission 的准备引用仍待实现。
+
+## 配额、tool-wait 与实际 admission
+
+已接通 retention、quota、tool_wait 三种可选策略，默认列表仍为空。配额使用软份额、
+空闲容量借用、importance 与等待时间，调度器在原生前缀匹配后读取有界观察并排序。
+实际分配继续由 `PrefillAdder` 使用当前匹配、批次预留及运行中请求增长进行检查。
+观察缺失或截断不会被视为零需求。共享的可淘汰前缀在整体准备需求中计费一次。
+
+Tool-wait 仅在已观察到引用压力、暂停预测长于配置阈值和搬运成本估计时提出保存。
+默认参数为压力 0.7、最小暂停 0.5 秒、初始单程搬运估计 0.1 秒。该初值属于配置估计；
+真实控制到就绪耗时用于后续修正，不代表硬件带宽测量。短暂停、未知暂停与低压力
+场景不搬运。当前搬运策略限 FULL、单 owner、持久 Host，以及可选的 `file` 后端；
+策略目标须为单个 token 分支和页对齐的完整前缀。
+
+恢复会绑定明确的任务 incarnation 和实际请求。准备在 `PrefillAdder` 创建前启动，
+并检查完整请求所需余量；发生分配后使用后续新调度轮次，避免沿用旧预算。COPY
+完成后保留内部准备引用，等请求取得自己的缓存锁再交接。请求取消、任务结束、
+过期、显式覆盖、重置，以及 decode 余量不足都会释放未消费的准备引用。已经完成
+的 COPY 状态不能替代当前就绪检查。已有推理预取会先发布 Host 数据，策略不会再
+为同一请求重复发起冷查询。
+
+CPU 用例覆盖真实 Host/文件数据、异步取消和 worker 排空、准备引用交接、重复与
+共享请求、整请求余量、ACK 后清理、显式优先级、旧预测被真实恢复替换、历史快照、
+观察截断及启动配置。既有原生调度、预算、参数更新与缓存测试继续保留。
+
+1 号卡的组合服务验证通过：策略保存后确认原 GPU 副本缺失，恢复请求复用 5 个前缀
+token，输出与不同 cache salt 的重新计算对照一致；统计记录 1 次准备消费和 5 个
+消费前缀 token。服务使用本地 OPT-125m 配置、FP16 与 dummy weights。底层非零
+17/18 K/V 文件往返和引用交接另有真实 CUDA 字节验证。上述证据用于功能与正确性，
+未据此宣称模型质量、吞吐提升或训练流程完成。
+
+组合服务日志与结果：`/tmp/sglang-kv-opt-tool-coordination-smoke/`。
+最终复验：`/tmp/sglang-kv-opt-tool-final-smoke/`。
+CPU 验收：`/tmp/sglang-kv-final-cpu-acceptance.log`。
+策略与生命周期专项日志：`/tmp/sglang-kv-tool-acceptance-cpu-proof.log`、
+`/tmp/sglang-kv-tool-lifecycle-cpu-proof.log`。
+
+TP/PP/CP/DP 多 owner、直接 linker、混合状态搬运、通用范围/descriptor 搬运、其他
+存储后端及性能实验仍在此实现范围之外，接口会返回对应限制。
+
+最终合并 CPU 验收：355 项、79 个子用例全部通过，用时 28.27 秒。
+最终 1 号卡组合策略服务复验通过：准备复用 5 个 token，输出与重新计算对照一致。
+格式、静态检查和 diff 空白检查通过。当前可执行范围的接口、生命周期、真实搬运、
+参数隔离、可组合策略和 admission 引用交接均有对应代码及验证记录。

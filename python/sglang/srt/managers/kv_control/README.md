@@ -213,8 +213,9 @@ Cancelling a logical interest never authorizes freeing a buffer still accessed
 by a worker or another waiter. Serving integration must continue progress until
 those obligations end, even after a task's finish action completes.
 
-Multi-rank publication, linker transfers, policies and event feeds remain
-pending. File-backed storage transfers are described below. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
+Multi-rank publication, direct-linker transfers and event feeds remain pending.
+File-backed storage and the opt-in retention/quota/tool-wait policies are
+described below. CPU tests validate in-process HTTP/IPC and cache/request behavior; GPU
 tests cover the explicitly described one-owner FULL profile. No serving
 performance or model-quality claim follows from these smoke tests.
 
@@ -469,7 +470,7 @@ advertised by this adapter.
 Native `finish_task` continues to abandon pending operation interests. Completed
 explicit copy claims retain their caller-controlled lifetime, so task cleanup
 cannot revoke another caller's declaration or delete shared bytes. Policy-owned
-claim ownership and cleanup remain a unit 2/4 integration obligation.
+claim ownership and cleanup are supplied by the configured policy runtime.
 
 ## Persistent-host movement
 
@@ -795,8 +796,9 @@ the new epoch. No retention policy acquires a pin or changes inference admission
 Unconsumed signals return before history resolution or observation construction,
 including tool_wait/resume_prediction with only retention configured. Tool-wait
 movement, quota guidance and admission preparation are not enabled by this
-profile. A resume signal cannot set priority on a still-pending load; its child
-reports the actual unsupported/missing scope instead of claiming a future copy.
+retention-only profile. With tool-wait also enabled, publication dependencies
+queue priority until the selected copy is ready; unavailable scopes remain
+explicit in child results.
 
 The one-GPU manual server probe accepts `--retention` (implies `--hicache`), also
 with `--storage`. It checks policy-derived child queries, larger policy priority
@@ -844,8 +846,8 @@ On the same Linux/CUDA one-GPU fixture, adding `--prepare` to
 `programmable_kv_hicache_smoke.py --storage` verifies file bytes and the handoff
 from copy references to preparation and then to a real cache request lock,
 including pressure eviction before and after release. The small fixture checks
-physical references; configured scheduler selection/expiry integration remains
-a separate unit.
+physical references; the configured tool-wait policy connects selection, expiry
+and request admission to this mechanism.
 
 ## Optional capacity and ordering guidance
 
@@ -910,3 +912,95 @@ Consumed signals freeze their historical scope at submission, before any sibling
 association can extend it. Owner-registered children retain that resolved scope;
 a same-envelope task finish cancels a later signal rather than resurrecting
 policy declarations for a finished incarnation.
+
+## Optional tool-wait coordination
+
+Add a `tool_wait` definition to the existing FULL persistent-host HiCache
+configuration. `tier` is `host`, or `storage` with the actual file backend:
+
+```json
+{
+  "namespace": "model-weights-v1",
+  "policies": [
+    {"name": "retain", "implementation": "retention"},
+    {"name": "capacity", "implementation": "quota"},
+    {
+      "name": "tools",
+      "implementation": "tool_wait",
+      "options": {
+        "tier": "host",
+        "min_pressure": 0.7,
+        "min_pause_seconds": 0.5,
+        "initial_estimated_transfer_seconds": 0.1,
+        "lead_seconds": 0.1,
+        "prefetch_on_admission": true,
+        "max_contexts": 128
+      }
+    }
+  ]
+}
+```
+
+The initial executable profile requires a single token-backed branch and a
+complete page-aligned prefix. The owner can materialize its endpoint using the
+native metadata match before execution. Other branch/range/state/backend cases
+remain explicitly unsupported. Policies still receive immutable values only.
+
+Tool wait proposes MOVE only when observed referenced GPU pressure passes the
+configured threshold and a known pause estimate exceeds both the minimum window
+and estimated saving/loading cost. Unknown pause/capacity does not become zero.
+The initial transfer value is a configurable estimate, not a hardware fact;
+observed control-to-readiness durations refine it conservatively. No-pressure,
+short-pause and unknown-pause cases retain ordinary cache behavior. Saving
+attached to a generation waits for its successful checkpoint and explicit
+completion commands, then acquires transfer references before request refs end.
+
+Resume/resume_prediction use the owner's bounded paused snapshot, preserving
+historical prefix and task incarnation if live history extends. Predictions
+schedule within the configured horizon; new observations supersede queued work.
+Compatible in-flight COPY interests can still join. A resume cancels an obsolete
+save interest and drains it without letting its later MOVE reclaim the prepared
+GPU source. Live explicit GPU priorities and pending explicit placement commands
+veto conflicting automatic movement; newly issued explicit commands cancel
+competing advice and release its scheduling references.
+
+With admission preparation enabled, a COPY waits for a selected request with an
+authoritative task binding and matching reusable prefix/compatibility. The owner
+checks the complete request's incremental allocation/protection estimate against
+current signed headroom before starting the prefix load. Existing inference L3
+prefetch publishes its host data first; no duplicate cold query is issued for
+that request. Starts happen before PrefillAdder construction; an in-flight load
+returns to a later pass, and the native prefill barrier prevents matching pending
+GPU indices. The later pass uses fresh allocator/growth/match state.
+
+COPY publication hands the complete scope to an internal preparation lease. The
+scheduler releases it only after PrefillAdder has installed the request's own
+cache lock. Bounded wait expiry, task finish, request abort, explicit override,
+reset and lost decode headroom release/revoke unconsumed preparation. Starvation
+escape removes advisory deferral, never physical feasibility checks. An already
+resident ready scope can be held without issuing a redundant COPY; its child is
+DEFERRED/gpu_already_ready, separate from the owner's actual ready lease. A
+historical COMPLETED result alone is never a readiness certificate.
+
+The asynchronous owner retains cancelled work until native control confirms
+worker quiescence, including shared interests. Priority dependent on a new COPY
+waits for successful publication; unrelated pending transfer fences also delay
+priority safely. Source/destination effects and failure causes remain in native
+child results. Result callbacks are consumed before client ACK compacts them;
+completed COPY records and the scheduling lease have independent lifetimes.
+
+`max_policy_actions` (128), `max_policy_actions_per_step` (8),
+`max_policy_snapshot_tokens` (1,048,576), `policy_max_delay_seconds` (300),
+`policy_max_wait_seconds` (1), copy/query/result limits and per-policy context
+limits bound state and work. The capacity reply includes fixed policy counters.
+They count proposals, ready/consumed scopes and prefix tokens, not physical bytes
+or attribution of every cache hit to movement. Reset/weight transitions cancel
+soft plans first and still require actual IO/model quiescence.
+
+The one-GPU serving probe accepts `--tool-wait --quota --retention --storage`.
+It deliberately sets small cost/pressure thresholds to force a correctness path:
+policy save, confirmed source GPU absence, a resuming model call with preparation
+and admission, and comparison against a different-salt recomputation. The OPT
+dummy-weight fixture reuses five prefix tokens with equal output IDs. CPU tests
+and nonzero CUDA KV-byte probes provide stronger data-movement evidence; this
+forced fixture is not a serving-performance or model-quality evaluation.

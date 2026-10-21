@@ -503,6 +503,8 @@ class KVControl:
 
     def _start(self, pending):
         assert self.executor is not None and pending.target is not None
+        if pending.origin == "explicit" and self.policy_runtime is not None:
+            self.policy_runtime.before_explicit(pending.payload, pending.target)
         if (
             any(branch.unaligned for branch in pending.target.branches)
             and not pending.target.allow_clip

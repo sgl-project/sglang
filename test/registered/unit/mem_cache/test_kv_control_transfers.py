@@ -90,6 +90,9 @@ def owner(request):
     case = fixtures.TestKVControlCache()
     case.setUp()
     fixture_kind = getattr(request, "param", None)
+    configured = None
+    if isinstance(fixture_kind, tuple):
+        configured, fixture_kind = fixture_kind
     storage = fixture_kind in ("file", "file_namespaced")
     storage_args = {}
     if storage:
@@ -113,8 +116,10 @@ def owner(request):
     parallel.__enter__()
     try:
         config = (
-            None if storage else getattr(request, "param", None)
-        ) or ServiceConfig(namespace="ns", engine_id="engine")
+            configured
+            or (None if storage else getattr(request, "param", None))
+            or ServiceConfig(namespace="ns", engine_id="engine")
+        )
         cache, _ = case.make(
             session=False, config=config.cache_config(), limits=config.limits
         )

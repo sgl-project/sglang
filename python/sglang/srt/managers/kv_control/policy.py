@@ -70,6 +70,7 @@ class PolicySignal:
     scope: ResolvedTarget
     owner_key: str
     tasks: tuple[TaskIdentity, ...] = ()
+    previous_scope: ResolvedTarget | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,7 @@ class KVPolicy:
     consumed_signals: frozenset[str] = frozenset()
     observation_categories: frozenset[str] = frozenset()
     uses_guidance = False
+    movement_policy = False
 
     def consumes(self, payload):
         return payload.signal in self.consumed_signals
@@ -137,6 +139,9 @@ class KVPolicy:
         return ()
 
     def cleanup(self, tasks: tuple[TaskIdentity, ...]):
+        pass
+
+    def on_result(self, proposal, result, *, elapsed_seconds):
         pass
 
 
