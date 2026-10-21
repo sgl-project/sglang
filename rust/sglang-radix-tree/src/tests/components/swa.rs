@@ -76,7 +76,7 @@ fn swa_window_attach_splits_both_edges_preserving_full_and_pending_actions() {
     assert_eq!(actions.len(), 2);
     for action in &actions {
         assert!(
-            matches!(action, CacheAction::ReplaceWriteThroughOnNodeSplit { ack_id: 91, old_node_id, new_child_node_id, .. } if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
+            matches!(action, CacheAction::UpdatePendingBackupOnNodeSplit { ack_id: Some(91), old_node_id, new_child_node_id, .. } if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
         );
     }
     let head = child_of(&tc, tc.arena.root(), &[1, 2]);
@@ -3899,46 +3899,94 @@ fn new_leaf_after_a_cached_prefix_splits_at_the_leaf_relative_boundary() {
 
 #[test]
 fn new_leaf_boundary_split_and_window_cap_compose_in_one_commit() {
-    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
-    tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
-    let root = tc.arena.root();
-    let a = child_of(&tc, root, &[1]);
-    let result = tc.insert(&insert_params_swa(
-        &vec![1, 2, 3, 4, 5, 6, 7],
-        &[20, 21, 22, 23, 24, 25, 26],
-        /* prev_prefix_len = */ 2,
-        /* swa_evicted_seqlen = */ 3,
-    ));
-    // Boundary split first ([3] tombstone), then the window cap splits the
-    // in-window run into [4, 5] + [6, 7], rebuilt older-prefix-first.
-    let p = child_of(&tc, a, &[3]);
-    let capped = child_of(&tc, p, &[4]);
-    let leaf = child_of(&tc, capped, &[6]);
-    assert_eq!(tc.arena.node(p).key, vec![3]);
-    assert_eq!(tc.arena.node(capped).key, vec![4, 5]);
-    assert_eq!(tc.arena.node(leaf).key, vec![6, 7]);
-    let rebuilds: Vec<NodeId> = result
-        .cache_actions
-        .iter()
-        .filter_map(|action| match action {
-            CacheAction::SwaRebuild { node_id, .. } => Some(*node_id),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        rebuilds,
-        vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
-    );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
-    )));
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26]))
-    )));
+    for buffer_only in [false, true] {
+        let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+        if buffer_only {
+            tc.set_host_memory_buffer_only();
+        }
+        tc.insert(&insert_params_swa(&vec![1, 2], &[10, 11], 0, 0));
+        let root = tc.arena.root();
+        let a = child_of(&tc, root, &[1]);
+        let result = tc.insert(&insert_params_swa(
+            &vec![1, 2, 3, 4, 5, 6, 7],
+            &[20, 21, 22, 23, 24, 25, 26],
+            /* prev_prefix_len = */ 2,
+            /* swa_evicted_seqlen = */ 3,
+        ));
+        // Boundary split first ([3] tombstone), then the window cap splits the
+        // in-window run into [4, 5] + [6, 7], rebuilt older-prefix-first.
+        let p = child_of(&tc, a, &[3]);
+        let capped = child_of(&tc, p, &[4]);
+        let leaf = child_of(&tc, capped, &[6]);
+        assert_eq!(tc.arena.node(p).key, vec![3]);
+        assert_eq!(tc.arena.node(capped).key, vec![4, 5]);
+        assert_eq!(tc.arena.node(leaf).key, vec![6, 7]);
+        let rebuilds: Vec<NodeId> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::SwaRebuild { node_id, .. } => Some(*node_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rebuilds,
+            vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
+        );
+        assert!(result.cache_actions.iter().any(|action| matches!(
+            action,
+            CacheAction::SwaRebuild { node_id, source_value }
+                if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
+        )));
+        assert!(result.cache_actions.iter().any(|action| matches!(
+            action,
+            CacheAction::SwaRebuild { node_id, source_value }
+                if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26]))
+        )));
+        let split_ids: Vec<NodeId> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| match action {
+                CacheAction::UpdatePendingBackupOnNodeSplit {
+                    ack_id,
+                    old_node_id,
+                    new_node_id,
+                    new_child_node_id,
+                } => {
+                    assert_eq!(*ack_id, None);
+                    assert_eq!(*old_node_id, tc.arena.node(leaf).id);
+                    assert_eq!(*new_child_node_id, tc.arena.node(leaf).id);
+                    Some(*new_node_id)
+                }
+                _ => None,
+            })
+            .collect();
+        if buffer_only {
+            assert_eq!(
+                split_ids,
+                vec![tc.arena.node(p).id, tc.arena.node(capped).id]
+            );
+            let first_rebuild = result
+                .cache_actions
+                .iter()
+                .position(|action| matches!(action, CacheAction::SwaRebuild { .. }))
+                .unwrap();
+            assert_eq!(
+                result.cache_actions[..first_rebuild]
+                    .iter()
+                    .filter(|action| {
+                        matches!(action, CacheAction::UpdatePendingBackupOnNodeSplit { .. })
+                    })
+                    .count(),
+                2,
+            );
+        } else {
+            assert!(split_ids.is_empty());
+        }
+        for node in [p, capped, leaf] {
+            assert_eq!(tc.arena.node(node).write_through_pending_id, None);
+        }
+    }
 }
 
 #[test]
@@ -4030,10 +4078,26 @@ fn window_cap_skips_a_page_misaligned_leaf() {
         )
         .unwrap();
     // split_at = 5 - 2 = 3 is not page-aligned: the cap is skipped.
-    let capped = swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf);
+    let mut actions = Vec::new();
+    let capped = swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf, &mut actions);
+    assert!(actions.is_empty());
     assert_eq!(capped, None);
     assert_eq!(tc.arena.node(leaf).key, vec![1, 2, 3, 4, 5]);
     assert_eq!(tc.arena.node(leaf).parent(), root);
+}
+
+#[test]
+#[should_panic(expected = "fresh SWA leaf cannot be write-through-pending")]
+fn window_cap_rejects_a_write_through_ack() {
+    let mut tc = swa_core(/* window = */ 2, /* page_size = */ 1);
+    tc.set_host_memory_buffer_only();
+    let root = tc.arena.root();
+    let leaf = tc
+        .arena
+        .alloc_child(root, vec![1, 2, 3, 4], 0, None)
+        .unwrap();
+    tc.arena.node_mut(leaf).write_through_pending_id = Some(91);
+    swa_component(2).maybe_split_leaf_for_swa_lock_(&mut tc, leaf, &mut Vec::new());
 }
 
 #[test]

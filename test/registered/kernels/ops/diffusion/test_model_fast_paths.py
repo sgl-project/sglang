@@ -2373,6 +2373,7 @@ def test_moss_image_norm_epilogue_gate_and_graph_replay(monkeypatch, epilogue):
             assert torch.equal(hot_out, expected)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA PTX")
 @pytest.mark.parametrize("operation", ["situ", "rmsnorm"])
 @torch.no_grad()
 def test_moss_image_selected_kernel_rejects_mismatched_operands(monkeypatch, operation):
