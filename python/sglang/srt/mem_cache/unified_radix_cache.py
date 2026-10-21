@@ -2042,6 +2042,26 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    def register_pp_prefetch_query(self, req):
+        # One common root span: local L1/L2 matches can differ across stages.
+        # Only the query uses this span; GET retains each stage's native suffix.
+        end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+        key = RadixKey(
+            req.full_untruncated_fill_ids[:end],
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.tree_core.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(key) >= self.prefetch_threshold:
+            transfers = self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH,
+                PoolTransfer(name=PoolName.KV, host_indices=None),
+                {},
+            )
+            self.cache_controller.register_cache_query(
+                req.cache_request_handle, key, transfers
+            )
+
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
@@ -2791,6 +2811,8 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        if pp_cache_admission_enabled():
+            self.cache_controller.release_pp_prefetch(rid)
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(rid)

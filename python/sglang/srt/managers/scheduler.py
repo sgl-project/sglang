@@ -3256,8 +3256,12 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if get_parallel().pp_rank == 0 and getattr(
-            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+        if (
+            not pp_cache_admission_enabled()
+            and get_parallel().pp_rank == 0
+            and getattr(
+                self.tree_cache.cache_controller, "pp_prefetch_command_group", None
+            )
         ):
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
@@ -3283,6 +3287,8 @@ class Scheduler(
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
+            if pp_cache_admission_enabled():
+                tree_cache.register_pp_prefetch_query(req)
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
@@ -5387,11 +5393,8 @@ class Scheduler(
         # L3 must not turn on cache-side admission without their counterparts.
         # An already-active admission may still update the same backend's
         # policy; the native attachment validates that operation below.
-        if (
-            self.pp_prefetch_admission is None
-            and pp_cache_admission_enabled(
-                storage_backend=recv_req.hicache_storage_backend
-            )
+        if self.pp_prefetch_admission is None and pp_cache_admission_enabled(
+            storage_backend=recv_req.hicache_storage_backend
         ):
             return AttachHiCacheStorageReqOutput(
                 success=False,

@@ -1,66 +1,52 @@
-# Cache-mode PP admission on v0.5.22
+# Async PP cache admission with shared queries
 
-## Pinned sources
-
-- Base: official `v0.5.22`, `baa9befa381511cd4d56f83980951e5a45fffc6d`.
-- Development branch: `codex/pp-admission-v0522-20261016`.
-- Feature source: the final reviewed `f21a8b84bb` delta against its original
-  `74308cf1d6` base, not the intermediate implementation history.
-- The local `main` was also fast-forwarded to `7098ec387c`, but is deliberately
-  NOT the development base. Pair this branch with the v0.5.22 image/runtime.
-
-The release's dependency files, Dockerfile, Rust sources and model files are
-unchanged. In particular, no unrelated DeepSeek/OwedOutput fix or FlashKV SDK
-compatibility shim is included. Image preparation and publication are separate.
+- Branch: `codex/pp-admission-v0522-20261016` (name retained).
+- Rebased community main: `f7b8c6fe404ca4f29c3188cb50692f7735d45a99`, fetched 2026-10-21.
+- Includes #43344 (`3eb4bd598f`) and the upstream first-blocked-poll timeout semantics.
+- Previous release head remains recoverable at
+  `refs/backup/pp-admission-before-query-rebase-20261021`.
+- The independent PAI worktree/branch was not changed.
 
 ## Execution path
 
-`SGLANG_PP_L3_CACHE_ASYNC_ADMISSION=1` selects static PD-prefill, PP > 1,
-HiCache + L3, cache mode, FULL/KV-derived DSA. Non-target configurations keep
-native scheduling. Existing unsupported-profile validation remains at startup.
+The existing `SGLANG_PP_L3_CACHE_ASYNC_ADMISSION` flag selects the same static
+PD-prefill + PP + HiCache cache-mode + L3 profile. No additional flag is added.
 
-1. Each stage progresses its native prefetch and stage-local TP/CP cache ACKs.
-2. Native `PPConsensusStore`/bootstrap polling moves requests into waiting_queue.
-3. The Gate collects readiness, prepares a full-prefix MIN and keeps the
-   necessary prefix lease/capacity credit until native selection takes over.
-4. PP0 chooses the candidate order and continuation end; peers replay them.
-5. Native PrefillAdder performs budget accounting, allocation and H2D.
+Every stage registers its query descriptor when handling the native request;
+only PP0 enqueues it. The existing ticket command worker broadcasts the descriptor,
+queries each stage's storage namespace, and uses the native query MIN groups
+(including PP). No cache allocation or radix mutation occurs in this worker.
+A root-span query gives all stages the same logical coordinates even when their
+resident L1/L2 prefixes differ. The result is clipped to each local operation's
+missing suffix and handed to the native hit queue. The existing ticket state
+handles both arrival orders; the worker never waits for the downstream request.
 
-The migration does not restore the old bootstrap RID ring. `PrefillControl`
-now carries native transfer/release RIDs plus the optional `AdmissionUpdate`.
-Admission rides the existing forward transfer fold and return release stream:
-no extra PP message, channel or collective is introduced. C posts these messages
-before model waits; flag0 retains native send placement and bare RID-list payloads.
-Bootstrap processing and the regular PP / PD-decode loops remain unchanged.
+Cache allocation/eviction, GET and ACK publication remain native. Completion
+groups include only stage-local TP/CP; **no cross-PP completion all-reduce is
+restored**. The existing PPAdmissionGate still performs readiness, protected
+full-prefix MIN and commit, then native selection/H2D. Query MIN is not a
+replacement for that final agreement.
 
-The Gate, configuration predicate and prefix-lease units retain the reviewed
-`f21a8b84bb` behavior (AST-identical; import whitespace normalized). No removed
-attempt-500, final layout rejection, restrict guards,
-chaos, direct-vote transport or extreme-buffer implementation was reintroduced.
-Native v0.5.22 prefix lengths, H2D token-count returns, adder factory, multimodal
-retirement and buffer staging metrics are preserved rather than backported away.
+Cancellation uses the native retirement path. A cancelled query still participates
+in its ordered MIN with zero; it does not publish a result to a retired operation.
+The buffer-mode ticket allocation/trim/GET path is retained.
 
-## Validation and remaining limits
+## Scope and validation
 
-- Focused suite: **75 tests + 466 subtests passed**, including four-process Gloo
-  TP2PP2/TP1PP4, real Gate votes with transfer RIDs, SPF/FCFS continuation replay,
-  and the production event-loop simulation at PP2/4/8/16.
-- Native RID intersection, empty transfer/release payloads, startup-slot gating,
-  and both flag0/flag1 message order/send placement are covered.
-- All five focused files are registered with CPU CI and pass their actual
-  `python3 file.py -f` entry points. Repository-selected Ruff rules, changed-source
-  compilation and whitespace checks pass; unrelated upstream lint is not fixed.
-- Native bootstrap, ordinary PP, PD-decode and decode release-relay bodies were
-  checked AST-identical to the release. Dependencies, Rust, native buffer
-  pipeline and the DeepSeek model file were checked against the release.
-- Full-import native idle/attach/HiCache-event and PPConsensusStore suites were
-  attempted but cannot collect on this control host: missing IPython and
-  parameterized, followed by an incomplete-package import error; the local
-  Torch/CUDA driver mismatch warning remains. These are NOT counted as passes.
-- CPU/Gloo results are not GPU, NCCL/RDMA, HTTP/PD or performance acceptance.
-  This migration did not contact or modify the restarting DSW.
-
-Existing policy tradeoffs remain: C budgets timeout from the submitted span and
-uses the ingress prefetch attempt; B retains native hash-based timeout/retries.
-Matching policy names alone does not isolate consensus overhead. GPU comparison,
-actual storage SDK compatibility and end-to-end model output checks remain due.
+- Keep native main timeout deadlines, deadline accounting and retry suppression.
+- Replace five large gate-specific test modules with focused admission/query
+  regressions and a small shared CPU loader. Keep upstream ticket tests.
+- Cover local-before-query / query-before-local arrival, PP0-only enqueue,
+  unequal/missing hits with real three-process Gloo broadcast/MIN, cancellation,
+  buffer allocation/trim, sync-group scopes, full-prefix admission/NACK, host
+  reference ownership, native chunk-end replay and wait/deadline accounting.
+- Root queries are conservative when L3 has prefix holes that resident caches
+  cover. They can query already-resident pages; this update does not claim an
+  optimal query budget or a measured performance improvement.
+- Validation: 12 focused tests passed, including real three-process Gloo, and
+  both registered test files passed their executable unittest entry points.
+  Changed Python files compile; repository-selected Ruff and formatting pass.
+  The upstream full-import ticket suite cannot collect locally because IPython
+  is missing and is not counted as passed.
+- No GPU, storage-service deployment or benchmark was run for this update.
+  Earlier v0.5.22 performance/accuracy numbers do not validate this rebased code.

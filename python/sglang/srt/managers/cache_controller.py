@@ -415,7 +415,9 @@ class HiCacheController:
             )
         return 0, 1
 
-    def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
+    def _create_sync_groups(
+        self, *, include_pp=True
+    ) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
         groups: List[torch.distributed.ProcessGroup] = []
@@ -425,7 +427,7 @@ class HiCacheController:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
         else:
             base_groups = [self.tp_group]
-        if self.pp_group is not None and not pp_cache_admission_enabled():
+        if self.pp_group is not None and include_pp:
             base_groups.append(self.pp_group)
 
         for group in base_groups:
@@ -618,7 +620,9 @@ class HiCacheController:
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
             self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups(
+                include_pp=not pp_cache_admission_enabled()
+            )
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
