@@ -62,6 +62,8 @@ def fused_attention_gate(
     """`attention_output * sigmoid(gate + gate_bias[head])` for 2-D `[tokens, heads*head_dim]` inputs."""
     if attention_output.shape != gate.shape or attention_output.ndim != 2:
         raise ValueError("attention_output and gate must be matching 2-D tensors")
+    if attention_output.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("attention_output must be fp16, bf16 or fp32")
     attention_output = attention_output.contiguous()
     hidden_dim = attention_output.shape[1]
     if gate_bias.numel() * head_dim != hidden_dim or not gate_bias.is_contiguous():

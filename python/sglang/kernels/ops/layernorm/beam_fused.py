@@ -100,6 +100,8 @@ def fused_sandwich_residual_rmsnorm(
         )
     if branch.stride(1) != 1 or residual.stride(1) != 1:
         raise ValueError("branch and residual must be contiguous along hidden")
+    if branch.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("branch must be fp16, bf16 or fp32")
     hidden_dim = branch.shape[1]
     for w in (sandwich_weight, out_weight):
         if w is not None and (w.shape != (hidden_dim,) or not w.is_contiguous()):
