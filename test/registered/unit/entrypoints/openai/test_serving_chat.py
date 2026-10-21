@@ -11,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
+import copy
 import gc
 import json
 import tempfile
@@ -37,6 +38,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.entrypoints.openai.serving_inkling import InklingChatEncodingAdapter
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -194,6 +196,7 @@ class _MockTemplateManager:
         self.reasoning_config = None
         self.force_reasoning = False
         self.jinja_template_may_reorder_tool_results = False
+        self.python_chat_template = None
 
 
 class TestChatTemplateCache(CustomTestCase):
@@ -759,6 +762,58 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
+        self,
+    ):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            logprobs=True,
+            top_logprobs=2,
+            return_flat_raw_output_top_logprobs=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_flat_raw_output_top_logprobs requires return_meta_info=true.",
+        )
+
+    def test_convert_to_internal_request_flat_output_top_logprobs_default_to_b64(self):
+        self.tm.tokenizer = None
+        # (request flags, expected flat output, expected b64)
+        cases = (
+            ({"return_flat_raw_output_top_logprobs": True}, True, True),
+            (
+                {
+                    "return_flat_raw_output_top_logprobs": True,
+                    "return_flat_raw_top_logprobs_b64": False,
+                },
+                True,
+                False,
+            ),
+            ({}, False, False),
+        )
+        for flags, flat, b64 in cases:
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "Hi?"}],
+                input_ids=[101, 102, 103],
+                logprobs=True,
+                top_logprobs=2,
+                return_meta_info=True,
+                **flags,
+            )
+            with self.subTest(flags=flags):
+                adapted, _ = self.chat._convert_to_internal_request(
+                    req, self.fastapi_request
+                )
+                # The b64 default must not trip GenerateReqInput validation.
+                adapted.normalize_batch_and_arguments()
+
+                self.assertEqual(adapted.top_logprobs_num, 2)
+                self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
+                self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
+
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
@@ -1292,6 +1347,69 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
+
+    def test_glm47_constraint_includes_message_tools(self):
+        """Constrain every active message tool, but none when tool use is disabled.
+
+        A terminal GLM47 grammar on ``tool_choice="none"`` ends generation early,
+        while omitting message-scoped tools rejects otherwise valid tool calls.
+        """
+        import xgrammar as xgr
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "glm47"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+        message_tool = {
+            "type": "function",
+            "function": {"name": "message_tool", "parameters": {"type": "object"}},
+        }
+        top_level_tool = {
+            "type": "function",
+            "function": {"name": "top_level_tool", "parameters": {"type": "object"}},
+        }
+        named = ToolChoice(function=ToolChoiceFuncName(name="message_tool"))
+        for role in ("system", "developer"):
+            for tools in (None, [], [top_level_tool]):
+                for choice in ("auto", "required", named, "none"):
+                    with self.subTest(role=role, tools=tools, choice=choice):
+                        request = ChatCompletionRequest(
+                            model="x",
+                            messages=[
+                                {"role": role, "content": "", "tools": [message_tool]},
+                                {"role": "user", "content": "Use message_tool."},
+                            ],
+                            tools=tools,
+                            tool_choice=choice,
+                            chat_template_kwargs={"enable_thinking": False},
+                        )
+                        result = self.chat._process_messages(
+                            request, is_multimodal=False
+                        )
+                        if choice == "none":
+                            self.assertIsNone(result.tool_call_constraint)
+                            continue
+                        self.assertIsNotNone(result.tool_call_constraint)
+                        kind, ebnf = result.tool_call_constraint
+                        self.assertEqual(kind, "full_assistant_ebnf")
+                        grammar = compiler.compile_grammar(xgr.Grammar.from_ebnf(ebnf))
+                        for name, allowed in (
+                            ("message_tool", True),
+                            ("top_level_tool", bool(tools) and choice != named),
+                            ("unknown_tool", False),
+                        ):
+                            matcher = xgr.GrammarMatcher(grammar)
+                            accepted = (
+                                matcher.accept_string(f"<tool_call>{name}</tool_call>")
+                                and matcher.is_completed()
+                            )
+                            self.assertEqual(accepted, allowed, name)
 
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
@@ -1871,6 +1989,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return a chunk with remaining arguments
@@ -1879,6 +1998,7 @@ class ServingChatTestCase(CustomTestCase):
         # Parse the result to verify content
         self.assertTrue(result.startswith("data: "))
         chunk = json.loads(result[6:])
+        self.assertEqual(chunk["created"], 123)
         tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(len(tool_calls), 1)
         arguments = tool_calls[0]["function"]["arguments"]
@@ -1924,6 +2044,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return None since no completion is needed
@@ -1962,6 +2083,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         self.assertIsNone(result, "Should not append encoded quotes")
@@ -1997,6 +2119,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
@@ -2032,6 +2155,7 @@ class ServingChatTestCase(CustomTestCase):
             content=content,
             request=request,
             index=0,
+            created=123,
         )
 
         # Should return None since there's no parser data
@@ -2563,6 +2687,7 @@ class ServingChatTestCase(CustomTestCase):
                     content={"meta_info": {"id": "chatcmpl-test"}},
                     request=req,
                     has_tool_calls={},
+                    created=123,
                 )
                 # Get first yielded SSE line
                 line = None
@@ -2577,6 +2702,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertTrue(line.startswith("data: "))
 
             payload = json.loads(line[len("data: ") :])
+            self.assertEqual(payload["created"], 123)
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
 
@@ -2932,6 +3058,152 @@ class ServingChatTestCase(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
             OpenAIServingChat(tm, TemplateManager())
 
+    def test_dsv41_rejects_image_placeholder_in_text(self):
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        for role in ("user", "tool"):
+            with self.subTest(role=role):
+                with self.assertRaises(ValueError):
+                    encoding_dsv41.encode_messages(
+                        [
+                            {
+                                "role": role,
+                                "content": f"hi {encoding_dsv41.IMAGE_PLACEHOLDER}",
+                            }
+                        ],
+                        thinking_mode="chat",
+                    )
+
+    def test_dsv41_tool_result_images_follow_prompt_order(self):
+        """Out-of-order tool results are sorted by call order; images must follow."""
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        image = encoding_dsv41.IMAGE_PLACEHOLDER
+        history = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "history.png"}},
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": name,
+                        "type": "function",
+                        "function": {"name": name, "arguments": "{}"},
+                    }
+                    for name in ("a", "b")
+                ],
+            },
+        ]
+        results = [
+            {
+                "type": "tool_result",
+                "tool_use_id": name,
+                "content": [
+                    {"type": "text", "text": f"result {name}"},
+                    {"type": "image_url", "image_url": {"url": f"{name}.png"}},
+                ],
+            }
+            for name in ("b", "a")
+        ]
+
+        for input_format in (
+            "content_blocks",
+            "tool_messages",
+            "tool_content_blocks",
+            "context",
+        ):
+            with self.subTest(input_format=input_format):
+                if input_format in ("tool_messages", "tool_content_blocks"):
+                    content_field = (
+                        "content_blocks"
+                        if input_format == "tool_content_blocks"
+                        else "content"
+                    )
+                    messages = history + [
+                        {
+                            "role": "tool",
+                            "tool_call_id": block["tool_use_id"],
+                            content_field: block["content"],
+                        }
+                        for block in results
+                    ]
+                    context = []
+                elif input_format == "context":
+                    messages = [{"role": "user", "content_blocks": results}]
+                    context = history
+                else:
+                    messages = history + [{"role": "user", "content_blocks": results}]
+                    context = []
+                original = copy.deepcopy((messages, context))
+
+                prompt, media = encoding_dsv41.encode_messages(
+                    messages,
+                    thinking_mode="chat",
+                    context=context,
+                    return_multi_modal_data=True,
+                )
+
+                self.assertTrue(
+                    prompt.endswith(
+                        f"<｜User｜><tool_result>result a\n\n{image}</tool_result>\n\n"
+                        f"<tool_result>result b\n\n{image}</tool_result>"
+                        "<｜Assistant｜></think>"
+                    ),
+                    prompt,
+                )
+                expected_urls = (
+                    ["a.png", "b.png"] if context else ["history.png", "a.png", "b.png"]
+                )
+                self.assertEqual(
+                    media,
+                    {"images": [{"url": url} for url in expected_urls]},
+                )
+                self.assertEqual((messages, context), original)
+
+    def test_dsv41_drop_thinking_without_tools(self):
+        """Tool results do not start a new turn, so current-turn reasoning is kept."""
+        from sglang.srt.entrypoints.openai import encoding_dsv41
+
+        messages = [
+            {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
+            {"role": "user", "content": "q2"},
+            {
+                "role": "assistant",
+                "reasoning_content": "r2",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "value"},
+        ]
+        prompt = encoding_dsv41.encode_messages(
+            messages, thinking_mode="thinking", drop_thinking=True
+        )
+        self.assertIn(
+            "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>", prompt
+        )
+        self.assertNotIn("r1", prompt)
+        self.assertIn("<think>r2</think>", prompt)
+        self.assertTrue(
+            prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
+        )
+
+        next_turn = encoding_dsv41.encode_messages(
+            messages + [{"role": "user", "content": "q3"}],
+            thinking_mode="thinking",
+        )
+        self.assertNotIn("r2", next_turn)
+        self.assertTrue(next_turn.endswith("q3<｜Assistant｜><think>"))
+
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
@@ -3186,12 +3458,41 @@ class ServingChatTestCase(CustomTestCase):
                 parsed.append(json.loads(c[len("data: ") :]))
         return parsed
 
+    def test_streaming_created_is_stable_across_chunks(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.time.time",
+            side_effect=[100, 101, 102, 103],
+        ) as current_time:
+            chunks = self._run_chat_stream(Mock(), req)
+
+        parsed = self._parse_chunks(chunks)
+        self.assertGreater(len(parsed), 1)
+        identities = {
+            (chunk["id"], chunk["created"], chunk["model"]) for chunk in parsed
+        }
+        self.assertEqual(len(identities), 1)
+        response_id, created, model = identities.pop()
+        self.assertTrue(response_id)
+        self.assertEqual((created, model), (100, "x"))
+        self.assertTrue(
+            any(not chunk["choices"] and chunk.get("usage") for chunk in parsed)
+        )
+        current_time.assert_called_once_with()
+
     async def _collect_stream_content(self, content, choice_logprobs, req):
         chunks = []
         async for chunk in self.chat._generate_stream_content(
             content=content,
             index=0,
             request=req,
+            created=123,
             stream_offsets={},
             reasoning_parser_dict={},
             parser_dict={},
@@ -4066,6 +4367,7 @@ class ServingChatTestCase(CustomTestCase):
                 content=content,
                 index=0,
                 request=req,
+                created=123,
                 stream_offsets={},
                 reasoning_parser_dict={},
                 parser_dict={},
@@ -4088,9 +4390,14 @@ class ServingChatTestCase(CustomTestCase):
         enter_override(
             self, get_context().override_server_args(enable_cache_report=True)
         )
-        usages = self._collect_continuous_usage(cached_tokens=6)
-        self.assertTrue(usages, "continuous_usage_stats attached no usage")
-        self.assertEqual(usages[0]["prompt_tokens_details"]["cached_tokens"], 6)
+        for cached_tokens in (0, 6):
+            with self.subTest(cached_tokens=cached_tokens):
+                usages = self._collect_continuous_usage(cached_tokens=cached_tokens)
+                self.assertTrue(usages, "continuous_usage_stats attached no usage")
+                self.assertEqual(
+                    usages[0]["prompt_tokens_details"]["cached_tokens"],
+                    cached_tokens,
+                )
 
     def test_continuous_usage_omits_cached_tokens_when_report_disabled(self):
         """With cache reporting off, continuous_usage_stats must not leak cached tokens."""
@@ -4345,7 +4652,7 @@ class ServingChatTestCase(CustomTestCase):
                 response = self.chat._build_chat_response(request, [ret], created=123)
                 message = response.model_dump(mode="json")["choices"][0]["message"]
                 self.assertEqual(message["content"], "" if tool_only else "Hello")
-                self.assertEqual(bool(message["tool_calls"]), tool_only)
+                self.assertEqual(bool(message.get("tool_calls")), tool_only)
                 self._assert_empty_reasoning_replays(message)
 
     def test_empty_stream_reasoning_each_choice(self):
@@ -4931,6 +5238,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
         serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[{"role": "user", "content": "hello"}],
@@ -4958,6 +5266,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
         serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[
@@ -4994,6 +5303,7 @@ class InklingReasoningEffortTest(unittest.TestCase):
         serving = object.__new__(OpenAIServingChat)
         serving.chat_encoding_spec = "inkling"
         serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
+        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
         request = ChatCompletionRequest(
             model="test-model",
             messages=[

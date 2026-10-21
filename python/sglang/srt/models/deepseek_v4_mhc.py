@@ -45,11 +45,22 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+# The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
+_FUSED_MHC_TP_SIZES = (2, 4)
+
+
+def fused_mhc_tp_ok(tp_size: int) -> bool:
+    return tp_size in _FUSED_MHC_TP_SIZES
+
+
 # ---------------------------------------------------------------------------
 # What a layer hands this module
 # ---------------------------------------------------------------------------
 
 HcTriplet = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+MHC_POST_MULT_VALUE = 2.0
 
 
 class HcConfig(NamedTuple):
@@ -275,7 +286,7 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     hopper_medium = get_platform().is_sm90 and 32 <= x_flat.shape[0] < 4096
     if (
         x.is_cuda
-        and (x_flat.shape[0] >= 128 or hopper_medium)
+        and x_flat.shape[0] >= 32
         and x_flat.is_contiguous()
         and (get_platform().is_sm100 or get_platform().is_sm90)
         and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
@@ -397,7 +408,7 @@ def _combine(
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
-    from sglang.kernels.ops.layernorm.mhc import hc_combine
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
     cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
@@ -441,7 +452,7 @@ def _combine(
         from sglang.kernels.ops.layernorm.hc_combine_norm import hc_combine_norm
 
         return hc_combine_norm(x_flat, apply_pre, norm.weight, norm.variance_epsilon)
-    return norm(hc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
+    return norm(mhc_combine(x_flat, apply_pre, cfg.mult, x.dtype))
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +614,7 @@ def _post_fusion(
         and next.norm_fusable
         and next.hc is not None
         and _can_use_mega_mhc(cfg)
+        and y.shape[0] > 0
     ):
         next_hc = next.hc
         updated, normalized, stats = mhc_mega_boundary(

@@ -1,9 +1,14 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
+from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+    FlashinferDispatcher,
+    _WorkspaceNamespace,
+)
 from sglang.srt.layers.moe.topk import (
     BypassedTopKOutput,
     StandardTopKOutput,
@@ -26,6 +31,7 @@ class _RecordingMoeAlltoAll:
 
 def _make_dispatcher(*, dispatch_type, max_num_tokens, quant_config):
     dispatcher = object.__new__(FlashinferDispatcher)
+    dispatcher.runner_backend = None
     dispatcher.dispatch_type = dispatch_type
     dispatcher.hidden_size = 128
     dispatcher.max_num_tokens = max_num_tokens
@@ -34,6 +40,8 @@ def _make_dispatcher(*, dispatch_type, max_num_tokens, quant_config):
     dispatcher.payload_in_workspace = False
     dispatcher.quant_config = quant_config
     dispatcher.moe_a2a = _RecordingMoeAlltoAll()
+    dispatcher.decode_a2a_namespace = _WorkspaceNamespace.DECODE
+    dispatcher.sp_prefill_moe_a2a = None
     return dispatcher
 
 
@@ -119,10 +127,20 @@ class TestFlashinferDispatcher(CustomTestCase):
         router_logits = torch.tensor(
             [[0.1, 3.0, 0.2, 2.0], [5.0, 0.0, 4.0, 0.1], [0.0, 0.1, 0.2, 9.0]]
         )
+        logical_to_physical = torch.tensor([2, 0, 3, 1])
         topk_output = BypassedTopKOutput(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            raw_router_logits=router_logits,
             topk_config=TopKConfig(top_k=2, torch_native=True),
+            expert_location_dispatch_info=ExpertLocationDispatchInfo(
+                ep_dispatch_algorithm="static",
+                partial_logical_to_rank_dispatch_physical_map=logical_to_physical,
+                partial_logical_to_all_physical_map=logical_to_physical[:, None],
+                partial_logical_to_all_physical_map_num_valid=torch.ones(
+                    4, dtype=torch.int64
+                ),
+                num_physical_experts=4,
+            ),
         )
 
         _dispatch_without_dp(
@@ -135,10 +153,136 @@ class TestFlashinferDispatcher(CustomTestCase):
         expert_ids = moe_a2a.token_selected_experts
         self.assertEqual(expert_ids.dtype, torch.int32)
         self.assertEqual(
-            expert_ids.sort(dim=-1).values.tolist(), [[1, 3], [0, 2], [2, 3]]
+            expert_ids.sort(dim=-1).values.tolist(), [[0, 1], [2, 3], [1, 3]]
         )
         topk_weights = moe_a2a.payloads[moe_a2a.expert_id_payload_index + 1]
         self.assertEqual(topk_weights.shape, (3, 2))
+
+
+class TestFlashinferRunnerDispatchFormats(CustomTestCase):
+    def test_cutlass_preserves_prefill_and_decode_combine_formats(self):
+        """AG prefill cannot use the decode workspace or A2A kernel layout."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_cutlass as runner
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferCombineInput,
+            FlashinferDispatchOutput,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+            StandardDispatchOutput,
+        )
+        from sglang.srt.runtime_context import get_context, get_parallel
+
+        layer = SimpleNamespace(
+            moe_tp_size=1, moe_tp_rank=0, moe_ep_size=4, moe_ep_rank=0
+        )
+        config = MoeRunnerConfig(layer=layer)
+        quant_info = runner.FlashInferCutlassMoeQuantInfo(
+            quant_type="bf16", w13_weight=torch.empty(0), w2_weight=torch.empty(0)
+        )
+        hidden = torch.zeros((2, 128), dtype=torch.bfloat16)
+        topk = StandardTopKOutput(
+            torch.ones((2, 1)), torch.zeros((2, 1), dtype=torch.int32), None
+        )
+
+        for prefill in (True, False):
+            with self.subTest(prefill=prefill):
+                workspace = torch.empty_like(hidden)
+                dispatch = (
+                    StandardDispatchOutput(hidden, None, topk)
+                    if prefill
+                    else FlashinferDispatchOutput(hidden, None, topk, workspace)
+                )
+
+                def kernel(**kwargs):
+                    # This flag changes FlashInfer's distributed input layout.
+                    self.assertEqual(kwargs["enable_alltoall"], not prefill)
+                    kwargs["output"].copy_(kwargs["input"] + 1)
+                    return (kwargs["output"],)
+
+                with (
+                    get_context().override_server_args(model_path="dummy"),
+                    get_parallel().override(tp_group=None),
+                    patch.object(
+                        runner,
+                        "_flashinfer_cutlass_fused_moe",
+                        return_value=(kernel, None),
+                    ),
+                    patch.object(runner, "_activation_type", return_value=None),
+                ):
+                    result = runner.fused_experts_flashinfer_to_flashinfer_cutlass(
+                        dispatch, quant_info, config
+                    )
+                self.assertIsInstance(
+                    result,
+                    StandardCombineInput if prefill else FlashinferCombineInput,
+                )
+                torch.testing.assert_close(
+                    result.hidden_states, torch.ones_like(hidden)
+                )
+                if not prefill:
+                    self.assertIs(result.hidden_states, workspace)
+
+    def test_cutedsl_preserves_prefill_and_decode_combine_formats(self):
+        """AG prefill (including idle ranks) must reach RS, not A2A combine."""
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+            CuteDslFp4MoeQuantInfo,
+            fused_experts_flashinfer_to_flashinfer_cutedsl_fp4,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+            FlashinferCombineInput,
+            FlashinferDispatchOutput,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardCombineInput,
+            StandardDispatchOutput,
+        )
+
+        # Replace only the GPU kernel boundary; routing and combine selection
+        # execute the real runner on CPU tensors.
+        wrapper = SimpleNamespace(run=lambda **kwargs: kwargs["x"] + 1)
+        weight = torch.empty(0)
+        quant_info = CuteDslFp4MoeQuantInfo(
+            w13_weight=weight,
+            w2_weight=weight,
+            w13_weight_sf=weight,
+            w2_weight_sf=weight,
+            w1_alpha=weight,
+            w2_alpha=weight,
+            a1_scale=weight,
+            a2_scale=weight,
+            wrapper=wrapper,
+            quant_mode="w4a16",
+        )
+        for num_tokens in (0, 2):
+            hidden = torch.zeros((num_tokens, 128), dtype=torch.bfloat16)
+            topk = StandardTopKOutput(
+                torch.ones((num_tokens, 1)),
+                torch.zeros((num_tokens, 1), dtype=torch.int32),
+                None,
+            )
+            for prefill in (True, False):
+                with self.subTest(num_tokens=num_tokens, prefill=prefill):
+                    workspace = torch.empty_like(hidden)
+                    dispatch = (
+                        StandardDispatchOutput(hidden, None, topk)
+                        if prefill
+                        else FlashinferDispatchOutput(hidden, None, topk, workspace)
+                    )
+                    result = fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
+                        dispatch, quant_info, MoeRunnerConfig()
+                    )
+                    self.assertIsInstance(
+                        result,
+                        StandardCombineInput if prefill else FlashinferCombineInput,
+                    )
+                    torch.testing.assert_close(
+                        result.hidden_states, torch.ones_like(hidden)
+                    )
+                    if not prefill:
+                        self.assertIs(result.hidden_states, workspace)
 
 
 if __name__ == "__main__":

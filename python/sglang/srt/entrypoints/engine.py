@@ -125,6 +125,7 @@ from sglang.srt.runtime_context import (
     restore_context,
     snapshot_context,
 )
+from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -164,6 +165,10 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _is_cuda = is_cuda()
+
+
+def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
+    return redact_watermark_secrets(server_args.resolved_dict())
 
 
 @dataclasses.dataclass
@@ -291,10 +296,14 @@ class Engine(EngineScoreMixin, EngineBase):
             msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",
-                "Engine(" + ", ".join(f"{k}={v!r}" for k, v in kwargs.items()) + ")",
+                "Engine("
+                + ", ".join(
+                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                )
+                + ")",
             )
         self.server_args = server_args
-        logger.info(f"server_args={server_args.resolved_dict()}")
+        logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
         # Rust Server is not supported with the offline Engine API
         if envs.SGLANG_RUST_SERVER.get():
@@ -1072,6 +1081,7 @@ class Engine(EngineScoreMixin, EngineBase):
         router_proc = mp.Process(
             target=run_multi_detokenizer_router_process,
             args=(worker_ipc_names, server_args, port_args),
+            kwargs={"enable_metrics": get_observability().enable_metrics},
         )
         router_proc.start()
         processes.append(router_proc)
@@ -1147,11 +1157,9 @@ class Engine(EngineScoreMixin, EngineBase):
         # sentinel: a record rejected here has to stay retryable.
         server_args.check_server_args()
 
-        # Needs a tokenizer and a chat template, so it cannot live in the
-        # pipeline; after the plugins, which may register the parser detected.
-        parsers = resolving_view(server_args)
-        if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
-            resolve_auto_parsers(server_args)
+        # Architecture defaults and template auto-detection must run before
+        # publication; plugins may register parsers used by either path.
+        resolve_auto_parsers(server_args)
 
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
@@ -1167,7 +1175,7 @@ class Engine(EngineScoreMixin, EngineBase):
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
-            logger.info(f"server_args={server_args.resolved_dict()}")
+            logger.info(f"server_args={_server_args_for_logging(server_args)}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
             engine_info_bootstrap_server = None
@@ -1551,14 +1559,16 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_internal_state()
         )
         return msgspec_to_builtins(
-            {
-                **self.tokenizer_manager.server_args.resolved_dict(),
-                "launch_command": self.tokenizer_manager.server_args.launch_command,
-                **self._scheduler_init_result.scheduler_infos[0],
-                "startup_time": self.tokenizer_manager.startup_time,
-                "internal_states": internal_states,
-                "version": __version__,
-            }
+            redact_watermark_secrets(
+                {
+                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    "launch_command": self.tokenizer_manager.server_args.launch_command,
+                    **self._scheduler_init_result.scheduler_infos[0],
+                    "startup_time": self.tokenizer_manager.startup_time,
+                    "internal_states": internal_states,
+                    "version": __version__,
+                }
+            )
         )
 
     def get_model_info(self):
@@ -1911,7 +1921,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.1",
+                "0.7.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
