@@ -118,6 +118,25 @@ class Memory(msgspec.Struct):
         Optional[float],
         "Fraction of the available host memory, bounded by visible cgroup memory.max/memory.high or v1 memory limits (after a 10 GiB reserve) that the HiCache host pools of all ranks on this machine may use. Applies only when neither --hicache-ratio nor --hicache-size is set: the default ratio is then reduced until the pools fit. Lower it when several engines share a memory cgroup.",
     ] = 0.8
+    hicache_host_shard: A[
+        str,
+        Arg(
+            help=(
+                "How the TP ranks share the HiCache host tier. 'off' keeps a "
+                "full host replica on every rank. 'stripe' stores each host "
+                "page on one owner rank only, multiplying the logical host "
+                "capacity by the TP size at the same pinned memory; a load "
+                "copies the owned pages host-to-device and all-gathers the rest "
+                "over the TP group. Requires TP > 1, a device KV cache "
+                "replicated over the TP group (DeepSeek V4 unified KV, "
+                "attention TP equal to TP or prefill CP with "
+                "--enable-cp-decode-attn-tp), aggregated serving, the "
+                "write_through policy, no draft model other than DSpark, and "
+                "no storage backend."
+            ),
+            choices=["off", "stripe"],
+        ),
+    ] = "off"
     hicache_write_policy: A[
         str,
         Arg(

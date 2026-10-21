@@ -1324,10 +1324,8 @@ class CommonKVManager(BaseKVManager):
         ):
             # MLA KV sharded across prefill attn-TP: every decode rank pulls
             # from all prefill TP ranks (None marks them all as real senders).
-            assert self.attn_tp_size == info.attn_tp_size, (
-                "MLA KV cache sharding requires equal prefill/decode attn TP "
-                f"sizes, got prefill={info.attn_tp_size} decode={self.attn_tp_size}"
-            )
+            # Each decode rank keeps the full latent, so the attn TP sizes
+            # (and decode DP attention) are independent of the prefill's.
             target_tp_rank = None
             target_tp_ranks = list(range(info.attn_tp_size))
             required_dst_info_num = self.attn_tp_size
