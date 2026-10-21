@@ -129,9 +129,9 @@ class OpenAI(BaseBackend):
             if key not in self.spec_kwargs:
                 self.spec_kwargs[key] = value
             else:
-                assert (
-                    value == self.spec_kwargs[key]
-                ), "sampling parameters should be consistent if turn on api speculative execution."
+                assert value == self.spec_kwargs[key], (
+                    "sampling parameters should be consistent if turn on api speculative execution."
+                )
         self.spec_format.append(
             {"text": "", "stop": params["stop"], "name": spec_var_name}
         )
@@ -180,9 +180,9 @@ class OpenAI(BaseBackend):
             )
             # Keep the returned list (or string) as is.
         elif sampling_params.dtype in [str, "str", "string"]:
-            assert (
-                not self.is_chat_model
-            ), "constrained type not supported on chat model"
+            assert not self.is_chat_model, (
+                "constrained type not supported on chat model"
+            )
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(
@@ -200,9 +200,9 @@ class OpenAI(BaseBackend):
             else:
                 comp = '"' + comp + '"'
         elif sampling_params.dtype in [int, "int"]:
-            assert (
-                not self.is_chat_model
-            ), "constrained type not supported on chat model"
+            assert not self.is_chat_model, (
+                "constrained type not supported on chat model"
+            )
             kwargs = sampling_params.to_openai_kwargs()
             kwargs.pop("stop")
             comp = openai_completion(

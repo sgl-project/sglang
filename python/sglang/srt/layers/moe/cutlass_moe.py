@@ -10,7 +10,6 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import (
-        apply_shuffle_mul_sum,
         es_fp8_blockwise_scaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_mm,
         es_sm100_mxfp8_blockscaled_grouped_quant,
@@ -23,6 +22,7 @@ if _is_cuda:
     from sglang.kernels.ops.moe.shuffle_rows_with_scales import (
         shuffle_rows_with_scales,
     )
+    from sglang.kernels.ops.moe.shuffle_weighted_sum import shuffle_weighted_sum
 
 
 def cutlass_fused_experts_fp8(
@@ -50,6 +50,7 @@ def cutlass_fused_experts_fp8(
     use_mxfp8: bool = False,
     output: Optional[torch.Tensor] = None,
     enable_es: Tuple[bool, bool] = (False, False),
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """Performs Fused MoE computation using CUTLASS-like kernels with FP8 weights and activations.
 
@@ -141,8 +142,9 @@ def cutlass_fused_experts_fp8(
     topk = topk_ids.size(1)
     device = a.device
 
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    # prepare_moe_input writes only live routes; gathers still span the tail.
+    a_map = torch.zeros((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.full((topk_ids.numel(),), -1, dtype=torch.int32, device=device)
 
     if use_mxfp8:
         assert es_up and es_down, "MXFP8 requires expert-specialization for both GEMMs"
@@ -161,12 +163,12 @@ def cutlass_fused_experts_fp8(
             w2_q.shape[1] // 32,
             w2_q.shape[2],
         )
-        assert (
-            w1_scale.shape == expected_w1_scale_shape
-        ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
-        assert (
-            w2_scale.shape == expected_w2_scale_shape
-        ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        assert w1_scale.shape == expected_w1_scale_shape, (
+            f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+        )
+        assert w2_scale.shape == expected_w2_scale_shape, (
+            f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+        )
 
         mxfp8_blockscale_align = 128
         total_tokens = m * topk
@@ -271,7 +273,12 @@ def cutlass_fused_experts_fp8(
         )
 
     intermediate = torch.empty((m * topk, n), device=device, dtype=out_dtype)
-    silu_and_mul(c1, intermediate)
+    if swiglu_limit is None:
+        silu_and_mul(c1, intermediate)
+    else:
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+
+        silu_and_mul_clamp(c1, intermediate, swiglu_limit)
 
     if use_mxfp8 and es_down:
         intemediate_q = torch.empty_like(intermediate, dtype=torch.float8_e4m3fn)
@@ -339,5 +346,5 @@ def cutlass_fused_experts_fp8(
     if output is None:
         output = torch.empty((m, k), device=device, dtype=out_dtype)
 
-    apply_shuffle_mul_sum(c2, output, c_map, topk_weights.to(out_dtype))
+    shuffle_weighted_sum(c2, output, c_map, topk_weights.to(out_dtype))
     return output

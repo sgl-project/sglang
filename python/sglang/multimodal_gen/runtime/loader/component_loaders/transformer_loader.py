@@ -6,16 +6,20 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.attention_roles import AttentionRole
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
+    ConvRotInt8Config,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    OnlineQuantizationComponentLoader,
+)
 from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
@@ -152,12 +156,8 @@ def _server_args_for_transformer_component(
     return component_server_args
 
 
-class TransformerLoader(ComponentLoader):
+class TransformerLoader(OnlineQuantizationComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
-
-    allow_global_attention_backend_fallback = False
-    supports_online_quantization_override = True
-    supports_fsdp_inference = True
 
     component_names = [
         "transformer",
@@ -166,6 +166,21 @@ class TransformerLoader(ComponentLoader):
         "video_dit",
     ]
     expected_library = "diffusers"
+
+    def component_attention_backend_context(
+        self,
+        attn_backend,
+        component_attn_name: str | None,
+        require_backend_selection: bool,
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
+    ):
+        return component_attn_backend_context_manager(
+            attn_backend,
+            component_name=component_attn_name,
+            backend_by_role=backend_by_role,
+            allow_global_backend_fallback=False,
+            require_backend_selection=require_backend_selection,
+        )
 
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
@@ -284,6 +299,14 @@ class TransformerLoader(ComponentLoader):
         dit_config.update_model_arch(config)
 
         cls_name = config.pop("_class_name")
+        override_cls_name = server_args.pipeline_config.transformer_class_override
+        if override_cls_name is not None and override_cls_name != cls_name:
+            logger.info(
+                "Overriding transformer class from %s to %s",
+                cls_name,
+                override_cls_name,
+            )
+            cls_name = override_cls_name
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
         is_minimax_h3 = model_cls.__name__ == "MiniMaxH3DiTModel"
         if is_minimax_h3:
@@ -370,6 +393,15 @@ class TransformerLoader(ComponentLoader):
                 "AutoRound checkpoints do not support diffusion FSDP inference; "
                 "use TP and/or sequence parallelism instead"
             )
+        if (
+            use_fsdp
+            and isinstance(quant_spec.quant_config, ConvRotInt8Config)
+            and not quant_spec.quant_config.is_checkpoint_int8_serialized
+        ):
+            # Only the comfy_kitchen backend has run under FSDP.
+            quant_spec.quant_config.require_comfy_kitchen(
+                "has not been validated with diffusion FSDP inference"
+            )
 
         if quant_spec.gguf_file is not None:
             logger.info(
@@ -420,11 +452,29 @@ class TransformerLoader(ComponentLoader):
                     "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
                     "are mutually exclusive"
                 )
+            if dit_config.arch_config.checkpoint_uses_diffusers_layout:
+                # The rebuild reads native tensor names straight from the
+                # shards; on a Diffusers-layout checkpoint it would KeyError
+                # on the first request instead of failing here.
+                raise ValueError(
+                    "--minimax-h3-adaln-online requires the native-layout "
+                    "MiniMax H3 checkpoint (FL2VA/transformer or "
+                    "Ref2VA/transformer), not the Diffusers-layout one"
+                )
             # Keep the weights off-device; the model rebuilds the AdaLN
             # outputs from the checkpoint for each request's timestep plan.
             init_params["adaln_weight_files"] = safetensors_list
             init_params["adaln_plan_width"] = (
                 component_server_args.minimax_h3_adaln_plan_width
+            )
+            init_params["adaln_max_plans"] = (
+                envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS
+            )
+            init_params["adaln_host_cache_bytes"] = int(
+                component_server_args.minimax_h3_adaln_host_cache_gb * 1e9
+            )
+            init_params["adaln_precision"] = (
+                "fp32" if envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32 else "match"
             )
             checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
 
@@ -449,7 +499,7 @@ class TransformerLoader(ComponentLoader):
                 runtime_quant_config=quant_spec.runtime_quant_config,
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
-                    or quant_spec.is_serialized_kitchen_int8
+                    or quant_spec.is_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
                 ),
             )
@@ -497,20 +547,14 @@ class TransformerLoader(ComponentLoader):
         # Model construction resolves attention implementations, so apply the
         # quantization-specific default around FSDP initialization and loading.
         with attn_backend_context:
-            model = maybe_load_fsdp_model(
+            model = self.load_state_dict_model(
                 model_cls=model_cls,
                 init_params=init_params,
-                weight_dir_list=safetensors_list,
-                device=local_torch_device,
-                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
-                hsdp_shard_dim=server_args.hsdp_shard_dim,
+                weight_files=safetensors_list,
+                server_args=component_server_args,
+                component_name=component_name,
                 component_starts_on_cpu=component_starts_on_cpu,
-                pin_cpu_memory=component_server_args.pin_cpu_memory,
-                fsdp_inference=use_fsdp,
-                param_dtype=quant_spec.param_dtype,
-                reduce_dtype=torch.float32,
-                output_dtype=None,
-                strict=False,
+                dtype=quant_spec.param_dtype,
                 weight_load_plan=weight_load_plan,
                 checkpoint_key_filter=checkpoint_key_filter,
                 weights_iterator=(

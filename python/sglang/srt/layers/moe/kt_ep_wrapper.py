@@ -272,6 +272,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.gpu_method.get_moe_runner_backend(layer)
+
     def submit(
         self,
         layer: torch.nn.Module,
@@ -286,9 +289,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
             dispatch_output: Dispatched tokens and routing information
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return

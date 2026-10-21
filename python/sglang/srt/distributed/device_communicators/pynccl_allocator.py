@@ -4,6 +4,7 @@ import os
 import tempfile
 import traceback
 from contextlib import nullcontext
+from typing import Optional
 
 import torch
 
@@ -234,6 +235,19 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
     return _mem_pool
 
 
+# The context whose segments are being registered with NCCL right now. The
+# registration has no timeout of its own, so the scheduler watchdog reads this
+# to name a stall inside it.
+_registering_context: Optional["SymmetricMemoryContext"] = None
+
+
+def describe_registration_in_progress() -> Optional[str]:
+    ctx = _registering_context
+    if ctx is None:
+        return None
+    return f"comm={ctx._comm_ptr} group={ctx.group_coordinator.unique_name}"
+
+
 class SymmetricMemoryContext:
     """
     Context manager for using symmetric memory with pynccl.
@@ -266,14 +280,14 @@ class SymmetricMemoryContext:
         self._comm_ptr = self.group_coordinator.pynccl_comm.comm.value
 
     def __enter__(self):
-        assert (
-            self.group_coordinator.pynccl_comm is not None
-        ), f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
+        assert self.group_coordinator.pynccl_comm is not None, (
+            f"Symmetric memory requires pynccl to be enabled in group '{self.group_coordinator.unique_name}'"
+        )
 
         if self.is_graph_capture:
-            assert (
-                _graph_pool_id is not None
-            ), "graph_pool_id is not set under graph capture"
+            assert _graph_pool_id is not None, (
+                "graph_pool_id is not set under graph capture"
+            )
             # Pause graph memory pool to use symmetric memory with cuda graph
             if after_2_8_0:
                 torch._C._cuda_endAllocateToPool(_cur_device, _graph_pool_id)
@@ -319,12 +333,18 @@ class SymmetricMemoryContext:
         3. Thread-safe access to the segment registry
         """
 
+        global _registering_context
+
+        _registering_context = self
         # Call C++ API to register all segments with this comm
         # C++ layer tracks per-comm registration state internally
-        result = _register_func(self._comm_ptr)
-        assert (
-            result == 0
-        ), f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
+        try:
+            result = _register_func(self._comm_ptr)
+        finally:
+            _registering_context = None
+        assert result == 0, (
+            f"nccl_allocator_register_segments_with_comm failed with return code: {result}"
+        )
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
@@ -427,7 +447,7 @@ def prealloc_symmetric_memory_pool(
     ):
         return
 
-    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.distributed.parallel_state import get_tp_group
 
     # Memory allocation is tied to a cuda stream, use the forward stream
     with torch.get_device_module(device).stream(forward_stream):

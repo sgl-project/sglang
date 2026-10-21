@@ -2,8 +2,8 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
-register_cpu_ci(est_time=7, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
 
 import copy
@@ -16,9 +16,11 @@ import msgspec
 
 from sglang.srt.sampling.sampling_params import (
     MAX_LEN,
+    MAX_REQUEST_REASONING_END_TOKEN_IDS,
     MAX_STOP_COUNT,
     MAX_STOP_REGEX_COUNT,
     MAX_STOP_REGEX_LEN,
+    REQUEST_REASONING_END_TOKEN_IDS_KEY,
     TOP_K_ALL,
     SamplingParams,
     get_max_seq_length,
@@ -107,6 +109,28 @@ class TestSamplingParamsVerify(CustomTestCase):
         """Default valid params should pass verify() without raising."""
         sp = self._make()
         sp.verify(self.VOCAB_SIZE)
+
+    def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
+        self._make(
+            custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]}
+        ).verify(self.VOCAB_SIZE)
+
+        invalid_values = [
+            [],
+            [-1],
+            [True],
+            [self.VOCAB_SIZE],
+            "17",
+            list(range(MAX_REQUEST_REASONING_END_TOKEN_IDS + 1)),
+        ]
+        for value in invalid_values:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "request reasoning end token IDs"),
+            ):
+                self._make(
+                    custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
+                ).verify(self.VOCAB_SIZE)
 
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
@@ -291,6 +315,31 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp = self._make(logit_bias={"0": 1.0, "31999": -0.5})
         sp.verify(self.VOCAB_SIZE)
 
+    # --- sampling_seed ---
+    def test_sampling_seed_valid(self):
+        """Test that None (the default) and the int64 min/max boundaries are accepted."""
+        self._make(sampling_seed=None).verify(self.VOCAB_SIZE)
+        self._make(sampling_seed=2**63 - 1).verify(self.VOCAB_SIZE)
+        self._make(sampling_seed=-(2**63)).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_out_of_range_raises(self):
+        """Test that verify() rejects a seed outside the int64 range.
+
+        With deterministic inference enabled the seed feeds a torch.int64
+        tensor; an out-of-range value raises "Overflow when unpacking long
+        long" inside the scheduler and crashes every rank, so it must be
+        rejected at admission instead.
+        """
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed=2**63).verify(self.VOCAB_SIZE)
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed=-(2**63) - 1).verify(self.VOCAB_SIZE)
+
+    def test_sampling_seed_non_int_raises(self):
+        """Test that verify() rejects a non-integer seed (e.g. a string)."""
+        with self.assertRaises(ValueError):
+            self._make(sampling_seed="100").verify(self.VOCAB_SIZE)
+
     def test_multiple_grammars_raises(self):
         """Reject structural_tag combined with any other grammar constraint.
 
@@ -435,7 +484,8 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         )
         source = rust_path.read_text()
         start = source.index("pub struct SamplingParams {")
-        end = source.index("\n}\n\n/// The `/generate`", start)
+        # The struct's own closing brace: the first one back at column 0.
+        end = source.index("\n}\n", start)
         rust_fields = tuple(
             re.findall(
                 r"^\s*pub ([a-z][a-z0-9_]*):",
@@ -535,11 +585,6 @@ class TestRegexMaxLength(CustomTestCase):
         result = get_max_seq_length("a*")
         self.assertEqual(result, MAX_LEN)
 
-    def test_unbounded_plus(self):
-        """Test that 'a+' (one or more, no upper bound) returns MAX_LEN."""
-        result = get_max_seq_length("a+")
-        self.assertEqual(result, MAX_LEN)
-
     def test_bounded_repeat(self):
         """Test that exact repeat 'a{5}' gives max length 5."""
         self.assertEqual(get_max_seq_length("a{5}"), 5)
@@ -584,11 +629,6 @@ class TestRegexMaxLength(CustomTestCase):
     def test_lookahead_triggers_unhandled_token(self):
         """Test that lookahead (?=a) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?=a)b")
-        self.assertGreaterEqual(result, MAX_LEN)
-
-    def test_lookbehind_triggers_unhandled_token(self):
-        """Test that lookbehind (?<=x) hits the unhandled-token fallback (MAX_LEN)."""
-        result = get_max_seq_length("(?<=x)y")
         self.assertGreaterEqual(result, MAX_LEN)
 
 

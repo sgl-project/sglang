@@ -152,8 +152,7 @@ def _resize_center_crop_uint8_cthw(
     """Resize and center-crop ``uint8 [3, T, H, W]`` transfer frames."""
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
-            "Transfer frames must have shape [3, T, H, W], got "
-            f"{tuple(frames.shape)}"
+            f"Transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
         )
     orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
     scale = max(width / orig_w, height / orig_h)
@@ -178,8 +177,7 @@ def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tenso
     """Pad ``[1, 3, T, H, W]`` with reflected temporal content."""
     if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
         raise ValueError(
-            "Transfer video must have shape [1, 3, T, H, W], got "
-            f"{tuple(video.shape)}"
+            f"Transfer video must have shape [1, 3, T, H, W], got {tuple(video.shape)}"
         )
     if target_frames <= 0:
         raise ValueError("Transfer target frame count must be positive")
@@ -207,9 +205,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
     """
 
     parallelism_type = StageParallelismType.REPLICATED
-
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        return VerificationResult()
 
     def _load_control_video(
         self,
@@ -242,8 +237,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         stride = frames_per_chunk - conditional_frames
         if stride <= 0:
             raise ValueError(
-                "num_conditional_frames must be smaller than "
-                "num_video_frames_per_chunk"
+                "num_conditional_frames must be smaller than num_video_frames_per_chunk"
             )
         remaining = total_frames - frames_per_chunk
         return 1 + math.ceil(remaining / stride), stride
@@ -811,36 +805,6 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         self.log_info(f"Prepared latents with shape {shape}")
 
-        # Transfer (control-video) conditioning: VAE-encode each control clip
-        # into clean latents the transformer prepends to the GEN sequence. Stored
-        # as a list (one block per hint) so multi-hint transfer (edge + depth …)
-        # threads through the denoiser uniformly with the single-hint case.
-        preprocessed_control = batch.extra.get("preprocessed_control")
-        if preprocessed_control is not None:
-            control_blocks = (
-                preprocessed_control
-                if isinstance(preprocessed_control, list)
-                else [preprocessed_control]
-            )
-            vae_dtype = next(self.vae.parameters()).dtype
-            control_latents_list: list[torch.Tensor] = []
-            for control_pixels_t in control_blocks:
-                control_pixels = control_pixels_t.to(device=device, dtype=vae_dtype)
-                with torch.no_grad():
-                    control_latent = self._vae_encode(control_pixels).to(dtype)
-                if control_latent.shape[-2:] != latents.shape[-2:]:
-                    raise ValueError(
-                        "control latent spatial dims "
-                        f"{tuple(control_latent.shape[-2:])} must match the target "
-                        f"latents {tuple(latents.shape[-2:])}"
-                    )
-                control_latents_list.append(control_latent)
-            batch.extra["control_latents"] = control_latents_list
-            self.log_info(
-                f"Prepared {len(control_latents_list)} control latent block(s) "
-                f"with shape {tuple(control_latents_list[0].shape)}"
-            )
-
         sound_duration = float(getattr(batch, "sound_duration", 0.0) or 0.0)
         if sound_duration > 0.0:
             if not getattr(self.transformer, "sound_gen", False):
@@ -1129,6 +1093,10 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.vae = vae
         self._logged_parallel_config = False
         self._logged_cfg_split = False
+        # Extra transformer kwargs a variant hands over per request through
+        # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
+        # multiview attention layout and temporal wrap period).
+        self._extra_transformer_kwargs: dict[str, Any] = {}
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1263,6 +1231,7 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 transfer_share_vision_temporal_positions=getattr(
                     self, "_share_vision_temporal_positions", True
                 ),
+                **self._extra_transformer_kwargs,
             )
 
     @staticmethod
@@ -1480,6 +1449,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 True,
             )
         )
+        self._extra_transformer_kwargs = dict(
+            batch.extra.get("transformer_extra_kwargs") or {}
+        )
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)
@@ -1611,6 +1583,9 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         for i, t in progress_bar:
+            # Precision is chosen once per step, before any transformer call,
+            # so all CFG branches of the step share the same selection.
+            self.transformer.set_denoising_step(step_index=i, num_steps=len(timesteps))
             batch_dim = batch.latents.shape[0] if batch.latents is not None else 1
             timestep = t.unsqueeze(0).expand(batch_dim) if t.dim() == 0 else t
             # Outside the CFG window the effective scale collapses to 1.0,
@@ -1871,6 +1846,11 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
             if batch.profile and not batch.is_warmup:
                 self.step_profile()
+
+        # Hygiene only: the set_denoising_step at each loop head is what
+        # actually selects precision, so stale state cannot leak into the
+        # next request's steps.
+        self.transformer.reset_denoising_step()
 
         if batch.rollout:
             self._postprocess_rollout_outputs(
@@ -2294,6 +2274,12 @@ class Cosmos3DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return uses
 
 
+def denormalize_vae_latents(
+    latents: torch.Tensor, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
+    return latents.to(mean.dtype) * std + mean
+
+
 class Cosmos3DecodingStage(PipelineStage):
     """
     VAE decoding stage for Cosmos3.
@@ -2323,14 +2309,11 @@ class Cosmos3DecodingStage(PipelineStage):
         result.add_check("latents", batch.latents, V.is_tensor)
         return result
 
-    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
+    def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Undo the VAE latent normalization and cast to the VAE dtype."""
         device = latents.device
-        # Get VAE dtype from its parameters
         vae_dtype = next(self.vae.parameters()).dtype
         latents = latents.to(vae_dtype)
-
-        # Apply latent normalization if configured
         if hasattr(self.vae.config, "latents_mean") and hasattr(
             self.vae.config, "latents_std"
         ):
@@ -2345,10 +2328,15 @@ class Cosmos3DecodingStage(PipelineStage):
                     .view(1, -1, 1, 1, 1)
                     .to(device, vae_dtype)
                 )
-            latents = (latents * self._latents_std) + self._latents_mean
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latents = latents / scaling_factor
+            return denormalize_vae_latents(
+                latents, self._latents_mean, self._latents_std
+            )
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        return latents / scaling_factor
+
+    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
+        latents = self._denormalize_latents(latents)
 
         # Decode - returns [B, C, T, H, W]
         video = self.vae.decode(latents)
