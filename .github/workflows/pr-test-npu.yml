@@ -386,8 +386,6 @@ jobs:
 
       - name: Run test
         timeout-minutes: ${{ inputs.coverage_mode == true && 150 || 60 }}
-        # Container jobs default to sh; the coverage branch uses bash syntax
-        # ([[ ]], pipefail) and would silently fall through to the full run.
         shell: bash
         env:
           SGLANG_USE_MODELSCOPE: true
@@ -489,8 +487,6 @@ jobs:
 
       - name: Run test
         timeout-minutes: ${{ inputs.coverage_mode == true && 150 || 60 }}
-        # Container jobs default to sh; the coverage branch uses bash syntax
-        # ([[ ]], pipefail) and would silently fall through to the full run.
         shell: bash
         env:
           SGLANG_USE_MODELSCOPE: true
