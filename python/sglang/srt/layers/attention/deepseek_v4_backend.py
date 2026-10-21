@@ -88,6 +88,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     make_candidate_indexer,
     make_full_topk_indexer,
 )
+from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
 )
@@ -1042,6 +1043,12 @@ class DSV4Metadata:
     # Shared by all low-ratio source layers; graph replay refreshes them live.
     low_ratio_req_indices: Optional[torch.Tensor] = None
     low_ratio_pos_i64: Optional[torch.Tensor] = None
+    # Eager extend: each low ratio's index-K slots (scoring.prefill_k_slots),
+    # shared with the late-layer tail metadata.
+    low_ratio_k_slots: Optional[Dict[int, torch.Tensor]] = None
+    # Eager extend: the indexer's batch-only plan per low ratio, filled by its first
+    # layer (scoring.prefill_index_plan); one per metadata, as the rows differ.
+    low_ratio_index_plans: Optional[Dict[int, object]] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -2717,8 +2724,43 @@ class DeepseekV4AttnBackend(
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
         )
+        if (
+            self.low_ratios
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self._snapshot_low_ratio_k_slots(forward_batch)
 
         self._activate_request_window()
+
+    def _snapshot_low_ratio_k_slots(self, forward_batch: ForwardBatch) -> None:
+        # Gathered once with the metadata instead of in every indexer layer, so no
+        # indexer layer reads req_to_token.
+        seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
+        k_slots = {
+            ratio: prefill_k_slots(
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+                ratio=ratio,
+            )
+            for ratio in self.low_ratios
+        }
+        metadata = self.forward_metadata
+        metadata.low_ratio_k_slots = k_slots
+        metadata.low_ratio_index_plans = {}
+        if metadata.low_ratio_req_indices is None:
+            # Every source layer would rebuild these rows; the tail and the
+            # prefill graph publish theirs at metadata init the same way.
+            num_tokens = sum(forward_batch.extend_seq_lens_cpu)
+            metadata.low_ratio_req_indices = token_req_indices(
+                forward_batch, num_tokens=num_tokens
+            )
+            metadata.low_ratio_pos_i64 = forward_batch.positions[:num_tokens].to(
+                torch.int64
+            )
+        if self.tail_forward_metadata is not None:
+            self.tail_forward_metadata.low_ratio_k_slots = k_slots
+            self.tail_forward_metadata.low_ratio_index_plans = {}
 
     def _activate_request_window(self) -> None:
         if self.token_to_kv_pool.request_window is not None:
@@ -2738,7 +2780,6 @@ class DeepseekV4AttnBackend(
             and not is_cp_active(forward_batch)
             and not get_platform().is_sm120
             and self.forward_metadata.late_layer_tail is None
-            and self.token_to_kv_pool.request_window is None
             and (
                 num_qo_tokens > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -3783,6 +3824,18 @@ class DeepseekV4AttnBackend(
         else:
             rows_per_request = _as_int_list(forward_batch.extend_seq_lens_cpu)
             rows_per_request_device = forward_batch.extend_seq_lens
+        seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
+        k_slots = self.forward_metadata.low_ratio_k_slots
+        if k_slots is not None:
+            k_slots = k_slots[layer.compress_ratio]
+        else:
+            # Graph-captured metadata carries no snapshot.
+            k_slots = prefill_k_slots(
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens_cpu=seq_lens_cpu,
+                ratio=layer.compress_ratio,
+            )
         return PrefillInputs(
             indexer=layer.indexer,
             layer_id=layer.layer_id,
@@ -3793,8 +3846,10 @@ class DeepseekV4AttnBackend(
             positions=pos,
             req_rows=req,
             req_pool_indices=forward_batch.req_pool_indices,
+            k_slots=k_slots,
+            index_plans=self.forward_metadata.low_ratio_index_plans,
             kv_page_table=core.page_table,
-            seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
+            seq_lens_cpu=seq_lens_cpu,
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
@@ -4590,6 +4645,7 @@ class DeepseekV4AttnBackend(
             request_layout = window_layout(
                 req_pool_indices_repeated[:live],
                 raw_positions[:live],
+                zero_row=self.token_to_kv_pool.request_window.zero_row,
                 capacity=self.token_to_kv_pool.request_window.capacity,
                 floor=None if swa_replay_start is None else swa_replay_start[:live],
                 num_groups=num_groups,

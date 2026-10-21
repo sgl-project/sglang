@@ -663,6 +663,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         layout = window_layout(
             torch.ones(rows, dtype=torch.int64),
             torch.arange(rows),
+            zero_row=pool.request_window.zero_row,
             capacity=pool.request_window.capacity,
             num_groups=1,
         )
