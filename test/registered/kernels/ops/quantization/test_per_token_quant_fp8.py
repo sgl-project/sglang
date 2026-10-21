@@ -31,6 +31,12 @@ def _warp_dispatch_num_tokens() -> int:
     return torch.cuda.get_device_properties(0).multi_processor_count * 16
 
 
+def _persistent_num_tokens() -> int:
+    # Large enough that every persistent CTA candidate loops over several
+    # tokens; +5 leaves a final token group that is not a multiple of 8.
+    return torch.cuda.get_device_properties(0).multi_processor_count * 128 + 5
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dispatch", ["cta", "warp"])
 @pytest.mark.parametrize("hidden_dim", [1076, 1368])
@@ -79,6 +85,47 @@ def test_per_token_quant_fp8_midpoints_are_bit_exact(dtype, dispatch):
 
     _assert_bitwise_equal(actual_scale, expected_scale)
     _assert_bitwise_equal(actual_output, expected_output)
+
+
+@pytest.mark.parametrize("hidden_dim", [1024, 1536])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_per_token_quant_fp8_persistent_paths_are_bit_exact(hidden_dim, dtype):
+    """Large batches must use the persistent kernels and stay bit-exact with AOT.
+
+    hidden_dim 1024 exercises the PPU AIU load path; 1536 exercises cp.async.
+    """
+    num_tokens = _persistent_num_tokens()
+    input = torch.randn((num_tokens, hidden_dim), dtype=dtype, device="cuda")
+
+    actual_output, actual_scale = _run_impl(input, use_jit=True)
+    expected_output, expected_scale = _run_impl(input, use_jit=False)
+
+    _assert_bitwise_equal(actual_scale, expected_scale)
+    _assert_bitwise_equal(actual_output, expected_output)
+
+
+@pytest.mark.parametrize("large_batch", [False, True])
+def test_per_token_quant_fp8_fp16_tiny_rows_avoid_scale_overflow(large_batch):
+    """scale_inv beyond the fp16 finite range must not saturate values or emit NaNs."""
+    hidden_dim = 1024
+    num_tokens = _persistent_num_tokens() if large_batch else 1
+    tiny_values = torch.tensor(
+        [2**-10, -(2**-11), 0.0, 2**-11], dtype=torch.float16, device="cuda"
+    )
+    input = tiny_values.repeat(num_tokens, hidden_dim // tiny_values.numel())
+
+    output, scale = _run_impl(input, use_jit=True)
+
+    expected_codes = torch.tensor(
+        [448.0, -224.0, 0.0, 224.0], dtype=torch.float32, device="cuda"
+    ).repeat(num_tokens, hidden_dim // tiny_values.numel())
+    assert torch.equal(output.float(), expected_codes)
+    torch.testing.assert_close(
+        scale,
+        torch.full_like(scale, (2**-10) / 448.0),
+        rtol=1e-6,
+        atol=0,
+    )
 
 
 def test_scaled_fp8_quant_accepts_padded_outputs():
