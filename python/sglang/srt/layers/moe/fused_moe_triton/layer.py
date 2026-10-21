@@ -107,7 +107,11 @@ def _fuses_routed_scaling_factor_in_topk(quant_method, runner_backend) -> bool:
         getattr(quant_method, "fuse_routed_scaling_factor_in_topk", False)
         or (
             isinstance(quant_method, ModelOptNvFp4FusedMoEMethod)
-            and (runner_backend is None or not runner_backend.is_marlin())
+            # Marlin, or the LoRA MoE runner on its Marlin NVFP4 vendor.
+            and (
+                runner_backend is None
+                or not (runner_backend.is_marlin() or runner_backend.is_lora_marlin())
+            )
         )
         or (
             runner_backend is not None
@@ -426,7 +430,11 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
-        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # Unquantized BF16 LoRA uses DeepGEMM's resident weight layout.
+        self.use_deep_gemm = (
+            get_moe_runner_backend().is_deep_gemm()
+            or get_moe_runner_backend().is_lora()
+        )
 
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
