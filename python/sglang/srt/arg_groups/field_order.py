@@ -546,5 +546,8 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_num_resident",
     "enable_nvidia_megakernel",
     "enable_megamoe_for_layernorm_sp",
+    "hicache_storage_key_scheme",
+    "hicache_storage_head_partition",
+    "hicache_storage_layer_partition",
 )
 # fmt: on
