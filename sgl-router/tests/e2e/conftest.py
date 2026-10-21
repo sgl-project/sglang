@@ -1,4 +1,4 @@
-"""Pytest fixtures for ``experimental/sgl-router/tests/e2e/``.
+"""Pytest fixtures for ``sgl-router/tests/e2e/``.
 
 Two flavors of fixtures coexist here:
 
@@ -45,28 +45,11 @@ if str(_E2E_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_DIR))
 
 from infra import model_pool  # noqa: E402  (needs the sys.path entry above)
+from infra.gateway import router_binary_path  # noqa: E402
 
 MODEL = "Qwen/Qwen3-0.6B"
 SGLANG_PORT = 30000
 ROUTER_PORT = 8090
-
-# Path to the release binary. This file lives at
-# `experimental/sgl-router/tests/e2e/conftest.py`, so:
-#   parent             = tests/e2e/
-#   parent.parent      = tests/
-#   parent.parent.parent = experimental/sgl-router/   ← cargo workspace root
-# A previous version used `parent.parent / "target"`, which pointed at
-# `experimental/sgl-router/tests/target/` and silently broke every
-# fixture that tries to launch the router binary (CI's
-# `cargo build --release` lands the artifact at
-# `experimental/sgl-router/target/release/sgl-router`, not under
-# `tests/`).
-_SGL_ROUTER_ROOT = Path(__file__).parent.parent.parent
-_BINARY = (
-    Path(os.environ.get("CARGO_TARGET_DIR", str(_SGL_ROUTER_ROOT / "target")))
-    / "release"
-    / "sgl-router"
-)
 
 
 def _wait_http(url: str, timeout: int = 120) -> None:
@@ -253,7 +236,7 @@ def router(sglang_server):  # noqa: ARG001  (sglang_server must start first)
     )
 
     proc = subprocess.Popen(
-        [str(_BINARY), *args],
+        [str(router_binary_path()), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -376,18 +359,12 @@ def router_binary() -> Path:
     Gateway per test instead of using the session-scoped ``router``
     fixture).
     """
-    env_path = os.environ.get("SGL_ROUTER_BINARY")
-    candidates: list[Path] = []
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.append(_BINARY)
-    for c in candidates:
-        if c.exists():
-            return c
+    binary = router_binary_path()
+    if binary.exists():
+        return binary
     pytest.skip(
-        "sgl-router release binary not found at any of: "
-        + ", ".join(str(c) for c in candidates)
-        + ". Build with `cargo build --release` in experimental/sgl-router/."
+        f"sgl-router binary not found at {binary}. Build with "
+        "`cargo build --release` in sgl-router/, or set SGL_ROUTER_BINARY."
     )
 
 
