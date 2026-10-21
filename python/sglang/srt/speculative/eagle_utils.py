@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import logging
 import math
-from enum import IntEnum
+from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.sampling import softmax as sampling_softmax
+from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative.spec_tree import (
-    sgl_build_tree_kernel_efficient_triton,
-    verify_tree_greedy_kernel_triton,
+    TreeMaskMode,
+    build_tree_kernel_efficient_func,
+    verify_tree_greedy_func,
+)
+from sglang.kernels.ops.speculative.verify_sampling import (
+    chain_speculative_sampling_triton,
+    tree_speculative_sampling_target_only,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
@@ -24,8 +31,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
-    is_musa,
-    is_npu,
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -38,30 +43,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.watermarking.core import WatermarkState
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_npu = is_npu()
-_is_musa = is_musa()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
-
-if _is_cuda or _is_hip:
-    from sglang.kernels.ops.speculative.tree import (
-        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-    )
-elif _is_musa:
-    from sgl_kernel import (
-        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
-    )
-elif _is_cpu:
-    from sgl_kernel import (
-        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
-    )
-    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
 
 
 def per_step_draft_out_cache_loc(
@@ -137,12 +127,6 @@ def organize_draft_results(
         )
 
     return parent_list, top_scores_index, draft_tokens
-
-
-class TreeMaskMode(IntEnum):
-    FULL_MASK = 0
-    QLEN_ONLY = 1
-    QLEN_ONLY_BITPACKING = 2
 
 
 def default_tree_mask_mode() -> TreeMaskMode:
@@ -226,66 +210,20 @@ def build_tree_kernel_efficient(
     # then, positions = [7, 8, 8, 9]
     positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
-    if _is_npu:
-        torch.ops.npu.build_tree_kernel_efficient(
-            parent_list.to(dtype=torch.int64),
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
-    elif _is_xpu:
-        sgl_build_tree_kernel_triton(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
-    elif _is_cpu:
-        sgl_build_tree_kernel_efficient_cpu(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
-    else:
-        sgl_build_tree_kernel_efficient(
-            parent_list,
-            top_scores_index,
-            seq_lens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            topk,
-            spec_steps,
-            num_verify_tokens,
-            tree_mask_mode,
-        )
+    build_tree_kernel_efficient_func(
+        parent_list,
+        top_scores_index,
+        seq_lens,
+        tree_mask,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        topk,
+        spec_steps,
+        num_verify_tokens,
+        tree_mask_mode,
+    )
     return (
         tree_mask,
         positions,
@@ -294,159 +232,6 @@ def build_tree_kernel_efficient(
         retrieve_next_sibling,
         draft_tokens,
     )
-
-
-def sgl_build_tree_kernel_triton(
-    parent_list: torch.Tensor,
-    selected_index: torch.Tensor,
-    verified_seq_len: torch.Tensor,
-    tree_mask: torch.Tensor,
-    positions: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    topk: int,
-    depth: int,
-    draft_token_num: int,
-    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
-):
-    """Triton-based implementation."""
-    # TODO: Add support for QLEN_ONLY_BITPACKING mode
-    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
-        raise NotImplementedError(
-            "QLEN_ONLY_BITPACKING is not supported in Triton implementation"
-        )
-
-    batch_size = verified_seq_len.shape[0]
-    seq_len_prefix_sum = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
-
-    # Launch kernel with one program per batch item
-    grid = (batch_size,)
-
-    sgl_build_tree_kernel_efficient_triton[grid](
-        parent_list,
-        selected_index,
-        verified_seq_len,
-        seq_len_prefix_sum,
-        tree_mask,
-        positions,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        topk=topk,
-        depth=depth,
-        draft_token_num=draft_token_num,
-        tree_mask_mode=int(tree_mask_mode),
-        batch_size=batch_size,
-        parent_list_stride=(
-            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
-        ),
-        selected_index_stride=selected_index.stride(0),
-    )
-
-
-def verify_tree_greedy_triton(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
-):
-    """Triton-based implementation."""
-    batch_size = candidates.shape[0]
-    num_speculative_tokens = accept_index.shape[1]
-    num_draft_tokens = candidates.shape[1]
-
-    # Launch kernel with one program per batch item
-    grid = (batch_size,)
-
-    verify_tree_greedy_kernel_triton[grid](
-        predicts,
-        accept_index,
-        accept_token_num,
-        candidates,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        target_predict,
-        batch_size=batch_size,
-        num_speculative_tokens=num_speculative_tokens,
-        num_draft_tokens=num_draft_tokens,
-    )
-
-
-def verify_tree_greedy_func(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
-    topk: int = -1,
-):
-    if _is_cuda or _is_hip or _is_musa:
-        if _is_cuda or _is_hip:
-            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
-        else:
-            from sgl_kernel import verify_tree_greedy
-
-        verify_tree_greedy(
-            predicts=predicts,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=accept_token_num,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-
-    elif _is_cpu:
-        sgl_verify_tree_greedy_cpu(
-            predicts=predicts,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=accept_token_num,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match the CUDA op schema, so
-            # the CPU/CUDA call sites stay grep-symmetric.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-
-    elif _is_npu:
-        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
-
-        verify_tree_greedy(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=retrieve_index,
-            retrive_next_token=retrieve_next_token,
-            retrive_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-    elif _is_xpu:
-        verify_tree_greedy_triton(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
-        )
-    return predicts, accept_index, accept_token_num
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
@@ -566,14 +351,19 @@ def eagle_prepare_for_verify(
         # Uniform variant: end offsets (= start + draft_token_num) are computed
         # inside the kernel, keeping the eager `seq_lens + N` add off the host
         # critical path (bs=1 MTP inter-phase seam).
-        batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
-            req_pool_indices=batch.req_pool_indices,
-            req_to_token=req_to_token_pool.req_to_token,
-            start_offset=batch.seq_lens,
-            batch_size=bs,
-            draft_token_num=verify_input.draft_token_num,
-            device=device,
-        )
+        if verify_input.prepared_out_cache_loc is not None:
+            batch.out_cache_loc = verify_input.prepared_out_cache_loc
+        else:
+            batch.out_cache_loc = assign_extend_cache_locs_uniform_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                batch_size=bs,
+                draft_token_num=verify_input.draft_token_num,
+                device=device,
+            )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
             batch, verify_input.draft_token_num
@@ -601,6 +391,8 @@ def eagle_prepare_for_verify(
         target_worker.model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
+        spec_mrope_positions=verify_input.prepared_mrope_positions,
+        kv_loc_plan=verify_input.kv_loc_plan,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -734,13 +526,14 @@ def eagle_sample(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
+    *,
+    watermark_state: Optional[WatermarkState] = None,
+    watermark_full_mask: bool = True,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
     (which contains spec decoding information).
     """
-    import torch.nn.functional as F
-
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
     )
@@ -795,6 +588,46 @@ def eagle_sample(
     # Apply grammar mask if provided
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
+
+    watermark_context_hashes = None
+    watermark_selected = None
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        if batch.return_logprob:
+            # compute_spec_logprobs reads logits_output after verify.
+            next_token_logits = next_token_logits.clone()
+        if next_token_logits.is_cuda:
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative_from_tree(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    draft_tokens=verify_input.draft_token,
+                    custom_mask=verify_input.custom_mask,
+                    positions=verify_input.positions,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                    full_mask=watermark_full_mask,
+                )
+            )
+        else:
+            contexts, context_lengths = watermark_state.speculative_contexts(
+                req_pool_indices=batch.req_pool_indices,
+                draft_tokens=verify_input.draft_token,
+                custom_mask=verify_input.custom_mask,
+                positions=verify_input.positions,
+                draft_token_num=verify_input.draft_token_num,
+                full_mask=watermark_full_mask,
+                context_windows=watermark_state.context_windows(sampling_info),
+            )
+            watermark_context_hashes, watermark_selected = (
+                watermark_state.force_speculative(
+                    logits=next_token_logits,
+                    req_pool_indices=batch.req_pool_indices,
+                    contexts=contexts,
+                    context_lengths=context_lengths,
+                    sampling_info=sampling_info,
+                    draft_token_num=verify_input.draft_token_num,
+                )
+            )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -879,52 +712,19 @@ def eagle_sample(
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        if _is_npu:
-            from sgl_kernel_npu.sample import (
-                chain_speculative_sampling_triton,
-                top_k_renorm_prob,
-                top_p_renorm_prob,
-                tree_speculative_sampling_target_only,
-            )
-        else:
-            from sglang.kernels.ops.speculative.reject_sampling import (
-                chain_speculative_sampling_triton,
-            )
-
-        # if/else, not a ternary: the CUDA-only name still has to resolve in the
-        # branch not taken, and HIP only reaches here with rejection sampling on.
         if use_rejection_sampling:
             sampling_fn = chain_speculative_sampling_triton
+            if get_spec().speculative_use_block_verification:
+                sampling_fn = partial(sampling_fn, block_verification=True)
         else:
-            if _is_cuda:
-                from sglang.kernels.ops.speculative.sampling import (
-                    tree_speculative_sampling_target_only,
-                )
-            elif not _is_npu:
-                from sgl_kernel import tree_speculative_sampling_target_only
-
             sampling_fn = tree_speculative_sampling_target_only
-
-        if _is_hip:
-            # Same names, same contract: dflash_utils.py aliases these too.
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_k_renorm_probs_triton as top_k_renorm_prob,
-            )
-            from sglang.kernels.ops.sampling.renorm_triton import (
-                top_p_renorm_probs_triton as top_p_renorm_prob,
-            )
-        elif _is_cuda:
-            from flashinfer.sampling import top_k_renorm_probs as top_k_renorm_prob
-            from flashinfer.sampling import top_p_renorm_probs as top_p_renorm_prob
-        elif not _is_npu:
-            from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
 
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, verify_input.draft_token_num, dim=0
         )  # (bs * num_draft_tokens, 1)
 
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
+        target_probs = sampling_softmax(
+            next_token_logits, temperatures=expanded_temperature
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
         if sampling_info.need_top_k_sampling:
@@ -1044,13 +844,20 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
-    return predict, num_correct_drafts + 1, accept_index
+    accept_lens = num_correct_drafts + 1
+    if watermark_state is not None and sampling_info.has_watermark_candidates:
+        watermark_state.record_speculative(
+            batch.req_pool_indices,
+            watermark_context_hashes,
+            watermark_selected,
+            accept_index,
+            accept_lens,
+        )
+    return predict, accept_lens, accept_index
 
 
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
-
-    bs = batch.batch_size()
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.

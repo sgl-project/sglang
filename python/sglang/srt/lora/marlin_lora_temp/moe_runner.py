@@ -24,13 +24,13 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import silu_and_mul
 
+    from sglang.kernels.ops.lora.moe.virtual_experts import (
+        _align_block_size_jit as moe_align_block_size,
+    )
     from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         moe_sum_reduce_triton,
     )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
-    from sglang.kernels.ops.moe.virtual_experts import (
-        _align_block_size_jit as moe_align_block_size,
-    )
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
     )
@@ -208,7 +208,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     runner_config: MoeRunnerConfig,
     lora_info,
 ) -> StandardCombineInput:
-    from sglang.kernels.ops.moe.trtllm_lora_temp.virtual_experts import (
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
         merged_experts_fused_moe_lora_add,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -232,8 +232,8 @@ def fused_experts_experimental_sgl_marlin_lora(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
-    topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights.masked_fill(topk_ids < 0, 0.0)
     if (
         topk_ids.ndim != 2
         or topk_weights.shape != topk_ids.shape
@@ -345,7 +345,7 @@ def fused_experts_experimental_sgl_marlin_lora(
             != lora_info.gate_up_lora_b_weights.shape[-1]
         )
         # Allocate and prewarm on main; side streams launch kernels only.
-        gate_up_delta = hidden_states.new_empty((M, topk, 2 * N))
+        gate_up_delta = hidden_states.new_zeros((M, topk, 2 * N))
         if not direct_decode:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta,
@@ -572,9 +572,13 @@ def fused_experts_experimental_sgl_marlin_lora(
     )
 
     # Stage 1: gate_up (marlin) — concurrent with the side-stream delta above.
-    intermediate_cache1 = torch.empty(
-        (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+    projection_cache = torch.zeros(
+        (M * topk * (2 * N + K),),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
     )
+    intermediate_cache1 = projection_cache[: M * topk * 2 * N].view(-1, 2 * N)
+    intermediate_cache3 = projection_cache[M * topk * 2 * N :].view(-1, K)
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
@@ -657,8 +661,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                         local_expert_offset=0,
                         local_num_experts=E,
                         zero_intermediate=(
-                            ep_active
-                            and lora_info.experts_shared_outer_loras
+                            lora_info.experts_shared_outer_loras
                             and not factored_shared_outer
                         ),
                     )
@@ -679,11 +682,6 @@ def fused_experts_experimental_sgl_marlin_lora(
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     # Stage 3: down (marlin).
-    intermediate_cache3 = torch.empty(
-        (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-    if ep_active:
-        intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
@@ -764,7 +762,7 @@ def fused_experts_experimental_sgl_marlin_lora(
             routing_cache=routing_cache,
             local_expert_offset=0,
             local_num_experts=E,
-            zero_intermediate=(ep_active and lora_info.experts_shared_outer_loras),
+            zero_intermediate=lora_info.experts_shared_outer_loras,
         )
 
     # Never alias hidden_states: the shared sink still reads it. The fused B200
@@ -866,9 +864,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                 down_intermediate if down_shrink_done is not None else None
             ),
             zero_intermediate=(
-                ep_active
-                and lora_info.experts_shared_outer_loras
-                and down_shrink_done is None
+                lora_info.experts_shared_outer_loras and down_shrink_done is None
             ),
         )
 

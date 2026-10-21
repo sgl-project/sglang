@@ -20,6 +20,7 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 import ast
 import types
+import typing
 import unittest
 import unittest.mock as mock
 from enum import Enum
@@ -67,6 +68,8 @@ with mock.patch.dict(
         _get_moe_tp_context,
         _moe_runner_keeps_global_expert_ids,
     )
+
+from sglang.srt.runtime_context import get_parallel
 
 
 class _IdentityMoeSlices:
@@ -154,6 +157,11 @@ def _load_standard_dispatcher(get_parallel, get_backend):
         def __init__(self):
             pass
 
+    keeps_global_ids = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_keeps_global_expert_ids"
+    )
     test_class = ast.ClassDef(
         name="_StandardDispatcherUnderTest",
         bases=[ast.Name(id="_DispatcherBase", ctx=ast.Load())],
@@ -164,8 +172,11 @@ def _load_standard_dispatcher(get_parallel, get_backend):
     namespace = {
         "_DispatcherBase": _DispatcherBase,
         "MoeRunnerConfig": object,
+        "MoeRunnerBackendLike": object,
+        "Optional": typing.Optional,
         "get_parallel": get_parallel,
         "get_moe_runner_backend": get_backend,
+        "get_lora": lambda: types.SimpleNamespace(enable_lora=False, lora_paths=None),
         "_use_aiter": False,
         "get_moe_a2a_backend": lambda: types.SimpleNamespace(
             supports_aiter=lambda: False
@@ -173,7 +184,9 @@ def _load_standard_dispatcher(get_parallel, get_backend):
     }
     exec(
         compile(
-            ast.fix_missing_locations(ast.Module(body=[test_class], type_ignores=[])),
+            ast.fix_missing_locations(
+                ast.Module(body=[keeps_global_ids, test_class], type_ignores=[])
+            ),
             str(STANDARD_DISPATCHER_PATH),
             "exec",
         ),
@@ -933,6 +946,7 @@ class TestModuleLevelHelpers(unittest.TestCase):
         moe_utils.get_moe_runner_backend = lambda: state.backend
         for backend in backends:
             state.backend = backend
+            config.runner_backend = backend
             with mock.patch.dict(
                 "sys.modules", {"sglang.srt.layers.moe.utils": moe_utils}
             ):
@@ -982,6 +996,21 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 return_value=keeps_global,
             ),
             mock.patch.object(LoRAMemoryPool, "init_buffers", lambda self, _m: None),
+            # The pool reads its TP placement from the parallel context; state
+            # a whole layout so the topology check sees a consistent one.
+            get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                attn_tp_size=tp_size,
+                attn_tp_rank=tp_rank,
+                attn_dp_size=1,
+                attn_dp_rank=0,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                moe_tp_size=tp_size,
+                moe_ep_size=1,
+                moe_dp_size=1,
+            ),
         ):
             hf_cfg = types.SimpleNamespace(
                 num_hidden_layers=1,
@@ -995,9 +1024,6 @@ class TestPoolInitPicksUpEpContext(unittest.TestCase):
                 base_hf_config=hf_cfg,
                 max_loras_per_batch=1,
                 dtype=torch.bfloat16,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                attn_tp_size=tp_size,
                 max_lora_rank=8,
                 target_modules={"qkv_proj"},
                 base_model=base_model,
@@ -1126,8 +1152,8 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         pool.max_loras_per_batch = 2
         pool.tp_size = tp_size
         pool.tp_rank = 0
-        # Without --enable-dp-attention the attention TP group equals the
-        # outer TP group.
+        # Without attention DP the attention TP group equals the outer TP
+        # group.
         pool.attn_tp_size = tp_size
         pool.moe_ep_size = ep_size
         pool.moe_ep_rank = ep_rank
@@ -1232,8 +1258,8 @@ class TestAttnModulesShardByAttnTp(unittest.TestCase):
     """Regression: attention-module LoRA buffers must shard by `attn_tp_size`,
     not the outer `tp_size`.
 
-    Under `--enable-dp-attention` attention layers are built on the attn_tp
-    group (`attn_tp_size = tp_size // dp_size`), so e.g. MLA `o_proj` holds an
+    Under `--attn-dp-size` attention layers are built on the attn_tp group
+    (`attn_tp_size = tp_size // attn_dp_size`), so e.g. MLA `o_proj` holds an
     attn_tp-local input shard. Sizing the LoRA buffer by the outer `tp_size`
     would make it narrower than the slice produced by
     `RowParallelLinearWithLoRA.slice_lora_a_weights` (which slices by the base
@@ -1437,7 +1463,7 @@ class TestRowParallelLoraAShardsByBaseLinear(unittest.TestCase):
     """Regression: dense row-parallel LoRA-A buffers must match the base linear's
     real input shard.
 
-    Under `--enable-dp-attention --moe-dense-tp-size 1` the dense-MLP and
+    Under `--attn-dp-size N --moe-dense-tp-size 1` the dense-MLP and
     shared-expert `down_proj` are fully replicated (K is the full intermediate
     size) although the outer `tp_size` is large. Dividing by `tp_size` undersized
     the buffer and `sgemm_lora_a_fwd` failed its `x.shape[-1] == K` assertion.

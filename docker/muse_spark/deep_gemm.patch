@@ -1,0 +1,1082 @@
+diff --git a/csrc/apis/mega_moe.hpp b/csrc/apis/mega_moe.hpp
+index b5a29f1..6823dd3 100644
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -203,6 +203,10 @@ static void fp8_fp4_mega_moe(
+     const std::optional<torch::Tensor>& l1_alphas,
+     const std::optional<torch::Tensor>& l2_alphas,
+     const std::optional<torch::Tensor>& l2_act_scales,
++    const bool& post_expert_norm = false,
++    const std::optional<torch::Tensor>& post_expert_norm_weight = std::nullopt,
++    const float& post_expert_norm_eps = 1e-6f,
++    const bool& post_expert_norm_weight_first = false,
+     const bool& use_trtllm_weights = false,
+     const std::optional<int64_t>& global_num_tokens = std::nullopt
+ ) {
+@@ -340,6 +344,17 @@ static void fp8_fp4_mega_moe(
+         DG_HOST_ASSERT(l2_act_scales->size(0) == num_experts_per_rank);
+     }
+
++    // `[hidden]` FP32 gain, optional; `weight_first` picks `rms_norm(w * x)`.
++    DG_HOST_ASSERT(post_expert_norm or not post_expert_norm_weight.has_value());
++    DG_HOST_ASSERT(not post_expert_norm or num_shared_experts == 0);
++    DG_HOST_ASSERT(not post_expert_norm or post_expert_norm_eps >= 0.0f);
++    if (post_expert_norm_weight.has_value()) {
++        DG_HOST_ASSERT(post_expert_norm_weight->scalar_type() == torch::kFloat);
++        DG_HOST_ASSERT(post_expert_norm_weight->is_contiguous());
++        DG_HOST_ASSERT(post_expert_norm_weight->dim() == 1);
++        DG_HOST_ASSERT(post_expert_norm_weight->size(0) == hidden);
++    }
++
+     // Already registered tensors
+     const auto [x, x_sf, topk_idx, topk_weights,
+                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+@@ -372,6 +387,11 @@ static void fp8_fp4_mega_moe(
+                                    ? l2_alphas->const_data_ptr<float>() : nullptr,
+                                l2_act_scales.has_value()
+                                    ? l2_act_scales->const_data_ptr<float>() : nullptr,
++                               post_expert_norm_weight.has_value()
++                                   ? post_expert_norm_weight->const_data_ptr<float>() : nullptr,
++                               post_expert_norm,
++                               post_expert_norm_weight_first,
++                               post_expert_norm_eps,
+                                mma_kind,
+                                use_fp8_combine, use_trtllm_weights, global_num_tokens);
+     } else {
+@@ -398,6 +418,10 @@ static void bf16_mega_moe(
+     const std::string& activation,
+     const std::optional<float>& activation_clamp_opt,
+     const bool& fast_math,
++    const bool& post_expert_norm = false,
++    const std::optional<torch::Tensor>& post_expert_norm_weight = std::nullopt,
++    const float& post_expert_norm_eps = 1e-6f,
++    const bool& post_expert_norm_weight_first = false,
+     const bool& use_trtllm_weights = false,
+     const std::optional<int64_t>& global_num_tokens = std::nullopt
+ ) {
+@@ -464,6 +488,17 @@ static void bf16_mega_moe(
+     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+     DG_HOST_ASSERT(num_experts == num_experts_);
+
++    DG_HOST_ASSERT(post_expert_norm or not post_expert_norm_weight.has_value());
++    DG_HOST_ASSERT(not post_expert_norm or num_shared_experts == 0);
++    DG_HOST_ASSERT(not post_expert_norm or post_expert_norm_eps >= 0.0f);
++    if (post_expert_norm_weight.has_value()) {
++        DG_HOST_ASSERT(post_expert_norm_weight->scalar_type() == torch::kFloat);
++        DG_HOST_ASSERT(post_expert_norm_weight->is_contiguous());
++        DG_HOST_ASSERT(post_expert_norm_weight->dim() == 1);
++        DG_HOST_ASSERT(post_expert_norm_weight->size(0) == hidden);
++        DG_HOST_ASSERT(post_expert_norm_weight->device() == y.device());
++    }
++
+     // Already registered tensors
+     const auto [x, _x_sf, topk_idx, topk_weights,
+                 shared_l1_acts, _shared_l1_acts_sf, shared_l2_acts, _shared_l2_acts_sf,
+@@ -483,7 +518,11 @@ static void bf16_mega_moe(
+                             num_shared_experts,
+                             num_tokens, num_topk,
+                             hidden, intermediate_hidden,
+-                            activation_clamp, fast_math, use_trtllm_weights, global_num_tokens);
++                            activation_clamp, fast_math,
++                            post_expert_norm_weight.has_value()
++                                ? post_expert_norm_weight->const_data_ptr<float>() : nullptr,
++                            post_expert_norm, post_expert_norm_weight_first,
++                            post_expert_norm_eps, use_trtllm_weights, global_num_tokens);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture");
+     }
+diff --git a/csrc/jit_kernels/heuristics/mega_moe.hpp b/csrc/jit_kernels/heuristics/mega_moe.hpp
+index 9d23754..1c6d8f7 100644
+--- a/csrc/jit_kernels/heuristics/mega_moe.hpp
++++ b/csrc/jit_kernels/heuristics/mega_moe.hpp
+@@ -2,6 +2,7 @@
+
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
+ #include <cstdint>
+ #include <format>
+ #include <iostream>
+@@ -142,8 +143,23 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+                 break;
+         }
+     }
+-    const int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 : block_m <= 192 ? 32 : 40;
+-    const int block_k = 128 * 8 / get_element_bits(mma_kind);
++    // Must divide `WG_BLOCK_M` (= block_m / 2), which pins each arm: 240 -> 120 and
++    // 128 -> 64 cannot take 48, 192 -> 96 can and halves its store iterations.
++    int store_block_m = block_m <= 16 ? 8 : block_m <= 64 ? 16 :
++                        block_m <= 128 ? 32 : block_m <= 192 ? 48 : 40;
++    int block_k = 128 * 8 / get_element_bits(mma_kind);
++    int cluster_size = 2, num_epilogue_warpgroups = 2;
++
++    // Offline tuning hook: "cluster,block_m,store_block_m,block_k,epilogue_warpgroups",
++    // `block_k` in the pre-scaling 8-bit units above.
++    if (const auto override_str = deep_jit::get_env<std::string>("DG_MEGA_MOE_TILES"); not override_str.empty()) {
++        int v[5];
++        const int n = std::sscanf(override_str.c_str(), "%d,%d,%d,%d,%d",
++                                  v + 0, v + 1, v + 2, v + 3, v + 4);
++        DG_HOST_ASSERT(n == 5 and "DG_MEGA_MOE_TILES needs 5 comma-separated ints");
++        cluster_size = v[0], block_m = v[1], store_block_m = v[2];
++        block_k = v[3] * 8 / get_element_bits(mma_kind), num_epilogue_warpgroups = v[4];
++    }
+
+     // Check whether our `block_m` lies in `kCandidateBlockM`
+     DG_HOST_ASSERT(std::any_of(
+@@ -151,8 +167,7 @@ static std::tuple<int, int, int, int, int> get_block_config_for_mega_moe(
+         [=](const auto& candidate) { return candidate == block_m; })
+     );
+
+-    // Return configs: 2-CTA clusters and 2 epilogue warpgroups
+-    return {2, block_m, store_block_m, block_k, 2 * 128};
++    return {cluster_size, block_m, store_block_m, block_k, num_epilogue_warpgroups * 128};
+ }
+
+ static std::pair<int, int> get_pipeline_config_for_mega_moe(
+@@ -200,6 +215,9 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
+     // Tensor memory pointer
+     const int smem_tmem_ptr = 4;
+
++    const int smem_sf_inv_lut = mma_kind == MmaKind::NVFP4 ?
++        256 * static_cast<int>(sizeof(float)) : 0;
++
+     // SF is aligned to UTCCP 128-element granularity
+     const int smem_sfa_per_stage = is_mma_with_sf(mma_kind) ? sf_block_m * (block_k / gran_k) : 0;
+     const int smem_sfb_per_stage = is_mma_with_sf(mma_kind) ? sf_block_n * (block_k / gran_k) : 0;
+@@ -216,7 +234,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe(
+
+     // Fixed total
+     const int smem_fixed = smem_dispatch_size + smem_cd + smem_amax_reduction + smem_barriers +
+-        smem_task_info + smem_tmem_ptr;
++        smem_task_info + smem_tmem_ptr + smem_sf_inv_lut;
+
+     // Select maximum number of stages
+     const int num_stages = (smem_capacity - smem_fixed) / smem_size_per_stage;
+diff --git a/csrc/jit_kernels/impls/sm100_bf16_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_bf16_mega_moe.hpp
+index 8b9df05..ab0da91 100644
+--- a/csrc/jit_kernels/impls/sm100_bf16_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_bf16_mega_moe.hpp
+@@ -49,6 +49,10 @@ static void sm100_bf16_mega_moe(
+     const int& hidden, const int& intermediate_hidden,
+     const float& activation_clamp,
+     const bool& fast_math,
++    const float* post_expert_norm_weight,
++    const bool& post_expert_norm,
++    const bool& post_expert_norm_weight_first,
++    const float& post_expert_norm_eps,
+     const bool& use_trtllm_weights = false,
+     const std::optional<int64_t>& global_num_tokens = std::nullopt
+ ) {
+@@ -160,7 +164,7 @@ static void __instantiate_kernel() {{
+         {}, {},
+         {},
+         {},
+-        {}
++        {}, {}, {}, {}, {}
+     >);
+ }};
+ )", num_max_tokens_per_rank,
+@@ -176,6 +180,10 @@ static void __instantiate_kernel() {{
+         num_sms, num_ranks,
+         to_string(activation_clamp),
+         fast_math ? "true" : "false",
++        post_expert_norm ? "true" : "false",
++        post_expert_norm_weight_first ? "true" : "false",
++        post_expert_norm_weight != nullptr ? "true" : "false",
++        to_string(post_expert_norm_eps),
+         use_trtllm_weights ? "true" : "false"));
+
+     // Launch
+@@ -187,6 +195,7 @@ static void __instantiate_kernel() {{
+             .cluster_dim = dim3(2, 1, 1),
+         },
+         y.data_ptr(),
++        post_expert_norm_weight,
+         cumulative_local_expert_recv_stats_ptr,
+         num_tokens,
+         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+diff --git a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+index 47ca655..f513780 100644
+--- a/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
++++ b/csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp
+@@ -94,6 +94,10 @@ static void sm100_fp8_fp4_mega_moe(
+     const float* l1_alphas,
+     const float* l2_alphas,
+     const float* l2_act_scales,
++    const float* post_expert_norm_weight,
++    const bool& with_post_expert_norm,
++    const bool& post_norm_weight_first,
++    const float& post_norm_eps,
+     const MmaKind& mma_kind,
+     const bool& use_fp8_combine,
+     const bool& use_trtllm_weights = false,
+@@ -272,7 +276,7 @@ static void __instantiate_kernel() {{
+         {},
+         {},
+         {}, {}, {}, {}, {}, {},
+-        {}
++        {}, {}, {}, {}, {}
+     >);
+ }};
+ )", num_max_tokens_per_rank,
+@@ -298,6 +302,10 @@ static void __instantiate_kernel() {{
+     (l2_act_scales != nullptr) ? "true" : "false",
+     use_fp8_combine ? "true" : "false",
+     to_string(l1_weights.scalar_type()),
++    with_post_expert_norm ? "true" : "false",
++    post_norm_weight_first ? "true" : "false",
++    post_expert_norm_weight != nullptr ? "true" : "false",
++    to_string(post_norm_eps),
+     use_trtllm_weights ? "true" : "false"));
+     // Launch
+     jit->launch(
+@@ -310,6 +318,7 @@ static void __instantiate_kernel() {{
+         y.data_ptr(),
+         cumulative_local_expert_recv_stats_ptr,
+         l1_alphas, l2_alphas, l2_act_scales,
++        post_expert_norm_weight,
+         num_tokens,
+         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+         tensor_map_l1_acts,
+diff --git a/csrc/tvm_ffi_api.cpp b/csrc/tvm_ffi_api.cpp
+index 7870999..b6f9ae7 100644
+--- a/csrc/tvm_ffi_api.cpp
++++ b/csrc/tvm_ffi_api.cpp
+@@ -760,7 +760,9 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
+                         Tuple<int64_t, int64_t, int64_t> recipe, std::string mma_type, std::string activation, Optional<double> activation_clamp_opt,
+                         bool fast_math, bool use_x_scales, Optional<TensorView> l1_alphas,
+                         Optional<TensorView> l2_alphas, Optional<TensorView> l2_act_scales,
+-                        bool use_trtllm_weights, Optional<int64_t> global_num_tokens) {
++                        bool post_expert_norm, Optional<TensorView> post_expert_norm_weight,
++                        double post_expert_norm_eps, bool post_expert_norm_weight_first, bool use_trtllm_weights,
++                        Optional<int64_t> global_num_tokens) {
+     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
+     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
+     std::vector<int64_t> sym_buffer_ptrs_val;
+@@ -794,7 +796,10 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
+         l1_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l1_alphas.value())) : std::nullopt,
+         l2_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_alphas.value())) : std::nullopt,
+         l2_act_scales.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_act_scales.value())) : std::nullopt,
+-        use_trtllm_weights,
++        post_expert_norm,
++        post_expert_norm_weight.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(post_expert_norm_weight.value())) : std::nullopt,
++        static_cast<float>(post_expert_norm_eps),
++        post_expert_norm_weight_first, use_trtllm_weights,
+         global_num_tokens.has_value() ? std::make_optional(global_num_tokens.value()) : std::nullopt
+     );
+ }
+@@ -805,7 +810,8 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
+                       Array<int64_t> sym_buffer_ptrs, int64_t rank_idx,
+                       int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
+                       std::string activation, Optional<double> activation_clamp_opt, bool fast_math,
+-                      bool use_trtllm_weights, Optional<int64_t> global_num_tokens) {
++                      bool post_expert_norm, Optional<TensorView> post_expert_norm_weight,
++                      double post_expert_norm_eps, bool post_expert_norm_weight_first, bool use_trtllm_weights, Optional<int64_t> global_num_tokens) {
+     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
+     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
+     std::vector<int64_t> sym_buffer_ptrs_val;
+@@ -817,6 +823,8 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
+     auto shared_l1_val = shared_l1_weights.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(shared_l1_weights.value())) : std::nullopt;
+     auto shared_l2_val = shared_l2_weights.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(shared_l2_weights.value())) : std::nullopt;
+
++    auto post_norm_weight_val = post_expert_norm_weight.has_value()
++        ? std::optional<torch::Tensor>(convert_to_torch_tensor(post_expert_norm_weight.value())) : std::nullopt;
+     mega::bf16_mega_moe(
+         convert_to_torch_tensor(y),
+         convert_to_torch_tensor(l1_weights),
+@@ -825,7 +833,8 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
+         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
+         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
+         static_cast<int>(num_topk), activation, act_clamp_opt_val, fast_math,
+-        use_trtllm_weights,
++        post_expert_norm, post_norm_weight_val,
++        static_cast<float>(post_expert_norm_eps), post_expert_norm_weight_first, use_trtllm_weights,
+         global_num_tokens.has_value() ? std::make_optional(global_num_tokens.value()) : std::nullopt
+     );
+ }
+diff --git a/deep_gemm/include/deep_gemm/common/math.cuh b/deep_gemm/include/deep_gemm/common/math.cuh
+index 646634b..9d20960 100644
+--- a/deep_gemm/include/deep_gemm/common/math.cuh
++++ b/deep_gemm/include/deep_gemm/common/math.cuh
+@@ -193,6 +193,26 @@ CUTLASS_DEVICE void get_nvfp4_sf_and_sf_inv(const float2& amax, float2& sf, floa
+     sf_inv.y = sf.y > 0.0f ? __frcp_rn(sf.y) : 0.0f;
+ }
+
++// Built with `__frcp_rn`, so a lookup is bit-identical to computing the reciprocal.
++constexpr uint32_t kNumNVFP4SFInvLutEntries = 256;
++
++CUTLASS_DEVICE void init_nvfp4_sf_inv_lut(float* lut, const uint32_t& lane_idx) {
++    #pragma unroll
++    for (uint32_t b = lane_idx; b < kNumNVFP4SFInvLutEntries; b += 32) {
++        __nv_fp8_e4m3 q;
++        q.__x = static_cast<__nv_fp8_storage_t>(b);
++        const float sf = static_cast<float>(q);
++        lut[b] = sf > 0.0f ? __frcp_rn(sf) : 0.0f;
++    }
++}
++
++CUTLASS_DEVICE void get_nvfp4_sf_inv_from_lut(const float2& amax, const float* lut,
++                                              float2& sf_inv, uint2& sf_bits) {
++    constexpr float kInvMax = 1.0f / 6.0f;
++    const __nv_fp8_e4m3 qx(amax.x * kInvMax), qy(amax.y * kInvMax);
++    sf_bits = {qx.__x, qy.__x};
++    sf_inv = {lut[qx.__x], lut[qy.__x]};
++}
+
+ CUTLASS_DEVICE uint32_t cast_into_e2m1x2_pairs(const float2& lower, const float2& upper) {
+     uint32_t packed;
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
+index 6e15002..f1fe8ad 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_bf16_mega_moe.cuh
+@@ -33,6 +33,10 @@ template <
+     uint32_t kNumSMs, uint32_t kNumRanks,
+     float kActivationClamp,
+     bool kFastMath,
++    bool kWithPostExpertNorm = false,
++    bool kPostNormWeightFirst = false,
++    bool kPostNormHasWeight = false,
++    float kPostNormEps = 1e-6f,
+     bool kUseTrtllmWeights = false,
+     bool kHasShared = (kNumSharedExperts > 0),
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+@@ -52,6 +56,7 @@ template <
+ >
+ CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
+ sm100_bf16_mega_moe_impl(void* y,
++                         const float* post_expert_norm_weight,
+                          int* cumulative_local_expert_recv_stats,
+                          const uint32_t num_tokens,
+                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+@@ -80,6 +85,11 @@ sm100_bf16_mega_moe_impl(void* y,
+                      (kHidden % 64 == 0 and kIntermediateHidden % 64 == 0 and BLOCK_K % 64 == 0),
+                      "TRTLLM BF16 weights require complete 128-byte K blocks");
+
++    DG_STATIC_ASSERT(not kWithPostExpertNorm or kNumSharedExperts == 0,
++                     "Post-expert norm does not support shared experts");
++    DG_STATIC_ASSERT(not kPostNormHasWeight or kWithPostExpertNorm,
++                     "Post-expert norm weight requires normalization");
++
+     // Thread indices
+     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
+     const uint32_t sm_idx = blockIdx.x;
+@@ -972,7 +982,7 @@ sm100_bf16_mega_moe_impl(void* y,
+
+                         // Load weights from global into register cache per 32 tokens
+                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
+-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
++                        if (not kWithPostExpertNorm and not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
+                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                             stored_cached_weight = *buffer.l1_topk_weights_buffer
+                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+@@ -1294,6 +1304,42 @@ sm100_bf16_mega_moe_impl(void* y,
+             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+
++            // Every lane joins each full-row reduction, two-chunk combine included.
++            float slot_norm_scale = 1.0f;
++            if constexpr (kWithPostExpertNorm) {
++                const float my_topk_weight = lane_idx < kNumTopk ?
++                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
++                          token_idx * kNumTopk + lane_idx) : 0.0f;
++                #pragma unroll 1
++                for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
++                    if (not (total_mask >> slot_idx & 1))
++                        continue;
++                    const auto row_ptr = buffer.combine_token_buffer.get_rank_buffer(slot_idx)
++                                         .get_data_buffer(token_idx).get_base_ptr<uint4>();
++                    float sum_sq = 0.0f;
++                    #pragma unroll 4
++                    for (uint32_t j = 0; j < kNumHiddenBytes / sizeof(uint4) / 32; ++ j) {
++                        const uint32_t elem_idx = (j * 32 + lane_idx) * 8;
++                        const uint4 raw = __ldg(row_ptr + j * 32 + lane_idx);
++                        const auto values = reinterpret_cast<const nv_bfloat162*>(&raw);
++                        #pragma unroll
++                        for (uint32_t k = 0; k < kNumElemsPerUint4; ++ k) {
++                            float2 value = __bfloat1622float2(values[k]);
++                            if constexpr (kPostNormHasWeight and kPostNormWeightFirst)
++                                value = __fmul2_rn(value, __ldg(reinterpret_cast<const float2*>(
++                                    post_expert_norm_weight + elem_idx + k * 2)));
++                            sum_sq = __fmaf_rn(value.x, value.x, sum_sq);
++                            sum_sq = __fmaf_rn(value.y, value.y, sum_sq);
++                        }
++                    }
++                    const float inv_rms = rsqrtf(
++                        math::warp_reduce_sum(sum_sq) / static_cast<float>(kHidden) + kPostNormEps);
++                    if (lane_idx == slot_idx)
++                        slot_norm_scale = my_topk_weight * inv_rms;
++                }
++            }
++
++
+             const uint32_t chunk_byte_offset = chunk_idx * kNumChunkBytes;
+
+             // Move mask and load
+@@ -1314,33 +1360,60 @@ sm100_bf16_mega_moe_impl(void* y,
+                         ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
+                     }
+                     __syncwarp();
+-                    return true;
++                    return static_cast<int>(slot_idx);
+                 }
+-                return false;
++                return -1;
+             };
+
+             // Load the first selection
+-            bool do_reduce = move_mask_and_load(load_stage_idx);
++            int active_slot = move_mask_and_load(load_stage_idx);
+
+             // Accumulate all top-k contributions for this chunk in float registers
+             float2 reduced[kNumUint4PerLane * kNumElemsPerUint4] = {};
+-            while (do_reduce) {
++            while (active_slot >= 0) {
+                 // Prefetch next top-k into the buffer while current is being accumulated
+-                do_reduce = move_mask_and_load(load_stage_idx ^ 1);
++                const int next_slot = move_mask_and_load(load_stage_idx ^ 1);
+
+                 // Accumulate
+                 combine_load_barriers[load_stage_idx]->wait(combine_phase);
++                float slot_scale = 1.0f;
++                if constexpr (kWithPostExpertNorm)
++                    slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
++                                             static_cast<uint32_t>(active_slot));
+                 #pragma unroll
+                 for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
+                     const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                     const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                     #pragma unroll
+-                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+-                        ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
++                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
++                        auto& acc = reduced[j * kNumElemsPerUint4 + l];
++                        if constexpr (kWithPostExpertNorm) {
++                            const float2 pair = __bfloat1622float2(bf16_values[l]);
++                            acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
++                            acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);
++                        } else {
++                            ptx::accumulate(acc, bf16_values[l]);
++                        }
++                    }
+                 }
+                 cutlass::arch::fence_view_async_shared();
+                 combine_phase ^= load_stage_idx;
+                 load_stage_idx ^= 1;
++                active_slot = next_slot;
++            }
++
++            if constexpr (kPostNormHasWeight) {
++                #pragma unroll
++                for (uint32_t j = 0; j < kNumUint4PerLane; ++ j) {
++                    const uint32_t elem_idx = chunk_idx * kNumChunkBytes / sizeof(nv_bfloat16) +
++                                              (j * 32 + lane_idx) * 8;
++                    #pragma unroll
++                    for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
++                        auto& acc = reduced[j * kNumElemsPerUint4 + l];
++                        acc = __fmul2_rn(acc, __ldg(reinterpret_cast<const float2*>(
++                            post_expert_norm_weight + elem_idx + l * 2)));
++                    }
++                }
+             }
+
+             // Cast
+diff --git a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+index c2052d4..7c0d1e9 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -48,6 +48,10 @@ template <
+     // controls the dispatch a2a and the mainloops.
+     bool kUseFp8Combine,
+     typename weight_dtype_t,
++    bool kWithPostExpertNorm = false,
++    bool kPostNormWeightFirst = false,
++    bool kPostNormHasWeight = false,
++    float kPostNormEps = 0.0f,
+     bool kUseTrtllmWeights = false,
+     bool kHasShared = (kNumSharedExperts > 0),
+     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
+@@ -72,6 +76,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             const float* __restrict__ l1_alphas,
+                             const float* __restrict__ l2_alphas,
+                             const float* __restrict__ l2_act_scales,
++                            const float* __restrict__ post_expert_norm_weight,
+                             const uint32_t num_tokens,
+                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
+@@ -101,6 +106,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
+     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
+     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
++    DG_STATIC_ASSERT(not kWithPostExpertNorm or kNumSharedExperts == 0,
++                     "Post-expert norm does not support shared experts");
++    DG_STATIC_ASSERT(kWithPostExpertNorm or not kPostNormHasWeight,
++                     "Post-expert norm weight without the post-expert norm");
+     DG_STATIC_ASSERT(not kUseTrtllmWeights or
+                      (kMmaKind == MmaKind::NVFP4 and kNumSharedExperts == 0),
+                      "TRT weight layout requires routed NVFP4 experts");
+@@ -279,6 +288,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         Barrier task_info_full_barriers[kNumScheduleStages];
+         Barrier task_info_empty_barriers[kNumScheduleStages];
+         uint32_t tmem_ptr_in_smem;
++        float nvfp4_sf_inv_lut[kIsNVFP4 ? math::kNumNVFP4SFInvLutEntries : 1];
+     };
+     constexpr uint32_t kNumReusableSmemBytes = offsetof(SharedStorage, dispatch_barriers);
+     SharedStorage &shared_storage = *reinterpret_cast<SharedStorage*>(smem_buffer);
+@@ -345,6 +355,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+     } else if (warp_idx == 3) {
+         // Allocate tensor memory
+         Allocator().allocate(kNumTmemCols, &shared_storage.tmem_ptr_in_smem);
++    } else if (warp_idx == 4) {
++        if constexpr (kIsNVFP4)
++            math::init_nvfp4_sf_inv_lut(shared_storage.nvfp4_sf_inv_lut, lane_idx);
+     }
+     cute::cluster_sync();
+
+@@ -400,6 +413,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+     constexpr uint32_t kDispatchGridSyncIndex = 0;
+     constexpr uint32_t kEpilogueGridSyncIndex = 1;
+
++    // Weight-first folds the producing rank's `post_expert_norm_weight` into the sum of
++    // squares, so that weight must be identical on every rank.
++    // ponytail: BF16 combine only; the FP8 combine would have to fold in its per-tile SF
++    constexpr bool kFusedPostNormPartials = kWithPostExpertNorm and not kUseFp8Combine;
++
+     // Different warp roles
+     if (warp_idx < kNumDispatchWarps) {
+         // Adjust registers
+@@ -427,6 +445,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             }
+         };
+
++        // Ordered before any adder: locally by the grid sync below, across ranks by the
++        // `kBeforeDispatchPullBarrierTag` barrier every rank enters after it.
++        if constexpr (kFusedPostNormPartials) {
++            const auto sum_sq_ptr = workspace.get_post_norm_sum_sq_ptr();
++            for (uint32_t i = sm_idx * kNumDispatchThreads + thread_idx;
++                 i < num_tokens * kNumTopk; i += kNumSMs * kNumDispatchThreads)
++                sum_sq_ptr[i] = 0.0f;
++        }
++
+         // Count experts' tokens
+         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
+            atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+@@ -1212,8 +1239,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                         const uint32_t j = s * kNumAtomsPerStore + i;
+
+                         // Load weights from global into register cache per 32 tokens
++                        // NOTES: the post-expert norm applies the top-k weight in the combine
+                         DG_STATIC_ASSERT(32 % ATOM_M == 0, "Invalid block size");
+-                        if (not task_info.is_shared() and (j * ATOM_M) % 32 == 0 and
++                        if (not kWithPostExpertNorm and not task_info.is_shared() and
++                            (j * ATOM_M) % 32 == 0 and
+                             (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                             stored_cached_weight = *buffer.l1_topk_weights_buffer
+                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
+@@ -1242,10 +1271,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             __fmul2_rn(x_scales, {l1_alpha.y, l1_alpha.y}) : x_scales;
+
+                         // Load weights from register cache
+-                        float2 weights = {
+-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+-                            ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+-                        };
++                        float2 weights = {1.0f, 1.0f};
++                        if constexpr (not kWithPostExpertNorm) {
++                            weights = {
++                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
++                                ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
++                            };
++                        }
+                         if constexpr (kWithL2ActScales)
+                             weights = __fmul2_rn(weights, {l2_act_gs, l2_act_gs});
+
+@@ -1353,7 +1385,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                         float2 sf, sf_inv;
+                         uint2 sf_bits;
+                         if constexpr (kIsNVFP4) {
+-                            math::get_nvfp4_sf_and_sf_inv(amax_values[i], sf, sf_inv, sf_bits);
++                            math::get_nvfp4_sf_inv_from_lut(amax_values[i], shared_storage.nvfp4_sf_inv_lut,
++                                                            sf_inv, sf_bits);
+                         } else {
+                             // Reduce amax (warp-pair-level)
+                             const float2 wp_amax =
+@@ -1655,6 +1688,44 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                                 dst_token.get_base_ptr(),
+                                 n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
+                             *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
++
++                            // Squares the values just stored, so the norm sees what the
++                            // combine would have read back.
++                            if constexpr (kFusedPostNormPartials) {
++                                if (not task_info.is_shared()) {
++                                    const uint32_t elem_base = n_idx + (lane_idx % 16) * 8;
++                                    const auto bf_pairs = reinterpret_cast<const nv_bfloat162*>(&packed);
++                                    float partial = 0.0f;
++                                    #pragma unroll
++                                    for (uint32_t q = 0; q < 4; ++ q) {
++                                        const float2 vf = __bfloat1622float2(bf_pairs[q]);
++                                        float a = vf.x, b = vf.y;
++                                        // Weight-first normalizes `w * x`
++                                        if constexpr (kPostNormHasWeight and kPostNormWeightFirst) {
++                                            a *= __ldg(post_expert_norm_weight + elem_base + q * 2 + 0);
++                                            b *= __ldg(post_expert_norm_weight + elem_base + q * 2 + 1);
++                                        }
++                                        partial = __fmaf_rn(a, a, partial);
++                                        partial = __fmaf_rn(b, b, partial);
++                                    }
++                                    // 16-lane mask: the `valid_m` break can retire the other half-warp
++                                    const uint32_t row_mask = 0x0000ffffu << (16u * (lane_idx / 16));
++                                    #pragma unroll
++                                    for (uint32_t d = 1; d < 16; d <<= 1)
++                                        partial += __shfl_xor_sync(row_mask, partial, d);
++                                    if ((lane_idx & 15u) == 0) {
++                                        const auto sum_sq_ptr = workspace.get_post_norm_sum_sq_ptr(
++                                            dst_token_idx, dst_topk_idx);
++                                        if constexpr (kNumRanks == 1) {
++                                            atomicAdd(sum_sq_ptr, partial);
++                                        } else {
++                                            // System scope: the accumulator is in a peer's workspace
++                                            ptx::red_add_sys(
++                                                sym_buffer.map(sum_sq_ptr, dst_rank_idx), partial);
++                                        }
++                                    }
++                                }
++                            }
+                         }
+                     }
+                 }
+@@ -1692,6 +1763,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+         DG_STATIC_ASSERT(kNumChunkUint4 % 32 == 0, "Combine chunk must be a multiple of 32 16-byte elements (one per lane)");
+         DG_STATIC_ASSERT(kNumTopk + (kNumSharedExperts > 0 ? 1u : 0u) <= 32u, "Top-k + shared must fit in a single warp");
+
++        constexpr uint32_t kNumElemsPerLoadUint4 = kUseFp8Combine ? 16u : 8u;
++        constexpr uint32_t kNumRowLoadBytes = kUseFp8Combine ? kNumHiddenBytes / 2 : kNumHiddenBytes;
++        constexpr uint32_t kNumRowLoadUint4PerLane = kNumRowLoadBytes / sizeof(uint4) / 32;
++        DG_STATIC_ASSERT(not kWithPostExpertNorm or
++                         kNumRowLoadUint4PerLane * 32 * sizeof(uint4) == kNumRowLoadBytes,
++                         "Hidden is not a whole number of 16-byte vectors per lane");
++
+         // Verify combined shared memory budget at runtime
+         DG_DEVICE_ASSERT(kNumChunkSlots * kNumEpilogueWarps * kNumChunkBytes <= kNumReusableSmemBytes);
+
+@@ -1747,6 +1825,84 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+             comm::wait_until([&]() { return __all_sync(0xffffffff, not is_routed or ptx::ld_acq_sys(peer_ready_ptr) == grid_idx); },
+                              [&]() { printf("DeepGEMM combine peers timeout: rank=%u, token=%u\n", sym_buffer.rank_idx, token_idx); });
+
++            // The RMS spans the full hidden dim, of which the L2 epilogue holds only
++            // `BLOCK_N`, so it lands here -- and so must the top-k weight, which the
++            // scale-invariant norm would otherwise erase.
++            float slot_norm_scale = 1.0f;
++            if constexpr (kFusedPostNormPartials) {
++                // Lane `s` reads slot `s`'s total, already accumulated by the L2 tiles.
++                const float my_topk_weight = lane_idx < kNumTopk ?
++                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
++                          token_idx * kNumTopk + lane_idx) : 0.0f;
++                // Not `__ldg`: peers write this over NVLink, the read-only path is not coherent
++                float sum_sq = 0.0f;
++                if (lane_idx < kNumTopk and (total_mask >> lane_idx & 1))
++                    sum_sq = *workspace.get_post_norm_sum_sq_ptr(token_idx, lane_idx);
++                const float inv_rms = rsqrtf(sum_sq / static_cast<float>(kHidden) + kPostNormEps);
++                slot_norm_scale = my_topk_weight * inv_rms;
++                __syncwarp();
++            } else if constexpr (kWithPostExpertNorm) {
++                const float my_topk_weight = lane_idx < kNumTopk ?
++                    __ldg(buffer.input_topk_weights_buffer.get_base_ptr<float>() +
++                          token_idx * kNumTopk + lane_idx) : 0.0f;
++                #pragma unroll 1
++                for (uint32_t slot_idx = 0; slot_idx < kNumTopk; ++ slot_idx) {
++                    // Warp-uniform: `total_mask` is a ballot result
++                    if (not (total_mask >> slot_idx & 1))
++                        continue;
++                    const auto row_ptr = buffer.combine_token_buffer.get_rank_buffer(slot_idx)
++                                         .get_data_buffer(token_idx).get_base_ptr<uint4>();
++                    const uint8_t* sf_row_ptr = nullptr;
++                    if constexpr (kUseFp8Combine)
++                        sf_row_ptr = buffer.combine_sf_buffer.get_rank_buffer(slot_idx)
++                                           .get_data_buffer(token_idx).get_base_ptr<uint8_t>();
++
++                    float sum_sq = 0.0f;
++                    #pragma unroll 4
++                    for (uint32_t j = 0; j < kNumRowLoadUint4PerLane; ++ j) {
++                        const uint32_t elem_idx = (j * 32 + lane_idx) * kNumElemsPerLoadUint4;
++                        const uint4 raw = __ldg(row_ptr + j * 32 + lane_idx);
++                        float values[kNumElemsPerLoadUint4];
++                        if constexpr (kUseFp8Combine) {
++                            const auto bytes = reinterpret_cast<const __nv_fp8_e4m3*>(&raw);
++                            #pragma unroll
++                            for (uint32_t k = 0; k < kNumElemsPerLoadUint4; ++ k)
++                                values[k] = static_cast<float>(bytes[k]);
++                        } else {
++                            const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&raw);
++                            #pragma unroll
++                            for (uint32_t k = 0; k < kNumElemsPerLoadUint4 / 2; ++ k) {
++                                const float2 pair = __bfloat1622float2(bf16_values[k]);
++                                values[k * 2 + 0] = pair.x;
++                                values[k * 2 + 1] = pair.y;
++                            }
++                        }
++
++                        float partial = 0.0f;
++                        #pragma unroll
++                        for (uint32_t k = 0; k < kNumElemsPerLoadUint4; ++ k) {
++                            float value = values[k];
++                            // Weight-first normalizes `w * x`, so `w` is inside the RMS
++                            if constexpr (kPostNormHasWeight and kPostNormWeightFirst)
++                                value *= __ldg(post_expert_norm_weight + elem_idx + k);
++                            partial = __fmaf_rn(value, value, partial);
++                        }
++                        if constexpr (kUseFp8Combine) {
++                            // All 16 elements share one SF, so it factors out of the square
++                            const float sf = math::fast_pow2(
++                                static_cast<int>(__ldg(sf_row_ptr + elem_idx / kCombineGranK)) - 127);
++                            partial *= sf * sf;
++                        }
++                        sum_sq += partial;
++                    }
++
++                    const float inv_rms = rsqrtf(
++                        math::warp_reduce_sum(sum_sq) / static_cast<float>(kHidden) + kPostNormEps);
++                    if (lane_idx == slot_idx)
++                        slot_norm_scale = my_topk_weight * inv_rms;
++                }
++            }
++
+             // Stream B: FP8 path loads kNumChunkBytes / 2 per slot (FP8 = 1 byte/elem)
+             // and reads a per-(slot, token, n_block) UE8M0 SF byte to dequant
+             // on the fly. Output is BF16 either way → store byte count is
+@@ -1803,6 +1959,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                     // Wait for current slot's load.
+                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
+
++                    float slot_scale = 1.0f;
++                    if constexpr (kWithPostExpertNorm)
++                        slot_scale = __shfl_sync(0xffffffff, slot_norm_scale,
++                                                 static_cast<uint32_t>(active_slot));
++
+                     if constexpr (kUseFp8Combine) {
+                         // Per-slot SF base for this token.
+                         const uint8_t* sf_token_ptr =
+@@ -1816,7 +1977,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             const uint32_t sf_idx =
+                                 (chunk * kNumLoadElemsPerChunk + (j * 32 + lane_idx) * 16) / kCombineGranK;
+                             const uint8_t sf_byte = __ldg(sf_token_ptr + sf_idx);
+-                            const float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
++                            float sf = math::fast_pow2(static_cast<int>(sf_byte) - 127);
++                            if constexpr (kWithPostExpertNorm)
++                                sf *= slot_scale;
+                             const uint32_t* w = reinterpret_cast<const uint32_t*>(&uint4_values);
+                             #pragma unroll
+                             for (uint32_t l = 0; l < 4; ++ l) {
+@@ -1845,8 +2008,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                             const auto uint4_values = combine_load_buffer[load_stage_idx][j * 32 + lane_idx];
+                             const auto bf16_values = reinterpret_cast<const nv_bfloat162*>(&uint4_values);
+                             #pragma unroll
+-                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l)
+-                                ptx::accumulate(reduced[j * kNumElemsPerUint4 + l], bf16_values[l]);
++                            for (uint32_t l = 0; l < kNumElemsPerUint4; ++ l) {
++                                auto& acc = reduced[j * kNumElemsPerUint4 + l];
++                                if constexpr (kWithPostExpertNorm) {
++                                    const float2 pair = __bfloat1622float2(bf16_values[l]);
++                                    acc.x = __fmaf_rn(pair.x, slot_scale, acc.x);
++                                    acc.y = __fmaf_rn(pair.y, slot_scale, acc.y);
++                                } else {
++                                    ptx::accumulate(acc, bf16_values[l]);
++                                }
++                            }
+                         }
+                     }
+                     cutlass::arch::fence_view_async_shared();
+@@ -1855,6 +2026,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
+                     active_slot = next_slot;
+                 }
+
++                // Both norm forms reduce to `w * sum_k(inv_rms_k * topk_weight_k * x_k)`.
++                if constexpr (kPostNormHasWeight) {
++                    #pragma unroll
++                    for (uint32_t j = 0; j < kNumLoadUint4PerLane; ++ j) {
++                        const uint32_t base_elem_idx = chunk * kNumLoadElemsPerChunk +
++                                                       (j * 32 + lane_idx) * kNumElemsPerLoadUint4;
++                        #pragma unroll
++                        for (uint32_t l = 0; l < kNumF32PairsPerLoadUint4; ++ l) {
++                            auto& acc = reduced[j * kNumF32PairsPerLoadUint4 + l];
++                            acc = __fmul2_rn(acc, __ldg(reinterpret_cast<const float2*>(
++                                post_expert_norm_weight + base_elem_idx + l * 2)));
++                        }
++                    }
++                }
++
+                 // Cast & write to smem store-buffer.
+                 // BF16 path: kNumUint4PerLane stores, mapping accumulator[j*4+l] → store-uint4 j.
+                 // FP8 path: kNumLoadUint4PerLane * 2 stores, mapping accumulator[j*8+l] → store-uint4 (j*2 + (l/4)).
+diff --git a/deep_gemm/include/deep_gemm/layout/mega_moe.cuh b/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+index ff0c674..70f7ee8 100644
+--- a/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
++++ b/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+@@ -96,6 +96,7 @@ struct Workspace {
+     uint32_t num_ranks, num_experts;
+     uint32_t num_experts_per_rank;
+     uint32_t num_max_tokens_per_rank;
++    uint32_t num_topk;
+     uint32_t num_shared_l2_pool_blocks;
+
+     // Full-pool span used by non-ring token metadata
+@@ -112,7 +113,7 @@ struct Workspace {
+               const uint32_t& num_ring_tokens):
+         signals(static_cast<MegaMoESignals*>(base)),
+         num_ranks(num_ranks), num_experts(num_experts),
+-        num_max_tokens_per_rank(num_max_tokens_per_rank) {
++        num_max_tokens_per_rank(num_max_tokens_per_rank), num_topk(num_topk) {
+         num_experts_per_rank = num_experts / num_ranks;
+         num_max_pool_tokens = get_num_max_pool_tokens(num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
+         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
+@@ -139,6 +140,10 @@ struct Workspace {
+         // Combine push source indices (full)
+         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
+
++        // Post-expert-norm partial sums of squares, one per (token, top-k slot). Sized
++        // unconditionally so the layout does not depend on a kernel template flag.
++        num_bytes += num_max_tokens_per_rank * num_topk * sizeof(float);
++
+         // Align to TMA descriptor requirements
+         num_bytes = math::align<uint64_t>(num_bytes, 16);
+         return num_bytes;
+@@ -262,6 +267,13 @@ struct Workspace {
+         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
+         return base + pool_token_idx;
+     }
++
++    // Each L2 N tile accumulates its partial sum of squares here for the combine.
++    CUTLASS_DEVICE
++    float* get_post_norm_sum_sq_ptr(const uint32_t& token_idx = 0, const uint32_t& topk_idx = 0) const {
++        const auto base = reinterpret_cast<float*>(get_token_src_metadata_ptr(num_max_pool_tokens));
++        return base + token_idx * num_topk + topk_idx;
++    }
+ };
+
+ // SM90 MegaMoE predates the reusable ring workspace used by the SM100 kernels.
+diff --git a/deep_gemm/include/deep_gemm/ptx/ld_st.cuh b/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
+index 64faae8..5d12fbe 100644
+--- a/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
++++ b/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
+@@ -324,6 +324,10 @@ CUTLASS_DEVICE void red_add_rel_sys(const int* ptr, const int& value) {
+     asm volatile("red.release.sys.global.add.s32 [%0], %1;" :: "l"(ptr), "r"(value));
+ }
+
++CUTLASS_DEVICE void red_add_sys(const float* ptr, const float& value) {
++    asm volatile("red.sys.global.add.f32 [%0], %1;" :: "l"(ptr), "f"(value));
++}
++
+ CUTLASS_DEVICE int ld_acq_sys(const int* ptr) {
+     int ret;
+     asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+diff --git a/deep_gemm/mega/__init__.py b/deep_gemm/mega/__init__.py
+index 24ce15d..65fe740 100644
+--- a/deep_gemm/mega/__init__.py
++++ b/deep_gemm/mega/__init__.py
+@@ -266,7 +266,11 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+                      l2_alphas: Optional[torch.Tensor] = None,
+                      l2_act_scales: Optional[torch.Tensor] = None,
+                      weight_layout: str = 'megamoe',
+-                     global_num_tokens: Optional[int] = None):
++                     global_num_tokens: Optional[int] = None,
++                     post_expert_norm: bool = False,
++                     post_expert_norm_weight: Optional[torch.Tensor] = None,
++                     post_expert_norm_eps: float = 1e-6,
++                     post_expert_norm_weight_first: bool = False):
+     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
+     if weight_layout == 'trtllm' and sym_buffer.mma_type != 'nvfp4xnvfp4':
+@@ -295,6 +299,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
+         recipe, sym_buffer.mma_type,
+         activation, activation_clamp,
+         fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales,
++        post_expert_norm, post_expert_norm_weight,
++        post_expert_norm_eps, post_expert_norm_weight_first,
+         weight_layout == 'trtllm', global_num_tokens
+     )
+
+@@ -313,7 +319,11 @@ def nvfp4_mega_moe(y: torch.Tensor,
+                    l2_alphas: Optional[torch.Tensor] = None,
+                    l2_act_scales: Optional[torch.Tensor] = None,
+                    weight_layout: str = 'megamoe',
+-                   global_num_tokens: Optional[int] = None):
++                   global_num_tokens: Optional[int] = None,
++                   post_expert_norm: bool = False,
++                   post_expert_norm_weight: Optional[torch.Tensor] = None,
++                   post_expert_norm_eps: float = 1e-6,
++                   post_expert_norm_weight_first: bool = False):
+     fp8_fp4_mega_moe(
+         y, l1_weights, l2_weights, sym_buffer,
+         shared_l1_weights, shared_l2_weights,
+@@ -322,6 +332,10 @@ def nvfp4_mega_moe(y: torch.Tensor,
+         activation=activation, activation_clamp=activation_clamp,
+         fast_math=fast_math, use_x_scales=use_x_scales,
+         l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales,
++        post_expert_norm=post_expert_norm,
++        post_expert_norm_weight=post_expert_norm_weight,
++        post_expert_norm_eps=post_expert_norm_eps,
++        post_expert_norm_weight_first=post_expert_norm_weight_first,
+         weight_layout=weight_layout, global_num_tokens=global_num_tokens
+     )
+
+@@ -337,7 +351,11 @@ def bf16_mega_moe(y: torch.Tensor,
+                   activation_clamp: Optional[float] = None,
+                   fast_math: bool = True,
+                   weight_layout: str = 'megamoe',
+-                  global_num_tokens: Optional[int] = None):
++                  global_num_tokens: Optional[int] = None,
++                  post_expert_norm: bool = False,
++                  post_expert_norm_weight: Optional[torch.Tensor] = None,
++                  post_expert_norm_eps: float = 1e-6,
++                  post_expert_norm_weight_first: bool = False):
+     _validate_weight_layout(weight_layout, shared_l1_weights, shared_l2_weights)
+     _validate_global_num_tokens(global_num_tokens, sym_buffer.group.size(), sym_buffer.num_max_tokens_per_rank)
+     _C.bf16_mega_moe(
+@@ -354,7 +372,8 @@ def bf16_mega_moe(y: torch.Tensor,
+         sym_buffer.num_experts,
+         sym_buffer.num_topk,
+         activation, activation_clamp,
+-        fast_math,
++        fast_math, post_expert_norm, post_expert_norm_weight,
++        post_expert_norm_eps, post_expert_norm_weight_first,
+         weight_layout == 'trtllm', global_num_tokens
+     )
+
+diff --git a/sgl_deep_gemm/VERSION b/sgl_deep_gemm/VERSION
+index bd52db8..bdb685a 100644
+--- a/sgl_deep_gemm/VERSION
++++ b/sgl_deep_gemm/VERSION
+@@ -1 +1 @@
+-0.0.0
+\ No newline at end of file
++0.2.1.post1+muse.cbe1727
+\ No newline at end of file
+diff --git a/sgl_deep_gemm/tests/test_mega_moe.py b/sgl_deep_gemm/tests/test_mega_moe.py
+index bcb2206..3af1100 100644
+--- a/sgl_deep_gemm/tests/test_mega_moe.py
++++ b/sgl_deep_gemm/tests/test_mega_moe.py
+@@ -15,6 +15,10 @@ from deep_gemm.testing import bench_kineto, calc_diff
+ def import_baseline():
+     # Load legacy implements from third-party
+     deep_ep, tilelang_ops, do_bench, is_legacy_loaded = None, None, None, False
++    # `ElasticBuffer` needs DeepEP v2 over NCCL GIN and throws past this guard without it.
++    if os.environ.get('DG_SKIP_LEGACY'):
++        dist_print('DG_SKIP_LEGACY set, skip baseline benchmarking', once_in_node=True)
++        return deep_ep, tilelang_ops, do_bench, is_legacy_loaded
+     # noinspection PyBroadException
+     try:
+         import deep_ep
+@@ -79,6 +83,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+
+     # Settings
+     is_bf16xbf16 = args.mma_type == 'bf16xbf16'
++    # `run_fused` passes this as the recipe's K granularity; it was never bound, so
++    # every non-BF16 run died with a `NameError`.
++    gran_k = 32
+     num_max_tokens_per_rank = args.num_max_tokens_per_rank
+     num_tokens = max(0, args.num_max_tokens_per_rank - random.randint(0, args.num_max_removed_tokens)) \
+         if args.num_tokens == 0 else args.num_tokens
+@@ -188,7 +195,7 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+         buffer.topk_idx[:num_tokens].copy_(topk_idx)
+         buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+-    def run_fused():
++    def run_fused(extra_kwargs: dict = None):
+         cumulative_local_expert_recv_stats_fused.copy_(initial_cumulative_local_expert_recv_stats_fused)
+         copy_inputs_to_buffer()
+
+@@ -204,9 +211,69 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+                 shared_l1_weights=transformed_shared_l1_weights,
+                 shared_l2_weights=transformed_shared_l2_weights
+             )
++        if not is_bf16xbf16:
++            kernel_kwargs['recipe'] = (1, 1, gran_k)
++        if extra_kwargs:
++            kernel_kwargs.update(extra_kwargs)
+         (deep_gemm.bf16_mega_moe if is_bf16xbf16 else deep_gemm.fp8_fp4_mega_moe)(**kernel_kwargs)
+         return y, cumulative_local_expert_recv_stats_fused
+
++    def check_post_expert_norm():
++        """One-hot the top-k weights so `y` is a single normalized expert output.
++
++        Its RMS is then analytic: 1 with no gain, 1 for weight-first (the gain is
++        inside the norm), rms(gain) for standard. The same gain therefore has to
++        leave weight-first at 1 and pull standard off it.
++        """
++        one_hot = torch.zeros_like(topk_weights)
++        one_hot[:, 0] = 1.0
++        one_hot.masked_fill_(topk_idx < 0, 0)
++        original = topk_weights.clone()
++        routed = topk_idx[:, 0] >= 0
++
++        def run(gain, weight_first):
++            # A tiny eps keeps an all-zero expert row at 0 instead of `0 * inf`
++            y = run_fused(dict(post_expert_norm=True,
++                               post_expert_norm_weight=gain,
++                               post_expert_norm_eps=1e-8,
++                               post_expert_norm_weight_first=weight_first))[0]
++            assert torch.all(y[~routed] == 0), 'unrouted rows are not zero'
++            assert torch.isfinite(y).all(), 'non-finite output'
++            return y, y[routed].float().pow(2).mean(dim=-1).sqrt()
++
++        try:
++            topk_weights.copy_(one_hot)
++            _, rms = run(None, False)
++            if not routed.any():
++                dist_print(' > Post-expert norm: no routed tokens, skipped',
++                           once_in_node=True)
++                return
++            err = (rms - 1.0).abs().max().item()
++            assert err < 5e-3, f'no gain: RMS off 1 by {err:.4g}'
++            dist_print(f' > Post-expert norm (no gain): RMS 1 +- {err:.2e}',
++                       once_in_node=True)
++
++            # Replicated, like the model weight it stands in for: the fused partial path
++            # folds it in on the producing rank.
++            gain = torch.rand(hidden, device='cuda', dtype=torch.float) + 0.5
++            dist.broadcast(gain, 0)
++            y_wf, rms_wf = run(gain, True)
++            y_std, rms_std = run(gain, False)
++            err = (rms_wf - 1.0).abs().max().item()
++            assert err < 5e-3, f'weight-first: RMS off 1 by {err:.4g}'
++            off = (rms_std - 1.0).abs().max().item()
++            assert off > 1e-2, f'standard: gain had no effect (RMS off 1 by {off:.4g})'
++            assert (y_wf.float() - y_std.float()).abs().max().item() > 0, \
++                'weight_first=True and False produced identical output'
++            dist_print(f' > Post-expert norm (gain, weight-first): RMS 1 +- {err:.2e}',
++                       once_in_node=True)
++            dist_print(f' > Post-expert norm (gain, standard): RMS '
++                       f'{rms_std.min().item():.4f}..{rms_std.max().item():.4f} '
++                       f'(rms(gain)={gain.pow(2).mean().sqrt().item():.4f})',
++                       once_in_node=True)
++        finally:
++            topk_weights.copy_(original)
++
+     dist_print('Config:', once_in_node=True)
+     dist_print(f' > MMA: {args.mma_type}', once_in_node=True)
+     dist_print(f' > Tokens: {num_tokens}/{num_max_tokens_per_rank}', once_in_node=True)
+@@ -230,6 +297,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
+         dist.destroy_process_group()
+         return
+
++    if args.post_expert_norm:
++        dist_print('Running post-expert norm test:', once_in_node=True)
++        create_inputs()
++        check_post_expert_norm()
++        dist_print(' > Done, exiting', once_in_node=True)
++        dist.barrier()
++        buffer.destroy()
++        dist.destroy_process_group()
++        return
++
+     # Non-overlapped baseline: EP dispatch + GEMM + EP combine
+     deep_ep, tilelang_ops, tilelang_bench, is_legacy_loaded = import_baseline()
+     if not is_legacy_loaded and args.num_correctness_tests != 0:
+@@ -476,6 +553,7 @@ if __name__ == '__main__':
+     parser.add_argument('--mma-type', type=str, default='fp8xfp4', choices=('fp8xfp4', 'fp8xfp8', 'bf16xbf16'))
+
+     # Test settings
++    parser.add_argument('--post-expert-norm', action='store_true', help='Check the fused post-expert RMS norm')
+     parser.add_argument('--num-correctness-tests', type=int, default=None, help='Pressure test')
+     parser.add_argument('--num-graph-correctness-tests', type=int, default=0,
+                         help='Changing-input graph replays for routed BF16 (requires at least two ranks)')
