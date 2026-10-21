@@ -942,8 +942,7 @@ class DeepseekMLAForwardMixin:
 
         return (
             self.rotary_emb is not None
-            and self.current_attention_backend
-            in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
+            and self.current_attention_backend in ("trtllm_mla", "cutedsl_mla")
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()

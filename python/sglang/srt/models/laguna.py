@@ -172,6 +172,7 @@ class LagunaMoE(nn.Module):
             scoring_func=config.moe_router_score_func,
             correction_bias=self.gate.e_score_correction_bias,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
