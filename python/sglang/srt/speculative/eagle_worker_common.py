@@ -45,12 +45,15 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_oob,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 if _is_cpu:
-    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
+    assign_draft_cache_locs_contiguous_cpu = LazyImport(
+        "sgl_kernel", "assign_draft_cache_locs_contiguous_cpu"
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
