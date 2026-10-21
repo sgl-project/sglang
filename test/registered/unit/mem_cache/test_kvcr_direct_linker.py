@@ -613,7 +613,7 @@ class TestKVCRDirectLinker(CustomTestCase):
         )
         self.assertEqual(self.linker.lookup("a", transfers), [])
 
-    def trailing_transfers(self):
+    def trailing_transfers(self, pool=PoolName.SWA):
         from sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker import (
             KVCRDirectLinker,
         )
@@ -622,7 +622,7 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.linker.close()
         base = self.group.entries[0]
         swa = copy(base)
-        swa.name = swa.indices_from_pool = PoolName.SWA
+        swa.name = swa.indices_from_pool = pool
         self.runtime = Runtime()
         with patch(
             "sglang.srt.mem_cache.storage.kvcr.kvcr_direct_linker.resolve_hybrid_device_pool_group",
@@ -636,13 +636,15 @@ class TestKVCRDirectLinker(CustomTestCase):
             )
         self.addCleanup(self.linker.close)
         self.client = self.runtime.client
+        labels = list(self.linker.layout._labels[PoolName.KV][0])
+        self.client.fetch_data.update(
+            {self.linker.layout.encode_key(k, PoolName.KV): labels for k in "abc"}
+        )
         self.assertTrue(self.linker.requires_lookup_confirmation)
         self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
         return [
             PoolTransfer(PoolName.KV, keys=["a", "b", "c"]),
-            PoolTransfer(
-                PoolName.SWA, keys=["c"], hit_policy=PoolHitPolicy.TRAILING_PAGES
-            ),
+            PoolTransfer(pool, keys=["c"], hit_policy=PoolHitPolicy.TRAILING_PAGES),
         ]
 
     def test_trailing_confirmation_retains_only_complete_state_through_load(self):
@@ -663,14 +665,15 @@ class TestKVCRDirectLinker(CustomTestCase):
         transfers[1].keys, transfers[1].device_indices = ["b"], torch.tensor([1])
         self.assertTrue(self.linker.load("a", [transfers[1]]))
         self.linker.release_request_context(CacheRequestHandle("a", 0))
+        first = self.client.next_handle + 1
         self.linker.start_layer_wise_loading()
-        eventually(lambda: len(self.client.calls) == 5)
-        self.client.complete(3, success=False)
-        self.client.complete(4)
+        eventually(lambda: self.client.next_handle == first + 2)
+        self.client.complete(first, success=False)
+        self.client.complete(first + 1)
         eventually(lambda: len(self.linker._operations) == 1)
         self.assertTrue(self.client.claims)
         self.assertEqual(self.linker.num_completed_loads(), 0)
-        self.client.complete(5)
+        self.client.complete(first + 2)
         eventually(lambda: self.linker.num_completed_loads() == 1)
         self.assertFalse(self.client.claims)
 
@@ -682,11 +685,17 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.client.fetch_data.update({b: labels, c: labels})
         self.assertTrue(self.linker.confirm_lookup("a", transfers, 3))
         self.assertFalse(self.linker.confirm_lookup("a", transfers, 2))
-        self.assertEqual({claim[1] for claim in self.client.claims}, {b})
+        self.assertEqual(
+            {claim[1] for claim in self.client.claims},
+            {b, *(self.linker.layout.encode_key(k, PoolName.KV) for k in "ab")},
+        )
         self.assertEqual(set(self.client.calls[-1][2]), {a})
         self.assertFalse(self.linker.confirm_lookup("a", transfers, 1))
-        self.assertEqual(len(self.client.calls), 2)
-        self.assertFalse(self.client.claims)
+        self.assertEqual(len(self.client.calls), 3)
+        self.assertEqual(
+            {claim[1] for claim in self.client.claims},
+            {self.linker.layout.encode_key("a", PoolName.KV)},
+        )
         self.client.fetch_data[a] = labels
         self.linker.lookup("a", transfers)
         self.assertTrue(self.linker.confirm_lookup("a", transfers, 1))
@@ -707,6 +716,26 @@ class TestKVCRDirectLinker(CustomTestCase):
         self.assertTrue(self.runtime.closed)
         self.linker.set_request_context(CacheRequestHandle("a", 0), {"actions": []})
         self.assertFalse(self.linker.confirm_lookup("a", transfers, 3))
+
+    def test_mamba_confirmation_retains_full_prefix_and_remembers_misses(self):
+        transfers = self.trailing_transfers(PoolName.MAMBA)
+        encode = self.linker.layout.encode_key
+        missing = encode("b", PoolName.KV)
+        del self.client.fetch_data[missing]
+        self.client.fetch_data[encode("c", PoolName.MAMBA)] = list(
+            self.linker.layout._labels[PoolName.MAMBA][0]
+        )
+        self.assertFalse(self.linker.confirm_lookup("a", transfers, 3))
+        calls = len(self.client.calls)
+        self.assertFalse(self.linker.confirm_lookup("a", transfers, 2))
+        self.assertEqual(len(self.client.calls), calls)
+        self.assertEqual(
+            {claim[1] for claim in self.client.claims},
+            {encode("a", PoolName.KV)},
+        )
+        self.linker.release_request_context(CacheRequestHandle("a", 0))
+        self.linker._call(lambda: None)
+        self.assertFalse(self.client.claims)
 
     def test_failure_stops_unsubmitted_work_and_fails_dependent_offload(self):
         for i in range(3):
@@ -1041,6 +1070,13 @@ class TestKVCRRuntime(CustomTestCase):
         self.assertIsNone(runtime.client.backends.local_dram)
         self.assertFalse(runtime._buffers)
         self.assertFalse(runtime.client.config.enable_telemetry)
+        self.assertIsNone(runtime.client.config.startup_timeout_seconds)
+        self.assertEqual(
+            self.make_runtime(
+                startup_timeout_seconds=600
+            ).client.config.startup_timeout_seconds,
+            600,
+        )
         self.assertIsNone(runtime.client.bindings.stats_factory)
         with patch.object(runtime.client, "get_stats", side_effect=AssertionError):
             runtime.log_stats(force=True)

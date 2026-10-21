@@ -122,7 +122,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             components=components,
         )
         self.requires_lookup_confirmation = any(
-            entry.indices_from_pool == PoolName.SWA for entry in self.pool_group.entries
+            entry.indices_from_pool in (PoolName.SWA, PoolName.MAMBA)
+            for entry in self.pool_group.entries
         )
         tp_rank, tp_size, rank = 0, get_parallel().tp_size, 0
         if torch.distributed.is_initialized():
@@ -377,22 +378,29 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         windows = {
             t.name: [
                 self.layout.encode_key(key, t.name)
-                for key in keys[max(0, hit_pages - max(1, len(t.keys))) : hit_pages]
+                for key in keys[
+                    (
+                        0
+                        if t.hit_policy == PoolHitPolicy.ALL_PAGES
+                        else max(0, hit_pages - max(1, len(t.keys)))
+                    ) : hit_pages
+                ]
             ]
             for t in prepared
-            if t.hit_policy != PoolHitPolicy.ALL_PAGES
         }
         if not windows:
             return True
         if scope is None:
-            raise RuntimeError("KVCR trailing confirmation requires a request context")
+            raise RuntimeError("KVCR confirmation requires a request context")
         required = {key for window in windows.values() for key in window}
         claims = self._lookup_claims.setdefault(scope, {})
         stale = claims.keys() - required
         self._release_claims([claims[key] for key in stale if claims[key] is not None])
         for key in stale:
             del claims[key]
-        # Keep only this candidate's window; None remembers misses while retrying.
+        # Keep only this candidate's pages; None remembers misses while retrying.
+        if any(key in claims and claims[key] is None for key in required):
+            return False
         owner = _Confirm(claims)
         for name, window in windows.items():
             pending = [key for key in window if key not in claims]
