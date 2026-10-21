@@ -66,7 +66,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     peek_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseUsageTracker,
     configure_layerwise_offload_modules,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
@@ -178,7 +177,7 @@ def _worker_cpu_intra_op_threads(num_gpus: int) -> int | None:
 def _bind_worker_to_gpu_numa_node(
     server_args: ServerArgs, local_rank: int
 ) -> int | None:
-    """Bind this worker's CPUs and host memory to its GPU's NUMA node, as srt does.
+    """Bind this worker's CPUs, and host memory when permitted, to its GPU's NUMA node.
 
     Must run before CUDA init and model load so first-touch host memory lands
     on that node; an unbound worker drifts across sockets and every
@@ -189,9 +188,7 @@ def _bind_worker_to_gpu_numa_node(
         numa_bind_to_node,
     )
 
-    # Pods without SYS_NICE cannot set memory policy; CPU affinity alone still
-    # removes the cross-socket drift (FLUX.1 TP2 on GB300: spread 26-60% -> 6-8%).
-    numa_node = get_numa_node_if_available(server_args, local_rank, cpu_only_ok=True)
+    numa_node = get_numa_node_if_available(server_args=server_args, gpu_id=local_rank)
     if numa_node is not None:
         numa_bind_to_node(numa_node)
         logger.info("GPU %d worker bound to NUMA node %d", local_rank, numa_node)
@@ -710,16 +707,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 int(req.width or 0),
                 int(req.height or 0),
                 int(req.num_frames or 1),
-                max(1, int(req.num_inference_steps or 1)),
             )
             if measure_server_warmup
             else None
         )
         warmup_baseline_allocated_bytes = 0
-        layerwise_usage_tracker: LayerwiseUsageTracker | None = None
-        layerwise_layer_uses_by_stage: dict[
-            str, dict[str, dict[str, tuple[int, ...]]]
-        ] = {}
         try:
             if measure_server_warmup:
                 # Drop the previous request's allocator pool so each probe
@@ -733,20 +725,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 warmup_baseline_allocated_bytes = (
                     torch.get_device_module().memory_allocated()
                 )
-                if (
-                    self.server_args.performance_mode == "auto"
-                    and self.pipeline is not None
-                ):
-                    layerwise_usage_tracker = LayerwiseUsageTracker(
-                        self.pipeline.modules,
-                        stage_name_provider=(
-                            lambda: (
-                                req.metrics.active_stage_name
-                                if req.metrics is not None
-                                else None
-                            )
-                        ),
-                    )
 
             start_time = (
                 execution_start_time
@@ -843,20 +821,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             # or the estimator would plan from the remaining partial data
             if measure_server_warmup:
                 assert warmup_workload is not None
-                if layerwise_usage_tracker is not None:
-                    (
-                        layerwise_layer_uses,
-                        layerwise_layer_uses_by_stage,
-                    ) = layerwise_usage_tracker.finish_with_stages()
-                else:
-                    layerwise_layer_uses = {}
                 self._record_server_warmup_memory(
-                    req=req,
                     workload=warmup_workload,
                     baseline_allocated_bytes=warmup_baseline_allocated_bytes,
                     succeeded=output_batch is not None and output_batch.error is None,
-                    layerwise_layer_uses=layerwise_layer_uses,
-                    layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage,
                 )
         return output_batch
 
@@ -872,6 +840,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         req_label = req.request_id[:8] if req.request_id else "unnamed"
         with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
             self._materialize_output_transport(output_batch, req, save_output_paths)
+        if req.is_warmup and not current_platform.is_cpu():
+            # A warmup saves no output, so nothing waits for its device work;
+            # drain it here or the next request's first blocking op pays for it.
+            torch.get_device_module().synchronize()
+
         self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
 
         collect_perf = (
@@ -972,46 +945,23 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _record_server_warmup_memory(
         self,
         *,
-        req: Req,
-        workload: tuple[int, int, int, int],
+        workload: tuple[int, int, int],
         baseline_allocated_bytes: int,
         succeeded: bool,
-        layerwise_layer_uses: dict[str, dict[str, tuple[int, ...]]] | None = None,
-        layerwise_layer_uses_by_stage: (
-            dict[str, dict[str, dict[str, tuple[int, ...]]]] | None
-        ) = None,
     ) -> None:
-        phase_allocated_peaks: dict[str, int] = {}
-        phase_components: dict[str, tuple[str, ...]] = {}
-        phase_used_components: dict[str, tuple[str, ...]] = {}
-        phase_full_weight_transition_components: dict[str, tuple[str, ...]] = {}
-        untracked_active_components: tuple[str, ...] = ()
+        # Warmup phases reset the device peak at every boundary, so the request
+        # peak is the largest per-phase peak or what ran after the last phase.
         residency_manager = peek_global_component_residency_manager()
-        if residency_manager is not None:
-            for phase_name, peak in residency_manager.take_warmup_phase_peaks().items():
-                phase_allocated_peaks[phase_name] = peak.allocated_bytes
-                phase_components[phase_name] = peak.active_components
-                phase_used_components[phase_name] = peak.used_components
-                phase_full_weight_transition_components[phase_name] = (
-                    peak.full_weight_transition_components
-                )
-            untracked_active_components = residency_manager.current_device_components()
+        phase_allocated_peaks = (
+            residency_manager.take_warmup_phase_peaks()
+            if residency_manager is not None
+            else {}
+        )
         request_allocated_peak = max(
             int(torch.get_device_module().max_memory_allocated()),
             max(phase_allocated_peaks.values(), default=0),
         )
-        if request_allocated_peak > max(phase_allocated_peaks.values(), default=0):
-            # Work after the residency-managed stage timeline (for example,
-            # output materialization) must remain a placement constraint.
-            # A reserved-only increase is not a second live placement. Record
-            # it separately so post-placement validation can still require
-            # allocator headroom without charging cache to candidate deltas.
-            phase_allocated_peaks["request:untracked"] = request_allocated_peak
-            phase_components["request:untracked"] = untracked_active_components
-            phase_used_components["request:untracked"] = ()
-            phase_full_weight_transition_components["request:untracked"] = ()
-        metrics = req.metrics
-        width, height, num_frames, num_inference_steps = workload
+        width, height, num_frames = workload
         self._auto_residency_warmup_records.append(
             WarmupMemoryRecord(
                 width=width,
@@ -1020,34 +970,6 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 baseline_allocated_bytes=int(baseline_allocated_bytes),
                 peak_allocated_bytes=request_allocated_peak,
                 succeeded=succeeded,
-                peak_reserved_bytes=int(
-                    torch.get_device_module().max_memory_reserved()
-                ),
-                phase_peak_allocated_bytes=phase_allocated_peaks,
-                phase_active_components=phase_components,
-                phase_used_components=phase_used_components,
-                phase_full_weight_transition_components=(
-                    phase_full_weight_transition_components
-                ),
-                layerwise_layer_uses=layerwise_layer_uses or {},
-                layerwise_layer_uses_by_stage=layerwise_layer_uses_by_stage or {},
-                num_inference_steps=num_inference_steps,
-                total_duration_ms=(
-                    float(metrics.total_duration_ms) if metrics is not None else 0.0
-                ),
-                stage_duration_ms=(dict(metrics.stages) if metrics is not None else {}),
-                step_duration_ms=(tuple(metrics.steps) if metrics is not None else ()),
-                step_duration_ms_by_stage=(
-                    {
-                        stage_name: tuple(durations)
-                        for stage_name, durations in metrics.steps_by_stage.items()
-                    }
-                    if metrics is not None
-                    else {}
-                ),
-                stage_iterations=(
-                    dict(metrics.stage_iterations) if metrics is not None else {}
-                ),
             )
         )
 

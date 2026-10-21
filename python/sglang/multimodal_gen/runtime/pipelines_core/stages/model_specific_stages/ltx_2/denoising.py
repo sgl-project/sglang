@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    rollout_step_kwargs,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
@@ -185,12 +188,6 @@ class LTX2DenoisingStage(DenoisingStage):
             tuple, tuple[torch.Tensor | None, torch.Tensor | None]
         ] = OrderedDict()
         self._ltx2_coords_cache_max_entries = 4
-
-    def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
-        return self.prepare_extra_func_kwargs(
-            scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
-        )
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -1473,6 +1470,13 @@ class LTX2DenoisingStage(DenoisingStage):
         tokenizes prompts to a fixed max length, so every serving request
         shares the warmup signatures and no text bucketing is needed.
         """
+        # Dense LTX attention can be captured, so a request that switches its
+        # backend must not replay graphs recorded with the server default.
+        if (
+            self._attention_backend_active_override is not None
+            or self._skip_softmax_forced_fa
+        ):
+            return step.current_model(**model_kwargs)
         runner = self._maybe_get_bcg_runner(step.current_model)
         if runner is None:
             return step.current_model(**model_kwargs)
@@ -1894,19 +1898,13 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                if batch.rollout:
-                    ctx.scheduler._step_index = step.step_index
-                    ctx.latents = ctx.scheduler.step(
-                        model_video,
-                        step.t_device,
-                        ctx.latents,
-                        return_dict=False,
-                        **self._scheduler_step_kwargs(batch, ctx.scheduler),
-                    )[0]
-                else:
-                    ctx.latents = ctx.scheduler.step(
-                        model_video, step.t_device, ctx.latents, return_dict=False
-                    )[0]
+                ctx.latents = ctx.scheduler.step(
+                    model_video,
+                    step.t_device,
+                    ctx.latents,
+                    **rollout_step_kwargs(batch),
+                    return_dict=False,
+                )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]
@@ -2134,8 +2132,8 @@ class LTX2DenoisingStage(DenoisingStage):
                                 model_kwargs_chunk["perturbation_configs"] = (
                                     split_perturbation_configs[index],
                                 )
-                            video_chunk, audio_chunk = step.current_model(
-                                **model_kwargs_chunk
+                            video_chunk, audio_chunk = self._ltx2_call_current_model(
+                                ctx, step, model_kwargs_chunk
                             )
                             batched_video_chunks.append(video_chunk)
                             batched_audio_chunks.append(audio_chunk)
@@ -2148,10 +2146,10 @@ class LTX2DenoisingStage(DenoisingStage):
                             execution_pass_specs, batch_size_local
                         )
                     )
+                    batched_model_kwargs["perturbation_configs"] = perturbation_configs
                     with self._ltx2_model_forward_context(ctx, step):
-                        batched_video, batched_audio = step.current_model(
-                            **batched_model_kwargs,
-                            perturbation_configs=perturbation_configs,
+                        batched_video, batched_audio = self._ltx2_call_current_model(
+                            ctx, step, batched_model_kwargs
                         )
 
                 batched_video = batched_video.float()

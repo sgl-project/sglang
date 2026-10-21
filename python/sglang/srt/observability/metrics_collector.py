@@ -1330,7 +1330,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
     ) -> SchedulerMetricsCollectorContext:
         enable_metrics = get_observability().enable_metrics
         parallel = get_parallel()
-        is_stats_logging_rank = parallel.attn_tp_rank == 0
+        is_stats_logging_rank = (
+            parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0
+        )
         current_scheduler_metrics_enabled = enable_metrics and (
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
@@ -2198,7 +2200,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap means the live device prefix diverged from the "
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
-            "reusable when cache-mode admission ran.",
+            "reusable when cache-mode admission ran; deadline means the "
+            "storage prefetch stop policy ended the read before it completed.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2207,6 +2210,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_capacity",
             "device_covered",
             "storage_transfer",
+            "deadline",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",

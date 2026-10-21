@@ -5,11 +5,7 @@ import zlib
 
 import torch
 
-from sglang.kernels.ops.memory.adler32 import (
-    adler32_checksum,
-    adler32_regions_checksum,
-    adler32_strided_checksum,
-)
+from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -35,7 +31,10 @@ class TestAdler32(unittest.TestCase):
         torch.manual_seed(42)
 
     def _check_whole(self, tensor):
-        self.assertEqual(adler32_checksum(tensor), _ref_adler32(tensor))
+        row_bytes = tensor[0].numel() * tensor.element_size()
+        rows = torch.arange(tensor.shape[0], dtype=torch.int64, device="cuda")
+        actual = adler32_strided_checksum([tensor.data_ptr()], [row_bytes], [rows])
+        self.assertEqual(actual, _ref_adler32(tensor))
 
     def test_whole_small(self):
         self._check_whole(torch.tensor([1.0, 2, 3, 4], device="cuda"))
@@ -75,20 +74,15 @@ class TestAdler32(unittest.TestCase):
         idx = torch.arange(1000, dtype=torch.int64, device="cuda")
         self._check_strided([t], [idx], [128 * 2])
 
-    def test_regions(self):
+    def test_strided_large_items(self):
         first = torch.randint(
             0, 256, (5 * 1024 * 1024,), dtype=torch.uint8, device="cuda"
         )
         second = torch.randint(0, 256, (12345,), dtype=torch.uint8, device="cuda")
-        actual = adler32_regions_checksum(
-            [first.data_ptr(), second.data_ptr()],
-            [first.numel(), second.numel()],
-            first.device,
+        idx = torch.zeros(1, dtype=torch.int64, device="cuda")
+        self._check_strided(
+            [first, second], [idx, idx], [first.numel(), second.numel()]
         )
-        expected = zlib.adler32(
-            first.cpu().numpy().tobytes() + second.cpu().numpy().tobytes()
-        )
-        self.assertEqual(actual, expected)
 
 
 if __name__ == "__main__":

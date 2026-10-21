@@ -188,8 +188,15 @@ def alloc_paged_token_slots_extend(
     # availability floor must cover every request's ceil(K_i/N) rounding,
     # matching the N*ps per-request admission reserve).
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
-        allocator.page_size * page_interleave_shard_size(allocator)
+    shard_size = page_interleave_shard_size(allocator)
+    conservative_num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
+        allocator.page_size * shard_size
+    )
+    num_tokens = allocator.get_extend_allocation_demand(
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        conservative_num_tokens=conservative_num_tokens,
+        shard_size=shard_size,
     )
     evict_from_tree_cache(tree_cache, num_tokens)
 
@@ -402,6 +409,11 @@ def alloc_for_extend(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Admission already charged HiSparse scratch; allocate it with the request
+    # slot so subsequent scheduling sees the remaining physical capacity.
+    if batch.hisparse_coordinator is not None:
+        batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
@@ -785,17 +797,41 @@ def alloc_for_spec_decode(
             last_loc = get_last_loc(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
-            out_cache_loc = ALLOC_EXTEND_FUNCS[_device_type(batch)](
-                tree_cache,
-                cur_kv_lens,
-                cur_kv_lens_cpu,
-                nxt_kv_lens,
-                nxt_kv_lens_cpu,
-                last_loc,
-                num_needed_tokens,
-                req_pool_indices=req_pool_indices,
-                batch=batch,
-            )
+            allocator = tree_cache.token_to_kv_pool_allocator
+            if batch is not None and batch.hisparse_coordinator is not None:
+                # Spec decode reserves logical target slots here. Target verify
+                # later binds those slots to HiSparse's extra page; allocating
+                # target physical pages first both wastes memory and breaks the
+                # physical paged allocator's last_loc chain after the reserve is
+                # released. Draft KV has its own logical GPU-page mapping.
+                evict_from_tree_cache(
+                    tree_cache,
+                    num_needed_tokens + len(nxt_kv_lens_cpu) * allocator.page_size,
+                )
+                out_cache_loc = allocator.alloc_logical_only(
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                )
+                if out_cache_loc is None:
+                    raise RuntimeError(
+                        "HiSparse spec decode failed to allocate logical KV slots."
+                    )
+            else:
+                out_cache_loc = ALLOC_EXTEND_FUNCS[_device_type(batch)](
+                    tree_cache,
+                    cur_kv_lens,
+                    cur_kv_lens_cpu,
+                    nxt_kv_lens,
+                    nxt_kv_lens_cpu,
+                    last_loc,
+                    num_needed_tokens,
+                    req_pool_indices=req_pool_indices,
+                    batch=batch,
+                )
         # Updating req_to_token is a write to a shared tensor: it must not overlap
         # with the previous batch's forward, which also reads req_to_token.
         assign_req_to_token_pool_func(

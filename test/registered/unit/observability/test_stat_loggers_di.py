@@ -288,6 +288,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             running_batch=SimpleNamespace(reqs=[]),
             waiting_queue=[],
             grammar_manager=[],
+            enable_fpm=False,
             enable_priority_scheduling=False,
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(
