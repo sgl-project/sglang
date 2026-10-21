@@ -87,7 +87,7 @@ def _kda_track_ssm_kernel(
         )
     tl.store(
         ssm_pool + dst * stride_ssm_slot + offs,
-        val.to(ssm_pool.dtype.element_ty),
+        val,
         mask=mask,
     )
 
