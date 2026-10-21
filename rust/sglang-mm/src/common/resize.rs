@@ -10,6 +10,7 @@ pub enum Filter {
     Lanczos,
     /// support 2.0, a = -0.5 — PIL `BICUBIC`.
     Bicubic,
+    Bilinear,
 }
 
 /// A resampler reproduced bit-exactly. Both share PIL's geometry, kernels and
@@ -52,6 +53,7 @@ impl Filter {
         match self {
             Filter::Lanczos => 3.0,
             Filter::Bicubic => 2.0,
+            Filter::Bilinear => 1.0,
         }
     }
 
@@ -59,6 +61,7 @@ impl Filter {
         match self {
             Filter::Lanczos => lanczos(x),
             Filter::Bicubic => bicubic(x),
+            Filter::Bilinear => bilinear(x),
         }
     }
 }
@@ -77,6 +80,11 @@ fn lanczos(x: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn bilinear(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1.0 { 1.0 - x } else { 0.0 }
 }
 
 fn bicubic(x: f64) -> f64 {
@@ -225,6 +233,30 @@ pub fn resize_rgb(
     par::in_pool(move || resize_passes(src, h, w, out_h, out_w, resample))
 }
 
+/// Pillow 13 chooses vertical-first for sufficiently tall downscales.
+/// Keep this opt-in: existing families depend on the older rounding order.
+pub fn resize_pil_bilinear_v13(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<u8> {
+    let resample = Resample::Pil(Filter::Bilinear);
+    let vertical_first = (h as i128 - out_h as i128) > 0
+        && (h as i128 - out_h as i128) > 2 * (w as i128 - out_w as i128);
+    par::in_pool(move || {
+        if vertical_first && out_h != h && out_w != w {
+            let cy = precompute_coeffs(h, out_h, resample);
+            let tmp = resample_vertical(src, w, out_h, &cy);
+            let cx = precompute_coeffs(w, out_w, resample);
+            resample_horizontal(&tmp, out_h, w, out_w, &cx)
+        } else {
+            resize_passes(src, h, w, out_h, out_w, resample)
+        }
+    })
+}
+
 fn resize_passes(
     src: &[u8],
     h: usize,
@@ -244,6 +276,116 @@ fn resize_passes(
         (false, true) => resample_vertical(src, w, out_h, &coeffs(h, out_h)),
         (false, false) => src.to_vec(),
     }
+}
+
+struct AaWeights {
+    bounds: Vec<(usize, usize)>,
+    weights: Vec<f32>,
+    ksize: usize,
+}
+
+fn aa_bilinear_weights(in_size: usize, out_size: usize) -> AaWeights {
+    let scale = in_size as f32 / out_size as f32;
+    let support = if scale >= 1.0 { scale } else { 1.0f32 };
+    let invscale = if scale >= 1.0 { 1.0 / scale } else { 1.0f32 };
+    let ksize = (support.ceil() as usize) * 2 + 1;
+    let mut weights = vec![0.0f32; out_size * ksize];
+    let mut bounds = vec![(0usize, 0usize); out_size];
+    for i in 0..out_size {
+        let center = scale * (i as f32 + 0.5);
+        let xmin = ((center - support + 0.5) as i64).max(0);
+        let xmax = ((center + support + 0.5) as i64).min(in_size as i64);
+        let xsize = (xmax - xmin).max(0) as usize;
+        let xmin_m_center = xmin as f32 - center;
+        let w = &mut weights[i * ksize..i * ksize + xsize];
+        let mut total = 0.0f32;
+        for (j, wj) in w.iter_mut().enumerate() {
+            let x = ((j as f32 + xmin_m_center + 0.5) * invscale).abs();
+            *wj = if x < 1.0 { 1.0 - x } else { 0.0 };
+            total += *wj;
+        }
+        if total != 0.0 {
+            for wj in w.iter_mut() {
+                *wj /= total;
+            }
+        }
+        bounds[i] = (xmin as usize, xsize);
+    }
+    AaWeights {
+        bounds,
+        weights,
+        ksize,
+    }
+}
+
+#[inline]
+fn aa_dot(src: &[f32], stride: usize, w: &[f32]) -> f32 {
+    let mut t = src[0] * w[0];
+    for (j, &wj) in w.iter().enumerate().skip(1) {
+        t = src[j * stride].mul_add(wj, t);
+    }
+    t
+}
+
+pub fn resize_aa_bilinear_planes(
+    src: &[f32],
+    planes: usize,
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    par::in_pool(move || {
+        let wx = aa_bilinear_weights(w, out_w);
+        let wy = aa_bilinear_weights(h, out_h);
+        let mut tmp = vec![0.0f32; planes * h * out_w];
+        par::for_chunks_mut(&mut tmp, out_w, |row, out| {
+            let src_row = &src[row * w..(row + 1) * w];
+            for (ox, o) in out.iter_mut().enumerate() {
+                let (xmin, xsize) = wx.bounds[ox];
+                *o = aa_dot(
+                    &src_row[xmin..],
+                    1,
+                    &wx.weights[ox * wx.ksize..ox * wx.ksize + xsize],
+                );
+            }
+        });
+        let mut out = vec![0.0f32; planes * out_h * out_w];
+        par::for_chunks_mut(&mut out, out_w, |row, o| {
+            let (p, oy) = (row / out_h, row % out_h);
+            let (ymin, ysize) = wy.bounds[oy];
+            let base = &tmp[(p * h + ymin) * out_w..];
+            let k = &wy.weights[oy * wy.ksize..oy * wy.ksize + ysize];
+            for (ox, v) in o.iter_mut().enumerate() {
+                *v = aa_dot(&base[ox..], out_w, k);
+            }
+        });
+        out
+    })
+}
+
+pub fn resize_aa_bilinear_rgb_u8(
+    src: &[u8],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<u8> {
+    let mut planes = vec![0.0f32; 3 * h * w];
+    for (i, px) in src.chunks_exact(3).enumerate() {
+        for c in 0..3 {
+            planes[c * h * w + i] = px[c] as f32;
+        }
+    }
+    let resized = resize_aa_bilinear_planes(&planes, 3, h, w, out_h, out_w);
+    let n = out_h * out_w;
+    let mut out = vec![0u8; n * 3];
+    for i in 0..n {
+        for c in 0..3 {
+            out[i * 3 + c] = resized[c * n + i].round_ties_even().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<u8> {
