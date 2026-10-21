@@ -368,10 +368,11 @@ class TreeComponent(ABC):
         return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
+        """Length of the stored device indices, including entries without backing."""
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
 
-    def reclaimable_tokens(self, node: UnifiedTreeNode) -> int:
+    def reclaimable_value_len(self, node: UnifiedTreeNode) -> int:
         """Pool tokens the allocator gets back when this node's device value
         is evicted. The evictable/protected ledgers count these (prefill
         admission adds the evictable ledger to the allocator's free space, and
