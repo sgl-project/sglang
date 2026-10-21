@@ -779,6 +779,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            if model.final_layer._pdd_heads is not None:
+                initial_video, initial_audio = _scale_pdd_initial_noise(
+                    ctx, positive, initial_video, initial_audio
+                )
             rollout_ctx = None
             if getattr(batch, "rollout", False):
                 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
@@ -1291,6 +1295,22 @@ def _expand_initial_rows(
         )
         full_audio[positive.audio_update_mask] = initial_audio
         initial_audio = full_audio
+    return initial_video, initial_audio
+
+
+def _scale_pdd_initial_noise(
+    ctx: _FullLoopContext,
+    positive: Any,
+    initial_video: torch.Tensor,
+    initial_audio: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Start PDD targets at the first node's noise level, as the students are
+    trained (``sigma_0 * eps``); condition rows stay as they are. A no-op on
+    grids that start at sigma 1."""
+    initial_video = initial_video.clone()
+    initial_audio = initial_audio.clone()
+    initial_video[positive.video_target_slice] *= float(ctx.sigmas["video"][0])
+    initial_audio[positive.audio_target_slice] *= float(ctx.sigmas["audio"][0])
     return initial_video, initial_audio
 
 
