@@ -314,6 +314,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
+        rollout_return_neg_cond_kwargs=request.rollout_return_neg_cond_kwargs,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
         rollout_sde_step_indices=request.rollout_sde_step_indices,
         rollout_return_step_indices=request.rollout_return_step_indices,
