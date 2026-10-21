@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     is_unadmitted_reject,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
+    poll_and_all_reduce_prefill_pp_sections,
     prepare_abort,
     setup_state_kv_args,
 )
@@ -490,8 +491,11 @@ class PrefillBootstrapQueue:
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def pop_bootstrapped(self) -> List[Req]:
-        """Pop the reqs which have finished bootstrapping."""
+    def pop_bootstrapped(self, polls: Optional[List[int]] = None) -> List[Req]:
+        """Pop the reqs which have finished bootstrapping.
+
+        ``polls`` is a PP consensus poll of ``self.queue`` the caller already synced.
+        """
 
         bootstrapped_reqs = []
         indices_to_remove = set()
@@ -499,7 +503,9 @@ class PrefillBootstrapQueue:
         if len(self.queue) == 0:
             return []
 
-        if self.pp_size > 1:
+        if polls is not None:
+            pass
+        elif self.pp_size > 1:
             polls = poll_and_all_reduce_prefill_pp(
                 [req.disagg_kv_sender for req in self.queue],
                 self.scheduler.attn_cp_cpu_group,
@@ -1149,6 +1155,12 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
+                # Only pop_bootstrapped_and_resolve_parked_pp may finalize or
+                # fail a parked request under PP; this poll is stage-local.
+                if req.pending_bootstrap:
+                    undone_reqs.append(req)
+                    continue
+
                 # In PP mode, the previous rank may have reached a terminal
                 # state (Success/Failed) while this rank's local poll is still
                 # in a transient state due to clock skew or propagation delay.
@@ -1377,12 +1389,90 @@ class SchedulerDisaggregationPrefillMixin:
         Returns True if bootstrap is finished."""
         if not req.pending_bootstrap:
             return True
+        if get_parallel().pp_size > 1:
+            # A stage-local poll would let PP stages diverge on this request;
+            # it resolves after prefill in pop_bootstrapped_and_resolve_parked_pp.
+            return False
         polls = poll_and_all_reduce_attn_cp_tp_group(
             [req.disagg_kv_sender],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
         return self.handle_pending_bootstrap(req, polls[0])
+
+    @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
+    def pop_bootstrapped_and_resolve_parked_pp(self: Scheduler) -> List[Req]:
+        """Pop bootstrapped requests and resolve pending ones on one PP consensus poll.
+
+        A stage's send of this poll completes only once the next stage receives
+        it in the same loop iteration, so a second poll sync per iteration
+        deadlocks the pipeline.
+        """
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue
+        # A pending chunked_req resolves once parked: freeing it here would race
+        # its earlier chunks still queued on the forward stream.
+        waiting = [
+            req
+            for req in self.waiting_queue
+            if req.pending_bootstrap and not is_aborted(req)
+        ]
+        parked = [
+            req for req in self.disagg_prefill_inflight_queue if req.pending_bootstrap
+        ]
+        if not (bootstrap_queue.queue or waiting or parked):
+            return []
+        queued_polls, waiting_polls, parked_polls = (
+            poll_and_all_reduce_prefill_pp_sections(
+                [
+                    [req.disagg_kv_sender for req in reqs]
+                    for reqs in (bootstrap_queue.queue, waiting, parked)
+                ],
+                self.attn_cp_cpu_group,
+                self.attn_tp_cpu_group,
+                self.pp_group,
+                bootstrap_queue.pp_rank,
+                bootstrap_queue.pp_size,
+                bootstrap_queue.pp_poll_sync_work_list,
+            )
+        )
+        self._drop_failed_waiting_bootstrap(waiting=waiting, polls=waiting_polls)
+        bootstrapped = bootstrap_queue.pop_bootstrapped(polls=queued_polls)
+        self._resolve_parked_bootstrap(parked=parked, polls=parked_polls)
+        return bootstrapped
+
+    def _drop_failed_waiting_bootstrap(
+        self: Scheduler, *, waiting: List[Req], polls: List[int]
+    ) -> None:
+        failed_rids = set()
+        for req, poll in zip(waiting, polls, strict=True):
+            if poll == KVPoll.Failed:
+                self.handle_bootstrap_failure(req)
+                failed_rids.add(req.rid)
+        if failed_rids:
+            self.waiting_queue = [
+                req for req in self.waiting_queue if req.rid not in failed_rids
+            ]
+
+    def _resolve_parked_bootstrap(
+        self: Scheduler, *, parked: List[Req], polls: List[int]
+    ) -> None:
+        """Finalize or fail parked requests on a PP consensus poll.
+
+        Finalizing re-checkpoints the request into the radix cache, so every PP
+        stage must act on the same poll in the same loop iteration.
+        """
+        failed_rids = set()
+        for req, poll in zip(parked, polls, strict=True):
+            if self.handle_pending_bootstrap(req, poll):
+                self.send_kv_chunk(req, last_chunk=True)
+            elif poll == KVPoll.Failed:
+                failed_rids.add(req.rid)
+        if failed_rids:
+            self.disagg_prefill_inflight_queue = [
+                req
+                for req in self.disagg_prefill_inflight_queue
+                if req.rid not in failed_rids
+            ]
 
     def process_prefill_chunk(
         self: Scheduler,
