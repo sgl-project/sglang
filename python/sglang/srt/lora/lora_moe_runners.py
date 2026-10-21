@@ -189,7 +189,12 @@ class LoRAInfo:
 
 @dataclass
 class LoRAHooks:
-    """Hook callbacks for injecting LoRA deltas into the MoE pipeline."""
+    """Hook callbacks for injecting LoRA deltas into the MoE pipeline.
+
+    Dropped route IDs remain negative. Hooks must skip those routes before
+    reading their payloads or scores; private inactive intermediates may be
+    uninitialized and routing scores are passed without a sanitized copy.
+    """
 
     after_gate_up: (
         Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None] | None

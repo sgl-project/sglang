@@ -23,6 +23,7 @@ def _fused_virtual_topk_ids_kernel(
     virtual_topk_ids_ptr,
     token_lora_mask_ptr,
     num_experts_for_weight: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
     M,
     top_k: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -38,7 +39,7 @@ def _fused_virtual_topk_ids_kernel(
         lora_id = token_lora_mapping[m]
         mask[m] = (lora_id >= 0)
         safe_lora = max(lora_id, 0)
-        if shared_outer:  (handled by num_experts_for_weight == 0 sentinel)
+        if shared_outer:
             virtual_topk_ids[m, k] = safe_lora * 1  (= safe_lora)
         else:
             virtual_topk_ids[m, k] = topk_ids[m, k] + safe_lora * num_experts_for_weight
@@ -74,7 +75,8 @@ def _fused_virtual_topk_ids_kernel(
     # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
     # a real virtual-expert slot belonging to another adapter and trigger OOB
     # loads in downstream LoRA kernels.
-    shifted = base + safe_lora * num_experts_for_weight
+    expert = 0 if SHARED_OUTER else base
+    shifted = expert + safe_lora * num_experts_for_weight
     result = tl.where(base < 0, base, shifted)
     result = tl.where(mask_val, result, -1)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
@@ -103,22 +105,18 @@ def _fused_virtual_topk_ids(
 
     `local_num_experts` (< `num_experts`) enables the EP mask on the per-expert
     path: non-owned `topk_ids` slots are dropped to the -1 sentinel in-kernel.
-    The shared-outer path routes by lora id, not expert, so it is never masked
-    (else non-owned-but-valid tokens would be dropped on ranks > 0).
+    The shared-outer path retains negative dropped routes but does not apply
+    the local expert range (its weights are shared by every owned expert).
     """
     M, top_k = topk_ids.shape
     device = topk_ids.device
 
-    if shared_outer:
-        num_experts_for_weight = 1
-        # For shared_outer, we need topk_ids to be zeros
-        zero_topk = torch.zeros_like(topk_ids)
-        input_topk = zero_topk
-        ep_local = False
-    else:
-        num_experts_for_weight = num_experts
-        input_topk = topk_ids
-        ep_local = local_num_experts is not None and local_num_experts < num_experts
+    num_experts_for_weight = 1 if shared_outer else num_experts
+    ep_local = (
+        not shared_outer
+        and local_num_experts is not None
+        and local_num_experts < num_experts
+    )
 
     virtual_topk_ids = torch.empty_like(topk_ids)
     token_lora_mask = torch.empty(M, dtype=torch.bool, device=device)
@@ -128,11 +126,12 @@ def _fused_virtual_topk_ids(
 
     enable_pdl, pdl_kwargs = get_pdl_launch_metadata()
     _fused_virtual_topk_ids_kernel[grid](
-        input_topk,
+        topk_ids,
         token_lora_mapping,
         virtual_topk_ids,
         token_lora_mask,
         num_experts_for_weight,
+        shared_outer,
         M,
         top_k,
         BLOCK_SIZE,

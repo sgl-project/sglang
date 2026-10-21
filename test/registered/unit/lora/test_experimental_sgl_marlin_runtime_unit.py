@@ -191,6 +191,7 @@ def _run_marlin_flow(
         marlin_sorted=[],
         marlin_output_ids=[],
         marlin_output_initialized=[],
+        marlin_zero_inactive_output=[],
         align_num_experts=[],
         schedule=[],
         zeroed=[],
@@ -309,6 +310,9 @@ def _run_marlin_flow(
     def fake_marlin_gemm(_x, output, *_args, **kwargs):
         calls.marlin_is_ep.append(kwargs["is_ep"])
         calls.marlin_sorted.append(kwargs.get("expert_ids_are_sorted", False))
+        calls.marlin_zero_inactive_output.append(
+            kwargs.get("zero_inactive_output", False)
+        )
         calls.marlin_output_ids.append(id(output))
         calls.marlin_output_initialized.append(
             bool(torch.isfinite(output).all() and torch.count_nonzero(output) == 0)
@@ -424,7 +428,7 @@ def _run_marlin_flow(
 
 
 def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
-    """EP alignment stays local and the down accumulator starts finite and zero."""
+    """EP stays local and delegates inactive output writes to the down GEMM."""
 
     calls = _run_marlin_flow(monkeypatch, tokens=16, ep=True, slots=2, rank=128)
 
@@ -432,7 +436,8 @@ def test_ep_uses_local_alignment_and_skips_nonlocal_marlin_blocks(monkeypatch):
     assert calls.marlin_is_ep == [True, True]
     assert calls.marlin_sorted == [False, False]
 
-    assert calls.marlin_output_initialized[1]
+    assert calls.marlin_zero_inactive_output == [False, True]
+    assert not any(calls.marlin_output_initialized)
 
     down_stage = [
         call for call in calls.merged if call["stage"] == "all" and call["shared_b"]

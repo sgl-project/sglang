@@ -69,12 +69,13 @@ __device__ __forceinline__ int compute_virtual_id(
   bool mask_val = lora_id >= 0;
   int safe_lora = lora_id > 0 ? lora_id : 0;
 
-  int base = shared_outer ? 0 : static_cast<int>(topk_ids[i]);
+  int base = static_cast<int>(topk_ids[i]);
   if (ep_local) {
     bool owned = base >= local_expert_offset && base < local_expert_offset + local_num_experts;
     base = owned ? base : -1;
   }
   if (!mask_val || base < 0) return -1;
+  if (shared_outer) base = 0;
   // compact: dense LOCAL expert id in [0, local_num_experts) so the histogram
   // spans only local_num_experts buckets instead of the full global virtual
   // space (337/385 empty under EP). Assumes max_loras==1 (safe_lora shift is 0;

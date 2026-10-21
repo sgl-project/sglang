@@ -1091,9 +1091,11 @@ def _check_marlin_inactive_routes(
                     if runner_kind != "fused":
                         dispatch = StandardDispatchOutput(x, None, routing)
                         if runner_kind == "stock_lora":
-                            return core.run_from_dispatch(
+                            result = core.run_from_dispatch(
                                 dispatch, quant_info, config, hooks
                             ).hidden_states
+                            assert hook_weights[0] is routing.topk_weights
+                            return result
                         return fused_experts_experimental_sgl_marlin_lora(
                             dispatch, quant_info, config, lora_info
                         ).hidden_states
@@ -1159,7 +1161,7 @@ def _check_marlin_inactive_routes(
                     assert torch.count_nonzero(actual[count:]) == 0
                     if hook_weights:
                         weights, ids = hook_weights
-                        assert torch.count_nonzero(weights[ids < 0]) == 0
+                        assert torch.isnan(weights[ids < 0]).all()
             assert projections == [False, True] * 4
 
 
