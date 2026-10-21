@@ -1122,7 +1122,24 @@ def _check_marlin_inactive_routes(
             activated = torch.nn.functional.silu(gate) * up
             projected = torch.einsum("mti,mthi->mth", activated, w2_ref[ids])
             reference = (projected.float() * weights[:, :, None]).sum(1).to(x.dtype)
-            with patch.object(zero_copy_context, "get_moe_output", return_value=output):
+            caller_module = {
+                "fused": "sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe",
+                "stock_lora": "sglang.srt.lora.lora_moe_runner_marlin",
+                "factored_lora": "sglang.srt.lora.marlin_lora_temp.moe_runner",
+            }[runner_kind]
+            projections = []
+
+            def checked_marlin_gemm(*args, **kwargs):
+                # Built-in alignment certifies both projections, including padded
+                # graph rows; dropping either certificate restores the table scan.
+                assert kwargs.get("expert_ids_are_sorted", False)
+                projections.append(kwargs["mul_topk_weights"])
+                return moe_wna16_marlin_gemm(*args, **kwargs)
+
+            with (
+                patch.object(zero_copy_context, "get_moe_output", return_value=output),
+                patch(f"{caller_module}.moe_wna16_marlin_gemm", checked_marlin_gemm),
+            ):
                 for _ in range(3):
                     run()
                 torch.cuda.synchronize()
@@ -1143,6 +1160,7 @@ def _check_marlin_inactive_routes(
                     if hook_weights:
                         weights, ids = hook_weights
                         assert torch.count_nonzero(weights[ids < 0]) == 0
+            assert projections == [False, True] * 4
 
 
 def test_moe_wna16_marlin_inactive_output_ownership():
