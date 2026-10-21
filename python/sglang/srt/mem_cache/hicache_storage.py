@@ -179,6 +179,25 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # An opt-in backend may read primary KV and KV-derived ALL_PAGES sidecars
+    # together. It must return a same-length per-entry result for EVERY pool;
+    # completion must protect all destinations until the native IO is terminal.
+    # Trailing/checkpoint pools retain their separate resume-boundary path.
+    supports_combined_page_reads = False
+
+    # Opt-in writes use one terminal completion for primary KV and KV-derived
+    # ALL_PAGES sidecars. A backup ACK must never claim success for KV alone.
+    supports_combined_page_writes = False
+
+    # Shared-store MLA backends can persist primary KV/indexer on TP0 only.
+    # A rank-local store must override this to retain every shard's writer.
+    requires_rank_local_backup = False
+
+    # Read batching only; write/query batches retain STORAGE_BATCH_SIZE. All
+    # ranks participating in prefetch ACK reduction must use the same value,
+    # including after a failed batch, to preserve their collective sequence.
+    prefetch_batch_pages = STORAGE_BATCH_SIZE
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
