@@ -306,6 +306,28 @@ def collect_model_override_declarations(
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
+@_register_for(
+    "MuseSparkForConditionalGeneration",
+)
+def _muse_spark_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    overrides: Dict[str, Any] = {}
+    if cfg.enable_tf32_matmul is None:
+        overrides["enable_tf32_matmul"] = True
+        logger.info("Enable TF32 matmul by default for Muse Spark")
+    if cfg.kv_cache_dtype == "auto":
+        logger.info("Use fp8_e4m3 KV cache by default for Muse Spark")
+        overrides["kv_cache_dtype"] = "fp8_e4m3"
+    if cfg.mm_enable_dp_encoder is None and cfg.attn_dp_size > 1:
+        # NaViT shards over the full TP group only, so attention TP narrower
+        # than TP needs the replicated (data-parallel) encoder.
+        logger.info(
+            "Enable the data-parallel mm encoder for Muse Spark under attention DP"
+        )
+        overrides["mm_enable_dp_encoder"] = True
+    return overrides
+
+
 @register_model_override_predicate(
     lambda arch: (
         "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
@@ -1122,15 +1144,6 @@ def _mla_backend_page_constraints(view: Any) -> dict:
             )
             page_size = 64
     if (
-        view.attention_backend == "tokenspeed_mla"
-        or view.decode_attention_backend == "tokenspeed_mla"
-    ):
-        if page_size not in [32, 64]:
-            logger.warning(
-                f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
-            )
-            page_size = 64
-    if (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
         or view.prefill_attention_backend == "cutedsl_mla"
@@ -1171,7 +1184,7 @@ def _mla_backend_page_constraints(view: Any) -> dict:
 
 @register_post_process
 def _mla_kv_cache_dtype_checks(view: Any) -> dict:
-    """Validate resolved KV-cache dtype for TRTLLM and tokenspeed MLA backends."""
+    """Validate resolved KV-cache dtype for the TRTLLM MLA backend."""
     if (
         view.attention_backend == "trtllm_mla"
         or view.decode_attention_backend == "trtllm_mla"
@@ -1183,19 +1196,6 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
         if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
             raise ValueError(
                 "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
-            )
-    if (
-        view.attention_backend == "tokenspeed_mla"
-        or view.decode_attention_backend == "tokenspeed_mla"
-    ):
-        if not get_platform().is_blackwell:
-            raise ValueError(
-                "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
-            )
-        if view.kv_cache_dtype not in ["fp8_e4m3"]:
-            raise ValueError(
-                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
-                f"got {view.kv_cache_dtype}."
             )
     return {}
 
@@ -1432,22 +1432,30 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """Resolve MoE runner backends from quantization."""
     moe_runner_backend = view.moe_runner_backend
     if view.quantization == "nvfp4_online":
+        use_megamoe_w4a16 = (
+            view.moe_a2a_backend == "flashinfer_megamoe"
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
         if not get_platform().is_sm100:
             raise ValueError(
                 "--quantization nvfp4_online is supported only on "
                 "NVIDIA Blackwell SM100/SM103 GPUs."
             )
         if moe_runner_backend == "auto":
-            moe_runner_backend = "flashinfer_trtllm"
+            moe_runner_backend = (
+                "flashinfer_megamoe" if use_megamoe_w4a16 else "flashinfer_trtllm"
+            )
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
             "flashinfer_cutedsl",
-        ]:
+        ] and not (moe_runner_backend == "flashinfer_megamoe" and use_megamoe_w4a16):
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl; "
+                "flashinfer_megamoe requires --moe-a2a-backend flashinfer_megamoe "
+                "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:

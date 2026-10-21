@@ -1708,6 +1708,8 @@ def runai_safetensors_weights_iterator(
 
         for name, tensor in tensor_iter:
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            # Views and detach() share storage but do not inherit tensor attributes.
+            setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
             yield name, tensor
 
 
@@ -1770,7 +1772,8 @@ def initialize_dummy_weights(
     """
     for name, param in model.state_dict().items():
         if torch.is_floating_point(param):
-            if name.endswith("weight_scale_inv"):
+            # Neutral FP4 global scales keep fused gate/up projections compatible.
+            if name.endswith(("weight_scale_inv", "weight_scale_2")):
                 param.fill_(1.0)
                 continue
             generator = torch.Generator(device=param.data.device)

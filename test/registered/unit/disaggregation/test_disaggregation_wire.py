@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.mooncake.conn import (
+    FailedSessionProbe,
     KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVSender,
@@ -160,6 +161,7 @@ class TestDisaggregationWire(unittest.TestCase):
                     manager.failure_lock = threading.Lock()
                     manager.failed_sessions = set()
                     manager.session_failures = defaultdict(int)
+                    manager.failed_session_probes = {}
                     manager.state_layout_rejections = {}
                     manager.state_strides_validated = set()
                     manager.failure_records = {}
@@ -369,6 +371,11 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 2})
+        manager.failed_session_probes = {
+            "decode": FailedSessionProbe(
+                last_requested=0.0, next_probe_at=0.0, interval=300.0
+            )
+        }
         manager.state_layout_rejections = {}
         manager.state_strides_validated = set()
         manager.decode_kv_args_table = {}
@@ -391,6 +398,7 @@ class TestDisaggregationWire(unittest.TestCase):
         # A transport blacklist is cleared by registering, as before.
         self.assertFalse(manager.failed_sessions)
         self.assertFalse(manager.session_failures)
+        self.assertFalse(manager.failed_session_probes)
 
         bad, mismatch = register(64)
         self.assertIn("item length mismatch", mismatch)
@@ -476,6 +484,7 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.failure_lock = threading.Lock()
         manager.failed_sessions = set()
         manager.session_failures = defaultdict(int)
+        manager.failed_session_probes = {}
         manager.failure_records = {}
         manager._staging_outstanding = defaultdict(int)
         manager.request_status = {42: KVPoll.Transferring}
@@ -526,8 +535,12 @@ class TestDisaggregationWire(unittest.TestCase):
         manager.session_lock = threading.Lock()
         manager.failed_sessions = {"decode"}
         manager.session_failures = defaultdict(int, {"decode": 1})
+        manager.failed_session_probes = {}
         reason = f"{StateType.SWA} item length mismatch for positional entry 0"
         manager.state_layout_rejections = {"decode": reason}
+        manager.failed_session_probe_interval = 30.0
+        manager.failed_session_probe_max_interval = 300.0
+        manager.failed_session_idle_timeout = 600.0
         manager.engine = SimpleNamespace(send_probe=Mock(return_value=0))
 
         manager._run_one_probe_pass()
@@ -1263,16 +1276,20 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
         prefill.agent = _MemcpyNixlAgent(memory)
-        handles = prefill.maybe_send_extra(
-            "decode",
-            [np.array(self.SRC_PAGES, dtype=np.int32)],
-            [dst_ptrs],
-            [self.DST_PAGES],
-            0,
-            "7_state_0",
-            decode_tp,
-            decode_tp_rank=dst_rank,
-            dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+        prefill._prepared_state_plans = {}
+        prefill._state_layout_rejections = {}
+        handles = list(
+            prefill.maybe_send_extra(
+                "decode",
+                [np.array(self.SRC_PAGES, dtype=np.int32)],
+                [dst_ptrs],
+                [self.DST_PAGES],
+                0,
+                "7_state_0",
+                decode_tp,
+                decode_tp_rank=dst_rank,
+                dst_state_item_lens=[[item_len] * len(dst_ptrs)],
+            )
         )
         self.assertEqual(len(handles), 1)
 
@@ -2306,9 +2323,10 @@ def _make_dsv4_target(*, unified, mapping=None):
     return pool
 
 
-def _make_dsv4_draft(*, unified, mapping=None):
+def _make_dsv4_draft(*, unified, mapping=None, swa_valid_from=None):
     pool = object.__new__(DeepSeekV4TokenToKVPool)
     pool._unified_kv = unified
+    pool.swa_valid_from = swa_valid_from
     pool.compression_ratios = [0]
     pool.page_size = 256
     pool.swa_page_size = 256
@@ -2350,6 +2368,23 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
                 [[11], [12]],
             ),
         ]
+        mark = torch.zeros(3, dtype=torch.int64)
+        draft = _make_dsv4_draft(unified=False, mapping=mapping, swa_valid_from=mark)
+        expected_infos = draft.get_state_buf_infos()
+        kv_args = KVArgs()
+
+        setup_state_kv_args(
+            kv_args, _make_dsv4_target(unified=False, mapping=mapping), draft
+        )
+
+        # The draft's SWA valid-from follows its SWA as one item per request slot.
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.SWA, StateType.SWA, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1], expected_infos[0])
+        self.assertEqual(kv_args.state_data_ptrs[2], [mark.data_ptr()])
+        self.assertEqual(kv_args.state_item_lens[2], [mark[0].nbytes])
 
         for name, target, draft, expected_types, target_ptrs in cases:
             with self.subTest(name=name):

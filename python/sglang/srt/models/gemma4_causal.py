@@ -295,6 +295,7 @@ class Gemma4MoE(nn.Module):
             activation=activation,
             reduce_results=reduce_results,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor

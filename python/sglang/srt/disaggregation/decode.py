@@ -62,6 +62,7 @@ from sglang.srt.disaggregation.utils import (
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
+    get_pd_kv_layout,
     get_qsa_pending_state_indices,
     is_mla_backend,
     is_unadmitted_reject,
@@ -124,6 +125,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils.common import async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import is_in_ci
@@ -595,6 +597,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_cache_dtype_str = (
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
+        kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
         transfer_kv_pool = (
             self.scheduler.hisparse_coordinator.mem_pool_host
             if self.scheduler.enable_hisparse
@@ -1056,6 +1059,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
+            if self.scheduler.enable_overlap:
+                # A request that finished last step can still have its forward in
+                # flight, writing slots this request was just given.
+                self.scheduler.schedule_stream.wait_stream(
+                    self.scheduler.forward_stream
+                )
             restore_kv_cache(
                 req,
                 self.tree_cache,
@@ -1700,6 +1709,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     int(decode_req.req.kv.req_pool_idx), seq_len
                 )
 
+            def _request_row_payload():
+                return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
+
             state_types = self.kv_manager.kv_args.state_types
             if StateType.DSV4_REQUEST_STATE in state_types:
                 clear_request_state = getattr(
@@ -1718,6 +1730,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
+                StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
             }
@@ -2344,11 +2357,11 @@ def alloc_for_decode_prealloc_hisparse(
 ) -> torch.Tensor:
     req.kv.kv_allocated_len = fill_len
     device = allocator.device
-    prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+    prefix_lens = async_h2d([0], dtype=torch.int64, device=device)
     prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-    seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+    seq_lens = async_h2d([fill_len], dtype=torch.int64, device=device)
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
-    last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+    last_loc = async_h2d([-1], dtype=torch.int64, device=device)
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -2395,7 +2408,7 @@ def alloc_for_decode_prealloc(
         last_loc = (
             prefix_indices[-1:].to(dtype=torch.int64, device=device)
             if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
+            else async_h2d([-1], dtype=torch.int64, device=device)
         )
         extra_kwargs = {}
         dsv4_unwrap_prealloc = None
@@ -2417,11 +2430,11 @@ def alloc_for_decode_prealloc(
             # Full-attention layers reuse prefix KV; SWA layers allocate only
             # the live window tail.
             kv_loc = allocator.alloc_extend_swa_tail(
-                prefix_lens=torch.tensor(
+                prefix_lens=async_h2d(
                     [total_prefix_len], dtype=torch.int64, device=device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
@@ -2436,11 +2449,11 @@ def alloc_for_decode_prealloc(
             req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
         else:
             kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
+                prefix_lens=async_h2d(
                     [total_prefix_len], dtype=torch.int64, device=device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=async_h2d([fill_len], dtype=torch.int64, device=device),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,
@@ -3200,9 +3213,13 @@ class SchedulerDisaggregationDecodeMixin:
         if computer is None:
             return
 
+        kv_manager = self.disagg_decode_prealloc_queue.kv_manager
         verified: List[int] = []
         for i, req in enumerate(batch.reqs):
             if is_health_check_req(req):
+                verified.append(i)
+                continue
+            if not kv_manager.should_verify_kv_checksum(_bootstrap_addr(req)):
                 verified.append(i)
                 continue
             expected = req.expected_kv_checksum
