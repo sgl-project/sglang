@@ -239,7 +239,7 @@ struct NormReduce<M, at::BFloat16, D> {
 };
 #endif
 
-template <NormMode M, typename scalar_t, bool has_residual>
+template <NormMode M, typename scalar_t, bool has_residual, bool has_post_residual = false>
 struct NormReduceGeneric {
   static inline void apply(
       scalar_t* __restrict__ out,
@@ -247,7 +247,8 @@ struct NormReduceGeneric {
       const scalar_t* __restrict__ gate,
       scalar_t* __restrict__ residual,
       const NormParams& params,
-      int D) {
+      int D,
+      const scalar_t* __restrict__ post_residual = nullptr) {
     using bVec = at::vec::Vectorized<scalar_t>;
     using fVec = at::vec::Vectorized<float>;
     constexpr int kVecSize = bVec::size();
@@ -335,6 +336,11 @@ struct NormReduceGeneric {
         x_fvec1 = NormTraits<M>::apply_gate(x_fvec1, g_fvec1);
       }
       bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+      if constexpr (has_post_residual) {
+        auto [t_fvec0, t_fvec1] = at::vec::convert_to_float(out_bvec);
+        auto [r_fvec0, r_fvec1] = load_float_vec2(post_residual + d);
+        out_bvec = convert_from_float_ext<scalar_t>(r_fvec0 + t_fvec0, r_fvec1 + t_fvec1);
+      }
       out_bvec.store(out + d);
     }
 #pragma GCC unroll 4
@@ -365,7 +371,11 @@ struct NormReduceGeneric {
         float g_val = static_cast<float>(static_cast<const scalar_t*>(gate)[d]);
         x_val = NormTraits<M>::apply_gate(x_val, g_val);
       }
-      out[d] = static_cast<scalar_t>(x_val);
+      scalar_t out_val = static_cast<scalar_t>(x_val);
+      if constexpr (has_post_residual) {
+        out_val = static_cast<scalar_t>(static_cast<float>(post_residual[d]) + static_cast<float>(out_val));
+      }
+      out[d] = out_val;
     }
   }
 };
@@ -488,20 +498,13 @@ float sum_squares(const scalar_t* __restrict__ input, int64_t size) {
   return sum_val + vec_reduce_sum(sum_fvec);
 }
 
-template <typename scalar_t>
-void fused_dual_residual_stage1_kernel_impl(
+template <NormMode M, typename scalar_t>
+void fused_norm_post_residual_kernel_impl(
     scalar_t* __restrict__ mid,
     const scalar_t* __restrict__ x,
     const scalar_t* __restrict__ residual,
-    const scalar_t* __restrict__ w1,
     const NormParams& x_params,
-    const NormParams& r_params,
-    float eps) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const int64_t D = x_params.D;
-
+    const NormParams& r_params) {
   at::parallel_for(0, x_params.rows(), 0, [&](int64_t begin, int64_t end) {
     int64_t b{0}, h{0}, t{0};
     data_index_init(begin, b, x_params.B, h, x_params.H, t, x_params.T);
@@ -510,28 +513,7 @@ void fused_dual_residual_stage1_kernel_impl(
       const scalar_t* __restrict__ r_row = residual + r_params.input_offset(b, h, t);
       scalar_t* __restrict__ mid_row = mid + x_params.output_offset(b, h, t);
 
-      const float rscale1 = 1.f / std::sqrt(sum_squares(x_row, D) / static_cast<float>(D) + eps);
-      const fVec rscale1_fvec = fVec(rscale1);
-
-      int64_t d = 0;
-#pragma GCC unroll 4
-      for (; d <= D - kVecSize; d += kVecSize) {
-        auto [x_fvec0, x_fvec1] = load_float_vec2(x_row + d);
-        auto [w_fvec0, w_fvec1] = load_float_vec2(w1 + d);
-        auto [r_fvec0, r_fvec1] = load_float_vec2(r_row + d);
-        // round t first, then add and round once on store
-        bVec t_bvec =
-            convert_from_float_ext<scalar_t>(x_fvec0 * rscale1_fvec * w_fvec0, x_fvec1 * rscale1_fvec * w_fvec1);
-        auto [t_fvec0, t_fvec1] = at::vec::convert_to_float(t_bvec);
-        convert_from_float_ext<scalar_t>(r_fvec0 + t_fvec0, r_fvec1 + t_fvec1).store(mid_row + d);
-      }
-#pragma GCC unroll 4
-      for (; d < D; ++d) {
-        // same two roundings, in the same order, as the vector path
-        const scalar_t t_val =
-            static_cast<scalar_t>(static_cast<float>(x_row[d]) * rscale1 * static_cast<float>(w1[d]));
-        mid_row[d] = static_cast<scalar_t>(static_cast<float>(r_row[d]) + static_cast<float>(t_val));
-      }
+      NormReduceGeneric<M, scalar_t, false, true>::apply(mid_row, x_row, nullptr, nullptr, x_params, x_params.D, r_row);
 
       data_index_step(b, x_params.B, h, x_params.H, t, x_params.T);
     }
@@ -891,20 +873,14 @@ std::tuple<at::Tensor, at::Tensor> fused_dual_residual_rmsnorm_cpu(
   at::Tensor output = at::empty_like(x);
 
   NormParams x_params{x, static_cast<float>(eps)};
+  x_params.weight = weight1.data_ptr();
   NormParams r_params{residual, static_cast<float>(eps)};
   NormParams mid_params{mid, static_cast<float>(eps)};
   mid_params.weight = weight2.data_ptr();
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_dual_residual_rmsnorm_kernel", [&] {
-    fused_dual_residual_stage1_kernel_impl<scalar_t>(
-        mid.data_ptr<scalar_t>(),
-        x.data_ptr<scalar_t>(),
-        residual.data_ptr<scalar_t>(),
-        weight1.data_ptr<scalar_t>(),
-        x_params,
-        r_params,
-        static_cast<float>(eps));
-    // Stage 2 is the existing RMSNorm kernel over the stored (already rounded) `mid`.
+    fused_norm_post_residual_kernel_impl<NormMode::RMSNorm, scalar_t>(
+        mid.data_ptr<scalar_t>(), x.data_ptr<scalar_t>(), residual.data_ptr<scalar_t>(), x_params, r_params);
     norm4d_kernel_impl<NormMode::RMSNorm, scalar_t>(output.data_ptr<scalar_t>(), mid.data_ptr<scalar_t>(), mid_params);
   });
   return std::make_tuple(output, mid);

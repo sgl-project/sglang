@@ -117,10 +117,6 @@ class TestNorm:
     @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
     @pytest.mark.parametrize("batch_size", [32, 121])
     def test_dual_residual_rmsnorm(self, batch_size, hidden_size, dtype):
-        from sglang.kernels.ops.layernorm.fused_rmsnorm import (
-            fused_dual_residual_rmsnorm,
-        )
-
         generator = torch.Generator().manual_seed(batch_size + hidden_size)
         x = make_non_contiguous(
             torch.randn(batch_size, hidden_size, dtype=dtype, generator=generator)
@@ -138,7 +134,9 @@ class TestNorm:
         expected_output = torch.nn.functional.rms_norm(
             expected_mid.float(), (hidden_size,), weight2.float(), eps
         ).to(dtype)
-        output, mid = fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps)
+        output, mid = torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
+            x, residual, weight1, weight2, eps
+        )
 
         torch.testing.assert_close(
             mid, expected_mid, atol=precision[dtype], rtol=precision[dtype]
