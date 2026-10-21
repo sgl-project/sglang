@@ -83,6 +83,7 @@ def cutlass_w4a8_moe(
         Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - topk_ids (torch.Tensor): The ids of each token->expert mapping.
+        Noncontiguous IDs are materialized once for the native flat-pointer consumers.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
     - c_strides1 (torch.Tensor): The output strides of the first grouped gemm.
@@ -123,6 +124,9 @@ def cutlass_w4a8_moe(
 
     if apply_router_weight_on_input:
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
+
+    # Native expert counts and reorder kernels read contiguous int32 IDs.
+    topk_ids = topk_ids.contiguous()
 
     device = a.device
     if a1_scale is None:
