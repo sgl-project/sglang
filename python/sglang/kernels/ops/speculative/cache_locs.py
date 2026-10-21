@@ -25,7 +25,10 @@ _is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if _is_cpu:
-    from sgl_kernel import assign_extend_cache_locs_cpu
+    from sgl_kernel import (
+        assign_draft_cache_locs_contiguous_cpu,
+        assign_extend_cache_locs_cpu,
+    )
 
 
 def _get_oot_speculative_cache_locs_fn() -> Callable[..., torch.Tensor] | None:
@@ -77,6 +80,47 @@ def assign_draft_cache_locs_contiguous(
                     kv_start,
                     topk_offset < topk,
                 )
+
+
+def assign_draft_cache_locs_contiguous_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,  # mutable
+    topk: int,
+    num_cols: int,
+    positions: Optional[torch.Tensor] = None,  # mutable
+    mrope: Optional[torch.Tensor] = None,  # mutable
+):
+    """Copy each request's ``topk * num_cols`` slots from ``seq_lens`` on, and
+    write the draft positions when ``positions`` is given."""
+    if _is_cpu:
+        assert positions is None and mrope is None, "CPU writes no positions"
+        assign_draft_cache_locs_contiguous_cpu(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            out_cache_loc,
+            req_to_token.shape[1],
+            topk,
+            num_cols,
+        )
+        return
+    bs = seq_lens.shape[0]
+    assign_draft_cache_locs_contiguous[(bs,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out_cache_loc,
+        req_to_token.shape[1],
+        topk,
+        num_cols,
+        positions=positions,
+        mrope=mrope,
+        BS=bs,
+        WRITE_POSITIONS=positions is not None,
+        WRITE_MROPE=mrope is not None,
+    )
 
 
 @triton.jit

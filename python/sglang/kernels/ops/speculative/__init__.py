@@ -10,6 +10,7 @@ from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
+    ("cache_locs", "assign_draft_cache_locs_contiguous_func"),
     ("cache_locs", "assign_extend_cache_locs_func"),
     ("cache_locs", "assign_extend_cache_locs_uniform_func"),
     ("cache_locs", "fill_front_out_cache_loc_func"),

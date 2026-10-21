@@ -250,7 +250,7 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
 @pytest.mark.parametrize("mrope", [False, True])
 def test_draft_cache_positions_graph(bs, steps, dtype, mrope):
     from sglang.kernels.ops.speculative.cache_locs import (
-        assign_draft_cache_locs_contiguous,
+        assign_draft_cache_locs_contiguous_func,
     )
 
     table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
@@ -263,19 +263,8 @@ def test_draft_cache_positions_graph(bs, steps, dtype, mrope):
     rope = torch.empty((3, bs), device="cuda", dtype=torch.int64) if mrope else None
 
     def run():
-        assign_draft_cache_locs_contiguous[(bs,)](
-            requests,
-            table,
-            seq,
-            cache,
-            64,
-            1,
-            steps,
-            positions=positions,
-            mrope=rope,
-            BS=bs,
-            WRITE_POSITIONS=True,
-            WRITE_MROPE=mrope,
+        assign_draft_cache_locs_contiguous_func(
+            requests, table, seq, cache, 1, steps, positions=positions, mrope=rope
         )
 
     run()
@@ -301,6 +290,26 @@ def test_draft_cache_positions_graph(bs, steps, dtype, mrope):
             torch.testing.assert_close(
                 rope, seq.long()[None, :].repeat(3, 1), rtol=0, atol=0
             )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 128])
+@pytest.mark.parametrize("width", [1, 4, 12])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_fill_front_out_cache_loc(bs, width, dtype):
+    from sglang.kernels.ops.speculative.cache_locs import (
+        fill_front_out_cache_loc_func,
+    )
+
+    window = torch.randperm(bs * width * 4, device="cuda")[: bs * width]
+    num_front = torch.randint(0, width + 1, (bs,), device="cuda", dtype=dtype)
+    out = torch.full((bs * width,), -3, device="cuda", dtype=torch.int64)
+    fill_front_out_cache_loc_func(num_front, window, out)
+
+    rows = window.view(bs, width)
+    expected = torch.cat([rows[i, :n] for i, n in enumerate(num_front.tolist())])
+    torch.testing.assert_close(out[: expected.numel()], expected, rtol=0, atol=0)
+    # The tail past the packed slots stays as the caller filled it.
+    assert (out[expected.numel() :] == -3).all()
 
 
 @pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
@@ -387,19 +396,15 @@ def test_dynamic_batch_reuses_kernel(operation, monkeypatch):
             locations = torch.empty((bs * 3,), device="cuda", dtype=torch.int64)
             positions = torch.empty_like(seq[:bs])
             mrope = torch.empty((3, bs), device="cuda", dtype=torch.int64)
-            kernel[(bs,)](
+            cache_locs.assign_draft_cache_locs_contiguous_func(
                 requests[:bs],
                 table,
                 seq[:bs],
                 locations,
-                64,
                 1,
                 3,
                 positions=positions,
                 mrope=mrope,
-                BS=bs,
-                WRITE_POSITIONS=True,
-                WRITE_MROPE=True,
             )
             torch.testing.assert_close(positions, seq[:bs], rtol=0, atol=0)
             torch.testing.assert_close(

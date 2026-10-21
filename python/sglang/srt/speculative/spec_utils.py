@@ -15,9 +15,6 @@ from sglang.kernels.ops.speculative.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
-    assign_extend_cache_locs as assign_extend_cache_locs,
-)
-from sglang.kernels.ops.speculative.cache_locs import (
     fill_front_out_cache_loc_func as fill_front_out_cache_loc_func,
 )
 from sglang.kernels.ops.speculative.cache_locs import (
