@@ -1,4 +1,4 @@
-# Muse Spark Open AgentX image (refactored tree): the day0 image plus this SGLang tree and aiter patch 05.
+# Muse Spark Open AgentX image (refactored tree): the day0 image plus this SGLang tree and aiter patches 05 + 06.
 # All Muse optimizations are on by default; no environment variable is needed at runtime.
 #
 # Build context: produced by prepare_context.sh from one commit of this repo (git archive), never the repo
@@ -21,15 +21,13 @@ LABEL org.opencontainers.image.title="sglang-rocm muse-spark-open AgentX (refact
 RUN rm -rf /sgl-workspace/sglang/python/sglang
 COPY python/sglang /sgl-workspace/sglang/python/sglang
 
-# aiter patch 05 (3rdparty/amd/muse_spark): opt-in unified-attention tiles. The day0 aiter already carries
-# patches 01-04; 05 touches two Python/Triton files only, so nothing is rebuilt.
-COPY 05-aiter-unified-attention-muse.patch /opt/muse_aiter_patches/05-aiter-unified-attention-muse.patch
-RUN git -C /sgl-workspace/aiter apply --check /opt/muse_aiter_patches/05-aiter-unified-attention-muse.patch \
- && git -C /sgl-workspace/aiter apply /opt/muse_aiter_patches/05-aiter-unified-attention-muse.patch
-
-# aiter merges every configs/model_configs/*bf16_tuned_gemm*.csv into its bf16 GEMM table at startup
-# ("merge tuned file under model_configs/ and configs/"). These 16 Muse rows collide with no existing key.
-COPY aiter_model_configs/muse_spark_bf16_tuned_gemm.csv /sgl-workspace/aiter/aiter/configs/model_configs/muse_spark_bf16_tuned_gemm.csv
+# aiter patches 05 and 06 (3rdparty/amd/muse_spark/patches; the day0 aiter already carries 01-04):
+# 05 = opt-in unified-attention tiles (two Python/Triton files), 06 = the Muse hipBLASLt rows of aiter's BF16
+# tuned-GEMM table (model_configs/muse_spark_bf16_tuned_gemm.csv, which aiter merges at startup, minus seven
+# duplicate keys in the Qwen3.5 table). Nothing is rebuilt.
+COPY 05-aiter-unified-attention-muse.patch 06-aiter-muse-spark-bf16-tuned-gemm.patch /opt/muse_aiter_patches/
+RUN for p in /opt/muse_aiter_patches/05-aiter-unified-attention-muse.patch /opt/muse_aiter_patches/06-aiter-muse-spark-bf16-tuned-gemm.patch; do \
+      git -C /sgl-workspace/aiter apply --check "$p" && git -C /sgl-workspace/aiter apply "$p" || exit 1; done
 
 COPY muse_image_manifest.json /opt/muse_image_manifest.json
 COPY verify_manifest.py /opt/muse_image_verify_manifest.py
