@@ -1,0 +1,58 @@
+新原生 LIM / SGLang / GLM-5.2-W4A8 / 217 decode profile
+
+SGLang runtime611760f1，kernel实现b5a45667，标准库ff93127d...；8K输入、实际并发1、graph batch16。生成16 token后采集6个decode step，共78层×6=468个完整copy/SFA分组。
+这是单份graph-on trace及源码顺序归因，没有graph-off mapping trace。profile请求与所有性能计时分离。
+Rank0原始trace SHA256: bc1a8741f1378ba750b78b88371f77ceb7fe60cd85996eba2d40e0d258cb0259；文件114213313字节。
+rank映射保存在lim-native-c4096-ep16-profile-workers.json：TP0/EP0 host PID1396061，container PID175858。原始trace和仅做schema/相对时间转换的派生trace均保留。
+
+1. Kernel table（累计NPU任务时间占比>=1%）
+
+| kernel | 次数 | 累计 ms | 累计任务时间占比 | 物理流 |
+|---|---:|---:|---:|---|
+| reduce_scatterAicpuKernel | 450 | 323.682 | 30.29% | [185] |
+| unidex_copy_21 | 2340 | 113.043 | 10.58% | [187] |
+| allgatherAicpuKernel | 456 | 109.812 | 10.28% | [185] |
+| aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3 | 2466 | 50.940 | 4.77% | [187] |
+| SparseFlashAttention | 468 | 38.718 | 3.62% | [187] |
+| aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul | 900 | 36.179 | 3.39% | [187] |
+| aclnnInplaceCopy_ViewCopyAiCore_ViewCopy | 2004 | 32.916 | 3.08% | [187, 43] |
+| aclnnInplaceZero_ZerosLikeAiCore_ZerosLike | 1560 | 27.815 | 2.60% | [187, 43] |
+| aclnnAdd_AddAiCore_Add | 4218 | 27.814 | 2.60% | [187] |
+| MoeLowLatencyCombineV2 | 450 | 26.216 | 2.45% | [187] |
+| aclnnBitwiseAndTensor_LogicalAndAiCore_LogicalAnd | 6726 | 24.199 | 2.26% | [187] |
+| aclnnArange_ArangeAiCore_Range | 2340 | 22.035 | 2.06% | [187] |
+| MoeLowLatencyDispatchV2 | 450 | 20.175 | 1.89% | [187] |
+| aclnnInplaceCopy_SliceAiCore_Slice | 1872 | 20.139 | 1.88% | [187] |
+| aclnnInplaceCopy_CastAiCore_Cast | 7285 | 14.293 | 1.34% | [187, 36] |
+| aclnnGeScalar_GreaterEqual_GreaterEqual | 2604 | 13.759 | 1.29% | [187] |
+| allreduceAicpuKernel | 42 | 13.519 | 1.26% | [185] |
+
+LIM原生核共126次，低于默认1%表格阈值，另作为执行证据记录。AI-CPU通信任务含等待；累计任务时长不能当作串行关键路径或TPOT。unidex_copy包含D2H/D2D/H2D及mask为空的调用，不能全部解释为H2D。GroupedMatmul是GEMM，通用脚本的memory分类不采用。
+
+2. Overlap opportunity table
+
+| 操作链 | 实测证据 | 依赖及结论 |
+|---|---|---|
+| miss回填→resident gather→tail→SFA | 468个完整五copy/SFA分组，copy及SFA均流187；与消费SFA重叠0/468 | 当前这一条数据搬运链没有被消费attention隐藏；prefix数据须先就绪。 |
+| IndexShare组内后续层稳定prefix预取 | 运行源码复用anchor plan；每层resident KV独立，但selected scratch复用 | 可考虑提前回填下一层prefix并用双缓冲selected与当前层计算重叠。当前token/tail仍须等该层KV生成。尚未实现或测得收益。 |
+| 通信与主流计算 | 通信流185，主流187；reduce_scatter/allgather任务时间包含等待 | 单trace不足以把所有跨度归因为通信成本；需要mapping/依赖图后才能量化可掩盖部分。 |
+
+3. Source-backed fuse-pattern table
+
+| 路径 | 现状 / 证据 | 源码及下一步约束 |
+|---|---|---|
+| Host miss + resident gather + SFA | 搬运113.04 ms，SFA38.72 ms累计；二者仍分开 | lim.py:210 materialize，lim.py:267 append_tail，attention.py:283 npu_sparse_flash_attention。Copy-SFA或直接resident-slot attention尚未接入，不能报为已实现融合。 |
+| 索引/偏移/mask生成与copy plan消费 | Arange/Add/LogicalAnd/类型转换为独立AI任务，多个家族累计占比超过1% | materialize/append_tail每层重新构造部分索引。可在device端plan消费中合并元数据处理；必须保留padding/reset/IndexShare语义并重新验证。 |
+| 相同流event依赖 | LIM materialize在同一流record miss_done/refill_done，attention再等待 | lim.py:264/265和attention.py:184/301。减少此分支冗余依赖属于待验证改动；参考分支使用其他流，不能全局删除。 |
+
+本轮原生LIM已融合索引与cache元数据管理，trace有126次原生调用；它没有融合KV payload搬运与SFA。通用parser的CUDA/NVFP4候选和Confirmed标签不构成本Ascend路径的实现证据，不采纳为融合结论。
+
+五次copy按已测源码顺序的中位数：
+- new-token device to DRAM: 8.200 us；累计3.826 ms。
+- miss DRAM to resident: 42.641 us；累计23.658 ms。
+- resident to selected: 156.743 us；累计73.453 ms。
+- short DRAM to selected: 12.320 us；累计5.776 ms。
+- visible tail DRAM to combined: 13.480 us；累计6.329 ms。
+
+这些kernel时长仅用于诊断，不与历史外部probe单次profile做因果性能比较。本轮未采集完整模型cache命中率，不以固定fixture命中率或copy时长推算实际命中率。
+结论：本trace的通信任务跨度最大，明确可核实的offload问题是copy与消费SFA串行、resident→selected仍有额外搬运。完整模型收益与延迟代价应以独立的未profile计时为准。

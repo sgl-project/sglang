@@ -31,18 +31,56 @@ torch.ops.npu registration. No extra LIM vendor package, external .so path,
 vLLM checkout or standalone operator installer is used at build/startup.
 SGLANG_NPU_LIM_LIBRARY is removed and warns if still set; its value is ignored.
 Kernel source branch: McZyWu/sgl-kernel-npu feat/lim-native-kv-offload.
-Kernel source commit: b5a45667efb377b0312108c01bbd0a730c1f9e78
+Kernel tested implementation commit: b5a45667efb377b0312108c01bbd0a730c1f9e78
 
 Migration validation on 217, 2026-10-21: the standard A3 wheel builds with
-CANN 9.1 / torch 2.10.0 / torch_npu 2.10.0.post6. All 10 native tests pass.
+CANN 9.1 / torch 2.10.0 / torch_npu 2.10.0.post6. All 12 native tests pass
+on 217, including the non-offload to cold-reset graph transitions at both C.
 Production host allocation, graph replay, request reuse, padding, new-page
 TopK, bitwise selected KV and the fixed-fixture attention comparison also
 pass. The loaded library SHA256 is
 ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8.
 No external LIM probe or custom vendor library is loaded in these checks.
-Checkpoint-backed GLM-5.2-W4A8 A/B is in progress separately; the historical
-measurements below retain their original external-probe provenance and must
-not be attributed to this port.
+Checkpoint-backed GLM-5.2-W4A8 A/B is complete for this native port. See
+LIM_NATIVE_217_RESULTS.txt for all timings, matched HBM windows, task scores
+and eight full-vocabulary KL comparisons. Runtime source is 611760f1; later
+branch changes add diagnostics and documentation without changing SRT.
+
+Current native-port TPOT (ms), with one excluded warmup and three measured
+rounds per case, and no individual-round outlier removal:
+  input/output/concurrency     full HBM   LI reference   LIM C4096   LIM C2048
+  8192/128/1                    47.976       285.830      118.510     123.423
+  32768/512/1                   48.273       285.721      127.061     135.411
+  8192/128/4                    49.727       269.340      123.482     134.488
+At 32K/512/1 the median chip sampled peak HBM is 57031.0 MiB full HBM,
+50390.5 MiB LIM C4096 and 47337.5 MiB LIM C2048. These are matched whole-device
+performance-window observations, not exact allocator watermarks. Every mode
+uses the same workload order; allocator carryover is a measurement limit.
+
+The custom 32-example long-prompt task scores are 30/32 full HBM, 28/32
+reference, 30/32 LIM C4096 and 28/32 LIM C2048, with no truncation. These are
+descriptive subset results, not a standard GSM8K score or quality-parity proof.
+Fixed-history full-vocabulary KL uses 32 samples x 512 positions per capture,
+with untouched logits saved before forcing identical continuation IDs.
+Reference self-repeat mean KL is 0.00613559, p99 0.12531799 and top1 agreement
+98.517%. Reference -> LIM C4096 gives mean 0.00961504, p99 0.18122482, max
+2.18040117 and top1 agreement 97.742%; reference -> LIM C2048 gives mean
+0.01028223, p99 0.19209434, max 1.26563377 and top1 agreement 97.748%.
+Same-mode variability exists, but these data do not establish lossless
+numerics or isolate every difference to the native operator.
+
+A separate current-port decode trace contains 126 native LIM calls and
+468 complete five-copy/SFA groups (78 layers x 6 steps). All copy/SFA tasks
+are on physical stream 187; consumer overlap is 0/468. The observed median
+miss-fill and resident-to-selected copies are 42.641 and 156.743 us. This
+single trace proves this chain remains serialized, not H2D hiding. Profile
+times are excluded from serving metrics. All 24 selected timing, quality,
+capture, profile and final-native-test intervals pass complete ownership
+audits. Contended attempts and captures lacking monitor coverage are retained
+as invalid and excluded. The task container and ownership guard were stopped.
+
+The historical measurements below retain their original external-probe
+provenance. Do not attribute those numbers to the new direct launch path.
 
 Selection semantics and accuracy status
 --------------------------------------
@@ -77,9 +115,11 @@ a measured model run. The actual 217 checkpoint metadata reports
 404,689,509,888 weight bytes. The fixed 151 dimensions were index H=32/D=128,
 K=2048, CKV=512, KPE=64, local attention QH=8.
 
-Still outside validation: full-distribution KL, perplexity, broad task-quality
-parity, speculative decoding, C8, and the SHMEM runtime. Equal fixed-fixture
-KV payloads do not establish general end-to-end numerical equivalence.
+Still outside validation: perplexity, broad task-quality parity, speculative
+decoding, C8, and a SHMEM KV backend. The current-port report includes
+cross-mode fixed-history full-vocabulary KL; this is not the repository's
+prefill-vs-decode sampled-token consistency helper. Equal fixed-fixture KV
+payloads do not establish general end-to-end numerical equivalence.
 
 151 measurements, 2026-10-20
 ----------------------------
@@ -142,8 +182,9 @@ Validation and reproduction
 ---------------------------
 After porting onto this main, all 14 CPU boundary tests passed again. The 18
 changed Python files pass repository Ruff rules, Ruff format, and isort checks.
-The original three CPU state-contract checks and NPU measurements above retain
-their measured-base provenance; complete-model accuracy remains unverified.
+The original three CPU state-contract checks and historical NPU measurements
+retain their measured-base provenance. Full-model evaluation for this native
+port is documented above; general quality and numerical parity remain unproven.
 
 CPU-only boundary tests:
   python test/manual/npu/test_sparse_kv_offload_cache.py
