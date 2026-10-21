@@ -76,6 +76,11 @@ def megamoe_autotune_context(
                 tuner.publish_namespaced_records(_CACHE_NAMESPACE, context.records)
 
 
+def megamoe_autotune_active() -> bool:
+    """Whether startup tuning is preparing MegaMoE capacity profiles now."""
+    return _active_context is not None
+
+
 @contextmanager
 def _native_cache(path: Path):
     # Native AUTO exposes its winner through this file; generic autotune owns

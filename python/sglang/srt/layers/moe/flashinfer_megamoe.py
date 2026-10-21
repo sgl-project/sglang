@@ -22,10 +22,11 @@ and combine stay pure no-ops; this module owns the layer build + forward.
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -119,8 +120,8 @@ def _capture_safe_ue8m0_pack() -> Generator[None, None, None]:
 class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     mega: Any
     mega_forward: Callable[[Any, Any], torch.Tensor] | None = None
-    # Same weights and kernel config as ``mega``, on a smaller decode workspace.
-    mega_decode: Any = None
+    # A smaller capacity profile of ``mega`` for decode-only forwards.
+    mega_decode_workspace: Any = None
     fc1_alpha: torch.Tensor | None = None
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
@@ -165,41 +166,69 @@ def _resolve_max_tokens_per_rank() -> int:
 def _resolve_decode_max_tokens_per_rank(max_tokens_per_rank: int) -> int:
     """Capacity of the optional decode-only workspace; 0 means none."""
     configured = envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get()
-    if configured <= 0 or configured >= max_tokens_per_rank:
+    if configured == 0:
         return 0
+    if not 0 < configured < max_tokens_per_rank:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK="
+            f"{configured} must be 0 (off) or below the main MegaMoE capacity "
+            f"of {max_tokens_per_rank} tokens per rank."
+        )
     return configured
 
 
-def _select_mega_for_forward(quant_info: FlashInferMegaMoeQuantInfo) -> Any:
-    """Pick the decode workspace only when every EP rank's batch fits in it.
+@functools.cache
+def _log_decode_workspace_skipped() -> None:
+    logger.info(
+        "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK is unused: "
+        "MegaMoE startup autotuning already prepares small-capacity profiles."
+    )
+
+
+def _maybe_create_decode_workspace(mega: Any, max_tokens_per_rank: int) -> Any:
+    capacity = _resolve_decode_max_tokens_per_rank(max_tokens_per_rank)
+    if capacity == 0:
+        return None
+    from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
+        megamoe_autotune_active,
+    )
+
+    # The tuned forward's profiles size small batches with tuned tactics, and
+    # FlashInfer allows one live workspace per capacity.
+    if megamoe_autotune_active():
+        _log_decode_workspace_skipped()
+        return None
+    return mega.create_workspace(capacity)
+
+
+def _select_decode_workspace(quant_info: FlashInferMegaMoeQuantInfo) -> Any:
+    """The decode workspace if every EP rank's batch fits in it, else None.
 
     MegaMOE is a lockstep collective, so the choice reads only DP-synchronized
     state. The token bound also catches prefill-sized forwards that publish
-    extend=False.
+    extend=False; such forwards keep the main workspace.
     """
-    mega_decode = quant_info.mega_decode
-    if mega_decode is None:
-        return quant_info.mega
+    workspace = quant_info.mega_decode_workspace
+    if workspace is None:
+        return None
 
     from sglang.srt.layers.dp_attention import (
         get_dp_global_num_tokens,
         get_is_extend_in_batch,
     )
-    from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
     from sglang.srt.runtime_context import get_parallel
 
-    # Startup tuning prepares the tuned forward's workspaces on quant_info.mega.
-    if get_in_autotune_dummy_run() or get_is_extend_in_batch():
-        return quant_info.mega
+    if get_is_extend_in_batch():
+        return None
     global_num_tokens = get_dp_global_num_tokens()
     # A singleton list under DP holds only this rank's count; it cannot agree.
     if not global_num_tokens or (
         len(global_num_tokens) == 1 and get_parallel().dp_size > 1
     ):
-        return quant_info.mega
-    if max(global_num_tokens) > mega_decode._fleet_params.max_tokens_per_rank:
-        return quant_info.mega
-    return mega_decode
+        return None
+    if max(global_num_tokens) > workspace.max_tokens_per_rank:
+        return None
+    return workspace
 
 
 def resolve_flashinfer_megamoe_combine_dtype() -> str:
@@ -281,7 +310,7 @@ def _bind_transformed_weights(
 
 def _init_flashinfer_megamoe_layer_state(layer: FusedMoE) -> None:
     layer._flashinfer_megamoe_layer = None
-    layer._flashinfer_megamoe_decode_layer = None
+    layer._flashinfer_megamoe_decode_workspace = None
     layer._flashinfer_megamoe_forward = None
     layer._flashinfer_megamoe_input_norm_const = None
 
@@ -298,6 +327,7 @@ def _ensure_flashinfer_megamoe_layer(
     megakernel_config: Any,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    with_decode_workspace: bool = False,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
@@ -317,19 +347,14 @@ def _ensure_flashinfer_megamoe_layer(
     world_size, rank = _layer_ep_world_rank(layer)
 
     max_tokens_per_rank = _resolve_max_tokens_per_rank()
-    decode_max_tokens_per_rank = _resolve_decode_max_tokens_per_rank(
-        max_tokens_per_rank
-    )
     logger.debug(
         "FlashInfer MegaMOE layer[%s] build: megakernel_config=%s "
-        "(world_size=%d, num_experts=%d, max_tokens_per_rank=%d, "
-        "decode_max_tokens_per_rank=%d, hidden_size=%d)",
+        "(world_size=%d, num_experts=%d, max_tokens_per_rank=%d, hidden_size=%d)",
         layer.layer_id,
         _format_megakernel_config(megakernel_config),
         world_size,
         layer.num_experts,
         max_tokens_per_rank,
-        decode_max_tokens_per_rank,
         layer.hidden_size,
     )
 
@@ -352,7 +377,6 @@ def _ensure_flashinfer_megamoe_layer(
     backend = MegaConfig(
         megakernel=megakernel_config,
         preprocess_weights=False,
-        # Held by reference, so a second layer object adds no weight copy.
         transformed_weights=transformed_weights,
     )
     mega = MoEEpMegaLayer(
@@ -364,15 +388,6 @@ def _ensure_flashinfer_megamoe_layer(
         backend=backend,
     )
     layer._flashinfer_megamoe_layer = mega
-    if decode_max_tokens_per_rank > 0:
-        layer._flashinfer_megamoe_decode_layer = MoEEpMegaLayer(
-            bootstrap=bootstrap,
-            fleet_params=replace(
-                fleet_params, max_tokens_per_rank=decode_max_tokens_per_rank
-            ),
-            weights=None,
-            backend=backend,
-        )
     if hasattr(megakernel_config, "knobs"):
         from sglang.srt.layers.moe.flashinfer_megamoe_autotune import (
             MegaMoeTunedForward,
@@ -383,6 +398,10 @@ def _ensure_flashinfer_megamoe_layer(
         )
     else:
         layer._flashinfer_megamoe_forward = _select_megamoe_forward(mega)
+    if with_decode_workspace:
+        layer._flashinfer_megamoe_decode_workspace = _maybe_create_decode_workspace(
+            mega, max_tokens_per_rank
+        )
     return mega
 
 
@@ -470,6 +489,8 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
         megakernel_config=megakernel_config,
         w13_scale=layer.w13_weight_scale,
         w2_scale=layer.w2_weight_scale,
+        # Only ModelOptNvFp4FusedMoEMethod passes the decode workspace on.
+        with_decode_workspace=True,
     )
 
 
@@ -725,14 +746,8 @@ def run_flashinfer_megamoe(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
-    mega = _select_mega_for_forward(quant_info)
-    # Tuned workspaces belong to quant_info.mega and FlashInfer rejects them on
-    # any other layer, so the decode layer runs a plain forward on its own.
-    mega_forward = (
-        quant_info.mega_forward
-        if mega is quant_info.mega
-        else _select_megamoe_forward(mega)
-    )
+    mega = quant_info.mega
+    decode_workspace = _select_decode_workspace(quant_info)
 
     t = MoEEpTensors(
         hidden_states=x.to(torch.bfloat16),
@@ -748,7 +763,14 @@ def run_flashinfer_megamoe(
     )
     with _capture_safe_ue8m0_pack():
         assert quant_info.mega_forward is not None
-        y = mega_forward(mega, t)
+        if decode_workspace is None:
+            y = quant_info.mega_forward(mega, t)
+        else:
+            y = mega.forward(
+                t,
+                workspace=decode_workspace,
+                return_workspace_view=mega.supports_output_view,
+            )
 
     if quant_info.apply_routed_scaling_factor:
         rsf = runner_config.routed_scaling_factor
