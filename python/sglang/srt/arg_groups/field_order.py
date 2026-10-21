@@ -277,6 +277,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "speculative_use_rejection_sampling",
+    "speculative_sampling_renorm_fallback",
     "speculative_token_map",
     "speculative_attention_mode",
     "speculative_draft_attention_backend",

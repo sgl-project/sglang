@@ -234,7 +234,17 @@ class BaseSpecWorker(ABC):
             return 0.0
         return self.draft_worker.weight_load_time
 
+    # Workers whose verify path runs eagle_sample's renorm ops (EAGLE/NGRAM)
+    # preflight those ops at startup; see prewarm_sampling (sglang#43412).
+    verify_uses_eagle_sample: bool = False
+
     def prewarm_sampling(self) -> SamplingPrewarmResult:
+        if self.verify_uses_eagle_sample:
+            from sglang.srt.speculative.eagle_utils import (
+                preflight_verify_sampling_ops,
+            )
+
+            preflight_verify_sampling_ops()
         return self.target_worker.model_runner.prewarm_sampling()
 
     @property
