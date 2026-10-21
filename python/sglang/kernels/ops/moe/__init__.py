@@ -72,9 +72,9 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="moe.per_tensor_absmax_fp8_for_cutlass_moe",
+        op="moe.prepare_cutlass_w4a8_moe_routes_and_scale",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.moe.ep_moe_kernels:per_tensor_absmax_fp8_for_cutlass_moe",
+        target="sglang.kernels.ops.moe.ep_moe_kernels:prepare_cutlass_w4a8_moe_routes_and_scale",
         capabilities=CUDA_ONLY,
     )
 )

@@ -202,9 +202,10 @@ def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
 
 
 @triton.jit
-def _per_tensor_absmax_fp8_for_cutlass_moe_kernel(
+def _prepare_cutlass_w4a8_moe_routes_and_scale_kernel(
     input_ptr,
     topk_ids_ptr,
+    output_topk_ids_ptr,
     output_s_ptr,
     stride_input_row,
     stride_input_col,
@@ -224,6 +225,11 @@ def _per_tensor_absmax_fp8_for_cutlass_moe_kernel(
         mask=routes < topk,
         other=-1,
     )
+    tl.store(
+        output_topk_ids_ptr + row * topk + routes,
+        tl.where(expert_ids == -1, num_local_experts, expert_ids),
+        mask=routes < topk,
+    )
     local_route = (expert_ids >= 0) & (expert_ids < num_local_experts)
     active = tl.sum(local_route.to(tl.int32), 0) > 0
     columns = tl.arange(0, BLOCK_SIZE)
@@ -236,30 +242,37 @@ def _per_tensor_absmax_fp8_for_cutlass_moe_kernel(
     tl.atomic_max(output_s_ptr, absmax / FP8_MAX, sem="relaxed")
 
 
-def per_tensor_absmax_fp8_for_cutlass_moe(
+def prepare_cutlass_w4a8_moe_routes_and_scale(
     input: torch.Tensor,
     topk_ids: torch.Tensor,
+    output_topk_ids: torch.Tensor,
     output_s: torch.Tensor,
     num_local_experts: int,
 ):
-    """Accumulate the FP8 scale from rows with any local route.
+    """Prepare sentinel IDs and accumulate the FP8 scale from local-route rows.
 
-    The caller initializes output_s to its minimum finite scale before reduction.
-    Fully inactive rows are excluded from activation loads, including their NaNs.
+    The caller provides fresh contiguous output IDs and initializes output_s to
+    its minimum finite scale. Only -1 maps to num_local_experts; other IDs and
+    inputs are preserved. Fully inactive rows never load activation values,
+    including NaNs. Empty-width inputs still produce canonical route IDs.
     """
     assert input.ndim == 2
     assert input.dtype in (torch.float16, torch.bfloat16, torch.float32)
     assert topk_ids.ndim == 2 and topk_ids.shape[0] == input.shape[0]
     assert topk_ids.dtype in (torch.int32, torch.int64)
+    assert output_topk_ids.shape == topk_ids.shape
+    assert output_topk_ids.dtype == topk_ids.dtype and output_topk_ids.is_contiguous()
     assert output_s.numel() == 1 and output_s.dtype == torch.float32
-    assert input.is_cuda and input.device == topk_ids.device == output_s.device
-    if input.numel() == 0:
+    assert input.is_cuda
+    assert input.device == topk_ids.device == output_topk_ids.device == output_s.device
+    if input.shape[0] == 0 or topk_ids.shape[1] == 0:
         return
     hidden_size = input.shape[1]
-    block_size = triton.next_power_of_2(hidden_size)
-    _per_tensor_absmax_fp8_for_cutlass_moe_kernel[(input.shape[0],)](
+    block_size = triton.next_power_of_2(max(1, hidden_size))
+    _prepare_cutlass_w4a8_moe_routes_and_scale_kernel[(input.shape[0],)](
         input,
         topk_ids,
+        output_topk_ids,
         output_s,
         input.stride(0),
         input.stride(1),

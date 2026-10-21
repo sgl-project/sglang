@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.moe.ep_moe_kernels import (
-    per_tensor_absmax_fp8_for_cutlass_moe,
+    prepare_cutlass_w4a8_moe_routes_and_scale,
 )
 from sglang.srt.layers.moe import cutlass_w4a8_moe as w4a8
 from sglang.srt.runtime_context import get_parallel
@@ -23,8 +23,8 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
 
-    def test_masked_absmax_excludes_inactive_rows(self):
-        """Any local route includes its row; inactive values cannot affect the scale."""
+    def test_route_preparation_excludes_inactive_rows(self):
+        """Prepare sentinel IDs and a live-row scale without changing strided inputs."""
         experts, rows, width = 2, 11, 257
         floor = 1e-10 / torch.finfo(torch.float8_e4m3fn).max
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
@@ -40,7 +40,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
             values[9, -1] = 7.25
             ids = torch.tensor(
                 [
-                    [2, -1, 2],
+                    [5, -1, -3],
                     [2, 0, 2],
                     [1, 2, -1],
                     [-1, -1, 2],
@@ -58,49 +58,76 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
             active = ((ids >= 0) & (ids < experts)).any(dim=-1)
             expected = values[active].float().abs().amax() / 448.0
             scale = torch.full((1,), floor, device="cuda", dtype=torch.float32)
+
+            def prepare(value, route_ids, expected_scale, *, rtol=0):
+                source_values, source_ids = value.clone(), route_ids.clone()
+                canonical = source_ids.masked_fill(source_ids == -1, experts)
+                prepared_ids = torch.full(
+                    route_ids.shape, -99, device="cuda", dtype=route_ids.dtype
+                )
+                scale.fill_(floor)
+                prepare_cutlass_w4a8_moe_routes_and_scale(
+                    input=value,
+                    topk_ids=route_ids,
+                    output_topk_ids=prepared_ids,
+                    output_s=scale,
+                    num_local_experts=experts,
+                )
+                torch.testing.assert_close(prepared_ids, canonical, rtol=0, atol=0)
+                torch.testing.assert_close(route_ids, source_ids, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    value, source_values, rtol=0, atol=0, equal_nan=True
+                )
+                torch.testing.assert_close(
+                    scale,
+                    torch.as_tensor(
+                        expected_scale, device=scale.device, dtype=scale.dtype
+                    ).reshape_as(scale),
+                    rtol=rtol,
+                    atol=0,
+                )
+
             for poison in (1e4, float("inf"), float("nan")):
                 with self.subTest(dtype=dtype, poison=poison):
                     values[~active] = poison
-                    scale.fill_(floor)
-                    per_tensor_absmax_fp8_for_cutlass_moe(
-                        input=values,
-                        topk_ids=ids,
-                        output_s=scale,
-                        num_local_experts=experts,
-                    )
-                    torch.testing.assert_close(
-                        scale, expected.reshape(1), rtol=1e-6, atol=0
-                    )
-            for case in ("zero", "inactive", "empty"):
+                    prepare(values, ids, expected, rtol=1e-6)
+            for case in ("zero", "inactive", "empty", "zero-topk", "zero-width"):
                 with self.subTest(dtype=dtype, case=case):
                     values.zero_()
-                    if case == "inactive":
+                    if case in ("inactive", "zero-topk"):
                         values.fill_(float("nan"))
-                        ids.fill_(experts)
-                    scale.fill_(floor)
-                    per_tensor_absmax_fp8_for_cutlass_moe(
-                        input=values[:0] if case == "empty" else values,
-                        topk_ids=ids[:0] if case == "empty" else ids,
-                        output_s=scale,
-                        num_local_experts=experts,
-                    )
-                    torch.testing.assert_close(
-                        scale, torch.full_like(scale, floor), rtol=0, atol=0
-                    )
+                    if case == "inactive":
+                        ids.fill_(-1)
+                    elif case == "zero-width":
+                        ids.fill_(0)
+                        ids[0, 0] = -1
+                    route_ids = ids
+                    if case == "empty":
+                        route_ids = ids[:0]
+                    elif case == "zero-topk":
+                        route_ids = ids[:, :0]
+                    value = values
+                    if case == "empty":
+                        value = values[:0]
+                    elif case == "zero-width":
+                        value = values[:, :0]
+                    prepare(value, route_ids, floor)
 
-    def test_masked_absmax_graph_replay_updates_scale(self):
-        """A replay must reset the scale before changing live rows or route validity."""
+    def test_route_preparation_graph_replay_updates_ids_and_scale(self):
+        """A replay resets the scale and rewrites IDs as live routes change."""
         experts, rows, width = 2, 13, 257
         floor = 1e-10 / torch.finfo(torch.float8_e4m3fn).max
         values = torch.ones((rows, width), device="cuda", dtype=torch.bfloat16)
         ids = torch.zeros((rows, 2), device="cuda", dtype=torch.int32)
+        prepared_ids = torch.full_like(ids, -99)
         scale = torch.full((1,), floor, device="cuda", dtype=torch.float32)
 
         def run():
             scale.fill_(floor)
-            per_tensor_absmax_fp8_for_cutlass_moe(
+            prepare_cutlass_w4a8_moe_routes_and_scale(
                 input=values,
                 topk_ids=ids,
+                output_topk_ids=prepared_ids,
                 output_s=scale,
                 num_local_experts=experts,
             )
@@ -121,12 +148,26 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                 ids.fill_(0)
                 if case == "inactive":
                     values.fill_(float("nan"))
-                    ids.fill_(experts)
+                    ids.fill_(-1)
                 elif case == "partial":
                     ids.fill_(experts)
+                    ids[0, 0], ids[0, 1] = -1, -3
                     ids[-1, 1] = 1
+                    values.fill_(float("nan"))
+                    values[-1].zero_()
                     values[-1, -1] = 3.0
+                source_values, source_ids = values.clone(), ids.clone()
                 graph.replay()
+                torch.testing.assert_close(
+                    prepared_ids,
+                    source_ids.masked_fill(source_ids == -1, experts),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(ids, source_ids, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    values, source_values, rtol=0, atol=0, equal_nan=True
+                )
                 torch.testing.assert_close(
                     scale, torch.full_like(scale, expected), rtol=1e-6, atol=0
                 )
