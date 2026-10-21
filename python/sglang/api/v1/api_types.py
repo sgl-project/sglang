@@ -203,6 +203,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Any] = None
     beam_width: Optional[int] = None
+    watermark: Optional[WatermarkRequestConfig] = None
+    choice: List[str] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -212,6 +214,23 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_SamplingParams(self)
+
+
+class WatermarkRequestConfig(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.WatermarkRequestConfig: JSON object (unknown keys rejected)."""
+
+    enabled: Optional[bool] = None
+    key: Optional[str] = None
+    context_window: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "WatermarkRequestConfig":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_WatermarkRequestConfig(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_WatermarkRequestConfig(self)
 
 
 class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -239,6 +258,15 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     mm_hashes: Optional[StringListOrList] = None
     video_data: Optional[MediaInput] = None
     audio_data: Optional[MediaInput] = None
+    extra_key: Optional[StringOrList] = None
+    priority: Optional[int] = None
+    cache_salt: Optional[StringOrList] = None
+    require_reasoning: Optional[bool] = None
+    lora_path: Optional[OptionalStringOrList] = None
+    session_params: Optional[Any] = None
+    kv_hints: Optional[KvHintsEnvelopeOrList] = None
+    routing_key: Optional[str] = None
+    max_thinking_tokens: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -248,6 +276,41 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateRequest(self)
+
+
+class KvHintsEnvelope(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvHintsEnvelope: JSON object (unknown keys ignored)."""
+
+    protocol_version: str = ""
+    message_id: str = ""
+    actions: List[KvHintAction] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvHintsEnvelope":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvHintsEnvelope(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvHintsEnvelope(self)
+
+
+class KvHintAction(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvHintAction: JSON object (unknown keys ignored)."""
+
+    action_id: str = ""
+    action_type: str = ""
+    action_version: str = ""
+    payload: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvHintAction":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvHintAction(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvHintAction(self)
 
 
 class LogprobEntry(msgspec.Struct, kw_only=True, frozen=True):
@@ -282,6 +345,8 @@ class GenerateMetaInfo(msgspec.Struct, kw_only=True, frozen=True):
     input_token_ids_logprobs: List[NullableTopLogprobs] = []
     hidden_states: List[HiddenStateRow] = []
     e2e_latency: Optional[float] = None
+    cached_tokens: int = 0
+    reasoning_tokens: int = 0
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateMetaInfo":
@@ -354,6 +419,113 @@ class MediaRef(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_MediaRef(self)
+
+
+class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListModelsRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListModelsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListModelsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListModelsRequest(self)
+
+
+class ListModelsResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ListModelsResponse: JSON object (unknown keys ignored)."""
+
+    models: List[ModelCard] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ListModelsResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ListModelsResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ListModelsResponse(self)
+
+
+class ModelCard(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ModelCard: JSON object (unknown keys ignored)."""
+
+    id: str = ""
+    root: str = ""
+    parent: Optional[str] = None
+    max_model_len: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ModelCard":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ModelCard(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ModelCard(self)
+
+
+class DetokenizeRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DetokenizeRequest: JSON object (unknown keys ignored)."""
+
+    tokens: List[int] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DetokenizeRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DetokenizeRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DetokenizeRequest(self)
+
+
+class DetokenizeResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DetokenizeResponse: JSON object (unknown keys ignored)."""
+
+    text: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DetokenizeResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DetokenizeResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DetokenizeResponse(self)
+
+
+class AbortRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AbortRequest: JSON object (unknown keys ignored)."""
+
+    rid: str = ""
+    abort_all: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AbortRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AbortRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AbortRequest(self)
+
+
+class AbortResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.AbortResponse: JSON object (unknown keys ignored)."""
+
+    success: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "AbortResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_AbortResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_AbortResponse(self)
 
 
 class HealthCheckRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -443,6 +615,11 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     max_total_num_tokens: Optional[int] = None
     version: str = ""
     internal_states: List[Any] = []
+    host: str = ""
+    port: int = 0
+    incremental_streaming_output: bool = False
+    disaggregation_mode: str = ""
+    deployment_info: Optional[DeploymentInfo] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -452,6 +629,57 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GetServerInfoResponse(self)
+
+
+class DeploymentInfo(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.DeploymentInfo: JSON object (unknown keys ignored)."""
+
+    disaggregation_bootstrap_port: Optional[int] = None
+    node_rank: int = 0
+    nnodes: int = 0
+    dp_size: int = 0
+    dp_rank: Optional[int] = None
+    dist_init_addr: Optional[str] = None
+    base_gpu_id: int = 0
+    page_size: Optional[int] = None
+    dcp_size: int = 0
+    max_running_requests: Optional[int] = None
+    max_prefill_tokens: int = 0
+    enable_dp_attention: bool = False
+    speculative_algorithm: Optional[str] = None
+    enable_hierarchical_cache: bool = False
+    hicache_ratio: Optional[float] = None
+    hicache_size: int = 0
+    hicache_write_policy: Optional[str] = None
+    hicache_host_total_tokens: Optional[int] = None
+    kv_event_sources: List[KvEventSource] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "DeploymentInfo":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_DeploymentInfo(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_DeploymentInfo(self)
+
+
+class KvEventSource(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.KvEventSource: JSON object (unknown keys ignored)."""
+
+    dp_rank: int = 0
+    endpoint: str = ""
+    topic: str = ""
+    block_size: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "KvEventSource":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_KvEventSource(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_KvEventSource(self)
 
 
 # ---- type aliases: JSON shapes without an object of their own ----
@@ -491,6 +719,9 @@ MatchedTokens = List[int]
 
 # sglang.api.v1.FinishReason: JSON object tagged by its type key; unknown tags pass through as a dict.
 FinishReason = Union[FinishStop, FinishLength, FinishAbort, Dict[str, Any]]
+
+# sglang.api.v1.OptionalKvHintsEnvelope: JSON: the wrapped value itself, null when unset.
+OptionalKvHintsEnvelope = Optional[KvHintsEnvelope]
 
 # sglang.api.v1.SamplingParamsList: JSON bare array.
 SamplingParamsList = List[SamplingParams]
@@ -552,8 +783,14 @@ OptionalInt64OrList = Union[OptionalInt64, OptionalInt64List]
 # sglang.api.v1.Matched: JSON: the value's shape picks the arm.
 Matched = Union[int, str, MatchedTokens]
 
+# sglang.api.v1.KvHintsEnvelopeList: JSON bare array.
+KvHintsEnvelopeList = List[OptionalKvHintsEnvelope]
+
 # sglang.api.v1.SamplingParamsOrList: JSON: one value or an array of values.
 SamplingParamsOrList = Union[SamplingParams, SamplingParamsList]
+
+# sglang.api.v1.KvHintsEnvelopeOrList: JSON: one value or an array of values.
+KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
 
 
 # ---- codecs: parsed JSON value <-> Python value ----
@@ -877,7 +1114,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark", "choice",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -936,6 +1173,10 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["custom_params"] = x
         elif key == "beam_width":
             kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "watermark":
+            kw["watermark"] = None if x is None else decode_WatermarkRequestConfig(x)
+        elif key == "choice":
+            kw["choice"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -994,6 +1235,39 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["custom_params"] = v.custom_params
     if v.beam_width is not None:
         d["beam_width"] = v.beam_width
+    if v.watermark is not None:
+        d["watermark"] = encode_WatermarkRequestConfig(v.watermark)
+    if v.choice:
+        d["choice"] = list(v.choice)
+    return d
+
+
+_FIELDS_WatermarkRequestConfig = ("enabled", "key", "context_window",)
+
+
+def decode_WatermarkRequestConfig(value: Any) -> WatermarkRequestConfig:
+    m = _expect_map(value, expected="struct WatermarkRequestConfig")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "enabled":
+            kw["enabled"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "key":
+            kw["key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context_window":
+            kw["context_window"] = None if x is None else _expect_int(x, expected="i64")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_WatermarkRequestConfig)
+    return WatermarkRequestConfig(**kw)
+
+
+def encode_WatermarkRequestConfig(v: WatermarkRequestConfig) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.enabled is not None:
+        d["enabled"] = v.enabled
+    if v.key is not None:
+        d["key"] = v.key
+    if v.context_window is not None:
+        d["context_window"] = v.context_window
     return d
 
 
@@ -1045,6 +1319,24 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["video_data"] = None if x is None else decode_MediaInput(x)
         elif key == "audio_data":
             kw["audio_data"] = None if x is None else decode_MediaInput(x)
+        elif key == "extra_key":
+            kw["extra_key"] = None if x is None else decode_StringOrList(x)
+        elif key == "priority":
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "cache_salt":
+            kw["cache_salt"] = None if x is None else decode_StringOrList(x)
+        elif key == "require_reasoning":
+            kw["require_reasoning"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "lora_path":
+            kw["lora_path"] = None if x is None else decode_OptionalStringOrList(x)
+        elif key == "session_params":
+            kw["session_params"] = x
+        elif key == "kv_hints":
+            kw["kv_hints"] = None if x is None else decode_KvHintsEnvelopeOrList(x)
+        elif key == "routing_key":
+            kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_thinking_tokens":
+            kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
     return GenerateRequest(**kw)
 
 
@@ -1094,6 +1386,99 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["video_data"] = encode_MediaInput(v.video_data)
     if v.audio_data is not None:
         d["audio_data"] = encode_MediaInput(v.audio_data)
+    if v.extra_key is not None:
+        d["extra_key"] = encode_StringOrList(v.extra_key)
+    if v.priority is not None:
+        d["priority"] = v.priority
+    if v.cache_salt is not None:
+        d["cache_salt"] = encode_StringOrList(v.cache_salt)
+    if v.require_reasoning is not None:
+        d["require_reasoning"] = v.require_reasoning
+    if v.lora_path is not None:
+        d["lora_path"] = encode_OptionalStringOrList(v.lora_path)
+    if v.session_params is not None:
+        d["session_params"] = v.session_params
+    if v.kv_hints is not None:
+        d["kv_hints"] = encode_KvHintsEnvelopeOrList(v.kv_hints)
+    if v.routing_key is not None:
+        d["routing_key"] = v.routing_key
+    if v.max_thinking_tokens is not None:
+        d["max_thinking_tokens"] = v.max_thinking_tokens
+    return d
+
+
+def decode_KvHintsEnvelopeOrList(value: Any) -> KvHintsEnvelopeOrList:
+    if isinstance(value, list):
+        return decode_KvHintsEnvelopeList(value)
+    return decode_KvHintsEnvelope(_expect_map(value, expected="a value or an array of values for KvHintsEnvelopeOrList"))
+
+
+def encode_KvHintsEnvelopeOrList(v: KvHintsEnvelopeOrList) -> Any:
+    if isinstance(v, list):
+        return encode_KvHintsEnvelopeList(v)
+    return encode_KvHintsEnvelope(v)
+
+
+def decode_KvHintsEnvelopeList(value: Any) -> KvHintsEnvelopeList:
+    return [decode_OptionalKvHintsEnvelope(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_KvHintsEnvelopeList(v: KvHintsEnvelopeList) -> List[Any]:
+    return [encode_OptionalKvHintsEnvelope(e) for e in v]
+
+
+def decode_OptionalKvHintsEnvelope(value: Any) -> OptionalKvHintsEnvelope:
+    return None if value is None else decode_KvHintsEnvelope(value)
+
+
+def encode_OptionalKvHintsEnvelope(v: OptionalKvHintsEnvelope) -> Any:
+    return None if v is None else encode_KvHintsEnvelope(v)
+
+
+def decode_KvHintsEnvelope(value: Any) -> KvHintsEnvelope:
+    m = _expect_map(value, expected="struct KvHintsEnvelope")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "protocol_version":
+            kw["protocol_version"] = _expect_str(x, expected="a string")
+        elif key == "message_id":
+            kw["message_id"] = _expect_str(x, expected="a string")
+        elif key == "actions":
+            kw["actions"] = [] if x is None else [decode_KvHintAction(e) for e in _expect_seq(x, expected="a sequence")]
+    return KvHintsEnvelope(**kw)
+
+
+def encode_KvHintsEnvelope(v: KvHintsEnvelope) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["protocol_version"] = v.protocol_version
+    d["message_id"] = v.message_id
+    if v.actions:
+        d["actions"] = [encode_KvHintAction(e) for e in v.actions]
+    return d
+
+
+def decode_KvHintAction(value: Any) -> KvHintAction:
+    m = _expect_map(value, expected="struct KvHintAction")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "action_id":
+            kw["action_id"] = _expect_str(x, expected="a string")
+        elif key == "action_type":
+            kw["action_type"] = _expect_str(x, expected="a string")
+        elif key == "action_version":
+            kw["action_version"] = _expect_str(x, expected="a string")
+        elif key == "payload":
+            kw["payload"] = x
+    return KvHintAction(**kw)
+
+
+def encode_KvHintAction(v: KvHintAction) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["action_id"] = v.action_id
+    d["action_type"] = v.action_type
+    d["action_version"] = v.action_version
+    if v.payload is not None:
+        d["payload"] = v.payload
     return d
 
 
@@ -1196,6 +1581,10 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
             kw["hidden_states"] = [] if x is None else [decode_HiddenStateRow(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "cached_tokens":
+            kw["cached_tokens"] = _expect_uint(x, expected="u32")
+        elif key == "reasoning_tokens":
+            kw["reasoning_tokens"] = _expect_uint(x, expected="u64")
     return GenerateMetaInfo(**kw)
 
 
@@ -1221,6 +1610,8 @@ def encode_GenerateMetaInfo(v: GenerateMetaInfo) -> Dict[str, Any]:
         d["hidden_states"] = [encode_HiddenStateRow(e) for e in v.hidden_states]
     if v.e2e_latency is not None:
         d["e2e_latency"] = float(v.e2e_latency)
+    d["cached_tokens"] = v.cached_tokens
+    d["reasoning_tokens"] = v.reasoning_tokens
     return d
 
 
@@ -1425,6 +1816,121 @@ def encode_MediaInput(v: MediaInput) -> Any:
     return v
 
 
+def decode_ListModelsRequest(value: Any) -> ListModelsRequest:
+    m = _expect_map(value, expected="struct ListModelsRequest")
+    return ListModelsRequest()
+
+
+def encode_ListModelsRequest(v: ListModelsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_ListModelsResponse(value: Any) -> ListModelsResponse:
+    m = _expect_map(value, expected="struct ListModelsResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "models":
+            kw["models"] = [] if x is None else [decode_ModelCard(e) for e in _expect_seq(x, expected="a sequence")]
+    return ListModelsResponse(**kw)
+
+
+def encode_ListModelsResponse(v: ListModelsResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.models:
+        d["models"] = [encode_ModelCard(e) for e in v.models]
+    return d
+
+
+def decode_ModelCard(value: Any) -> ModelCard:
+    m = _expect_map(value, expected="struct ModelCard")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "id":
+            kw["id"] = _expect_str(x, expected="a string")
+        elif key == "root":
+            kw["root"] = _expect_str(x, expected="a string")
+        elif key == "parent":
+            kw["parent"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "max_model_len":
+            kw["max_model_len"] = _expect_uint(x, expected="u64")
+    return ModelCard(**kw)
+
+
+def encode_ModelCard(v: ModelCard) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["id"] = v.id
+    d["root"] = v.root
+    if v.parent is not None:
+        d["parent"] = v.parent
+    d["max_model_len"] = v.max_model_len
+    return d
+
+
+def decode_DetokenizeRequest(value: Any) -> DetokenizeRequest:
+    m = _expect_map(value, expected="struct DetokenizeRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "tokens":
+            kw["tokens"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+    return DetokenizeRequest(**kw)
+
+
+def encode_DetokenizeRequest(v: DetokenizeRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.tokens:
+        d["tokens"] = list(v.tokens)
+    return d
+
+
+def decode_DetokenizeResponse(value: Any) -> DetokenizeResponse:
+    m = _expect_map(value, expected="struct DetokenizeResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "text":
+            kw["text"] = _expect_str(x, expected="a string")
+    return DetokenizeResponse(**kw)
+
+
+def encode_DetokenizeResponse(v: DetokenizeResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["text"] = v.text
+    return d
+
+
+def decode_AbortRequest(value: Any) -> AbortRequest:
+    m = _expect_map(value, expected="struct AbortRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "rid":
+            kw["rid"] = _expect_str(x, expected="a string")
+        elif key == "abort_all":
+            kw["abort_all"] = _expect_bool(x, expected="a boolean")
+    return AbortRequest(**kw)
+
+
+def encode_AbortRequest(v: AbortRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["rid"] = v.rid
+    d["abort_all"] = v.abort_all
+    return d
+
+
+def decode_AbortResponse(value: Any) -> AbortResponse:
+    m = _expect_map(value, expected="struct AbortResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "success":
+            kw["success"] = _expect_bool(x, expected="a boolean")
+    return AbortResponse(**kw)
+
+
+def encode_AbortResponse(v: AbortResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["success"] = v.success
+    return d
+
+
 def decode_HealthCheckRequest(value: Any) -> HealthCheckRequest:
     m = _expect_map(value, expected="struct HealthCheckRequest")
     return HealthCheckRequest()
@@ -1527,6 +2033,16 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["version"] = _expect_str(x, expected="a string")
         elif key == "internal_states":
             kw["internal_states"] = [] if x is None else list(_expect_seq(x, expected="a sequence"))
+        elif key == "host":
+            kw["host"] = _expect_str(x, expected="a string")
+        elif key == "port":
+            kw["port"] = _expect_uint(x, expected="u32")
+        elif key == "incremental_streaming_output":
+            kw["incremental_streaming_output"] = _expect_bool(x, expected="a boolean")
+        elif key == "disaggregation_mode":
+            kw["disaggregation_mode"] = _expect_str(x, expected="a string")
+        elif key == "deployment_info":
+            kw["deployment_info"] = None if x is None else decode_DeploymentInfo(x)
     return GetServerInfoResponse(**kw)
 
 
@@ -1541,4 +2057,113 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["version"] = v.version
     if v.internal_states:
         d["internal_states"] = list(v.internal_states)
+    d["host"] = v.host
+    d["port"] = v.port
+    d["incremental_streaming_output"] = v.incremental_streaming_output
+    d["disaggregation_mode"] = v.disaggregation_mode
+    if v.deployment_info is not None:
+        d["deployment_info"] = encode_DeploymentInfo(v.deployment_info)
+    return d
+
+
+def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
+    m = _expect_map(value, expected="struct DeploymentInfo")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "disaggregation_bootstrap_port":
+            kw["disaggregation_bootstrap_port"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "node_rank":
+            kw["node_rank"] = _expect_uint(x, expected="u32")
+        elif key == "nnodes":
+            kw["nnodes"] = _expect_uint(x, expected="u32")
+        elif key == "dp_size":
+            kw["dp_size"] = _expect_uint(x, expected="u32")
+        elif key == "dp_rank":
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "dist_init_addr":
+            kw["dist_init_addr"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "base_gpu_id":
+            kw["base_gpu_id"] = _expect_uint(x, expected="u32")
+        elif key == "page_size":
+            kw["page_size"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "dcp_size":
+            kw["dcp_size"] = _expect_uint(x, expected="u32")
+        elif key == "max_running_requests":
+            kw["max_running_requests"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "max_prefill_tokens":
+            kw["max_prefill_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "enable_dp_attention":
+            kw["enable_dp_attention"] = _expect_bool(x, expected="a boolean")
+        elif key == "speculative_algorithm":
+            kw["speculative_algorithm"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "enable_hierarchical_cache":
+            kw["enable_hierarchical_cache"] = _expect_bool(x, expected="a boolean")
+        elif key == "hicache_ratio":
+            kw["hicache_ratio"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "hicache_size":
+            kw["hicache_size"] = _expect_uint(x, expected="u64")
+        elif key == "hicache_write_policy":
+            kw["hicache_write_policy"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "hicache_host_total_tokens":
+            kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+        elif key == "kv_event_sources":
+            kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
+    return DeploymentInfo(**kw)
+
+
+def encode_DeploymentInfo(v: DeploymentInfo) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.disaggregation_bootstrap_port is not None:
+        d["disaggregation_bootstrap_port"] = v.disaggregation_bootstrap_port
+    d["node_rank"] = v.node_rank
+    d["nnodes"] = v.nnodes
+    d["dp_size"] = v.dp_size
+    if v.dp_rank is not None:
+        d["dp_rank"] = v.dp_rank
+    if v.dist_init_addr is not None:
+        d["dist_init_addr"] = v.dist_init_addr
+    d["base_gpu_id"] = v.base_gpu_id
+    if v.page_size is not None:
+        d["page_size"] = v.page_size
+    d["dcp_size"] = v.dcp_size
+    if v.max_running_requests is not None:
+        d["max_running_requests"] = v.max_running_requests
+    d["max_prefill_tokens"] = v.max_prefill_tokens
+    d["enable_dp_attention"] = v.enable_dp_attention
+    if v.speculative_algorithm is not None:
+        d["speculative_algorithm"] = v.speculative_algorithm
+    d["enable_hierarchical_cache"] = v.enable_hierarchical_cache
+    if v.hicache_ratio is not None:
+        d["hicache_ratio"] = float(v.hicache_ratio)
+    d["hicache_size"] = v.hicache_size
+    if v.hicache_write_policy is not None:
+        d["hicache_write_policy"] = v.hicache_write_policy
+    if v.hicache_host_total_tokens is not None:
+        d["hicache_host_total_tokens"] = v.hicache_host_total_tokens
+    if v.kv_event_sources:
+        d["kv_event_sources"] = [encode_KvEventSource(e) for e in v.kv_event_sources]
+    return d
+
+
+def decode_KvEventSource(value: Any) -> KvEventSource:
+    m = _expect_map(value, expected="struct KvEventSource")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "dp_rank":
+            kw["dp_rank"] = _expect_uint(x, expected="u32")
+        elif key == "endpoint":
+            kw["endpoint"] = _expect_str(x, expected="a string")
+        elif key == "topic":
+            kw["topic"] = _expect_str(x, expected="a string")
+        elif key == "block_size":
+            kw["block_size"] = _expect_uint(x, expected="u32")
+    return KvEventSource(**kw)
+
+
+def encode_KvEventSource(v: KvEventSource) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["dp_rank"] = v.dp_rank
+    d["endpoint"] = v.endpoint
+    d["topic"] = v.topic
+    d["block_size"] = v.block_size
     return d

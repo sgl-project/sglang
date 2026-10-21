@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
     can_use_silu_mul_mxfp8,
     swiglu_oai_mxfp8,
     swiglu_oai_mxfp8_deepgemm,
@@ -36,7 +36,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -67,7 +66,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.mxfp8_input import (
@@ -384,9 +383,7 @@ class MiniMaxM3MoE(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         if self.tp_size > config.num_local_experts:
             raise ValueError(
@@ -424,15 +421,15 @@ class MiniMaxM3MoE(nn.Module):
             gate_up_interleaved=False,
         )
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=config.num_experts_per_tok,
             renormalize=True,
             layer_id=layer_id,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts
@@ -537,10 +534,6 @@ class MiniMaxM3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -1260,9 +1253,9 @@ class MiniMaxM3Attention(nn.Module):
                 positions, q, k, idx_q, idx_k
             )
             and getattr(forward_batch, "out_cache_loc", None) is not None
-            and v.dim() == 2
+            # V agreeing with K on rank and shape is the kernel's contract, which
+            # `sparse_qk_index_gemma_rmsnorm_rope_cache` asserts.
             and v.dtype == q.dtype
-            and v.shape == k.shape
         )
         if can_use_cache_fusion and kv_pool is not None:
             layer_id = self.attn.layer_id
@@ -1763,8 +1756,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        if self.num_fused_shared_experts:
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         self.model = MiniMaxM3Model(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1811,15 +1806,13 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             return "Shared experts fusion is not supported when Deepep MoE backend is enabled."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        if is_shared_experts_fusion_disabled():
-            return
-        self.num_fused_shared_experts = self.config.n_shared_experts
-        assert self.num_fused_shared_experts == 1, (
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        assert hf_config.n_shared_experts == 1, (
             "Only 1 fused shared expert is supported for MiniMax-M3"
         )
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+        return hf_config.n_shared_experts
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
         if not self.pp_group.is_last_rank:
